@@ -158,6 +158,22 @@ _FAKE_CATALOG: dict[str, dict] = {
     },
 }
 
+_FAKE_CATALOG["fireworks_ai"] = {
+    "schema_version": "1.0",
+    "models": {
+        "accounts/fireworks/models/deepseek-v4p1-flash": {
+            "mode": "chat",
+            "capabilities": {"function_calling": True},
+            "context_window": {"max_input": 1000000, "max_output": 384000},
+            "pricing": {
+                "input_per_million_tokens": 0.3,
+                "output_per_million_tokens": 1.2,
+                "cache_read_per_million_tokens": 0.006,
+            },
+        },
+    },
+}
+
 _REAL_FETCH_PROVIDER_CATALOG = _providers_mod._fetch_provider_catalog
 
 
@@ -878,3 +894,85 @@ def test_unknown_provider_gets_default_api_key_mode() -> None:
     assert config.default_mode == "api_key"
     assert len(config.auth_modes) == 1
     assert config.auth_modes[0].fields[0].name == "api_key"
+
+
+# ── Fireworks gateway id pricing ───────────────────────────
+
+
+def test_catalog_lookup_targets_fireworks_namespaced_id() -> None:
+    """A bare Fireworks gateway id routes to the ``fireworks_ai`` catalog.
+
+    Harnesses report the model exactly as the gateway spells it —
+    ``accounts/fireworks/models/<id>`` — which carries no provider prefix. The
+    lookup used to fall through to OpenRouter (the unknown-namespace branch),
+    which has no entry under that id, so the session showed tokens and no cost.
+    """
+    targets = _providers_mod._catalog_lookup_targets(
+        "accounts/fireworks/models/deepseek-v4p1-flash"
+    )
+    assert ("fireworks_ai", "accounts/fireworks/models/deepseek-v4p1-flash") in targets, (
+        f"fireworks_ai catalog was not queried for a bare Fireworks id; got {targets}"
+    )
+    # OpenRouter stays as the bounded fallback, but must not be the only target.
+    assert targets[0] == ("fireworks_ai", "accounts/fireworks/models/deepseek-v4p1-flash")
+
+
+def test_catalog_lookup_targets_fireworks_router_id() -> None:
+    """``accounts/fireworks/routers/<id>`` routes to ``fireworks_ai`` too."""
+    targets = _providers_mod._catalog_lookup_targets(
+        "accounts/fireworks/routers/deepseek-v4p1-flash-us"
+    )
+    assert ("fireworks_ai", "accounts/fireworks/routers/deepseek-v4p1-flash-us") in targets, (
+        f"fireworks_ai catalog was not queried for a routed Fireworks id; got {targets}"
+    )
+
+
+def test_catalog_lookup_targets_fireworks_provider_alias() -> None:
+    """The resolved ``fireworks/<bare>`` spelling routes to ``fireworks_ai``."""
+    targets = _providers_mod._catalog_lookup_targets(
+        "fireworks/accounts/fireworks/models/deepseek-v4p1-flash"
+    )
+    assert ("fireworks_ai", "accounts/fireworks/models/deepseek-v4p1-flash") in targets, (
+        f"fireworks_ai catalog was not queried for the fireworks/ alias; got {targets}"
+    )
+
+
+def test_find_catalog_models_prices_fireworks_gateway_id() -> None:
+    """End to end: a Fireworks gateway id resolves to its catalog pricing.
+
+    This is the regression that left pi-native sessions on a Fireworks gateway
+    at ``$0.00``: ``fetch_model_pricing`` returns ``None`` when the lookup
+    reaches no catalog entry, and the server then stores the token counts with
+    no cost.
+    """
+    matches = find_catalog_models("accounts/fireworks/models/deepseek-v4p1-flash")
+    assert [match.name for match in matches] == [
+        "accounts/fireworks/models/deepseek-v4p1-flash"
+    ], f"expected the Fireworks catalog entry, got {matches}"
+    assert matches[0].input_price == pytest.approx(0.3)
+    assert matches[0].output_price == pytest.approx(1.2)
+
+
+def test_catalog_lookup_targets_leave_other_namespaces_alone() -> None:
+    """Non-Fireworks routing is untouched by the Fireworks branch.
+
+    Guards the new prefix check against over-matching: an OpenRouter-style
+    ``vendor/model`` id must still resolve through OpenRouter, and a
+    ``databricks-`` alias must still de-prefix to its base model.
+    """
+    # An unknown vendor namespace still falls through to OpenRouter.
+    assert _providers_mod._catalog_lookup_targets("acme/acme-model")[0] == (
+        "openrouter",
+        "acme/acme-model",
+    )
+    # A known provider namespace still resolves to that provider directly.
+    assert _providers_mod._catalog_lookup_targets("deepseek/deepseek-v4.1-flash")[0] == (
+        "deepseek",
+        "deepseek-v4.1-flash",
+    )
+    databricks_targets = _providers_mod._catalog_lookup_targets("databricks-gpt-5-5")
+    assert databricks_targets[0] == ("databricks", "databricks-gpt-5-5")
+    # A namespaced id that merely *contains* the prefix must not match.
+    assert ("fireworks_ai", "vendor/accounts/fireworks/models/x") not in (
+        _providers_mod._catalog_lookup_targets("vendor/accounts/fireworks/models/x")
+    )

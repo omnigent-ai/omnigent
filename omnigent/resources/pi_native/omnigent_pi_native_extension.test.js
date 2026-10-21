@@ -266,6 +266,118 @@ async function testMidTurnInterruptFallbackNoIsIdle() {
   );
 }
 
+// Build an assistant message shaped like Pi's ``AssistantMessage``: per-message
+// token counts plus Pi's own USD cost for the call.
+function assistantUsageMessage({ responseId, timestamp, cost, model }) {
+  return {
+    role: "assistant",
+    model: model || "accounts/fireworks/models/deepseek-v4p1-flash",
+    timestamp,
+    responseId,
+    usage: {
+      input: 1000,
+      output: 200,
+      cacheRead: 5000,
+      cacheWrite: 0,
+      totalTokens: 6200,
+      cost: {
+        input: 0.0003,
+        output: 0.00024,
+        cacheRead: 0.00003,
+        cacheWrite: 0,
+        total: cost,
+      },
+    },
+    content: [{ type: "text", text: "ok" }],
+  };
+}
+
+function sessionUsageEvents(h) {
+  return h.postedEvents
+    .filter((item) => item.type === "external_session_usage" && item.data)
+    .map((item) => item.data);
+}
+
+async function testUsageForwardsPiCost() {
+  // Regression: the extension forwarded only token counts and let the server
+  // price them from the shared catalog. For a model the catalog cannot price —
+  // a gateway's own namespaced id such as Fireworks'
+  // ``accounts/fireworks/models/<id>`` — the server stored the tokens and left
+  // ``total_cost_usd`` absent, so the Session-cost badge read $0.00 forever.
+  // Pi already computes exact USD per call as ``usage.cost.total``; forwarding
+  // it as ``cumulative_cost_usd`` is what makes the badge correct.
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+
+  await h.handlers.message_end(
+    { message: assistantUsageMessage({ responseId: "r1", timestamp: 1, cost: 0.00057 }) },
+    makeCtx({ idle: true }),
+  );
+  await h.handlers.message_end(
+    { message: assistantUsageMessage({ responseId: "r2", timestamp: 2, cost: 0.00043 }) },
+    makeCtx({ idle: true }),
+  );
+
+  const flushes = sessionUsageEvents(h);
+  const last = flushes[flushes.length - 1];
+  assert(
+    "usage flush carries Pi's cumulative cost",
+    !!last && Math.abs(Number(last.cumulative_cost_usd) - 0.001) < 1e-9,
+    JSON.stringify(last),
+  );
+  assert(
+    "usage flush keeps the cumulative token counts alongside cost",
+    !!last &&
+      last.cumulative_input_tokens === 12000 &&
+      last.cumulative_output_tokens === 400 &&
+      last.cumulative_cache_read_input_tokens === 10000,
+    JSON.stringify(last),
+  );
+  assert(
+    "usage flush still names the model for the per-model breakdown",
+    !!last && last.model === "accounts/fireworks/models/deepseek-v4p1-flash",
+    JSON.stringify(last),
+  );
+
+  // The same message re-emitted on a later lifecycle event must not double-count
+  // its cost any more than its tokens (the fingerprint dedup covers both).
+  await h.handlers.turn_end(
+    { message: assistantUsageMessage({ responseId: "r2", timestamp: 2, cost: 0.00043 }) },
+    makeCtx({ idle: true }),
+  );
+  const afterRedelivery = sessionUsageEvents(h).pop();
+  assert(
+    "re-delivered message does not double-count cost",
+    !!afterRedelivery && Math.abs(Number(afterRedelivery.cumulative_cost_usd) - 0.001) < 1e-9,
+    JSON.stringify(afterRedelivery),
+  );
+}
+
+async function testUsageOmitsCostWhenPiReportsNone() {
+  // An own-login or unpriced model reports no ``usage.cost``. The flush must
+  // still carry the token counts (so the per-model token view populates) and
+  // must NOT claim a $0.00 cost — absent means unpriced, and writing a zero
+  // would present a confidently wrong figure.
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+
+  const message = assistantUsageMessage({ responseId: "r1", timestamp: 1, cost: 0 });
+  delete message.usage.cost;
+  await h.handlers.message_end({ message }, makeCtx({ idle: true }));
+
+  const last = sessionUsageEvents(h).pop();
+  assert(
+    "usage flush without a Pi cost still reports tokens",
+    !!last && last.cumulative_input_tokens === 6000 && last.cumulative_output_tokens === 200,
+    JSON.stringify(last),
+  );
+  assert(
+    "usage flush without a Pi cost omits cumulative_cost_usd",
+    !!last && !("cumulative_cost_usd" in last),
+    JSON.stringify(last),
+  );
+}
+
 async function testAgentStartClearsStaleWindow() {
   // Belt-and-suspenders: even if a window is armed during a live turn, a brand
   // new agent loop must start clean and not abort its first tool call.
@@ -573,6 +685,8 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
     await testAgentLoopInterruptFallbackNoIsIdleBeforeTurnStart();
     await testMidTurnInterruptFallbackNoIsIdle();
     await testAgentStartClearsStaleWindow();
+    await testUsageForwardsPiCost();
+    await testUsageOmitsCostWhenPiReportsNone();
   } finally {
     for (const h of harnesses) {
       if (h.pi.__omnigentInboxPoller) clearInterval(h.pi.__omnigentInboxPoller);

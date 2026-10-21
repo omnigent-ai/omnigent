@@ -785,6 +785,27 @@ function toInt(value) {
 }
 
 /**
+ * Read Pi's own per-call cost total (USD), or ``0`` when absent.
+ *
+ * Pi prices every LLM call itself and carries the result as
+ * ``usage.cost.total`` — the same figure its TUI footer and ``/session``
+ * report. Forwarding it lets the session be priced even when the shared
+ * catalog has no row for the model id (e.g. a gateway's own namespaced id
+ * such as Fireworks' ``accounts/fireworks/models/<id>``), which otherwise
+ * left the Session-cost badge at $0.00 forever.
+ *
+ * Mirrors the finite / non-negative guard the token counts use: a malformed
+ * or negative report must never reach the server's monotonic cost clamp.
+ *
+ * @param value: The message's ``usage.cost`` object.
+ * @returns {number} The non-negative finite total, else ``0``.
+ */
+function toCost(value) {
+  const total = value && typeof value === "object" ? Number(value.total) : NaN;
+  return Number.isFinite(total) && total > 0 ? total : 0;
+}
+
+/**
  * Lift token usage out of one Pi assistant message.
  *
  * Mirrors the non-native executor's ``_extract_pi_turn_usage``
@@ -795,9 +816,14 @@ function toInt(value) {
  * (Anthropic semantics) — ``cacheRead`` / ``cacheWrite`` are separate, so the
  * full input a turn sent is ``input + cacheRead + cacheWrite``.
  *
+ * ``usage.cost.total`` is carried alongside the counts: it is Pi's own
+ * authoritative USD figure for the call, and forwarding it is what makes the
+ * Session-cost badge correct for models the shared catalog cannot price.
+ *
  * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
- *   total:number,model:(string|null)}|null} the per-message counts, or
- *   ``null`` when ``message`` is not an assistant message carrying usage.
+ *   total:number,cost:number,model:(string|null)}|null} the per-message
+ *   counts, or ``null`` when ``message`` is not an assistant message
+ *   carrying usage.
  */
 function extractPiUsage(message) {
   if (!message || typeof message !== "object") return null;
@@ -808,6 +834,7 @@ function extractPiUsage(message) {
   const output = toInt(usage.output);
   const cacheRead = toInt(usage.cacheRead);
   const cacheWrite = toInt(usage.cacheWrite);
+  const cost = toCost(usage.cost);
   // No countable tokens means Pi emitted an empty usage object — treat as "no
   // usage" so the server leaves the session unpriced rather than recording a
   // $0.00 turn (matches _aggregate_pi_turn_usage's empty-usage guard).
@@ -820,6 +847,7 @@ function extractPiUsage(message) {
     cacheRead,
     cacheWrite,
     total: toInt(usage.totalTokens),
+    cost,
     model,
   };
 }
@@ -1673,7 +1701,7 @@ module.exports = function (pi) {
     if (changed) await publishTaskList();
   }
 
-  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
+  // Cumulative session token + cost usage. Pi reports PER-MESSAGE counts (one
   // assistant message per LLM call); session billing is their SUM — each call
   // is billed for the full context it re-sent, so summing per-message inputs is
   // the correct cumulative input. The server applies vendor pricing to these
@@ -1689,6 +1717,11 @@ module.exports = function (pi) {
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
   let cumulativeCacheReadTokens = 0;
+  // Pi's own authoritative USD total, summed across the same messages. Sent as
+  // ``cumulative_cost_usd`` so the badge is correct even when the shared
+  // catalog cannot price the model id (a gateway's own namespaced id, e.g.
+  // Fireworks' ``accounts/fireworks/models/<id>``).
+  let cumulativeCostUsd = 0;
   let usageModel = null;
   let lastPostedUsageKey = "";
 
@@ -1734,6 +1767,7 @@ module.exports = function (pi) {
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    cumulativeCostUsd += usage.cost;
     if (usage.model) usageModel = usage.model;
     return true;
   }
@@ -1743,8 +1777,9 @@ module.exports = function (pi) {
   // its stored totals each flush. Deduped so a flush with no advance is a
   // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
   async function postSessionUsage() {
-    if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
-    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    if (!(cumulativeInputTokens || cumulativeOutputTokens || cumulativeCostUsd))
+      return;
+    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${cumulativeCostUsd}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
     const data = {
@@ -1752,6 +1787,11 @@ module.exports = function (pi) {
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
+    // Pi's own per-call cost total, summed. The server stores
+    // ``cumulative_cost_usd`` verbatim as the display cost (monotonic), so the
+    // badge is correct even when the shared catalog can't price the model id;
+    // the token fields above still drive the per-model breakdown.
+    if (cumulativeCostUsd > 0) data.cumulative_cost_usd = cumulativeCostUsd;
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
   }

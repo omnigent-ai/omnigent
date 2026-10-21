@@ -267,6 +267,138 @@ def test_message_end_posts_external_session_usage(tmp_path: Path) -> None:
     _run_extension_script(node, extension_path, script)
 
 
+def test_message_end_forwards_pi_cost(tmp_path: Path) -> None:
+    """Pi's own per-call cost is forwarded as ``cumulative_cost_usd``.
+
+    Regression: the extension forwarded only token counts and left pricing to
+    the server's shared catalog. For any model the catalog cannot price — a
+    gateway's own namespaced id such as Fireworks'
+    ``accounts/fireworks/models/<id>`` — the server stored the tokens and left
+    ``total_cost_usd`` absent, so the Session-cost badge read $0.00 forever.
+
+    Pi already computes exact USD per call and carries it on the message as
+    ``usage.cost.total``. Forwarding it is what makes the badge correct without
+    depending on catalog coverage.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    extension_path = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent"
+        / "resources"
+        / "pi_native"
+        / "omnigent_pi_native_extension.js"
+    )
+
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  const message = (responseId, timestamp, costTotal) => ({
+    role: "assistant",
+    model: "accounts/fireworks/models/deepseek-v4p1-flash",
+    responseId,
+    timestamp,
+    content: [{ type: "text", text: "hi" }],
+    usage: {
+      input: 100,
+      output: 40,
+      cacheRead: 30,
+      cacheWrite: 10,
+      totalTokens: 180,
+      cost: { input: 0.1, output: 0.2, cacheRead: 0.05, cacheWrite: 0.02, total: costTotal },
+    },
+  });
+
+  await handlers.message_end({ message: message("r1", 1, 0.37) }, ctx);
+  await handlers.message_end({ message: message("r2", 2, 0.13) }, ctx);
+
+  const usage = usageEvents();
+  const data = usage[usage.length - 1].data;
+  // Pi's cost is summed alongside the token counts, to full float precision.
+  assert.ok(
+    Math.abs(data.cumulative_cost_usd - 0.5) < 1e-9,
+    `cumulative_cost_usd=${data.cumulative_cost_usd} ${JSON.stringify(data)}`,
+  );
+  // The token fields are unaffected by carrying cost.
+  assert.equal(data.cumulative_input_tokens, 280);
+  assert.equal(data.cumulative_output_tokens, 80);
+  assert.equal(data.cumulative_cache_read_input_tokens, 60);
+  assert.equal(data.model, "accounts/fireworks/models/deepseek-v4p1-flash");
+
+  // A re-delivered message must not double-count its cost any more than its
+  // tokens (the fingerprint dedup covers both).
+  await handlers.turn_end({ message: message("r2", 2, 0.13) }, ctx);
+  const after = usageEvents();
+  const latest = after[after.length - 1].data;
+  assert.ok(
+    Math.abs(latest.cumulative_cost_usd - 0.5) < 1e-9,
+    `re-delivery double-counted cost: ${latest.cumulative_cost_usd}`,
+  );
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, extension_path, script)
+
+
+def test_usage_without_pi_cost_omits_the_cost_field(tmp_path: Path) -> None:
+    """No ``usage.cost`` means no ``cumulative_cost_usd``, but tokens still flow.
+
+    An own-login or otherwise unpriced model reports no cost. The flush must
+    still carry the token counts so the per-model token view populates, and must
+    NOT claim a $0.00 cost: absent means unpriced, and a synthesized zero would
+    present a confidently wrong figure to the badge and the daily rollup.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+    extension_path = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent"
+        / "resources"
+        / "pi_native"
+        / "omnigent_pi_native_extension.js"
+    )
+
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+  await handlers.message_end(
+    {
+      message: {
+        role: "assistant",
+        model: "some-own-login-model",
+        responseId: "r1",
+        timestamp: 1,
+        content: [{ type: "text", text: "hi" }],
+        usage: { input: 100, output: 40, cacheRead: 30, cacheWrite: 10, totalTokens: 180 },
+      },
+    },
+    ctx,
+  );
+
+  const usage = usageEvents();
+  assert.equal(usage.length, 1, JSON.stringify(postedEvents));
+  const data = usage[0].data;
+  assert.equal(data.cumulative_input_tokens, 140);
+  assert.ok(
+    !("cumulative_cost_usd" in data),
+    `expected no cumulative_cost_usd, got ${JSON.stringify(data)}`,
+  );
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, extension_path, script)
+
+
 def test_usage_accumulates_and_dedupes_across_messages(tmp_path: Path) -> None:
     """Per-message usage SUMS into cumulative totals; a re-emitted message is deduped."""
     node = shutil.which("node")
