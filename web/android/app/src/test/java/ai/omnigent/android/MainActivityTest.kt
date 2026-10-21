@@ -260,6 +260,7 @@ class MainActivityTest {
         )
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
         activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        assertEquals(0f, activity.findViewById<Button>(R.id.status_details_toggle).rotation)
         val before = activity.declared<View>("connectionOverlay")
         val dark =
             Configuration(activity.resources.configuration).apply {
@@ -275,6 +276,7 @@ class MainActivityTest {
             View.VISIBLE,
             activity.findViewById<View>(R.id.status_details_content).visibility,
         )
+        assertEquals(0f, activity.findViewById<Button>(R.id.status_details_toggle).rotation)
         assertEquals(
             activity.getString(R.string.status_server_unreachable),
             activity.findViewById<TextView>(R.id.status_headline).text.toString(),

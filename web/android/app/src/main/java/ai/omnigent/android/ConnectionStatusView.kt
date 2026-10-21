@@ -86,7 +86,6 @@ internal class ConnectionStatusView(
         detailsToggle.setOnClickListener {
             detailsExpanded = !detailsExpanded
             detailsContent.visibility = if (detailsExpanded) View.VISIBLE else View.GONE
-            detailsToggle.rotation = if (detailsExpanded) 180f else 0f
         }
     }
 
@@ -209,7 +208,6 @@ internal class ConnectionStatusView(
         detailsPanel.visibility = if (details == null) View.GONE else View.VISIBLE
         detailsContent.visibility =
             if (details != null && detailsExpanded) View.VISIBLE else View.GONE
-        detailsToggle.rotation = if (detailsExpanded) 180f else 0f
         if (details != null) bindDetails(details)
         bindAction(primary, presentation.primary, state)
         bindAction(secondary, presentation.secondary, state)
