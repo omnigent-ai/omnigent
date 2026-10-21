@@ -11,7 +11,7 @@ so each harness names the coding agent and client surfaces the same way.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
 
@@ -110,16 +110,25 @@ _UG_USER_AGENT_PREFIX: Final[str] = "ucode/"
 _HeaderValue = TypeVar("_HeaderValue")
 
 
-def gateway_attribution_headers(coding_agent: str, *, via_ug: bool = False) -> dict[str, str]:
+def gateway_attribution_headers(
+    coding_agent: str, *, via_ug: bool = False, client_surfaces: Iterable[str] = ()
+) -> dict[str, str]:
     """Return the attribution headers for a Unity Gateway request Omnigent originates.
 
     :param coding_agent: The harness making the request, e.g. ``"codex"``.
     :param via_ug: Whether the route comes from ug's configuration.
+    :param client_surfaces: Existing inner surfaces, in their original order.
     :returns: e.g. ``{"Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent, ug"}``.
     """
-    surfaces = "omnigent, ug" if via_ug else "omnigent"
-    return {CODING_AGENT_HEADER: coding_agent, CLIENT_SURFACES_HEADER: surfaces}
+    surfaces: list[str] = []
+    seen: set[str] = set()
+    for surface in ("omnigent", *client_surfaces, *(("ug",) if via_ug else ())):
+        name = surface.strip()
+        if name and name.lower() not in seen:
+            seen.add(name.lower())
+            surfaces.append(name)
+    return {CODING_AGENT_HEADER: coding_agent, CLIENT_SURFACES_HEADER: ", ".join(surfaces)}
 
 
 def is_ug_route(base_url: str) -> bool:
@@ -131,31 +140,58 @@ def is_ug_route(base_url: str) -> bool:
 
 
 def with_gateway_attribution(
-    headers: Mapping[str, _HeaderValue] | None, coding_agent: str, base_url: str
+    headers: Mapping[str, _HeaderValue] | None,
+    coding_agent: str,
+    base_url: str,
+    *,
+    via_ug: bool = False,
 ) -> dict[str, _HeaderValue | str]:
     """Return a provider's static *headers* plus the attribution headers.
 
     The provider is ug's when ug configured its workspace or wrote its ``User-Agent``.
     """
-    existing: dict[str, _HeaderValue | str] = dict(headers or {})
-    user_agent = existing.get("User-Agent")
-    via_ug = (
-        isinstance(user_agent, str) and user_agent.startswith(_UG_USER_AGENT_PREFIX)
-    ) or is_ug_route(base_url)
-    return {**existing, **gateway_attribution_headers(coding_agent, via_ug=via_ug)}
+    existing: dict[str, _HeaderValue | str] = {}
+    surfaces: list[str] = []
+    for name, value in (headers or {}).items():
+        lowered = name.lower()
+        if lowered == CLIENT_SURFACES_HEADER.lower():
+            if isinstance(value, str):
+                surfaces.extend(value.split(","))
+        elif lowered != CODING_AGENT_HEADER.lower():
+            existing[name] = value
+        if lowered == "user-agent" and isinstance(value, str):
+            via_ug = via_ug or any(
+                product.startswith(_UG_USER_AGENT_PREFIX) for product in value.split()
+            )
+    return {
+        **existing,
+        **gateway_attribution_headers(
+            coding_agent, via_ug=via_ug or is_ug_route(base_url), client_surfaces=surfaces
+        ),
+    }
 
 
 def with_gateway_attribution_lines(
     custom_headers: str | None, coding_agent: str, *, via_ug: bool = False
 ) -> str:
-    """Append the attribution headers to Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
+    """Merge attribution into Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
 
     :param custom_headers: The existing newline-separated ``Name: value`` block, or ``None``.
     :param coding_agent: The harness making the request, e.g. ``"claude-code"``.
     :param via_ug: Whether the route comes from ug's configuration.
-    :returns: The block with both attribution lines appended.
+    :returns: The block with one line per attribution header.
     """
-    lines = [custom_headers] if custom_headers else []
-    attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
-    lines.extend(f"{name}: {value}" for name, value in attribution.items())
+    lines: list[str] = []
+    headers: dict[str, str] = {}
+    for line in (custom_headers or "").splitlines():
+        name, separator, value = line.partition(":")
+        lowered = name.strip().lower()
+        if separator:
+            headers[lowered] = ",".join(filter(None, (headers.get(lowered), value.strip())))
+        if lowered not in (CODING_AGENT_HEADER.lower(), CLIENT_SURFACES_HEADER.lower()):
+            lines.append(line)
+    attribution = with_gateway_attribution(headers, coding_agent, "", via_ug=via_ug)
+    lines.extend(
+        f"{name}: {attribution[name]}" for name in (CODING_AGENT_HEADER, CLIENT_SURFACES_HEADER)
+    )
     return "\n".join(lines)

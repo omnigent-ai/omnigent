@@ -21,27 +21,86 @@ def test_gateway_attribution_headers_name_omnigent_outermost(via_ug: bool, surfa
     }
 
 
-def test_with_gateway_attribution_marks_ug_providers_by_user_agent() -> None:
-    assert with_gateway_attribution({"User-Agent": "ucode/0.1.0 pi/0.80.0"}, "pi", _GW) == {
-        "User-Agent": "ucode/0.1.0 pi/0.80.0",
-        "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+@pytest.mark.parametrize(
+    ("headers", "surfaces"),
+    [
+        (None, "omnigent"),
+        ({"User-Agent": "ucode/0.1.0 pi/0.80.0"}, "omnigent, ug"),
+        ({"user-agent": "ucode/0.1.0 pi/0.80.0"}, "omnigent, ug"),
+        ({"User-Agent": "outer/1 ucode/0.1.0 pi/0.80.0"}, "omnigent, ug"),
+        (
+            {
+                "databricks-custom-coding-agent": "codex",
+                "databricks-custom-client-surfaces": "ug, inner, ug, omnigent",
+                "X-Trace": "keep",
+            },
+            "omnigent, ug, inner",
+        ),
+        (
+            {
+                "Databricks-Custom-Coding-Agent": "codex",
+                "Databricks-Custom-Client-Surfaces": "ug",
+                "databricks-custom-client-surfaces": "inner, ug",
+            },
+            "omnigent, ug, inner",
+        ),
+        ({"Databricks-Custom-Client-Surfaces": " , omnigent, , "}, "omnigent"),
+    ],
+    ids=["plain", "ug", "lowercase", "nested-user-agent", "inherited", "duplicate-keys", "empty"],
+)
+def test_with_gateway_attribution_preserves_nested_surfaces(
+    headers: dict[str, str] | None, surfaces: str
+) -> None:
+    original = dict(headers) if headers is not None else None
+    result = with_gateway_attribution(headers, "pi", _GW)
+    unrelated = {
+        name: value
+        for name, value in (headers or {}).items()
+        if not name.lower().startswith("databricks-custom-")
     }
-    assert (
-        with_gateway_attribution(None, "pi", _GW)["Databricks-Custom-Client-Surfaces"]
-        == "omnigent"
-    )
+    assert result == {
+        **unrelated,
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": surfaces,
+    }
+    assert with_gateway_attribution(result, "pi", _GW) == result
+    assert headers == original
 
 
-def test_with_gateway_attribution_lines_appends_to_the_claude_block() -> None:
-    block = with_gateway_attribution_lines(
-        "x-databricks-use-coding-agent-mode: true", "claude-code", via_ug=True
-    )
-
+@pytest.mark.parametrize(
+    "attribution",
+    [
+        "",
+        "databricks-custom-coding-agent: codex\n"
+        "databricks-custom-client-surfaces: ug, omnigent, ug\n",
+        "Databricks-Custom-Coding-Agent: codex\n"
+        "Databricks-Custom-Coding-Agent: pi\n"
+        "Databricks-Custom-Client-Surfaces: ug\n",
+    ],
+    ids=["new", "lowercase", "repeated"],
+)
+def test_with_gateway_attribution_lines_merges_the_claude_block(attribution: str) -> None:
+    original = f"{attribution}x-databricks-use-coding-agent-mode: true"
+    block = with_gateway_attribution_lines(original, "claude-code", via_ug=True)
     assert block.splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
         "Databricks-Custom-Coding-Agent: claude-code",
         "Databricks-Custom-Client-Surfaces: omnigent, ug",
+    ]
+    assert with_gateway_attribution_lines(block, "claude-code", via_ug=True) == block
+
+
+def test_claude_header_block_detects_ug_and_keeps_inner_surfaces() -> None:
+    block = with_gateway_attribution_lines(
+        "user-agent: outer/1 ucode/0.1.0 claude/2\n"
+        "databricks-custom-client-surfaces: ug, inner\nX-Trace: keep:colon",
+        "claude-code",
+    )
+    assert block.splitlines() == [
+        "user-agent: outer/1 ucode/0.1.0 claude/2",
+        "X-Trace: keep:colon",
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent, ug, inner",
     ]
 
 

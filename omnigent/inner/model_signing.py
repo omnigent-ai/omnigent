@@ -8,6 +8,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from omnigent.databricks_ai_gateway import (
+    CODEX_AGENT,
+    gateway_attribution_headers,
+    is_databricks_ai_gateway_url,
+)
+
 from .model_egress import FrozenModelRoute
 
 _HEADER_NAME = re.compile(r"\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
@@ -69,6 +75,7 @@ def reconstruct_signed_request(
     headers: Sequence[tuple[str, str]],
     body: bytes,
     max_body_bytes: int = 10 * 1024 * 1024,
+    via_ug: bool = False,
 ) -> SignedModelRequest:
     """Authorize and rebuild one queryless JSON model request."""
     _validate_secret_value(placeholder, label="placeholder")
@@ -126,6 +133,9 @@ def reconstruct_signed_request(
         raise SigningRejected("duplicate Accept is not allowed")
     if accept:
         rebuilt.append(("Accept", accept[0]))
+    if is_databricks_ai_gateway_url(f"https://{route.host}{route.path}"):
+        # Use trusted launch metadata rather than the worker's attribution.
+        rebuilt.extend(gateway_attribution_headers(CODEX_AGENT, via_ug=via_ug).items())
 
     return SignedModelRequest(
         method=route.method,
