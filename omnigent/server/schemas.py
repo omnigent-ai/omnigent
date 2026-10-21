@@ -904,6 +904,9 @@ class ChildSessionSummary(BaseModel):
         child's ``model_override`` — the field intelligent routing writes
         when it picks a model for a spawned child. ``None`` when the child
         inherits the parent/spec model.
+    :param model_override: Explicit model pinned for this child, if any.
+    :param llm_model: Model reported by the child, falling back to its agent or sub-agent spec.
+    :param reasoning_effort: Persisted reasoning effort for this child, if any.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
         ``RoutingDecisionData.decision_id``. Read from the child's
@@ -931,6 +934,9 @@ class ChildSessionSummary(BaseModel):
     last_message_preview: str | None = None
     pending_elicitations_count: int = 0
     routed_model: str | None = None
+    model_override: str | None = None
+    llm_model: str | None = None
+    reasoning_effort: str | None = None
     routing_decision_id: str | None = None
 
 

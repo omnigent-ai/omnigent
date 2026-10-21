@@ -3,6 +3,8 @@ import { userEvent, within } from "storybook/test";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { ChatStoreSeed, StoryQueryRouter } from "@/storybook/StoryProviders";
+import { useChatStore } from "@/store/chatStore";
+import type { Session } from "@/lib/types";
 import { Composer } from "./ChatPage";
 
 const meta = {
@@ -33,7 +35,19 @@ const meta = {
   decorators: [
     (Story) => (
       <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
-        <StoryQueryRouter>
+        <StoryQueryRouter
+          seed={(queryClient) =>
+            queryClient.setQueryData(["session", "child-session-model-effort"], {
+              id: "child-session-model-effort",
+              parentSessionId: "parent-session",
+              reasoningEffort: "high",
+              hostId: null,
+              workspace: null,
+              labels: {},
+              gitBranch: null,
+            } as Session)
+          }
+        >
           <ChatStoreSeed
             seed={{
               conversationId: null,
@@ -63,6 +77,24 @@ type Story = StoryObj<typeof meta>;
 export const Open: Story = {
   play: async ({ canvasElement }) => {
     await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
+  },
+};
+
+export const ReadOnlyChildModelEffort: Story = {
+  args: {
+    disabled: true,
+    readOnlyReason: "Sub-agent sessions are read-only",
+    showModels: false,
+    showEffort: false,
+    modelPickerKind: null,
+  },
+  play: async () => {
+    useChatStore.setState({
+      conversationId: "child-session-model-effort",
+      sessionHarness: "pi",
+      llmModel: "databricks-gpt-5-4",
+      sessionReasoningEffort: null,
+    });
   },
 };
 

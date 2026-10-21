@@ -4,7 +4,7 @@ import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { useChildSessions, useDescendantSession } from "./useChildSessions";
+import { fetchChildSessions, useChildSessions, useDescendantSession } from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -30,6 +30,37 @@ describe("useChildSessions", () => {
 
     expect(result.current.children).toEqual([]);
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+
+  it("maps model and reasoning-effort fields from the child summary", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          object: "list",
+          data: [
+            {
+              id: "conv_child",
+              title: "researcher:auth",
+              tool: "researcher",
+              session_name: "auth",
+              current_task_status: null,
+              busy: false,
+              model_override: "databricks-gpt-5-4",
+              llm_model: "databricks-gpt-5-4",
+              reasoning_effort: "high",
+            },
+          ],
+        }),
+      ),
+    );
+
+    const children = await fetchChildSessions("conv_parent");
+
+    expect(children[0]).toMatchObject({
+      model_override: "databricks-gpt-5-4",
+      llm_model: "databricks-gpt-5-4",
+      reasoning_effort: "high",
+    });
   });
 });
 

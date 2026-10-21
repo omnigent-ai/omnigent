@@ -1224,6 +1224,10 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router,
             )
+            if parsed_metadata.reasoning_effort is None and parent_conv is not None:
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={"reasoning_effort": parent_conv.reasoning_effort}
+                )
 
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host
