@@ -314,6 +314,8 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     assert decoded.spawn_env_allowlist == ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
     assert decoded.bind_host_proc is True
     assert SandboxPolicy.from_jsonable({}).bind_host_proc is None
+    assert SandboxPolicy.from_jsonable({"bind_host_proc": "false"}).bind_host_proc is None
+    assert SandboxPolicy.from_jsonable({"bind_host_proc": False}).bind_host_proc is False
     # Old payloads (no key) and unset policies must decode to None —
     # "no prune", not "prune everything".
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
@@ -507,6 +509,7 @@ def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
     from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox._LAKEBOX_MARKER", tmp_path / "absent")
     monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
     monkeypatch.setattr(
         "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name: "/usr/bin/bwrap"
