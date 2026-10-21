@@ -277,6 +277,7 @@ class MainActivity : AppCompatActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
+                    if (connectionOverlay.isHiding) return
                     connectionStatus?.let { status ->
                         if (status.presentation().cancel) cancelConnection() else finish()
                         return
@@ -447,7 +448,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         override fun showServerUnreachable(error: Throwable) {
-            showUnreachable(error.message ?: error.javaClass.simpleName)
+            showUnreachable(failureClassName(error))
         }
 
         override fun loadWithoutNativeSignIn(url: String) = loadPage(url)
@@ -596,9 +597,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 when (error) {
                     is DatabricksSessionException.NetworkUnavailable -> {
-                        showUnreachable(
-                            error.message.orEmpty(),
-                        )
+                        showUnreachable("NetworkUnavailable")
                     }
 
                     else -> {
@@ -606,7 +605,7 @@ class MainActivity : AppCompatActivity() {
                             ConnectionStatus.WorkspaceFailure(
                                 statusHost(),
                                 error?.message.orEmpty(),
-                                failureDetails(error?.message.orEmpty()),
+                                failureDetails(failureClassName(error)),
                             ),
                         )
                     }
@@ -698,6 +697,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleStatusAction(action: StatusAction) {
+        if (connectionStatus == null || connectionOverlay.isHiding) return
         when (action) {
             StatusAction.CANCEL -> {
                 cancelConnection()
@@ -1003,9 +1003,9 @@ class MainActivity : AppCompatActivity() {
                     onMainFrameCommitted = { view ->
                         if (view === webView) hideStatus()
                     },
-                    onMainFrameUnreachable = { view, code, description ->
+                    onMainFrameUnreachable = { view, code, _ ->
                         if (view === webView) {
-                            showUnreachable("$description (${connectionErrorName(code)})")
+                            showUnreachable(connectionErrorName(code))
                         }
                     },
                     onMainFrameSslError = { view, description ->
@@ -1133,7 +1133,7 @@ class MainActivity : AppCompatActivity() {
         if (loopExhausted) {
             revealServerSwitcherNow()
             showStatus(
-                ConnectionStatus.CrashRecovery(statusHost(), failureDetails("Renderer crash loop")),
+                ConnectionStatus.CrashRecovery(statusHost(), failureDetails("RENDERER_CRASH")),
             )
             return
         }

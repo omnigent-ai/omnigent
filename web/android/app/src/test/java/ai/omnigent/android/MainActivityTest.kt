@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.RestrictionsManager
@@ -205,6 +206,93 @@ class MainActivityTest {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
         assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `main frame error details use numeric code and exclude callback query`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/oauth/callback?state=ERR_PRIVATESTATE&code=private-code"
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(url),
+            FakeWebResourceError(-2, url),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(800))
+        activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        val rendered = activity.findViewById<TextView>(R.id.status_details_text).text.toString()
+        activity.findViewById<Button>(R.id.status_copy_details).performClick()
+        val copied =
+            activity
+                .getSystemService(ClipboardManager::class.java)
+                .primaryClip!!
+                .getItemAt(0)
+                .text
+                .toString()
+        assertEquals(rendered, copied)
+        assertTrue(rendered.contains("ERROR_HOST_LOOKUP"))
+        assertFalse(rendered.contains("ERR_PRIVATESTATE"))
+        assertFalse(rendered.contains("private-code"))
+        assertFalse(rendered.contains("/oauth/callback"))
+    }
+
+    @Test
+    fun `successful commit makes retry change server and Back inert during the hold`() {
+        var manifestReads = 0
+        MainActivity.manifestReader = {
+            manifestReads++
+            ServerManifest.BASELINE
+        }
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/chat/123"
+        val status =
+            ConnectionStatus.ServerUnreachable(
+                "example.com",
+                UnreachableKind.GENERIC,
+                null,
+            )
+        shadowOf(activity).nextStartedActivity
+        activity.invoke("showStatus", arrayOf(ConnectionStatus::class.java), status)
+        activity.declared<ConnectionStatusView>("connectionOverlay").show(status, immediate = true)
+        webView.loadUrl(url)
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onPageCommitVisible(webView, url)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        val before = manifestReads
+        val page = shadowOf(webView).lastLoadedUrl
+        activity.findViewById<Button>(R.id.status_primary).performClick()
+        activity.findViewById<Button>(R.id.status_secondary).performClick()
+        activity.onBackPressedDispatcher.onBackPressed()
+        assertEquals(before, manifestReads)
+        assertEquals(url, page)
+        assertEquals(url, shadowOf(webView).lastLoadedUrl)
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertFalse(activity.isFinishing)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+    }
+
+    @Test
+    fun `successful commit makes Cancel inert during the hold`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        val status = ConnectionStatus.ConnectingSlow("example.com")
+        shadowOf(activity).nextStartedActivity
+        activity.invoke("showStatus", arrayOf(ConnectionStatus::class.java), status)
+        activity.declared<ConnectionStatusView>("connectionOverlay").show(status, immediate = true)
+        webView.loadUrl(url)
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onPageCommitVisible(webView, url)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        activity.findViewById<Button>(R.id.status_cancel).performClick()
+        assertEquals(url, shadowOf(webView).lastLoadedUrl)
+        assertNull(shadowOf(activity).nextStartedActivity)
+        assertFalse(activity.isFinishing)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
     }
 
     @Test

@@ -68,6 +68,18 @@ class ConnectionStatusTest {
     }
 
     @Test
+    fun `exception labels come from fixed classes and ignore messages`() {
+        val privateUrl = "https://example.com/callback?state=ERR_PRIVATESTATE"
+        assertEquals(
+            "UnknownHostException",
+            failureClassName(java.net.UnknownHostException(privateUrl)),
+        )
+        assertEquals("ConnectException", failureClassName(java.net.ConnectException(privateUrl)))
+        assertEquals("IOException", failureClassName(java.io.IOException(privateUrl)))
+        assertEquals("ERROR_UNKNOWN", failureClassName(IllegalStateException(privateUrl)))
+    }
+
+    @Test
     fun `legacy sign in detects only the reserved upgrade response`() {
         assertTrue(isUpgradeRequiredTicket("upgrade-required"))
         assertFalse(isUpgradeRequiredTicket("other"))
