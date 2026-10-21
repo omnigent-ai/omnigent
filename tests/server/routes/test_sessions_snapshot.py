@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -256,7 +257,11 @@ async def test_session_snapshot_reads_latest_items_then_returns_chronological() 
 async def test_session_snapshot_uses_child_spec_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Child snapshots expose their selected spec while parents keep the root spec."""
+    """Child snapshots expose their selected spec while parents keep the root spec.
+
+    Each snapshot reads the agent row twice (metadata, then harness), both
+    off the event loop: a sync store read on the loop stalls every request.
+    """
     child_spec = AgentSpec(
         spec_version=1,
         name="executor",
@@ -297,11 +302,13 @@ async def test_session_snapshot_uses_child_spec_metadata(
     }
     conv_store = _ConversationStore([], conversations=conversations)
     cache_loads: list[bool] = []
+    agent_reads_on_loop: list[bool] = []
 
     class _AgentStore:
         @staticmethod
         def get(agent_id: str) -> Any:
             assert agent_id == "ag_advisor"
+            agent_reads_on_loop.append(threading.current_thread() is threading.main_thread())
             return type(
                 "StoredAgent",
                 (),
@@ -346,6 +353,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert child.context_window == 100_000
     assert child.harness == "codex"
     assert cache_loads == [True, True, True, True]
+    assert agent_reads_on_loop == [False, False, False, False]
 
 
 @pytest.mark.asyncio
