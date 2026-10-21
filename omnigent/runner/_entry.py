@@ -684,6 +684,23 @@ def _make_auth_token_factory(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     )
 
+    # Behind the Databricks Apps proxy (header auth) the server cannot mint a
+    # runner token and the proxy admits only the owner's own Databricks token,
+    # so that launcher-refreshed bearer is the runner's credential, for its server only.
+    from omnigent.util.proxy_bearer import (
+        proxy_bearer_allowed_for,
+        proxy_bearer_configured,
+        read_proxy_bearer,
+    )
+
+    if (
+        proxy_bearer_configured()
+        and resolved_server_url
+        and proxy_bearer_allowed_for(resolved_server_url)
+    ):
+        os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, None)
+        return lambda: read_proxy_bearer(resolved_server_url)
+
     initial_token = (
         os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()
         if _allow_initial_token
@@ -2162,13 +2179,6 @@ def main() -> None:
     :returns: None.
     """
     from omnigent.process_logging import configure_process_logging
-
-    # Spawned with -P, so the workspace is not on sys.path. Re-add it now that
-    # the real omnigent is imported (it can no longer be shadowed) so
-    # spec-declared local tools living in the workspace still import.
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()

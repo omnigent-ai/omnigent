@@ -16,16 +16,13 @@ How it differs from the transcript forwarder it supersedes:
   snapshot), so the driver de-dups *within the run* by ``(trajectory_id,
   step_index)`` identity and posts only steps it has not yet seen.
 
-* **No durable cursor.** The transcript forwarder persisted a ``forwarded_steps``
-  resume cursor to bridge state so a restart did not re-mirror the whole file.
-  This driver keeps an *in-memory* seen-set only; the durable cursor (and its
-  JSONL) is retired in the Task 12 cutover. A restart re-reads from the start —
-  acceptable because the reader is recreated per session by the Task 11 runner,
-  not crash-restarted mid-conversation, and the mapper's USER_INPUT-skip plus the
-  server's own item handling bound the blast radius.
+* **Replay is idempotent.** A restart re-reads the full trajectory. Each
+  conversation item carries a stable ``source_id`` derived from its cascade,
+  step identity and item type, so the server's durable item deduplication
+  preserves messages and tool pairs without a separate local cursor.
 
 * **The mapper carries the item logic.** :func:`map_step_to_events` is the pure,
-  no-delta, skip-USER_INPUT mapping layer (Task 4). It deliberately does NOT emit
+  no-delta mapping layer. It deliberately does NOT emit
   status edges — that was always the stateful parser's job. This driver is now
   that stateful layer: it replicates the transcript parser's RUNNING/IDLE
   transition emission (a turn opens on a USER_INPUT step and closes on an
@@ -55,6 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -959,8 +958,7 @@ async def supervise_reader(
     for every step it has not seen before this run:
 
     * maps the step to conversation-item events (:func:`map_step_to_events`) and
-      POSTs each one (USER_INPUT maps to ``[]`` so it posts nothing — the user
-      turn is already persisted by the direct ``POST /events`` hook);
+      POSTs each one, including user turns, with a stable source identity;
     * emits an ``external_session_status`` RUNNING edge when a user turn opens and
       an IDLE edge when an assistant-text step closes it, each only on a real
       transition (deduped via an in-memory turn-active flag);
@@ -969,8 +967,9 @@ async def supervise_reader(
       bridge drives the elicitation + answer).
 
     De-dup is by ``(trajectory_id, step_index)`` identity in an in-memory
-    seen-set (no durable cursor — retired in Task 12), so re-reading the same
-    snapshot posts nothing. Tool-call ids are derived from each step's own
+    seen-set, so re-reading the same snapshot posts nothing within a run. Across
+    restarts, the server deduplicates items by their stable source ids.
+    Tool-call ids are derived from each step's own
     ``(trajectory, step)`` identity by the mapper, so a re-read or a fallback to
     a different RPC re-derives the same id rather than re-keying the pair.
 
@@ -1895,8 +1894,7 @@ def _is_settled(step: dict[str, object]) -> bool:
     A step is settled when re-emitting it can produce nothing new, so recording
     its identity in ``seen`` will not drop later content:
 
-    * a USER_INPUT step (always terminal; maps to ``[]`` permanently — the user
-      turn is persisted by the direct ``POST /events``);
+    * a USER_INPUT step (always terminal; maps to one user message);
     * any step whose ``status`` is terminal — DONE (the mapper emits its content)
       or ERROR (the command failed before producing output, so none is coming).
 
@@ -2290,6 +2288,10 @@ async def _emit_step(
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
     for event in map_step_to_events(step, conversation_id=cascade_id):
+        # The server deduplicates replayed items across reader/process restarts.
+        # Include item type so a tool call and its result remain separate items.
+        identity = json.dumps([cascade_id, _step_key(step), event.data["item_type"]])
+        event.data["source_id"] = "agy:" + hashlib.sha256(identity.encode()).hexdigest()
         await _post_event(client, session_id, event)
 
     if _is_turn_close_step(step) and turn_active:

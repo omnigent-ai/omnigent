@@ -151,7 +151,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
    * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
    */
-  refreshDbcert: () => ipcRenderer.invoke("omnigent:dbcert-refresh"),
+  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
+  /** Check the laptop's dbcert without starting sign-in. */
+  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host

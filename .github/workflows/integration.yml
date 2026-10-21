@@ -54,6 +54,9 @@ jobs:
   # (see security-gate.yml); trusted authors / non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Harness matrix (integration-matrix.sh). Fork PRs run by default; draft PRs
   # resolve to an empty matrix.

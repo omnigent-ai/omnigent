@@ -68,12 +68,15 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Compute the shard matrix once. A skipped run (draft / fork pull_request)
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
-    name: UI scope
+    name: UI coverage scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -145,7 +148,7 @@ jobs:
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \
             --target-dir .tmp-codex-parity-target
       - name: Upload sidecar binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: codex-parity-sidecar
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
@@ -165,7 +168,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -184,7 +187,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       # ci.yml skips UI-only changes, so check here that the verify-omnigent
       # feature map still names tests that exist after UI test renames.
@@ -229,7 +232,7 @@ jobs:
 
       - name: Upload Playwright artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: browser-contract-playwright-${{ github.run_id }}
           path: test-results/
@@ -259,7 +262,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -277,7 +280,7 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose
@@ -296,7 +299,7 @@ jobs:
       # build. The mocked_native_codex_goal_session fixture uses this binary
       # via CODEX_PARITY_SIDECAR_BIN (set on the pytest step below).
       - name: Download codex-parity sidecar binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: codex-parity-sidecar
           path: .tmp-codex-parity-target/debug
@@ -330,12 +333,12 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
         with:
           harness: codex
 
@@ -405,7 +408,7 @@ jobs:
 
       - name: Upload UI test timings and shard assignment
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: e2e-ui-timings-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard_id }}
           path: artifacts/ui-timings.jsonl
@@ -415,7 +418,7 @@ jobs:
       - name: Upload Playwright traces / videos / screenshots on failure
         id: upload_playwright
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           # Shard suffix avoids the matrix's parallel uploads colliding (v4
           # 409s on dupe names).
@@ -452,7 +455,7 @@ jobs:
       - name: Upload server logs on failure
         id: upload_server_logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
           # server.log + runner.log from the live_server and mocked-Codex

@@ -429,6 +429,34 @@ def test_login_apps_fails_loud_without_databricks_extra(
     assert load_databricks_workspace_host(_APPS_URL) is None
 
 
+def test_login_apps_fails_loud_without_databricks_cli(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Python extra alone cannot complete a fresh workspace browser login."""
+    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None])
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL], standalone_mode=False)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, click.ClickException), result.output
+    assert suppresses_recovery_hint(result.exception)
+    result.exception.show()
+    error_output = capsys.readouterr().err
+    assert "Databricks CLI not found on PATH" in error_output
+    assert "Install it, then retry this command." in error_output
+    assert "https://docs.databricks.com/dev-tools/cli/install.html" in error_output
+    error_lines = error_output.splitlines()
+    assert len(error_lines) == 2
+    assert all(len(line) <= 80 for line in error_lines)
+    assert login_calls == []
+    assert load_databricks_workspace_host(_APPS_URL) is None
+
+
 def test_login_runs_databricks_auth_login_when_no_cached_grant(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:
@@ -1016,6 +1044,25 @@ def test_workspace_url_leaves_oss_server_alone(
     assert (
         cli_mod._workspace_api_server_url("https://omni.example.com") == "https://omni.example.com"
     )
+
+
+@pytest.mark.parametrize("suffix", ["", "/omnigent"])
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection refused"), httpx.InvalidURL("invalid proxy")],
+    ids=["connection-error", "invalid-proxy"],
+)
+def test_workspace_url_keeps_input_when_probe_cannot_connect(
+    suffix: str,
+    failure: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An optional workspace probe leaves connection errors to the requesting command."""
+    server = f"https://omni.example.com{suffix}"
+    probed = _scripted_normalizer_httpx(monkeypatch, {"https://omni.example.com/v1/me": failure})
+
+    assert cli_mod._workspace_api_server_url(server) == server
+    assert probed == ["https://omni.example.com/v1/me"]
 
 
 def test_workspace_url_leaves_apps_edge_alone(

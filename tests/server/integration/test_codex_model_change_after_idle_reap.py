@@ -28,8 +28,15 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.terminals.pane_reaper import NativePaneReaper
 from omnigent.terminals.registry import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
-from tests.runner.conftest import _build_app_for_spec, _runner_client
+from tests.runner.conftest import (
+    _build_app_for_spec,
+    _FakeProcessManager,
+    _runner_client,
+    _ScriptedHarnessClient,
+    _sse,
+)
 from tests.runner.helpers import make_test_terminal_instance
 from tests.runner.native_helpers import _harness_spec
 from tests.server.helpers import create_test_agent
@@ -181,6 +188,7 @@ class _NativeSession:
     session_id: str
     store: SqlAlchemyConversationStore
     runner: httpx.AsyncClient
+    process_manager: _FakeProcessManager
     terminals: TerminalRegistry
     resources: SessionResourceRegistry
     reaper: NativePaneReaper
@@ -298,7 +306,7 @@ async def native_session(
         )
 
     monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch)
-    runner_app, _ = await _build_app_for_spec(
+    runner_app, process_manager = await _build_app_for_spec(
         _harness_spec("codex-native", model=_PREVIOUS_MODEL), terminal_registry=terminals
     )
     reaper = runner_app.state.native_pane_reaper
@@ -341,6 +349,7 @@ async def native_session(
                 session_id,
                 store,
                 runner,
+                process_manager,
                 terminals,
                 runner_app.state.session_resource_registry,
                 reaper,
@@ -365,6 +374,64 @@ async def test_connected_codex_model_change_before_idle_reap(
     )
     native_session.assert_applied(response)
     assert native_session.codex.launches == 1
+
+
+@pytest.mark.parametrize("backend", ["running", "exited", "forwarder-ended", "unowned"])
+async def test_new_turn_recovers_stopped_backend_behind_live_codex_pane(
+    native_session: _NativeSession,
+    backend: str,
+) -> None:
+    session = native_session
+    pane = session.terminals.get(session.session_id, "codex", "main")
+    assert pane is not None and await pane.is_alive()
+    if backend != "running":
+        await session.codex.close()
+    if backend == "forwarder-ended":
+        native_runtime._AUTO_CODEX_APP_SERVERS.pop(session.session_id)
+        failure = bridge.CODEX_APP_SERVER_STOPPED
+        bridge.write_bridge_startup_error(
+            session.codex.bridge_dir, failure.message, code=failure.code
+        )
+    elif backend == "unowned":
+        session.resources._terminal_roles.pop(
+            (session.session_id, terminal_resource_id("codex", "main"))
+        )
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_recovered"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_recovered"}}),
+        ]
+    )
+    session.process_manager._client = harness
+
+    response = await session.runner.post(
+        f"/v1/sessions/{session.session_id}/events",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": session.store.get_conversation(session.session_id).agent_id,
+            "content": [{"type": "input_text", "text": "Continue the session"}],
+        },
+    )
+    assert response.status_code == 202, response.text
+    await poll_until_async(lambda: harness.posted_bodies, timeout_s=budget(5))
+
+    expected_launches = 2 if backend in {"exited", "forwarder-ended"} else 1
+    assert session.codex.launches == expected_launches
+    if backend in {"running", "unowned"}:
+        assert session.terminals.get(session.session_id, "codex", "main") is pane
+    else:
+        assert session.terminals.get(session.session_id, "codex", "main") is not pane
+        assert bridge.read_bridge_startup_error(session.codex.bridge_dir) is None
+        state = bridge.read_bridge_state(session.codex.bridge_dir)
+        assert state is not None
+        client = app_server.client_for_transport(state.socket_path, client_name="recovery-test")
+        try:
+            await client.connect()
+            loaded = await client.request("thread/list/loaded", {})
+            assert loaded["result"]["data"] == [session.codex.thread_id]
+        finally:
+            await client.close()
 
 
 @pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])
@@ -445,7 +512,7 @@ async def test_codex_refused_connection_does_not_close_a_replacement_backend(
     _assert_codex_refusal(session, response)
     replacement.close.assert_not_awaited()
     assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is replacement
-    assert session.codex.launches == 1
+    assert session.codex.launches == 2
 
 
 async def test_codex_unregistered_backend_is_not_restarted_after_connection_refusal(
@@ -684,7 +751,7 @@ async def test_model_change_succeeds_after_delayed_codex_startup(
 
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
 @pytest.mark.parametrize("selection", ["model", "effort", "model-and-effort"])
-async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
+async def test_codex_settings_forward_uses_startup_budget(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -693,11 +760,13 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
     session = native_session
     assert session.codex.ready_gate is not None
     monkeypatch.setattr(routes_core, "_TUI_INJECT_FORWARD_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(routes_core, "_CODEX_SETTINGS_FORWARD_TIMEOUT_S", 1.0)
+    settings_timeout_s = routes_core._CODEX_SETTINGS_FORWARD_TIMEOUT_S
     missing = _observe_missing_bridge(monkeypatch, session)
     post = session.runner.post
+    forward_timeouts: list[float] = []
 
     async def timed_post(url: str, **kwargs: Any) -> httpx.Response:
+        forward_timeouts.append(kwargs["timeout"])
         # ASGITransport doesn't enforce HTTP timeouts; use the actual forward
         # budget here so a premature public rollback is observable.
         try:
@@ -713,11 +782,12 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
         settings["reasoning_effort"] = "low"
     change = asyncio.create_task(client.patch(f"/v1/sessions/{session.session_id}", json=settings))
     try:
-        await asyncio.wait_for(missing.wait(), timeout=budget(2))
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(missing.wait(), timeout=budget(5))
+        assert forward_timeouts == [settings_timeout_s]
         assert not change.done()
+        assert session.codex.applied_updates == []
         session.codex.ready_gate.set()
-        response = await asyncio.wait_for(change, timeout=budget(2))
+        response = await asyncio.wait_for(change, timeout=budget(5))
     finally:
         session.codex.ready_gate.set()
         change.cancel()

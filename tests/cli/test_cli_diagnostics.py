@@ -9,8 +9,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import pytest
 
+from omnigent import chat as chat_module
+from omnigent import cli as cli_module
 from omnigent import cli_diagnostics
 
 
@@ -511,6 +514,66 @@ async def test_slash_command_exceptions_reach_cli_log(
     assert "openai/gpt-5.4-mini" not in log_text, (
         f"slash-command diagnostics should not copy command arguments into the log: {log_text!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_hint", "explicit_agent"),
+    [
+        (
+            httpx.ConnectError("connection refused"),
+            "Check the URL, your network connection",
+            False,
+        ),
+        (httpx.InvalidURL("invalid proxy"), "HTTP proxy settings", True),
+        (
+            httpx.ReadTimeout("read timed out"),
+            "failed before a response arrived (ReadTimeout)",
+            True,
+        ),
+        (401, "Sign in with `isaac omni login https://server.example`", False),
+    ],
+)
+def test_main_reports_discovery_failure_without_runner_recovery_hint(
+    failure: httpx.HTTPError | httpx.InvalidURL | int,
+    expected_hint: str,
+    explicit_agent: bool,
+    isolated_cli_diagnostics: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Real run dispatch renders discovery failures without unrelated runner advice."""
+    del isolated_cli_diagnostics
+    server_url = "https://server.example"
+    requests: list[str] = []
+
+    def _get(url: str, **_kwargs: object) -> httpx.Response:
+        requests.append(url)
+        if not isinstance(failure, int):
+            raise failure
+        return httpx.Response(failure, request=httpx.Request("GET", url))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
+    argv = ["omnigent", "run", "--server", server_url, "-p", "hi"]
+    if explicit_agent:
+        argv.extend(["--agent", "scribe"])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_module.main()
+
+    assert excinfo.value.code == 1
+    assert requests == [f"{server_url}/v1/me", f"{server_url}/v1/agents"]
+    output = capsys.readouterr().err
+    assert "Error: " in output
+    assert server_url in output
+    assert expected_hint in output
+    assert "stale host processes" not in output
+    assert "runner tunnel rejection" not in output
+    assert "Traceback" not in output
 
 
 def test_safe_mtime_returns_zero_for_vanished_file(tmp_path: Path) -> None:

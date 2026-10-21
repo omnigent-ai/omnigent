@@ -63,6 +63,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -101,6 +102,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostRefreshHarnessesFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -139,7 +142,9 @@ from omnigent.onboarding.harness_auth import (
 )
 from omnigent.onboarding.harness_install import (
     harness_cli_installed,
+    harness_cli_version,
     harness_setup_hint,
+    invalidate_harness_login_probe_cache,
     try_install_harness_cli,
     ui_install_key,
 )
@@ -706,6 +711,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_TELEMETRY_ENABLED",
         # Preserve the harness stderr opt-in through daemon and runner hops.
         "OMNIGENT_HARNESS_STDERR_ENABLED",
+        # Runner release flags must survive CLI -> daemon -> runner.
+        "OMNIGENT_FEATURES",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -724,6 +731,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Path (not a secret) to the launcher-refreshed front-door bearer, and
+        # the only server it may be sent to.
+        "OMNIGENT_PROXY_BEARER_FILE",
+        "OMNIGENT_PROXY_BEARER_SERVER_URL",
+        # The outer sandbox hint must survive both daemon and runner filtering.
+        "OMNIGENT_HOST_SANDBOX_BACKEND",
         # Executable selection must survive CLI -> daemon -> runner. The
         # passthrough list is only applied at the second boundary.
         "OMNIGENT_CODEX_PATH",
@@ -1322,6 +1335,9 @@ class HostProcess:
         # Status queries wait for this runner's queued launch before deciding
         # that an unregistered runner is unknown.
         self._pending_runner_launches: dict[str, set[asyncio.Future[None]]] = {}
+        # Launch request ids whose runner process has been spawned; a handler
+        # fault after that point is not reported as a failed launch.
+        self._spawned_launch_requests: set[str] = set()
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
@@ -1732,11 +1748,22 @@ class HostProcess:
         :param frame: Launch request that failed.
         :param error: Human-readable failure reason.
         :param error_code: Optional machine-readable failure category.
-        :param error_category: Fault attribution for an uncoded failure; a coded
-            preflight refusal uses its code's mapping instead.
+        :param error_category: Fault attribution for a failure whose code has no
+            mapping of its own; a coded preflight refusal uses its code's
+            mapping instead.
         :returns: Failed result frame for the server.
         """
         session_id = frame.session_id or "<unknown>"
+        # An unmapped code must not erase the caller's attribution, or a host
+        # fault reads as UNKNOWN rather than HOST. The server guards the same
+        # way when it logs the refusal.
+        mapped_category = category_for_code(error_code) if error_code else ErrorCategory.UNKNOWN
+        if mapped_category is ErrorCategory.UNKNOWN:
+            mapped_category = error_category
+        mapped_phase = phase_for_code(error_code) if error_code else ErrorPhase.UNKNOWN
+        if mapped_phase is ErrorPhase.UNKNOWN:
+            # This frame is a launch regardless of how the code is mapped.
+            mapped_phase = ErrorPhase.RUNNER_LAUNCH
         diagnostic_lines = error.splitlines()
         diagnostic = diagnostic_lines[0] if diagnostic_lines else error
         _logger.warning(
@@ -1755,13 +1782,9 @@ class HostProcess:
                 host_request_id=frame.request_id,
                 stage="runner_launch",
                 error_code=error_code or "runner_spawn_failed",
-                error_category=(
-                    category_for_code(error_code) if error_code else error_category
-                ).value,
+                error_category=mapped_category.value,
                 error_impact=ErrorImpact.BLOCKING.value,
-                error_phase=(
-                    phase_for_code(error_code) if error_code else ErrorPhase.RUNNER_LAUNCH
-                ).value,
+                error_phase=mapped_phase.value,
             ),
         )
         print(
@@ -1918,11 +1941,12 @@ class HostProcess:
                         frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
                     )
         if not harness_ready:
+            setup_hint = await asyncio.to_thread(harness_setup_hint, frame.harness)
             return self._launch_failed(
                 frame,
                 (
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
+                    f"{self._identity.name!r} — {setup_hint}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
@@ -2017,6 +2041,8 @@ class HostProcess:
                     frame,
                     f"failed to spawn runner: {exc}",
                 )
+        # A runner now exists and may connect on its own.
+        self._spawned_launch_requests.add(frame.request_id)
 
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
@@ -2039,16 +2065,23 @@ class HostProcess:
         # the exit as intentional); the SIGTERM/SIGKILL round itself is
         # detached so a stop that waits out its 5s grace cannot
         # head-of-line block other sessions' launches on this host.
-        if frame.session_id:
+        # A server that names the superseded runners is authoritative: after
+        # /clear or /switch the session's old runner serves another session.
+        if frame.superseded_runner_ids is not None:
+            named = set(frame.superseded_runner_ids)
+            superseded = [(rid, handle) for rid, handle in self._runners.items() if rid in named]
+        elif frame.session_id:
             superseded = [
                 (rid, handle)
                 for rid, handle in self._runners.items()
                 if handle.session_id == frame.session_id
             ]
-            for rid, handle in superseded:
-                self._runners.pop(rid, None)
-                handle.stop_requested = True
-                self._spawn_superseded_stop(rid, handle, frame.session_id)
+        else:
+            superseded = []
+        for rid, handle in superseded:
+            self._runners.pop(rid, None)
+            handle.stop_requested = True
+            self._spawn_superseded_stop(rid, handle, frame.session_id or "")
         self._runners[runner_id] = _RunnerHandle(
             proc=proc,
             log_path=log_path,
@@ -3016,8 +3049,9 @@ class HostProcess:
         ``omnigent setup``) uses, then recomputes readiness so the result frame
         carries a fresh ``configured_harnesses`` map. The ``ui_install_key``
         guard re-checks the allowlist as defence in depth against a spoofed
-        frame. Idempotent: an already-installed CLI skips the install. Runs off
-        the event loop (it shells out / probes ``PATH``).
+        frame. Idempotent: an already-installed, version-compatible CLI skips
+        the install. An outdated CLI runs the installer again to upgrade in
+        place. Runs off the event loop (it shells out / probes ``PATH``).
 
         :param frame: The install request frame. ``frame.harness`` is a UI
             harness identifier, e.g. ``"claude"``.
@@ -3039,6 +3073,7 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 configured_harnesses=configured_harness_map(),
+                version=harness_cli_version(key)[0],
                 gateway_inference=gateway_inference_map(),
             )
         installed, reason = try_install_harness_cli(key)
@@ -3053,7 +3088,30 @@ class HostProcess:
             request_id=frame.request_id,
             status="ok",
             configured_harnesses=configured_harness_map(),
+            version=harness_cli_version(key)[0],
             gateway_inference=gateway_inference_map(),
+        )
+
+    def _handle_refresh_harnesses(
+        self, frame: HostRefreshHarnessesFrame
+    ) -> HostRefreshHarnessesResultFrame:
+        """Force a full readiness probe, bypassing periodic and login caches."""
+        try:
+            invalidate_harness_login_probe_cache()
+            configured = configured_harness_map()
+            gateway = gateway_inference_map()
+        except Exception as exc:
+            _logger.exception("Forced harness readiness refresh failed")
+            return HostRefreshHarnessesResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"readiness refresh failed: {exc}",
+            )
+        return HostRefreshHarnessesResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured,
+            gateway_inference=gateway,
         )
 
     def _handle_store_secret(self, frame: HostStoreSecretFrame) -> HostStoreSecretResultFrame:
@@ -3681,6 +3739,8 @@ class HostProcess:
             )
         if op == "github_pr_diff":
             return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+        if op == "github_labels":
+            return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3766,6 +3826,14 @@ class HostProcess:
                 str(params["session_id"]),
                 str(params["url"]),
                 str(params.get("action", "attach")),
+            )
+        if op == "github_labels_update":
+            return pr_resource.update_pr_labels(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                add=params.get("add", []),
+                remove=params.get("remove", []),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 
@@ -4632,6 +4700,14 @@ class HostProcess:
         managed_token = os.environ.get(HOST_TOKEN_ENV_VAR)
         if managed_token:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
+            # Behind an authenticating front door (Databricks Apps OAuth proxy)
+            # the launch token alone never reaches the server; the launcher-
+            # provisioned proxy bearer gets the request through the proxy.
+            from omnigent.util.proxy_bearer import read_proxy_bearer
+
+            proxy_bearer = read_proxy_bearer(self._server_url)
+            if proxy_bearer:
+                headers["Authorization"] = f"Bearer {proxy_bearer}"
             return headers
         token = self._current_auth_token()
         if token:
@@ -4654,7 +4730,9 @@ class HostProcess:
         from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 
         if os.environ.get(HOST_TOKEN_ENV_VAR):
-            return None
+            from omnigent.util.proxy_bearer import read_proxy_bearer
+
+            return read_proxy_bearer(self._server_url)
         try:
             if not self._auth_token_factory_resolved:
                 if not initialize:
@@ -4991,12 +5069,40 @@ class HostProcess:
                 )
             # Register before queuing; keep the lifecycle lock as the first
             # await so launch/stop frames still acquire it in arrival order.
+            launch_fault: BaseException | None = None
+            launch_result: HostLaunchRunnerResultFrame | None = None
             try:
                 async with self._runner_lifecycle_lock:
                     launch_result = await self._handle_launch(frame)
+            except Exception as exc:  # noqa: BLE001 — a pre-spawn fault still owes a result
+                launch_fault = exc
+                # Do not report failure after spawn: servers may terminate the
+                # launch or revoke its binding before the runner connects.
+                # Before the spawn no runner can connect, and staying silent
+                # would make the server wait out its result timeout as if the
+                # host were merely slow.
+                if frame.request_id not in self._spawned_launch_requests:
+                    launch_result = self._launch_failed(
+                        frame,
+                        f"host failed to handle the launch request: {exc}",
+                        error_code=LAUNCH_HANDLER_FAILED_ERROR_CODE,
+                    )
             finally:
+                self._spawned_launch_requests.discard(frame.request_id)
                 completion.set_result(None)
-            await self._send_text(ws, encode_host_frame(launch_result))
+            if launch_result is not None:
+                try:
+                    await self._send_text(ws, encode_host_frame(launch_result))
+                except ConnectionClosed:
+                    if launch_fault is None:
+                        raise
+                    # The answer was lost with the tunnel; the fault (re-raised
+                    # below, chain intact) is still the diagnostic to record.
+            if launch_fault is not None:
+                # Answered, but still unexplained: re-raise so the frame task
+                # records the traceback, which is the only diagnostic an
+                # unexpected fault leaves behind.
+                raise launch_fault
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)
@@ -5006,19 +5112,34 @@ class HostProcess:
         elif isinstance(frame, HostStatFrame):
             await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_list_dir(frame)))
+            # Stat-ing every entry can be slow on large or network-backed
+            # directories; keep the tunnel's event loop free meanwhile.
+            list_result = await asyncio.to_thread(self._handle_list_dir, frame)
+            await self._send_text(ws, encode_host_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
             await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
-            install_result = await asyncio.to_thread(self._handle_install_harness, frame)
+            install_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_install_harness(frame)
+            )
             if install_result.status == "ok":
                 self._replace_capabilities(
                     install_result.configured_harnesses,
                     install_result.gateway_inference,
                 )
             await self._send_text(ws, encode_host_frame(install_result))
+        elif isinstance(frame, HostRefreshHarnessesFrame):
+            refresh_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_refresh_harnesses(frame)
+            )
+            if refresh_result.status == "ok":
+                self._replace_capabilities(
+                    refresh_result.configured_harnesses,
+                    refresh_result.gateway_inference,
+                )
+            await self._send_text(ws, encode_host_frame(refresh_result))
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.

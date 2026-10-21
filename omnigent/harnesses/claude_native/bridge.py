@@ -313,6 +313,12 @@ _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
+# Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
+# rather than as text when they arrive in one burst.
+_COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
+_COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
+# Retry rounds when the capture cannot show the whole box.
+_COMPOSER_CLEAR_MAX_ROUNDS = 3
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -409,6 +415,13 @@ _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
+# What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
+_SHELL_MODE_SURFACE = "shell mode"
+# Ctrl+U, CSI-u encoded like the other clearing keys. Claude Code leaves shell
+# mode on it only with the cursor at the start of the line, so a typed command
+# takes two: the first clears the line, the second switches the box back to
+# chat input. Neither submits, and unlike Escape neither interrupts a turn.
+_CLEAR_LINE_KEY = "\x1b[117;5u"
 # The dismissal every surface drawn over the input box advertises in its
 # footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
 # an action with "/", so the task details panels print "Esc/Enter/Space to
@@ -657,6 +670,10 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
+
+
+class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
+    """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
 class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
@@ -4173,8 +4190,9 @@ def inject_user_message(
     Between the two, anything the person left occupying the composer
     from the embedded terminal — a ctrl+r history search, a rewind
     dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
-    Escape (see :func:`_restore_occupied_input`), so the message reclaims
-    the input box instead of being typed into that surface.
+    Escape, or cleared when it is a typed shell command (see
+    :func:`_restore_occupied_input`), so the message reclaims the input box
+    instead of being typed into that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -4326,6 +4344,8 @@ def _paste_and_submit(
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
+    :raises ClaudeComposerNotCleared: If a draft left in the input box could
+        not be cleared first; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
@@ -4338,13 +4358,9 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     delivery_diagnostics.set_stage("pasting")
-    # Space returns focus to the input box if the footer (shells item or agent
-    # list) holds it. Either way it types a space, which the clear removes.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    # Clear stale text first: raw controls can otherwise become pasted text.
-    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+    # Clear stale text first, or the paste lands inside the person's draft and
+    # Enter submits both together.
+    _clear_composer(socket_path, tmux_target)
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4830,8 +4846,8 @@ def inject_slash_command(
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Same reclaim-then-wait as inject_user_message: a surface left occupying
-    # the composer would swallow the C-u and the typed command, and so would a
-    # TUI that has not mounted its input box yet.
+    # the composer would swallow the clearing keys and command, and a TUI that
+    # has not mounted its input box yet would drop them.
     _reclaim_and_wait_for_prompt(
         bridge_dir,
         socket_path,
@@ -4843,13 +4859,11 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
         )
-    # ``C-u`` clears any draft the user is mid-typing; otherwise the
-    # paste below concatenates with their text and Enter submits
+    # Clear any draft the user is mid-typing; otherwise the command below
+    # concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation. Space first refocuses the input
-    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
+    # not interrupt an in-flight generation.
+    _clear_composer(socket_path, tmux_target)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
@@ -5905,7 +5919,10 @@ def _restore_occupied_input(
     restores a checkpoint, and shell mode runs the message as a bash
     command. Every one of them documents Escape as its way out ("Esc to
     cancel"), which commits nothing and hands the empty input box back, so
-    the web-UI message wins the pane.
+    the web-UI message wins the pane. The exception is a shell-mode box
+    holding a typed command, which Escape leaves in shell mode: that command
+    is cleared from the box instead (see :func:`_shell_mode_draft`), the way
+    an unsent chat draft is cleared before a paste.
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -5988,8 +6005,15 @@ def _restore_occupied_input(
             if unclearable_seen:
                 return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
-            _logger.info("claude-native: dismissing %s covering the input box", surface)
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+            if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
+                # Escape keeps a typed shell command in shell mode, so the
+                # command is cleared instead, as a chat draft is before a paste.
+                _logger.info("claude-native: clearing a shell-mode draft from the input box")
+                for _ in range(2):
+                    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _CLEAR_LINE_KEY)
+            else:
+                _logger.info("claude-native: dismissing %s covering the input box", surface)
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -6042,7 +6066,25 @@ def _occupying_surface(pane: str) -> str | None:
         return _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
-    return "shell mode"
+    return _SHELL_MODE_SURFACE
+
+
+def _shell_mode_draft(pane: str) -> bool:
+    """
+    Return whether the input box is in shell mode with a command typed.
+
+    Escape takes an empty shell-mode box back to chat input, but Claude Code
+    keeps a box holding a typed command in shell mode, so that one is
+    cleared with :data:`_CLEAR_LINE_KEY` instead.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the composer row leads with the shell-mode glyph
+        and carries text after it.
+    """
+    row = _composer_row(pane)
+    if row is None or not row.strip().startswith(_SHELL_MODE_GLYPH):
+        return False
+    return bool(row.strip()[len(_SHELL_MODE_GLYPH) :].strip())
 
 
 def _composer_row(pane: str) -> str | None:
@@ -6083,6 +6125,93 @@ def _composer_row(pane: str) -> str | None:
         if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return row
     return None
+
+
+class _ComposerBox(NamedTuple):
+    """Claude Code's live input box as a pane capture showed it."""
+
+    #: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``. Blank rows
+    #: are kept, since a draft's empty lines are lines too.
+    rows: list[str]
+    #: Whether the closing rule was on screen, so ``rows`` is the whole box
+    #: rather than the part of it above the bottom of the pane.
+    framed: bool
+
+
+def _composer_box(pane: str) -> _ComposerBox | None:
+    """
+    Return every visible row of Claude Code's live input box, or ``None``.
+
+    The box is located as in :func:`_composer_row`: its first row sits
+    directly under the opening rule, led by a composer glyph. The rows run to
+    the closing rule, or to the bottom of the pane when there is none on
+    screen.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The box's visible rows and whether its closing rule was on
+        screen, or ``None`` when no input box is on screen.
+    """
+    lines = pane.splitlines()
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
+        return None
+    if len(rules) >= 2:
+        first = rules[-2] + 1
+        if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            return _ComposerBox(lines[first : rules[-1]], framed=True)
+    first = rules[-1] + 1
+    if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+        return _ComposerBox(lines[first:], framed=False)
+    return None
+
+
+def _clear_composer(socket_path: str, tmux_target: str) -> None:
+    """
+    Delete the whole draft in Claude Code's input box.
+
+    Ctrl+K deletes to the end of the line and, at the end of a line, the
+    line break after it; Ctrl+U does the same towards the start. Two of each
+    per row of the box therefore empty a draft from any cursor position,
+    while presses beyond the draft do nothing. Clearing only the cursor's
+    line would leave the rest of a multi-line draft to be submitted with the
+    next message.
+
+    One burst is known to have emptied the box only when the capture showed
+    the box whole (closing rule on screen) with a single row. A box with
+    more rows, or one cut off by the bottom of the pane (a draft taller than
+    the pane, or a sliver-height pane with no room for the closing rule),
+    may still hold lines the capture did not show, so it is cleared again,
+    up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
+    state afterwards is refused rather than pasted into: an exhausted budget
+    is no evidence the box is empty, and a paste beside leftover text would
+    submit the person's draft along with the injected input. An unavailable
+    capture is likewise retried without sending clearing keys, then refused
+    if no readable box appears within the budget.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
+        capture showed the box whole and down to one row; nothing was pasted.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
+    # Space returns focus from the footer to the input box. The clear also
+    # removes the space when the input box already held focus.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
+        box = _composer_box(_capture_pane(socket_path, tmux_target))
+        settled = box is not None and box.framed and len(box.rows) <= 1
+        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            raise ClaudeComposerNotCleared(
+                "A draft left in Claude Code's input box could not be cleared, so nothing "
+                "was sent. Open the terminal, clear the input box, then retry."
+            )
+        if box is not None:
+            presses = 2 * len(box.rows)
+            keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+            _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
+            if settled:
+                return
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:

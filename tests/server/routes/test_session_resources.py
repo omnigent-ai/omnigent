@@ -8,10 +8,12 @@ import json
 import logging
 import re
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -30,9 +32,20 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    UnifiedAuthProvider,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
+from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
 class _ConversationStore:
@@ -1800,6 +1813,114 @@ async def test_delete_terminal_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_level,target_level,host_owner,expected_status,admin,inherited",
+    [
+        (LEVEL_READ, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_EDIT, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_MANAGE, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_READ, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_EDIT, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_MANAGE, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "bob@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, None, 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "", 404, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, True),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, True),
+    ],
+)
+async def test_terminal_transfer_requires_session_and_host_ownership(
+    db_uri: str,
+    runner_globals_reset: None,
+    source_level: int,
+    target_level: int,
+    host_owner: str | None,
+    expected_status: int,
+    admin: bool,
+    inherited: bool,
+) -> None:
+    """Placement changes require authority over both sessions and their host."""
+    del runner_globals_reset
+    source_id = "79b22ebd2309e48fdeb450c65611d51b"
+    target_id = "5d29bee4350489d66feafecfebd94a97"
+    host_id = uuid.uuid4().hex
+    conversations = _ConversationStore()
+    source = conversations.get_conversation(source_id)
+    target = conversations.get_conversation(target_id)
+    assert source is not None and target is not None
+    source.host_id = host_id
+    source.workspace = "/workspace/project"
+    source.git_branch = "feature/rotation"
+    if inherited:
+        parent = conversations.get_conversation("64a784c3aa907d1774f44313546947c6")
+        assert parent is not None
+        parent.host_id = host_id
+        source.host_id = None
+        source.kind = "sub_agent"
+        source.parent_conversation_id = parent.id
+        source.runner_id = "runner_one"
+    permissions = _StubPermissionStore()
+    if admin:
+        permissions.add_admin("alice@example.com")
+    permissions.add_grant("alice@example.com", source_id, source_level)
+    permissions.add_grant("alice@example.com", target_id, target_level)
+    if inherited:
+        permissions.add_grant("alice@example.com", parent.id, source_level)
+    application = FastAPI()
+    if host_owner is not None:
+        hosts = HostStore(db_uri)
+        # An empty owner leaves the host unregistered in a configured store.
+        if host_owner:
+            hosts.upsert_on_connect(host_id, "test-host", host_owner)
+        application.state.host_store = hosts
+
+    @application.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(status_code=exc.http_status, content={"error": exc.code})
+
+    application.include_router(
+        create_sessions_router(
+            conversations,  # type: ignore[arg-type]
+            Mock(),  # Agent loading is outside the transfer boundary.
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+            permission_store=permissions,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    # No terminal process is needed to exercise authorization and stored placement.
+    runner = _FakeRunnerClient(payload={"id": "terminal_main", "session_id": target_id})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://server"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{source_id}/resources/terminals/terminal_main/transfer",
+            json={"target_session_id": target_id},
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    assert response.status_code == expected_status, response.text
+    assert source.host_id == (None if inherited else host_id)
+    assert source.workspace == "/workspace/project"
+    if expected_status == 200 and not inherited:
+        assert response.json()["session_id"] == target_id
+        assert target.host_id == source.host_id
+        assert target.workspace == source.workspace
+        assert target.git_branch == source.git_branch
+    else:
+        if expected_status == 200:
+            assert runner.calls
+            assert response.json()["session_id"] == target_id
+        else:
+            assert runner.calls == []
+        assert target.host_id is None
+        assert target.workspace is None
+        assert target.git_branch is None
+
+
+@pytest.mark.asyncio
 async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -2454,12 +2575,14 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_type", [False, True], ids=["default-type", "recorded-gz"])
 async def test_copy_spends_the_child_workspace_quota(
     file_client: httpx.AsyncClient,
     file_conv_store: _ConversationStore,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
     monkeypatch: pytest.MonkeyPatch,
+    recorded_type: bool,
 ) -> None:
     """Copies count against the child's workspace quota, like uploads."""
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
@@ -2472,7 +2595,19 @@ async def test_copy_spends_the_child_workspace_quota(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
     )
     first = _seed_parent_zip(file_store, artifact_store, "first.zip")
-    second = _seed_parent_zip(file_store, artifact_store, "second.zip")
+    if recorded_type:
+        # Counted by its recorded delivery, since .gz isn't a default extension.
+        stored = file_store.create(
+            session_id="b460374fc8e697b296708f52dc9d8179",
+            filename="second.gz",
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata={"delivery": "filesystem"},
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        second = stored.id
+    else:
+        second = _seed_parent_zip(file_store, artifact_store, "second.zip")
     url = "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy"
     source = "b460374fc8e697b296708f52dc9d8179"
 
@@ -2514,6 +2649,43 @@ async def test_native_forward_leaves_a_workspace_file_for_the_runner(
     )
     assert forwarded["content"] == [zip_block]
     assert "File reference resolution failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_native_forward_drops_client_delivery_claims(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Only an upload's stored record can mark a file for filesystem delivery."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [
+        {"type": "input_file", "file_id": upload.json()["id"], "delivery": "filesystem"},
+        {
+            "type": "input_file",
+            "filename": "inline.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+            "delivery": "filesystem",
+        },
+    ]
+
+    resp = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert len(forwarded["content"]) == 2
+    assert all("delivery" not in block for block in forwarded["content"])
 
 
 @pytest.mark.asyncio
@@ -3059,6 +3231,48 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+    """A provider refusal keeps the runner's status and message for the panel."""
+    from omnigent.runner import github_resource
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/labels"
+    detail = "The GitHub account on the host cannot edit this pull request's labels."
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    timeouts: list[float | None] = []
+    proxy_get, proxy_post = fake_runner.get, fake_runner.post
+
+    async def get(url: str, *, params: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_get(url, params=params, timeout=timeout)
+
+    async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_post(url, json=json, timeout=timeout)
+
+    fake_runner.get, fake_runner.post = get, post  # type: ignore[method-assign]
+
+    resp = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"]}
+    )
+    malformed = await client.post(path, json={"add": ["bug"]})
+    await client.get(path, params={"pr_url": "https://github.com/acme/widgets/pull/17"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert malformed.status_code == 400
+    # The server and the host tunnel both outwait the runner's label request budget.
+    assert timeouts == [routes_resources._LABEL_PROXY_TIMEOUT_S] * 2
+    assert github_resource._LABEL_REQUEST_SECONDS < routes_resources._LABEL_PROXY_TIMEOUT_S
+    assert github_resource._LABEL_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
+    assert fake_runner.post_json_calls == [
+        (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"], "remove": []})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> None:
     """GET /resources/github/changes proxies the PR file list to the runner."""
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
@@ -3093,7 +3307,20 @@ async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> 
 
 
 @pytest.mark.asyncio
-async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize(
+    ("previous_path", "status"),
+    [
+        (None, 200),
+        ("old/%2F #?.py", 200),
+        ("folder/../old.py", 400),
+        ("folder//old.py", 400),
+        ("", 400),
+        ("/old.py", 400),
+    ],
+)
+async def test_github_diff_proxies_path_and_base(
+    client: httpx.AsyncClient, previous_path: str | None, status: int
+) -> None:
     """GET /resources/github/diff/{path} proxies the path + base to the runner."""
     payload = {
         "object": "session.github.file_diff",
@@ -3104,17 +3331,24 @@ async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> N
     fake_runner = _FakeRunnerClient(payload=payload)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
+    params = {"base": "main"}
+    if previous_path is not None:
+        params["previous_path"] = previous_path
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py?base=main"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
+        params=params,
     )
 
-    assert resp.status_code == 200
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert fake_runner.calls == []
+        return
     assert resp.json() == payload
     assert (
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
     ) in fake_runner.calls
-    assert {"base": "main"} in fake_runner.get_params
+    assert params in fake_runner.get_params
 
 
 @pytest.mark.asyncio
@@ -3760,6 +3994,65 @@ async def test_filesystem_forwards_a_literal_percent_still_encoded(
             await client.get(url, params={"download": "true"} if operation == "download" else None)
 
     assert seen == ["%2Fetc/passwd"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "environments/default/filesystem",
+        "environments/default/diff",
+        "github/diff",
+        "environments/default/search",
+    ],
+)
+@pytest.mark.parametrize("name", ["docs/release #1?.md", "notes/%2Fdata.txt"])
+async def test_resource_reads_preserve_literal_paths(
+    client: httpx.AsyncClient, resource: str, name: str
+) -> None:
+    runner = FastAPI()
+    seen: list[tuple[str, str]] = []
+
+    @runner.get(f"/v1/sessions/{{session_id}}/resources/{resource}/{{relative_path:path}}")
+    async def serve(request: Request, session_id: str, relative_path: str) -> JSONResponse:
+        del session_id
+        seen.append((relative_path, request.query_params.get("q", "")))
+        return JSONResponse({"path": relative_path})
+
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+    async with _runner_app_client(runner):
+        response = await client.get(f"{base}/{resource}/{quote(name)}", params={"q": "notes"})
+    assert response.status_code == 200, response.text
+    assert seen == [(name, "notes" if resource.endswith("search") else "")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,resource",
+    [
+        ("GET", "environments/default/filesystem"),
+        ("PUT", "environments/default/filesystem"),
+        ("PATCH", "environments/default/filesystem"),
+        ("DELETE", "environments/default/filesystem"),
+        ("GET", "environments/default/diff"),
+        ("GET", "github/diff"),
+        ("GET", "environments/default/search"),
+    ],
+)
+async def test_resource_paths_reject_parent_segments_before_forwarding(
+    client: httpx.AsyncClient, method: str, resource: str
+) -> None:
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+    response = await client.request(
+        method,
+        f"{base}/{resource}/folder/%2E%2E/notes.txt",
+        params={"q": "notes"},
+        json={"content": "notes", "encoding": "utf-8", "old_text": "old", "new_text": "new"},
+    )
+    assert response.status_code == 400, response.text
+    assert runner.calls == []
 
 
 @pytest.mark.asyncio
@@ -5333,7 +5626,7 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
         )
 
         assert [item.type for item in store.appended_items] == ["message"]
-        assert store.appended_items[0].created_by == "a@example.com"
+        assert store.appended_items[0].created_by is None
         assert pending_inputs.snapshot_for(sid) == []
         assert pending_id  # the drained entry was the reformatted message itself
     finally:
@@ -5989,7 +6282,7 @@ async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
 
     try:
         request = asyncio.create_task(persist())
-        await asyncio.to_thread(store.first_append_started.wait, 5)
+        assert await asyncio.to_thread(store.first_append_started.wait, budget(5))
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
             await request
@@ -6001,10 +6294,15 @@ async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
         assert pending_inputs.resolve_matching_text(sid, "still here?").matched is None
 
         store.release_first_append.set()
-        for _attempt in range(200):
-            if not pending_inputs.snapshot_for(sid):
-                break
-            await asyncio.sleep(0.01)
+        # Settlement precedes title seeding and publication of the final receipt.
+        await poll_until_async(
+            lambda: any(
+                event.get("type") == "session.input.consumed"
+                and event["data"]["cleared_pending_id"] == matched
+                for _conversation_id, event in published
+            ),
+            timeout_s=budget(5),
+        )
 
         assert pending_inputs.snapshot_for(sid) == []
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
@@ -8945,9 +9243,22 @@ async def test_github_info_falls_back_to_host_when_runner_offline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_path", "status"),
+    [
+        (None, 200),
+        ("old/%2F #?.py", 200),
+        ("folder/../old.py", 400),
+        ("folder//old.py", 400),
+        ("", 400),
+        ("/old.py", 400),
+    ],
+)
 async def test_github_diff_falls_back_to_host_when_runner_offline(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    previous_path: str | None,
+    status: int,
 ) -> None:
     """The GitHub diff (gzip route) also falls back to the host tunnel offline.
 
@@ -8979,14 +9290,20 @@ async def test_github_diff_falls_back_to_host_when_runner_offline(
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
 
+    params = {"base": "main"}
+    if previous_path is not None:
+        params["previous_path"] = previous_path
     resp = await offline_env_client.get(
-        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py?base=main"
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py", params=params
     )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert captured == {}
+        return
     assert resp.json()["after"] == "changed"
     assert captured["op"] == "github_diff"
-    assert captured["params"] == {"base": "main", "path": "app.py"}
+    assert captured["params"] == {"path": "app.py", **params}
 
 
 @pytest.mark.asyncio
@@ -9394,6 +9711,7 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/changes", "github_changes"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
+        ("/labels", "github_labels"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -9444,31 +9762,101 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
 
 
+async def test_pr_label_edit_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+    labels = {"object": "session.github.pr_labels", "labels": []}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return labels
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/labels",
+        json={"pr_url": url, "remove": ["bug"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == labels
+    assert captured["op"] == "github_labels_update"
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"] == {"pr_url": url, "add": [], "remove": ["bug"]}
+
+
 @pytest.mark.asyncio
-async def test_copy_new_type_refuses_old_runtime(
+@pytest.mark.parametrize(
+    ("filename", "host_tier", "status"),
+    [
+        ("archive.zip", "none", 409),
+        ("archive.zip", "attachments", 200),
+        ("trace.gz", "attachments", 409),
+        ("trace.gz", "current", 200),
+    ],
+    ids=[
+        "default-type-needs-attachments",
+        "default-type-on-attachments-host",
+        "recorded-type-needs-delivery",
+        "recorded-type-on-current-host",
+    ],
+)
+async def test_copy_requires_the_hosts_attachment_support(
     file_client: httpx.AsyncClient,
     file_app: FastAPI,
     file_conv_store: _ConversationStore,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
+    filename: str,
+    host_tier: str,
+    status: int,
 ) -> None:
-    """A capable harness on an old host cannot receive a copied binary file."""
+    """A copy into a capable harness still needs a host that can deliver the file."""
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     child = "405bfe154d5c0e795a2b87021bc897bf"
     parent = "b460374fc8e697b296708f52dc9d8179"
     file_conv_store._conversations[child].labels.update(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
     )
-    file_app.state.host_registry.get("host_files").hello.capabilities = []
-    file_id = _seed_parent_zip(file_store, artifact_store, "archive.zip")
+    file_app.state.host_registry.get("host_files").hello.capabilities = {
+        "none": [],
+        "attachments": [CAP_FILESYSTEM_ATTACHMENTS],
+        "current": HOST_CAPABILITIES,
+    }[host_tier]
+    if filename.endswith(".zip"):
+        file_id = _seed_parent_zip(file_store, artifact_store, filename)
+        source_metadata = None
+    else:
+        # Outside the default extensions, so only the record marks it for disk.
+        source_metadata = {"delivery": "filesystem"}
+        stored = file_store.create(
+            session_id=parent,
+            filename=filename,
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata=source_metadata,
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        file_id = stored.id
+
     response = await file_client.post(
         f"/v1/sessions/{child}/resources/files:copy",
         json={"source_session_id": parent, "file_ids": [file_id]},
     )
-    assert response.status_code == 409, response.text
-    assert file_store.list(child).data == []
+
+    assert response.status_code == status, response.text
     assert file_store.get(file_id, session_id=parent) is not None
+    if status == 200:
+        copied = file_store.get(response.json()["mapping"][file_id]["new_id"], session_id=child)
+        assert copied is not None
+        assert copied.source_metadata == source_metadata
+    else:
+        assert file_store.list(child).data == []
 
 
 @pytest.mark.asyncio
@@ -9514,6 +9902,70 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retained_history", "host_has_attachments", "status"),
+    [(False, True, 409), (True, True, 202), (True, False, 409)],
+)
+async def test_native_send_requires_delivery_support_for_new_types(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+    host_has_attachments: bool,
+    status: int,
+) -> None:
+    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+
+    A recorded file in retained history still needs filesystem attachment support.
+    """
+    from omnigent.entities import MessageData
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENTS,
+        FilesystemAttachmentPolicy,
+    )
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+        all_types=True
+    )
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [{"type": "input_file", "file_id": upload.json()["id"]}]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached trace again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = (
+        [CAP_FILESYSTEM_ATTACHMENTS] if host_has_attachments else []
+    )
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == status, response.text
+    if status == 202:
+        assert runner.post_json_calls
+    else:
+        assert runner.post_json_calls == []
+        if not retained_history:
+            assert "this file type" in response.text
 
 
 @pytest.mark.asyncio
@@ -9807,3 +10259,41 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
         assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
     finally:
         pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "",
+        "/filesystem",
+        "/filesystem/file.txt",
+        "/changes",
+        "/diff/file.txt",
+        "/search",
+        "/search/folder",
+    ],
+)
+@pytest.mark.parametrize("environment_id", ["default", "env?draft#one%two", ".", ".."])
+async def test_environment_id_is_one_runner_url_segment(
+    client: httpx.AsyncClient, suffix: str, environment_id: str
+) -> None:
+    from urllib.parse import quote
+
+    fake_runner = _FakeRunnerClient(payload={"data": []})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    encoded = quote(environment_id, safe="").replace(".", "%2E")
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/"
+    response = await client.get(base + encoded + suffix, params={"q": "file"})
+    if environment_id in {".", ".."}:
+        assert response.status_code == 400, response.text
+        assert fake_runner.calls == []
+    else:
+        assert response.status_code == 200, response.text
+        assert fake_runner.calls
+        forwarded = httpx.URL(fake_runner.calls[-1][1])
+        assert (
+            forwarded.raw_path.split(b"?", 1)[0]
+            == (base + quote(environment_id, safe="") + suffix).encode()
+        )
+        assert forwarded.fragment == ""

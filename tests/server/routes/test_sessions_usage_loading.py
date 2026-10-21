@@ -16,7 +16,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
-from omnigent.runner.native.orchestration import _codex_native_launch_config
+from omnigent.runner.native.orchestration import (
+    _codex_native_launch_config,
+    _pi_native_launch_config,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import create_sessions_router
@@ -162,6 +165,36 @@ async def test_snapshot_can_skip_usage_without_exposing_parent_only_cost(
         stored = usage_app.conversations.get_conversation(usage_app.parent_id)
         assert stored is not None and stored.external_session_id == "thread-resumed"
     load_usage.assert_not_called()
+
+
+async def test_pi_launch_restores_only_own_tokens_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real HTTP snapshot and runner decoding exclude the parent's children."""
+    monkeypatch.setattr(orchestration, "_resolve_harness", lambda *_args, **_kwargs: "pi-native")
+    monkeypatch.setattr(
+        orchestration,
+        "load_session_usage",
+        Mock(side_effect=AssertionError("native launch must not aggregate the tree")),
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.parent_id,
+        {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30},
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.child_id,
+        {"input_tokens": 9000, "output_tokens": 8000, "cache_read_input_tokens": 7000},
+    )
+    launch = await _pi_native_launch_config(
+        session_id=usage_app.parent_id, server_client=usage_client
+    )
+    assert launch.native_usage_baseline == {
+        "cumulative_input_tokens": 130,
+        "cumulative_output_tokens": 20,
+        "cumulative_cache_read_input_tokens": 30,
+    }
 
 
 async def test_real_codex_launch_config_does_not_load_usage(

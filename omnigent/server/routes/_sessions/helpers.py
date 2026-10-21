@@ -28,7 +28,7 @@ from collections.abc import (
 )
 from dataclasses import dataclass
 from pathlib import PurePath
-from typing import Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import httpx
 from fastapi import (
@@ -242,6 +242,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _unbound_managed_launch_tasks,
     build_policy_engine,
     get_agent_cache,
     get_caps,
@@ -298,6 +299,7 @@ from omnigent.server.schemas import (
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
+from omnigent.server.startup_inputs import StartupInputContext
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -326,6 +328,9 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
@@ -6224,6 +6229,9 @@ async def _launch_runner_on_host_locked(
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
+                # Only the binding we just replaced: an unbound session's old
+                # runner may now serve its /clear or /switch successor.
+                superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
             )
         )
         try:
@@ -6291,24 +6299,44 @@ async def _launch_runner_on_host_locked(
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 
-async def cancel_managed_launch_tasks() -> None:
+async def cancel_managed_launch_tasks(drain_s: float = 0.0) -> None:
     """
-    Cancel and await every in-flight background managed launch.
+    Let in-flight managed launches bind their host, then cancel them.
 
-    Lifespan-teardown hook: without it, a slow provision outlives the
-    ASGI shutdown and dies wherever the loop teardown happens to kill
-    it. Cancellation is deterministic teardown of the TASK only — an
-    already-provisioned sandbox is not terminated here (there is no
-    time budget for provider calls during shutdown); its armed launch
-    token expires with the provider lifetime cap that also reaps the
-    sandbox.
+    Lifespan-teardown hook. A launch cancelled before it binds the session
+    to its host strands the session: no other replica knows which host it
+    belongs to, so its sandbox never serves it and its saved messages are
+    never delivered. Once bound, whichever replica the host tunnels to
+    starts the runner and delivers them, so only the bind is waited for.
+    A launch still unbound after *drain_s* is cancelled and records itself
+    failed. Cancellation stops the TASK only — an already-provisioned
+    sandbox is reaped by the provider lifetime cap.
 
+    :param drain_s: Longest wait for unbound launches, in seconds — the
+        deployment's :attr:`ManagedSandboxDeployment.shutdown_drain_s`.
     :returns: None once every task has settled (cancellations and any
         in-flight failures are absorbed via ``return_exceptions``).
     """
     tasks = list(_managed_launch_tasks)
     if not tasks:
         return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + drain_s
+    if _unbound_managed_launch_tasks and drain_s > 0:
+        _logger.info(
+            "Waiting up to %gs for %d managed launch(es) to bind their host before shutdown",
+            drain_s,
+            len(_unbound_managed_launch_tasks),
+        )
+    while _unbound_managed_launch_tasks and loop.time() < deadline:
+        await asyncio.sleep(0.2)
+    if _unbound_managed_launch_tasks:
+        _logger.warning(
+            "Cancelling %d managed launch(es) still unbound after %gs",
+            len(_unbound_managed_launch_tasks),
+            drain_s,
+        )
+    tasks = list(_managed_launch_tasks)
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -7609,6 +7637,7 @@ async def _dispatch_skill_slash_command_to_runner(
     has_mcp_servers: bool,
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
+    startup_input: StartupInputContext | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -7659,6 +7688,9 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_client,
         legacy_name=(legacy_skill_names or {}).get(skill_name),
     )
+    if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
+        return startup_input.input_id
+    startup_input_id = startup_input.input_id if startup_input is not None else None
 
     response_id = f"turn_{uuid.uuid4().hex}"
     meta_content = [{"type": "input_text", "text": meta_text}]
@@ -7672,6 +7704,8 @@ async def _dispatch_skill_slash_command_to_runner(
             arguments=arguments,
         ),
         created_by=created_by,
+        stable_id=startup_input_id,
+        replaces_pending_id=startup_input_id,
     )
     meta_item = NewConversationItem(
         type="message",
@@ -8738,7 +8772,7 @@ def _filesystem_attachment_in_history(
     :param content: Additional incoming message blocks to check before stored history.
     :returns: A referenced filesystem attachment's name, or ``None``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import uses_filesystem_delivery
 
     if file_store is None:
         return None
@@ -8747,7 +8781,7 @@ def _filesystem_attachment_in_history(
     while True:
         files_page = file_store.list(session_id, limit=1000, after=files_after, order="asc")
         for stored_file in files_page.data:
-            if requires_filesystem(stored_file.filename):
+            if uses_filesystem_delivery(stored_file.filename, stored_file.source_metadata):
                 filenames[stored_file.id] = stored_file.filename
         if not files_page.has_more or not files_page.data:
             break
@@ -8976,7 +9010,9 @@ async def _apply_pending_policy_ask_writes(
         await asyncio.to_thread(engine.apply_label_writes, pending.set_labels)
     if pending.state_updates:
         with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(engine.apply_state_updates, pending.state_updates)
+            await asyncio.to_thread(
+                engine.apply_state_updates, pending.state_updates, approved=True
+            )
 
 
 def _build_actor(user_id: str | None) -> dict[str, str] | None:
@@ -11433,6 +11469,23 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
 _FILESYSTEM_QUOTA_PAGE_SIZE = 100
 
 
+def _filesystem_attachment_policy(app_state: Any) -> FilesystemAttachmentPolicy:
+    """Return the filesystem attachment policy for the current request.
+
+    ``create_app`` installs a resolver on the app state, which a deployment
+    can back with its own per-request setting; an app without one reads the
+    server config.
+
+    :param app_state: The FastAPI app's ``state``.
+    """
+    resolve = getattr(app_state, "filesystem_attachment_policy", None)
+    if callable(resolve):
+        return cast("FilesystemAttachmentPolicy", resolve())
+    from omnigent.server.server_config import filesystem_attachment_policy
+
+    return filesystem_attachment_policy()
+
+
 async def _require_filesystem_attachment_harness(conv: Conversation, filename: str) -> None:
     """Require a harness supporting delivery and restoration of filesystem attachments.
 
@@ -11460,6 +11513,7 @@ def require_filesystem_attachment_runtime(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     runner_router: RunnerRouter | None = None,
+    capability: str | None = None,
 ) -> None:
     """Require a connected build that can deliver and restore native file attachments.
 
@@ -11468,17 +11522,24 @@ def require_filesystem_attachment_runtime(
     :param host_registry: Live host connections on this server replica.
     :param tunnel_registry: Live runner connections on this server replica.
     :param runner_router: Router used to distinguish a remote host from an offline one.
+    :param capability: Capability the files need (see
+        :func:`~omnigent.inner.native_attachments.filesystem_attachment_capability`),
+        defaulting to the one for the default extensions.
     :raises OmnigentError: When the runtime needs an upgrade, connection, or reroute.
     """
     from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 
+    required = capability or CAP_FILESYSTEM_ATTACHMENTS
     host = host_registry.get(host_id) if host_id and host_registry is not None else None
     runner = tunnel_registry.get(runner_id) if runner_id and tunnel_registry is not None else None
     for connection in (host, runner):
-        if (
-            connection is not None
-            and CAP_FILESYSTEM_ATTACHMENTS not in connection.hello.capabilities
-        ):
+        if connection is not None and required not in connection.hello.capabilities:
+            if required != CAP_FILESYSTEM_ATTACHMENTS:
+                raise OmnigentError(
+                    "Update Omnigent on this host and restart it before attaching this "
+                    "file type. This host cannot deliver it to the agent as a file.",
+                    code=ErrorCode.CONFLICT,
+                )
             raise OmnigentError(
                 "Update Omnigent on this host and restart it before attaching archives, "
                 "Office documents, or databases. This host cannot restore these files "
@@ -11525,7 +11586,7 @@ def _enforce_filesystem_attachment_policy(
     :raises HTTPException: 415 when an extension is denied by configuration,
         or 413 when the files would exceed a per-file or per-session quota.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
+    from omnigent.inner.native_attachments import uses_filesystem_delivery
     from omnigent.server.server_config import (
         filesystem_attachment_denied_extensions,
         filesystem_attachment_file_limit,
@@ -11564,8 +11625,8 @@ def _enforce_filesystem_attachment_policy(
             order="asc",
         )
         for stored in page.data:
-            # This quota covers the types that require filesystem tools.
-            if requires_filesystem(stored.filename):
+            # This quota covers the files delivered through filesystem tools.
+            if uses_filesystem_delivery(stored.filename, stored.source_metadata):
                 used_files += 1
                 used_bytes += stored.bytes
         if not page.has_more or page.last_id is None:
