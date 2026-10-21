@@ -329,6 +329,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
             assert tool_completed.is_set(), "gateway did not receive the real file tool result"
             assert any("GATEWAY_SETUP_OK" in json.dumps(r.get("contents")) for r in captured)
+            expect(page.get_by_test_id("error-pill")).to_have_count(0)
 
             page.reload()
             expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1)
@@ -342,7 +343,13 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             ).to_have_count(1, timeout=90_000)
             expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1)
             expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+            expect(page.get_by_test_id("error-pill")).to_have_count(0)
+            response = client.get(f"/v1/sessions/{session_id}")
+            response.raise_for_status()
+            assert response.json()["status"] == "idle"
         finally:
+            # Finish the recording before deleting the session and its native stream.
+            page.context.close()
             (tmp_path / "gateway-requests.json").write_text(json.dumps(captured, indent=2))
             if client is not None:
                 if session_id is not None:
