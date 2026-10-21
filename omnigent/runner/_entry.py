@@ -347,6 +347,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             (which pass only the factory) need no change.
         """
         self._factory = factory
+        self._last_bearer: str | None = None
         self._server_url = server_url or os.environ.get(_RUNNER_SERVER_URL_ENV_VAR)
 
     @property
@@ -354,7 +355,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         """Whether account-wide tools are unavailable with the current bearer."""
         from omnigent.runner.identity import runner_bearer_is_confined
 
-        return runner_bearer_is_confined(self._factory() if self._factory is not None else None)
+        return runner_bearer_is_confined(self._last_bearer)
 
     def auth_flow(
         self,
@@ -417,10 +418,12 @@ class _RunnerDatabricksAuth(ThreadedAuth):
                     reset()
                     token = self._factory()
                     if token:
+                        self._last_bearer = token
                         request.headers["Authorization"] = f"Bearer {token}"
                         yield request
                     return
                 raise httpx.RequestError("Databricks token refresh returned no token")
+            self._last_bearer = token
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
@@ -429,6 +432,7 @@ class _RunnerDatabricksAuth(ThreadedAuth):
             _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
+                self._last_bearer = token
                 request.headers["Authorization"] = f"Bearer {token}"
                 yield request
 
@@ -451,6 +455,10 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :returns: ``True`` when the response indicates the request should
         be retried with a fresh token, ``False`` otherwise.
     """
+    from omnigent.errors import ERROR_CODE_HEADER, ErrorCode
+
+    if response.headers.get(ERROR_CODE_HEADER) == ErrorCode.RUNNER_SCOPE_DENIED:
+        return False
     if response.status_code in (401, 403):
         # Databricks Apps returns 403 "Invalid Token" for an expired bearer
         # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.
@@ -958,9 +966,11 @@ class _ManagedMintTokenFactory:
         except httpx.HTTPStatusError as exc:
             response = exc.response
             if response.status_code == 426:
-                raise RuntimeError(
+                raise httpx.HTTPStatusError(
                     "runner credential protocol is incompatible with the server; "
-                    "upgrade the runner before restarting it"
+                    "upgrade the runner before restarting it",
+                    request=exc.request,
+                    response=response,
                 ) from exc
             if (
                 response.status_code in (400, 404)

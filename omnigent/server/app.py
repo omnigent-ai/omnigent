@@ -2398,9 +2398,12 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
+        from omnigent.errors import ERROR_CODE_HEADER
+
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+            headers={ERROR_CODE_HEADER: exc.code},
         )
 
     @app.exception_handler(RequestValidationError)

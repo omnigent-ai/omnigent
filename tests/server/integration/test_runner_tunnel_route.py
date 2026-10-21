@@ -2623,8 +2623,8 @@ async def test_mint_rejects_incompatible_runners_before_issuing_credentials(cred
         credential_protocol=credential_protocol,
     )
     assert response.status_code == 426
-    assert response.headers["Upgrade"] == RUNNER_CREDENTIAL_PROTOCOL
-    assert "upgrade the runner" in response.json()["detail"]
+    assert response.json()["error"]["code"] == "runner_upgrade_required"
+    assert "upgrade the runner" in response.json()["error"]["message"]
     assert "token" not in response.json()
 
 

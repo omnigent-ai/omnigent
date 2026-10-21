@@ -1052,7 +1052,7 @@ def _runner_for_session(owner_client, stores, owner, *, legacy=False):
             f"/v1/runners/{runner_id}/token", headers={RUNNER_TUNNEL_TOKEN_HEADER: binding}
         )
         assert refused.status_code == 426, refused.text
-        assert refused.headers["Upgrade"] == RUNNER_CREDENTIAL_PROTOCOL
+        assert refused.json()["error"]["code"] == "runner_upgrade_required"
         # Reproduce the token shape issued before scoped credentials existed.
         token = mint_session_token(
             owner,
@@ -1068,8 +1068,16 @@ def _runner_for_session(owner_client, stores, owner, *, legacy=False):
 
 
 @pytest.mark.parametrize("owner", ["alice", "admin"])
-def test_runner_token_is_confined_to_its_runner_sessions(setup_app, owner):
+def test_runner_token_is_confined_to_its_runner_sessions(setup_app, monkeypatch, owner):
+    from concurrent.futures import Future
+
+    from omnigent.entities.conversation import MessageData, NewConversationItem
     from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server._elicitation_registry import (
+        _harness_elicitation_owners,
+        _harness_elicitation_registry,
+    )
 
     admin, alice, stores, _ = setup_app
     owner_client, other_client = (alice, admin) if owner == "alice" else (admin, alice)
@@ -1090,12 +1098,82 @@ def test_runner_token_is_confined_to_its_runner_sessions(setup_app, owner):
         f"/v1/hosts/{host_id}",
         f"/v1/runners/{other_runner_id}/status",
     ):
-        assert runner.get(path).status_code in (401, 403), path
+        assert runner.get(path).status_code == 403, path
 
     agent_id = snapshot.json()["agent_id"]
     child = runner.post("/v1/sessions", json={"agent_id": agent_id, "parent_session_id": bound})
     assert child.status_code == 201, child.text
     assert runner.get(f"/v1/sessions/{child.json()['id']}").status_code == 200
+    child_id = child.json()["id"]
+    conversations.append(
+        child_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="scope-preview",
+                data=MessageData(
+                    role="assistant",
+                    agent="review-agent",
+                    content=[{"type": "output_text", "text": "private-child-preview"}],
+                ),
+            )
+        ],
+    )
+    visible_children = runner.get(f"/v1/sessions/{bound}/child_sessions")
+    assert visible_children.status_code == 200, visible_children.text
+    assert child_id in {row["id"] for row in visible_children.json()["data"]}
+    assert "private-child-preview" in visible_children.text
+    conversations.replace_runner_id(child_id, other_runner_id)
+    assert runner.get(f"/v1/sessions/{child_id}").status_code == 403
+    children = runner.get(f"/v1/sessions/{bound}/child_sessions")
+    assert children.status_code == 200, children.text
+    assert child_id not in {row["id"] for row in children.json()["data"]}
+    assert "private-child-preview" not in children.text
+    assert runner.get(f"/v1/sessions/{bound}/stream").status_code == 403
+
+    try:
+        for native in (False, True):
+            elicitation_id = f"elicit_rebound_{native}"
+            future = Future()
+            monkeypatch.setitem(_harness_elicitation_owners, elicitation_id, child_id)
+            monkeypatch.setitem(_harness_elicitation_registry, elicitation_id, future)
+            event = {
+                "type": "response.elicitation_request",
+                "elicitation_id": elicitation_id,
+                "params": {
+                    "message": "private-child-preview",
+                    "target_session_id": child_id,
+                    **(
+                        {"native_delivery": {"state": "unconfirmed", "attempt": "test"}}
+                        if native
+                        else {}
+                    ),
+                },
+            }
+            pending_elicitations.record_publish(child_id, event)
+            pending_elicitations.record_publish(bound, event)
+            parent_snapshot = runner.get(f"/v1/sessions/{bound}")
+            assert parent_snapshot.status_code == 200, parent_snapshot.text
+            assert "private-child-preview" not in parent_snapshot.text
+            for response in (
+                runner.post(
+                    f"/v1/sessions/{bound}/events",
+                    json={
+                        "type": "approval",
+                        "data": {"elicitation_id": elicitation_id, "action": "accept"},
+                    },
+                ),
+                runner.post(
+                    f"/v1/sessions/{bound}/elicitations/{elicitation_id}/resolve",
+                    json={"action": "accept"},
+                ),
+            ):
+                assert response.status_code == 403, response.text
+                assert response.json()["error"]["code"] == "runner_scope_denied"
+            assert not future.done()
+    finally:
+        pending_elicitations.reset_for_tests()
+
     # Agent definitions uploaded by the same owner remain reusable; transcripts
     # of sessions on other runners are still outside this credential's scope.
     reusable_agent = owner_client.get(f"/v1/sessions/{own_elsewhere}").json()["agent_id"]
@@ -1176,7 +1254,7 @@ async def test_runner_clear_finalizes_before_detaching(setup_app, monkeypatch, l
             )
     posts = [("POST", 202)] * 3
     assert responses == ([("PATCH", 200), *posts] if legacy else [*posts, ("PATCH", 200)])
-    assert runner.get(f"/v1/sessions/{old_id}").status_code == (200 if legacy else 401)
+    assert runner.get(f"/v1/sessions/{old_id}").status_code == (200 if legacy else 403)
     assert runner.get(f"/v1/sessions/{new_id}").status_code == 200
     assert stores["conversation_store"].get_conversation(old_id).runner_id is None
     items = alice.get(f"/v1/sessions/{old_id}/items")
@@ -1332,13 +1410,14 @@ def test_runner_binding_lifecycle_consumes_bootstrap_scope(setup_app):
     assert RUNNER_CREATOR_LABEL_KEY not in conversations.get_conversation(rotated_id).labels
     assert runner.get(f"/v1/sessions/{rotated_id}").status_code == 200
     conversations.replace_runner_id(rotated_id, other_runner_id)
-    assert runner.get(f"/v1/sessions/{rotated_id}").status_code == 401
+    assert runner.get(f"/v1/sessions/{rotated_id}").status_code == 403
     detached = owner_client.patch(f"/v1/sessions/{rotated_id}", json={"runner_id": ""})
     assert detached.status_code == 200, detached.text
-    assert runner.get(f"/v1/sessions/{rotated_id}").status_code == 401
+    assert runner.get(f"/v1/sessions/{rotated_id}").status_code == 403
 
 
-def test_runner_scope_depth_boundary_can_be_repaired_by_owner(setup_app):
+def test_runner_scope_depth_boundary_can_be_repaired_by_owner(setup_app, monkeypatch):
+    monkeypatch.setattr("omnigent.server.auth._RUNNER_SCOPE_MAX_DEPTH", 1)
     _, alice, stores, _ = setup_app
     runner, bound, runner_id = _runner_for_session(alice, stores, "alice")
     conversations = stores["conversation_store"]
@@ -1348,13 +1427,12 @@ def test_runner_scope_depth_boundary_can_be_repaired_by_owner(setup_app):
     descendant = child.json()["id"]
     detached = alice.patch(f"/v1/sessions/{descendant}", json={"runner_id": ""})
     assert detached.status_code == 200, detached.text
-    for _ in range(32):
-        created_child = alice.post(
-            "/v1/sessions", json={"agent_id": agent_id, "parent_session_id": descendant}
-        )
-        assert created_child.status_code == 201, created_child.text
-        descendant = created_child.json()["id"]
-    assert runner.get(f"/v1/sessions/{descendant}").status_code == 401
+    created_child = alice.post(
+        "/v1/sessions", json={"agent_id": agent_id, "parent_session_id": descendant}
+    )
+    assert created_child.status_code == 201, created_child.text
+    descendant = created_child.json()["id"]
+    assert runner.get(f"/v1/sessions/{descendant}").status_code == 403
     conversations.replace_runner_id(descendant, runner_id)
     assert runner.get(f"/v1/sessions/{descendant}").status_code == 200
 

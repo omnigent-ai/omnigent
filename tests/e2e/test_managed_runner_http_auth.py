@@ -405,7 +405,7 @@ def test_managed_runner_callback_authenticates_end_to_end(
     # and host routes refuse it even after the client's re-mint retry.
     for path in ("/v1/me", "/v1/hosts"):
         refused = asyncio.run(_get_agent_contents(base_url, path, auth))
-        assert refused.status_code == 401, (path, refused.status_code, refused.text)
+        assert refused.status_code == 403, (path, refused.status_code, refused.text)
     recovered = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
     assert recovered.status_code == 200, recovered.text
     assert recovered.content == authed.content

@@ -69,7 +69,6 @@ from omnigent.server.auth import (
     RUNNER_CREATOR_LABEL_KEY,
     AuthProvider,
     RunnerTokenConfinement,
-    local_single_user_enabled,
     require_runner_session_scope,
     runner_token_confinement,
 )
@@ -3657,7 +3656,7 @@ def register_core_routes(
             )
         _require_runner_confined_placement(
             request,
-            host_id=None,
+            host_id=body.host_id,
             host_type=body.host_type,
             sandbox_provider=body.sandbox_provider,
             project_id=None,

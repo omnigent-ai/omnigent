@@ -24,7 +24,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
 from typing import cast
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.debug_logging import debug_event
@@ -355,7 +355,7 @@ def create_runner_tunnel_router(
             doesn't match ``runner_id``, or resolves to no managed-launch
             owner; 400 when the active auth mode can't mint server-side
             (header/proxy, or no auth provider).
-        :raises HTTPException: 426 when the runner does not announce scoped-v1 support.
+        :raises OmnigentError: 426 when the runner does not announce scoped-v1 support.
         """
         if auth_provider is None:
             # No auth configured: the runner authenticates by binding
@@ -374,11 +374,10 @@ def create_runner_tunnel_router(
         ):
             # Old runners detach before final events and advertise account-wide tools.
             # Do not give them a credential with semantics they cannot handle.
-            raise HTTPException(
-                status_code=426,
-                detail="upgrade the runner before requesting scoped-v1 credentials; "
+            raise OmnigentError(
+                "upgrade the runner before requesting scoped-v1 credentials; "
                 "deploy compatible runners before upgrading the accounts/OIDC server",
-                headers={"Upgrade": RUNNER_CREDENTIAL_PROTOCOL},
+                code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
             )
         if mint_managed_runner_token is not None:
             bearer = await asyncio.to_thread(

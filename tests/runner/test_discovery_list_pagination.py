@@ -783,3 +783,36 @@ async def test_discovery_list_rejects_invalid_windows(
         )
 
     assert error in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_confined_session_list_uses_only_session_local_discovery():
+    class ConfinedAuth(httpx.Auth):
+        runner_confined = True
+
+    paths = []
+
+    async def handler(request):
+        paths.append(request.url.path)
+        if request.url.path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(
+                200, json={"data": [{"id": "conv_child", "title": "helper:task"}]}
+            )
+        if request.url.path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        pytest.fail(f"confined discovery attempted {request.url.path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server", auth=ConfinedAuth()
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_list",
+                arguments="{}",
+                server_client=client,
+                conversation_id="conv_caller",
+            )
+        )
+    assert result["sessions"] == []
+    assert result["sub_agents"][0]["conversation_id"] == "conv_child"
+    assert "/v1/sessions" not in paths

@@ -1659,6 +1659,8 @@ def _descendant_sessions(
 def _pending_elicitation_snapshot_for_session(
     conv_store: ConversationStore,
     conv: Conversation,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return pending elicitation events visible from a session snapshot.
@@ -1680,7 +1682,17 @@ def _pending_elicitation_snapshot_for_session(
     :returns: Pending elicitation event dicts suitable for
         :class:`SessionResponse.pending_elicitations`.
     """
-    events = pending_elicitations.snapshot_for(conv.id)
+
+    def visible(event: dict[str, Any]) -> bool:
+        params = event.get("params", {})
+        target = params.get("target_session_id") if isinstance(params, dict) else None
+        return (
+            confinement is None
+            or not isinstance(target, str)
+            or confinement.allows_session(target)
+        )
+
+    events = [event for event in pending_elicitations.snapshot_for(conv.id) if visible(event)]
     if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
     seen = {
@@ -1689,7 +1701,11 @@ def _pending_elicitation_snapshot_for_session(
         if isinstance(event.get("elicitation_id"), str)
     }
     for child in _descendant_sessions(conv_store, conv.id):
+        if confinement is not None and not confinement.allows_session(child.id):
+            continue
         for event in pending_elicitations.snapshot_for(child.id):
+            if not visible(event):
+                continue
             elicitation_id = event.get("elicitation_id")
             if isinstance(elicitation_id, str) and elicitation_id in seen:
                 continue

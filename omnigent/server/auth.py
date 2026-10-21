@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from starlette.requests import HTTPConnection
 
+from omnigent.errors import ERROR_CODE_HEADER, ErrorCode, OmnigentError
 from omnigent.stores.conversation_store import RUNNER_CREATOR_LABEL_KEY
 
 logger = logging.getLogger(__name__)
@@ -96,9 +97,7 @@ def delegated_path_allowed(path: str) -> bool:
     return False
 
 
-# ``scope`` claim of a runner bearer minted by POST /v1/runners/{id}/token.
-# The bearer is readable by code in the runner's sandbox, so it is confined
-# to that runner's own sessions instead of carrying the owner's authority.
+# Sandbox-readable bearer confined to its runner's sessions.
 RUNNER_TOKEN_SCOPE = "runner"
 
 _RUNNER_CONFINEMENT_KEY = "omnigent.runner_confinement"
@@ -188,6 +187,9 @@ class RunnerTokenConfinement:
             if not rest:
                 # Creation is further confined by the create route itself.
                 return method == "POST"
+            # Browser streams mirror events from children on other runners.
+            if len(rest) == 2 and rest[1] == "stream":
+                return False
             return bool(rest[0]) and self.allows_session(rest[0])
         if family == "runners":
             return bool(rest) and rest[0] == self.runner_id
@@ -216,11 +218,9 @@ def require_runner_session_scope(connection: HTTPConnection, session_id: str) ->
     """
     confinement = runner_token_confinement(connection)
     if confinement is not None and not confinement.allows_session(session_id):
-        from omnigent.errors import ErrorCode, OmnigentError
-
         raise OmnigentError(
             "runner credential is not authorized for this session",
-            code=ErrorCode.FORBIDDEN,
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
         )
 
 
@@ -863,7 +863,10 @@ class UnifiedAuthProvider(AuthProvider):
                 return None
             confinement = RunnerTokenConfinement(runner_id, self._runner_session_check)
             if not confinement.allows_request(request):
-                return None
+                raise OmnigentError(
+                    "runner credential is not authorized for this request",
+                    code=ErrorCode.RUNNER_SCOPE_DENIED,
+                )
             # Routes whose target session arrives in the body read this back.
             request.scope[_RUNNER_CONFINEMENT_KEY] = confinement
             return user_id
@@ -1021,7 +1024,23 @@ class AccountAuthenticationMiddleware:
 
         with account_authority_scope(None, None):
             connection = HTTPConnection(scope)
-            identity = await asyncio.to_thread(self._authenticate, connection)
+            try:
+                identity = await asyncio.to_thread(self._authenticate, connection)
+            except OmnigentError as exc:
+                if exc.code != ErrorCode.RUNNER_SCOPE_DENIED:
+                    raise
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008, "reason": exc.message})
+                else:
+                    from starlette.responses import JSONResponse
+
+                    response = JSONResponse(
+                        status_code=exc.http_status,
+                        content={"error": {"code": exc.code, "message": exc.message}},
+                        headers={ERROR_CODE_HEADER: exc.code},
+                    )
+                    await response(scope, receive, send)
+                return
             scope[_CONNECTION_IDENTITY_KEY] = identity
             try:
                 self._auth_provider.get_user_id(connection)

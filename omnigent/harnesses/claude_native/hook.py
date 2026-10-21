@@ -557,7 +557,7 @@ def _create_clear_replacement_session(
     clear_resp = client.patch(
         f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
         json={
-            # The forwarder detaches after posting the old session's final events.
+            # Detach is owned by the forwarder.
             # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
             # so its later resume gets its own isolated dir instead of the new
             # session's live one (which would double-mirror the transcript and

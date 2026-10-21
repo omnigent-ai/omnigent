@@ -27,11 +27,13 @@ import secrets
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.accounts_bootstrap import (
     bootstrap_admin,
     resolve_admin_username,
@@ -388,16 +390,23 @@ def _bearer_request(
     )
 
 
-def _runner_provider(in_scope: frozenset[str] = frozenset()) -> UnifiedAuthProvider:
-    """Accounts provider whose runner-scope lookup admits *in_scope* for ``_RUNNER``."""
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+def _runner_provider(
+    in_scope: frozenset[str] = frozenset(), *, source: Literal["accounts", "oidc"] = "accounts"
+) -> UnifiedAuthProvider:
+    """Provider whose runner-scope lookup admits *in_scope* for ``_RUNNER``."""
+    from tests.server.integration.oidc_fixtures import make_oidc_config
+
+    provider = UnifiedAuthProvider(
+        source=source, accounts_config=_make_accounts_config(), oidc_config=make_oidc_config()
+    )
     provider.set_runner_session_check(
         lambda runner_id, session_id: runner_id == _RUNNER and session_id in in_scope
     )
     return provider
 
 
-def test_mint_runner_token_round_trips_to_owner() -> None:
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_mint_runner_token_round_trips_to_owner(source: Literal["accounts", "oidc"]) -> None:
     """A delegated runner's minted token resolves to the owner on its own routes.
 
     The sandbox runner has no login of its own, so the server mints a JWT
@@ -406,15 +415,28 @@ def test_mint_runner_token_round_trips_to_owner() -> None:
     """
     import jwt
 
-    provider = _runner_provider()
+    from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY
+
+    provider = _runner_provider(frozenset({"conv_bound"}), source=source)
 
     token = provider.mint_runner_token("alice@example.com", 1800, runner_id=_RUNNER)
     assert token is not None
-    claims = jwt.decode(token, _TEST_COOKIE_SECRET, algorithms=["HS256"])
+    claims = jwt.decode(
+        token,
+        _TEST_COOKIE_SECRET if source == "accounts" else TEST_SIGNING_KEY,
+        algorithms=["HS256"],
+    )
     assert (claims["scope"], claims["runner_id"]) == (RUNNER_TOKEN_SCOPE, _RUNNER)
 
     request = _bearer_request(token, f"/v1/runners/{_RUNNER}/status")
     assert provider.get_user_id(request) == "alice@example.com"
+    assert (
+        provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))
+        == "alice@example.com"
+    )
+    with pytest.raises(OmnigentError) as denied:
+        provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_other"))
+    assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
 
 
 def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
@@ -496,6 +518,7 @@ def test_runner_token_accepted_on_runner_routes(
         ("GET", "/auth/users", None),
         ("POST", "/auth/invite", None),
         ("GET", "/v1/sessions", None),
+        ("GET", "/v1/sessions/conv_bound/stream", None),
         ("GET", "/v1/sessions/conv_other", None),
         ("POST", "/v1/sessions/conv_other/resources/environments/env/shell", None),
         ("GET", "/v1/hosts", None),
@@ -522,7 +545,10 @@ def test_runner_token_rejected_outside_runner_scope(
 
     request = _bearer_request(token, path, method=method, headers=headers)
 
-    assert provider.get_user_id(request) is None
+    with pytest.raises(OmnigentError) as denied:
+        provider.get_user_id(request)
+    assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+    assert denied.value.http_status == 403
 
 
 def test_runner_token_reaches_no_session_without_scope_lookup() -> None:
@@ -531,7 +557,8 @@ def test_runner_token_reaches_no_session_without_scope_lookup() -> None:
     token = provider.mint_runner_token("alice", 1800, runner_id=_RUNNER)
     assert token is not None
 
-    assert provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound")) is None
+    with pytest.raises(OmnigentError, match="not authorized"):
+        provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))
     assert provider.get_user_id(_bearer_request(token, f"/v1/runners/{_RUNNER}/status")) == "alice"
 
 

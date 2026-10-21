@@ -8924,7 +8924,8 @@ async def test_sys_session_share_public_allows_public_grant(level: str, number: 
 
 
 @pytest.mark.asyncio
-async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() -> None:
+@pytest.mark.parametrize("confined", [False, True])
+async def test_sys_session_get_info_projects_metadata_and_runner_connectivity(confined) -> None:
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
@@ -8971,6 +8972,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         if request.method == "GET" and request.url.path == "/v1/runners/runner_1/status":
             return httpx.Response(200, json={"runner_id": "runner_1", "online": True})
         if request.method == "GET" and request.url.path == "/v1/hosts/host_1":
+            assert not confined, "confined metadata reads must skip host readiness"
             return httpx.Response(
                 200,
                 json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
@@ -8981,6 +8983,11 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
+
+        class CapabilityAuth(httpx.Auth):
+            runner_confined = confined
+
+        server_client.auth = CapabilityAuth()
         output = await execute_tool(
             tool_name="sys_session_get_info",
             arguments=json.dumps({"session_id": "conv_target"}),
@@ -9000,10 +9007,9 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     # None here would mean the best-effort status call was skipped.
     assert info["runner_online"] is True
     assert info["host_id"] == "host_1"
-    assert info["configured_harnesses"] == {
-        "codex-native": True,
-        "cursor-native": False,
-    }
+    assert info["configured_harnesses"] == (
+        None if confined else {"codex-native": True, "cursor-native": False}
+    )
     assert info["parent_session_id"] == "conv_parent"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the

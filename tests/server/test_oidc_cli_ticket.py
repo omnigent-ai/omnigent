@@ -13,6 +13,7 @@ import httpx
 import jwt
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import mint_session_cookie
@@ -415,16 +416,34 @@ async def test_cli_decision_requires_ticket_login_provenance(
     ) as client:
         ticket, verifier = await _create_ticket(client)
         if credential_kind == "runner":
-            token = provider.mint_runner_token("alice@example.com", ttl_seconds=1800)
+            token = provider.mint_runner_token(
+                "alice@example.com", ttl_seconds=1800, runner_id="runner_cli_consent"
+            )
             assert token is not None
         else:
             token = mint_session_cookie("alice@example.com", TEST_SIGNING_KEY, 8, "github")
         client.cookies.set("ap_session", token)
         with patch("omnigent.server.routes.auth.issue_login_grant") as issue_grant:
-            approval = await client.post(
-                f"/auth/cli-{decision}", data={"ticket": ticket}, headers={"Origin": "http://test"}
-            )
-            assert "<h1>Approved</h1>" not in approval.text
+            if credential_kind == "runner":
+                # This router-only fixture has no application error handler.
+                with pytest.raises(OmnigentError) as denied:
+                    await client.post(
+                        f"/auth/cli-{decision}",
+                        data={"ticket": ticket},
+                        headers={"Origin": "http://test"},
+                    )
+                assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+                with pytest.raises(OmnigentError) as denied:
+                    await client.get("/auth/cli-consent", params={"ticket": ticket})
+                assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+                client.cookies.clear()
+            else:
+                approval = await client.post(
+                    f"/auth/cli-{decision}",
+                    data={"ticket": ticket},
+                    headers={"Origin": "http://test"},
+                )
+                assert "<h1>Approved</h1>" not in approval.text
             pending = await client.get(
                 "/auth/cli-poll", params={"ticket": ticket, "code_verifier": verifier}
             )

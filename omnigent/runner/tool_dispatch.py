@@ -439,9 +439,9 @@ _ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {"sys_agent_list"}
 
 
 async def runner_uses_confined_bearer(server_client: httpx.AsyncClient | None) -> bool:
-    """Resolve credential capability off the event loop, including token refresh."""
+    """Read the last authenticated bearer's capability without refreshing it."""
     auth = getattr(server_client, "auth", None)
-    return await asyncio.to_thread(lambda: getattr(auth, "runner_confined", False) is True)
+    return getattr(auth, "runner_confined", False) is True
 
 
 def strip_account_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
@@ -5011,7 +5011,7 @@ async def _host_harnesses_or_none(
     server_client: httpx.AsyncClient,
 ) -> _JsonObject | None:
     """Return the bound host's reported harness readiness, best-effort."""
-    if not host_id:
+    if not host_id or await runner_uses_confined_bearer(server_client):
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
@@ -5920,6 +5920,7 @@ async def _session_list_via_rest(
     sessions_page = (
         _DiscoveryPage([], False)
         if cursor_state["sessions"][0] == _DISCOVERY_END
+        or await runner_uses_confined_bearer(server_client)
         else await _collect_global_sessions(
             server_client,
             agent_name,

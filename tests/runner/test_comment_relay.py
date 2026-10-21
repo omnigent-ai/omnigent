@@ -1574,6 +1574,11 @@ async def test_relay_refreshes_tools_when_bearer_becomes_confined(
                         if confined
                         else None,
                     )
+                    auth_flow = server_client.auth.auth_flow(
+                        httpx.Request("GET", "http://server/health")
+                    )
+                    next(auth_flow)
+                    auth_flow.close()
                     await _launch_bridged(client, session_id)
                     names = _relay_tool_names(relay_file)
                     assert ("sys_agent_list" in names) is not confined

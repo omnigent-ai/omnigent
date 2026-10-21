@@ -22,6 +22,7 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
+    runner_token_confinement,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -193,8 +194,14 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
+        confinement = runner_token_confinement(request)
+        children = page.data
+        if confinement is not None:
+            children = await asyncio.to_thread(
+                lambda: [child for child in children if confinement.allows_session(child.id)]
+            )
         data = await _child_session_summaries_from_conversations(
-            page.data,
+            children,
             session_id,
             conversation_store,
         )

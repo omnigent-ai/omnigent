@@ -217,3 +217,16 @@ def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypat
 )
 def test_runner_bearer_hint_ignores_opaque_or_malformed_tokens(token):
     assert not runner_bearer_is_confined(token)
+
+
+def test_runner_bearer_hint_recognizes_scoped_jwt():
+    from omnigent.server.oidc import mint_session_token
+
+    token = mint_session_token(
+        "alice",
+        b"test-only-secret" * 3,
+        1800,
+        "accounts",
+        extra_claims={"scope": "runner", "runner_id": "runner_hint"},
+    )
+    assert runner_bearer_is_confined(token)

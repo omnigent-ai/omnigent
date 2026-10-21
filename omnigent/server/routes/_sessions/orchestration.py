@@ -136,6 +136,8 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
+    RunnerTokenConfinement,
+    runner_token_confinement,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -2334,6 +2336,8 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    confinement: RunnerTokenConfinement | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -2386,6 +2390,17 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    if confinement is not None and isinstance(elicitation_id, str):
+        owner = _harness_elicitation_owners.get(elicitation_id)
+        entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        params = entry[1].get("params", {}) if entry is not None else {}
+        target = params.get("target_session_id") if isinstance(params, dict) else None
+        for target_id in (owner, target):
+            if isinstance(target_id, str) and not confinement.allows_session(target_id):
+                raise OmnigentError(
+                    "runner credential cannot resolve an approval outside its scope",
+                    code=ErrorCode.RUNNER_SCOPE_DENIED,
+                )
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
         session_id, elicitation_id, data, conversation_store
     ):
@@ -13446,6 +13461,7 @@ async def _get_session_snapshot(
             _pending_elicitation_snapshot_for_session,
             conv_store,
             conv,
+            confinement=runner_token_confinement(request) if request is not None else None,
         ),
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,

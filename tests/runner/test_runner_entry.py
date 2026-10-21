@@ -1727,7 +1727,8 @@ def test_runner_databricks_auth_does_not_remint_on_unrelated_redirect(
     assert factory_calls == 1
 
 
-def test_runner_databricks_auth_remints_on_401() -> None:
+@pytest.mark.parametrize("denied", [False, True])
+def test_runner_databricks_auth_remints_on_401(denied: bool) -> None:
     """The classic 401 path still re-mints (regression guard).
 
     The login-redirect fix added a parallel branch alongside the 401
@@ -1748,12 +1749,21 @@ def test_runner_databricks_auth_remints_on_401() -> None:
 
     auth = _RunnerDatabricksAuth(_factory)
     request = httpx.Request("GET", "http://server/v1/agents")
-    unauthorized = httpx.Response(401)
+    from omnigent.errors import ERROR_CODE_HEADER, ErrorCode
+
+    assert not auth.runner_confined
+    assert minted_tokens == []
+    unauthorized = (
+        httpx.Response(403, headers={ERROR_CODE_HEADER: ErrorCode.RUNNER_SCOPE_DENIED})
+        if denied
+        else httpx.Response(401)
+    )
 
     captured = _drive_auth_flow(auth, request, unauthorized)
 
-    assert len(captured) == 2
-    assert captured[1] == "Bearer tok-2"
+    assert len(captured) == (1 if denied else 2)
+    assert len(minted_tokens) == len(captured)
+    assert captured[-1] == ("Bearer tok-1" if denied else "Bearer tok-2")
 
 
 @pytest.mark.asyncio
@@ -3396,8 +3406,10 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
     assert "registry" not in (results[0].workdir / "config.yaml").read_text()
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
-def test_managed_mint_protocol_failure_never_falls_back(monkeypatch, cached):
+@pytest.mark.parametrize("caller", ["factory", "http", "tunnel"])
+async def test_managed_mint_protocol_failure_never_falls_back(monkeypatch, cached, caller):
     def refuse(mint_url, *args, **kwargs):
         request = httpx.Request("POST", mint_url)
         raise httpx.HTTPStatusError(
@@ -3409,7 +3421,18 @@ def test_managed_mint_protocol_failure_never_falls_back(monkeypatch, cached):
     if cached:
         factory._cached_token = "previous-bearer"
         factory._cached_expires_at = time.time() + 1
-    with pytest.raises(RuntimeError, match="upgrade the runner"):
-        factory()
+    with pytest.raises(httpx.HTTPStatusError, match="upgrade the runner"):
+        if caller == "http":
+            async with httpx.AsyncClient(
+                auth=_RunnerDatabricksAuth(factory),
+                transport=httpx.MockTransport(lambda _: pytest.fail("no callback after 426")),
+            ) as client:
+                await client.get("http://server/v1/runners/runner/status")
+        elif caller == "tunnel":
+            from omnigent.runner.transports.ws_tunnel.serve import _refresh_auth_token
+
+            await _refresh_auth_token("previous-bearer", factory)
+        else:
+            factory()
     assert not factory.declined
     assert not factory.proxy_auth_failed
