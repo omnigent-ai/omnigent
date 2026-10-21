@@ -59,8 +59,39 @@ from dateutil.rrule import (  # type: ignore[import-untyped]
 )
 
 
+class RRuleSearchLimitError(ValueError):
+    """A bounded search ran out of work or time, rather than occurrences."""
+
+
+def _starting_period(state: Any, start_at: datetime.datetime | None) -> datetime.datetime:
+    """Skip complete periods without changing DTSTART's defaults or interval phase."""
+    start = state._dtstart
+    if start_at is None or start_at <= start:
+        return start
+    after = start_at.astimezone(start.tzinfo)
+    interval = state._interval
+    frequency = state._freq
+    if frequency == YEARLY:
+        year = start.year + (after.year - start.year) // interval * interval
+        return start.replace(year=year, month=1, day=1)
+    if frequency == MONTHLY:
+        elapsed = (after.year - start.year) * 12 + after.month - start.month
+        year, month = divmod(
+            start.year * 12 + start.month - 1 + elapsed // interval * interval, 12
+        )
+        return start.replace(year=year, month=month + 1, day=1)
+    if frequency == WEEKLY:
+        week = start - datetime.timedelta(days=(start.weekday() - state._wkst) % 7)
+        periods = (after.date() - week.date()).days // (7 * interval)
+        return max(start, week + datetime.timedelta(weeks=periods * interval))
+    seconds = {DAILY: 86400, HOURLY: 3600, MINUTELY: 60, SECONDLY: 1}[frequency] * interval
+    # Arithmetic in the rule's timezone preserves wall-clock phase across DST.
+    periods = (after - start) // datetime.timedelta(seconds=seconds)
+    return start + datetime.timedelta(seconds=periods * seconds)
+
+
 def iter_bounded(
-    rule: rrule, *, max_steps: int, max_seconds: float
+    rule: rrule, *, max_steps: int, max_seconds: float, start_at: datetime.datetime | None = None
 ) -> Iterator[datetime.datetime]:
     remaining = max_steps
     deadline = monotonic() + max_seconds
@@ -69,13 +100,15 @@ def iter_bounded(
         nonlocal remaining
         remaining -= steps
         if remaining < 0:
-            raise ValueError("RRULE search exceeds the supported work limit")
+            raise RRuleSearchLimitError("RRULE search exceeds the supported work limit")
         if monotonic() >= deadline:
-            raise ValueError("RRULE search exceeds the supported time limit")
+            raise RRuleSearchLimitError("RRULE search exceeds the supported time limit")
 
     # Public dateutil stubs omit the iterator state and mask types.
     state = cast(Any, rule)
-    year, month, day, hour, minute, second, weekday, _yearday, _ = state._dtstart.timetuple()
+    # COUNT needs every previous occurrence; callers must retain its full walk.
+    start = _starting_period(state, start_at if state._count is None else None)
+    year, month, day, hour, minute, second, weekday, _yearday, _ = start.timetuple()
 
     # Some local variables to speed things up a bit
     freq = state._freq
