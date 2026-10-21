@@ -59,8 +59,7 @@ _CLAUDE_TITLE_MODEL_ENV = "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL"
 
 
 def background_title_model(harness: str) -> str | None:
-    """Return the economy-tier title model for a harness; claude honors
-    :data:`_CLAUDE_TITLE_MODEL_ENV` as an override."""
+    """Return the economy title model for a harness; Claude harnesses honor the env override."""
     model = _BACKGROUND_TITLE_MODELS.get(harness)
     if model is not None and harness in ("claude-sdk", "claude-native"):
         override = os.environ.get(_CLAUDE_TITLE_MODEL_ENV, "").strip()

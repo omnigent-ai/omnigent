@@ -106,6 +106,8 @@ logger = logging.getLogger(__name__)
 # producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+# Claude Code floors a thinking budget at this size and requires max_tokens above it.
+_CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
@@ -2714,12 +2716,13 @@ class ClaudeSDKExecutor(Executor):
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
         if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
-        if resolved.setting_sources == []:
-            # The CLI then skips the user settings env, which can hold the provider endpoint.
+        if resolved.setting_sources == [] and not self._gateway:
+            # The CLI then skips the user settings env, which may hold the only provider endpoint.
             env = {**_claude_user_settings_env(), **env}
         max_output_tokens = cfg.extra.get("max_tokens")
         if max_output_tokens is not None:
-            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(int(max_output_tokens))
+            max_output_tokens = int(max_output_tokens)
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -2750,8 +2753,10 @@ class ClaudeSDKExecutor(Executor):
             options_kwargs["setting_sources"] = resolved.setting_sources
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
-        if max_output_tokens is not None:
-            # Claude Code needs max_tokens above any thinking budget, so a small cap disables it.
+        if (
+            max_output_tokens is not None
+            and max_output_tokens <= _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS
+        ):
             options_kwargs["thinking"] = {"type": "disabled"}
         # Databricks opus/fable endpoints reject thinking.type="enabled"
         # (HTTP 400); they require "adaptive" instead (those tiers are
