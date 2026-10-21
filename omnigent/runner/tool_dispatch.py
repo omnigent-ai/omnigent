@@ -209,6 +209,12 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 
+# PHASE_TOOL_RESULT never parks an ASK gate server-side (only TOOL_CALL and the
+# REQUEST/LLM_REQUEST phases hold it), so the result gate must not wait a day for
+# a verdict. Bound its read so a wedged server degrades to the documented
+# fail-open keep-result path instead of hanging a completed built-in's result.
+_RESULT_POLICY_EVALUATE_TIMEOUT = httpx.Timeout(60.0, connect=30.0)
+
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
 # timeouts, so these must sit above the runner's execution timeout rather than
@@ -385,6 +391,11 @@ _TIMER_TOOLS = frozenset({"sys_timer_set", "sys_timer_cancel"})
 # Priority 5f.3: sys_advise_models — server-side via MCP intercept;
 # included in the tool surface only when smart routing is enabled.
 _ADVISE_MODELS_TOOLS = frozenset({"sys_advise_models"})
+
+# Built-ins whose /mcp route runs a server-side lifecycle hook beyond policy.
+# sys_read_inbox triggers undrained-subagent-result recovery (runner/mcp_routes.py),
+# so it keeps the /mcp round trip rather than dispatching locally.
+_SERVER_LIFECYCLE_HOOK_TOOLS = frozenset({SysReadInboxTool.name()})
 
 # Priority 5h: Task lifecycle tools — runner-local sys_cancel_task.
 # The only cancellable task ids visible to the LLM are async dispatches
@@ -932,6 +943,52 @@ def should_dispatch_locally(tool_name: str) -> bool:
     function directly — Phase 5 of RUNNER_TOOL_DISPATCH.md.
     """
     return tool_name in _ALL_LOCAL_TOOLS
+
+
+def _must_proxy_through_server_mcp(tool_name: str) -> bool:
+    """Return True if a tool must traverse the server /mcp round trip.
+
+    Spec-declared MCP-server tools need the server's held credentials and
+    configuration, ``sys_advise_models`` is intercepted server-side (it has no
+    runner-local execution branch), and ``sys_read_inbox`` relies on the /mcp
+    route's subagent-result recovery hook. Every other runner built-in runs
+    locally; its TOOL_CALL/TOOL_RESULT policy is enforced via the
+    ``/policies/evaluate`` endpoint rather than the full /mcp dispatch, which
+    avoids a server round trip on every built-in call.
+    """
+    if not should_dispatch_locally(tool_name):
+        return True
+    return tool_name in _ADVISE_MODELS_TOOLS or tool_name in _SERVER_LIFECYCLE_HOOK_TOOLS
+
+
+# Server release that surfaces an approved ASK's policy-transformed arguments on
+# ``/policies/evaluate``. Local built-in dispatch applies that transform before
+# execution; an older server collapses an approved ASK to ALLOW without the
+# transform, so the runner would execute the un-rewritten arguments. Keep those
+# built-ins on the /mcp gate (which applies the transform server-side) until the
+# server is new enough to return it.
+_BUILTIN_LOCAL_DISPATCH_MIN_SERVER_VERSION = "0.19.0"
+
+
+def _server_supports_builtin_local_dispatch(server_version: str | None) -> bool:
+    """Whether *server_version* surfaces approved-ASK policy transforms.
+
+    Local built-in dispatch trusts ``/policies/evaluate`` to return an approved
+    ASK's transformed arguments. Servers older than
+    ``_BUILTIN_LOCAL_DISPATCH_MIN_SERVER_VERSION`` return ALLOW without that
+    data, so fall back to the /mcp gate when the version is unknown or older.
+    """
+    if server_version is None:
+        return False
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return (
+            Version(server_version).release
+            >= Version(_BUILTIN_LOCAL_DISPATCH_MIN_SERVER_VERSION).release
+        )
+    except InvalidVersion:
+        return False
 
 
 # Granted tool names per live AgentSpec + effective harness, keyed by
@@ -6542,6 +6599,7 @@ async def execute_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    server_version: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -6577,9 +6635,27 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
-    # MCP dispatch resolves the target against the spec inside the MCP
-    # manager; every other branch is gated on the spec's granted surface.
-    if mcp_manager is None:
+    # Runner built-ins run locally even when an mcp_manager is present, so they
+    # skip the per-call server /mcp round trip; spec-declared MCP-server tools
+    # and server-intercepted built-ins still dispatch through /mcp. Local
+    # dispatch also requires the server policy channel, so a built-in that lacks
+    # one falls back to the /mcp gate rather than executing ungated — keeping the
+    # fail-closed TOOL_CALL contract. (A no-AP runner has mcp_manager=None and
+    # runs ungated by design on the branch below.) It also requires a server new
+    # enough to surface an approved ASK's transformed arguments; against an older
+    # or unknown server the built-in stays on the /mcp gate so a policy rewrite
+    # survives approval instead of executing the original arguments.
+    dispatch_builtin_locally = (
+        mcp_manager is not None
+        and server_client is not None
+        and conversation_id is not None
+        and not _must_proxy_through_server_mcp(tool_name)
+        and _server_supports_builtin_local_dispatch(server_version)
+    )
+    # /mcp dispatch resolves the target against the spec inside the MCP
+    # manager; every runner-local branch (including a locally dispatched
+    # built-in) is gated on the spec's granted surface.
+    if mcp_manager is None or dispatch_builtin_locally:
         refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
         if refusal is not None:
             return json.dumps({"error": refusal})
@@ -6601,12 +6677,27 @@ async def execute_tool(
                 "use sys_os_* tools and an inherited terminal for filesystem operations"
             }
         )
+    # A locally dispatched built-in skips the /mcp gate, so enforce TOOL_CALL
+    # policy here via /policies/evaluate. dispatch_builtin_locally guarantees the
+    # server policy channel, so this gate always runs for a local AP built-in.
+    if dispatch_builtin_locally:
+        assert server_client is not None and conversation_id is not None
+        decision = await _evaluate_builtin_tool_call_policy(
+            tool_name,
+            args,
+            server_client=server_client,
+            conversation_id=conversation_id,
+        )
+        if not decision.allowed:
+            return json.dumps({"error": f"Denied by policy: {decision.reason}"})
+        if decision.transformed_arguments is not None:
+            args = decision.transformed_arguments
+            arguments = json.dumps(args)
     try:
-        if mcp_manager is not None:
-            # All MCP tool calls are routed through the AP server's
-            # /mcp endpoint, which enforces TOOL_CALL and TOOL_RESULT
-            # policies centrally before forwarding to the runner's
-            # /mcp/execute. No runner-side policy gate needed.
+        if mcp_manager is not None and not dispatch_builtin_locally:
+            # Spec-declared MCP-server tools and server-intercepted built-ins
+            # route through the AP server's /mcp endpoint, which enforces
+            # TOOL_CALL/TOOL_RESULT policy centrally before runner execution.
             if agent_spec is None:
                 return "Error: agent_spec not available for MCP dispatch"
             output = await mcp_manager.call_tool(agent_spec, tool_name, args)
@@ -6671,6 +6762,7 @@ async def execute_tool(
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+                server_version=server_version,
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -6858,6 +6950,17 @@ async def execute_tool(
             successful=not output.startswith("Error:"),
             source="runner_shell",
         )
+    # Mirror the /mcp gate's post-execution TOOL_RESULT check for a locally
+    # dispatched built-in. TOOL_RESULT is not fail-closed, so a policy outage
+    # returns the completed output unchanged rather than blanking it.
+    if dispatch_builtin_locally and server_client is not None and conversation_id is not None:
+        output = await _apply_builtin_tool_result_policy(
+            tool_name,
+            args,
+            output,
+            server_client=server_client,
+            conversation_id=conversation_id,
+        )
     return output
 
 
@@ -6939,6 +7042,7 @@ async def dispatch_tool_locally(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    server_version: str | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -6989,6 +7093,7 @@ async def dispatch_tool_locally(
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
         effective_harness=effective_harness,
+        server_version=server_version,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -7835,6 +7940,7 @@ async def _execute_async_inbox_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
     effective_harness: str | None = None,
+    server_version: str | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -7885,6 +7991,7 @@ async def _execute_async_inbox_tool(
             mcp_manager=mcp_manager,
             filesystem_registry=filesystem_registry,
             effective_harness=effective_harness,
+            server_version=server_version,
         )
 
     if tool_name == SysCancelAsyncTool.name():
@@ -8328,42 +8435,163 @@ async def _evaluate_async_tool_call_policy(
 
     :returns: ``True`` when the tool may proceed; ``False`` to DENY.
     """
-    evaluation_id = f"poleval_async_{uuid.uuid4().hex[:12]}"
-    phase = "PHASE_TOOL_CALL"
     try:
-        try:
-            arguments_dict: _JsonObject = json.loads(tool_args)
-            if not isinstance(arguments_dict, dict):
-                arguments_dict = {}
-        except (json.JSONDecodeError, ValueError):
+        arguments_dict: _JsonObject = json.loads(tool_args)
+        if not isinstance(arguments_dict, dict):
             arguments_dict = {}
+    except (json.JSONDecodeError, ValueError):
+        arguments_dict = {}
+    decision = await _evaluate_builtin_tool_call_policy(
+        tool_name,
+        arguments_dict,
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
+    return decision.allowed
+
+
+@dataclass(frozen=True)
+class _BuiltinToolCallDecision:
+    """Outcome of a runner-local built-in's PHASE_TOOL_CALL policy check."""
+
+    allowed: bool
+    reason: str
+    transformed_arguments: _JsonObject | None
+
+
+async def _evaluate_builtin_tool_call_policy(
+    tool_name: str,
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> _BuiltinToolCallDecision:
+    """
+    Enforce PHASE_TOOL_CALL policy for a runner-dispatched built-in.
+
+    Built-ins execute on the runner, so unlike spec-declared MCP servers they
+    do not traverse the server /mcp round trip. This calls the AP server's
+    ``/policies/evaluate`` endpoint, which short-circuits when no policy
+    applies to the phase, to keep central TOOL_CALL enforcement.
+
+    PHASE_TOOL_CALL is fail-closed: a non-200 response or transport error
+    denies the call. An ASK verdict is parked server-side and collapses to
+    ALLOW/DENY before returning; an unexpected raw ASK is treated as a deny.
+
+    :returns: Decision carrying the allow flag, a deny reason, and any
+        policy-transformed arguments to execute with.
+    """
+    try:
         resp = await server_client.post(
             f"{_session_url(conversation_id)}/policies/evaluate",
             json={
-                "event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}
+                "event": {
+                    "type": "PHASE_TOOL_CALL",
+                    "data": {"name": tool_name, "arguments": args},
+                }
             },
             timeout=_ASK_GATE_DELIVERY_TIMEOUT,
         )
-        if resp.status_code == 200:
-            result = _string_object_dict(resp.json())
-            if result is None:
-                return False
-            action = result.get("result", "POLICY_ACTION_DENY")
-            return bool(action == "POLICY_ACTION_ALLOW" or action == "POLICY_ACTION_UNSPECIFIED")
-        _logger.warning(
-            "async PHASE_TOOL_CALL policy evaluate returned %d for %s; denying",
-            resp.status_code,
-            evaluation_id,
-            extra={"session_id": conversation_id},
-        )
     except Exception:  # noqa: BLE001
         _logger.warning(
-            "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
-            evaluation_id,
+            "built-in %s PHASE_TOOL_CALL policy evaluate failed; denying",
+            tool_name,
             exc_info=True,
             extra={"session_id": conversation_id},
         )
-    return False
+        return _BuiltinToolCallDecision(False, "policy evaluation failed", None)
+    if resp.status_code != 200:
+        _logger.warning(
+            "built-in %s PHASE_TOOL_CALL policy evaluate returned %d; denying",
+            tool_name,
+            resp.status_code,
+            extra={"session_id": conversation_id},
+        )
+        return _BuiltinToolCallDecision(False, "policy evaluation unavailable", None)
+    try:
+        verdict = _string_object_dict(resp.json())
+    except (json.JSONDecodeError, ValueError):
+        verdict = None
+    if verdict is None:
+        return _BuiltinToolCallDecision(False, "policy evaluation returned no verdict", None)
+    action = verdict.get("result")
+    reason = _optional_string(verdict.get("reason")) or "no reason given"
+    if action in {"POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"}:
+        return _BuiltinToolCallDecision(True, reason, _string_object_dict(verdict.get("data")))
+    return _BuiltinToolCallDecision(False, reason, None)
+
+
+async def _apply_builtin_tool_result_policy(
+    tool_name: str,
+    args: _JsonObject,
+    output: str,
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> str:
+    """
+    Enforce PHASE_TOOL_RESULT policy for a runner-dispatched built-in.
+
+    Mirrors the server /mcp path's post-execution gate using
+    ``/policies/evaluate``: a DENY suppresses the output, while an ALLOW or ASK
+    passes it through — replaced with policy-transformed ``data`` only when the
+    verdict carries it. The server /mcp gate this replaces suppresses a
+    runner-executed tool's result on DENY alone; a TOOL_RESULT ASK cannot prompt
+    mid-flight, so it falls through rather than blanking the result.
+    PHASE_TOOL_RESULT is not a fail-closed phase, so an evaluation failure keeps
+    the output unchanged rather than blanking a completed built-in's result.
+
+    :returns: The policy-approved, possibly transformed or suppressed, output.
+    """
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{conversation_id}/policies/evaluate",
+            json={
+                "event": {
+                    "type": "PHASE_TOOL_RESULT",
+                    "data": {"result": output},
+                    "request_data": {"name": tool_name, "arguments": args},
+                }
+            },
+            timeout=_RESULT_POLICY_EVALUATE_TIMEOUT,
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "built-in %s PHASE_TOOL_RESULT policy evaluate failed; keeping result",
+            tool_name,
+            exc_info=True,
+            extra={"session_id": conversation_id},
+        )
+        return output
+    if resp.status_code != 200:
+        _logger.warning(
+            "built-in %s PHASE_TOOL_RESULT policy evaluate returned %d; keeping result",
+            tool_name,
+            resp.status_code,
+            extra={"session_id": conversation_id},
+        )
+        return output
+    try:
+        verdict = _string_object_dict(resp.json())
+    except (json.JSONDecodeError, ValueError):
+        return output
+    if verdict is None:
+        return output
+    action = verdict.get("result")
+    if action == "POLICY_ACTION_DENY":
+        reason = _optional_string(verdict.get("reason")) or "no reason given"
+        return f"[Result suppressed by policy: {reason}]"
+    transformed = verdict.get("data")
+    if transformed is not None:
+        if not isinstance(transformed, str):
+            _logger.warning(
+                "built-in %s TOOL_RESULT policy data must be str; got %s — coercing via str()",
+                tool_name,
+                type(transformed).__name__,
+                extra={"session_id": conversation_id},
+            )
+        return transformed if isinstance(transformed, str) else str(transformed)
+    return output
 
 
 def _spawn_async_tool(
@@ -8384,6 +8612,7 @@ def _spawn_async_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
     effective_harness: str | None = None,
+    server_version: str | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
@@ -8479,6 +8708,7 @@ def _spawn_async_tool(
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+                server_version=server_version,
             )
             execution_task = asyncio.create_task(exec_coro)
             cancellation_task = asyncio.create_task(cancel_event.wait())

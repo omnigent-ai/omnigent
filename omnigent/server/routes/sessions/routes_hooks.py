@@ -1008,6 +1008,11 @@ def register_hooks_routes(
                                 "reason": result.reason or "Approval was not granted.",
                             }
                         )
+                        # An approved ASK still carries any policy-transformed
+                        # data (e.g. rewritten tool arguments); surface it so a
+                        # caller applies the approved form, matching a direct ALLOW.
+                        if approved and result.data is not None:
+                            approval_body["data"] = result.data
                         add_audit_attrs(
                             policy_verdict=approval_body["result"],
                             policy_phase=phase.value,
