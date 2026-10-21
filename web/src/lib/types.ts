@@ -564,6 +564,8 @@ export interface SandboxStatus {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error?: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
+  provider?: string | null;
 }
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */

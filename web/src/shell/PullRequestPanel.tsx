@@ -1,9 +1,8 @@
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
-// PullRequestPanel — the right-rail "Pull Requests" tab. Read-only view of the
-// session branch's relationship to its git provider: the associated PR (number,
-// title, state, CI summary, link out) and the branch-vs-base diff.
+// PullRequestPanel — the right-rail "Pull Requests" tab: the session branch's PR
+// (number, title, state, CI summary, labels, link out) and the branch-vs-base diff.
 // Provider-visible text comes from lib/gitProviders.ts.
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll
@@ -23,6 +22,7 @@
 // the header + stacked diff.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -49,6 +49,7 @@ import {
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   PlusIcon,
+  RefreshCwIcon,
   Rows2Icon,
   ServerOffIcon,
   TerminalIcon,
@@ -73,10 +74,12 @@ import {
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useCanEdit } from "@/hooks/usePermissions";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
-import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
+import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchPullRequestFileContents,
@@ -95,6 +98,7 @@ import {
   type PullRequestInfo,
   type PullRequestReviewer,
 } from "@/hooks/usePullRequests";
+import { PullRequestLabels } from "./PullRequestLabels";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -223,6 +227,7 @@ function GithubAccountSelector({
 export type PullRequestPanelState =
   | { kind: "loading" }
   | { kind: "runner-offline" }
+  | { kind: "sandbox-offline" }
   | { kind: "error"; message: string }
   | { kind: "host-outdated" }
   | { kind: "unavailable" }
@@ -242,7 +247,13 @@ export function derivePullRequestPanelState(info: {
   isLoading: boolean;
   error: unknown;
   data: PullRequestInfo | undefined;
+  /** The session's managed sandbox is asleep (see `useWorkspaceAsleep`). */
+  sandboxAsleep?: boolean;
 }): PullRequestPanelState {
+  // Nothing can answer until the sandbox starts again, so the query is skipped
+  // or 503s. Say so instead of spinning or "not available"; info cached before
+  // it stopped still renders.
+  if (info.sandboxAsleep && info.data === undefined) return { kind: "sandbox-offline" };
   if (info.isLoading) return { kind: "loading" };
   if (info.error) {
     if (info.error instanceof RunnerOfflineError) return { kind: "runner-offline" };
@@ -515,11 +526,13 @@ function listKeys<T>(items: readonly T[], identity: (item: T) => readonly unknow
   });
 }
 
+const CHECK_ROW_CLASS = "flex items-center gap-2 px-1.5 py-1.5";
+
 /**
  * A CI-status pill (e.g. "✓ 66 passed"); hovering it reveals the individual job
  * names in that bucket, each with the status icon and a divider between rows.
- * Renders nothing when the bucket is empty. The full list shows — the card is
- * height-capped and scrolls.
+ * A job with an http(s) run URL links to it. Renders nothing when the bucket
+ * is empty. The full list shows — the card is height-capped and scrolls.
  */
 function CheckPill({
   label,
@@ -562,14 +575,33 @@ function CheckPill({
           <p className="px-1.5 py-1 text-muted-foreground">No job details.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {names.map((r, i) => (
-              <li key={keys[i]} className="flex items-center gap-2 px-1.5 py-1.5">
-                <span className="shrink-0">{icon}</span>
-                <span className="truncate" title={r.name}>
-                  {r.name}
-                </span>
-              </li>
-            ))}
+            {names.map((r, i) => {
+              const href = r.url ? parseHttpUrl(r.url)?.href : undefined;
+              const row = (
+                <>
+                  <span className="shrink-0">{icon}</span>
+                  <span className="truncate" title={r.name}>
+                    {r.name}
+                  </span>
+                </>
+              );
+              return (
+                <li key={keys[i]}>
+                  {href ? (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={cn(CHECK_ROW_CLASS, "cursor-pointer hover:underline")}
+                    >
+                      {row}
+                    </a>
+                  ) : (
+                    <div className={CHECK_ROW_CLASS}>{row}</div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </HoverCardContent>
@@ -742,16 +774,18 @@ function PullRequestCommentCard({
   );
 }
 
-/** The Summary tab body: reviewers, CI checks, then the PR description. When the token
- *  can't read check runs, the Checks area says so instead of counts. */
+/** The Summary tab body: reviewers, labels, CI checks, then the PR description. When the
+ *  token can't read check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   reviewers,
+  labels,
   checks,
   checksSupported,
   checksUnavailableHint,
   body,
 }: {
   reviewers: PullRequestReviewer[] | undefined;
+  labels: React.ReactNode;
   checks: PullRequestChecks;
   checksSupported: boolean;
   checksUnavailableHint?: string;
@@ -762,6 +796,7 @@ function PullRequestSummaryTab({
     // of the very bottom edge, where it's awkward to read.
     <div className="space-y-4 p-3 pb-16">
       {reviewers !== undefined && <PullRequestReviewers reviewers={reviewers} />}
+      {labels}
       {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
           pill to see the job names in that bucket. */}
       {(checks.total > 0 || checks.partial || !checksSupported) && (
@@ -1038,6 +1073,29 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
+  const queryClient = useQueryClient();
+  const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all(
+        ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
+          queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
+        ),
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const refreshIcon = (
+    <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} aria-hidden="true" />
+  );
+  const refreshButton = (
+    <Button size="sm" variant="ghost" disabled={refreshing} onClick={refresh}>
+      {refreshIcon}
+      Refresh
+    </Button>
+  );
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
     data: Pick<
@@ -1220,6 +1278,9 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
               <TooltipProvider delayDuration={0}>
+                <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+                  {refreshIcon}
+                </IconButton>
                 <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>
@@ -1244,8 +1305,9 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           </div>
         </div>
       ) : panelState.kind !== "ready" ? (
-        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+        <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
           <PanelTitle copy={copy} showTitle />
+          {refreshButton}
         </div>
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
@@ -1265,6 +1327,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           conversationId={conversationId}
           info={info}
           showProviderIcon={!showTrackingControls}
+          refreshButton={!showTrackingControls ? refreshButton : undefined}
           emptyStateAction={
             associations?.tracking_available && linkInEmptyState ? (
               <div className="mt-2 w-full max-w-sm">
@@ -1285,11 +1348,13 @@ function PullRequestPanelDetails({
   conversationId,
   info,
   showProviderIcon,
+  refreshButton,
   emptyStateAction,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
   showProviderIcon: boolean;
+  refreshButton?: React.ReactNode;
   emptyStateAction?: React.ReactNode;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
@@ -1300,6 +1365,8 @@ function PullRequestPanelDetails({
   const hasPr = !!info.data?.pr;
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  const canEdit = useCanEdit(conversationId);
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
@@ -1365,7 +1432,7 @@ function PullRequestPanelDetails({
   }, [files]);
 
   // Parse the one whole-PR patch into per-file diffs, keyed by path.
-  const filesByPath = useMemo(() => {
+  const { filesByPath, parseError } = useMemo(() => {
     const map = new Map<string, FileDiffMetadata>();
     const patch = prDiff.data?.patch;
     if (patch) {
@@ -1374,11 +1441,13 @@ function PullRequestPanelDetails({
           for (const f of parsed.files) map.set(f.name, f);
         }
       } catch {
-        // A malformed patch just yields no rendered diffs (the sidebar and the
-        // per-section "no diff" fallback still render).
+        return {
+          filesByPath: map,
+          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
+        };
       }
     }
-    return map;
+    return { filesByPath: map, parseError: undefined };
   }, [prDiff.data]);
 
   // Expand-context loader: fetch a file's full old/new content on demand when
@@ -1473,6 +1542,7 @@ function PullRequestPanelDetails({
     isLoading: info.isLoading,
     error: info.error,
     data: info.data,
+    sandboxAsleep,
   });
   switch (panelState.kind) {
     case "loading":
@@ -1486,6 +1556,13 @@ function PullRequestPanelDetails({
       return (
         <PanelMessage>
           <p>The agent is asleep. Send a message to reconnect its runner.</p>
+          {emptyStateAction}
+        </PanelMessage>
+      );
+    case "sandbox-offline":
+      return (
+        <PanelMessage>
+          <p>The sandbox is offline. Send a message in the chat to start it again.</p>
           {emptyStateAction}
         </PanelMessage>
       );
@@ -1636,6 +1713,7 @@ function PullRequestPanelDetails({
                   </>
                 )}
               </span>
+              <div className="ml-auto shrink-0">{refreshButton}</div>
             </div>
             <div className="mt-1 flex flex-nowrap items-center gap-2">
               <a
@@ -1680,6 +1758,17 @@ function PullRequestPanelDetails({
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
           <PullRequestSummaryTab
             reviewers={pr.reviewers}
+            labels={
+              pr.labels !== undefined &&
+              data.selected_pr_url && (
+                <PullRequestLabels
+                  conversationId={conversationId}
+                  prUrl={data.selected_pr_url}
+                  labels={pr.labels}
+                  editable={canEdit && !!data.capabilities.label_editing}
+                />
+              )
+            }
             checks={checks}
             checksSupported={pr.checks_supported !== false}
             checksUnavailableHint={copy.checksUnavailableHint}
@@ -1769,7 +1858,9 @@ function PullRequestPanelDetails({
                   </p>
                 ) : files.length === 0 ? (
                   <p className="px-2 py-1 text-ui text-muted-foreground">
-                    {changes.data?.has_more || changes.data?.warning
+                    {changes.data?.available === false ||
+                    changes.data?.has_more ||
+                    changes.data?.warning
                       ? "Changed files are unavailable."
                       : "No changes vs base."}
                   </p>
@@ -1793,8 +1884,12 @@ function PullRequestPanelDetails({
               onScroll={onScroll}
               className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
             >
-              {prDiff.error ? (
-                <PanelMessage>{(prDiff.error as Error).message}</PanelMessage>
+              {changes.error || prDiff.error || parseError ? (
+                <PanelMessage>
+                  <p role="alert">
+                    {parseError || ((changes.error || prDiff.error) as Error).message}
+                  </p>
+                </PanelMessage>
               ) : prDiff.data?.unavailable_reason ? (
                 <PanelMessage>
                   {prDiff.data.message ||
@@ -1809,7 +1904,9 @@ function PullRequestPanelDetails({
                       <Loader2Icon className="size-5 animate-spin" />
                       Loading changes…
                     </>
-                  ) : changes.data?.has_more || changes.data?.warning ? (
+                  ) : changes.data?.available === false ||
+                    changes.data?.has_more ||
+                    changes.data?.warning ? (
                     "Changed files are unavailable."
                   ) : (
                     "No changes vs base."

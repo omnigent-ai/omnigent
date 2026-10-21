@@ -945,7 +945,10 @@ class SandboxHostLauncher(SandboxLifecycle):
 
         :param sandbox_id: The sandbox from :meth:`provision`.
         :param token: The raw launch token the host authenticates with.
-        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_id: Host identity, e.g. ``"host_a1b2c3d4..."``, minted by the
+            server or chosen by a managed create's ``host_id``. The host must
+            register under exactly this id: *token* resolves only for it, and the
+            session's caller may already route by it.
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.
@@ -1055,10 +1058,17 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 (HOST_NAME_ENV_VAR, host_name),
             )
         )
-        self.run_background(
-            sandbox_id,
-            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-        )
+        try:
+            self.run_background(
+                sandbox_id,
+                f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+            )
+        except click.ClickException as exc:
+            # Provider errors echo the failed command, and this one carries the token.
+            # Redact in place so subclasses such as SandboxGoneError keep their type.
+            exc.message = exc.message.replace(token, "[redacted]")  # type: ignore[read-only]
+            exc.args = (exc.message,)
+            raise exc from None
         return workspace
 
     def materialize_workspace(

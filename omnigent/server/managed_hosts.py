@@ -40,6 +40,10 @@ stores into ``create_app``):
          # For SEVERAL providers, replace `provider:` with a `providers:`
          # list (mutually exclusive); a create picks one by name via
          # `sandbox_provider`, else the first. See parse_sandbox_config.
+         shutdown_drain_s: 0      # optional; deployment-wide. Seconds a
+                                  # shutting-down server waits for in-flight
+                                  # launches to bind their host; needs another
+                                  # replica to take the host (default: 0)
          reaper:                  # optional; deployment-wide, not per-provider
            enabled: true          # default: false
            terminate_after_offline_days: 30  # default: 30 days
@@ -340,6 +344,73 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # ``<base>.`` family, and the fork's own launch re-stamps whatever it resolves),
 # while an in-place agent switch keeps them — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+# Server-owned routing id from a managed create's or fork's ``host_id``:
+# available before the host binds, and never copied from a fork's source.
+REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
+
+
+def managed_host_name(host_id: str) -> str:
+    """
+    The host-picker name of the managed host *host_id*, e.g. ``"managed-a1b2c3d4"``.
+
+    ``(owner, name)`` is unique in the hosts table, so the name embeds the id's
+    leading hex; a create that chooses its id must avoid an owner's taken name.
+
+    :param host_id: The managed host's id.
+    :returns: Its display name.
+    """
+    return f"managed-{host_id[:8]}"
+
+
+def host_slice_key_enabled(labels: Mapping[str, str], host_id: str) -> bool:
+    """
+    Whether a session's managed host routes by its own id.
+
+    Only when the create or fork chose this host id, so the caller routes by it from
+    the start; otherwise the host stays on the caller's default replica.
+
+    :param labels: The session's labels.
+    :param host_id: The session's managed host.
+    :returns: ``True`` when the create requested *host_id*.
+    """
+    return labels.get(REQUESTED_HOST_ID_LABEL_KEY) == host_id
+
+
+def _with_host_slice_key(
+    host_config: dict[str, object] | None, enabled: bool, server_url: str
+) -> dict[str, object] | None:
+    """
+    Apply the launch's ``host.slice_key_enabled`` decision to *host_config*.
+
+    The setting rides ``host_config`` because every launcher already installs
+    it before the host starts; a host env var would need each launcher's own
+    plumbing. The env var ``OMNIGENT_HOST_SLICE_KEY_ENABLED`` still overrides it.
+    *host_config* is returned as is when the host would already key as
+    *enabled* says, whether by the deployment's explicit
+    ``host.slice_key_enabled`` or, absent one, by its default for
+    *server_url*; so when no override or deployment config is needed,
+    ``host_config`` stays unset for legacy launchers. An explicit deployment
+    value that contradicts the launch is overwritten: the launch decides the
+    host's routing, since the caller already routes by its decision.
+
+    :param host_config: The deployment's ``sandbox.host_config``, or ``None``.
+    :param enabled: Whether the host keys its traffic by its own id.
+    :param server_url: URL the host dials, which sets its default.
+    :returns: *host_config*, or a copy with the setting in its ``host`` section.
+    """
+    from omnigent.util.server_url import is_workspace_hosted_url
+
+    existing = host_config.get("host") if host_config else None
+    configured = existing.get("slice_key_enabled") if isinstance(existing, dict) else None
+    current = configured if isinstance(configured, bool) else is_workspace_hosted_url(server_url)
+    if enabled == current:
+        return host_config
+    merged = dict(host_config or {})
+    host = dict(existing) if isinstance(existing, dict) else {}
+    host["slice_key_enabled"] = enabled
+    merged["host"] = host
+    return merged
 
 
 def managed_repo_labels(workspaces: Sequence[str]) -> dict[str, str]:
@@ -657,6 +728,11 @@ class ManagedSandboxReaperConfig:
     sweep_interval_s: int = 24 * 60 * 60
 
 
+_SHUTDOWN_DRAIN_ERROR = (
+    "server config 'sandbox.shutdown_drain_s' must be a non-negative number of seconds"
+)
+
+
 @dataclass
 class ManagedSandboxDeployment:
     """
@@ -678,12 +754,19 @@ class ManagedSandboxDeployment:
         default a request that names no provider gets.
     :param reaper: One deployment-wide reaper policy shared by every
         configured provider.
+    :param shutdown_drain_s: Seconds a shutting-down server waits for
+        in-flight launches to bind their session to a host before
+        cancelling them. A launch can only bind through another replica
+        (this one has stopped accepting connections), so ``0`` (no wait)
+        suits a single replica. A multi-replica deployment sizes it, plus
+        uvicorn's graceful shutdown, inside its termination grace period.
     """
 
     configs: tuple[ManagedSandboxConfig, ...]
     reaper: ManagedSandboxReaperConfig = dataclass_field(
         default_factory=ManagedSandboxReaperConfig
     )
+    shutdown_drain_s: float = 0.0
 
     def __post_init__(self) -> None:
         # Enforce the "never empty" invariant the accessors rely on
@@ -692,6 +775,9 @@ class ManagedSandboxDeployment:
         # direct constructor passed ``configs=()``.
         if not self.configs:
             raise ValueError("ManagedSandboxDeployment requires at least one provider config")
+        # Embedders construct this directly, bypassing the YAML parser.
+        if not math.isfinite(self.shutdown_drain_s) or self.shutdown_drain_s < 0:
+            raise ValueError(_SHUTDOWN_DRAIN_ERROR)
 
     @classmethod
     def single(
@@ -699,6 +785,7 @@ class ManagedSandboxDeployment:
         config: ManagedSandboxConfig,
         *,
         reaper: ManagedSandboxReaperConfig | None = None,
+        shutdown_drain_s: float = 0.0,
     ) -> ManagedSandboxDeployment:
         """
         Wrap one provider config as a one-provider deployment.
@@ -709,9 +796,14 @@ class ManagedSandboxDeployment:
 
         :param config: The single provider's config.
         :param reaper: Optional deployment-wide reaper policy.
+        :param shutdown_drain_s: See :attr:`shutdown_drain_s`.
         :returns: A deployment offering exactly *config*.
         """
-        return cls(configs=(config,), reaper=reaper or ManagedSandboxReaperConfig())
+        return cls(
+            configs=(config,),
+            reaper=reaper or ManagedSandboxReaperConfig(),
+            shutdown_drain_s=shutdown_drain_s,
+        )
 
     @property
     def default(self) -> ManagedSandboxConfig:
@@ -1332,11 +1424,22 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
     if not isinstance(raw, dict):
         raise ValueError("server config 'sandbox' must be a mapping")
     reaper = _parse_managed_sandbox_reaper_config(raw)
+    raw_drain = raw.get("shutdown_drain_s", 0)
+    if not isinstance(raw_drain, (int, float)) or isinstance(raw_drain, bool):
+        raise ValueError(_SHUTDOWN_DRAIN_ERROR)
+    try:
+        shutdown_drain_s = float(raw_drain)
+    except OverflowError:
+        raise ValueError(_SHUTDOWN_DRAIN_ERROR) from None
     if "providers" in raw:
-        return _parse_multi_provider_sandbox_config(raw, reaper=reaper)
+        return replace(
+            _parse_multi_provider_sandbox_config(raw, reaper=reaper),
+            shutdown_drain_s=shutdown_drain_s,
+        )
     return ManagedSandboxDeployment.single(
         _parse_single_provider_sandbox_config(raw),
         reaper=reaper,
+        shutdown_drain_s=shutdown_drain_s,
     )
 
 
@@ -1413,7 +1516,9 @@ def _parse_multi_provider_sandbox_config(
     # Shared keys describe THIS server, so they ride into every entry
     # instead of being repeated per entry.
     shared = {
-        key: value for key, value in raw.items() if key not in {"providers", "provider", "reaper"}
+        key: value
+        for key, value in raw.items()
+        if key not in {"providers", "provider", "reaper", "shutdown_drain_s"}
     }
     parsed: list[ManagedSandboxConfig] = []
     seen: set[str] = set()
@@ -1427,11 +1532,12 @@ def _parse_multi_provider_sandbox_config(
             raise ValueError(
                 f"server config 'sandbox.providers[{index}]' must not nest 'providers'"
             )
-        if "reaper" in entry:
-            raise ValueError(
-                "server config 'sandbox.reaper' is deployment-wide and must be set "
-                "next to 'providers', not inside a provider entry"
-            )
+        for key in ("reaper", "shutdown_drain_s"):
+            if key in entry:
+                raise ValueError(
+                    f"server config 'sandbox.{key}' is deployment-wide and must be set "
+                    "next to 'providers', not inside a provider entry"
+                )
         config = _parse_single_provider_sandbox_config({**shared, **entry})
         # Always a str: the single-provider parser rejects anything else.
         name = str(config.provider)
@@ -3461,6 +3567,7 @@ async def launch_managed_host(
     provider: str | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    host_id: str | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -3502,6 +3609,9 @@ async def launch_managed_host(
         worker thread (the sandbox exec steps run via
         ``asyncio.to_thread``), so it must be thread-safe. ``None``
         disables progress reporting.
+    :param host_id: Id to register the host under — a create's
+        ``host_id`` — or ``None`` to mint one. A requested id also makes the
+        host route by it (see :func:`host_slice_key_enabled`).
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3511,11 +3621,9 @@ async def launch_managed_host(
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
-    host_id = uuid.uuid4().hex
-    # Visible label in the host picker; (owner, name) is the hosts
-    # table PK, so embed the host_id's leading hex for uniqueness
-    # across a user's managed sandboxes.
-    host_name = f"managed-{host_id[:8]}"
+    slice_key_enabled = host_id is not None
+    host_id = host_id or uuid.uuid4().hex
+    host_name = managed_host_name(host_id)
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
@@ -3536,6 +3644,7 @@ async def launch_managed_host(
         repos=repos,
         agent_name=agent_name,
         on_stage=on_stage,
+        slice_key_enabled=slice_key_enabled,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
@@ -3548,6 +3657,7 @@ async def relaunch_managed_host(
     repos: Sequence[RepoWorkspace] = (),
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    slice_key_enabled: bool = False,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -3580,6 +3690,8 @@ async def relaunch_managed_host(
     :param on_stage: Progress observer forwarded to
         :func:`_register_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
+    :param slice_key_enabled: Whether the host routes by its own id, as at its
+        first launch (see :func:`host_slice_key_enabled`).
     :returns: The (unchanged) host id + fresh in-sandbox workspace.
     :raises HTTPException: 400 when the host's recorded provider no
         longer matches the configured launcher; 502 when
@@ -3630,6 +3742,7 @@ async def relaunch_managed_host(
             agent_name=agent_name,
             on_stage=on_stage,
             keep_host_on_failure=True,
+            slice_key_enabled=slice_key_enabled,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -3752,6 +3865,7 @@ async def _register_and_start_host(
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
+    slice_key_enabled: bool = False,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -3788,6 +3902,7 @@ async def _register_and_start_host(
     :param keep_host_on_failure: ``True`` on a relaunch — failure
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
+    :param slice_key_enabled: Whether the host routes by its own id.
     :returns: The absolute in-sandbox workspace path.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
@@ -3830,7 +3945,9 @@ async def _register_and_start_host(
             host_name=host_name,
             server_url=config.server_url,
             repos=repos,
-            host_config=config.host_config,
+            host_config=_with_host_slice_key(
+                config.host_config, slice_key_enabled, config.server_url
+            ),
             agent_name=agent_name,
             on_stage=on_stage,
         )
@@ -4010,6 +4127,7 @@ async def resume_managed_host(
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
+    slice_key_enabled: bool = False,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -4051,6 +4169,8 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
+    :param slice_key_enabled: Whether the host routes by its own id, as at its
+        first launch (see :func:`host_slice_key_enabled`).
     :raises SandboxGoneError: When the sandbox generation definitively no
         longer exists, allowing the caller to create a fresh one.
     :raises HTTPException: 502 when the resume or host restart otherwise fails.
@@ -4132,7 +4252,9 @@ async def resume_managed_host(
                 host_name=host.name,
                 server_url=entry.server_url,
                 repos=workspace_repos,
-                host_config=entry.host_config,
+                host_config=_with_host_slice_key(
+                    entry.host_config, slice_key_enabled, entry.server_url
+                ),
                 on_stage=on_stage,
                 agent_name=agent_name,
             )

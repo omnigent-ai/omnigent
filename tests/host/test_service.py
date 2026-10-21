@@ -44,6 +44,7 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert payload["Label"] == "ai.omnigent.host"
     assert payload["ProgramArguments"] == [
         "/opt/omnigent/bin/python",
+        "-P",
         "-m",
         "omnigent.host.service_entry",
         "--server",
@@ -167,7 +168,7 @@ def test_enable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert installed.path == tmp_path / "xdg/systemd/user/omnigent-host.service"
     assert 'Environment="HOME=' in unit
     assert (
-        'ExecStart="/opt/omnigent/bin/python" "-m" "omnigent.host.service_entry" "--local"'
+        'ExecStart="/opt/omnigent/bin/python" "-P" "-m" "omnigent.host.service_entry" "--local"'
     ) in unit
     assert "Restart=on-failure" in unit
     assert "RestartPreventExitStatus=78 143" in unit

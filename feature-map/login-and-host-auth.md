@@ -26,7 +26,9 @@ be able to write resources without a separate Omnigent account.
 - `profile-selection`: when several Databricks profiles match the workspace, the
   person's own profile wins over a service principal.
 - `expired-credential`: an expired or revoked Databricks credential leads to a
-  re-authentication prompt, not a raw 403 from the workspace edge.
+  re-authentication prompt. When a newly launched runner explicitly reports a
+  pending host sign-in, its first message waits on that same runner until the
+  sign-in finishes or its bounded wait expires.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
@@ -42,7 +44,9 @@ be able to write resources without a separate Omnigent account.
   other's records, so two that start at the same moment can both connect.
 - `host-inline-login`: `omnigent host` against a Databricks-fronted server that
   the user is not signed in to runs the login flow first; `--non-interactive`
-  fails with the login command instead.
+  fails with the login command instead. States: missing Databricks SDK extra,
+  missing Databricks CLI, first browser login followed by host registration,
+  and a saved login reused on the next invocation.
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.
@@ -131,6 +135,15 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/e2e/test_host_auth_prefers_user_over_m2m_sp_e2e.py::test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile`
 - **`expired-credential`:**
   `tests/e2e/test_expired_databricks_credential_launch.py::test_expired_databricks_credential_offers_reauth_not_edge_403`
+- **Pending host sign-in:**
+  `tests/server/integration/test_session_host_launch.py::test_host_session_message_waits_for_bound_runner_before_relaunch`
+  checks that the original message is forwarded once after the sign-in wait,
+  without replacing the runner. The `sign_in_pending` parameter covers the
+  explicit pending state; ordinary startup retains its shorter grace.
+  `tests/server/routes/test_runner_connect_wait.py::test_explicit_sign_in_wait_is_bounded_and_owned`
+  covers cancellation, stop, replacement, process exit and expiry. The isolated
+  header-mode environment has no interactive credential source, so it cannot
+  drive an actual browser reauthorization.
 - **`databricks-credential-kind`:** needs a real workspace and one test
   profile of each kind. No e2e covers the host daemon against a real workspace.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands
@@ -147,6 +160,40 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
   A real check needs two URLs that reach one workspace, so run it only in a
   private-network sandbox against a disposable server.
+- **`host-inline-login` (own environment, Linux):** run
+  `uv run --no-sync pytest tests/e2e/test_host_inline_login.py --reruns 0 -q`.
+  It starts an isolated real server and a local HTTPS mock workspace, then
+  drives the real Omnigent and Databricks CLIs through a PTY. First, with the
+  Databricks CLI absent from PATH, the command must exit with a two-line error
+  naming the missing CLI and giving an install link and retry guidance, without
+  the unrelated `omnigent stop` hint, opening a browser, or registering a host.
+  Restore the CLI and retry the same command and home: Chromium completes the
+  OAuth callback, the command continues to `Connected as`, and `GET /v1/hosts`
+  confirms this user's host is
+  online. Restart with the same home to confirm its host ID and login are reused
+  without a second browser authorization. Transcripts and host API snapshots
+  remain in pytest's temporary directory; use `--basetemp=/tmp/host-onboarding`
+  to keep them at a known location.
+  Prerequisites: Databricks CLI, OpenSSL, and this checkout's Playwright Chromium
+  (`uv run --no-sync playwright install chromium`). Missing prerequisites skip
+  the journey; a passing feature-map check does not run it. The regular E2E CI
+  setup does not provision the Databricks CLI or Chromium for this test.
+  This proves a mock workspace's OAuth and the real local host tunnel, not a
+  live Databricks workspace, event network, or remote-browser callback.
+- **Inline-login component variants:**
+  `tests/cli/test_login_databricks.py::test_login_apps_fails_loud_without_databricks_extra`
+  checks the SDK install hint, and
+  `tests/cli/test_login_databricks.py::test_login_apps_fails_loud_without_databricks_cli`
+  checks the missing executable in the regular unit suite without installing
+  the real Databricks CLI or browser.
+  `tests/cli/test_backend.py::test_host_remote_preflight_hints_headless`,
+  `tests/cli/test_backend.py::test_host_non_interactive_flag_forwarded_to_preflight`, and
+  `tests/cli/test_backend.py::test_host_remote_preflight_skips_when_authenticated`
+  cover headless failure, explicit suppression, and an authenticated connection.
+  These stub login/connection collaborators. The process journey above covers
+  foreground positional `host <url> --no-open`; `host --server`, background
+  host/start, system services, and desktop/mobile onboarding are separate entry
+  points and are not proved by that recording.
 - **`embedded-resource-write` (in-process app and real stores):**
   `tests/server/test_external_account_authority.py::test_custom_auth_project_routes_without_users`.
   Run with plain `uv run pytest`; it constructs `create_app` with a custom
@@ -215,6 +262,13 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   establish every resource endpoint or a real host-registration flow.
 - Sign-in can open a browser even with `--no-open`; use `--non-interactive` in
   scripted runs.
+- For a fresh-machine event, check `databricks --version` before running
+  `omnigent host <server-url>`. Installing Omnigent's Databricks Python extra
+  does not install the Databricks CLI executable. If the CLI is missing, follow
+  the printed install link, verify it is on PATH in the same terminal, and retry
+  the same host command. A successful browser sign-in must also return to the
+  Databricks CLI's localhost callback on the machine running the command;
+  signing in on another machine does not complete that callback.
 - The iOS app also needs the server to list `ai.omnigent.ios:/oauth/callback`
   in its manifest; an OIDC server without it keeps the ticket sign-in in Safari.
 - The Android app also needs the server to list

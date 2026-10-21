@@ -334,6 +334,8 @@ class HostConnection:
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent
         frame from this host.
+    :param last_frame_monotonic: Monotonic timestamp of the last frame,
+        used for watchdog inactivity checks across wall-clock corrections.
     :param pending_launches: Per-``request_id`` futures for
         in-flight ``host.launch_runner`` requests. Resolved when
         the host sends ``host.launch_runner_result``.
@@ -378,6 +380,9 @@ class HostConnection:
         ``host.install_harness_result``. Values carry the result fields
         (``status``, ``configured_harnesses``, ``gateway_inference``,
         ``error``). Same ``Any`` typing rationale as ``pending_stats``.
+    :param pending_harness_refreshes: Per-``request_id`` futures for forced
+        harness readiness probes. Values carry ``status``,
+        ``configured_harnesses``, ``gateway_inference``, and ``error``.
     :param inflight_installs: Install tasks used to coalesce concurrent
         install requests for the same harness family (a double-click, or
         two spellings of one npm package) onto one in-flight install, so
@@ -417,6 +422,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[OutboundFrame | None]
     connected_at: float
     last_frame_at: float
+    last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
     retirement_reason: str | None = None
     sender_end_reason: str | None = None
@@ -456,6 +462,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_refreshes: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
@@ -586,6 +595,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            last_frame_monotonic=time.monotonic(),
             registered_with_managed_token=registered_with_managed_token,
         )
         with self._lock:
@@ -668,6 +678,7 @@ class HostRegistry:
             if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
                 return False
             conn.last_frame_at = time.time()
+            conn.last_frame_monotonic = time.monotonic()
             return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:

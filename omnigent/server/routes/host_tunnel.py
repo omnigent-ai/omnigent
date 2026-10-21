@@ -20,10 +20,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
@@ -52,6 +54,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -65,6 +68,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.runner.transports.ws_tunnel.diagnostics import silence_source
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -86,6 +90,10 @@ SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 _HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
+# Per phase: persistence/workers, diagnostics and notification total at most 15s.
+_DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
+# WebSocket close codes a host sends on purpose: 1000 normal, 1001 going away.
+_CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -415,9 +423,12 @@ def create_host_tunnel_router(
                 ),
             )
 
-            async with conn.diagnostics.monitoring(
-                report_diagnostics, connection_id=frame.connection_id
-            ):
+            async with contextlib.AsyncExitStack() as diagnostics_cleanup:
+                await diagnostics_cleanup.enter_async_context(
+                    conn.diagnostics.monitoring(
+                        report_diagnostics, connection_id=frame.connection_id
+                    )
+                )
                 sender_task = asyncio.create_task(
                     _sender_loop(ws, conn),
                     name=f"host-sender:{host_id}",
@@ -480,26 +491,66 @@ def create_host_tunnel_router(
                 finally:
                     conn.diagnostics.freeze()
                     disconnect_attrs = connection_attrs()
-                    for task in (sender_task, ping_task, receive_task, heartbeat_task):
-                        task.cancel()
-                    await asyncio.gather(
-                        sender_task,
-                        ping_task,
-                        receive_task,
-                        heartbeat_task,
-                        return_exceptions=True,
-                    )
-                    # If the host already reconnected, this handler's connection
-                    # was replaced; only the current one may mark it offline.
-                    if host_registry.deregister(host_id, conn=conn):
-                        await asyncio.to_thread(host_store.set_offline, host_id)
+                    # Shield teardown from ASGI cancellation, but do not let a
+                    # stalled dependency hold shutdown indefinitely.
+                    try:
+                        for task in (sender_task, ping_task, receive_task, heartbeat_task):
+                            task.cancel()
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as cleanup_scope:
+                            try:
+                                await asyncio.gather(
+                                    sender_task,
+                                    ping_task,
+                                    receive_task,
+                                    heartbeat_task,
+                                    return_exceptions=True,
+                                )
+                            finally:
+                                # A replaced connection must not mark its successor offline.
+                                if host_registry.deregister(host_id, conn=conn):
+                                    offline_cancelled = threading.Event()
+                                    try:
+                                        await asyncio.to_thread(
+                                            host_store.set_offline,
+                                            host_id,
+                                            cancelled=offline_cancelled.is_set,
+                                        )
+                                    except Exception:
+                                        _logger.exception(
+                                            "Failed to mark host %s offline after disconnect",
+                                            host_id,
+                                        )
+                                    finally:
+                                        offline_cancelled.set()
+                        if cleanup_scope.cancel_called:
+                            # The row ages out via its liveness TTL if persistence stalls.
+                            _logger.warning("Timed out cleaning up host %s", host_id)
+                    finally:
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as diagnostics_scope:
+                            try:
+                                await diagnostics_cleanup.aclose()
+                            except Exception:
+                                _logger.exception("Failed to close host %s diagnostics", host_id)
+                        if diagnostics_scope.cancel_called:
+                            _logger.warning("Timed out closing host %s diagnostics", host_id)
                     if on_host_disconnect is not None:
-                        try:
-                            await on_host_disconnect(host_id, tunnel_owner)
-                        except Exception:
-                            _logger.exception(
-                                "on_host_disconnect callback failed for %s",
-                                host_id,
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as callback_scope:
+                            try:
+                                await on_host_disconnect(host_id, tunnel_owner)
+                            except Exception:
+                                _logger.exception(
+                                    "on_host_disconnect callback failed for %s",
+                                    host_id,
+                                )
+                        if callback_scope.cancel_called:
+                            _logger.warning(
+                                "on_host_disconnect callback timed out for %s", host_id
                             )
 
         except asyncio.CancelledError as exc:
@@ -551,8 +602,15 @@ def create_host_tunnel_router(
         finally:
             if conn is not None or disconnect_error is not None:
                 log = _logger.info
-                if disconnect_error is not None and not isinstance(
-                    disconnect_error, asyncio.CancelledError
+                # A normal or going-away close (host stop, restart) is expected.
+                clean_close = (
+                    isinstance(disconnect_error, WebSocketDisconnect)
+                    and disconnect_error.code in _CLEAN_CLOSE_CODES
+                )
+                if (
+                    disconnect_error is not None
+                    and not isinstance(disconnect_error, asyncio.CancelledError)
+                    and not clean_close
                 ):
                     log = _logger.warning
                 log(
@@ -642,9 +700,9 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         try:
             await conn.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
         except RuntimeError:
-            if ws.application_state is WebSocketState.DISCONNECTED:
-                # The ping loop or registry retirement closed the socket
-                # concurrently; the disconnect is already logged there.
+            if WebSocketState.DISCONNECTED in (ws.application_state, ws.client_state):
+                # A local close (ping timeout, retire) or the peer's close won the
+                # race; the receive helper or closer reports the disconnect.
                 _logger.debug("Host %s send raced a concurrent close", conn.host_id)
                 conn.sender_end_reason = "send_after_close"
                 return
@@ -903,6 +961,20 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "version": frame.version,
+                        "gateway_inference": frame.gateway_inference,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostRefreshHarnessesResultFrame):
+            refresh_future = conn.pending_harness_refreshes.pop(frame.request_id, None)
+            if refresh_future is not None and not refresh_future.done():
+                refresh_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
                         "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
@@ -1155,11 +1227,16 @@ async def _ping_loop(
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
-        elapsed = time.time() - conn.last_frame_at
+        elapsed = time.monotonic() - conn.last_frame_monotonic
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
             conn.close_requested_code = 4003
             conn.close_requested_reason = "ping timeout"
-            _logger.warning(
+            # A sleeping or offline machine is expected; a stall of this
+            # server's own loop is not.
+            diagnostics = conn.diagnostics.snapshot()
+            source = silence_source(elapsed, diagnostics)
+            _logger.log(
+                logging.WARNING if source == "local_event_loop" else logging.INFO,
                 "Host %s missed %d ping intervals (%.0fs); declaring dead",
                 host_id,
                 PING_MISS_THRESHOLD,
@@ -1169,9 +1246,10 @@ async def _ping_loop(
                     host_id=host_id,
                     connection_id=conn.hello.connection_id,
                     silent_s=round(elapsed, 3),
+                    silence_source=source,
                     close_requested_code=4003,
                     close_requested_reason="ping timeout",
-                    **conn.diagnostics.snapshot(),
+                    **diagnostics,
                 ),
             )
             with contextlib.suppress(RuntimeError):

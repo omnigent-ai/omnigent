@@ -11,7 +11,7 @@ import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import httpx
 from fastapi import (
@@ -36,7 +36,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -52,6 +52,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -65,6 +66,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -79,6 +81,7 @@ from omnigent.server.routes._sessions.helpers import (
     _await_settled_managed_launch,
     _enforce_filesystem_attachment_policy,
     _file_content_etag,
+    _filesystem_attachment_policy,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
     _load_agent_spec_for_session,
@@ -107,6 +110,9 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
 
 class _RunnerStreamResponse(StreamingResponse):
     """Stream a runner response body and close it however the send ends.
@@ -130,6 +136,10 @@ class _RunnerStreamResponse(StreamingResponse):
         finally:
             await self._upstream.aclose()
 
+
+# Runner wait for a PR label request, above the runner's 15-second budget for all of
+# its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
+_LABEL_PROXY_TIMEOUT_S = 20.0
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -165,6 +175,23 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachmentPolicy) -> str:
+    """Explain a refused upload in terms of the types this server accepts."""
+    from omnigent.inner.native_attachments import DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+
+    detail = (
+        f"Unsupported attachment type '{content_type}'. Attach images, PDF, or text/code files"
+    )
+    if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
+        return (
+            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+        )
+    if policy.extensions:
+        extensions = ", ".join(sorted(policy.extensions))
+        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+    return f"{detail}."
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -176,11 +203,12 @@ def register_resources_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     host_registry: HostRegistry | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
 ) -> None:
     """Register the resources routes on router."""
 
     async def _require_filesystem_attachment_support(
-        request: Request, conv: Conversation, filename: str
+        request: Request, conv: Conversation, filename: str, capability: str
     ) -> None:
         await _require_filesystem_attachment_harness(conv, filename)
         tracker = getattr(request.app.state, "managed_launches", None)
@@ -221,6 +249,7 @@ def register_resources_routes(
             host_registry=host_registry,
             tunnel_registry=tunnel_registry,
             runner_router=runner_router,
+            capability=capability,
         )
 
     @router.get(
@@ -451,6 +480,8 @@ def register_resources_routes(
         path: str,
         conversation: Conversation,
         params: dict[str, str] | None = None,
+        timeout: float = 10.0,
+        unsupported_endpoint_message: str | None = None,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -459,8 +490,11 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
+        :param timeout: Seconds to wait for the runner response.
+        :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
         :returns: Parsed JSON response body.
-        :raises OmnigentError: Typed ``not_found`` (404) or
+        :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
+            typed ``not_found`` (404) or
             ``session_agent_missing`` (410) re-derived from the runner body.
         :raises HTTPException: 502 on any other runner failure.
         """
@@ -474,7 +508,7 @@ def register_resources_routes(
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.get(path, params=params, timeout=10.0)
+            resp = await runner_client.get(path, params=params, timeout=timeout)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
@@ -487,6 +521,11 @@ def register_resources_routes(
                 status_code=502, detail="runner resource endpoint returned invalid JSON"
             ) from exc
         if resp.status_code == 404:
+            if unsupported_endpoint_message and response_payload == {"detail": "Not Found"}:
+                raise OmnigentError(
+                    unsupported_endpoint_message,
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             message = "Resource not found"
             if isinstance(response_payload, dict):
                 error = response_payload.get("error")
@@ -521,6 +560,7 @@ def register_resources_routes(
         runner_path: str,
         runner_params: dict[str, str] | None = None,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+        runner_timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -536,7 +576,8 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
-            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
+            ``"github_labels"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -550,6 +591,7 @@ def register_resources_routes(
             has nothing for this to resolve against. Resolving it eagerly
             would refuse absolute browsing on exactly those sessions even
             though the online runner can serve them.
+        :param runner_timeout: Seconds to wait for the runner's response.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -561,6 +603,7 @@ def register_resources_routes(
                 runner_path,
                 conversation,
                 params=runner_params,
+                timeout=runner_timeout,
             )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
@@ -619,6 +662,12 @@ def register_resources_routes(
             conversation.workspace,
         )
 
+    def _runner_environment_segment(environment_id: str) -> str:
+        """Preserve an environment identifier as one runner URL segment."""
+        if environment_id in {".", ".."}:
+            raise OmnigentError("Invalid environment identifier", code=ErrorCode.INVALID_INPUT)
+        return urllib.parse.quote(environment_id, safe="")
+
     def _runner_path_segment(relative_path: str, *, absolute: bool) -> str:
         """Encode a browse path for the runner's ``{relative_path:path}`` segment.
 
@@ -631,6 +680,11 @@ def register_resources_routes(
         :param absolute: Whether the path is host-absolute.
         :returns: The encoded segment.
         """
+        if ".." in relative_path.split("/"):
+            raise OmnigentError(
+                "Parent path segments are not permitted",
+                code=ErrorCode.INVALID_INPUT,
+            )
         quoted = urllib.parse.quote(relative_path.lstrip("/"))
         return "%2F" + quoted if absolute else quoted
 
@@ -655,7 +709,7 @@ def register_resources_routes(
         encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{encoded}"
+            f"/{_runner_environment_segment(environment_id)}/filesystem/{encoded}"
         )
 
     def _browse_level(client_path: str, *, within_workspace: int) -> int:
@@ -935,7 +989,8 @@ def register_resources_routes(
         The write counterpart of :func:`_read_workspace_via_host`, for when the
         runner is offline but the host holding the workspace is connected.
 
-        :param op: Host-side write op — currently ``"github_set_preference"``.
+        :param op: Host-side write op — ``"github_set_preference"``,
+            ``"github_prs_update"``, or ``"github_labels_update"``.
         :param host_params: Op-specific args for the host writer.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
@@ -976,6 +1031,8 @@ def register_resources_routes(
         path: str,
         body: dict[str, Any],
         conversation: Conversation,
+        *,
+        timeout: float = 10.0,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a POST request to the runner and return status + JSON.
 
@@ -983,6 +1040,7 @@ def register_resources_routes(
         :param path: Runner-relative URL path.
         :param body: JSON body to forward.
         :param conversation: Conversation loaded during authorization.
+        :param timeout: Seconds to wait for the runner's response.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
@@ -999,7 +1057,7 @@ def register_resources_routes(
             resp = await runner_client.post(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=timeout,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
@@ -1154,7 +1212,10 @@ def register_resources_routes(
         :returns: The environment resource object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}"
+        )
         try:
             return await _proxy_get_to_runner(session_id, path, conv)
         except OmnigentError as exc:
@@ -1504,7 +1565,8 @@ def register_resources_routes(
         from the previous conversation to the fresh one while the tmux
         pane keeps running. A successful transfer also carries the
         source host, workspace, and git branch to the target because the
-        live terminal remains on that same placement.
+        live terminal remains on that same placement. The caller must own
+        both sessions and the source host.
 
         :param request: The incoming FastAPI request (for auth) with
             JSON body ``{"target_session_id": "conv_new"}``.
@@ -1514,7 +1576,7 @@ def register_resources_routes(
             e.g. ``"terminal_claude_main"``.
         :returns: The terminal resource object under the target session.
         """
-        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_OWNER)
         body = await request.json()
         target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
         if not isinstance(target_session_id, str) or not target_session_id:
@@ -1522,7 +1584,24 @@ def register_resources_routes(
                 "'target_session_id' is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        await _validate_session(target_session_id, request, LEVEL_EDIT)
+        await _validate_session(target_session_id, request, LEVEL_OWNER)
+
+        user_id = _get_user_id(request, auth_provider)
+        # Sub-agents inherit their parent's host; check the host the terminal runs on.
+        source_host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+        if source_host_id is not None and user_id is not None:
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is None:
+                raise OmnigentError(
+                    "Host ownership cannot be verified",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                resolve_host_owner,
+                user_id=user_id,
+                host_id=source_host_id,
+                host_store=host_store,
+            )
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
         status, payload = await _proxy_post_to_runner(
@@ -1699,6 +1778,11 @@ def register_resources_routes(
         :param file: The uploaded file (multipart form data).
         :returns: The session file resource object.
         """
+        return await _store_session_file(request, session_id, file)
+
+    async def _store_session_file(
+        request: Request, session_id: str, file: UploadFile, *, initial_input: bool = False
+    ) -> dict[str, Any]:
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
@@ -1710,12 +1794,18 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            DELIVERY_KEY,
+            FILESYSTEM_DELIVERY,
+            filesystem_attachment_capability,
+            requires_filesystem,
+        )
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
             ImageCompressionError,
             _resolve_content_type,
+            attachment_delivery,
             attachment_text_type_for_extension,
             attachment_upload_limit,
             compress_image_attachment,
@@ -1728,13 +1818,26 @@ def register_resources_routes(
             file.content_type,
             file.filename,
         )
-        # Check the filename first so a misleading MIME cannot skip the
-        # harness requirement or the quotas for files that need local tools.
-        filesystem_required = requires_filesystem(file.filename)
-        if filesystem_required:
-            # Drop the declared type so the file is never stored as text.
+        # Listed extensions are checked by name first so a misleading MIME cannot
+        # skip the harness requirement or the quotas for files that need local tools.
+        policy = _filesystem_attachment_policy(request.app.state)
+        delivery = attachment_delivery(file.filename, file.content_type, policy)
+        filesystem_required = delivery == "filesystem"
+        if filesystem_required or requires_filesystem(file.filename):
+            # Drop the declared type so the file is never stored as text, even
+            # when the policy leaves its extension out.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_support(request, conv, file.filename)
+        if filesystem_required:
+            if initial_input:
+                # The host does not exist yet; dispatch validates its runtime after provisioning.
+                await _require_filesystem_attachment_harness(conv, file.filename)
+            else:
+                await _require_filesystem_attachment_support(
+                    request,
+                    conv,
+                    file.filename,
+                    filesystem_attachment_capability([file.filename]),
+                )
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1763,17 +1866,14 @@ def register_resources_routes(
                 if type_limit is None:
                     raise HTTPException(
                         status_code=415,
-                        detail=(
-                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
-                            "or text/code files, or use Claude Code or Codex for archives, "
-                            "Office documents, and databases."
-                        ),
+                        detail=_unsupported_attachment_detail(content_type, policy),
                     )
                 read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
             filename = file.filename
             # Persist original dimensions only after a downscale.
             source_dims: tuple[int, int] | None = None
-            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+            # An image delivered as a file keeps its original bytes.
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES and not filesystem_required:
                 # Compressible images carry the large cap and the decode, so they are
                 # the server's peak upload memory. The body is already spooled to
                 # disk by the multipart parser, so gate the in-memory read + the
@@ -1802,14 +1902,18 @@ def register_resources_routes(
                 # PDF/text/SVG and other non-compressed types use their smaller
                 # per-type caps and aren't decoded, so they read outside the gate.
                 content = await _read_upload_capped(file, read_limit)
+            source_metadata: dict[str, Any] | None = (
+                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+            )
+            # Record the decision so delivery doesn't change if the policy does.
+            if filesystem_required:
+                source_metadata = {DELIVERY_KEY: FILESYSTEM_DELIVERY}
             stored = file_store.create(
                 session_id=session_id,
                 filename=filename,
                 bytes=len(content),
                 content_type=content_type,
-                source_metadata=(
-                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
-                ),
+                source_metadata=source_metadata,
             )
             try:
                 artifact_store.put(stored.id, content)
@@ -1847,6 +1951,14 @@ def register_resources_routes(
             resource=resource,
         )
         return resource
+
+    async def _upload_initial_file(
+        request: Request, session_id: str, file: UploadFile
+    ) -> dict[str, Any]:
+        return await _store_session_file(request, session_id, file, initial_input=True)
+
+    if register_initial_file_upload is not None:
+        register_initial_file_upload(_upload_initial_file)
 
     @router.get(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -2103,16 +2215,23 @@ def register_resources_routes(
 
         # Files requiring filesystem tools entering a session pass the same checks as an upload,
         # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            filesystem_attachment_capability,
+            uses_filesystem_delivery,
+        )
 
         filesystem_sources = [
             stored
             for stored in sources
-            if stored.filename and requires_filesystem(stored.filename)
+            if stored.filename
+            and uses_filesystem_delivery(stored.filename, stored.source_metadata)
         ]
         if filesystem_sources:
             await _require_filesystem_attachment_support(
-                request, conv, filesystem_sources[0].filename or ""
+                request,
+                conv,
+                filesystem_sources[0].filename or "",
+                filesystem_attachment_capability(stored.filename for stored in filesystem_sources),
             )
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
@@ -2367,7 +2486,10 @@ def register_resources_routes(
         if before is not None:
             params["before"] = before
         qs = urllib.parse.urlencode(params)
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/filesystem?{qs}"
+        )
         conv = await _authorize_browse_read(session_id, request)
         return _skip_gzip_for_binary(
             request,
@@ -2383,6 +2505,44 @@ def register_resources_routes(
                     "order": order,
                 },
                 runner_path=path,
+            ),
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+        response_model=None,
+    )
+    async def search_environment_content(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        include: str = Query(default="", max_length=4096),
+        exclude: str = Query(default="", max_length=4096),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """Search the session workspace with the same access gate as file reads."""
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH):
+            raise HTTPException(status_code=404, detail="Workspace content search is disabled")
+        conv = await _authorize_browse_read(session_id, request)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+            conv,
+            params={
+                "q": q,
+                "case_sensitive": str(case_sensitive).lower(),
+                "regex": str(regex).lower(),
+                "include": include,
+                "exclude": exclude,
+                "limit": str(limit),
+            },
+            timeout=25.0,
+            unsupported_endpoint_message=(
+                "Session runner does not support content search; update the host and restart the session"
             ),
         )
 
@@ -2498,10 +2658,10 @@ def register_resources_routes(
         qs = urllib.parse.urlencode(params)
         suffix = ""
         if path:
-            suffix = "/" + ("%2F" + urllib.parse.quote(path.lstrip("/")) if absolute else path)
+            suffix = "/" + _runner_path_segment(path, absolute=absolute)
         runner_path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/search{suffix}?{qs}"
+            f"/{_runner_environment_segment(environment_id)}/search{suffix}?{qs}"
         )
         resolver = functools.partial(_authorize_absolute_browse, conv, path) if absolute else None
         return await _fs_get_with_host_fallback(
@@ -2540,7 +2700,10 @@ def register_resources_routes(
         :param environment_id: Environment resource id.
         :returns: Flat list of changed filesystem entries with ``status``.
         """
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/changes"
+        )
         conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
@@ -2575,9 +2738,10 @@ def register_resources_routes(
         :param relative_path: Path relative to environment root.
         :returns: JSON with ``before`` and ``after`` content strings.
         """
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/diff/{relative_path}"
+            f"/{_runner_environment_segment(environment_id)}/diff/{encoded}"
         )
         conv = await _authorize_browse_read(session_id, request, relative_path)
         return await _fs_get_with_host_fallback(
@@ -2649,6 +2813,14 @@ def register_resources_routes(
         :returns: JSON with ``before`` and ``after`` content strings.
         """
         conv = await _authorize_browse_read(session_id, request, relative_path)
+        if previous_path is not None:
+            if not all(previous_path.split("/")):
+                raise OmnigentError(
+                    "Previous path must be a non-empty relative file path",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # Query and host parameters retain the literal name after validation.
+            _runner_path_segment(previous_path, absolute=False)
         params = {
             key: value
             for key, value in {
@@ -2660,12 +2832,13 @@ def register_resources_routes(
             }.items()
             if value is not None
         }
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_diff",
             host_params={"base": base, "path": relative_path, **params},
-            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{encoded}",
             runner_params=params or None,
         )
 
@@ -2743,12 +2916,12 @@ def register_resources_routes(
                 session_id,
                 conv,
                 f"/v1/sessions/{session_id}/resources/environments"
-                f"/{environment_id}/filesystem/{runner_rel}?"
+                f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **reach}),
             )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{runner_rel}?{qs}"
+            f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?{qs}"
         )
         # Offline, the host reads whatever root it is handed, so the server
         # authorizes the target itself before rooting the reader there. Deferred:
@@ -2906,7 +3079,10 @@ def register_resources_routes(
         :returns: Shell result.
         """
         body = await request.json()
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/shell"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/shell"
+        )
         return await _proxy_fs_response(
             session_id,
             "POST",
@@ -3061,6 +3237,84 @@ def register_resources_routes(
             raise OmnigentError(
                 error.get("message", f"GitHub preference update failed (HTTP {status})"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+    )
+    async def list_session_github_labels(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the labels the selected PR's repository offers, for the label picker.
+
+        Requires edit access, like the label edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{name, color, description}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_labels",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            runner_timeout=_LABEL_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_labels(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Add and remove labels on the selected PR with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` name lists.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        params = {
+            "pr_url": body["pr_url"],
+            "add": body.get("add", []),
+            "remove": body.get("remove", []),
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/labels",
+                params,
+                conv,
+                timeout=_LABEL_PROXY_TIMEOUT_S,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_labels_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update labels")
             )
         return result
 

@@ -17,6 +17,10 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
+# Pending inputs share the item store, but are not harness transcript history yet.
+PENDING_INPUT_RESPONSE_ID = "pending_input"
+MAX_PENDING_INPUTS = 100
+
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
 
@@ -197,6 +201,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
@@ -216,11 +221,16 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 # ``MANAGED_REPO_LABEL_KEY``; a store test cross-checks it so a rename there
 # fails loudly here.
 _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+# The host id a managed create asked for: a fork launches its own sandbox, so the
+# source's id would route the fork to the wrong host. Mirrors the server's
+# ``REQUESTED_HOST_ID_LABEL_KEY`` (cross-checked by a store test).
+_SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     _SANDBOX_REPO_LABEL_KEY,
+    _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY,
 }
 
 
@@ -408,6 +418,53 @@ class ConversationStore(ABC):
     paginated listing, appending items, full-text search,
     updates, and deletion.
     """
+
+    def list_pending_inputs_page(
+        self,
+        conversation_id: str,  # noqa: ARG002
+        *,
+        after: int | None = None,  # noqa: ARG002
+        limit: int = MAX_PENDING_INPUTS,  # noqa: ARG002
+    ) -> tuple[list[ConversationItem], int | None]:
+        """
+        Page the conversation's startup inputs in submission order.
+
+        :param after: The cursor a previous page returned, or ``None`` to start.
+        :param limit: Most inputs to return.
+        :returns: The inputs and the cursor for the next page, ``None`` at the end.
+        """
+        return [], None
+
+    def list_pending_inputs(self, conversation_id: str) -> list[ConversationItem]:
+        """Return all startup inputs (at most ``MAX_PENDING_INPUTS``) in submission order."""
+        items: list[ConversationItem] = []
+        after: int | None = None
+        while True:
+            page, after = self.list_pending_inputs_page(conversation_id, after=after)
+            items.extend(page)
+            if after is None:
+                return items
+
+    def transition_pending_input(
+        self,
+        conversation_id: str,
+        item_id: str,
+        *,
+        expected: str,
+        status: str | None,
+    ) -> bool:
+        """Compare-and-set delivery state; None discards a canceled, unsent input."""
+        raise NotImplementedError
+
+    def list_host_conversation_ids(
+        self,
+        host_id: str,  # noqa: ARG002
+        *,
+        after: str | None = None,  # noqa: ARG002
+        limit: int = 32,  # noqa: ARG002
+    ) -> list[str]:
+        """Page the sessions assigned to a host, including not-yet-launched sessions."""
+        return []
 
     def __init__(
         self, storage_location: str, conversation_storage_location: str | None = None
@@ -638,6 +695,21 @@ class ConversationStore(ABC):
         :returns: Mapping from every unique input parent id to the
             matching direct child ids. Parents with no direct sub-agent
             children, or ids that do not exist, map to an empty list.
+        """
+        ...
+
+    @abstractmethod
+    def list_child_conversation_ids_page(
+        self,
+        parent_conversation_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int = 128,
+    ) -> list[tuple[str, int]]:
+        """Return one parent's children as (ID, creation time) in descending key order.
+
+        Pass the last row's (creation time, ID) as *after* to continue via
+        the workspace/parent/creation-time/ID index.
         """
         ...
 

@@ -70,6 +70,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
@@ -101,6 +102,7 @@ import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTi
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
+import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -262,8 +264,10 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
+  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
+  hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
   type HostIdentity,
@@ -2295,6 +2299,7 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
@@ -2313,13 +2318,23 @@ export function NewChatLandingScreen() {
   // — without it the upload only fails after the session is created and
   // navigated into, where the first turn's 415 strands the typed message in
   // a session the user never wanted.
-  const { files, attachmentError, addFiles, removeFile, restoreFiles, onPaste, clearError } =
-    useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  const {
+    files,
+    attachmentError,
+    accept: fileAccept,
+    addFiles,
+    removeFile,
+    restoreFiles,
+    onPaste,
+    clearError,
+  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, addFiles);
+  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
+    if (!checkingDbcert) addFiles(droppedFiles);
+  });
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -2623,6 +2638,9 @@ export function NewChatLandingScreen() {
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [dbcertRequired, setDbcertRequired] = useState(false);
+  const createAttemptRef = useRef<symbol | null>(null);
+  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -5359,11 +5377,9 @@ export function NewChatLandingScreen() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit) return;
-    // A create is actually happening: report it for pointer clicks (via the
-    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
-    // don't emit, matching the disabled Start button.
-    trackClick("new_chat.start_session", "button");
+    if (!canSubmit || createAttemptRef.current !== null) return;
+    const createAttempt = Symbol();
+    createAttemptRef.current = createAttempt;
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
@@ -5381,12 +5397,6 @@ export function NewChatLandingScreen() {
         typeof destination === "string" ? destination : destination.pathname,
       );
     };
-    // Remember the repos/branches for next time (seeds the picker on the next
-    // visit). Only when a repo is actually set — a no-repo session leaves the
-    // remembered repos untouched rather than clearing them.
-    if (sandboxRepoSelections.length > 0) {
-      writeLastSandboxRepos(sandboxRepoSelections);
-    }
     setCreating(true);
     setCreateError(null);
     let localConv: {
@@ -5408,14 +5418,49 @@ export function NewChatLandingScreen() {
         navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
       }
     };
-    // The draft is spent from the moment it is submitted: it belongs to the
-    // session now being created, so a detour back to this screen must not
-    // hand it back pre-filled. Flipped here rather than on the response
-    // because the create outlives an unmount; a create that fails hands the
-    // draft back via returnDraftToUser.
-    submittedDraftRevisionRef.current = landingDraftRevision;
-    submittedRef.current = true;
     try {
+      if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
+        const skipCheck = new Promise<null>((resolve) => {
+          skipDbcertCheckRef.current = () => resolve(null);
+        });
+        setCheckingDbcert(true);
+        setDbcertRequired(false);
+        const credentials = await Promise.race([
+          getDesktopFeatures().then((features) =>
+            createAttemptRef.current === createAttempt &&
+            skipDbcertCheckRef.current !== null &&
+            onScreenRef.current &&
+            window.location.href === createLocation &&
+            features?.databricksInternalFeatures === true &&
+            features.canRefreshDbcert === true
+              ? checkDbcert()
+              : null,
+          ),
+          skipCheck,
+        ]);
+        skipDbcertCheckRef.current = null;
+        if (
+          createAttemptRef.current !== createAttempt ||
+          !onScreenRef.current ||
+          window.location.href !== createLocation
+        )
+          return;
+        setCheckingDbcert(false);
+        if (credentials !== null && !credentials.ok) {
+          setCreateError(credentials.error);
+          return;
+        }
+        const needsDbcert = credentials !== null && !credentials.valid;
+        setDbcertRequired(needsDbcert);
+        if (needsDbcert) return;
+      }
+      // Spend the draft only once provisioning starts, after the laptop credential check.
+      submittedDraftRevisionRef.current = landingDraftRevision;
+      submittedRef.current = true;
+      trackClick("new_chat.start_session", "button");
+      if (sandboxRepoSelections.length > 0) {
+        writeLastSandboxRepos(sandboxRepoSelections);
+      }
       const trimmedBranch = branchName.trim();
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -5563,14 +5608,25 @@ export function NewChatLandingScreen() {
             }
           : { ...(baseLabels ?? {}), ...composerContextLabels };
 
+      const skill = isNativeTerminalAgent
+        ? null
+        : matchSkillInvocation(initialPrompt, availableSkills);
+      const serverOwnsInitialInput =
+        sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+      const initialInput =
+        skill !== null
+          ? {
+              type: "slash_command",
+              data: { kind: "skill", name: skill.name, arguments: skill.args },
+            }
+          : {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
+            };
       let data: { id: string };
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
-        // Custom agent path: build bundle client-side and use multipart POST.
-        // The multipart create only stores the agent + session rows — it does
-        // NOT launch a runner on the host. We must follow up with launchRunner
-        // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
-        // same way the fork-resume path does.
+        // Custom agents upload their bundle with the session, then launch on the host below.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = { labels: createLabels };
         if (mcpServicesForLaunch.length) {
@@ -5645,105 +5701,115 @@ export function NewChatLandingScreen() {
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
+        const createPayload = JSON.stringify({
+          ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
+          // Config-seeded agent on a `project_id` create: omitted so the
+          // server default-fills it from the project config.
+          ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+          ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
+          ...(createProjectId !== null ? { project_id: createProjectId } : {}),
+          ...(sandboxSelected
+            ? {
+                host_type: "managed",
+                // The repos to clone in parallel; the agent starts in the one
+                // repo, or the parent that holds them all. Empty = empty
+                // sandbox workspace.
+                workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                // On a `project_id` create an ABSENT (path) workspace would be
+                // default-filled with the config's path workspace, which a
+                // managed create rejects — pin an explicit null (explicit
+                // values are never replaced by project hints). Same guard for
+                // a config-stored `git` block: a sandbox has no host for the
+                // server to create a worktree on.
+                ...(createProjectId !== null ? { workspace: null, git: null } : {}),
+                // Omitted when null so a default create is unchanged.
+                ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                // The new sandbox host's id, in the server's minted shape;
+                // keys the create and the session's requests until it binds.
+                ...(info !== "loading" && info.request_managed_sandbox_host_id
+                  ? { host_id: randomUUID().replace(/-/g, "") }
+                  : {}),
+                ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
+                  ? {
+                      inference_configuration_revision: sandboxModels.data.configuration_revision,
+                    }
+                  : {}),
+              }
+            : {
+                host_id: selectedHostId,
+                // Config-seeded workspace on a `project_id` create: omitted
+                // so the server default-fills it (see agent_id above).
+                ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
+                // Create a new worktree, or bind an existing one
+                // (`existing_worktree` records the branch for the sidebar +
+                // delete flow without creating anything), or neither. Always
+                // explicit when set: the branch name is generated (or typed)
+                // client-side, so the server cannot default-fill it.
+                git: shouldCreateWorktree
+                  ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
+                  : startInExistingWorktree
+                    ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
+                    : createProjectId !== null && workspaceIsNonGit
+                      ? null
+                      : undefined,
+              }),
+          // Native-wrapper labels + codex bypass + the born-filed project
+          // label (see `createLabels` above).
+          // Smart Routing sends none of these: the bound agent is only a
+          // placeholder, so the placeholder's wrapper labels, launch args and
+          // model would all describe a CLI the router may not pick. The
+          // server stamps the routed wrapper's labels once it has rebound.
+          labels: {
+            ...(smartRoutingHarnessSelected ? {} : createLabels),
+            [CLIENT_CREATE_TOKEN_LABEL]: createToken,
+          },
+          // Permission / approval / cursor mode → CLI flag pair, persisted as
+          // terminal_launch_args. Omitted for the default and non-native agents.
+          terminal_launch_args: smartRoutingHarnessSelected
+            ? undefined
+            : agentSupportsPermissionMode &&
+                permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+              ? ["--permission-mode", permissionMode]
+              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
+                : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+                  ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
+                  : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
+                    ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
+                    : agentSupportsDevinPermission &&
+                        devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
+                      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === devinPermissionMode)
+                          ?.args ?? [])
+                      : undefined,
+          // Model + reasoning effort, persisted on the session row before
+          // the runner launches. An unselected ("") knob is omitted so the
+          // harness keeps its own configured/default value.
+          model_override: normalizedModelOverride ?? undefined,
+          reasoning_effort: normalizedReasoningEffort ?? undefined,
+          cost_control_mode_override: costControlOverride,
+          // Top-level Smart Routing sends the same "auto" sentinel the bundle
+          // path does; the server tells them apart by the bound agent being a
+          // native wrapper, and routes at create time (the terminal launches
+          // with the row, so there is no first message to wait for). The
+          // routing hint is separate from first-input delivery.
+          harness_override: smartRoutingHarnessSelected
+            ? AUTO_HARNESS_ID
+            : (pickedHarness ?? undefined),
+          smart_routing_message:
+            smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+        });
+        const createForm = serverOwnsInitialInput && files.length > 0 ? new FormData() : null;
+        if (createForm !== null) {
+          createForm.append("metadata", createPayload);
+          for (const file of files) createForm.append("initial_files", file, file.name);
+        }
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
+            ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...backgroundSessionTitlesRequestHeaders(),
           },
-          body: JSON.stringify({
-            // Config-seeded agent on a `project_id` create: omitted so the
-            // server default-fills it from the project config.
-            ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
-            ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
-            ...(createProjectId !== null ? { project_id: createProjectId } : {}),
-            ...(sandboxSelected
-              ? {
-                  host_type: "managed",
-                  // The repos to clone in parallel; the agent starts in the one
-                  // repo, or the parent that holds them all. Empty = empty
-                  // sandbox workspace.
-                  workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
-                  // On a `project_id` create an ABSENT (path) workspace would be
-                  // default-filled with the config's path workspace, which a
-                  // managed create rejects — pin an explicit null (explicit
-                  // values are never replaced by project hints). Same guard for
-                  // a config-stored `git` block: a sandbox has no host for the
-                  // server to create a worktree on.
-                  ...(createProjectId !== null ? { workspace: null, git: null } : {}),
-                  // Omitted when null so a default create is unchanged.
-                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
-                  ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
-                    ? {
-                        inference_configuration_revision: sandboxModels.data.configuration_revision,
-                      }
-                    : {}),
-                }
-              : {
-                  host_id: selectedHostId,
-                  // Config-seeded workspace on a `project_id` create: omitted
-                  // so the server default-fills it (see agent_id above).
-                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
-                  // Create a new worktree, or bind an existing one
-                  // (`existing_worktree` records the branch for the sidebar +
-                  // delete flow without creating anything), or neither. Always
-                  // explicit when set: the branch name is generated (or typed)
-                  // client-side, so the server cannot default-fill it.
-                  git: shouldCreateWorktree
-                    ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : startInExistingWorktree
-                      ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
-                      : createProjectId !== null && workspaceIsNonGit
-                        ? null
-                        : undefined,
-                }),
-            // Native-wrapper labels + codex bypass + the born-filed project
-            // label (see `createLabels` above).
-            // Smart Routing sends none of these: the bound agent is only a
-            // placeholder, so the placeholder's wrapper labels, launch args and
-            // model would all describe a CLI the router may not pick. The
-            // server stamps the routed wrapper's labels once it has rebound.
-            labels: {
-              ...(smartRoutingHarnessSelected ? {} : createLabels),
-              [CLIENT_CREATE_TOKEN_LABEL]: createToken,
-            },
-            // Permission / approval / cursor mode → CLI flag pair, persisted as
-            // terminal_launch_args. Omitted for the default and non-native agents.
-            terminal_launch_args: smartRoutingHarnessSelected
-              ? undefined
-              : agentSupportsPermissionMode &&
-                  permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
-                ? ["--permission-mode", permissionMode]
-                : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                  ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                  : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
-                    ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                    : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
-                      ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
-                      : agentSupportsDevinPermission &&
-                          devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
-                        ? (DEVIN_NATIVE_PERMISSION_MODES.find(
-                            (m) => m.value === devinPermissionMode,
-                          )?.args ?? [])
-                        : undefined,
-            // Model + reasoning effort, persisted on the session row before
-            // the runner launches. An unselected ("") knob is omitted so the
-            // harness keeps its own configured/default value.
-            model_override: normalizedModelOverride ?? undefined,
-            reasoning_effort: normalizedReasoningEffort ?? undefined,
-            cost_control_mode_override: costControlOverride,
-            // Top-level Smart Routing sends the same "auto" sentinel the bundle
-            // path does; the server tells them apart by the bound agent being a
-            // native wrapper, and routes at create time (the terminal launches
-            // with the row, so there is no first message to wait for). The
-            // message text rides along for routing only — the client still
-            // delivers the real message after navigation.
-            harness_override: smartRoutingHarnessSelected
-              ? AUTO_HARNESS_ID
-              : (pickedHarness ?? undefined),
-            smart_routing_message:
-              smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
-          }),
+          body: createForm ?? createPayload,
         });
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
@@ -5768,7 +5834,13 @@ export function NewChatLandingScreen() {
           }
           const created = (await response.json()) as {
             id: string;
+            labels?: Record<string, string>;
           };
+          // Route the new session's first requests by its chosen host id
+          // before any snapshot of it loads. Only seeds: a null here would
+          // erase a host the session's snapshot already recorded.
+          const requestedHostId = sessionRoutingHostId(null, created.labels);
+          if (requestedHostId !== null) setSessionHost(created.id, requestedHostId);
           return { id: created.id };
         })();
         // Once the create answers, its id is authoritative — stop listening.
@@ -5871,9 +5943,6 @@ export function NewChatLandingScreen() {
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
       // SDK invocations resolve on the runner after create; native CLIs receive plain text.
-      const skill = isNativeTerminalAgent
-        ? null
-        : matchSkillInvocation(initialPrompt, availableSkills);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
@@ -5883,12 +5952,11 @@ export function NewChatLandingScreen() {
         writeLandingDraft(null);
       }
 
-      // `localConv` is set only when a real agent id was resolved up front, so
-      // it's safe to POST the first message with it.
+      // `localConv` is set only when a real agent id was resolved up front.
       if (localConv !== null && effectiveAgentId !== null) {
         const tempConvId = localConv.tempConvId;
         promoteSessionDraft(localConv.tempConvId, data.id);
-        // Hydrate the temp id onto the real id and POST the first message.
+        // Hydrate the temp id, binding server-owned input or sending on older servers.
         hydrateLocalConversation(
           localConv.tempConvId,
           data.id,
@@ -5900,14 +5968,16 @@ export function NewChatLandingScreen() {
           returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
           () => stillViewingLocalSession(tempConvId),
           localProject,
+          serverOwnsInitialInput,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
       } else {
         // Server-first: a pending custom agent (or no client cache in tests).
-        // Label the row, stash the first message for ChatPage to send, navigate.
+        // Keep a browser delivery draft only when the create did not accept the input.
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (!serverOwnsInitialInput)
+          setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
         if (onScreenRef.current && window.location.href === createLocation) {
           navigate(sessionLocation(data.id));
         }
@@ -5920,7 +5990,12 @@ export function NewChatLandingScreen() {
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
-      setCreating(false);
+      if (createAttemptRef.current === createAttempt) {
+        createAttemptRef.current = null;
+        skipDbcertCheckRef.current = null;
+        setCheckingDbcert(false);
+        setCreating(false);
+      }
     }
   }
 
@@ -5929,9 +6004,7 @@ export function NewChatLandingScreen() {
     : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
-    host.host_id === arcaHostId ||
-    !!host.sandbox_provider ||
-    host.name.toLowerCase().includes("cloud");
+    !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
   // Keep the selected host and this machine's reconnect action above the fold.
@@ -6088,9 +6161,10 @@ export function NewChatLandingScreen() {
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
-        <div
+        <fieldset
+          disabled={checkingDbcert}
           className={cn(
-            "relative flex flex-col gap-0 max-md:w-[calc(100%-1rem)]",
+            "relative flex min-w-0 flex-col gap-0 max-md:w-[calc(100%-1rem)]",
             COMPOSER_COLUMN_WIDTH,
           )}
           data-testid="new-chat-landing-composer-surface"
@@ -6683,7 +6757,7 @@ export function NewChatLandingScreen() {
                       ref={fileInputRef}
                       type="file"
                       multiple
-                      accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+                      accept={fileAccept}
                       className="hidden"
                       data-testid="new-chat-landing-file-input"
                       onChange={(e) => {
@@ -7147,7 +7221,7 @@ export function NewChatLandingScreen() {
                 : undefined
             }
           />
-        </div>
+        </fieldset>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&
             !autoRoutingSelected &&
@@ -7248,6 +7322,31 @@ export function NewChatLandingScreen() {
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
+          )}
+
+          {checkingDbcert && (
+            <div
+              className="flex items-center gap-2 text-sm text-muted-foreground"
+              data-testid="new-chat-landing-dbcert-status"
+            >
+              <Spinner className="size-4 shrink-0" />
+              <p role="status">Checking laptop credentials…</p>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => skipDbcertCheckRef.current?.()}
+              >
+                Skip
+              </Button>
+            </div>
+          )}
+
+          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
+            <LaptopDbcertBanner
+              onReady={() => setDbcertRequired(false)}
+              onDismiss={() => setDbcertRequired(false)}
+            />
           )}
 
           {connectError && (

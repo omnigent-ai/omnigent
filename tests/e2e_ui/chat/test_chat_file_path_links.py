@@ -45,7 +45,8 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Page, expect
 
-from tests._helpers.session import bind_session_runner, post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
+from tests._helpers.session import bind_session_runner
 
 _ROOT_FILE = "README.md"
 _README_CONTENT = "# Readme\n\nWorkspace-root file for the e2e link test.\n"
@@ -112,7 +113,7 @@ def linkify_session(
     ws = Path(tempfile.mkdtemp(prefix="omnigent-e2e-ui-links-", dir=Path.home()))
     (ws / _ROOT_FILE).write_text(_README_CONTENT)
 
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()
@@ -238,7 +239,7 @@ def test_chat_link_opens_file_beyond_first_large_directory_page(
     target = large / "zzzz-target.md"
     target.write_text("# File beyond the first page\n")
 
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(tmp_path)), timeout=30.0
     )
     create_resp.raise_for_status()

@@ -28,8 +28,15 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
   build:
     name: Build unsigned AAB
+    needs: gate
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -37,24 +44,35 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Set up JDK 17
+      # Robolectric's Android 16/API 36 runtime requires Java 21.
+      - name: Set up JDK 21
         uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9  # v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947  # v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4
         with:
           cache-read-only: false
 
-      - name: Build release AAB
+      - name: Run unit tests and build release AAB
         run: |
-          ./gradlew bundleRelease --no-daemon --console=plain \
+          ./gradlew testDebugUnitTest bundleRelease --no-daemon --console=plain \
             "-PversionCode=${{ inputs.version-code }}" \
             "-PversionName=${{ inputs.version-name }}"
+
+      - name: Upload unit test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-unit-tests-${{ github.run_id }}
+          path: |
+            web/android/app/build/test-results/testDebugUnitTest/
+            web/android/app/build/reports/tests/testDebugUnitTest/
+          retention-days: 14
 
       - name: Verify artifact
         run: |
@@ -64,7 +82,7 @@ jobs:
 
       - name: Upload artifact
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: omnigent-android-aab${{ inputs.version-note && format('-{0}', inputs.version-note) || '' }}
           path: web/android/app/build/outputs/bundle/release/app-release.aab

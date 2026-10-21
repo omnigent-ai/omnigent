@@ -50,6 +50,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
+from omnigent_ui_sdk.terminal import StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -69,7 +70,15 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.remote_launch import (
+    REMOTE_LAUNCH_MESSAGE,
+    no_online_runner_message,
+    resolve_remote_launch_host,
+)
+from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -1299,6 +1308,7 @@ class _SessionsChatReplAdapter:
         field_input_state: _FieldInputState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1345,9 +1355,11 @@ class _SessionsChatReplAdapter:
             field values interactively via the main input loop.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
+        :param registered_agent: Catalog identity selected for a new remote session.
         """
         self._client = client
         self._agent_id: str | None = None
+        self._registered_agent = registered_agent
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
@@ -1656,6 +1668,8 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if self._session_id is not None:
+            set_session_host(self._session_id, getattr(session, "host_id", None))
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1731,11 +1745,11 @@ class _SessionsChatReplAdapter:
         """
         Create a session bound to an agent already registered server-side.
 
-        The remote-URL path: there is no local bundle to upload, so
-        resolve the picked name to its id and use the JSON create route.
-        A remote client also has no runner of its own, so adopt one the
-        server already has online — otherwise the first turn fails the
-        runner-binding precondition.
+        The remote-URL path: there is no local bundle to upload, so use
+        the selected catalog identity or resolve the name for direct callers.
+        Adopt a matching online runner, or ask the server to launch one
+        on this machine's connected host. Host-launched runners arrive
+        bound to the session and remain owned by the host lifecycle.
 
         :param pending_debug: Whether to emit adapter debug lines.
         :returns: None.
@@ -1746,22 +1760,35 @@ class _SessionsChatReplAdapter:
                 file=sys.stderr,
                 flush=True,
             )
-        # Skip the name lookup only when nothing needs it: we already know
-        # the id, and a bound runner means we don't need the harness either.
-        agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
-            agent = await self._client.sessions.resolve_agent(self._agent_name)
-        agent_id = self._agent_id or (agent.id if agent is not None else None)
-        if agent_id is None:
-            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        # /new keeps the session's identity, including unnamed uploaded agents.
+        if self._agent_id is not None:
+            agent = RegisteredAgent(id=self._agent_id, harness=self._harness)
+            if self._runner_id is None and not agent.harness:
+                raise RuntimeError(
+                    "The previous session does not report its harness, so a compatible "
+                    "runner cannot be selected. Start a new session with --agent <name>."
+                )
+        else:
+            agent = self._registered_agent
+        if agent is None:
+            try:
+                agent = await self._client.sessions.resolve_agent(self._agent_name)
+            except LookupError as exc:
+                # The REPL renders this message; keep server-supplied names inert.
+                raise LookupError(printable(str(exc))) from exc
+        launch_host_id: str | None = None
         if self._runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
-
             self._runner_id = await self._client.sessions.resolve_online_runner(
-                harness=agent.harness if agent is not None else None,
+                harness=agent.harness,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
-            if pending_debug:
+            if self._runner_id is None:
+                launch_host_id = await resolve_remote_launch_host(
+                    self._client.sessions, harness=agent.harness
+                )
+                if launch_host_id is None:
+                    raise RuntimeError(no_online_runner_message())
+            if pending_debug and self._runner_id is not None:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
                     file=sys.stderr,
@@ -1770,13 +1797,23 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
-        session = await self._client.sessions.create_from_agent_id(
-            agent_id,
-            reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
-        )
+        progress_host = self._host if launch_host_id is not None else None
+        if progress_host is not None:
+            progress_host.output(StreamLive(Text(REMOTE_LAUNCH_MESSAGE)))
+        try:
+            session = await self._client.sessions.create_from_agent_id(
+                agent.id,
+                reasoning_effort=self._reasoning_effort,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
+        finally:
+            if progress_host is not None:
+                progress_host.clear_streamed_text()
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if launch_host_id is not None:
+            set_session_host(session.id, launch_host_id)
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1901,11 +1938,7 @@ class _SessionsChatReplAdapter:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
                     # online runners at create time and found none.
-                    raise RuntimeError(
-                        "This server has no online runner to run the turn. Start one "
-                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
-                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
-                    )
+                    raise RuntimeError(no_online_runner_message())
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
                     f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
@@ -3188,11 +3221,13 @@ async def run_repl(
     agent_description: str | None = None,
     used_families: list[str] | None = None,
     attach_only: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """The entire REPL — using the framework.
 
     :param client: Connected OmnigentClient.
     :param agent_name: Agent name (used for API calls).
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param tool_handler: Optional client-side tool handler.
     :param initial_message: If set, auto-send this message on startup
         (e.g. a greeting prompt for onboarding).
@@ -3363,6 +3398,7 @@ async def run_repl(
     session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
+        registered_agent=registered_agent,
         tool_callables=tool_callables,
         hooks=hooks,
         session_id=resume_conversation_id,

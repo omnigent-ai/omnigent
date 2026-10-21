@@ -217,14 +217,29 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
-@pytest.mark.parametrize("enabled", ["0", "1"])
-def test_host_slice_key_gate_reaches_daemon_and_runner(
+@pytest.mark.parametrize(
+    ("name", "value", "expected_osc"),
+    [
+        ("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0", True),
+        ("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1", True),
+        ("OMNIGENT_FEATURES", None, True),
+        ("OMNIGENT_FEATURES", "", True),
+        ("OMNIGENT_FEATURES", "usage_page,claude_osc_status", True),
+        ("OMNIGENT_FEATURES", "usage_page,-claude_osc_status", False),
+        ("OMNIGENT_FEATURES", "-claude_osc_status,claude_osc_status", False),
+    ],
+)
+def test_release_controls_reach_daemon_and_runner(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
-    enabled: str,
+    name: str,
+    value: str | None,
+    expected_osc: bool,
 ) -> None:
-    """The host and its spawned runner make the same slice-key decision."""
-    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", enabled)
+    """Operator controls survive both environment boundaries in either server mode."""
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
 
     daemon_env = _build_host_daemon_env(server_url=server_url)
     runner_env = _build_runner_env(
@@ -236,8 +251,15 @@ def test_host_slice_key_gate_reaches_daemon_and_runner(
         parent_pid=12345,
     )
 
-    assert daemon_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
-    assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+    assert daemon_env.get(name) == value
+    assert runner_env.get(name) == value
+    if name == "OMNIGENT_FEATURES":
+        from omnigent.runner.resource_registry import SessionResourceRegistry
+        from omnigent.server.feature_flags import Feature
+
+        with patch.dict(os.environ, runner_env, clear=True):
+            registry = SessionResourceRegistry()
+        assert registry._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS) == expected_osc
 
 
 _CLAUDE_TOOL_SEARCH_ENV: Final = {
@@ -521,3 +543,21 @@ def test_ci_detection_stays_on_the_local_server(
     )
     assert "CI" not in runner_env
     assert "OMNIGENT_DISABLE_TELEMETRY" not in runner_env
+
+
+def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gateway-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini")
+    daemon = _build_host_daemon_env(server_url=None)
+    runner = _build_runner_env(
+        daemon,
+        server_url="http://localhost:6767",
+        runner_id="test-gemini",
+        binding_token="fake-binding",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    for env in (daemon, runner):
+        assert env["GEMINI_API_KEY"] == "fake-gateway-key"
+        assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"

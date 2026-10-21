@@ -223,17 +223,19 @@ def test_refuse_by_tag_resets_only_matching_new_connections(loop_thread: LoopThr
 
 def test_unreachable_upstream_is_a_gateway_error_or_a_reset(loop_thread: LoopThread) -> None:
     upstream = _upstream(loop_thread)
-    loop_thread.run(_close_server(upstream.server))
+    # Bind both listeners before releasing the upstream port so neither can reuse it.
     gateway = _proxy(loop_thread, upstream, upstream_down="gateway")
+    direct = _proxy(loop_thread, upstream, upstream_down="reset")
+    loop_thread.run(_close_server(upstream.server))
     with contextlib.closing(_connect(gateway, _HTTP)) as sock:
         assert _recv(sock).startswith(b"HTTP/1.1 502 Bad Gateway")
-    direct = _proxy(loop_thread, upstream, upstream_down="reset")
     with contextlib.closing(_connect(direct, _HTTP)) as sock, pytest.raises(ConnectionResetError):
         _recv(sock)
 
 
 async def _close_server(server: asyncio.base_events.Server) -> None:
     server.close()
+    await server.wait_closed()
 
 
 def test_delay_adds_latency(loop_thread: LoopThread) -> None:

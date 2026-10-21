@@ -31,6 +31,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from tests.budgets import budget
 
 
 class _Registry:
@@ -79,24 +80,40 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     )
     conversation = _conversation()
 
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     first = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
     await client.entered.wait()
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     second = asyncio.create_task(initializer.initialize(conversation, client, timeout=10))  # type: ignore[arg-type]
     await asyncio.sleep(0)
     client.release.set()
     first_response, second_response = await asyncio.gather(first, second)
 
     assert first_response is second_response
+    assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
     assert len(client.calls) == 1
+    conversation.inference_snapshot = {"runtime_config": {"providers": {}}}
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    conversation.inference_snapshot = None
 
     initializer.invalidate_runner("runner_init")
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert len(client.calls) == 2
+    registry.connection = SimpleNamespace(generation=2)
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    conversation.agent_id = "different_agent"
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
+    conversation.agent_id = "agent_init"
+    conversation.sub_agent_name = "different_child"
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -115,6 +132,7 @@ async def test_initializer_evicts_rejected_result_for_retry() -> None:
     second = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
 
     assert first.status_code == second.status_code == 503
+    assert not initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 2
 
 
@@ -245,8 +263,10 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
     assert len(client.calls) == 3
     # A later binding back to this live runner starts a distinct recovery.
     initializer.invalidate_session(conv.id)
+    assert not initializer.is_initialized(conv, client)  # type: ignore[arg-type]
     await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
     assert client.calls[-1]["session_init"]["recovery_id"] != first_id
+    assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
 
 
 class _AdvertisedRunner:
@@ -674,12 +694,12 @@ async def test_delayed_initialization_cannot_follow_a_replacement_tunnel() -> No
             )
         )
         try:
-            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.wait_for(entered.wait(), timeout=budget(1))
             new = reg.register("runner_init", AsyncMock(), hello)
             assert new.generation > old.generation
             release.set()
             with pytest.raises(ConnectionError, match="before request was sent"):
-                await asyncio.wait_for(init, timeout=1)
+                await asyncio.wait_for(init, timeout=budget(1))
         finally:
             release.set()
             init.cancel()

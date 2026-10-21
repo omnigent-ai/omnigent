@@ -1,0 +1,170 @@
+{
+  "cooldown_days": 7,
+  "python": {
+    "default": "minor",
+    "manual": [
+      "claude-agent-sdk",
+      "openai-agents",
+      "cursor-sdk",
+      "google-adk",
+      "google-antigravity",
+      "github-copilot-sdk",
+      "kiro-cli",
+      "copilot-sdk",
+      "pi-coding-agent"
+    ],
+    "zero_minor": [
+      "*"
+    ]
+  },
+  "npm": {
+    "default": "minor",
+    "manual": [
+      "@anthropic-ai/claude-code",
+      "@openai/codex",
+      "@earendil-works/pi-coding-agent",
+      "@mariozechner/pi-*",
+      "@github/copilot*",
+      "@cursor/*",
+      "electron",
+      "@electron/*",
+      "@capacitor/*",
+      "react-native",
+      "react-pdf",
+      "pdfjs-dist"
+    ],
+    "zero_minor": [
+      "*"
+    ]
+  },
+  "actions": {
+    "default": "minor",
+    "manual": [
+      "pypa/gh-action-pypi-publish",
+      "softprops/action-gh-release",
+      "release-drafter/release-drafter",
+      "googleapis/release-please-action",
+      "actions/attest*",
+      "actions/create-github-app-token"
+    ],
+    "zero_minor": [
+      "*"
+    ]
+  },
+  "action_test_paths": {
+    ".github/workflows/ci.yml": "ci.yml",
+    ".github/workflows/lint.yml": "lint.yml",
+    ".github/workflows/web-tests.yml": "web-tests.yml",
+    ".github/workflows/e2e.yml": "e2e.yml",
+    ".github/workflows/e2e-ui.yml": "e2e-ui.yml",
+    ".github/workflows/integration.yml": "integration.yml",
+    ".github/actions/setup-pnpm/action.yml": "web-tests.yml",
+    ".github/actions/e2e-run/action.yml": "e2e.yml",
+    ".github/actions/integration-run/action.yml": "integration.yml",
+    ".github/actions/setup-uv/action.yml": "ci.yml",
+    ".github/workflows/docker-build.yml": "docker-build.yml",
+    ".github/workflows/trivy.yml": "trivy.yml",
+    ".github/workflows/windows.yml": "windows.yml"
+  },
+  "pre_commit": [
+    "https://github.com/pre-commit/pre-commit-hooks"
+  ],
+  "cargo": {
+    "default": "minor",
+    "manual": [],
+    "zero_minor": [
+      "*"
+    ],
+    "targets": {
+      "tests/codex_parity/sidecar/Cargo.lock": {
+        "workflows": [
+          "ci.yml",
+          "e2e-ui.yml"
+        ],
+        "checks": [
+          "Pytest (codex-parity)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Pytest (codex-parity)"
+          ],
+          "e2e-ui.yml": [
+            "UI coverage scope",
+            "E2E UI result",
+            "E2E UI Tests (shard *)"
+          ]
+        }
+      },
+      "dev/omnidev/Cargo.lock": {
+        "workflows": [
+          "ci.yml"
+        ],
+        "checks": [
+          "Rust tests (omnidev)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Rust tests (omnidev)"
+          ]
+        }
+      }
+    }
+  },
+  "dependency_workflow_test_jobs": {
+    "npm": {
+      "ci.yml": [
+        "CI coverage scope",
+        "CI result"
+      ]
+    },
+    "pre-commit": {
+      "ci.yml": [
+        "CI coverage scope",
+        "CI result"
+      ]
+    }
+  },
+  "workflow_test_jobs": {
+    "windows.yml": [
+      "Windows smoke + unit"
+    ],
+    "ci.yml": [
+      "CI coverage scope",
+      "CI result",
+      "Pytest (*)"
+    ],
+    "lint.yml": [
+      "Pre-commit checks"
+    ],
+    "trivy.yml": [
+      "Trivy CVE Scan (repository)",
+      "Trivy CVE Scan (dev-tools)"
+    ],
+    "integration.yml": [
+      "Integration (openai-agents)"
+    ],
+    "e2e.yml": [
+      "E2E coverage scope",
+      "E2E Tests (shard *)"
+    ],
+    "web-tests.yml": [
+      "Web coverage scope",
+      "web test",
+      "Web result"
+    ],
+    "e2e-ui.yml": [
+      "UI coverage scope",
+      "E2E UI result",
+      "Browser Contract UI",
+      "E2E UI Tests (shard *)"
+    ],
+    "docker-build.yml": [
+      "Docker build",
+      "Docker result"
+    ]
+  }
+}

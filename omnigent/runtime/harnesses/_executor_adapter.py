@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -724,6 +725,10 @@ class ExecutorAdapter(HarnessApp):
                     )
                     try:
                         accepted = await executor.enqueue_session_message(self._session_key, text)
+                        outcome = "executor_accepted" if accepted else "executor_refused"
+                    except InjectionDeliveryAmbiguous:
+                        # The harness may already hold the message; resending could duplicate it.
+                        accepted, outcome = True, "executor_ambiguous"
                     except BaseException as exc:
                         log_input_event(
                             _logger,
@@ -739,7 +744,7 @@ class ExecutorAdapter(HarnessApp):
                         _logger,
                         "native_input_steering_finished",
                         session_id=ctx.session_id,
-                        outcome="executor_accepted" if accepted else "executor_refused",
+                        outcome=outcome,
                     )
             except Exception:
                 _logger.exception(
@@ -1171,7 +1176,10 @@ class ExecutorAdapter(HarnessApp):
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
-        from omnigent.runner.launch_failure import diagnose_client_update_required
+        from omnigent.runner.launch_failure import (
+            diagnose_client_update_required,
+            diagnose_model_unavailable,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1213,6 +1221,12 @@ class ExecutorAdapter(HarnessApp):
                 cause=diagnosis.cause,
                 remediation=diagnosis.remediation,
             )
+
+        # Preserve the failure metadata; add only the recovery guidance.
+        model_diagnosis = diagnose_model_unavailable(message)
+        if model_diagnosis is not None:
+            detail = super()._build_error_detail(exception)
+            return detail.model_copy(update={"remediation": model_diagnosis.remediation})
 
         return super()._build_error_detail(exception)
 

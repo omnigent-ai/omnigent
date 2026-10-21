@@ -37,21 +37,26 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import itertools
 import json
 import logging
 import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
-import subprocess
+import signal
 import tempfile
+import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
+from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -65,6 +70,7 @@ from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
+    pi_generic_model_json_entry,
     pi_model_is_reasoning,
     pi_model_json_entry,
     unsupported_in_pi,
@@ -103,30 +109,64 @@ from .executor import (
 
 logger = logging.getLogger(__name__)
 
+_GATEWAY_AUTH_REFRESH_MS = 900_000
+# Leave time for the bridge round trip within Pi's 10-second command deadline.
+_GATEWAY_AUTH_TIMEOUT_S = 7
+_GATEWAY_BRIDGE_TIMEOUT_S = 8
+
+
+class _GatewayAuthError(OSError):
+    """Credential failure whose message is safe to show without redaction."""
+
+
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
 # tool_execution_start/end, agent_end, message_end, etc.).
 CodexEvent: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 
-def _fetch_shell_command_token(command: str) -> str | None:
-    """Run an auth helper command and return its stdout token.
-
-    :param command: Shell command that prints a bearer token.
-    :returns: The stripped token, or ``None`` when the command fails or
-        prints no token.
-    """
-    result = subprocess.run(
-        ["sh", "-c", command],
-        check=False,
-        capture_output=True,
-        text=True,
+async def _fetch_shell_command_token(command: str) -> str:
+    """Resolve a token with a deadline, without exposing helper output on failure."""
+    process = await asyncio.create_subprocess_exec(
+        "sh",
+        "-c",
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
     )
-    token = result.stdout.strip()
-    if result.returncode != 0 or not token:
-        logger.debug("Pi Databricks auth command failed: %s", result.stderr.strip())
-        return None
-    return token
+    try:
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), _GATEWAY_AUTH_TIMEOUT_S)
+        except (TimeoutError, asyncio.CancelledError):
+            # Children may still hold stdout open after the helper shell exits.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.communicate()
+            raise
+        if process.returncode != 0:
+            raise _GatewayAuthError("Pi gateway auth command failed")
+        token = stdout.decode().strip()
+        if not token:
+            raise _GatewayAuthError("Pi gateway auth command returned an empty token")
+        return token
+    except TimeoutError:
+        raise _GatewayAuthError("Pi gateway auth command timed out") from None
+
+
+def _write_gateway_auth_client(tmp_dir: str, port: int, token: str) -> pathlib.Path:
+    """Copy Pi's credential client and write its private connection settings."""
+    client_path = pathlib.Path(tmp_dir) / "gateway-auth.cjs"
+    config_path = client_path.with_suffix(".json")
+    config_path.write_text(
+        json.dumps({"port": port, "token": token}),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    resource = files("omnigent.resources.pi").joinpath("gateway_auth.cjs")
+    client_path.write_bytes(resource.read_bytes())
+    client_path.chmod(0o600)
+    return client_path
 
 
 class ToolExecutor(Protocol):
@@ -160,6 +200,7 @@ class _PiProviderConfig(TypedDict):
     models: list[_JsonObject]
     authHeader: NotRequired[bool]
     compat: NotRequired[_JsonObject]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -239,6 +280,8 @@ class _ToolServer:
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
         self.token: str = secrets.token_urlsafe(32)
+        self._gateway_auth: Callable[[], Awaitable[str]] | None = None
+        self._clients: set[asyncio.Task[None]] = set()
 
     async def start(self) -> int:
         """Start listening on a random port. Returns the port number."""
@@ -255,6 +298,11 @@ class _ToolServer:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+        clients = list(self._clients)
+        for client in clients:
+            client.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+        if self._server is not None:
             await self._server.wait_closed()
             self._server = None
 
@@ -263,6 +311,9 @@ class _ToolServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._clients.add(task)
         try:
             while True:
                 raw = await reader.readline()
@@ -285,6 +336,20 @@ class _ToolServer:
                         ).encode("utf-8")
                         + b"\n"
                     )
+                    await writer.drain()
+                    break
+                if request.get("kind") == "gateway_auth":
+                    try:
+                        if self._gateway_auth is None:
+                            raise OSError("Pi gateway authentication is not configured")
+                        async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                            credential = await self._gateway_auth()
+                        auth_response = {"token": credential}
+                    except (OSError, TimeoutError) as exc:
+                        error = str(exc) or "Pi gateway authentication timed out"
+                        logger.warning("Pi gateway credential request failed: %s", error)
+                        auth_response = {"error": error}
+                    writer.write(json.dumps(auth_response).encode() + b"\n")
                     await writer.drain()
                     break
                 raw_req_id = request.get("id")
@@ -320,6 +385,7 @@ class _ToolServer:
             pass
         finally:
             writer.close()
+            self._clients.discard(task)
 
     def _token_ok(self, presented: JsonValue) -> bool:
         """
@@ -730,7 +796,7 @@ def _build_models_json(
 
     :param host: Databricks workspace URL used for legacy profile-only
         defaults.
-    :param token: Bearer token to write into Pi's provider entries.
+    :param token: Pi API-key configuration value (literal or ``!command``).
     :param base_urls: Optional provider base URLs keyed by model family,
         e.g. ``{"claude": "...", "openai": "..."}`` — from ucode state or
         a generic (OpenRouter/LiteLLM) provider entry.
@@ -776,7 +842,6 @@ def _build_models_json(
         "supportsDeveloperRole": False,
         "supportsStore": False,
         "supportsStrictMode": False,
-        "supportsReasoningEffort": False,
     }
     provider_models: dict[str, list[_JsonObject]] = {
         "databricks-openai": [],
@@ -843,7 +908,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
                     "supportsUsageInStreaming": False,
                 },
                 "models": provider_models["databricks-mlflow"],
@@ -859,7 +923,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
                     # Gemini/Qwen/Llama/inkling models reject stream_options
                     # (which carries include_usage) with 400 "unknown field".
                     "supportsUsageInStreaming": False,
@@ -889,10 +952,21 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            entry: _JsonObject = {"id": model, "input": ["text", "image"]}
-            if pi_model_is_reasoning(model):
-                entry["reasoning"] = True
+            if any(
+                url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
+                for url in (base_urls or {}).values()
+            ):
+                entry = dict(pi_generic_model_json_entry(model))
+            else:
+                entry = {"id": model, "input": ["text", "image"]}
+                if pi_model_is_reasoning(model):
+                    entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
+    for provider_config in config["providers"].values():
+        if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
+            provider_config["headers"] = gateway_attribution_headers(
+                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+            )
     return config
 
 
@@ -1541,6 +1615,7 @@ def _try_sandbox_pi(
     os_env: OSEnvSpec | None,
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
+    extra_read_roots: Sequence[pathlib.Path] | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -1555,6 +1630,9 @@ def _try_sandbox_pi(
         anything else its environment picks up — defense in depth
         against host-env leakage into the sandbox. ``None`` skips the
         prune.
+    :param extra_read_roots: Directories granted read-only alongside Pi's
+        own installation, e.g. the bundle resource directories passed to
+        Pi via ``--skill`` / ``--extension``.
     """
     if os_env is None:
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
@@ -1582,7 +1660,7 @@ def _try_sandbox_pi(
             (parent for parent in executable.parents if parent.name == "node_modules"),
             executable.parent,
         )
-        sandbox = with_additional_read_roots(sandbox, [pi_dir])
+        sandbox = with_additional_read_roots(sandbox, [pi_dir, *(extra_read_roots or ())])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
@@ -1619,7 +1697,11 @@ def _resolve_pi_skill_args(
       not an error.
 
     Pi's ``--skill`` flag accepts a directory path, not a name, so
-    the resolver looks up named skills under ``<bundle>/skills/``.
+    the resolver looks up named skills under ``<bundle>/skills/`` and
+    Pi's own project layout ``<bundle>/.pi/skills/`` (``skills/`` wins
+    when both ship the same name). Pi would discover ``.pi/skills``
+    itself, but only relative to its cwd — the session workspace, not
+    the bundle — so bundled skills always need the explicit flag.
     Host-installed Pi skills aren't accessible by name without
     knowing Pi's internal extension layout, so the named-list mode
     only resolves bundle skills.
@@ -1636,11 +1718,12 @@ def _resolve_pi_skill_args(
     """
     bundle_skills: dict[str, pathlib.Path] = {}
     if bundle_dir is not None:
-        skills_root = bundle_dir / "skills"
-        if skills_root.is_dir():
+        for skills_root in (bundle_dir / "skills", bundle_dir / ".pi" / "skills"):
+            if not skills_root.is_dir():
+                continue
             for child in sorted(skills_root.iterdir()):
                 if child.is_dir() and (child / "SKILL.md").is_file():
-                    bundle_skills[child.name] = child
+                    bundle_skills.setdefault(child.name, child)
 
     if skills_filter == "all":
         # Pi auto-discovers host skills; we explicitly add bundled
@@ -1664,6 +1747,138 @@ def _resolve_pi_skill_args(
     # no explicit skills). The harness wrap's resolver should
     # have validated upstream, so this branch is belt-and-suspenders.
     return []
+
+
+# Bundle-root context-file candidates, in Pi's own precedence order
+# (mirrors Pi's cwd-based project context loader).
+_PI_BUNDLE_CONTEXT_FILE_CANDIDATES = (
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+)
+
+
+def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Resolve one extension directory to its entry-point file(s)."""
+    manifest_path = ext_dir / "package.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "PiExecutor: could not read extension manifest %s: %s", manifest_path, exc
+            )
+            manifest = None
+        pi_field = manifest.get("pi") if isinstance(manifest, dict) else None
+        raw_entries = pi_field.get("extensions") if isinstance(pi_field, dict) else None
+        if isinstance(raw_entries, list):
+            root = ext_dir.resolve()
+            entries: list[pathlib.Path] = []
+            for entry in raw_entries:
+                candidate = (ext_dir / entry).resolve() if isinstance(entry, str) else None
+                if (
+                    candidate is not None
+                    and candidate.is_file()
+                    and candidate.is_relative_to(root)
+                ):
+                    entries.append(ext_dir / entry)
+                else:
+                    logger.warning(
+                        "PiExecutor: skipping manifest extension entry %r in %s "
+                        "(not a file inside the extension dir)",
+                        entry,
+                        manifest_path,
+                    )
+            if entries:
+                return entries
+    for name in ("index.ts", "index.js"):
+        entry = ext_dir / name
+        if entry.is_file():
+            return [entry]
+    return []
+
+
+def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Discover extension entry files under a bundle's ``.pi/extensions``."""
+    root_entries = _pi_extension_dir_entries(extensions_dir)
+    if root_entries:
+        return root_entries
+    entries: list[pathlib.Path] = []
+    try:
+        children = sorted(extensions_dir.iterdir())
+    except OSError as exc:
+        logger.warning(
+            "PiExecutor: could not list bundle extensions dir %s: %s", extensions_dir, exc
+        )
+        return entries
+    for child in children:
+        if child.name.startswith(".") or child.name == "node_modules":
+            continue
+        if child.is_file() and child.suffix in (".ts", ".js"):
+            entries.append(child)
+        elif child.is_dir():
+            entries.extend(_pi_extension_dir_entries(child))
+    return entries
+
+
+def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[str]:
+    """Pass bundled extension entry files explicitly; Pi's cwd is the workspace."""
+    if bundle_dir is None:
+        return []
+    extensions_dir = bundle_dir / ".pi" / "extensions"
+    if not extensions_dir.is_dir():
+        return []
+    args: list[str] = []
+    for entry in _resolve_pi_bundle_extension_entries(extensions_dir):
+        args.extend(["--extension", str(entry)])
+    return args
+
+
+def _pi_bundle_resource_roots(
+    bundle_dir: pathlib.Path | None, args: Sequence[str]
+) -> list[pathlib.Path]:
+    """Grant selected resource roots; sandbox tmpfs hides extracted bundles.
+
+    Granting only the bundle root would leave .pi hidden by the dotfile mask.
+    """
+    if bundle_dir is None:
+        return []
+    passed = {
+        pathlib.Path(value)
+        for flag, value in itertools.pairwise(args)
+        if flag in ("--skill", "--extension")
+    }
+    roots = (
+        bundle_dir / "skills",
+        bundle_dir / ".pi" / "skills",
+        bundle_dir / ".pi" / "extensions",
+    )
+    return [root for root in roots if any(path.is_relative_to(root) for path in passed)]
+
+
+def _squash_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
+    """Read the first readable bundle context file in Pi's precedence order."""
+    if bundle_dir is None:
+        return None
+    for candidate in _PI_BUNDLE_CONTEXT_FILE_CANDIDATES:
+        context_file = bundle_dir / candidate
+        if not context_file.is_file():
+            continue
+        try:
+            content = context_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            logger.warning(
+                "PiExecutor: could not read bundle context file %s: %s", context_file, exc
+            )
+            continue
+        return content or None
+    return None
 
 
 def _extract_pi_turn_usage(
@@ -1810,6 +2025,7 @@ class PiExecutor(Executor):
         base_urls_override: dict[str, str] | None = None,
         openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
+        gateway_auth_refresh_interval_ms: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
@@ -1822,7 +2038,8 @@ class PiExecutor(Executor):
 
         :param cwd: Working directory for the Pi subprocess.
         :param context_files: Allow Pi to automatically load context files such
-            as AGENTS.md and CLAUDE.md. Explicit agent instructions are unaffected.
+            as AGENTS.md and CLAUDE.md, including the one at the bundle root.
+            Explicit agent instructions are unaffected.
         :param system_prompt_mode: ``append`` retains Pi's base prompt;
             ``replace`` uses Omnigent's composed instructions as the base.
         :param os_env: Optional OS environment / sandbox spec.  When set, the
@@ -1860,6 +2077,8 @@ class PiExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_PI_GATEWAY_AUTH_COMMAND``.
+        :param gateway_auth_refresh_interval_ms: Token cache lifetime in milliseconds;
+            defaults to 15 minutes. Zero resolves credentials on every request.
         :param retry_policy: The spec's ``llm.retry`` budget. Threads
             ``policy.pi.settings()`` into Pi's ``.pi/settings.json``
             before subprocess spawn — Pi natively does exponential
@@ -1867,9 +2086,15 @@ class PiExecutor(Executor):
             budget. ``None`` resolves to ``RetryPolicy()`` defaults.
             See Phase 1f of ``designs/RETRY_ACROSS_HARNESSES.md``.
         :param bundle_dir: The agent bundle's extracted on-disk path.
-            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` files
-            are exposed to Pi via ``--skill <path>`` based on
-            *skills_filter*. ``None`` skips bundle-skill wiring.
+            When set, ``<bundle_dir>/skills/<dir>/SKILL.md`` and
+            ``<bundle_dir>/.pi/skills/<dir>/SKILL.md`` files are exposed
+            to Pi via ``--skill <path>`` based on *skills_filter*,
+            ``<bundle_dir>/.pi/extensions`` via ``--extension``, and a
+            bundle-root context file (``AGENTS.md`` et al.) is appended
+            to the composed system prompt when *context_files* allows.
+            A sandboxed Pi is granted read access to the resource
+            directories it is passed. ``None`` skips all bundle-resource
+            wiring.
         :param agent_name: Optional agent display name. Reserved for
             future use; currently unused by Pi.
         :param skills_filter: Host-skill filter (``"all"`` / ``"none"``
@@ -1905,6 +2130,16 @@ class PiExecutor(Executor):
         self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
         self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
+        interval = (
+            int(gateway_auth_refresh_interval_ms)
+            if gateway_auth_refresh_interval_ms
+            else _GATEWAY_AUTH_REFRESH_MS
+        )
+        if interval < 0:
+            raise ValueError("gateway_auth_refresh_interval_ms must be nonnegative")
+        self._gateway_auth_refresh_interval_s = interval / 1000
+        self._gateway_refresh_after = 0.0
+        self._gateway_auth_lock = asyncio.Lock()
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
         # does exponential backoff + Retry-After honoring; we just set
@@ -1962,44 +2197,24 @@ class PiExecutor(Executor):
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
         # extension is read-only after init.
         self._extra_args.extend(_resolve_pi_skill_args(skills_filter, bundle_dir))
+        self._extra_args.extend(_resolve_pi_bundle_extension_args(bundle_dir))
+        # The bundle-root context file is an automatic context file like the
+        # workspace ones Pi discovers, so ``context_files=False`` drops it too.
+        self._bundle_context = _read_pi_bundle_context(bundle_dir) if context_files else None
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
 
+        self._databricks_host = self._gateway_host_override or ""
+        self._databricks_token = ""
         if gateway:
-            creds = None
-            if self._gateway_host_override is None:
-                creds = _read_databrickscfg(databricks_profile)
-                if creds is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) requires gateway credentials via "
-                        "the gateway base URL / auth command or a valid "
-                        "~/.databrickscfg profile."
-                    )
-            if self._gateway_host_override is not None:
-                self._databricks_host = self._gateway_host_override
-                if gateway_auth_command is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) with a gateway workspace host "
-                        "requires a gateway auth command."
-                    )
-                token = _fetch_shell_command_token(gateway_auth_command)
-                if token is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) could not fetch a gateway token "
-                        "for the workspace host."
-                    )
-                self._databricks_token = token
-            elif base_url_override:
-                # Derive the workspace host from the Anthropic gateway URL
-                # ucode wrote to state.json.
-                _parsed = _urlparse(base_url_override)
-                self._databricks_host = f"{_parsed.scheme}://{_parsed.netloc}"
-                assert creds is not None
-                self._databricks_token = creds.token
-            else:
-                assert creds is not None
-                self._databricks_host = creds.host
-                self._databricks_token = creds.token
+            if self._gateway_host_override is not None and gateway_auth_command is None:
+                raise OSError(
+                    "PiExecutor(gateway=True) with a gateway workspace host "
+                    "requires a gateway auth command."
+                )
+            if self._gateway_host_override is None and base_url_override:
+                parsed = _urlparse(base_url_override)
+                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
 
         # True when the gateway transport was derived from a ~/.databrickscfg
         # profile (no gateway host or base URL supplied directly). Gates the
@@ -2022,6 +2237,7 @@ class PiExecutor(Executor):
             os_env,
             cwd,
             spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+            extra_read_roots=_pi_bundle_resource_roots(bundle_dir, self._extra_args),
         )
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
@@ -2188,6 +2404,8 @@ class PiExecutor(Executor):
         """Fetch and cache the live Databricks model catalog."""
         if self._gateway_model_wire_apis is not None:
             return self._gateway_model_wire_apis
+        if self._gateway:
+            await self._get_gateway_token()
         workspace_url = self._gateway_workspace_url if self._gateway else None
         if workspace_url is None:
             self._gateway_model_entries = ()
@@ -2225,15 +2443,47 @@ class PiExecutor(Executor):
         return self._gateway_model_wire_apis
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
-        """Start the TCP tool server if there are Omnigent tools to bridge."""
-        if not tools:
+        """Start the authenticated bridge for tools or gateway credentials."""
+        if not tools and not self._gateway:
             return None
         if self._tool_server is None:
             self._tool_server = _ToolServer()
             await self._tool_server.start()
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
+        self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
         return self._tool_server.port
+
+    async def _get_gateway_token(self) -> str:
+        """Refresh expired credentials under a lock; never fall back after failure."""
+        async with self._gateway_auth_lock:
+            if time.monotonic() < self._gateway_refresh_after:
+                return self._databricks_token
+            self._gateway_refresh_after = 0.0
+            try:
+                async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                    if self._gateway_host_override is not None:
+                        assert self._gateway_auth_command is not None
+                        token = await _fetch_shell_command_token(self._gateway_auth_command)
+                    else:
+                        creds = await run_sync_on_thread(
+                            _read_databrickscfg, self._databricks_profile
+                        )
+                        token = creds.token if creds is not None else None
+                        if creds is not None and not self._databricks_host:
+                            self._databricks_host = creds.host
+                    if not isinstance(token, str) or not token.strip():
+                        raise _GatewayAuthError("Pi gateway authentication returned no token")
+            except _GatewayAuthError:
+                raise
+            except TimeoutError:
+                raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
+            except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
+                raise _GatewayAuthError("Pi gateway credential refresh failed") from None
+            self._databricks_token = token
+            self._gateway_workspace_url = self._gateway_model_service_workspace_url()
+            self._gateway_refresh_after = time.monotonic() + self._gateway_auth_refresh_interval_s
+            return token
 
     async def _gate_native_tool(  # type: ignore[explicit-any]
         self,
@@ -2273,7 +2523,7 @@ class PiExecutor(Executor):
         tools: list[ToolSpec],
         tool_server_port: int | None,
         tool_server_token: str | None,
-        model: str | None,
+        models_json: _PiModelsConfig | None,
     ) -> PiSubprocessConfig:
         """Build env dict, temp dir, and extra CLI args for a Pi subprocess.
 
@@ -2284,12 +2534,11 @@ class PiExecutor(Executor):
             (:attr:`_ToolServer.token`), embedded in the generated
             extension so requests authenticate. Non-``None`` whenever
             *tool_server_port* is.
-        :param model: The resolved model id this subprocess will run, e.g.
-            ``"moonshotai/kimi-k2.6"``; registered in the generated
-            ``models.json`` on the gateway path so the
-            ``provider/<model>`` selector resolves. ``None`` when no model
-            is pinned (Pi picks its own default).
+        :param models_json: Provider configuration resolved off-loop before
+            allocating session files; ``None`` for Pi-owned configuration.
         """
+        if self._gateway and models_json is None:
+            raise ValueError("Gateway provider configuration must be resolved before startup")
         env = dict(self._env)
         tmp_parent = None
         if self._sandboxed:
@@ -2299,16 +2548,11 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
-            effective_model = model
-            models_json = _build_models_json(
-                self._gateway_workspace_url or self._databricks_host,
-                self._databricks_token,
-                self._base_urls_override,
-                model=effective_model,
-                catalog_models=self._gateway_model_entries or (),
-                model_wire_apis=self._gateway_model_wire_apis,
-                openai_wire_api=self._openai_wire_api,
-            )
+            assert tool_server_port is not None and tool_server_token is not None
+            assert models_json is not None
+            auth_client = _write_gateway_auth_client(tmp_dir, tool_server_port, tool_server_token)
+            for provider in models_json["providers"].values():
+                provider["apiKey"] = f"!node {shlex.quote(str(auth_client))}"
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
@@ -2322,6 +2566,10 @@ class PiExecutor(Executor):
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
             )
+            from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+            assert models_json is not None
+            extra_args.extend(pi_gateway_extension_args(pathlib.Path(tmp_dir), models_json))
 
         # Pi natively supports retry config via ``.pi/settings.json``
         # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
@@ -2449,6 +2697,13 @@ class PiExecutor(Executor):
         )
         state.applied_thinking = thinking
 
+    def _with_bundle_context(self, system_prompt: str) -> str:
+        """Append bundle context unless the prompt already starts with it."""
+        context = self._bundle_context
+        if not context or _squash_ws(system_prompt).startswith(_squash_ws(context)):
+            return system_prompt
+        return f"{system_prompt}\n\n{context}" if system_prompt else context
+
     async def _ensure_rpc(
         self,
         session_key: str,
@@ -2478,6 +2733,18 @@ class PiExecutor(Executor):
             return state.rpc
 
         wire_catalog = await self._load_gateway_model_wire_apis()
+        models_json = None
+        if self._gateway:
+            models_json = await run_sync_on_thread(
+                _build_models_json,
+                self._gateway_workspace_url or self._databricks_host,
+                "",  # The session's credential helper is attached when writing models.json.
+                self._base_urls_override,
+                model=effective_model,
+                catalog_models=self._gateway_model_entries or (),
+                model_wire_apis=wire_catalog,
+                openai_wire_api=self._openai_wire_api,
+            )
 
         if state.rpc is not None:
             await state.rpc.close()
@@ -2485,7 +2752,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, effective_model
+            tools, tool_server_port, tool_server_token, models_json
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -2513,7 +2780,7 @@ class PiExecutor(Executor):
             env=env,
             cwd=self._cwd,
             model=pi_model or None,
-            system_prompt=system_prompt or None,
+            system_prompt=self._with_bundle_context(system_prompt) or None,
             system_prompt_mode=self._system_prompt_mode,
             thinking=thinking,
             extra_args=extra_args or None,
@@ -2533,15 +2800,11 @@ class PiExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         if self._gateway:
-            if self._gateway_host_override is None:
-                creds = _read_databrickscfg(self._databricks_profile)
-                if creds is not None:
-                    self._databricks_token = creds.token
-            else:
-                assert self._gateway_auth_command is not None
-                token = _fetch_shell_command_token(self._gateway_auth_command)
-                if token:
-                    self._databricks_token = token
+            try:
+                await self._get_gateway_token()
+            except OSError as exc:
+                yield ExecutorError(message=str(exc), retryable=False)
+                return
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
         try:
