@@ -22,6 +22,14 @@ from omnigent.tools import ToolManager
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient
 
+_ACCOUNT_TOOLS = {
+    "sys_scheduled_task_create",
+    "sys_scheduled_task_list",
+    "sys_scheduled_task_update",
+    "sys_scheduled_task_delete",
+    "sys_agent_list",
+}
+
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("os_env", [None, OSEnvSpec(), OSEnvSpec(cwd=".")])
@@ -144,6 +152,10 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
     )
     server_client = NullServerClient()
     server_client.auth = _RunnerDatabricksAuth(lambda: token)
+    # The fake resolver skips the bundle download that normally authenticates first.
+    auth_flow = server_client.auth.auth_flow(httpx.Request("GET", "http://server/health"))
+    next(auth_flow)
+    auth_flow.close()
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         spec_resolver=resolve,
@@ -168,14 +180,7 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
     assert len(harness.posted_bodies) == 1
     names = {schema["function"]["name"] for schema in harness.posted_bodies[0]["tools"]}
     assert names >= tool_dispatch._OS_ENV_TOOLS | {"local_probe", "sys_timer_set"}
-    account_tools = {
-        "sys_scheduled_task_create",
-        "sys_scheduled_task_list",
-        "sys_scheduled_task_update",
-        "sys_scheduled_task_delete",
-        "sys_agent_list",
-    }
-    assert account_tools.isdisjoint(names) if confined else account_tools <= names
+    assert _ACCOUNT_TOOLS.isdisjoint(names) if confined else names >= _ACCOUNT_TOOLS
     assert {"sys_session_list", "sys_agent_get", "sys_agent_download"} <= names
     for relay_spec in (spec, None):
         relay_names = {
@@ -189,21 +194,35 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
         assert {"sys_session_list", "sys_agent_get"} <= relay_names
         if relay_spec is not None:
             assert (
-                account_tools.isdisjoint(relay_names) if confined else account_tools <= relay_names
+                _ACCOUNT_TOOLS.isdisjoint(relay_names)
+                if confined
+                else relay_names >= _ACCOUNT_TOOLS
             )
-    if confined:
-        # A stale cached tool call must fail locally rather than repeatedly reauthenticating.
-        async with httpx.AsyncClient(
-            auth=server_client.auth,
-            base_url="http://server",
-            transport=httpx.MockTransport(lambda _: pytest.fail("unsupported tool reached HTTP")),
-        ) as api:
-            for tool_name in account_tools:
-                result = await tool_dispatch.execute_tool(
-                    tool_name=tool_name,
-                    arguments="{}",
-                    agent_spec=spec,
-                    server_client=api,
-                )
-                assert "requires interactive user credentials" in json.loads(result)["error"]
     create_env.assert_not_called()
+
+
+async def test_confined_account_tools_are_rejected_before_http() -> None:
+    token = mint_session_token(
+        "alice",
+        b"test-only-secret" * 3,
+        1800,
+        "accounts",
+        extra_claims={"scope": "runner", "runner_id": "runner_test"},
+    )
+    auth = _RunnerDatabricksAuth(lambda: token)
+    auth_flow = auth.auth_flow(httpx.Request("GET", "http://server/health"))
+    next(auth_flow)
+    auth_flow.close()
+    async with httpx.AsyncClient(
+        auth=auth,
+        base_url="http://server",
+        transport=httpx.MockTransport(lambda _: pytest.fail("unsupported tool reached HTTP")),
+    ) as api:
+        for tool_name in _ACCOUNT_TOOLS:
+            result = await tool_dispatch.execute_tool(
+                tool_name=tool_name,
+                arguments="{}",
+                agent_spec=AgentSpec(spec_version=1, timers=True),
+                server_client=api,
+            )
+            assert "requires interactive user credentials" in json.loads(result)["error"]
