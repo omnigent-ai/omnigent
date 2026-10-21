@@ -283,6 +283,44 @@ class MainActivityTest {
     }
 
     @Test
+    fun `server menu Reload reports a second TLS failure without page start`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val error =
+            SslError(
+                SslError.SSL_UNTRUSTED,
+                SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+                "https://example.com/",
+            )
+        val firstHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+        webView.webViewClient.onReceivedSslError(webView, firstHandler, error)
+        val firstFailure =
+            activity.declared<ConnectionStatus?>("connectionStatus") as
+                ConnectionStatus.ServerUnreachable
+
+        activity.invoke(
+            "showServerSwitcherMenu",
+            arrayOf(View::class.java),
+            activity.switchButton(),
+        )
+        val popup = ShadowPopupMenu.getLatestPopupMenu()
+        assertTrue(shadowOf(popup).onMenuItemClickListener.onMenuItemClick(popup.menu.findItem(3)))
+        val secondHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+        webView.webViewClient.onReceivedSslError(webView, secondHandler, error)
+
+        val secondFailure =
+            activity.declared<ConnectionStatus?>("connectionStatus") as
+                ConnectionStatus.ServerUnreachable
+        assertNotSame(firstFailure, secondFailure)
+        assertEquals(UnreachableKind.TLS, secondFailure.kind)
+        listOf(firstHandler, secondHandler).forEach { handler ->
+            val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+            assertTrue(shadow.wasCancelCalled())
+            assertFalse(shadow.wasProceedCalled())
+        }
+    }
+
+    @Test
     fun `main frame error details use numeric code and exclude callback query`() {
         val activity = launch()
         val webView = activity.webView()
