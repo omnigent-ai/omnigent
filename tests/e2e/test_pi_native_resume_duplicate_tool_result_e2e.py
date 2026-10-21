@@ -8,13 +8,16 @@ import hashlib
 import json
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 from tests._helpers.server_runner import server_runner
+from tests._helpers.session import bundle_files, post_session_bundle
 
 # Every HTTP call targets 127.0.0.1; bypass any CI egress proxy autodetection.
 _http = httpx.Client(trust_env=False)
@@ -39,36 +42,14 @@ pytestmark = pytest.mark.skipif(
 
 def _create_pi_native_session(base_url: str) -> str:
     """Create a pi-native wrapper session (production spec + labels) like ``omnigent pi``."""
-    import io
-    import tarfile
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        PI_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
-
     with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_pi_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("pi-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: PI_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
+        spec = _materialize_pi_agent_spec(Path(tmp))
+        bundle = bundle_files({spec.name: spec.read_bytes()})
+    create = post_session_bundle(
+        _http.post,
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={"bundle": ("pi-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
+        bundle,
+        metadata={"labels": dict(_SESSION_LABELS)},
         timeout=30.0,
     )
     create.raise_for_status()
@@ -160,11 +141,6 @@ def _tool_result_messages(session_file: Path) -> list[dict]:
     return messages
 
 
-def _tool_result_call_ids(session_file: Path) -> list[str | None]:
-    """Return the ``toolCallId`` of every ``toolResult`` record, in file order."""
-    return [message.get("toolCallId") for message in _tool_result_messages(session_file)]
-
-
 def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> None:
     """Cold resume rebuilds exactly one toolResult for a doubly-committed output."""
     # Stub Pi CLI: parks so the tmux pane stays alive. The resume JSONL is
@@ -231,7 +207,8 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
             f"{(tmp_path / 'runner.log').read_text()[-3000:]}"
         )
 
-        call_ids = _tool_result_call_ids(session_file)
+        results = _tool_result_messages(session_file)
+        call_ids = [message.get("toolCallId") for message in results]
         # Sanity: the rebuild produced the tool result at all (history intact).
         assert _CALL_ID in call_ids, (
             f"rebuilt Pi session has no toolResult for {_CALL_ID}; "
@@ -245,16 +222,7 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
             f"(Anthropic rejects multiple tool_result blocks for one tool_use id). "
             f"toolResult ids in rebuilt session: {call_ids}"
         )
-        # Cold resume must also keep the tool's name on the rebuilt result; an
-        # empty toolName makes Gemini reject the next turn with
-        # "function_response.name: Name cannot be empty".
-        names = {
-            message.get("toolName")
-            for message in _tool_result_messages(session_file)
-            if message.get("toolCallId") == _CALL_ID
-        }
-        assert names == {"get_time"}, (
-            f"cold resume rebuilt the toolResult for {_CALL_ID} with name(s) {names}; "
-            f"expected the committed tool name 'get_time' so the rebuilt "
-            f"functionResponse.name is non-empty. file: {session_file.read_text()[:2000]}"
-        )
+        # Gemini requires the matching tool name on replayed results.
+        assert [
+            message.get("toolName") for message in results if message.get("toolCallId") == _CALL_ID
+        ] == ["get_time"]

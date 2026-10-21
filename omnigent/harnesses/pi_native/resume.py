@@ -202,12 +202,7 @@ def _interrupted_response_ids(items: list[_JsonObject]) -> set[str]:
 
 
 def _function_call_names(items: list[_JsonObject]) -> dict[str, str]:
-    """Return the tool name of every ``function_call`` item by ``call_id``.
-
-    :param items: Flat Omnigent item dicts in chronological order.
-    :returns: Mapping from ``call_id`` to the call's tool name, e.g.
-        ``{"call_1": "bash"}``. Calls without a name or id are omitted.
-    """
+    """Index named tool calls so rebuilt results retain their tool name."""
     names: dict[str, str] = {}
     for item in items:
         if item.get("type") != "function_call":
