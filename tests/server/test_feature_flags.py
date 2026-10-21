@@ -30,6 +30,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "sidebar_grouping_ui": False,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
+        "automations_v2": False,
     }
 
 
@@ -125,3 +126,12 @@ def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
         assert definition.review_by_release
         assert defaults.enabled(definition.feature) == definition.default_enabled
     assert FeatureFlags().enabled_features == frozenset()
+
+
+@pytest.mark.parametrize(
+    "override,enabled", [("", False), ("automations_v2", True), ("-automations_v2", False)]
+)
+def test_automations_v2_is_default_off_and_frontend_visible(override: str, enabled: bool) -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: override})
+    assert flags.enabled(Feature.AUTOMATIONS_V2) is enabled
+    assert flags.frontend_dict()["automations_v2"] is enabled
