@@ -2550,6 +2550,7 @@ async def _query_sessions_once(
     """
     from omnigent.remote_launch import (
         LaunchHostError,
+        no_online_runner_message,
         resolve_remote_launch_host,
     )
 
@@ -2595,11 +2596,7 @@ async def _query_sessions_once(
             except LaunchHostError as exc:
                 raise _server_setup_error(str(exc)) from exc
         if runner_id is None and launch_host_id is None:
-            raise _server_setup_error(
-                "This server has no online runner to run the turn. Start one against "
-                f"it with `{cli_invocation()} host --server <url>` (or run the agent locally "
-                f"with `{cli_invocation()} run <agent.yaml>`), then retry."
-            )
+            raise _server_setup_error(no_online_runner_message())
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
     if launch_host_id is not None and agent is not None:
         # The server launches and binds the host's runner itself.

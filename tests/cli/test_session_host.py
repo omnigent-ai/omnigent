@@ -6,18 +6,9 @@ import httpx
 import pytest
 from omnigent_client import OmnigentClient
 
-from omnigent import session_host
 from omnigent.chat import _DatabricksTokenAuth
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 from omnigent.session_host import get_session_host, route_session_request, set_session_host
-
-
-@pytest.fixture(autouse=True)
-def _clear_map() -> None:
-    """Reset the module-global session→host map between tests."""
-    session_host._session_hosts.clear()
-    yield
-    session_host._session_hosts.clear()
 
 
 def test_set_session_host_clears_on_empty() -> None:
@@ -70,10 +61,10 @@ def test_auth_no_key_off_workspace() -> None:
     assert _slice_key(auth, "http://127.0.0.1:6767/v1/sessions/conv_1/events") is None
 
 
-@pytest.mark.parametrize("session_host", ["host_new", None], ids=["override", "fallback"])
+@pytest.mark.parametrize("target_host", ["host_new", None], ids=["override", "fallback"])
 @pytest.mark.asyncio
 async def test_request_routing_follows_the_target_session(
-    monkeypatch: pytest.MonkeyPatch, session_host: str | None
+    monkeypatch: pytest.MonkeyPatch, target_host: str | None
 ) -> None:
     """The SDK hook overrides stale auth routing without changing shared headers."""
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
@@ -81,12 +72,12 @@ async def test_request_routing_follows_the_target_session(
     monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
     mount = "http://127.0.0.1/api/2.0/omnigent"
     set_session_host("conv_old", "host_old")
-    set_session_host("conv_new", session_host)
+    set_session_host("conv_new", target_host)
     auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_old")
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/2.0/omnigent/v1/sessions/conv_new"
-        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (session_host or "host_fallback")
+        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (target_host or "host_fallback")
         assert request.headers["Authorization"] == "Bearer test-token"
         return httpx.Response(
             200, json={"id": "conv_new", "agent_id": "ag_new", "status": "idle", "created_at": 0}

@@ -1924,17 +1924,16 @@ def test_pick_agent_follows_agent_listing_pages(monkeypatch: pytest.MonkeyPatch)
     assert requests == [("agents", None), ("agents", "ag_coder")]
 
 
-@pytest.mark.parametrize(
-    "second_page",
-    [_agents_page(["coder"], has_more=True, last_id="ag_first")],
-)
 def test_pick_agent_rejects_a_stalled_agent_listing(
-    monkeypatch: pytest.MonkeyPatch, second_page: dict[str, object]
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Claiming more agents without a usable cursor is an error, not a partial list."""
     _serve_listings(
         monkeypatch,
-        agent_pages=[_agents_page(["first"], has_more=True, last_id="ag_first"), second_page],
+        agent_pages=[
+            _agents_page(["first"], has_more=True, last_id="ag_first"),
+            _agents_page(["coder"], has_more=True, last_id="ag_first"),
+        ],
     )
 
     with pytest.raises(click.ClickException, match="no usable cursor"):
@@ -2188,11 +2187,9 @@ def test_chat_with_server_headless_resume_reports_a_failed_session_lookup(
 
 
 @pytest.mark.parametrize("session_agent", ["uploaded-only", None])
-@pytest.mark.parametrize("catalog_status", [200, 500])
 def test_chat_with_server_fork_uses_source_not_catalog(
     monkeypatch: pytest.MonkeyPatch,
     session_agent: str | None,
-    catalog_status: int,
 ) -> None:
     """Forking uses the source snapshot even if the catalog is broken or ambiguous."""
     requests: list[str] = []
@@ -2206,11 +2203,7 @@ def test_chat_with_server_fork_uses_source_not_catalog(
                 request=httpx.Request("GET", url),
                 json={"id": "conv_source", "agent_name": session_agent, "host_id": "host_source"},
             )
-        return httpx.Response(
-            catalog_status,
-            request=httpx.Request("GET", url),
-            json={"data": [{"id": "ag_one", "name": "one"}, {"id": "ag_two", "name": "two"}]},
-        )
+        raise AssertionError(f"Fork must not query the catalog: {url}")
 
     def _repl(_base_url: str, agent_name: str, *_args: object, **kwargs: object) -> None:
         dispatched.update(agent_name=agent_name, **kwargs)
@@ -5638,7 +5631,7 @@ def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
     monkeypatch.setattr(chat_module, "_server_auth", lambda **_kwargs: None)
     requests: list[str] = []
 
-    async def handler(_transport: object, request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(f"{request.method} {request.url.path}")
         if request.url.path == "/v1/runners":
             return httpx.Response(200, json={"data": []})
@@ -5649,10 +5642,12 @@ def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
         assert request.url.path == "/v1/sessions"
         raise failure("private transport details", request=request)
 
-    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    client = chat_module.OmnigentClient("http://127.0.0.1")
+    monkeypatch.setattr(client._http, "_transport", httpx.MockTransport(handler))
+    monkeypatch.setattr(chat_module, "OmnigentClient", lambda **_kwargs: client)
     with pytest.raises(SystemExit) as excinfo:
         chat_module._run_headless_prompt(
-            "http://srv",
+            "http://127.0.0.1",
             "scribe",
             None,
             prompt="hi",
@@ -5723,8 +5718,6 @@ def test_one_shot_with_only_other_machines_hosts_names_them(
 ) -> None:
     """Another machine can't use this directory as its workspace, so say so."""
     from omnigent_client import LaunchHost
-
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
 
     _local_host(monkeypatch, None)
     sessions = _LaunchSessions(hosts=[LaunchHost("host_dev", "devbox.local")])
@@ -5904,8 +5897,6 @@ async def test_resume_old_snapshot_fails_before_runner_requests(listing_status: 
 
 
 def test_one_shot_unknown_agent_is_a_clean_cli_error() -> None:
-    from omnigent.cli_diagnostics import suppresses_recovery_hint
-
     async def _resolve_agent(name: str) -> object:
         raise LookupError(f"No agent named {name!r} is registered on this server.")
 

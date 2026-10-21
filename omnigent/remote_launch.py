@@ -16,6 +16,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def no_online_runner_message() -> str:
+    """Explain how to connect a runner using the current CLI invocation."""
+    command = cli_invocation()
+    return (
+        "This server has no online runner to run the turn. Start one against "
+        f"it with `{command} host --server <url>` (or run the agent locally "
+        f"with `{command} run <agent.yaml>`), then retry."
+    )
+
+
 class LaunchHostError(RuntimeError):
     """Host discovery or launch selection failed; ``str()`` explains why."""
 

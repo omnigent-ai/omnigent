@@ -24,7 +24,7 @@ async def test_remote_repl_unknown_agent_error_is_escaped() -> None:
     """A missing agent name keeps its LookupError, with control characters escaped."""
 
     async def _resolve_agent(name: str) -> object:
-        raise LookupError(f"No agent named {name!r} is registered on this server.")
+        raise LookupError(f"No agent named {name!r}. Available: evil\x1b[2J")
 
     adapter = _SessionsChatReplAdapter(
         SimpleNamespace(sessions=SimpleNamespace(resolve_agent=_resolve_agent)),  # type: ignore[arg-type]
@@ -80,6 +80,7 @@ async def _remote_adapter(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     session_id: str | None = None,
+    agent_name: str = "reviewer",
 ) -> AsyncIterator[_SessionsChatReplAdapter]:
     """Use real SDK requests and snapshots; suppress only the background stream."""
     monkeypatch.setattr(session_host, "_session_hosts", {})
@@ -93,7 +94,7 @@ async def _remote_adapter(
     ) as http:
         adapter = _SessionsChatReplAdapter(
             SimpleNamespace(sessions=SessionsNamespace(http, "http://srv")),  # type: ignore[arg-type]
-            "reviewer",
+            agent_name,
             session_id=session_id,
             registered_agent=RegisteredAgent(id="ag_selected", harness="claude"),
         )
@@ -179,6 +180,67 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             if scenario == "resume":
                 assert requests == ["GET /v1/sessions/conv_remote"]
                 assert adapter._agent_name == "uploaded-only"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_name", "harness"), [(None, "claude-sdk"), ("shadowed", "claude-sdk"), (None, None)]
+)
+async def test_new_session_uses_snapshot_identity_without_a_runner(
+    monkeypatch: pytest.MonkeyPatch, agent_name: str | None, harness: str | None
+) -> None:
+    """An unnamed or shadowed session agent survives /new without a catalog lookup."""
+    snapshot = {
+        "id": "conv_source",
+        "agent_id": "ag_uploaded",
+        "agent_name": agent_name,
+        "harness": harness,
+        "runner_id": None,
+        "status": "idle",
+        "created_at": 0,
+    }
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        requests.append(f"{request.method} {path}")
+        if path == "/v1/sessions/conv_source":
+            return httpx.Response(200, json=snapshot)
+        if path == "/v1/runners":
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"runner_id": "runner_wrong", "online": True, "harnesses": ["codex"]},
+                        {"runner_id": "runner_right", "online": True, "harnesses": ["claude-sdk"]},
+                    ]
+                },
+            )
+        if path == "/v1/sessions":
+            assert json.loads(request.content)["agent_id"] == "ag_uploaded"
+            return httpx.Response(201, json={**snapshot, "id": "conv_new"})
+        if path == "/v1/sessions/conv_new":
+            assert json.loads(request.content) == {"runner_id": "runner_right"}
+            return httpx.Response(
+                200,
+                json={
+                    **snapshot,
+                    "id": "conv_new",
+                    "runner_id": "runner_right",
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with _remote_adapter(monkeypatch, handler, agent_name="agent") as adapter:
+        await adapter.view_session("conv_source", read_only=True)
+        await adapter.start_new_conversation()
+        if harness is None:
+            with pytest.raises(RuntimeError, match="does not report its harness"):
+                await adapter._ensure_session()
+            assert requests == ["GET /v1/sessions/conv_source", "PATCH /v1/sessions/conv_source"]
+        else:
+            assert await adapter._ensure_session() == "conv_new"
+            assert adapter._runner_id == "runner_right"
 
 
 @pytest.mark.asyncio

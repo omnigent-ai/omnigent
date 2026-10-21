@@ -52,8 +52,9 @@ coverage requires `pexpect`; a skipped variant is not proof.
    interactive and one-shot launches; verify the selected registration, host,
    workspace, reply and runner ownership after exit.
 4. Resume or fork an existing session and verify its original agent is used.
-   Within the REPL, `/new` should start a fresh session without inheriting a
-   previous launch's routing header.
+   Within the REPL, `/new` keeps that agent's ID and harness, including unnamed
+   uploads, without inheriting a previous launch's routing header. If no runner
+   or harness is known, it asks you to start with `--agent` rather than guessing.
 
 The process scenarios live in
 `tests/e2e/test_remote_url_chat_fresh_session_2437.py`; catalog, host policy,

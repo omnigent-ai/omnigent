@@ -69,9 +69,10 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.remote_launch import resolve_remote_launch_host
+from omnigent.remote_launch import no_online_runner_message, resolve_remote_launch_host
 from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
@@ -1754,36 +1755,34 @@ class _SessionsChatReplAdapter:
                 file=sys.stderr,
                 flush=True,
             )
-        # Skip the name lookup only when nothing needs it: we already know
-        # the id, and a bound runner means we don't need the harness either.
-        agent = self._registered_agent if self._agent_id is None else None
-        if agent is None and (self._agent_id is None or self._runner_id is None):
+        # /new keeps the session's identity, including unnamed uploaded agents.
+        if self._agent_id is not None:
+            agent = RegisteredAgent(id=self._agent_id, harness=self._harness)
+            if self._runner_id is None and not agent.harness:
+                raise RuntimeError(
+                    "The previous session does not report its harness, so a compatible "
+                    "runner cannot be selected. Start a new session with --agent <name>."
+                )
+        else:
+            agent = self._registered_agent
+        if agent is None:
             try:
                 agent = await self._client.sessions.resolve_agent(self._agent_name)
             except LookupError as exc:
-                from omnigent.cli_diagnostics import printable
-
                 # The REPL renders this message; keep server-supplied names inert.
                 raise LookupError(printable(str(exc))) from exc
-        agent_id = self._agent_id or (agent.id if agent is not None else None)
-        if agent_id is None:
-            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
         launch_host_id: str | None = None
         if self._runner_id is None:
             self._runner_id = await self._client.sessions.resolve_online_runner(
-                harness=agent.harness if agent is not None else None,
+                harness=agent.harness,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
             if self._runner_id is None:
                 launch_host_id = await resolve_remote_launch_host(
-                    self._client.sessions, harness=agent.harness if agent is not None else None
+                    self._client.sessions, harness=agent.harness
                 )
                 if launch_host_id is None:
-                    raise RuntimeError(
-                        "This server has no online runner to run the turn. Start one "
-                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
-                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
-                    )
+                    raise RuntimeError(no_online_runner_message())
             if pending_debug and self._runner_id is not None:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
@@ -1794,7 +1793,7 @@ class _SessionsChatReplAdapter:
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
         session = await self._client.sessions.create_from_agent_id(
-            agent_id,
+            agent.id,
             reasoning_effort=self._reasoning_effort,
             workspace=os.getcwd(),
             host_id=launch_host_id,
@@ -1927,11 +1926,7 @@ class _SessionsChatReplAdapter:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
                     # online runners at create time and found none.
-                    raise RuntimeError(
-                        "This server has no online runner to run the turn. Start one "
-                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
-                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
-                    )
+                    raise RuntimeError(no_online_runner_message())
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
                     f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
