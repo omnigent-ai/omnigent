@@ -589,9 +589,11 @@ def test_runner_token_rejected_outside_runner_scope(
 
 def test_runner_token_reaches_no_session_without_scope_lookup() -> None:
     """Fail closed: until the app wires the scope lookup, no session is reachable."""
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=_make_accounts_config())
+    provider = _runner_provider()
     token = provider.mint_runner_token("alice", 1800, runner_id=_RUNNER)
     assert token is not None
+    provider._runner_session_check = None
+    assert provider.mint_runner_token("alice", 1800, runner_id=_RUNNER) is None
 
     with pytest.raises(OmnigentError, match="not authorized"):
         provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))

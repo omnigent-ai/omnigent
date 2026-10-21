@@ -4151,7 +4151,7 @@ def create_app(
 
         auth_provider.set_runner_session_check(
             lambda runner_id, session_id: runner_session_in_scope(
-                runner_id, session_id, conversation_store.get_conversation
+                runner_id, session_id, conversation_store.get_runner_scope
             )
         )
 

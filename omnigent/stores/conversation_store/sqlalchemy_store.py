@@ -109,6 +109,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    RunnerSessionScope,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -1206,6 +1207,37 @@ class SqlAlchemyConversationStore(ConversationStore):
                     f"conversation id {conversation_id!r} already exists"
                 ) from exc
             raise
+
+    def get_runner_scope(self, conversation_id: str) -> RunnerSessionScope | None:
+        """Read three full primary keys across the conversation and metadata databases."""
+        with shared_read_scope(), self._conv_session("select_runner_scope") as session:
+            row = session.execute(
+                select(SqlConversation.parent_conversation_id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            creator = session.scalar(
+                select(SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == RUNNER_CREATOR_LABEL_KEY,
+                )
+            )
+            with self._session("select_runner_scope") as metadata_session:
+                runner_id = metadata_session.scalar(
+                    select(SqlConversationMetadata.runner_id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                    )
+                )
+            return RunnerSessionScope(
+                runner_id,
+                row.parent_conversation_id,
+                {RUNNER_CREATOR_LABEL_KEY: creator} if creator is not None else {},
+            )
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """

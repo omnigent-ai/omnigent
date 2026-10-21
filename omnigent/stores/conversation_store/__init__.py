@@ -238,6 +238,15 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
 
 
 @dataclass(frozen=True)
+class RunnerSessionScope:
+    """Only the binding, parent and creator grant needed for runner authorization."""
+
+    runner_id: str | None
+    parent_conversation_id: str | None
+    labels: dict[str, str]
+
+
+@dataclass(frozen=True)
 class CreatedSession:
     """
     Result of atomic session and agent creation.
@@ -592,6 +601,18 @@ class ConversationStore(ABC):
             ``None``.
         """
         ...
+
+    def get_runner_scope(self, conversation_id: str) -> RunnerSessionScope | None:
+        """Look up runner authorization state; stores may avoid hydrating full sessions."""
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None:
+            return None
+        creator = conversation.labels.get(RUNNER_CREATOR_LABEL_KEY)
+        return RunnerSessionScope(
+            conversation.runner_id,
+            conversation.parent_conversation_id,
+            {RUNNER_CREATOR_LABEL_KEY: creator} if creator is not None else {},
+        )
 
     @abstractmethod
     def find_conversation_by_external_session_id(

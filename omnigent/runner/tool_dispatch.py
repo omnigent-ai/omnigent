@@ -435,10 +435,10 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
-_ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {"sys_agent_list"}
+_ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {"sys_agent_list", "sys_session_share"}
 
 
-async def runner_uses_confined_bearer(server_client: httpx.AsyncClient | None) -> bool:
+def runner_uses_confined_bearer(server_client: httpx.AsyncClient | None) -> bool:
     """Read the last authenticated bearer's capability without refreshing it."""
     auth = getattr(server_client, "auth", None)
     return getattr(auth, "runner_confined", False) is True
@@ -5011,7 +5011,7 @@ async def _host_harnesses_or_none(
     server_client: httpx.AsyncClient,
 ) -> _JsonObject | None:
     """Return the bound host's reported harness readiness, best-effort."""
-    if not host_id or await runner_uses_confined_bearer(server_client):
+    if not host_id or runner_uses_confined_bearer(server_client):
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
@@ -5920,7 +5920,7 @@ async def _session_list_via_rest(
     sessions_page = (
         _DiscoveryPage([], False)
         if cursor_state["sessions"][0] == _DISCOVERY_END
-        or await runner_uses_confined_bearer(server_client)
+        or runner_uses_confined_bearer(server_client)
         else await _collect_global_sessions(
             server_client,
             agent_name,
@@ -6599,7 +6599,7 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
-    if tool_name in _ACCOUNT_WIDE_TOOLS and await runner_uses_confined_bearer(server_client):
+    if tool_name in _ACCOUNT_WIDE_TOOLS and runner_uses_confined_bearer(server_client):
         return json.dumps(
             {
                 "error": f"{tool_name} requires interactive user credentials; "

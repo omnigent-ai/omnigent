@@ -57,8 +57,8 @@ from omnigent.server import managed_host_keepalive, session_live_state, shutdown
 from omnigent.server.auth import (
     LEGACY_RUNNER_TOKENS_ENV,
     RESERVED_USER_LOCAL,
-    RUNNER_TOKEN_SCOPE,
     AuthProvider,
+    UnifiedAuthProvider,
     env_var_is_truthy,
 )
 from omnigent.server.host_registry import RunnerExitReports
@@ -254,6 +254,7 @@ def create_runner_tunnel_router(
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
+    legacy_warning_logged = False
 
     def _get_user_id_from_request(request: Request) -> str | None:
         """Extract user identity from an HTTP request, 401 if rejected.
@@ -343,27 +344,10 @@ def create_runner_tunnel_router(
             default=None, alias=RUNNER_CREDENTIAL_PROTOCOL_HEADER
         ),
     ) -> dict[str, str | int]:
-        """Mint a short-lived bearer using the runner/provider credential protocol.
+        """Mint a short-lived runner bearer, confined when scoped-v1 is requested.
 
-        A host-launched or managed-sandbox runner does not inherit the host
-        user's credential; it presents its server-minted tunnel binding token
-        (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a
-        short-lived JWT the runner then uses on its HTTP callbacks (which
-        gate on ``require_user``). When runner and provider support scoped-v1,
-        the JWT authenticates as the owner only on this runner's own routes
-        and sessions (see ``RunnerTokenConfinement``). Otherwise the 0.20.x
-        compatibility window permits legacy owner-wide issuance by default;
-        disable it with ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0``. Legacy
-        issuance is scheduled for removal in 0.21.0. This is the HTTP analog of the
-        runner tunnel's binding-token handshake: the same SHA-256 gate
-        (``token_bound_runner_id(token) == runner_id``) and the same
-        owner resolution (``resolve_managed_runner_owner``), minting a
-        bearer instead of registering a tunnel.
-
-        The binding-token match is required unconditionally — the
-        allow-list shortcut honored on some other runner-token checks is
-        deliberately NOT accepted here, because this endpoint issues an
-        owner-identity credential and delegated runners are token-bound.
+        Legacy owner-wide issuance remains until 0.21.0 unless
+        ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0``. A scoped request never downgrades.
 
         :param request: The incoming FastAPI request (carries the binding
             token header).
@@ -375,8 +359,9 @@ def create_runner_tunnel_router(
             (header/proxy, or no auth provider).
         :param credential_protocol: ``scoped-v1`` for confined credentials;
             absent for legacy issuance during the 0.20.x compatibility window.
-        :raises OmnigentError: 426 for unknown protocols or disabled legacy issuance.
+        :raises OmnigentError: 426 for unsupported protocols/providers or disabled legacy issuance.
         """
+        nonlocal legacy_warning_logged
         if auth_provider is None:
             # No auth configured: the runner authenticates by binding
             # token alone and needs no bearer — minting is meaningless.
@@ -392,11 +377,18 @@ def create_runner_tunnel_router(
                 "upgrade the runner to a supported credential protocol (scoped-v1)",
                 code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
             )
-        confined = (
-            credential_protocol == RUNNER_CREDENTIAL_PROTOCOL
-            and auth_provider.runner_token_scope == RUNNER_TOKEN_SCOPE
+        confined = credential_protocol == RUNNER_CREDENTIAL_PROTOCOL
+        if confined and not (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider.runner_confinement_ready
             and (mint_managed_runner_token is None or mint_scoped_managed_runner_token is not None)
-        )
+        ):
+            raise OmnigentError(
+                "upgrade the auth provider and managed issuer to a wired scoped-v1 "
+                "implementation; "
+                "a scoped request cannot use legacy credentials",
+                code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
+            )
         if not confined and not env_var_is_truthy(LEGACY_RUNNER_TOKENS_ENV, default=True):
             raise OmnigentError(
                 "upgrade the runner and auth provider to scoped-v1; "
@@ -428,7 +420,8 @@ def create_runner_tunnel_router(
                 "runner token minting is unsupported in this auth mode",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if not confined:
+        if not confined and not legacy_warning_logged:
+            legacy_warning_logged = True
             _logger.warning(
                 "Legacy owner-wide runner credentials are deprecated until removal in "
                 "0.21.0; upgrade runners/providers and set %s=0 to enforce confinement",

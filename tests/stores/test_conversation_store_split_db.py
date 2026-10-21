@@ -275,6 +275,10 @@ def test_runner_binding_consumes_bootstrap_permission(
     conv = store.create_conversation(
         title="bootstrap", labels={RUNNER_CREATOR_LABEL_KEY: "runner_xyz", "keep": "value"}
     )
+    scope = store.get_runner_scope(conv.id)
+    assert scope is not None
+    assert scope.runner_id is None
+    assert scope.labels == {RUNNER_CREATOR_LABEL_KEY: "runner_xyz"}
     if operation == "set_runner_id":
         assert store.set_runner_id(conv.id, "runner_xyz")
     elif operation == "replace_runner_id":
@@ -289,6 +293,13 @@ def test_runner_binding_consumes_bootstrap_permission(
     assert fetched.runner_id == (
         "runner_xyz" if operation in ("set_runner_id", "replace_runner_id") else None
     )
+    scope = store.get_runner_scope(conv.id)
+    assert scope is not None
+    assert scope.runner_id == fetched.runner_id
+    assert scope.labels == {}
+    child = store.create_conversation(parent_conversation_id=conv.id)
+    assert store.get_runner_scope(child.id).parent_conversation_id == conv.id
+    assert store.get_runner_scope("00000000000000000000000000000000") is None
 
 
 def test_failed_initial_binding_keeps_bootstrap_revoked(

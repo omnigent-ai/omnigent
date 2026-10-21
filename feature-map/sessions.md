@@ -7,6 +7,11 @@ running again when their runner or host goes away. Most actions are offered in
 more than one place (the sidebar row, the right-click menu, bulk selection, and
 the header menu), and each place is a separate entry point.
 
+Delegated runners with confined credentials cannot list account-wide sessions
+or change sharing. Their child lists use opaque cursors and may return empty
+pages with a continuation. See [runner credential compatibility](../deploy/README.md#delegated-runner-credentials)
+and [login and host authentication](login-and-host-auth.md).
+
 ## Sub-features
 
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a

@@ -17,7 +17,7 @@ from omnigent.runner import create_runner_app, tool_dispatch
 from omnigent.runner._entry import _RunnerDatabricksAuth
 from omnigent.runner.app import ResolvedSpec
 from omnigent.server.oidc import mint_session_token
-from omnigent.spec.types import AgentSpec, LocalToolInfo, ToolRuntime
+from omnigent.spec.types import AgentSpec, LocalToolInfo, SharePolicy, ToolRuntime
 from omnigent.tools import ToolManager
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient
@@ -28,6 +28,7 @@ _ACCOUNT_TOOLS = {
     "sys_scheduled_task_update",
     "sys_scheduled_task_delete",
     "sys_agent_list",
+    "sys_session_share",
 }
 
 
@@ -132,6 +133,7 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
         spec_version=1,
         os_env=OSEnvSpec(),
         timers=True,
+        agent_session_sharing=SharePolicy.NON_PUBLIC,
         local_tools=[LocalToolInfo(name="local_probe", path="local_probe.py", language="python")],
     )
 
@@ -187,7 +189,7 @@ async def test_cold_turn_schemas_preserve_local_tools_without_os_environment(
             entry["name"]
             for entry in tool_dispatch.build_native_relay_tool_schemas(
                 relay_spec,
-                runner_confined=await tool_dispatch.runner_uses_confined_bearer(server_client),
+                runner_confined=tool_dispatch.runner_uses_confined_bearer(server_client),
             )
         }
         assert ("sys_agent_list" in relay_names) is not confined

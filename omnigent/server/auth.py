@@ -28,13 +28,17 @@ and closed over by route factories — no per-request import cost.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import ipaddress
+import json
 import logging
 import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol
 
@@ -112,9 +116,14 @@ _RUNNER_SCOPE_MAX_DEPTH = 32
 
 
 class _ScopedConversation(Protocol):
-    runner_id: str | None
-    labels: dict[str, str]
-    parent_conversation_id: str | None
+    @property
+    def runner_id(self) -> str | None: ...
+
+    @property
+    def labels(self) -> dict[str, str]: ...
+
+    @property
+    def parent_conversation_id(self) -> str | None: ...
 
 
 def runner_session_in_scope(
@@ -122,18 +131,9 @@ def runner_session_in_scope(
     session_id: str,
     get_conversation: Callable[[str], _ScopedConversation | None],
 ) -> bool:
-    """Whether a runner-confined bearer may act on *session_id*.
+    """Check the nearest runner binding or active creator grant on the parent chain.
 
-    The nearest runner binding on the session's parent chain decides: the
-    session (or the ancestor it inherits from) must be bound to *runner_id*.
-    An unbound session is also in scope while its one-shot bootstrap label
-    names *runner_id*. Binding or detaching consumes that permission.
-    Inheritance stops after 32 parent edges; direct bindings have no depth limit.
-
-    :param runner_id: Runner the bearer is confined to, e.g. ``"runner_ab"``.
-    :param session_id: Session the request targets, e.g. ``"conv_abc"``.
-    :param get_conversation: Conversation lookup returning ``None`` if absent.
-    :returns: ``True`` when the session belongs to the runner.
+    Inspect at most 32 parent edges; nearer bindings override ancestor grants.
     """
     seen: set[str] = set()
     current: str | None = session_id
@@ -161,6 +161,37 @@ class RunnerTokenConfinement:
 
     runner_id: str
     session_in_scope: Callable[[str, str], bool] | None
+    cursor_secret: bytes | None = field(default=None, repr=False)
+
+    def child_cursor(
+        self, parent_id: str, cursor: str | None, *, decode: bool = False
+    ) -> str | None:
+        """Keep bounded child-page continuation positions private, even on empty pages."""
+        if cursor is None:
+            return None
+        from cryptography.fernet import Fernet, InvalidToken
+
+        if self.cursor_secret is None:
+            raise OmnigentError(
+                "runner pagination is unavailable", code=ErrorCode.RUNNER_SCOPE_DENIED
+            )
+        key = hmac.digest(self.cursor_secret, b"omnigent.runner.child-cursor.v1", hashlib.sha256)
+        cipher = Fernet(base64.urlsafe_b64encode(key))
+        if not decode:
+            return cipher.encrypt(
+                json.dumps([self.runner_id, parent_id, cursor]).encode()
+            ).decode()
+        try:
+            if len(cursor) > 2048:
+                raise ValueError("invalid cursor length")
+            runner_id, parent, position = json.loads(cipher.decrypt(cursor.encode(), ttl=3600))
+            if runner_id == self.runner_id and parent == parent_id and isinstance(position, str):
+                return position
+        except (InvalidToken, ValueError, TypeError):
+            pass
+        raise OmnigentError(
+            "restart child pagination without a cursor", code=ErrorCode.STALE_CURSOR
+        )
 
     def allows_session(self, session_id: str) -> bool:
         """Whether the bearer may act on *session_id*."""
@@ -520,7 +551,7 @@ class AuthProvider(ABC):
     When ``None`` is returned, the route helpers respond with 401.
     """
 
-    # Providers opt in only after implementing runner-bound issuance and checks.
+    # A capability hint; issuance also requires the wired built-in validator.
     runner_token_scope: str | None = None
 
     @abstractmethod
@@ -536,14 +567,9 @@ class AuthProvider(ABC):
         runner_id: str | None = None,  # noqa: ARG002
     ) -> str | None:
         """
-        Mint a short-lived bearer a delegated runner presents as *user_id*.
+        When *runner_id* is given, confine the bearer to that runner's sessions.
 
-        A managed runner runs in a sandbox with no logged-in user
-        credential of its own, so the server mints one for its HTTP
-        callbacks when auth is enabled (see the
-        ``POST /v1/runners/{id}/token`` endpoint). Code in that sandbox can
-        read the bearer, so providers opting into ``runner_token_scope``
-        must confine it to *runner_id*'s sessions. Until 0.21.0, calls
+        Only the wired built-in validator supports scoped issuance. Until 0.21.0, calls
         without *runner_id* retain the legacy owner-wide contract when
         ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS`` is enabled (default).
         Default: ``None`` — no minting (single-user / no-auth, or a
@@ -649,6 +675,16 @@ class UnifiedAuthProvider(AuthProvider):
     def set_runner_session_check(self, check: Callable[[str, str], bool]) -> None:
         """Wire the ``(runner_id, session_id) -> bool`` runner-scope lookup."""
         self._runner_session_check = check
+
+    @property
+    def runner_confinement_ready(self) -> bool:
+        """Whether the built-in scope validator has its session lookup wired."""
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        return (
+            self.runner_token_scope == RUNNER_TOKEN_SCOPE
+            and config is not None
+            and self._runner_session_check is not None
+        )
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -775,6 +811,8 @@ class UnifiedAuthProvider(AuthProvider):
             return None
         if runner_id is None and not env_var_is_truthy(LEGACY_RUNNER_TOKENS_ENV, default=True):
             return None
+        if runner_id is not None and not self.runner_confinement_ready:
+            return None
         if self._source not in ("oidc", "accounts"):
             return None
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
@@ -876,7 +914,9 @@ class UnifiedAuthProvider(AuthProvider):
             runner_id = payload.get("runner_id")
             if not isinstance(runner_id, str) or not runner_id:
                 return None
-            confinement = RunnerTokenConfinement(runner_id, self._runner_session_check)
+            confinement = RunnerTokenConfinement(
+                runner_id, self._runner_session_check, cookie_config.cookie_secret
+            )
             if not confinement.allows_request(request):
                 raise OmnigentError(
                     "runner credential is not authorized for this request",

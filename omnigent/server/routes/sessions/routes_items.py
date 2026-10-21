@@ -144,6 +144,9 @@ def register_items_routes(
         matches :func:`list_session_items` so existing client code
         can reuse the same cursor logic.
 
+        Confined runners receive opaque cursors valid for one hour. Filtering
+        may leave an empty page with ``has_more=true``; continue using its cursor.
+
         :param request: Inbound HTTP request; carries the caller
             identity used to authorize READ on the parent session.
         :param session_id: Parent session/conversation identifier,
@@ -183,6 +186,10 @@ def register_items_routes(
         title_filter: str | None = None
         if tool and session_name:
             title_filter = f"{tool}:{session_name}"
+        confinement = runner_token_confinement(request)
+        if confinement is not None:
+            after = confinement.child_cursor(session_id, after, decode=True)
+            before = confinement.child_cursor(session_id, before, decode=True)
         page = await asyncio.to_thread(
             conversation_store.list_conversations,
             limit=limit,
@@ -194,7 +201,6 @@ def register_items_routes(
             sort_by="created_at",
             title=title_filter,
         )
-        confinement = runner_token_confinement(request)
         children = page.data
         if confinement is not None:
             children = await asyncio.to_thread(
@@ -207,7 +213,11 @@ def register_items_routes(
         )
         return PaginatedList(
             data=data,
-            first_id=page.first_id,
-            last_id=page.last_id,
+            first_id=confinement.child_cursor(session_id, page.first_id)
+            if confinement
+            else page.first_id,
+            last_id=confinement.child_cursor(session_id, page.last_id)
+            if confinement
+            else page.last_id,
             has_more=page.has_more,
         )

@@ -4659,7 +4659,7 @@ def create_runner_app(
             runner_uses_confined_bearer,
         )
 
-        runner_confined = await runner_uses_confined_bearer(server_client)
+        runner_confined = runner_uses_confined_bearer(server_client)
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
         except OmnigentError:
@@ -5277,7 +5277,7 @@ def create_runner_app(
             strip_account_tool_schemas,
         )
 
-        if await runner_uses_confined_bearer(server_client):
+        if runner_uses_confined_bearer(server_client):
             _spec_tools = strip_account_tool_schemas(_spec_tools)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)

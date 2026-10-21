@@ -1105,6 +1105,9 @@ def test_runner_token_is_confined_to_its_runner_sessions(setup_app, monkeypatch,
     assert child.status_code == 201, child.text
     assert runner.get(f"/v1/sessions/{child.json()['id']}").status_code == 200
     child_id = child.json()["id"]
+    child_binding = conversations.get_conversation(child_id)
+    assert child_binding.runner_id == runner_id
+    assert child_binding.host_id is None
     conversations.append(
         child_id,
         [
@@ -1186,13 +1189,72 @@ def test_runner_token_is_confined_to_its_runner_sessions(setup_app, monkeypatch,
         {"agent_id": other_client.get(f"/v1/sessions/{foreign}").json()["agent_id"]},
     ):
         assert runner.post("/v1/sessions", json=escape).status_code == 403, escape
-    assert create_session(runner).status_code == 403
+    parentless = create_session(runner)
+    assert parentless.status_code == 403
+    assert parentless.json()["error"]["code"] == "runner_scope_denied"
     sub_agent = runner.post(
         "/v1/sessions",
         data={"metadata": json.dumps({"parent_session_id": bound})},
         files={"bundle": ("agent.tar.gz", build_agent_bundle(name="helper"), "application/gzip")},
     )
     assert sub_agent.status_code == 201, sub_agent.text
+
+
+@pytest.mark.parametrize("order", ["asc", "desc"])
+def test_runner_child_pagination_keeps_hidden_positions_private(setup_app, order):
+    from omnigent.runner.identity import token_bound_runner_id
+
+    _, alice, stores, _ = setup_app
+    runner, parent, _ = _runner_for_session(alice, stores, "alice")
+    conversations = stores["conversation_store"]
+    agent_id = conversations.get_conversation(parent).agent_id
+    children = []
+    for index in range(4):
+        created = runner.post(
+            "/v1/sessions",
+            json={"agent_id": agent_id, "parent_session_id": parent, "title": f"child:{index}"},
+        )
+        assert created.status_code == 201, created.text
+        children.append(created.json()["id"])
+    hidden = children[1:3]
+    for child_id in hidden:
+        conversations.replace_runner_id(child_id, token_bound_runner_id("other-binding"))
+
+    url = f"/v1/sessions/{parent}/child_sessions"
+    cursor = None
+    visible = []
+    pages = []
+    for _ in children:
+        params = {"limit": 1, "order": order}
+        if cursor is not None:
+            params["after"] = cursor
+        response = runner.get(url, params=params)
+        assert response.status_code == 200, response.text
+        assert all(child_id not in response.text for child_id in hidden)
+        page = response.json()
+        pages.append(page)
+        visible.extend(child["id"] for child in page["data"])
+        assert page["first_id"] and page["last_id"]
+        cursor = page["last_id"]
+    assert visible == (
+        [children[0], children[3]] if order == "asc" else [children[3], children[0]]
+    )
+    assert all(not page["data"] and page["has_more"] for page in pages[1:3])
+    assert pages[-1]["has_more"] is False
+    previous = runner.get(url, params={"before": pages[-1]["first_id"], "order": order})
+    assert previous.status_code == 200, previous.text
+    assert [child["id"] for child in previous.json()["data"]] == visible[:1]
+
+    other_parent = runner.post("/v1/sessions", json={"agent_id": agent_id}).json()["id"]
+    for target, after in ((parent, cursor[:-8]), (other_parent, cursor), (parent, "x" * 2049)):
+        denied = runner.get(f"/v1/sessions/{target}/child_sessions", params={"after": after})
+        assert denied.status_code == 400, denied.text
+        assert denied.json()["error"]["code"] == "stale_cursor"
+
+    owner_page = alice.get(url).json()
+    assert {child["id"] for child in owner_page["data"]} == set(children)
+    assert owner_page["first_id"] in children
+    assert owner_page["last_id"] in children
 
 
 @pytest.mark.asyncio
@@ -1394,11 +1456,12 @@ def test_runner_binding_lifecycle_consumes_bootstrap_scope(setup_app, monkeypatc
     created = conversations.get_conversation(rotated_id)
     assert created.labels[RUNNER_CREATOR_LABEL_KEY] == runner_id
     for caller in (runner, owner_client):
-        rejected = caller.patch(
+        copied_labels = caller.patch(
             f"/v1/sessions/{rotated_id}",
-            json={"labels": {RUNNER_CREATOR_LABEL_KEY: other_runner_id}},
+            json={"labels": {RUNNER_CREATOR_LABEL_KEY: other_runner_id, "user_note": "kept"}},
         )
-        assert rejected.status_code == 403, rejected.text
+        assert copied_labels.status_code == 200, copied_labels.text
+        assert conversations.get_conversation(rotated_id).labels["user_note"] == "kept"
         assert (
             conversations.get_conversation(rotated_id).labels[RUNNER_CREATOR_LABEL_KEY]
             == runner_id

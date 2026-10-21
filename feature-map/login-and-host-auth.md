@@ -40,7 +40,7 @@ be able to write resources without a separate Omnigent account.
 - `delegated-runner-credentials`: accounts/OIDC runners announcing `scoped-v1` use
   credentials confined to their own session tree. Legacy issuance remains
   enabled through 0.20.x unless disabled by the operator; removal is planned
-  for 0.21.0. Scheduled-task tools and `sys_agent_list` are
+  for 0.21.0. Scheduled-task tools, `sys_agent_list` and `sys_session_share` are
   hidden, global session listing is empty, and host readiness is unavailable.
   Hosts and interactive user clients keep their own authority. States: own
   callback succeeds, another runner's session is denied, permission denials do

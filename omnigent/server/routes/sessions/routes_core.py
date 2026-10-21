@@ -1278,7 +1278,7 @@ def register_core_routes(
             # A top-level upload would add the bundle to the owner's agent catalog.
             raise OmnigentError(
                 "runner credential can upload agents only for sub-agent sessions",
-                code=ErrorCode.FORBIDDEN,
+                code=ErrorCode.RUNNER_SCOPE_DENIED,
             )
         created_labels = _runner_created_labels(
             parsed_metadata.labels, runner_token_confinement(request)
@@ -2717,9 +2717,14 @@ def register_core_routes(
                 code=ErrorCode.RUNNER_SCOPE_DENIED,
             )
         if body.labels and RUNNER_CREATOR_LABEL_KEY in body.labels:
-            raise OmnigentError(
-                "Runner creator metadata cannot be changed by clients",
-                code=ErrorCode.FORBIDDEN,
+            body = body.model_copy(
+                update={
+                    "labels": {
+                        key: value
+                        for key, value in body.labels.items()
+                        if key != RUNNER_CREATOR_LABEL_KEY
+                    }
+                }
             )
         if body.labels:
             _reject_server_reserved_label_seed(body.labels)

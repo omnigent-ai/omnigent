@@ -410,6 +410,7 @@ async def test_cli_decision_requires_ticket_login_provenance(
 ) -> None:
     config = make_oidc_config()
     provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    provider.set_runner_session_check(lambda _runner, _session: False)
     store = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
     async with httpx.AsyncClient(
         transport=_build_app(store), base_url="http://test", follow_redirects=False

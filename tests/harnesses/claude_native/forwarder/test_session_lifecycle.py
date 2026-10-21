@@ -344,7 +344,8 @@ async def test_clear_hook_transfer_failure_does_not_loop(
 
 
 @pytest.mark.asyncio
-async def test_post_clear_supersession_notifies_old_session() -> None:
+@pytest.mark.parametrize("detach_failure", [False, True])
+async def test_post_clear_supersession_notifies_old_session(detach_failure, caplog) -> None:
     """
     A /clear rotation notifies the superseded (old) conversation.
 
@@ -361,6 +362,8 @@ async def test_post_clear_supersession_notifies_old_session() -> None:
         """Record each POST and return a benign success."""
         body = json.loads(request.content.decode("utf-8")) if request.content else None
         calls.append((request.method, request.url.path, body))
+        if detach_failure and request.method == "PATCH":
+            return httpx.Response(503, json={"error": {"message": "temporarily unavailable"}})
         return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
 
     transport = httpx.MockTransport(handler)
@@ -372,6 +375,7 @@ async def test_post_clear_supersession_notifies_old_session() -> None:
             agent_name="claude-native-ui",
         )
 
+    assert ("Failed to detach superseded session after /clear" in caplog.text) is detach_failure
     assert len(calls) == 4
     assert calls[-1] == ("PATCH", "/v1/sessions/conv_old", {"runner_id": ""})
     # Every post is addressed to the OLD conversation.

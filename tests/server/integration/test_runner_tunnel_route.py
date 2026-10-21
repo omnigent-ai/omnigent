@@ -43,7 +43,13 @@ from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelR
 from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server import tunnel_handshake
-from omnigent.server.auth import LEGACY_RUNNER_TOKENS_ENV, RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.accounts_config import AccountsConfig
+from omnigent.server.auth import (
+    LEGACY_RUNNER_TOKENS_ENV,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    UnifiedAuthProvider,
+)
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
@@ -1902,7 +1908,7 @@ async def test_disconnected_batch_waiting_on_lock_cannot_apply_after_reconnect()
 # ── Managed-runner token mint endpoint (POST /v1/runners/{id}/token) ──
 
 
-class _MintingAuthProvider(_CredentialHeaderAuthProvider):
+class _MintingAuthProvider(UnifiedAuthProvider):
     """OIDC/accounts-style provider that also mints runner owner tokens.
 
     Models the deployed contract where ``mint_runner_token`` returns a
@@ -1912,7 +1918,20 @@ class _MintingAuthProvider(_CredentialHeaderAuthProvider):
     ``tests/server/test_accounts.py``.
     """
 
-    runner_token_scope = "runner"
+    def __init__(self, *, wired: bool = True):
+        super().__init__(
+            "accounts",
+            accounts_config=AccountsConfig(
+                cookie_secret=b"test-mint-route-secret-not-for-production",
+                session_ttl_hours=1,
+                base_url="http://testserver",
+                init_admin_password=None,
+                invite_ttl_seconds=600,
+                magic_ttl_seconds=600,
+            ),
+        )
+        if wired:
+            self.set_runner_session_check(lambda _runner, _session: False)
 
     def mint_runner_token(
         self, user_id: str, ttl_seconds: int, *, runner_id: str | None = None
@@ -2093,7 +2112,7 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400() -> None
         ),
     )
 
-    response = await _post_mint_token(app, runner_id, token=token)
+    response = await _post_mint_token(app, runner_id, token=token, credential_protocol=None)
 
     assert response.status_code == 400
 
@@ -2676,7 +2695,7 @@ async def test_mint_preserves_legacy_provider_signature(
     response = await _post_mint_token(
         app, token_bound_runner_id(token), token=token, credential_protocol=credential_protocol
     )
-    if legacy_enabled:
+    if legacy_enabled and credential_protocol is None:
         assert response.status_code == 200, response.text
         assert response.json()["token"] == "legacy-custom-provider-token"
         assert minted == [("owner@example.com", 1800)]
@@ -2718,7 +2737,7 @@ async def test_managed_issuers_follow_compatibility_negotiation(
         app, runner_id, token=token, credential_protocol=credential_protocol
     )
     confined = credential_protocol == RUNNER_CREDENTIAL_PROTOCOL and scoped_issuer
-    if confined or legacy_enabled:
+    if confined or (credential_protocol is None and legacy_enabled):
         assert response.status_code == 200, response.text
         kind = "scoped" if confined else "legacy"
         assert response.json()["token"] == f"{kind}-managed-bearer"
@@ -2727,3 +2746,25 @@ async def test_managed_issuers_follow_compatibility_negotiation(
         assert response.status_code == 426
         assert response.json()["error"]["code"] == "runner_upgrade_required"
         assert issued == []
+
+
+@pytest.mark.parametrize("custom", [False, True])
+async def test_scoped_mint_requires_wired_builtin_confinement(custom):
+    issued = []
+
+    class UnverifiedProvider(_CredentialHeaderAuthProvider):
+        runner_token_scope = "runner"
+
+        def mint_runner_token(self, *args, **kwargs):
+            issued.append((args, kwargs))
+            return "owner-wide-token"
+
+    token = "managed-runner-binding-token"
+    app = _mint_route_app(
+        auth_provider=UnverifiedProvider() if custom else _MintingAuthProvider(wired=False),
+        resolve_managed_runner_owner=lambda _: "owner@example.com",
+    )
+    response = await _post_mint_token(app, token_bound_runner_id(token), token=token)
+    assert response.status_code == 426
+    assert response.json()["error"]["code"] == "runner_upgrade_required"
+    assert issued == []

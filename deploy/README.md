@@ -696,9 +696,10 @@ sandbox is trustworthy. Upgrade/restart runners, then set
 `OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0` on the server to require confinement.
 Legacy issuance is deprecated and scheduled for removal in **0.21.0**.
 
-Unknown protocols receive HTTP 426 (`runner_upgrade_required`). With legacy
-issuance disabled, missing protocols and providers without confinement support
-also receive 426. Existing legacy bearers retain their authority until expiry;
+Unknown protocols and scoped requests without a wired built-in accounts/OIDC
+validator receive HTTP 426 (`runner_upgrade_required`), even during the
+compatibility window. Scoped requests never downgrade to legacy credentials.
+With legacy issuance disabled, missing protocols also receive 426. Existing legacy bearers retain their authority until expiry;
 password rotation or account deletion revokes both legacy and scoped bearers.
 Scoped denials return HTTP 403 (`runner_scope_denied`) without token renewal.
 Confined runners hide scheduling and account-wide agent discovery, skip global
@@ -706,18 +707,28 @@ session/host discovery, and cannot change session sharing or use browser SSE.
 Their session-scoped agent routes and local child discovery remain available.
 
 Custom `AuthProvider`s retain their two-argument `mint_runner_token` contract
-during this window (including for updated runners). To opt into confinement,
-accept `runner_id` as an optional keyword, enforce it when supplied, and declare
-`runner_token_scope = "runner"`. The server passes that keyword only when both
-runner and provider opt in; legacy calls omit it. Strict mode refuses the legacy
-path before calling the provider. Custom managed-token issuers retain their
-two-argument legacy callback; pair it with `mint_scoped_managed_runner_token`
-to opt into scoped issuance under the same saved-authority lock.
+for callers without a protocol header during this window. Declaring
+`runner_token_scope` alone does not enable scoped issuance: custom providers
+need a framework-verified validation integration, which is not provided here.
+A scoped request using one receives 426 before the issuer is called. Custom
+managed-token issuers for built-in accounts/OIDC must pair their legacy callback
+with `mint_scoped_managed_runner_token` under the same saved-authority lock.
 
-Session creation and native rotation stay on the creating runner; bootstrap
+JSON creation by known owner-agent ID permits unbound top-level sessions for
+native `/clear` rotation, with no host launch. Multipart uploads require an
+in-scope parent to avoid adding agents to the owner catalog. Both stay on the
+creating runner; bootstrap
 scope is consumed before binding, transfer, or detach. Claude-native `/clear`
-finalizes before detach. Inherited scope stops after 32 parent edges (33 indexed
+finalizes before detach. If detach fails, its warning identifies the old session;
+an owner can clear that binding with `{"runner_id": ""}`.
+Inherited scope stops after 32 parent edges (33 indexed
 lookups). For deeper unbound sessions, or a failed initial binding, use owner
 credentials to bind explicitly with `PATCH /v1/sessions/{id}` and
 `{"runner_id": "<runner-id>"}`. A nearer conflicting binding still denies access;
 direct bindings and active bootstrap grants have no total nesting-depth limit.
+
+Confined child lists use encrypted cursors, bound to the runner and parent and
+valid for one hour. Treat `first_id` and `last_id` as opaque continuation tokens.
+A bounded page may be empty with `has_more=true` after children move to another
+runner; continue with `last_id` (`after`) or `first_id` (`before`). Owner lists
+keep their ordinary session-ID cursors.
