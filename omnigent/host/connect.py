@@ -1977,6 +1977,9 @@ class HostProcess:
                     self._server_url,
                     frame.session_id or runner_id,
                     temporary=frame.temporary_preferences,
+                    prepared=frame.preferences_prepared,
+                    snapshot=frame.preference_snapshot,
+                    owner_user_id=self._owner_user_id,
                 )
             )
         except (ValueError, OSError, httpx.HTTPError, TimeoutError) as exc:

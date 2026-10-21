@@ -234,6 +234,11 @@ def _to_conversation(
         session_todos=session_todos,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        preference_snapshot=(
+            json.loads(meta.preference_snapshot)
+            if meta and meta.preference_snapshot is not None
+            else None
+        ),
         inference_snapshot=(
             json.loads(meta.inference_snapshot)
             if meta and meta.inference_snapshot is not None
@@ -342,6 +347,7 @@ def _new_session_metadata_row(
     project_id: str | None = None,
     host_id: str | None = None,
     inference_snapshot: str | None = None,
+    preference_snapshot: str | None = None,
 ) -> SqlConversationMetadata:
     """
     Build the Omnigent metadata row paired with a new session conversation.
@@ -369,6 +375,7 @@ def _new_session_metadata_row(
         project_id=project_id,
         host_id=host_id,
         inference_snapshot=inference_snapshot,
+        preference_snapshot=preference_snapshot,
         workspace=workspace,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
@@ -1001,6 +1008,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1071,6 +1079,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         encoded_terminal_launch_args = (
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         )
+        from omnigent.preference_session import encode_preference_snapshot
+
+        encoded_preference_snapshot = encode_preference_snapshot(preference_snapshot)
         encoded_inference_snapshot = (
             json.dumps(inference_snapshot) if inference_snapshot is not None else None
         )
@@ -1098,8 +1109,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"parent conversation {parent_conversation_id!r} does not exist"
                         )
                     root_id = parent_row.root_conversation_id
+                parent_meta = self._get_meta(parent_conversation_id)
+                if preference_snapshot is None and parent_meta is not None:
+                    encoded_preference_snapshot = parent_meta.preference_snapshot
                 if inference_snapshot is None:
-                    parent_meta = self._get_meta(parent_conversation_id)
                     encoded_inference_snapshot = (
                         parent_meta.inference_snapshot if parent_meta else None
                     )
@@ -1167,6 +1180,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     git_branch=git_branch,
                     terminal_launch_args=encoded_terminal_launch_args,
                     inference_snapshot=encoded_inference_snapshot,
+                    preference_snapshot=encoded_preference_snapshot,
                     project_id=project_id,
                 )
                 meta_sess.add(meta)
@@ -4426,6 +4440,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -4500,6 +4515,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             project_id=project_id,
             host_id=host_id,
             inference_snapshot=inference_snapshot,
+            preference_snapshot=preference_snapshot,
             created_by=created_by,
         )
 
@@ -4523,6 +4539,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4536,6 +4553,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "model_override": model_override,
             }
         )
+        from omnigent.preference_session import encode_preference_snapshot
+
+        encoded_preference_snapshot = encode_preference_snapshot(preference_snapshot)
         encoded_inference_snapshot = (
             json.dumps(inference_snapshot) if inference_snapshot is not None else None
         )
@@ -4554,8 +4574,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"parent conversation {parent_conversation_id!r} does not exist"
                     )
                 root_conversation_id = parent_row.root_conversation_id
+            parent_meta = self._get_meta(parent_conversation_id)
+            if preference_snapshot is None and parent_meta is not None:
+                encoded_preference_snapshot = parent_meta.preference_snapshot
             if inference_snapshot is None:
-                parent_meta = self._get_meta(parent_conversation_id)
                 encoded_inference_snapshot = (
                     parent_meta.inference_snapshot if parent_meta else None
                 )
@@ -4603,6 +4625,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=terminal_launch_args,
                 host_id=host_id,
                 inference_snapshot=encoded_inference_snapshot,
+                preference_snapshot=encoded_preference_snapshot,
             )
             session.add(agent_row)
             session.add(meta_row)
@@ -5264,6 +5287,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 terminal_launch_args=source_terminal_args,
                 inference_snapshot=(
                     source_meta_ref.inference_snapshot if source_meta_ref else None
+                ),
+                preference_snapshot=(
+                    source_meta_ref.preference_snapshot if source_meta_ref else None
                 ),
                 project_id=project_id,
             )

@@ -5,7 +5,7 @@ and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
 and an opt-in server API for durable edits and conflicts. Explicit shared/machine scope controls and import previews are available through
 the CLI and Settings → Shared preferences. Connected CLI launches and user-owned
-hosts adopt cached/shared defaults at startup; browser launch selection and managed
+hosts consume saved choices at startup; browser launch selection and managed
 startup remain separate integration work. Pending edits
 retry on host reconnect without polling between messages.
 Claude/Codex native and SDK sessions also apply plugin toggles in private settings.
@@ -37,6 +37,9 @@ Saved native arguments are applied once by the runner, including browser launche
 - `shared-startup`: refresh once for a new launch, use a verified workspace cache
   during an outage, or explicitly choose temporary defaults. Resume keeps its
   frozen handoff; reconnect retries pending edits with bounded jitter.
+- `saved-session-defaults`: persist the adopted portable defaults with the session;
+  restart or move it to a fresh host without adopting later defaults. Forks and
+  children inherit the saved choice; legacy sessions stay legacy.
 - `shared-cli`: connect to an authenticated workspace, inspect shared/machine values,
   preview/apply an import or restore, retry edits and resolve conflicts.
 - `shared-browser`: review/import all four groups, edit shared or machine values,
@@ -164,11 +167,29 @@ uv run --no-sync pytest tests/test_preference_startup.py \
 The host scenario decodes the wire frame, builds the real launch environment,
 and spawns a Python child that loads effective defaults and composes saved native
 arguments before explicit session arguments. The server scenario
-covers multipart metadata through SQL to the outbound frame. The native matrix
-checks temporary intent in all twelve adapters' multipart requests using simulated
+covers JSON and multipart metadata through SQL to the outbound frame. The native matrix
+checks saved and temporary intent in all twelve adapters' multipart requests using simulated
 HTTP. Those checks do not prove vendor model/plugin application or availability UI.
 Component cases cover login changes, initial choice, startup timeout, frozen
 session choices, bounded snapshots, and idle/bounded reconnect retries.
+
+**Saved session defaults (own environment):**
+
+```sh
+uv run --no-sync pytest tests/stores/test_preference_snapshot.py \
+  tests/server/integration/test_multipart_create_host_launch.py \
+  tests/e2e/omnigent/test_shared_preferences_e2e.py::test_saved_session_preferences_resume_on_fresh_host --reruns 0 -q
+```
+
+The real-process journey creates a session, changes shared defaults, and runs the
+same session on two isolated hosts, the second without a preference profile or
+cache. Both runners initialize with the original snapshot and complete a scripted
+provider turn. It checks saved intent and process handoff; the agent explicitly
+specifies its model, so this does not establish SDK default-model selection.
+Store cases cover single/split databases, bundle/registered create, reopen,
+children, forks and oversized input. Account mismatch and temporary/adopted
+contradictions are rejected at the server boundary. Legacy sessions resume with
+no shared handoff; a runner with different saved preferences refuses reuse.
 
 **Adopted native models (component/process boundary):**
 

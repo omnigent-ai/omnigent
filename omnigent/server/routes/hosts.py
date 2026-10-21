@@ -1171,6 +1171,8 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                preferences_prepared=True,
+                preference_snapshot=target.conv.preference_snapshot,
                 temporary_preferences=(
                     target.conv.labels.get("omnigent.preferences.temporary") == "true"
                 ),

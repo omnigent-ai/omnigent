@@ -311,6 +311,8 @@ class HostLaunchRunnerFrame:
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
     temporary_preferences: bool = False
+    preference_snapshot: dict[str, Any] | None = None
+    preferences_prepared: bool = False
 
 
 @dataclass
@@ -1465,6 +1467,9 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.preferences_prepared:
+            payload["preferences_prepared"] = True
+            payload["preference_snapshot"] = frame.preference_snapshot
         if frame.temporary_preferences:
             payload["temporary_preferences"] = True
         if frame.superseded_runner_ids is not None:
@@ -2403,6 +2408,12 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     )
 
 
+def _preference_launch_json(value: object) -> dict[str, Any]:
+    from omnigent.preference_startup import PreferenceLaunch
+
+    return PreferenceLaunch.model_validate(value).model_dump(mode="json")
+
+
 def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     """Decode a launch-runner frame.
 
@@ -2423,6 +2434,14 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
             _required_bool(msg, "temporary_preferences")
             if "temporary_preferences" in msg
             else False
+        ),
+        preference_snapshot=(
+            _preference_launch_json(msg["preference_snapshot"])
+            if msg.get("preference_snapshot") is not None
+            else None
+        ),
+        preferences_prepared=(
+            _required_bool(msg, "preferences_prepared") if "preferences_prepared" in msg else False
         ),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(

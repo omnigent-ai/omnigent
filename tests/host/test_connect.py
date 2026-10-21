@@ -836,7 +836,9 @@ def _cleanup_host(host: HostProcess) -> None:
         task.cancel()
 
 
-@pytest.mark.parametrize("preference_mode", ["legacy", "shared", "temporary"])
+@pytest.mark.parametrize(
+    "preference_mode", ["legacy", "shared", "temporary", "saved", "saved-legacy"]
+)
 async def test_handle_launch_spawns_subprocess(
     tmp_path: Path,
     startup,
@@ -873,6 +875,18 @@ async def test_handle_launch_spawns_subprocess(
                 SharedPreferenceKey(kind="harness_args", name="pi-native"), ["--base", "shared"]
             )
             await local.sync(client)
+    saved_snapshot = None
+    if preference_mode in {"saved", "saved-legacy"}:
+        from omnigent.preference_startup import prepare_preferences
+
+        launch = await prepare_preferences(connection)
+        if preference_mode == "saved":
+            saved_snapshot = launch.model_dump(mode="json")
+        # A replacement machine has neither the original profile nor its snapshot files.
+        monkeypatch.setattr("omnigent.preference_connection.load_connection", lambda _: None)
+        monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "replacement-host"))
+        monkeypatch.setenv("OMNIGENT_SHARED_PREFERENCES", "1")
+
     monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, "/another/session.json")
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", PREFERENCE_SNAPSHOT_ENV)
     child_result = tmp_path / "child-result.json"
@@ -887,6 +901,8 @@ async def test_handle_launch_spawns_subprocess(
         binding_token="test_token_abc",
         workspace=str(workspace),
         temporary_preferences=preference_mode == "temporary",
+        preferences_prepared=preference_mode in {"saved", "saved-legacy"},
+        preference_snapshot=saved_snapshot,
     )
     frame = decode_host_frame(encode_host_frame(frame))
     assert isinstance(frame, HostLaunchRunnerFrame)
@@ -964,11 +980,15 @@ async def test_handle_launch_spawns_subprocess(
     try:
         await poll_until_async(child_result.exists, timeout_s=10, interval_s=0.05)
         child_config = json.loads(child_result.read_text())
-        assert child_config["model"] == ("shared" if preference_mode == "shared" else "legacy")
-        assert child_config["launch_args"] == (
-            ["--base", "shared", "--session"] if preference_mode == "shared" else ["--session"]
+        assert child_config["model"] == (
+            "shared" if preference_mode in {"shared", "saved"} else "legacy"
         )
-        assert (PREFERENCE_SNAPSHOT_ENV in spawned_env) == (preference_mode == "shared")
+        assert child_config["launch_args"] == (
+            ["--base", "shared", "--session"]
+            if preference_mode in {"shared", "saved"}
+            else ["--session"]
+        )
+        assert (PREFERENCE_SNAPSHOT_ENV in spawned_env) == (preference_mode in {"shared", "saved"})
     finally:
         _cleanup_host(host)
 

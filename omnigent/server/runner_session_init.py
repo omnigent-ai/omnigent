@@ -23,9 +23,14 @@ if TYPE_CHECKING:
     from omnigent.stores.file_store import FileStore
 
 
-def runner_inference_verified(conversation: Conversation, response: httpx.Response) -> bool:
-    """Configured sessions require a runner that accepted their saved routing."""
-    if conversation.inference_snapshot is None:
+def runner_configuration_verified(conversation: Conversation, response: httpx.Response) -> bool:
+    """Require explicit acknowledgement of each saved session configuration."""
+    flags = []
+    if conversation.inference_snapshot is not None:
+        flags.append("inference_config_verified")
+    if conversation.preference_snapshot is not None:
+        flags.append("preference_snapshot_verified")
+    if not flags:
         return True
     if response.status_code >= 400:
         return False
@@ -33,7 +38,7 @@ def runner_inference_verified(conversation: Conversation, response: httpx.Respon
         payload = response.json()
     except ValueError:
         return False
-    return isinstance(payload, dict) and payload.get("inference_config_verified") is True
+    return isinstance(payload, dict) and all(payload.get(flag) is True for flag in flags)
 
 
 _BODY_SNIPPET_MAX = 500
@@ -136,7 +141,7 @@ class RunnerSessionInitializer:
             if task is None or not task.done() or task.cancelled() or task.exception() is not None:
                 continue
             response = task.result()
-            if 200 <= response.status_code < 300 and runner_inference_verified(
+            if 200 <= response.status_code < 300 and runner_configuration_verified(
                 conversation, response
             ):
                 return True
@@ -289,10 +294,10 @@ class RunnerSessionInitializer:
                 self._tasks.pop(key, None)
             raise
         self.require_generation(runner_id, runner_client, generation)
-        if not runner_inference_verified(conversation, response):
+        if not runner_configuration_verified(conversation, response):
             response = httpx.Response(
                 409,
-                json={"error": "The runner did not accept this session's inference configuration"},
+                json={"error": "The runner did not accept this session's saved configuration"},
                 request=httpx.Request("POST", "/v1/sessions"),
             )
         if response.status_code >= 400 and self._tasks.get(key) is task:

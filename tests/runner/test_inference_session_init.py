@@ -116,3 +116,58 @@ async def test_inference_mismatch_response_does_not_expose_exception_details(
     }
     assert "credential-sentinel" not in response.text
     assert manager.get_client_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["same", "different", "unconfigured-session", "unconfigured-runner", "legacy-server"]
+)
+async def test_session_init_requires_saved_preferences(mode, tmp_path, monkeypatch):
+    from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+    from omnigent.preference_sync import (
+        PreferenceNamespace,
+        SharedPreferenceEntry,
+        SharedPreferenceKey,
+    )
+    from tests._helpers.preferences import preference_snapshot
+
+    path = preference_snapshot(
+        tmp_path,
+        identity=PreferenceNamespace(authority_id="test", workspace_id="0", user_id="local"),
+        shared=[
+            SharedPreferenceEntry(
+                key=SharedPreferenceKey(kind="model", name="model"), version=1, value="saved"
+            )
+        ],
+    )
+    saved = json.loads(path.read_text())
+    monkeypatch.delenv(PREFERENCE_SNAPSHOT_ENV, raising=False)
+    if mode != "unconfigured-runner":
+        monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+    expected = json.loads(path.read_text()) if mode != "unconfigured-session" else None
+    if mode == "different":
+        expected["shared"]["entries"][0]["value"] = "other"
+    conversation = Conversation(
+        id="preference-session",
+        created_at=1,
+        updated_at=1,
+        agent_id="test-agent",
+        root_conversation_id="preference-session",
+        preference_snapshot=expected,
+    )
+    payload = build_runner_session_init_payload(conversation, server_version="test")
+    if mode == "legacy-server":
+        payload.pop("session_init")
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(process_manager=manager, server_client=NullServerClient())
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+    if mode == "same":
+        assert response.status_code == 201, response.text
+        assert response.json()["preference_snapshot_verified"] is True
+        assert len(manager.get_client_calls) == 1
+    else:
+        assert response.status_code == 409, response.text
+        assert response.json()["error"] == "preference_snapshot_mismatch"
+        assert manager.get_client_calls == []
+    assert json.loads(path.read_text()) == saved

@@ -63,6 +63,7 @@ from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native.native_terminal import url_component
+from omnigent.preference_session import session_preference_metadata
 from omnigent.preference_startup import temporary_preference_labels
 
 _logger = logging.getLogger(__name__)
@@ -241,6 +242,7 @@ class _CursorSessionPatch(TypedDict, total=False):
 class _CursorSessionMetadata(TypedDict, total=False):
     labels: dict[str, str]
     terminal_launch_args: list[str]
+    preference_snapshot: dict[str, object]
 
 
 def _cursor_base_model_id(compound_id: str) -> str:
@@ -622,7 +624,8 @@ async def _create_cursor_session(
 ) -> str:
     """Create a bundled terminal-first cursor-native session."""
     metadata: _CursorSessionMetadata = {
-        "labels": {**_SESSION_LABELS, **temporary_preference_labels()}
+        **session_preference_metadata(),
+        "labels": {**_SESSION_LABELS, **temporary_preference_labels()},
     }
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args

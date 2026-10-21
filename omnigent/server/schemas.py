@@ -32,6 +32,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.preference_startup import PreferenceLaunch
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1676,6 +1677,7 @@ class _SessionCreateRequestBase(BaseModel):
     workspace: str | None = None
     workspaces: list[str] | None = None
     git: SessionGitOptions | None = None
+    preference_snapshot: PreferenceLaunch | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
@@ -1910,6 +1912,7 @@ class SessionCreateMetadata(BaseModel):
     reasoning_effort: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    preference_snapshot: PreferenceLaunch | None = None
     terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"

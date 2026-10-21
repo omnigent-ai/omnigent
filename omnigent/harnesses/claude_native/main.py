@@ -24,6 +24,7 @@ import sys
 import uuid
 
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.preference_session import session_preference_metadata
 from omnigent.preference_startup import temporary_preference_labels
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
@@ -6264,7 +6265,7 @@ async def _create_claude_session(
     labels = {**_SESSION_LABELS, **temporary_preference_labels()}
     if bridge_id is not None:
         labels[BRIDGE_ID_LABEL_KEY] = bridge_id
-    metadata: _JsonObject = {"labels": labels}
+    metadata: _JsonObject = {**session_preference_metadata(), "labels": labels}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     # Stamp the wrapped claude's real effortLevel so the pill isn't a guess.

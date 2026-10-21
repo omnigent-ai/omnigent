@@ -668,6 +668,8 @@ class SqlConversationMetadata(OmnigentBase):
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded provider binding and model catalog captured at session creation.
     inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # Portable defaults frozen at creation; NULL preserves legacy session behavior.
+    preference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.

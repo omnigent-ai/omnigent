@@ -370,3 +370,57 @@ async def test_multipart_create_rejects_workspace_missing_on_host(
     assert resp.status_code == 400, resp.text
     assert "does not exist" in resp.text
     assert not cap.launch, "no launch frame may be sent for a rejected workspace"
+
+
+@pytest.mark.parametrize("surface", ["bundle", "registered"])
+async def test_session_preferences_cross_create_and_launch(
+    app, db_uri, tmp_path, client, register_host, conv_store, surface
+):
+    from omnigent.preference_sync import SharedPreferenceEntry, SharedPreferenceKey
+    from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
+    from tests._helpers.preferences import preference_snapshot
+
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="session-preferences")
+    app.state.preference_store = store
+    path = preference_snapshot(
+        tmp_path / "snapshot",
+        identity=store.identity(None),
+        shared=[
+            SharedPreferenceEntry(
+                key=SharedPreferenceKey(kind="model", name="model"), version=1, value="original"
+            )
+        ],
+    )
+    snapshot = json.loads(path.read_text())
+    cap = register_host()
+    metadata = {"host_id": _HOST_ID, "workspace": _WORKSPACE, "preference_snapshot": snapshot}
+    agent_id = None
+    if surface == "registered":
+        original = await _multipart_create(client, {})
+        assert original.status_code == 201, original.text
+        agent_id = original.json()["agent_id"]
+
+    async def create(payload):
+        if agent_id is not None:
+            return await client.post("/v1/sessions", json={"agent_id": agent_id, **payload})
+        return await _multipart_create(client, payload)
+
+    wrong = json.loads(path.read_text())
+    wrong["shared"]["identity"]["user_id"] = "another-user"
+    denied = await create({**metadata, "preference_snapshot": wrong})
+    assert denied.status_code == 403, denied.text
+    invalid = await create({**metadata, "labels": {"omnigent.preferences.temporary": "true"}})
+    assert invalid.status_code == 422, invalid.text
+    response = await create(metadata)
+    assert response.status_code in (200, 201), response.text
+    session_id = response.json().get("session_id") or response.json()["id"]
+    assert conv_store.get_conversation(session_id).preference_snapshot == snapshot
+    assert len(cap.launch) == 1
+    assert cap.launch[0].preferences_prepared is True
+    assert cap.launch[0].preference_snapshot == snapshot
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+
+    payload = build_runner_session_init_payload(
+        conv_store.get_conversation(session_id), server_version="test"
+    )
+    assert payload["session_init"]["snapshot"]["preference_snapshot"] == snapshot

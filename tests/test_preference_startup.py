@@ -317,3 +317,45 @@ async def test_timed_out_reconnects_share_unfinished_credential_lookup(tmp_path,
         assert started.is_set() and len(calls) == 1
     finally:
         release.set()
+
+
+@pytest.mark.asyncio
+async def test_saved_handoff_rejects_changed_intent_and_runner_reuse(
+    startup, tmp_path, monkeypatch
+):
+    from omnigent.preference_startup import PreferenceLaunch, write_launch_snapshot
+    from omnigent.runner.session_init_protocol import validate_runner_preferences
+
+    store, connection = startup
+    local = connection.workspace().client
+    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+        await local.sync(http)
+        local.enqueue(MODEL, "frozen")
+        await local.sync(http)
+    launch = await prepare_preferences(connection)
+    snapshot = launch.model_dump(mode="json")
+    env = await host_preference_environment(
+        "http://test", "saved", prepared=True, snapshot=snapshot, owner_user_id="alice"
+    )
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, env[PREFERENCE_SNAPSHOT_ENV])
+    validate_runner_preferences(snapshot)
+    with pytest.raises(ValueError, match="different saved preferences"):
+        validate_runner_preferences(None)
+    altered = launch.model_dump(mode="json")
+    altered["shared"]["entries"][0]["value"] = "changed"
+    with pytest.raises(ValueError, match="different saved preferences"):
+        validate_runner_preferences(altered)
+    with pytest.raises(ValueError, match="saved choice"):
+        write_launch_snapshot(
+            Path(env[PREFERENCE_SNAPSHOT_ENV]), PreferenceLaunch.model_validate(altered)
+        )
+    with pytest.raises(ValueError, match="another account"):
+        await host_preference_environment(
+            "http://test", "saved", prepared=True, snapshot=snapshot, owner_user_id="bob"
+        )
+    for entries in (
+        [snapshot["shared"]["entries"][0]] * 2,
+        [{**snapshot["shared"]["entries"][0], "value": False}],
+    ):
+        with pytest.raises(ValueError):
+            PreferenceLaunch.model_validate({**snapshot, "machine": entries})

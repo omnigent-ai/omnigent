@@ -151,6 +151,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.preference_session import session_preference_metadata
 from omnigent.preference_startup import temporary_preference_labels
 
 _logger = logging.getLogger(__name__)
@@ -1436,7 +1437,7 @@ async def _create_antigravity_session(
     """
     labels = {**_SESSION_LABELS, **temporary_preference_labels()}
     labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
-    metadata: dict[str, object] = {"labels": labels}
+    metadata: dict[str, object] = {**session_preference_metadata(), "labels": labels}
     resp = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},

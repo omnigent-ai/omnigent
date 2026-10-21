@@ -28,7 +28,25 @@ import pytest
     ],
 )
 @pytest.mark.parametrize("temporary", [False, True])
-async def test_native_create_preserves_temporary_intent(harness, temporary):
+async def test_native_create_preserves_temporary_intent(harness, temporary, tmp_path):
+    from omnigent.preference_startup import PreferenceLaunch
+    from omnigent.preference_sync import (
+        PreferenceNamespace,
+        SharedPreferenceEntry,
+        SharedPreferenceKey,
+    )
+    from tests._helpers.preferences import preference_snapshot
+
+    path = preference_snapshot(
+        tmp_path,
+        identity=PreferenceNamespace(authority_id="test", workspace_id="0", user_id="local"),
+        shared=[
+            SharedPreferenceEntry(
+                key=SharedPreferenceKey(kind="model", name="model"), version=1, value="saved"
+            )
+        ],
+    )
+    launch = PreferenceLaunch.model_validate_json(path.read_bytes())
     captured = []
 
     def handle(request):
@@ -45,6 +63,7 @@ async def test_native_create_preserves_temporary_intent(harness, temporary):
     kwargs = {"bridge_id": "bridge"} if harness in {"antigravity", "claude", "codex"} else {}
     with click.Context(click.Command(harness)) as context:
         context.meta["temporary_preferences"] = temporary
+        context.meta["preferences:http://test"] = launch
         async with httpx.AsyncClient(
             base_url="http://test", transport=httpx.MockTransport(handle)
         ) as client:
@@ -53,3 +72,7 @@ async def test_native_create_preserves_temporary_intent(harness, temporary):
     labels = captured[0]["labels"]
     assert labels["omnigent.wrapper"]
     assert labels.get("omnigent.preferences.temporary") == ("true" if temporary else None)
+
+    assert captured[0].get("preference_snapshot") == (
+        None if temporary else launch.model_dump(mode="json")
+    )

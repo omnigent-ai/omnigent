@@ -1,6 +1,7 @@
 """Real HTTP/SQL preference edits across two server processes and a restart.
 
-Own environment; no provider calls, mock services, browser, or native harness.
+Own environments. The saved-session journey uses a scripted model; other journeys
+make no provider calls. No browser, live vendor, or native harness is exercised.
 The CLI config explicitly enables the API on these isolated local servers.
 """
 
@@ -392,3 +393,143 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, su
         assert all(
             entry["value"] is None for entry in json.loads(cli("show"))["shared"]["entries"]
         )
+
+
+def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_llm_server_url):
+    """Real server → two independent hosts → runner init; deterministic provider only."""
+    from omnigent.preference_startup import PreferenceLaunch
+    from omnigent.preference_sync import PreferenceNamespace, PreferenceSnapshot
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests._helpers.host import isolated_host
+    from tests._helpers.polling import poll_until
+    from tests._helpers.session import bundle_files, post_session_bundle
+    from tests.e2e.conftest import configure_mock_llm
+
+    config = tmp_path / "server.yaml"
+    config.write_text("shared_preferences_authority_id: resume-test\n")
+    model = "mock-saved-session-model"
+    bundle = bundle_files(
+        {
+            "config.yaml": (
+                "spec_version: 1\nname: saved-preference-test\nprompt: Say hello.\n"
+                "executor:\n  type: omnigent\n  config:\n    harness: openai-agents\n"
+                f"  model: {model}\n"
+            ).encode()
+        }
+    )
+    with isolated_local_server(
+        tmp_path / "server", extra_args=("--config", str(config), "--database-uri", db_uri)
+    ) as server:
+        with httpx.Client(base_url=server, timeout=40, trust_env=False) as client:
+            identity = client.get("/v1/preferences/shared").json()["identity"]
+            operation = {
+                "protocol_version": 1,
+                "identity": identity,
+                "operation_id": str(uuid4()),
+                "installation_id": "original-machine",
+                "key": {"kind": "model", "name": "model"},
+                "expected_version": 0,
+                "value": model,
+            }
+            client.post("/v1/preferences/shared/operations", json=operation).raise_for_status()
+            page = client.get("/v1/preferences/shared").json()
+            launch = PreferenceLaunch(
+                shared=PreferenceSnapshot(
+                    identity=PreferenceNamespace(**identity),
+                    revision=page["revision"],
+                    entries=page["entries"],
+                ),
+                installation_id="original-machine",
+                state="current",
+            )
+            snapshot = launch.model_dump(mode="json")
+            created = post_session_bundle(
+                client.post, "/v1/sessions", bundle, metadata={"preference_snapshot": snapshot}
+            )
+            assert created.status_code == 201, created.text
+            session_id = created.json()["session_id"]
+            client.post(
+                "/v1/preferences/shared/operations",
+                json={
+                    **operation,
+                    "operation_id": str(uuid4()),
+                    "expected_version": 1,
+                    "value": "later-default",
+                },
+            ).raise_for_status()
+            host_env = {
+                "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+                "OPENAI_API_KEY": "mock-key",
+                "OMNIGENT_SHARED_PREFERENCES": "1",
+            }
+            for name in ("original", "replacement"):
+                reply = f"{name} runner used the saved session"
+                configure_mock_llm(mock_llm_server_url, [{"text": reply}], key=model)
+                with isolated_host(
+                    tmp_path / name,
+                    server,
+                    base_env={"PATH": os.environ["PATH"]},
+                    env=host_env,
+                    config={"auth": {"type": "api_key"}, "model": "different-local-default"},
+                ) as host:
+                    host.wait_online(client)
+                    if name == "replacement":
+                        client.patch(
+                            f"/v1/sessions/{session_id}", json={"runner_id": ""}
+                        ).raise_for_status()
+                    workspace = host.home / "workspace"
+                    workspace.mkdir()
+                    response = client.post(
+                        f"/v1/hosts/{host.host_id}/runners",
+                        json={"session_id": session_id, "workspace": str(workspace)},
+                    )
+                    assert response.status_code == 200, (
+                        response.text + host.log_path.read_text()[-4000:]
+                    )
+                    runner_id = response.json()["runner_id"]
+                    poll_until(
+                        lambda runner=runner_id: (
+                            client.get(f"/v1/runners/{runner}/status").json().get("online")
+                        ),
+                        timeout_s=30,
+                        interval_s=0.2,
+                    )
+                    # Binding initializes the real runner with the saved envelope.
+                    client.patch(
+                        f"/v1/sessions/{session_id}", json={"runner_id": runner_id}
+                    ).raise_for_status()
+                    client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": f"hello from {name}"}],
+                            },
+                        },
+                    ).raise_for_status()
+                    last = {}
+
+                    def answered(expected=reply):
+                        nonlocal last
+                        last = client.get(f"/v1/sessions/{session_id}").json()
+                        return last.get("status") == "failed" or expected in json.dumps(
+                            last.get("items", [])
+                        )
+
+                    poll_until(answered, timeout_s=40, interval_s=0.2)
+                    assert reply in json.dumps(last.get("items", [])), (
+                        json.dumps(last) + host.log_path.read_text()[-4000:]
+                    )
+                    saved = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+                    assert saved.preference_snapshot == snapshot
+                    handoffs = list(host.home.rglob("preferences/sessions/*.json"))
+                    assert len(handoffs) == 1
+                    assert json.loads(handoffs[0].read_text()) == snapshot
+                    assert (
+                        "shared_preferences:"
+                        not in (host.home / ".omnigent/config.yaml").read_text()
+                    )
+                    client.post(
+                        f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+                    ).raise_for_status()

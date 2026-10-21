@@ -2108,6 +2108,13 @@ def create_runner_app(
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
         validate_runner_inference_config(envelope.snapshot.inference_config)
+        from omnigent.runner.session_init_protocol import validate_runner_preferences
+
+        validate_runner_preferences(
+            envelope.snapshot.preference_snapshot
+            if envelope.snapshot.preferences_prepared
+            else None
+        )
 
         global _server_version
         _server_version = envelope.server_version
@@ -2164,6 +2171,9 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
+            from omnigent.runner.session_init_protocol import validate_runner_preferences
+
+            validate_runner_preferences(None)
             if os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
                 from omnigent.runner.session_init_protocol import validate_runner_inference_config
 
@@ -2381,7 +2391,10 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
-        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+        from omnigent.runner.session_init_protocol import (
+            RunnerInferenceConfigMismatch,
+            RunnerPreferenceMismatch,
+        )
 
         raw_id = body.get("session_id")
         set_current_session_id(raw_id if isinstance(raw_id, str) else None)
@@ -2444,6 +2457,14 @@ def create_runner_app(
                 body,
                 session_id=session_id,
                 agent_id=agent_id,
+            )
+        except RunnerPreferenceMismatch:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "preference_snapshot_mismatch",
+                    "detail": "This runner has different saved preferences; launch a new runner.",
+                },
             )
         except RunnerInferenceConfigMismatch:
             return JSONResponse(
@@ -3188,6 +3209,10 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                "preference_snapshot_verified": (
+                    init_context.envelope is not None
+                    and init_context.envelope.snapshot.preferences_prepared
+                ),
                 **(
                     {"inference_config_verified": True}
                     if init_context.envelope is not None

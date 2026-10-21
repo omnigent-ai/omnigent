@@ -4032,6 +4032,24 @@ def _start_cli_runner_process(
         RUNNER_PARENT_PID_ENV_VAR: str(os.getpid()),
     }
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
+    from omnigent.preference_session import session_preference_snapshot
+    from omnigent.preference_startup import (
+        PREFERENCE_SNAPSHOT_ENV,
+        PreferenceLaunch,
+        write_launch_snapshot,
+    )
+
+    preference_snapshot = session_preference_snapshot()
+    env.pop(PREFERENCE_SNAPSHOT_ENV, None)
+    if preference_snapshot is not None:
+        import hashlib
+
+        from omnigent.process_logging import data_dir
+
+        digest = hashlib.sha256(f"{server_url}\0{resolved_runner_id}".encode()).hexdigest()
+        snapshot_path = data_dir() / "preferences" / "sessions" / f"{digest}.json"
+        write_launch_snapshot(snapshot_path, PreferenceLaunch.model_validate(preference_snapshot))
+        env[PREFERENCE_SNAPSHOT_ENV] = str(snapshot_path)
     if workspace_cwd is not None:
         env[RUNNER_WORKSPACE_ENV_VAR] = str(Path(workspace_cwd).expanduser().resolve())
     if isolate_session:

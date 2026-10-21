@@ -32,6 +32,8 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     parent_session_id: str | None = None
     root_session_id: str | None = None
     inference_config: dict[str, object] | None = None
+    preference_snapshot: dict[str, object] | None = None
+    preferences_prepared: bool = False
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -92,6 +94,8 @@ def build_runner_session_init_payload(
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
             inference_config=snapshot_runtime_config(conversation.inference_snapshot),
+            preference_snapshot=conversation.preference_snapshot,
+            preferences_prepared=True,
         ),
     )
     return {
@@ -104,6 +108,21 @@ def build_runner_session_init_payload(
 
 class RunnerInferenceConfigMismatch(ValueError):
     """A session cannot share a runner carrying another saved provider configuration."""
+
+
+class RunnerPreferenceMismatch(ValueError):
+    """A runner cannot apply another session's frozen portable choices."""
+
+
+def validate_runner_preferences(expected: dict[str, object] | None) -> None:
+    from omnigent.preference_startup import PreferenceLaunch, inherited_launch
+
+    actual = inherited_launch()
+    saved = PreferenceLaunch.model_validate(expected) if expected is not None else None
+    if actual != saved:
+        raise RunnerPreferenceMismatch(
+            "This runner has different saved preferences; launch a runner for this session."
+        )
 
 
 def validate_runner_inference_config(expected: dict[str, object] | None) -> None:

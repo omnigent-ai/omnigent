@@ -767,3 +767,22 @@ async def test_init_rejection_level_by_status(status: int, level: str) -> None:
     assert rejected["level"] == level
     assert rejected["attributes"]["response_body"] == "nope"
     assert "finished" not in rejected["message"]
+
+
+@pytest.mark.parametrize("acknowledged", [None, False, "true", True])
+def test_adopted_session_requires_explicit_runner_acknowledgement(acknowledged):
+    from omnigent.server.runner_session_init import runner_configuration_verified
+
+    conversation = Conversation(
+        id="preferences",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="preferences",
+        preference_snapshot={"protocol_version": 1},
+    )
+    response = httpx.Response(
+        201, json={"inference_config_verified": True, "preference_snapshot_verified": acknowledged}
+    )
+    assert runner_configuration_verified(conversation, response) is (acknowledged is True)
+    conversation.preference_snapshot = None
+    assert runner_configuration_verified(conversation, response)

@@ -503,6 +503,7 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -1851,6 +1852,7 @@ class ConversationStore(ABC):
         host_id: str | None = None,
         inference_snapshot: dict[str, Any] | None = None,
         created_by: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.

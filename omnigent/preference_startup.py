@@ -5,17 +5,19 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 import httpx
 from filelock import FileLock, Timeout
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from omnigent.config import ResolvedConfig, resolve_effective_config
 from omnigent.install_ledger import atomic_write_json
 from omnigent.preference_connection import PreferenceConnection, open_preference_http
 from omnigent.preference_sync import (
+    MAX_CONFLICTS,
     MAX_KEYS,
+    MAX_VALUE_BYTES,
     Name,
     PreferenceSnapshot,
     ProtocolModel,
@@ -35,7 +37,24 @@ class PreferenceLaunch(ProtocolModel):
     installation_id: Name
     machine: list[SharedPreferenceEntry] = Field(default_factory=list, max_length=MAX_KEYS)
     state: Literal["current", "cached"]
-    warning: str | None = None
+    warning: str | None = Field(default=None, max_length=1024)
+
+    @model_validator(mode="after")
+    def validate_layers(self) -> Self:
+        for entries in (self.shared.entries, self.machine):
+            if len(entries) > MAX_KEYS:
+                raise ValueError("Too many session preference entries")
+            if len({entry.key.as_key() for entry in entries}) != len(entries):
+                raise ValueError("Session preference keys must be unique within each scope")
+            for entry in entries:
+                if len(entry.model_dump_json(include={"value"}).encode()) > MAX_VALUE_BYTES:
+                    raise ValueError("Session preference value exceeds 8192 bytes")
+            PreferenceSnapshot(identity=self.shared.identity, entries=entries).as_layer()
+        if len(self.shared.conflicts) > MAX_CONFLICTS or any(
+            conflict.identity != self.shared.identity for conflict in self.shared.conflicts
+        ):
+            raise ValueError("Session preference conflicts have invalid scope or size")
+        return self
 
     def resolve(
         self, global_config: dict[str, object], project_config: dict[str, object]
@@ -170,6 +189,8 @@ def write_launch_snapshot(path: Path, launch: PreferenceLaunch) -> None:
                 launch.installation_id,
             ):
                 raise ValueError("Session preference snapshot belongs to another identity")
+            if existing != launch:
+                raise ValueError("Session preference snapshot differs from its saved choice")
             return
         # Never evict a running/resumable session's frozen choice to admit another.
         from itertools import islice
@@ -207,6 +228,9 @@ async def host_preference_environment(
     session_id: str,
     *,
     temporary: bool = False,
+    prepared: bool = False,
+    snapshot: dict[str, object] | None = None,
+    owner_user_id: str | None = None,
 ) -> dict[str, str]:
     """Freeze one session's defaults; registration never waits for this operation."""
     import hashlib
@@ -214,8 +238,20 @@ async def host_preference_environment(
     from omnigent.preference_connection import load_connection
     from omnigent.process_logging import data_dir
 
+    if temporary and snapshot is not None:
+        raise ValueError("Temporary sessions cannot adopt shared preferences")
     if temporary:
         return {}
+    if prepared:
+        if snapshot is None:
+            return {}
+        launch = PreferenceLaunch.model_validate(snapshot)
+        if owner_user_id is not None and launch.shared.identity.user_id != owner_user_id:
+            raise ValueError("Session preferences belong to another account")
+        digest = hashlib.sha256(f"{server_url}\0{session_id}".encode()).hexdigest()
+        path = data_dir() / "preferences" / "sessions" / f"{digest}.json"
+        await asyncio.to_thread(write_launch_snapshot, path, launch)
+        return {PREFERENCE_SNAPSHOT_ENV: str(path)}
     connection = await asyncio.to_thread(load_connection, server_url)
     digest = hashlib.sha256(session_id.encode()).hexdigest()
     path = data_dir() / "preferences" / "sessions" / f"{digest}.json"

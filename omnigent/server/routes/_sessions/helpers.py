@@ -6223,6 +6223,8 @@ async def _launch_runner_on_host_locked(
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
+                preferences_prepared=True,
+                preference_snapshot=conv.preference_snapshot,
                 temporary_preferences=(
                     conv.labels.get("omnigent.preferences.temporary") == "true"
                 ),
@@ -10569,6 +10571,10 @@ def _persist_stored_session_bundle(
         any non-integrity reason.
     """
     inference_kwargs: dict[str, Any] = {}
+    if metadata.preference_snapshot is not None:
+        inference_kwargs["preference_snapshot"] = metadata.preference_snapshot.model_dump(
+            mode="json"
+        )
     if inference_snapshot is not None:
         inference_kwargs["inference_snapshot"] = inference_snapshot
     if inference_model is not None:
@@ -10666,6 +10672,11 @@ def _persist_session_for_uploaded_agent(
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
+            preference_snapshot=(
+                metadata.preference_snapshot.model_dump(mode="json")
+                if metadata.preference_snapshot is not None
+                else None
+            ),
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model,

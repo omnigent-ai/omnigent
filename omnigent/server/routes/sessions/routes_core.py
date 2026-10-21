@@ -834,6 +834,8 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                preferences_prepared=True,
+                preference_snapshot=target.conv.preference_snapshot,
                 temporary_preferences=(
                     target.conv.labels.get("omnigent.preferences.temporary") == "true"
                 ),
@@ -1285,6 +1287,11 @@ def register_core_routes(
             tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
         )
 
+        from omnigent.server.session_preferences import validate_session_preferences
+
+        validate_session_preferences(
+            request, user_id, parsed_metadata.preference_snapshot, labels=parsed_metadata.labels
+        )
         from omnigent.server.routes.sandbox_inference import prepare_create_inference
 
         inference_snapshot, inference_model = await prepare_create_inference(
@@ -2950,11 +2957,13 @@ def register_core_routes(
                             exc_info=True,
                         )
                     else:
-                        from omnigent.server.runner_session_init import runner_inference_verified
+                        from omnigent.server.runner_session_init import (
+                            runner_configuration_verified,
+                        )
 
                         parent_initialized = (
                             runner_init_resp.status_code < 400
-                            and runner_inference_verified(conv, runner_init_resp)
+                            and runner_configuration_verified(conv, runner_init_resp)
                         )
                 if (
                     conv is not None
@@ -2968,7 +2977,7 @@ def register_core_routes(
                             conversation_store.replace_runner_id, session_id, previous_runner_id
                         )
                     raise OmnigentError(
-                        "The runner did not accept this session's saved inference configuration",
+                        "The runner did not accept this session's saved configuration",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
                 if _runner_client is None:
@@ -3564,6 +3573,16 @@ def register_core_routes(
         )
 
         source_configured = configured_snapshot(source.inference_snapshot)
+        if source.preference_snapshot is not None:
+            from omnigent.preference_startup import PreferenceLaunch
+            from omnigent.server.session_preferences import validate_session_preferences
+
+            validate_session_preferences(
+                request,
+                user_id,
+                PreferenceLaunch.model_validate(source.preference_snapshot),
+                labels=source.labels,
+            )
         if source.inference_snapshot is not None:
             from omnigent.server.auth import RESERVED_USER_LOCAL
 

@@ -5706,18 +5706,22 @@ async def _ensure_runner_session_initialized(
             )
         from omnigent.server.runner_session_init import (
             is_session_agent_removed,
-            runner_inference_verified,
+            runner_configuration_verified,
         )
 
         if is_session_agent_removed(resp):
             # Forwarded anyway, the message gets the runner's own "this agent no
             # longer exists" reply; a caller that needs the runner ready gets it now.
-            if require_success or conv.inference_snapshot is not None:
+            if (
+                require_success
+                or conv.inference_snapshot is not None
+                or conv.preference_snapshot is not None
+            ):
                 raise _agent_removed()
             return False
-        if not runner_inference_verified(conv, resp):
+        if not runner_configuration_verified(conv, resp):
             raise OmnigentError(
-                "The runner did not accept this session's saved inference configuration",
+                "The runner did not accept this session's saved configuration",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         # httpx only raises on transport errors; a 4xx/5xx means create_session
@@ -5733,7 +5737,11 @@ async def _ensure_runner_session_initialized(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        if require_success or conv.inference_snapshot is not None:
+        if (
+            require_success
+            or conv.inference_snapshot is not None
+            or conv.preference_snapshot is not None
+        ):
             raise OmnigentError(
                 "The recovered runner did not finish session initialization.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -11386,6 +11394,9 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    from omnigent.server.session_preferences import validate_session_preferences
+
+    validate_session_preferences(request, user_id, body.preference_snapshot, labels=body.labels)
     inference_snapshot = None
     selection_spec = None
     from omnigent.server.mcp_compatibility import registry_services, require_registry_mcp_runtime
@@ -11707,6 +11718,8 @@ async def _create_session_from_existing_agent(
     snapshot_kwargs: dict[str, Any] = (
         {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
     )
+    if body.preference_snapshot is not None:
+        snapshot_kwargs["preference_snapshot"] = body.preference_snapshot.model_dump(mode="json")
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
 
     # A new session from another user's agent runs on the caller's own copy, so

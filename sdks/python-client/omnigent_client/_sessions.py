@@ -391,6 +391,7 @@ class SessionsNamespace:
         workspace: str | None = None,
         host_type: str = "external",
         sandbox_provider: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> Session:
         """
         Create a new session from an uploaded agent bundle.
@@ -422,11 +423,15 @@ class SessionsNamespace:
         :param sandbox_provider: With ``host_type="managed"``, which
             configured sandbox provider to provision (e.g. ``"lakebox"``);
             ``None`` takes the server's first. Ignored for external hosts.
+        :param preference_snapshot: Already resolved portable defaults to freeze with
+            this session. Omitted for legacy or explicit temporary sessions.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
         """
         metadata: dict[str, Any] = {}
+        if preference_snapshot is not None:
+            metadata["preference_snapshot"] = preference_snapshot
         if title is not None:
             metadata["title"] = title
         if labels is not None:
@@ -458,6 +463,7 @@ class SessionsNamespace:
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        preference_snapshot: dict[str, Any] | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -480,11 +486,15 @@ class SessionsNamespace:
             the session, e.g. ``"/Users/corey/projects/myapp"``.
         :param host_id: Launch the runner on this host; read timeout is at least
             3660 seconds. Longer or unlimited client timeouts are retained.
+        :param preference_snapshot: Already resolved portable defaults to freeze with
+            this session. Omitted for legacy or explicit temporary sessions.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx status,
             or a host-targeted create times out before its outcome is known.
         """
         body: dict[str, Any] = {"agent_id": agent_id}
+        if preference_snapshot is not None:
+            body["preference_snapshot"] = preference_snapshot
         if title is not None:
             body["title"] = title
         if labels is not None:
