@@ -1109,8 +1109,8 @@ class CreateResponseRequest(BaseModel):
         "description": "...", "parameters": {...}}}]``.
     :param tool_choice: Ignored — agent controls this. Silently
         dropped.
-    :param max_output_tokens: Ignored — agent controls this.
-        Silently dropped.
+    :param max_output_tokens: Output token cap, e.g. ``32``.
+        Executors that support a cap apply it; others ignore it.
     :param frequency_penalty: Ignored — agent controls this.
         Silently dropped.
     :param presence_penalty: Ignored — agent controls this.
