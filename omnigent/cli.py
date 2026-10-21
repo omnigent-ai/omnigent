@@ -3749,6 +3749,29 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
 
 
+def _ensure_host_server_auth(server: str, *, non_interactive: bool) -> None:
+    """Run the sign-in pre-flight for a host start unless a launch token covers it.
+
+    A server-managed sandbox host authenticates its tunnel with
+    ``OMNIGENT_HOST_TOKEN`` and holds no user credentials, so the user sign-in
+    pre-flight could only send it to a login it cannot complete.
+    Session-creation clients (:func:`_ensure_backend`) keep the user pre-flight.
+
+    :param server: Remote server base URL without a trailing slash.
+    :param non_interactive: Forwarded to :func:`_ensure_databricks_server_auth`.
+    """
+    from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+    if os.environ.get(HOST_TOKEN_ENV_VAR):
+        click.echo(
+            f"{HOST_TOKEN_ENV_VAR} is set; connecting with the launch token "
+            "instead of a user sign-in.",
+            err=True,
+        )
+        return
+    _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+
+
 def _ensure_backend(server: str | None) -> str:
     """Ensure the host daemon is running and return the Omnigent server URL.
 
@@ -9117,7 +9140,7 @@ def _run_background_host(
         Omnigent server.
     """
     if server:
-        _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+        _ensure_host_server_auth(server, non_interactive=non_interactive)
     target = _normalize_daemon_target(server)
     previous = _find_daemon_record(target)
     _ensure_host_daemon(server or None)
@@ -9340,7 +9363,7 @@ def host(
         # this runs the browser login and continues; ``--non-interactive``
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
-            _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+            _ensure_host_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
@@ -10377,7 +10400,7 @@ def host_enable(
     group_obj = ctx.obj if isinstance(ctx.obj, dict) else {}
     non_interactive = non_interactive or bool(group_obj.get("non_interactive"))
     if resolved_server:
-        _ensure_databricks_server_auth(
+        _ensure_host_server_auth(
             resolved_server,
             non_interactive=non_interactive or not _stdin_is_tty(),
         )
