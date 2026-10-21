@@ -872,6 +872,26 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
     assert isinstance(error.data, ErrorData) and "store unavailable" in error.data.message
 
 
+async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input(
+    startup_env: _Env,
+) -> None:
+    """A launch shutdown gives up on before it binds a host leaves no replica to deliver
+    the saved first message, so the session reports that instead of waiting forever."""
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = startup_env
+    session_id = await _create(env)
+
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"
+    [pending] = env.conv_store.list_pending_inputs(session_id)
+    assert pending.status == "failed"
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData) and "shut down" in error.data.message
+
+
 async def test_refused_input_does_not_hold_back_the_next_one(
     startup_env: _Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:

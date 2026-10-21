@@ -71,6 +71,8 @@ import {
   ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
   beginLocalConversation,
   committedItemProvesDelivery,
+  takeFailedSendDraft,
+  restoredSendDraftUnchanged,
   consumePendingInitialPrompt,
   handleSessionEvent,
   hydrateLocalConversation,
@@ -20159,3 +20161,45 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 });
+
+it.each(["restore", "newer", "foreign", "delivered", "no-id", "refused", "unsettled"])(
+  "consumes failed drafts safely: %s",
+  (scenario) => {
+    const id = "failed-draft-owner";
+    const failed = {
+      conversationId: scenario === "foreign" ? "other" : id,
+      text: "Retry",
+      files: [],
+      stableId: scenario === "no-id" ? undefined : "stable",
+      serverRefused: scenario === "refused",
+      unsettled: scenario === "unsettled",
+    };
+    const entry = conversationRegistry.acquire(id);
+    entry.setState({
+      failedSendDraft: failed,
+      blocks: ["delivered", "refused", "unsettled"].includes(scenario)
+        ? itemsToBlocks([
+            {
+              id: "stable",
+              response_id: "turn",
+              type: "message",
+              role: "user",
+              status: "completed",
+              content: [{ type: "input_text", text: "Retry" }],
+            },
+          ])
+        : [],
+    });
+    const restore = !["foreign", "delivered", "newer"].includes(scenario);
+    expect(takeFailedSendDraft(id, scenario === "newer")).toBe(restore ? failed : null);
+    expect(entry.getState().failedSendDraft).toBe(scenario === "foreign" ? failed : null);
+    expect(entry.getState().pendingRetryStableId).toBe(restore ? (failed.stableId ?? null) : null);
+    const restored = entry.getState().restoredSendDraft;
+    expect(restored !== null).toBe(restore && scenario !== "no-id");
+    if (restored) {
+      expect(restoredSendDraftUnchanged(restored, "stable", "Retry", [], undefined)).toBe(true);
+      expect(restoredSendDraftUnchanged(restored, "stable", "Edited", [], undefined)).toBe(false);
+    }
+    if (scenario !== "foreign") expect(takeFailedSendDraft(id, false)).toBeNull();
+  },
+);

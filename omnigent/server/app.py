@@ -1841,12 +1841,14 @@ def create_app(
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
             # Stop in-flight background managed-sandbox launches so a
-            # slow provision doesn't outlive the ASGI shutdown (the
-            # sandbox itself, if already provisioned, is reaped by the
-            # provider lifetime cap — see the hook's docstring).
+            # slow provision doesn't outlive the ASGI shutdown, after giving
+            # unbound ones the deployment's drain to bind their host (see the
+            # hook's docstring).
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
-            await cancel_managed_launch_tasks()
+            await cancel_managed_launch_tasks(
+                drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
+            )
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
@@ -4164,6 +4166,22 @@ def create_app(
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
                     # Idle trees reinitialize on demand; active trees recover now.
+                    if not initialize_runtime:
+                        if conv.agent_id is None:
+                            reason = "no_agent"
+                        elif conv.archived:
+                            reason = "archived"
+                        else:
+                            reason = "idle"
+                        _logger.info(
+                            "Deferred runner session init until first use: session=%s reason=%s",
+                            conv.id,
+                            reason,
+                            extra=debug_event(
+                                "runner_session_init_deferred",
+                                reason=reason,
+                            ),
+                        )
                     if initialize_runtime:
                         response = await runner_session_initializer.initialize(
                             conv,

@@ -367,7 +367,7 @@ export function GridWorkspace({
     );
     return () => release.forEach((unretain) => unretain());
   }, [grids?.enabled, gridId, layout]);
-  if (!grids?.enabled) return content;
+  if (!grids) return content;
   if (!gridId)
     return (
       <div
@@ -397,11 +397,17 @@ export function GridWorkspace({
               componentId="grid.open_sidebar"
             />
           )}
-          <h1>Grid unavailable</h1>
+          <h1>{!grids.enabled && !grids.identityReady ? "Loading grid…" : "Grid unavailable"}</h1>
           <p>
-            This grid isn’t saved on this device. Open a session and drag another session into it to
-            create a grid.
+            {grids.enabled
+              ? "This grid isn’t saved on this device. Open a session and drag another session into it to create a grid."
+              : grids.identityReady
+                ? "Your account identity is unavailable. Reload to retry."
+                : "Waiting for your account identity."}
           </p>
+          {!grids.enabled && grids.identityReady && (
+            <Button onClick={() => window.location.reload()}>Reload</Button>
+          )}
           <Button asChild variant="outline">
             <Link to="/">Back to sessions</Link>
           </Button>

@@ -1,3 +1,4 @@
+import type * as TerminalsModule from "@/hooks/useTerminals";
 import { type ComponentProps, useContext, useState } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -28,7 +29,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   useWorkspaceEnvironment: () => ({ data: { available: true, root: "/workspace" } }),
   useWorkspaceChangedFiles: () => ({ data: { data: [] } }),
 }));
-vi.mock("@/hooks/useTerminals", () => ({
+vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
+  ...(await importOriginal<typeof TerminalsModule>()),
   useTerminals: () => ({ terminals: [] }),
   useDeleteTerminal: () => ({}),
   terminalTabKey: () => "terminal",

@@ -44,8 +44,12 @@ import { Button } from "@/components/ui/button";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  restoredSendDraftUnchanged,
+  takeFailedSendDraft,
   useChatStore,
 } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { validateAttachments } from "@/lib/attachments";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
@@ -443,6 +447,48 @@ function SideChatComposer({
   const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
   const updateComposer = useChatStore((s) => s.updateSideChatComposer);
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
+  const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
+    fullSession ? childId : null,
+  );
+  useEffect(() => {
+    if (!fullSession || !failedSendDraft) return;
+    const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+    const failed = takeFailedSendDraft(
+      childId,
+      !!(current.text.trim() || current.files.length || current.quotes?.length),
+    );
+    if (!failed) return;
+    const { accepted, errors } = validateAttachments(failed.files);
+    errors.forEach((message) => toast.error(message));
+    updateComposer(childId, () => ({ text: failed.text, files: accepted }));
+    // Track the displayed draft for delivery; filtered files require a fresh send ID.
+    const entry = conversationRegistry.peek(childId)!;
+    const restored = entry.getState().restoredSendDraft;
+    if (restored)
+      entry.setState({
+        restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
+        pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
+      });
+  }, [fullSession, childId, failedSendDraft, updateComposer]);
+  useEffect(() => {
+    if (!fullSession || !restoredSendDraft?.delivered) return;
+    const entry = conversationRegistry.peek(childId);
+    const restored = entry?.getState().restoredSendDraft;
+    if (!restored?.delivered || restored.conversationId !== childId) return;
+    const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+    entry!.setState({ restoredSendDraft: null });
+    if (current.quotes?.length) return;
+    if (
+      restoredSendDraftUnchanged(
+        restored,
+        restored.stableId,
+        current.text,
+        current.files,
+        undefined,
+      )
+    )
+      clearComposer(childId);
+  }, [fullSession, childId, restoredSendDraft, clearComposer]);
   const setText = useCallback(
     (next: string) => updateComposer(childId, (current) => ({ ...current, text: next })),
     [childId, updateComposer],

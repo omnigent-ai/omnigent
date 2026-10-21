@@ -70,6 +70,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
@@ -263,8 +264,10 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
+  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
+  hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
   type HostIdentity,
@@ -2296,6 +2299,7 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
@@ -2320,7 +2324,9 @@ export function NewChatLandingScreen() {
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, addFiles);
+  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
+    if (!checkingDbcert) addFiles(droppedFiles);
+  });
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -2624,6 +2630,9 @@ export function NewChatLandingScreen() {
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [dbcertRequired, setDbcertRequired] = useState(false);
+  const createAttemptRef = useRef<symbol | null>(null);
+  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -5360,11 +5369,9 @@ export function NewChatLandingScreen() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit) return;
-    // A create is actually happening: report it for pointer clicks (via the
-    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
-    // don't emit, matching the disabled Start button.
-    trackClick("new_chat.start_session", "button");
+    if (!canSubmit || createAttemptRef.current !== null) return;
+    const createAttempt = Symbol();
+    createAttemptRef.current = createAttempt;
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
@@ -5382,12 +5389,6 @@ export function NewChatLandingScreen() {
         typeof destination === "string" ? destination : destination.pathname,
       );
     };
-    // Remember the repos/branches for next time (seeds the picker on the next
-    // visit). Only when a repo is actually set — a no-repo session leaves the
-    // remembered repos untouched rather than clearing them.
-    if (sandboxRepoSelections.length > 0) {
-      writeLastSandboxRepos(sandboxRepoSelections);
-    }
     setCreating(true);
     setCreateError(null);
     let localConv: {
@@ -5409,14 +5410,49 @@ export function NewChatLandingScreen() {
         navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
       }
     };
-    // The draft is spent from the moment it is submitted: it belongs to the
-    // session now being created, so a detour back to this screen must not
-    // hand it back pre-filled. Flipped here rather than on the response
-    // because the create outlives an unmount; a create that fails hands the
-    // draft back via returnDraftToUser.
-    submittedDraftRevisionRef.current = landingDraftRevision;
-    submittedRef.current = true;
     try {
+      if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
+        const skipCheck = new Promise<null>((resolve) => {
+          skipDbcertCheckRef.current = () => resolve(null);
+        });
+        setCheckingDbcert(true);
+        setDbcertRequired(false);
+        const credentials = await Promise.race([
+          getDesktopFeatures().then((features) =>
+            createAttemptRef.current === createAttempt &&
+            skipDbcertCheckRef.current !== null &&
+            onScreenRef.current &&
+            window.location.href === createLocation &&
+            features?.databricksInternalFeatures === true &&
+            features.canRefreshDbcert === true
+              ? checkDbcert()
+              : null,
+          ),
+          skipCheck,
+        ]);
+        skipDbcertCheckRef.current = null;
+        if (
+          createAttemptRef.current !== createAttempt ||
+          !onScreenRef.current ||
+          window.location.href !== createLocation
+        )
+          return;
+        setCheckingDbcert(false);
+        if (credentials !== null && !credentials.ok) {
+          setCreateError(credentials.error);
+          return;
+        }
+        const needsDbcert = credentials !== null && !credentials.valid;
+        setDbcertRequired(needsDbcert);
+        if (needsDbcert) return;
+      }
+      // Spend the draft only once provisioning starts, after the laptop credential check.
+      submittedDraftRevisionRef.current = landingDraftRevision;
+      submittedRef.current = true;
+      trackClick("new_chat.start_session", "button");
+      if (sandboxRepoSelections.length > 0) {
+        writeLastSandboxRepos(sandboxRepoSelections);
+      }
       const trimmedBranch = branchName.trim();
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -5946,7 +5982,12 @@ export function NewChatLandingScreen() {
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
-      setCreating(false);
+      if (createAttemptRef.current === createAttempt) {
+        createAttemptRef.current = null;
+        skipDbcertCheckRef.current = null;
+        setCheckingDbcert(false);
+        setCreating(false);
+      }
     }
   }
 
@@ -6112,9 +6153,10 @@ export function NewChatLandingScreen() {
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
-        <div
+        <fieldset
+          disabled={checkingDbcert}
           className={cn(
-            "relative flex flex-col gap-0 max-md:w-[calc(100%-1rem)]",
+            "relative flex min-w-0 flex-col gap-0 max-md:w-[calc(100%-1rem)]",
             COMPOSER_COLUMN_WIDTH,
           )}
           data-testid="new-chat-landing-composer-surface"
@@ -7171,7 +7213,7 @@ export function NewChatLandingScreen() {
                 : undefined
             }
           />
-        </div>
+        </fieldset>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&
             !autoRoutingSelected &&
@@ -7272,6 +7314,31 @@ export function NewChatLandingScreen() {
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
+          )}
+
+          {checkingDbcert && (
+            <div
+              className="flex items-center gap-2 text-sm text-muted-foreground"
+              data-testid="new-chat-landing-dbcert-status"
+            >
+              <Spinner className="size-4 shrink-0" />
+              <p role="status">Checking laptop credentials…</p>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => skipDbcertCheckRef.current?.()}
+              >
+                Skip
+              </Button>
+            </div>
+          )}
+
+          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
+            <LaptopDbcertBanner
+              onReady={() => setDbcertRequired(false)}
+              onDismiss={() => setDbcertRequired(false)}
+            />
           )}
 
           {connectError && (

@@ -117,14 +117,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_url = page.url
         expect(page.get_by_role("region", name="Grids")).to_be_visible()
         grid_nav = page.get_by_role("region", name="Grids")
-        grid_nav.get_by_role("link").dblclick()
+        # dnd-kit suppresses click propagation for 50 ms after a drop.
+        grid_nav.get_by_role("link").dblclick(delay=75)
         rename = page.get_by_role("textbox", name="Rename grid")
         page.get_by_role("heading", name="Grid · 2 sessions", exact=True).click()
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 1 + Grid session 0")
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 0 + Grid session 1")
-        grid_nav.get_by_role("link").dblclick()
+        grid_nav.get_by_role("link").dblclick(delay=75)
         rename.fill("Cancelled title")
         rename.press("Escape")
         expect(grid_nav.get_by_role("link")).not_to_contain_text("Cancelled title")
@@ -240,6 +241,23 @@ def test_session_grid_drag_persist_live_updates_and_close(
         second = page.locator('[data-grid-session="grid-1"]')
         first.get_by_role("textbox").fill("Keep this draft")
         second.get_by_role("textbox").fill("Send to session one")
+        sessions[1].reject_uploads = False
+        second.locator('input[type="file"]').set_input_files(
+            {"name": "notes.txt", "mimeType": "text/plain", "buffer": b"notes"}
+        )
+        page.route(
+            "**/v1/sessions/grid-1/events",
+            lambda route: route.fulfill(status=503, json={"detail": "Temporary send failure"}),
+            times=1,
+        )
+        with page.expect_response(
+            lambda response: response.url.endswith("/grid-1/events") and response.status == 503
+        ):
+            second.get_by_role("button", name="Send message", exact=True).click()
+        expect(second.get_by_role("textbox")).to_have_value("Send to session one")
+        expect(second.get_by_text("notes.txt", exact=True)).to_be_visible()
+        expect(first.get_by_role("textbox")).to_have_value("Keep this draft")
+        page.screenshot(path=str(artifacts / "grid-failed-send-restored.png"))
         with page.expect_response(
             lambda response: (
                 response.url.endswith(f"/{sessions[1].session_id}/events")
@@ -390,3 +408,15 @@ def test_grid_flag_off_and_unknown_local_grid(
         page.reload()
         expect(page.get_by_text("Grid unavailable", exact=True)).to_be_visible()
         expect(page.get_by_role("link", name="Back to sessions")).to_be_visible()
+
+        if not features:
+            browser_contract.json("/v1/me", {"user_id": None, "is_admin": False})
+            page.reload()
+            expect(
+                page.get_by_text("Your account identity is unavailable. Reload to retry.")
+            ).to_be_visible()
+            browser_contract.json("/v1/me", {"user_id": "local", "is_admin": True})
+            page.get_by_role("button", name="Reload", exact=True).click()
+            expect(
+                page.get_by_text("This grid isn’t saved on this device.", exact=False)
+            ).to_be_visible()

@@ -2979,6 +2979,365 @@ describe("Run on this machine (desktop host enrollment)", () => {
   });
 });
 
+describe("desktop Arclet credential preflight", () => {
+  const checkDbcert = vi.fn<() => Promise<NativeBridgeModule.DbcertStatusResult>>();
+  const refreshDbcert = vi.fn<() => Promise<NativeBridgeModule.DbcertRefreshResult>>();
+  const arcletInfo = { managed_sandboxes_enabled: true, sandbox_provider: "arclet" };
+
+  beforeEach(() => {
+    setupLandingMocks();
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getDesktopFeatures).mockResolvedValue({
+      databricksInternalFeatures: true,
+      canRefreshDbcert: true,
+    });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { kind: "electron", checkDbcert, refreshDbcert },
+    });
+    checkDbcert.mockReset().mockResolvedValue({ ok: true, valid: true });
+    refreshDbcert.mockReset().mockResolvedValue({ ok: true });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+  });
+
+  afterEach(() => {
+    cleanup();
+    Reflect.deleteProperty(window, "omnigentDesktop");
+    vi.mocked(isElectronShell).mockReturnValue(false);
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+  });
+
+  async function start() {
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep this task while I sign in" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+  }
+
+  it("checks valid credentials before creating exactly one Arclet without sign-in", async () => {
+    let finish!: (result: { ok: true; valid: boolean }) => void;
+    checkDbcert.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderLanding(arcletInfo);
+    await start();
+    await waitFor(() => expect(checkDbcert).toHaveBeenCalledOnce());
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(checkDbcert).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("new-chat-landing-dbcert-status")).toHaveTextContent(
+      "Checking laptop credentials",
+    );
+    expect(screen.getByRole("button", { name: "Skip" })).toBeEnabled();
+    expect(screen.getByTestId("new-chat-landing-input")).toBeDisabled();
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toBeDisabled();
+    expect(screen.getByTestId("new-chat-landing-repo-chip")).toBeDisabled();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toBeDisabled();
+    fireEvent.drop(screen.getByTestId("new-chat-landing"), {
+      dataTransfer: fileDrag([new File(["notes"], "late-attachment.txt", { type: "text/plain" })]),
+    });
+    expect(screen.queryByText("late-attachment.txt")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel launch" })).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    await act(async () => finish({ ok: true, valid: true }));
+    const { body } = await readCreateBody();
+    expect(body).toMatchObject({ host_type: "managed", sandbox_provider: "arclet" });
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+      "conv_new",
+      expect.objectContaining({ text: "Keep this task while I sign in" }),
+    );
+    expect(
+      authenticatedFetchMock.mock.calls.filter(([url]) => url === "/v1/sessions"),
+    ).toHaveLength(1);
+    expect(refreshDbcert).not.toHaveBeenCalled();
+  });
+
+  it("blocks invalid credentials with a refresh banner, then waits for an explicit launch", async () => {
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    const startEvent = {
+      type: "click",
+      componentId: "new_chat.start_session",
+      componentKind: "button",
+    };
+    checkDbcert.mockResolvedValueOnce({ ok: true, valid: false });
+    let finishRefresh!: (result: { ok: true }) => void;
+    refreshDbcert.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishRefresh = resolve;
+      }),
+    );
+    renderLanding(arcletInfo);
+    await start();
+    const refresh = await screen.findByRole("button", { name: "Refresh dbcert" });
+    expect(screen.getByText(/Your laptop's dbcert is missing or expired/)).toBeTruthy();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(refreshDbcert).not.toHaveBeenCalled();
+    expect(analytics).not.toHaveBeenCalledWith(startEvent);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "Keep this task while I sign in",
+    );
+    fireEvent.click(refresh);
+    expect(refreshDbcert).toHaveBeenCalledOnce();
+    expect(refreshDbcert).toHaveBeenCalledWith({ skipArcaSync: true });
+    expect(screen.getByRole("button", { name: "Refreshing…" })).toBeDisabled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-chat-landing-input")).toBeEnabled();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Use the task edited during sign-in" },
+    });
+    await act(async () => finishRefresh({ ok: true }));
+    expect(checkDbcert).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Your laptop's dbcert is missing or expired/)).toBeNull();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(analytics).not.toHaveBeenCalledWith(startEvent);
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    const { body } = await readCreateBody();
+    expect(body).toMatchObject({ host_type: "managed", sandbox_provider: "arclet" });
+    expect(checkDbcert).toHaveBeenCalledTimes(3);
+    expect(refreshDbcert).toHaveBeenCalledOnce();
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+      "conv_new",
+      expect.objectContaining({ text: "Use the task edited during sign-in" }),
+    );
+    expect(
+      analytics.mock.calls.filter(([event]) => event.componentId === startEvent.componentId),
+    ).toEqual([[startEvent]]);
+  });
+
+  it.each([false, true])(
+    "locks the draft while checking capabilities and supports Skip (skip=%s)",
+    async (skip) => {
+      let finishFeatures!: (features: Awaited<ReturnType<typeof getDesktopFeatures>>) => void;
+      const pendingFeatures = new Promise<Awaited<ReturnType<typeof getDesktopFeatures>>>(
+        (resolve) => {
+          finishFeatures = resolve;
+        },
+      );
+      renderLanding(arcletInfo);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Keep this task during the capability check" },
+      });
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      vi.mocked(getDesktopFeatures).mockReturnValueOnce(pendingFeatures);
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      expect(screen.getByTestId("new-chat-landing-input")).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Skip" })).toBeEnabled();
+      expect(checkDbcert).not.toHaveBeenCalled();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      if (skip) {
+        fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+        await readCreateBody();
+      }
+      await act(async () =>
+        finishFeatures({ databricksInternalFeatures: true, canRefreshDbcert: true }),
+      );
+      await readCreateBody();
+      expect(checkDbcert).toHaveBeenCalledTimes(skip ? 0 : 1);
+      expect(refreshDbcert).not.toHaveBeenCalled();
+      expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "Keep this task during the capability check" }),
+      );
+    },
+  );
+
+  it("clears the previous refresh warning while a new check is pending", async () => {
+    let finishCheck!: (result: { ok: true; valid: boolean }) => void;
+    checkDbcert.mockResolvedValueOnce({ ok: true, valid: false }).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishCheck = resolve;
+      }),
+    );
+    renderLanding(arcletInfo);
+    await start();
+    await screen.findByRole("button", { name: "Refresh dbcert" });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(checkDbcert).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId("new-chat-landing-dbcert-status")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
+    await act(async () => finishCheck({ ok: true, valid: false }));
+    await screen.findByRole("button", { name: "Refresh dbcert" });
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(refreshDbcert).not.toHaveBeenCalled();
+  });
+
+  it("does not bypass the credential check when the banner is dismissed", async () => {
+    checkDbcert.mockResolvedValue({ ok: true, valid: false });
+    renderLanding(arcletInfo);
+    await start();
+    await screen.findByRole("button", { name: "Refresh dbcert" });
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await screen.findByRole("button", { name: "Refresh dbcert" });
+    expect(checkDbcert).toHaveBeenCalledTimes(2);
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(refreshDbcert).not.toHaveBeenCalled();
+  });
+
+  it("keeps the draft and shows a credential error without provisioning, then allows retry", async () => {
+    checkDbcert.mockResolvedValueOnce({
+      ok: false,
+      error: "dbcert is not installed on this laptop. Install dbcert, then try again.",
+    });
+    renderLanding(arcletInfo);
+    await start();
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent("Install dbcert");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "Keep this task while I sign in",
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await readCreateBody();
+    expect(checkDbcert).toHaveBeenCalledTimes(2);
+    expect(refreshDbcert).not.toHaveBeenCalled();
+  });
+
+  it.each<NativeBridgeModule.DbcertStatusResult>([
+    { ok: true, valid: true },
+    { ok: true, valid: false },
+    { ok: false, error: "Couldn't check credentials" },
+  ])(
+    "skips a pending check and launches once, ignoring its late result (%j)",
+    async (lateResult) => {
+      let finish!: (result: NativeBridgeModule.DbcertStatusResult) => void;
+      checkDbcert.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      renderLanding(arcletInfo);
+      await start();
+      const skip = await screen.findByRole("button", { name: "Skip" });
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      fireEvent.click(skip);
+      fireEvent.click(skip);
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+      const { body } = await readCreateBody();
+      expect(body).toMatchObject({ host_type: "managed", sandbox_provider: "arclet" });
+      expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "Keep this task while I sign in" }),
+      );
+      expect(screen.queryByTestId("new-chat-landing-dbcert-status")).toBeNull();
+      await act(async () => finish(lateResult));
+      expect(
+        authenticatedFetchMock.mock.calls.filter(([url]) => url === "/v1/sessions"),
+      ).toHaveLength(1);
+      expect(checkDbcert).toHaveBeenCalledOnce();
+      expect(refreshDbcert).not.toHaveBeenCalled();
+      expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+    },
+  );
+
+  it("checks credentials again after a skipped launch fails", async () => {
+    let finish!: (result: { ok: true; valid: boolean }) => void;
+    checkDbcert.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    authenticatedFetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({ detail: "Temporary launch failure" }),
+      text: async () => "Temporary launch failure",
+    } as Response);
+    renderLanding(arcletInfo);
+    await start();
+    fireEvent.click(await screen.findByRole("button", { name: "Skip" }));
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      "Temporary launch failure",
+    );
+    checkDbcert.mockResolvedValueOnce({ ok: true, valid: false });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await screen.findByRole("button", { name: "Refresh dbcert" });
+    await act(async () => finish({ ok: true, valid: true }));
+    expect(checkDbcert).toHaveBeenCalledTimes(2);
+    expect(
+      authenticatedFetchMock.mock.calls.filter(([url]) => url === "/v1/sessions"),
+    ).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeEnabled();
+    expect(refreshDbcert).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "Keep this task while I sign in",
+    );
+  });
+
+  it.each([false, true])(
+    "does not provision after leaving the form during a check (skip=%s)",
+    async (skip) => {
+      let finish!: (result: { ok: true; valid: boolean }) => void;
+      checkDbcert.mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const mounted = renderLanding(arcletInfo);
+      await start();
+      await waitFor(() => expect(checkDbcert).toHaveBeenCalledOnce());
+      if (skip) fireEvent.click(screen.getByRole("button", { name: "Skip" }));
+      mounted.unmount();
+      await act(async () => finish({ ok: true, valid: true }));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      renderLanding(arcletInfo);
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+        "Keep this task while I sign in",
+      );
+    },
+  );
+
+  it.each([
+    "browser",
+    "older shell",
+    "legacy renewal shell",
+    "partial shell",
+    "disabled feature",
+    "missing feature flag",
+    "other provider",
+    "connected host",
+  ])("does not invoke laptop credential checks or renewal for %s", async (kind) => {
+    if (kind === "browser" || kind === "older shell") {
+      Object.defineProperty(window, "omnigentDesktop", {
+        configurable: true,
+        value: kind === "older shell" ? { kind: "electron" } : undefined,
+      });
+    }
+    if (kind === "legacy renewal shell" || kind === "partial shell") {
+      Object.defineProperty(window, "omnigentDesktop", {
+        configurable: true,
+        value:
+          kind === "legacy renewal shell"
+            ? { kind: "electron", ensureDbcert: refreshDbcert, refreshDbcert }
+            : { kind: "electron", checkDbcert },
+      });
+    }
+    if (kind === "disabled feature") vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+    if (kind === "missing feature flag")
+      vi.mocked(getDesktopFeatures).mockResolvedValue({ databricksInternalFeatures: true });
+    if (kind === "connected host") localStorage.setItem("omnigent:last-host-choice", "host_1");
+    renderLanding({
+      ...arcletInfo,
+      sandbox_provider: kind === "other provider" ? "modal" : "arclet",
+    });
+    await start();
+    await readCreateBody();
+    expect(checkDbcert).not.toHaveBeenCalled();
+    expect(refreshDbcert).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("new-chat-landing-dbcert-status")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
+  });
+});
+
 describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   beforeEach(() => {
     setupLandingMocks();

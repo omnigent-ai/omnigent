@@ -112,8 +112,10 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
     _logger,
     _managed_launch_tasks,
+    _unbound_managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -386,6 +388,16 @@ def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
+def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None:
+    """Return the runner's reason when the terminal has no way to select the requested model."""
+    if result is None or _runner_reply_field(result.body, "error") != (
+        "claude_native_model_unsupported"
+    ):
+        return None
+    detail = _runner_reply_field(result.body, "detail")
+    return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -626,9 +638,28 @@ def register_core_routes(
         )
         startup = getattr(request.app.state, "startup_inputs", None)
 
+        async def record_unbound_launch_failure() -> None:
+            # Shutdown gave up on the launch. Bound, the host's replica finishes
+            # it; unbound, no replica can, so fail the saved inputs rather than
+            # leave them pending with nothing to deliver them.
+            assert startup is not None
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is not None and conv.host_id is None:
+                await startup.record_launch_failure(
+                    session_id, "the server shut down before the sandbox finished launching"
+                )
+
         async def launch_and_record_failure() -> None:
             try:
                 await launch
+            except asyncio.CancelledError:
+                if startup is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(
+                            record_unbound_launch_failure(),
+                            timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
+                        )
+                raise
             except Exception as exc:
                 if startup is not None:
                     await startup.record_launch_failure(
@@ -641,7 +672,9 @@ def register_core_routes(
 
         launch_task = asyncio.create_task(launch_and_record_failure())
         _managed_launch_tasks.add(launch_task)
+        _unbound_managed_launch_tasks.add(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
+        launch_task.add_done_callback(_unbound_managed_launch_tasks.discard)
 
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None
@@ -3182,13 +3215,20 @@ def register_core_routes(
                 unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
                     _model_forward
                 )
-                forward_failed = not unconfirmed and _surface_model_change_forward_failure(
-                    session_id,
-                    updated.model_override,
-                    _model_forward,
+                # A model the terminal can't select is a bad request, not a failed session.
+                unsupported = _unsupported_model_detail(_model_forward)
+                forward_failed = (
+                    unsupported is None
+                    and not unconfirmed
+                    and _surface_model_change_forward_failure(
+                        session_id,
+                        updated.model_override,
+                        _model_forward,
+                    )
                 )
                 if conv is not None and (
-                    (wake_for_model_change and (_model_forward is None or forward_failed))
+                    unsupported is not None
+                    or (wake_for_model_change and (_model_forward is None or forward_failed))
                     or (forward_failed and configured_snapshot(conv.inference_snapshot))
                 ):
                     if combined_model_forward:
@@ -3212,6 +3252,8 @@ def register_core_routes(
                         model_override=conv.model_override,
                         _unset_model_override=conv.model_override is None,
                     )
+                    if unsupported is not None:
+                        raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
                         "The previous selection has been restored.",

@@ -1037,6 +1037,16 @@ def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
     )
 
 
+def is_compaction_steer_refusal(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex refused input because its active task is compaction."""
+    if error.code != _CODEX_INVALID_REQUEST_CODE or error.message != "cannot steer a compact turn":
+        return False
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    info = data.get("codexErrorInfo") if isinstance(data, dict) else None
+    refusal = info.get("activeTurnNotSteerable") if isinstance(info, dict) else None
+    return isinstance(refusal, dict) and refusal.get("turnKind") == "compact"
+
+
 def is_unreadable_thread_error(exc: BaseException) -> bool:
     """
     Whether a ``thread/resume`` failure means codex cannot load the thread.
