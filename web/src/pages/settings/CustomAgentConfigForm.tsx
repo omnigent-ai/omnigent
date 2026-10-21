@@ -93,7 +93,7 @@ export function CustomAgentConfigForm({
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!revision?.etag || !dirty || validation || conflict || busy) return;
+    if (!revision || !dirty || validation || conflict || busy) return;
     setError(null);
     try {
       const result = await save.mutateAsync({ etag: revision.etag, patch });
@@ -273,16 +273,11 @@ export function CustomAgentConfigForm({
               {error || validation}
             </p>
           )}
-          {!revision?.etag && (
-            <p role="alert">
-              The server did not provide a configuration revision. Reload before saving.
-            </p>
-          )}
           <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 border-t border-border bg-background py-4">
             <p className="mr-auto w-full text-xs text-muted-foreground @lg:w-auto">
               Changes apply to sessions on their next turn.
             </p>
-            {(conflict || !revision?.etag) && (
+            {conflict && (
               <Button
                 type="button"
                 variant="outline"
@@ -298,7 +293,7 @@ export function CustomAgentConfigForm({
             <Button
               type="submit"
               loading={save.isPending}
-              disabled={busy || !dirty || Boolean(validation) || conflict || !revision?.etag}
+              disabled={busy || !dirty || Boolean(validation) || conflict || !revision}
             >
               Save changes
             </Button>

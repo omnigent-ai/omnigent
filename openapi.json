@@ -10432,7 +10432,7 @@
         ]
       },
       "patch": {
-        "description": "Patch only supplied fields; require the ETag from GET /agents/{id}/config.",
+        "description": "Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config.",
         "operationId": "patch_agent_config_v1_agents__agent_id__patch",
         "parameters": [
           {
@@ -10548,16 +10548,6 @@
               }
             },
             "description": "Invalid partial configuration"
-          },
-          "428": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "If-Match is required"
           }
         },
         "summary": "Patch Agent Config",

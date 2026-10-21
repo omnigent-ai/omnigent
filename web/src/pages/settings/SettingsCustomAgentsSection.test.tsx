@@ -363,7 +363,7 @@ function configResponses({ fail = 0, etag = true }: { fail?: number; etag?: bool
       const patch = JSON.parse(init.body as string);
       current = { ...current, ...patch, version: current.version + 1 };
       users[0] = { ...users[0], description: current.description, version: current.version };
-      return new Response(JSON.stringify(current), { headers: { ETag: '"new"' } });
+      return new Response(JSON.stringify(current), { headers: etag ? { ETag: '"new"' } : {} });
     }
     if (String(url).endsWith("/config"))
       return new Response(JSON.stringify(current), { headers: etag ? { ETag: '"original"' } : {} });
@@ -404,42 +404,48 @@ describe("editing custom agents", () => {
       expect.anything(),
     );
   });
-  it("saves only changed fields, updates the summary, and never builds a replacement bundle", async () => {
-    configResponses();
-    await openEditor();
-    expect(screen.queryByRole("dialog")).toBeNull();
-    const description = screen.getByLabelText("Description");
-    expect(description).not.toHaveAttribute("readonly");
-    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    fireEvent.change(description, { target: { value: "Updated" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
-    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    expect(screen.getByLabelText("Description")).toBe(description);
-    expect(description).toHaveValue("Updated");
-    fireEvent.change(description, { target: { value: "Updated again" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
-    expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
-    expect(description).toHaveValue("Updated again");
-    expect(authenticatedFetch).toHaveBeenCalledWith(
-      "/v1/agents/a1",
-      expect.objectContaining({
-        method: "PATCH",
-        headers: { "Content-Type": "application/json", "If-Match": '"new"' },
-        body: '{"description":"Updated again"}',
-      }),
-    );
-    expect(authenticatedFetch).toHaveBeenCalledWith(
-      "/v1/agents/a1",
-      expect.objectContaining({
-        method: "PATCH",
-        headers: { "Content-Type": "application/json", "If-Match": '"original"' },
-        body: '{"description":"Updated"}',
-      }),
-    );
-    expect(buildAgentBundle).not.toHaveBeenCalled();
-  });
+  it.each([true, false])(
+    "saves only changed fields twice with revision headers: %s",
+    async (etag) => {
+      configResponses({ etag });
+      await openEditor();
+      expect(screen.queryByRole("dialog")).toBeNull();
+      const description = screen.getByLabelText("Description");
+      expect(description).not.toHaveAttribute("readonly");
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+      fireEvent.change(description, { target: { value: "Updated" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+      expect(screen.getByLabelText("Description")).toBe(description);
+      expect(description).toHaveValue("Updated");
+      fireEvent.change(description, { target: { value: "Updated again" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+      await waitFor(() => expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled());
+      expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+      expect(description).toHaveValue("Updated again");
+      expect(authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/agents/a1",
+        expect.objectContaining({
+          method: "PATCH",
+          headers: { "Content-Type": "application/json", ...(etag ? { "If-Match": '"new"' } : {}) },
+          body: '{"description":"Updated again"}',
+        }),
+      );
+      expect(authenticatedFetch).toHaveBeenCalledWith(
+        "/v1/agents/a1",
+        expect.objectContaining({
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            ...(etag ? { "If-Match": '"original"' } : {}),
+          },
+          body: '{"description":"Updated"}',
+        }),
+      );
+      expect(buildAgentBundle).not.toHaveBeenCalled();
+    },
+  );
   it("preserves new edits when the detail refresh after saving fails and is retried", async () => {
     configResponses();
     await openEditor();
@@ -521,11 +527,13 @@ describe("editing custom agents", () => {
     expect(await screen.findByDisplayValue("Concurrent winner")).toBeVisible();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
-  it("never saves without a revision", async () => {
-    configResponses({ etag: false });
+  it("preserves the draft when an older server requires a missing revision", async () => {
+    configResponses({ etag: false, fail: 428 });
     await openEditor();
     fireEvent.change(screen.getByLabelText("Description"), { target: { value: "New" } });
-    expect(screen.getByRole("alert")).toHaveTextContent("did not provide");
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Your draft is still here");
+    expect(screen.getByLabelText("Description")).toHaveValue("New");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
   });
 });
