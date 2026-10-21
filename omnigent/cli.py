@@ -9017,11 +9017,17 @@ def _registration_target_display(record: _HostDaemonRecord) -> str:
     return urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
 
 
+class _HostRegistrationPending(click.ClickException):
+    """The server answered but the daemon has not registered yet; it may still
+    come online (e.g. a slow tunnel handshake), so callers leave it running."""
+
+
 def _background_registration_timeout(
     record: _HostDaemonRecord,
     *,
     server_responded: bool,
     transport_error: str | None,
+    stop_command: str,
 ) -> click.ClickException:
     """Build the error for a registration wait that exhausted its grace.
 
@@ -9029,11 +9035,13 @@ def _background_registration_timeout(
     :param server_responded: Whether any status probe got an HTTP answer.
     :param transport_error: Last probe transport failure, e.g.
         ``"ConnectError: [Errno 111] Connection refused"``.
+    :param stop_command: Command that stops the daemon, e.g.
+        ``"omnigent stop"``.
     :returns: The exception to raise — an unreachable server is named
-        together with its transport failure instead of the generic
-        registration-timeout wording.
+        together with its transport failure; a server that answered gets a
+        :class:`_HostRegistrationPending` naming the still-running daemon.
     """
-    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR, redact_secrets
 
     target = _registration_target_display(record)
     log_detail = _background_host_log_detail(record.log_path)
@@ -9048,15 +9056,26 @@ def _background_registration_timeout(
         # tunnel rejection, so the recovery hint would mislead here.
         setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
         return exc
-    return click.ClickException(
+    timeout_message = (
         "The host daemon started but did not register with the server at "
         f"{target} within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
-        f"{log_detail}"
+    )
+    if not server_responded:
+        return click.ClickException(f"{timeout_message}{log_detail}")
+    return _HostRegistrationPending(
+        f"{timeout_message} It is still running (pid {record.pid}) and may "
+        f"still register. Check it with `{cli_invocation()} host status`, or "
+        f"stop it with `{redact_secrets(stop_command)}`.{log_detail}"
     )
 
 
-def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
-    """Wait until the detached daemon completes server registration."""
+def _confirm_background_host_registered(record: _HostDaemonRecord, *, stop_command: str) -> None:
+    """Wait until the detached daemon completes server registration.
+
+    :param stop_command: Stop command named in the timeout error.
+    :raises click.ClickException: If the daemon exits or the grace expires
+        (:class:`_HostRegistrationPending` when it may still register).
+    """
     deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
     announced = False
     server_responded = False
@@ -9066,6 +9085,15 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
             raise click.ClickException(
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
+            )
+        # Checked after the liveness check so a daemon that died during the
+        # last probe is reported as exited, not as still retrying.
+        if announced and time.monotonic() >= deadline:
+            raise _background_registration_timeout(
+                record,
+                server_responded=server_responded,
+                transport_error=last_transport_error,
+                stop_command=stop_command,
             )
         result = _daemon_host_status_probe(record, timeout_s=1.0)
         if result is not None and result.status_code == 0:
@@ -9086,12 +9114,6 @@ def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
                 err=True,
             )
             announced = True
-        if time.monotonic() >= deadline:
-            raise _background_registration_timeout(
-                record,
-                server_responded=server_responded,
-                transport_error=last_transport_error,
-            )
         time.sleep(0.2)
 
 
@@ -9163,7 +9185,8 @@ def _run_background_host(
     :param no_open: When ``True``, skip automatically opening the host web UI.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
-        Omnigent server.
+        Omnigent server. A daemon that is still retrying registration when the
+        wait expires is left running.
     """
     if server:
         _ensure_databricks_server_auth(server, non_interactive=non_interactive)
@@ -9179,7 +9202,7 @@ def _run_background_host(
             if local_record is not None:
                 from omnigent.util.server_url import display_server_url
 
-                _confirm_background_host_registered(local_record)
+                _confirm_background_host_registered(local_record, stop_command=stop_command)
                 click.echo(f"The local host daemon already serves {display_server_url(target)}.")
                 return
         raise click.ClickException(
@@ -9197,9 +9220,9 @@ def _run_background_host(
             record = _find_daemon_record(target) or record
         else:
             server_url = target
-        _confirm_background_host_registered(record)
-    except click.ClickException:
-        if not reused:
+        _confirm_background_host_registered(record, stop_command=stop_command)
+    except click.ClickException as exc:
+        if not reused and not isinstance(exc, _HostRegistrationPending):
             with contextlib.suppress(click.ClickException):
                 _terminate_daemon(record, force=True)
         raise
