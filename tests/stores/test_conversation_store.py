@@ -3375,11 +3375,18 @@ def test_list_conversations_filter_orders_by_sort_by(
     assert [c.id for c in page.data] == [older.id]
 
 
-def test_cascade_delete_removes_descendants(
-    conversation_store: SqlAlchemyConversationStore,
+@pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
+@pytest.mark.parametrize("terminal_reason", [None, "outcome_unknown"])
+async def test_cascade_delete_removes_descendants(
+    request: pytest.FixtureRequest,
+    store_fixture: str,
+    terminal_reason: str | None,
 ) -> None:
-    """Deleting a parent recursively removes children + grandchildren (FK CASCADE)."""
-    import asyncio
+    """Deleting a subtree also releases its durable host holds in the metadata DB."""
+    conversation_store = request.getfixturevalue(store_fixture)
+    hosts = HostStore(conversation_store.storage_location)
+    host_id = "a" * 32
+    hosts.upsert_on_connect(host_id, "recovery-host", "alice")
 
     parent = conversation_store.create_conversation()
     child = conversation_store.create_conversation(
@@ -3388,15 +3395,38 @@ def test_cascade_delete_removes_descendants(
     grandchild = conversation_store.create_conversation(
         kind="sub_agent", title="reviewer:nested", parent_conversation_id=child.id
     )
-    # Delete the root — both descendants must vanish via the
-    # ON DELETE CASCADE on parent_conversation_id.
-    asyncio.run(conversation_store.delete_conversation(parent.id))
-    assert conversation_store.get_conversation(parent.id) is None
-    assert conversation_store.get_conversation(child.id) is None, (
-        "Child not cascaded — FK ondelete=CASCADE missing or migration didn't apply it"
-    )
-    assert conversation_store.get_conversation(grandchild.id) is None, (
-        "Grandchild not cascaded — recursive FK cascade missing"
+    sibling = conversation_store.create_conversation()
+    for conv in (parent, child, grandchild, sibling):
+        conversation_store.set_host_id(conv.id, host_id, workspace="/tmp")
+        if conv == sibling:
+            continue
+        claim_id = hosts.claim_session_recovery(
+            host_id,
+            conv.id,
+            "a" * 64,
+            now=100,
+            lease_s=60,
+            max_attempts=3,
+            retry_backoff_s=30,
+        )
+        assert claim_id is not None
+        if conv != grandchild or terminal_reason is not None:
+            assert hosts.finish_session_recovery(
+                conv.id, claim_id, terminal_reason=terminal_reason if conv == grandchild else None
+            )
+    assert await conversation_store.delete_conversation(parent.id)
+    for conv in (parent, child, grandchild):
+        assert conversation_store.get_conversation(conv.id) is None
+        assert hosts.get_session_recovery(conv.id) is None
+    assert conversation_store.get_conversation(sibling.id) is not None
+    assert hosts.claim_session_recovery(
+        host_id,
+        sibling.id,
+        "a" * 64,
+        now=101,
+        lease_s=60,
+        max_attempts=3,
+        retry_backoff_s=30,
     )
 
 
@@ -8339,7 +8369,7 @@ def test_get_conversation_keeps_distinct_query_names(
 
 
 @pytest.mark.parametrize("limit", [1, 3, 50])
-def test_list_interrupted_host_sessions_spans_workspaces_and_filters(
+def test_list_interrupted_host_session_candidates_spans_workspaces_and_filters(
     conversation_store: SqlAlchemyConversationStore, limit: int
 ) -> None:
     from omnigent.db.db_models import workspace_scope
@@ -8376,35 +8406,37 @@ def test_list_interrupted_host_sessions_spans_workspaces_and_filters(
         (0, seed("failed", labels=disconnected)),
     }
     root = seed("idle")
-    seed("failed", labels={"omnigent.last_task_error_code": "response_failed"})
-    seed("failed")
+    expected.add((0, seed("failed", labels={"omnigent.last_task_error_code": "response_failed"})))
+    expected.add((0, seed("failed")))
     seed("running", host=False)
     seed("running", parent=root)
-    seed("running", archived=True)
+    expected.add((0, seed("running", archived=True)))
     with workspace_scope(424242):
         expected.add((424242, seed("failed", labels=disconnected)))
 
     actual: set[tuple[int, str]] = set()
     after = None
     while True:
-        page, after = conversation_store.list_interrupted_host_sessions(
+        page, after = conversation_store.list_interrupted_host_session_candidates(
             stale_before=stale_before, after=after, limit=limit
         )
-        actual.update((workspace_id, conv.id) for workspace_id, conv in page)
+        actual.update((workspace_id, session_id) for workspace_id, session_id, _host_id in page)
         if after is None:
             break
     assert actual == expected
 
     # A fresh runner stamp means the turn may still be live on another replica.
     conversation_store.touch_runner_liveness(["runner-gone"], stale_before)
-    page, _ = conversation_store.list_interrupted_host_sessions(
+    page, _ = conversation_store.list_interrupted_host_session_candidates(
         stale_before=stale_before, after=None, limit=50
     )
-    assert {(ws, conv.id) for ws, conv in page} == {
+    assert {(ws, session_id) for ws, session_id, _host_id in page} == {
         item for item in expected if _live_status(conversation_store, item) == "failed"
     }
     with pytest.raises(ValueError, match="limit must be positive"):
-        conversation_store.list_interrupted_host_sessions(stale_before=0, after=None, limit=0)
+        conversation_store.list_interrupted_host_session_candidates(
+            stale_before=0, after=None, limit=0
+        )
 
 
 def _live_status(

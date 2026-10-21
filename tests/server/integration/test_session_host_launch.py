@@ -23,6 +23,7 @@ import logging
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -3684,6 +3685,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
 ) -> None:
     """Retry relaunches one dead runner and confirms its recovered lifecycle."""
     from omnigent.runtime import set_runner_client
+    from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
 
@@ -3692,6 +3694,19 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     session = await _inline_launch_session(client, comm)
     session_id = session["id"]
     original_runner_id = session["runner_id"]
+    monkeypatch.setattr(
+        app.state,
+        "sandbox_config",
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://srv.example.test",
+                "auto_resume_interrupted": {"enabled": True},
+            }
+        ),
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(session_id, {"omnigent.recovery.manual_retry": "previous-retry"})
     before = await client.get(f"/v1/sessions/{session_id}/items")
     runner_client = object()
     wait_for_runner_client = AsyncMock(return_value=runner_client)
@@ -3723,6 +3738,9 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.runner_id != original_runner_id
+    retry_nonce = conv.labels["omnigent.recovery.manual_retry"]
+    assert retry_nonce != "previous-retry"
+    assert uuid.UUID(hex=retry_nonce).hex == retry_nonce
 
 
 async def test_retry_session_single_flight_launches_and_rotates_once(

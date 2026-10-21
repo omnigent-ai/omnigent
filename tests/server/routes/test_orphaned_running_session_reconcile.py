@@ -21,10 +21,14 @@ proving the grace-window guard.
 from __future__ import annotations
 
 import time
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.server.routes._sessions.helpers import (
@@ -37,7 +41,9 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 
 
-def _seed_running_session(db_uri: str, *, runner_fresh: bool) -> str:
+def _seed_running_session(
+    db_uri: str, *, runner_fresh: bool, store: SqlAlchemyConversationStore | None = None
+) -> str:
     """Seed a session persisted as ``running`` with a bound runner.
 
     :param db_uri: SQLite database URI shared with the test app.
@@ -45,10 +51,11 @@ def _seed_running_session(db_uri: str, *, runner_fresh: bool) -> str:
         the runner reads reachable (alive on another replica within the
         grace window); when ``False``, leave it unset so the runner reads
         confirmed-gone.
+    :param store: Optional store using separate metadata and conversation databases.
     :returns: The seeded session/conversation id.
     """
     agent_store = SqlAlchemyAgentStore(db_uri)
-    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store = store or SqlAlchemyConversationStore(db_uri)
     agent_id = generate_agent_id()
     agent_store.create(
         agent_id,
@@ -68,6 +75,15 @@ def _seed_running_session(db_uri: str, *, runner_fresh: bool) -> str:
     return conv.id
 
 
+@pytest.fixture(params=[False, True], ids=["single-db", "split-db"])
+def reconcile_store(
+    db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> SqlAlchemyConversationStore:
+    return SqlAlchemyConversationStore(
+        db_uri, f"sqlite:///{tmp_path}/conversations.db" if request.param else None
+    )
+
+
 @pytest_asyncio.fixture(autouse=True)
 def _isolate_status_cache() -> None:
     """Keep the module-level relay status cache from leaking across tests."""
@@ -82,13 +98,14 @@ def _isolate_status_cache() -> None:
 
 def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     db_uri: str,
+    reconcile_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only a stale running row settles, and a scheduled fire fails."""
     from omnigent.server import session_live_state
 
-    sid = _seed_running_session(db_uri, runner_fresh=False)
-    store = SqlAlchemyConversationStore(db_uri)
+    store = reconcile_store
+    sid = _seed_running_session(db_uri, runner_fresh=False, store=store)
     completions: list[tuple[str, str, str | None]] = []
 
     def _record_completion(
@@ -109,11 +126,33 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     assert completions == [(sid, "failed", "incomplete")]
     assert not reconcile_orphaned_running_status(sid, store, int(time.time()) - 90)
 
-    fresh_sid = _seed_running_session(db_uri, runner_fresh=True)
+    fresh_sid = _seed_running_session(db_uri, runner_fresh=True, store=store)
     assert not reconcile_orphaned_running_status(fresh_sid, store, int(time.time()) - 90)
     fresh = store.get_conversation(fresh_sid)
     assert fresh is not None
     assert fresh.live_status == "running"
+    assert not reconcile_orphaned_running_status(
+        fresh_sid, store, int(time.time()) - 90, preserve_interruption=True
+    )
+    store.clear_runner_liveness(f"runner_{fresh_sid}")
+    for terminal_status in ("idle", "failed"):
+        store.set_session_live_status(fresh_sid, terminal_status)
+        assert not reconcile_orphaned_running_status(
+            fresh_sid, store, int(time.time()) - 90, preserve_interruption=True
+        )
+        current = store.get_conversation(fresh_sid)
+        assert current is not None and current.live_status == terminal_status
+    store.set_session_live_status(fresh_sid, "running")
+    assert not reconcile_orphaned_running_status(
+        fresh_sid,
+        store,
+        int(time.time()) - 90,
+        preserve_interruption=True,
+        owner_runner_id="replaced-runner",
+    )
+    current = store.get_conversation(fresh_sid)
+    assert current is not None and current.live_status == "running"
+    assert not current.labels.get("omnigent.last_task_error_code")
 
 
 # ── Facet 1: GET /v1/sessions settles orphaned "running" rows ────────────
@@ -191,6 +230,7 @@ async def test_stop_leaves_running_session_with_fresh_runner(
 
 def test_reconcile_preserving_interruption_records_runner_disconnect(
     db_uri: str,
+    reconcile_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """With auto-resume on, an orphan settles as a disconnect, not idle."""
@@ -199,18 +239,35 @@ def test_reconcile_preserving_interruption_records_runner_disconnect(
     monkeypatch.setattr(
         session_live_state, "persist_scheduled_run_completion", lambda *a, **k: None
     )
-    sid = _seed_running_session(db_uri, runner_fresh=False)
-    store = SqlAlchemyConversationStore(db_uri)
+    store = reconcile_store
+    sid = _seed_running_session(db_uri, runner_fresh=False, store=store)
+    before = store.get_conversation(sid)
+    observed_commit = False
 
-    assert reconcile_orphaned_running_status(
-        sid,
-        store,
-        int(time.time()) - 90,
-        preserve_interruption=True,
-        owner_runner_id=f"runner_{sid}",
-    )
+    def observe_metadata_commit(session: Session) -> None:
+        nonlocal observed_commit
+        if session.bind is not store._engine or observed_commit:
+            return
+        observed_commit = True
+        current = store.get_conversation(sid)
+        assert current is not None and current.live_status == "failed"
+        assert current.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+
+    event.listen(Session, "after_commit", observe_metadata_commit)
+    try:
+        assert reconcile_orphaned_running_status(
+            sid,
+            store,
+            int(time.time()) - 90,
+            preserve_interruption=True,
+            owner_runner_id=f"runner_{sid}",
+        )
+    finally:
+        event.remove(Session, "after_commit", observe_metadata_commit)
+    assert observed_commit
     conv = store.get_conversation(sid)
     assert conv is not None
+    assert before is not None and conv.updated_at == before.updated_at
     assert conv.live_status == "failed"
     assert conv.labels["omnigent.last_task_error_code"] == "runner_disconnected"
     assert conv.labels["omnigent.last_task_error_message"] == "Runner disconnected unexpectedly."
@@ -221,45 +278,72 @@ def test_reconcile_preserving_interruption_records_runner_disconnect(
     )
 
 
+@pytest.mark.parametrize("reconnect_edge", ["liveness", "running", "idle", "cached_running"])
 def test_reconcile_yields_to_a_runner_that_reconnects_mid_settlement(
     db_uri: str,
+    reconcile_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
+    reconnect_edge: str,
 ) -> None:
-    """A reconnect landing between status and labels leaves the session idle."""
+    """A reconnect after commit owns the next edge, even before its DB write."""
     from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions import helpers
 
     monkeypatch.setattr(
         session_live_state, "persist_scheduled_run_completion", lambda *a, **k: None
     )
-    sid = _seed_running_session(db_uri, runner_fresh=False)
-    store = SqlAlchemyConversationStore(db_uri)
+    store = reconcile_store
+    sid = _seed_running_session(db_uri, runner_fresh=False, store=store)
     stale_before = int(time.time()) - 90
-    set_labels = store.set_labels
-    reconnected = False
+    settle = store.settle_orphaned_live_status
+    published: list[Any] = []
+    persisted: list[Any] = []
+    monkeypatch.setattr(helpers, "_publish_status", lambda *a, **k: published.append(a))
+    monkeypatch.setattr(session_live_state, "persist_live_status", lambda *a: persisted.append(a))
 
-    def reconnect_then_set_labels(conversation_id: str, labels: dict[str, str]) -> None:
-        nonlocal reconnected
-        if not reconnected:
-            reconnected = True
+    def settle_then_reconnect(*args: Any, **kwargs: Any) -> bool:
+        assert settle(*args, **kwargs)
+        current = store.get_conversation(sid)
+        assert current is not None
+        assert current.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+        if reconnect_edge != "cached_running":
             store.touch_runner_liveness([f"runner_{sid}"], int(time.time()))
-        set_labels(conversation_id, labels)
+        if reconnect_edge != "liveness":
+            status = "idle" if reconnect_edge == "idle" else "running"
+            _session_status_cache[sid] = status
+            store.set_labels(sid, helpers._session_status_error_label_updates(None))
+            if reconnect_edge != "cached_running":
+                store.set_session_live_status(sid, status)
+        return True
 
-    monkeypatch.setattr(store, "set_labels", reconnect_then_set_labels)
+    monkeypatch.setattr(store, "settle_orphaned_live_status", settle_then_reconnect)
 
     assert reconcile_orphaned_running_status(sid, store, stale_before, preserve_interruption=True)
-    assert reconnected
-    assert _session_status_cache[sid] == "idle"
+    assert published == persisted == []
+    expected_cache = (
+        None
+        if reconnect_edge == "liveness"
+        else ("idle" if reconnect_edge == "idle" else "running")
+    )
+    assert _session_status_cache.get(sid) == expected_cache
     conv = store.get_conversation(sid)
     assert conv is not None
-    assert not conv.labels.get("omnigent.last_task_error_code")
+    assert conv.live_status == (
+        reconnect_edge if reconnect_edge in {"idle", "running"} else "failed"
+    )
+    assert bool(conv.labels.get("omnigent.last_task_error_code")) == (reconnect_edge == "liveness")
 
 
-def test_reconcile_settles_idle_when_the_disconnect_cause_cannot_be_saved(
+@pytest.mark.parametrize("failure_at", ["labels", "metadata_commit"])
+def test_reconcile_leaves_interruption_retryable_when_persistence_fails(
     db_uri: str,
+    reconcile_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
+    failure_at: str,
 ) -> None:
-    """A failure without its cause would never be resumed, so it stays idle."""
+    """A failed label or metadata write must not erase the interrupted turn."""
     from omnigent.server import session_live_state
+    from omnigent.stores.conversation_store import sqlalchemy_store
 
     monkeypatch.setattr(
         session_live_state, "persist_scheduled_run_completion", lambda *a, **k: None
@@ -270,16 +354,38 @@ def test_reconcile_settles_idle_when_the_disconnect_cause_cannot_be_saved(
         "persist_live_status",
         lambda sid, status: persisted.append((sid, status)),
     )
-    sid = _seed_running_session(db_uri, runner_fresh=False)
-    store = SqlAlchemyConversationStore(db_uri)
+    store = reconcile_store
+    sid = _seed_running_session(db_uri, runner_fresh=False, store=store)
+    upsert_labels = sqlalchemy_store._upsert_labels
 
-    def broken_set_labels(conversation_id: str, labels: dict[str, str]) -> None:
-        raise RuntimeError("label store unavailable")
+    def broken_upsert_labels(*args: Any, **kwargs: Any) -> None:
+        upsert_labels(*args, **kwargs)
+        raise RuntimeError("label write failed")
 
-    monkeypatch.setattr(store, "set_labels", broken_set_labels)
+    def broken_metadata_commit(session: Session) -> None:
+        if session.bind is store._engine:
+            raise RuntimeError("metadata commit failed")
 
+    if failure_at == "labels":
+        monkeypatch.setattr(sqlalchemy_store, "_upsert_labels", broken_upsert_labels)
+    else:
+        event.listen(Session, "before_commit", broken_metadata_commit)
+    try:
+        assert not reconcile_orphaned_running_status(
+            sid, store, int(time.time()) - 90, preserve_interruption=True
+        )
+    finally:
+        monkeypatch.setattr(sqlalchemy_store, "_upsert_labels", upsert_labels)
+        if failure_at == "metadata_commit":
+            event.remove(Session, "before_commit", broken_metadata_commit)
+    assert sid not in _session_status_cache
+    assert persisted == []
+    conv = store.get_conversation(sid)
+    assert conv is not None and conv.live_status == "running"
+    assert bool(conv.labels.get("omnigent.last_task_error_code")) == (
+        failure_at == "metadata_commit" and store._engine is not store._conv_engine
+    )
     assert reconcile_orphaned_running_status(
         sid, store, int(time.time()) - 90, preserve_interruption=True
     )
-    assert _session_status_cache[sid] == "idle"
-    assert persisted == [(sid, "idle")]
+    assert _session_status_cache[sid] == "failed"

@@ -246,17 +246,26 @@ def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) ->
 
 
 @pytest.mark.asyncio
-async def test_recovery_has_own_readiness_and_stable_identity_across_failed_posts() -> None:
+@pytest.mark.parametrize("recovery_id", [None, "claim-1"])
+async def test_recovery_has_own_readiness_and_stable_identity_across_failed_posts(
+    recovery_id: str | None,
+) -> None:
     registry, client = _Registry(), _Client()
     client.release.set()
     initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
     conv = _conversation()
     await initializer.initialize(conv, client, timeout=10)  # type: ignore[arg-type]
     client.status_code = 500
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_id=recovery_id
+    )
     first_id = client.calls[-1]["session_init"]["recovery_id"]
+    if recovery_id is not None:
+        assert first_id == recovery_id
     client.status_code = 201
-    await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_id=recovery_id
+    )
     assert len(client.calls) == 3
     assert first_id and client.calls[-1]["session_init"]["recovery_id"] == first_id
     await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
@@ -267,6 +276,102 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
     await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
     assert client.calls[-1]["session_init"]["recovery_id"] != first_id
     assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_id", [None, "claim-1"])
+async def test_cancelled_recovery_owner_drains_post_but_shared_waiter_does_not(
+    recovery_id: str | None,
+) -> None:
+    cancelling, finish_cleanup, drained = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class CleanupClient(_Client):
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            try:
+                return await super().post(path, **kwargs)
+            except asyncio.CancelledError:
+                cancelling.set()
+                await finish_cleanup.wait()
+                drained.set()
+                raise
+
+    client = CleanupClient()
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    owner = asyncio.create_task(
+        initializer.initialize(  # type: ignore[arg-type]
+            conv, client, timeout=10, resume_interrupted_turn=True, recovery_id=recovery_id
+        )
+    )
+    await client.entered.wait()
+    waiter = asyncio.create_task(
+        initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    try:
+        owner.cancel()
+        if recovery_id is not None:
+            await asyncio.wait_for(cancelling.wait(), 1)
+            assert not owner.done()
+            assert not waiter.done()
+            finish_cleanup.set()
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            assert drained.is_set()
+            with pytest.raises(ConnectionError, match="cancelled"):
+                await waiter
+            assert not initializer.is_initialized(conv, client)  # type: ignore[arg-type]
+            client.release.set()
+            await initializer.initialize(  # type: ignore[arg-type]
+                conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="claim-2"
+            )
+            assert [call["session_init"]["recovery_id"] for call in client.calls] == [
+                "claim-1",
+                "claim-2",
+            ]
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await owner
+            assert not cancelling.is_set()
+            assert not waiter.done()
+            client.release.set()
+            assert (await waiter).status_code == 201
+            assert len(client.calls) == 1
+    finally:
+        finish_cleanup.set()
+        client.release.set()
+        await asyncio.gather(owner, waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_recovery_id_override_rejects_inflight_and_replaces_completed_attempt() -> None:
+    client = _Client()
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    first = asyncio.create_task(
+        initializer.initialize(  # type: ignore[arg-type]
+            conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="claim-1"
+        )
+    )
+    await client.entered.wait()
+    try:
+        with pytest.raises(ConnectionError, match="another recovery attempt"):
+            await initializer.initialize(  # type: ignore[arg-type]
+                conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="claim-2"
+            )
+    finally:
+        client.release.set()
+        response = await first
+    assert (
+        await initializer.initialize(  # type: ignore[arg-type]
+            conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="claim-1"
+        )
+        is response
+    )
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="claim-2"
+    )
+    assert [call["session_init"]["recovery_id"] for call in client.calls] == ["claim-1", "claim-2"]
 
 
 @pytest.mark.asyncio
@@ -602,6 +707,50 @@ async def test_callers_arriving_during_the_agent_check_share_one_init() -> None:
     )
     assert [response.status_code for response in responses] == [201, 201]
     assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_id_is_rechecked_after_agent_lookup() -> None:
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    class DelayedAgents(_Agents):
+        def get(self, agent_id: str) -> object | None:
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(5)
+            return super().get(agent_id)
+
+    client = _Client()
+    conv = _conversation()
+    initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
+        _Registry(), server_version="test", agent_store=DelayedAgents(conv.agent_id)
+    )
+    delayed = asyncio.create_task(
+        initializer.initialize(  # type: ignore[arg-type]
+            conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="delayed-claim"
+        )
+    )
+    current = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        current = asyncio.create_task(
+            initializer.initialize(  # type: ignore[arg-type]
+                conv, client, timeout=10, resume_interrupted_turn=True, recovery_id="current-claim"
+            )
+        )
+        await client.entered.wait()
+        release.set()
+        with pytest.raises(ConnectionError, match="another recovery attempt"):
+            await delayed
+        assert not current.done()
+    finally:
+        release.set()
+        client.release.set()
+        await asyncio.gather(delayed, *([current] if current else []), return_exceptions=True)
+    assert len(client.calls) == 1
+    assert client.calls[0]["session_init"]["recovery_id"] == "current-claim"
 
 
 @pytest.mark.asyncio

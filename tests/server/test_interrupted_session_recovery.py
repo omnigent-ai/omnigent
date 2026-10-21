@@ -3,22 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, nullcontext
+from contextvars import ContextVar
 from types import SimpleNamespace
-from typing import Any
+from unittest.mock import AsyncMock, Mock
+from uuid import uuid4
 
 import httpx
 import pytest
 
-from omnigent.db.db_models import current_workspace_id
-from omnigent.entities import Conversation
+from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.db.utils import generate_agent_id, now_epoch
+from omnigent.entities import Conversation, MessageData, NewConversationItem
+from omnigent.onboarding.sandboxes.types import RestoredState, ResumeOutcome
 from omnigent.server.interrupted_session_recovery import (
     InterruptedSessionRecoverer,
     auto_resume_requested,
     init_started_turn,
     managed_host_ids,
+    managed_recovery_context,
     preserves_interruption,
 )
 from omnigent.server.managed_hosts import (
+    ManagedLaunchTracker,
     ManagedSandboxAutoResumeConfig,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -27,8 +34,8 @@ from omnigent.server.routes._sessions.common import (
     _intentional_stop_sessions,
     _session_status_cache,
 )
-from omnigent.stores.conversation_store import InterruptedSessionCursor
-from omnigent.stores.host_store import Host
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import Host, HostStore
 
 _DISCONNECTED = {
     "omnigent.last_task_error_code": "runner_disconnected",
@@ -42,7 +49,10 @@ def _deployment(
     return ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://omnigent.example.com",
-            launcher_factory=lambda: None,  # type: ignore[arg-type,return-value]
+            provider="remote",
+            launcher_factory=lambda: SimpleNamespace(
+                provider="remote", background_recovery_context=lambda target: nullcontext()
+            ),  # type: ignore[return-value]
             token_ttl_s=60,
         ),
         auto_resume_interrupted=ManagedSandboxAutoResumeConfig(
@@ -93,31 +103,15 @@ class _FakeHostStore:
     def __init__(self, hosts: list[Host]) -> None:
         self.hosts = {host.host_id: host for host in hosts}
 
+    def get_session_recovery(self, session_id: str):
+        return None
+
     def get_host(self, host_id: str) -> Host | None:
         return self.hosts.get(host_id)
 
 
-class _FakeConversationStore:
-    def __init__(self, rows: list[tuple[int, Conversation]]) -> None:
-        self.rows = rows
-        self.queries: list[tuple[int, InterruptedSessionCursor | None, int]] = []
-
-    def list_interrupted_host_sessions(
-        self,
-        *,
-        stale_before: int,
-        after: InterruptedSessionCursor | None,
-        limit: int,
-    ) -> tuple[list[tuple[int, Conversation]], InterruptedSessionCursor | None]:
-        self.queries.append((stale_before, after, limit))
-        start = 0 if after is None else after[0]
-        page = self.rows[start : start + limit]
-        more = start + limit < len(self.rows)
-        return page, ((start + limit, 0, "") if more else None)
-
-
 @pytest.fixture(autouse=True)
-def _isolate_caches() -> Any:
+def _isolate_caches():
     _session_status_cache.clear()
     _intentional_stop_sessions.clear()
     yield
@@ -126,226 +120,447 @@ def _isolate_caches() -> Any:
 
 
 @pytest.fixture
-def woken(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
-    calls: list[tuple[int, str]] = []
-
-    async def fake_ensure_runner_connected(
-        *, session_id: str, conv: Conversation, **_: Any
-    ) -> tuple[object, Conversation]:
-        calls.append((current_workspace_id(), session_id))
-        return object(), conv
-
-    monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected",
-        fake_ensure_runner_connected,
+def recovery_case(db_uri: str, monkeypatch: pytest.MonkeyPatch):
+    store = SqlAlchemyConversationStore(db_uri)
+    hosts = HostStore(db_uri)
+    now = now_epoch()
+    initializer = SimpleNamespace(
+        initialize=AsyncMock(
+            return_value=httpx.Response(
+                201, json={"status": "running"}, request=httpx.Request("POST", "/v1/sessions")
+            )
+        )
     )
-    return calls
-
-
-def _recoverer(
-    rows: list[tuple[int, Conversation]],
-    hosts: list[Host],
-    *,
-    max_attempts: int = 3,
-    max_age_s: int = 10**10,
-    scan_batch_size: int = 500,
-) -> tuple[InterruptedSessionRecoverer, _FakeConversationStore]:
-    store = _FakeConversationStore(rows)
-    recoverer = InterruptedSessionRecoverer(
-        conversation_store=store,  # type: ignore[arg-type]
-        host_store=_FakeHostStore(hosts),  # type: ignore[arg-type]
-        sandbox_config=_deployment(max_attempts=max_attempts, max_age_s=max_age_s),
-        app_state=object(),
-        runner_router=None,
-        scan_batch_size=scan_batch_size,
+    state = SimpleNamespace(
+        runner_session_initializer=initializer, managed_launches=ManagedLaunchTracker()
     )
-    return recoverer, store
+    config = _deployment(max_attempts=2)
+    wakes = []
 
+    def seed(*, workspace_id=0, host_id=None, status="failed", labels=None):
+        with workspace_scope(workspace_id):
+            host_id = host_id or uuid4().hex
+            if hosts.get_host(host_id) is None:
+                hosts.register_managed_host(
+                    host_id=host_id,
+                    name=host_id,
+                    user_id="owner@example.test",
+                    token="test",
+                    provider="remote",
+                    sandbox_id=f"sandbox-{host_id}",
+                    token_expires_at=now + 3600,
+                )
+            conv = store.create_conversation(
+                agent_id=generate_agent_id(),
+                runner_id=uuid4().hex,
+                host_id=host_id,
+                workspace="/workspace",
+            )
+            store.set_session_live_status(conv.id, status)
+            store.set_labels(conv.id, _DISCONNECTED if labels is None else labels)
+            return store.get_conversation(conv.id)
 
-async def test_sweep_pages_and_wakes_managed_sessions_in_their_workspace(
-    woken: list[tuple[int, str]],
-) -> None:
-    rows = [
-        (0, _conv("c1")),
-        (7, _conv("c2", host_id="host-2")),
-        (0, _conv("c3", host_id="host-local")),
-        (0, _conv("c4", live_status="running", labels={})),
-    ]
-    recoverer, store = _recoverer(
-        rows,
-        [_host(), _host("host-2"), _host("host-local", provider=None)],
-        scan_batch_size=2,
-    )
+    async def wake(*, conv, **kwargs):
+        wakes.append((current_workspace_id(), conv.id))
+        return Mock(spec=httpx.AsyncClient), conv
 
-    assert await recoverer.sweep_once(now=10_000) == 3
-    assert sorted(woken) == [(0, "c1"), (0, "c4"), (7, "c2")]
-    assert [query[1] for query in store.queries] == [None, (2, 0, "")]
-    assert all(query[0] == 10_000 - 90 for query in store.queries)
-
-
-async def test_sweep_skips_sessions_stopped_on_purpose_or_no_longer_interrupted(
-    woken: list[tuple[int, str]],
-) -> None:
-    _intentional_stop_sessions["stopped"] = "runner-old"
-    _session_status_cache["recovered"] = "idle"
-    rows = [(0, _conv("stopped")), (0, _conv("recovered")), (0, _conv("live"))]
-    recoverer, _ = _recoverer(rows, [_host()])
-
-    assert await recoverer.sweep_once(now=10_000) == 1
-    assert woken == [(0, "live")]
-
-
-async def test_attempts_back_off_and_stop_at_the_cap(woken: list[tuple[int, str]]) -> None:
-    recoverer, _ = _recoverer([(0, _conv("c1"))], [_host()], max_attempts=2)
-
-    assert await recoverer.sweep_once(now=1_000) == 1
-    # Backoff: the second attempt waits one sweep interval, the third two.
-    assert await recoverer.sweep_once(now=1_059) == 0
-    assert await recoverer.sweep_once(now=1_060) == 1
-    assert await recoverer.sweep_once(now=10_000) == 0
-    assert woken == [(0, "c1"), (0, "c1")]
-
-
-async def test_attempts_reset_once_the_session_leaves_the_interrupted_set(
-    woken: list[tuple[int, str]],
-) -> None:
-    recoverer, store = _recoverer([(0, _conv("c1"))], [_host()], max_attempts=1)
-    assert await recoverer.sweep_once(now=1_000) == 1
-    assert await recoverer.sweep_once(now=5_000) == 0
-
-    rows = store.rows
-    store.rows = []
-    assert await recoverer.sweep_once(now=5_000) == 0
-    store.rows = rows
-    assert await recoverer.sweep_once(now=5_000) == 1
-    assert woken == [(0, "c1"), (0, "c1")]
-
-
-async def test_sweep_leaves_sessions_past_the_age_limit_alone(
-    woken: list[tuple[int, str]],
-) -> None:
-    rows = [(0, _conv("old", updated_at=0)), (0, _conv("new", updated_at=100_000 - 3600))]
-    recoverer, _ = _recoverer(rows, [_host()], max_age_s=3600)
-
-    assert await recoverer.sweep_once(now=100_000) == 1
-    assert woken == [(0, "new")]
-    assert set(recoverer._attempts) == {(0, "new")}
-
-
-async def test_sweep_ignores_failures_other_than_a_runner_disconnect(
-    woken: list[tuple[int, str]],
-) -> None:
-    never_started = _conv(
-        "never-started", labels={"omnigent.last_task_error_code": "runner_failed_to_start"}
-    )
-    recoverer, _ = _recoverer([(0, never_started)], [_host()])
-
-    assert await recoverer.sweep_once(now=1_000) == 0
-    assert woken == []
-
-
-async def test_wake_failure_counts_as_an_attempt_and_does_not_stop_the_sweep(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[str] = []
-
-    async def flaky(*, session_id: str, conv: Conversation, **_: Any) -> tuple[None, Conversation]:
-        calls.append(session_id)
-        if session_id == "broken":
-            raise RuntimeError("provider down")
-        return None, conv
-
-    monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", flaky
-    )
-    rows = [(0, _conv("broken")), (0, _conv("other", host_id="host-2"))]
-    recoverer, _ = _recoverer(rows, [_host(), _host("host-2")], max_attempts=1)
-
-    assert await recoverer.sweep_once(now=1_000) == 2
-    assert await recoverer.sweep_once(now=99_999) == 0
-    assert sorted(calls) == ["broken", "other"]
-
-
-@pytest.mark.parametrize(("status", "cleared"), [("running", []), ("idle", ["c1"])])
-async def test_sweep_resends_the_continuation_to_an_already_connected_runner(
-    woken: list[tuple[int, str]],
-    monkeypatch: pytest.MonkeyPatch,
-    status: str,
-    cleared: list[str],
-) -> None:
-    """A declined continuation clears the disconnect; a started one leaves it to the turn."""
-    calls: list[dict[str, Any]] = []
-    recovered: list[str] = []
-
-    class _Initializer:
-        async def initialize(self, conv: Conversation, client: object, **kwargs: Any) -> Any:
-            calls.append({"session_id": conv.id, **kwargs})
-            return httpx.Response(201, json={"status": status}, request=httpx.Request("POST", "/"))
-
-    async def record_recovered(session_id: str, store: object, **kwargs: Any) -> None:
-        assert kwargs == {"require_disconnect_code": True}
-        recovered.append(session_id)
-
-    monkeypatch.setattr(
-        "omnigent.server.routes.sessions._publish_runner_recovered_status", record_recovered
-    )
-    recoverer, _ = _recoverer([(0, _conv("c1"))], [_host()])
-    recoverer._app_state = SimpleNamespace(runner_session_initializer=_Initializer())
-
-    assert await recoverer.sweep_once(now=1_000) == 1
-    assert calls == [
-        {
-            "session_id": "c1",
-            "timeout": 10.0,
-            "resume_interrupted_turn": True,
-            "recovery_prompt": _deployment().auto_resume_interrupted.recovery_prompt,
+    def recoverer(**overrides):
+        args = {
+            "conversation_store": store,
+            "host_store": hosts,
+            "sandbox_config": config,
+            "app_state": state,
+            "runner_router": None,
+            "clock": lambda: now,
+            "scan_batch_size": 2,
         }
-    ]
-    assert recovered == cleared
+        args.update(overrides)
+        return InterruptedSessionRecoverer(**args)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", wake
+    )
+    return SimpleNamespace(
+        store=store,
+        hosts=hosts,
+        now=now,
+        initializer=initializer,
+        state=state,
+        config=config,
+        wakes=wakes,
+        seed=seed,
+        recoverer=recoverer,
+    )
 
 
-async def test_one_failing_host_lookup_does_not_stop_the_sweep(
-    woken: list[tuple[int, str]],
-) -> None:
-    class _FlakyHostStore(_FakeHostStore):
-        def get_host(self, host_id: str) -> Host | None:
-            if host_id == "host-broken":
-                raise RuntimeError("database unavailable")
-            return super().get_host(host_id)
+async def test_scan_enters_authority_before_reading_session_content(recovery_case, monkeypatch):
+    case = recovery_case
+    rows = [case.seed(workspace_id=workspace) for workspace in (101, 202)]
+    entered = ContextVar("test_recovery_identity", default=None)
 
-    rows = [(0, _conv("broken", host_id="host-broken")), (0, _conv("ok"))]
-    recoverer, _ = _recoverer(rows, [_host()])
-    recoverer._host_store = _FlakyHostStore([_host()])  # type: ignore[assignment]
+    @asynccontextmanager
+    async def authority(target):
+        token = entered.set((target.workspace_id, target.session_id))
+        try:
+            yield
+        finally:
+            entered.reset(token)
 
-    assert await recoverer.sweep_once(now=1_000) == 1
-    assert woken == [(0, "ok")]
+    case.config.default.launcher_factory = lambda: SimpleNamespace(
+        provider="remote", background_recovery_context=authority
+    )
+    original = case.store.get_conversation
 
+    def authorized_read(session_id):
+        assert entered.get() == (current_workspace_id(), session_id)
+        return original(session_id)
 
-async def test_start_and_shutdown_run_the_loop(woken: list[tuple[int, str]]) -> None:
-    recoverer, _ = _recoverer([(0, _conv("c1"))], [_host()])
-    await recoverer.start()
-    await recoverer.start()
-    for _ in range(50):
-        if woken:
-            break
-        await asyncio.sleep(0.01)
-    await recoverer.shutdown()
-    await recoverer.shutdown()
-    assert woken == [(0, "c1")]
+    monkeypatch.setattr(case.store, "get_conversation", authorized_read)
+    assert await case.recoverer().sweep_once(now=case.now) == 2
+    assert set(case.wakes) == {(101, rows[0].id), (202, rows[1].id)}
+    assert entered.get() is None
 
 
-def test_constructor_rejects_non_positive_limits() -> None:
-    kwargs: dict[str, Any] = {
-        "conversation_store": _FakeConversationStore([]),
-        "host_store": _FakeHostStore([]),
-        "sandbox_config": _deployment(),
-        "app_state": object(),
-        "runner_router": None,
-    }
-    with pytest.raises(ValueError, match="scan_batch_size"):
-        InterruptedSessionRecoverer(**kwargs, scan_batch_size=0)
-    with pytest.raises(ValueError, match="max_concurrent_hosts"):
-        InterruptedSessionRecoverer(**kwargs, max_concurrent_hosts=0)
+async def test_failed_replacement_keeps_budget_across_replicas_and_restart(
+    recovery_case, monkeypatch
+):
+    case = recovery_case
+    conv = case.seed()
+
+    async def fail(*, conv, **kwargs):
+        case.wakes.append(conv.id)
+        case.store.set_labels(conv.id, {"omnigent.last_task_error_code": "runner_failed_to_start"})
+        raise ConnectionError("replacement exited before connecting")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", fail
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    assert await case.recoverer().sweep_once(now=case.now + 59) == 0
+    assert await case.recoverer().sweep_once(now=case.now + 60) == 1
+    assert await case.recoverer().sweep_once(now=case.now + 600) == 0
+    fresh = case.store.get_conversation(conv.id)
+    assert await case.recoverer().resume_connected(fresh, Mock(spec=httpx.AsyncClient)) is None
+    assert case.wakes == [conv.id, conv.id]
+    record = case.hosts.get_session_recovery(conv.id)
+    assert record.attempts == 2 and record.terminal_reason == "exhausted"
+    assert "stopped after 2" in fresh.labels["omnigent.last_task_error_message"]
+
+
+async def test_sessions_on_one_host_keep_separate_budgets(recovery_case, monkeypatch):
+    case = recovery_case
+    first = case.seed()
+    second = case.seed(host_id=first.host_id)
+
+    async def fail(**kwargs):
+        raise ConnectionError("host down")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", fail
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 2
+    assert await case.recoverer().sweep_once(now=case.now + 60) == 2
+    assert await case.recoverer().sweep_once(now=case.now + 600) == 0
+    assert [case.hosts.get_session_recovery(row.id).attempts for row in (first, second)] == [2, 2]
+
+
+@pytest.mark.parametrize("change", ["idle", "archive", "rebind", "stop", "delete", "generation"])
+async def test_wake_rereads_eligibility_and_binding_before_continuing(
+    recovery_case, monkeypatch, change
+):
+    case = recovery_case
+    case.seed()
+
+    async def race(*, conv, **kwargs):
+        if change == "idle":
+            case.store.set_session_live_status(conv.id, "idle")
+        elif change == "archive":
+            case.store.update_conversation(conv.id, archived=True)
+        elif change == "rebind":
+            case.store.replace_runner_id(conv.id, uuid4().hex)
+        elif change == "delete":
+            case.hosts.delete_host(conv.host_id)
+        elif change == "generation":
+            case.hosts.replace_managed_host_sandbox(
+                host_id=conv.host_id,
+                user_id="owner@example.test",
+                token="replacement",
+                provider="remote",
+                sandbox_id="replacement-sandbox",
+                token_expires_at=case.now + 3600,
+            )
+        else:
+            _intentional_stop_sessions[conv.id] = conv.runner_id
+        return Mock(spec=httpx.AsyncClient), conv
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", race
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    case.initializer.initialize.assert_not_awaited()
+
+
+async def test_reconnect_during_wake_joins_existing_attempt(recovery_case, monkeypatch):
+    case = recovery_case
+    conv = case.seed()
+    worker = case.recoverer()
+    claims = []
+
+    async def wake(*, conv, **kwargs):
+        assert await case.recoverer().resume_connected(conv, Mock(spec=httpx.AsyncClient)) is None
+        claims.append(case.hosts.get_session_recovery(conv.id).claim_id)
+        context = managed_recovery_context.get()
+        await context.record_outcome(
+            ResumeOutcome(workspace=RestoredState("partial", "repository"))
+        )
+        return Mock(spec=httpx.AsyncClient), conv
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", wake
+    )
+    assert await worker.sweep_once(now=case.now) == 1
+    case.initializer.initialize.assert_awaited_once()
+    kwargs = case.initializer.initialize.await_args.kwargs
+    record = case.hosts.get_session_recovery(conv.id)
+    assert kwargs["recovery_id"] == claims[0]
+    assert record.claim_id is None
+    assert '"status": "partial"' in kwargs["recovery_prompt"]
+    assert '"scope": "repository"' in record.outcome_json
+
+
+async def test_unknown_provider_does_not_read_content_or_wake(recovery_case, monkeypatch):
+    case = recovery_case
+    case.seed()
+    case.config.default.launcher_factory = lambda: SimpleNamespace(
+        provider="remote", background_recovery_context=lambda target: None
+    )
+    monkeypatch.setattr(
+        case.store, "get_conversation", Mock(side_effect=AssertionError("not authorized"))
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 0
+    assert case.wakes == []
+
+
+async def test_duplicate_scan_row_cannot_exceed_attempt_limit(recovery_case, monkeypatch):
+    case = recovery_case
+    conv = case.seed()
+    case.config.auto_resume_interrupted = ManagedSandboxAutoResumeConfig(
+        enabled=True, max_attempts=1
+    )
+    monkeypatch.setattr(
+        case.store,
+        "list_interrupted_host_session_candidates",
+        Mock(return_value=([(0, conv.id, conv.host_id), (0, conv.id, conv.host_id)], None)),
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    assert len(case.wakes) == 1
+
+
+async def test_completed_and_never_started_sessions_stay_stopped(recovery_case):
+    case = recovery_case
+    case.seed(status="idle", labels={})
+    case.seed(labels={"omnigent.last_task_error_code": "runner_failed_to_start"})
+    assert await case.recoverer().sweep_once(now=case.now) == 0
+    case.initializer.initialize.assert_not_awaited()
+
+
+async def test_server_restart_preserves_cap_but_new_user_work_gets_budget(
+    recovery_case, monkeypatch
+):
+    case = recovery_case
+    conv = case.seed()
+    case.config.auto_resume_interrupted = ManagedSandboxAutoResumeConfig(
+        enabled=True, max_attempts=1
+    )
+
+    async def fail(**kwargs):
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", fail
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    case.store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id=uuid4().hex,
+                type="message",
+                data=MessageData(role="assistant", agent="test-agent", content=[]),
+            )
+        ],
+    )
+    assert await case.recoverer().sweep_once(now=case.now + 600) == 0
+    case.store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id=uuid4().hex,
+                type="message",
+                data=MessageData(role="user", content=[]),
+            )
+        ],
+    )
+    assert await case.recoverer().sweep_once(now=case.now + 600) == 0
+    case.store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id=uuid4().hex,
+                type="message",
+                data=MessageData(role="user", content=[], user_authored=True),
+            )
+        ],
+    )
+    assert await case.recoverer().sweep_once(now=case.now + 601) == 1
+
+
+async def test_start_shutdown_and_invalid_limits(recovery_case):
+    case = recovery_case
+    worker = case.recoverer()
+    await worker.start()
+    await worker.start()
+    await worker.shutdown()
+    await worker.shutdown()
+    assert worker._task is None
+    for key in ("scan_batch_size", "max_concurrent_hosts"):
+        with pytest.raises(ValueError, match=key):
+            case.recoverer(**{key: 0})
+
+
+async def test_queued_claim_uses_current_time(recovery_case, monkeypatch):
+    case = recovery_case
+    conv = case.seed()
+    later = case.now + 600
+
+    async def wake(**kwargs):
+        record = case.hosts.get_session_recovery(conv.id)
+        assert record.lease_until > later
+        return Mock(spec=httpx.AsyncClient), conv
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", wake
+    )
+    assert await case.recoverer(clock=lambda: later).sweep_once(now=case.now) == 1
+
+
+async def test_reconnect_retains_outcome_from_failed_runner_start(recovery_case, monkeypatch):
+    case = recovery_case
+    conv = case.seed()
+
+    async def wake(**kwargs):
+        await managed_recovery_context.get().record_outcome(
+            ResumeOutcome(workspace=RestoredState("partial", "repository"))
+        )
+        raise ConnectionError("runner failed after workspace restoration")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", wake
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    response = await case.recoverer(clock=lambda: case.now + 60).resume_connected(
+        conv, Mock(spec=httpx.AsyncClient)
+    )
+    assert response.status_code == 201
+    assert (
+        '"status": "partial"' in case.initializer.initialize.await_args.kwargs["recovery_prompt"]
+    )
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_ambiguous_attempt_stops_and_drains_launch(recovery_case, monkeypatch, cancel):
+    case = recovery_case
+    conv = case.seed()
+    started = asyncio.Event()
+    launch = case.state.managed_launches.begin(conv.id)
+
+    async def wake(**kwargs):
+        launch.task = asyncio.create_task(asyncio.Event().wait())
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", wake
+    )
+    monkeypatch.setattr(
+        "omnigent.server.interrupted_session_recovery._ATTEMPT_TIMEOUT_S", 1 if cancel else 0.05
+    )
+    task = asyncio.create_task(case.recoverer().sweep_once(now=case.now))
+    await started.wait()
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        assert await task == 1
+    assert launch.task.done() and launch.settled.is_set()
+    record = case.hosts.get_session_recovery(conv.id)
+    assert record.terminal_reason == "outcome_unknown"
+    assert await case.recoverer().sweep_once(now=case.now + 600) == 0
+    case.initializer.initialize.assert_not_awaited()
+
+
+async def test_long_provider_refusal_is_terminal(recovery_case, monkeypatch):
+    from omnigent.onboarding.sandboxes.base import SandboxRecoveryRefusedError
+
+    case = recovery_case
+    conv = case.seed()
+
+    async def refuse(**kwargs):
+        raise SandboxRecoveryRefusedError("No authority. " * 100)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", refuse
+    )
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    record = case.hosts.get_session_recovery(conv.id)
+    assert record.terminal_reason == "refused" and record.claim_id is None
+    assert await case.recoverer().sweep_once(now=case.now + 600) == 0
+
+
+async def test_lost_claim_cannot_publish_failure(recovery_case, monkeypatch):
+    case = recovery_case
+    conv = case.seed()
+    case.config.auto_resume_interrupted = ManagedSandboxAutoResumeConfig(
+        enabled=True, max_attempts=1
+    )
+
+    async def fail(**kwargs):
+        raise ConnectionError("old attempt")
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.ensure_runner_connected", fail
+    )
+    monkeypatch.setattr(case.hosts, "finish_session_recovery", Mock(return_value=False))
+    assert await case.recoverer().sweep_once(now=case.now) == 1
+    assert case.store.get_conversation(conv.id).labels == conv.labels
+
+
+async def test_exhaustion_becomes_visible_after_liveness_grace(recovery_case):
+    case = recovery_case
+    conv = case.seed(status="running")
+    _session_status_cache[conv.id] = "running"
+    worker = case.recoverer()
+    claim = case.hosts.claim_session_recovery(
+        conv.host_id,
+        conv.id,
+        await worker._episode(conv.id),
+        now=case.now,
+        lease_s=180,
+        max_attempts=1,
+        retry_backoff_s=1,
+    )
+    case.hosts.finish_session_recovery(conv.id, claim, terminal_reason="exhausted")
+    case.store.touch_runner_liveness([conv.runner_id], now=case.now)
+    assert await worker.resume_connected(conv, Mock(spec=httpx.AsyncClient)) is None
+    assert case.store.get_conversation(conv.id).live_status == "running"
+    assert await case.recoverer(clock=lambda: case.now + 120).sweep_once() == 0
+    fresh = case.store.get_conversation(conv.id)
+    assert fresh.live_status == "failed"
+    assert _session_status_cache[conv.id] == "failed"
+    assert "stopped after 1 attempts" in fresh.labels["omnigent.last_task_error_message"]
+    assert case.hosts.get_session_recovery(conv.id).attempts == 1
+    case.initializer.initialize.assert_not_awaited()
 
 
 async def test_preserves_interruption_only_for_top_level_managed_sessions() -> None:

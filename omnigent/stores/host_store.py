@@ -18,6 +18,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
+from uuid import uuid4
 
 from sqlalchemy import Engine, or_, select, tuple_, update
 from sqlalchemy import delete as sql_delete
@@ -26,11 +27,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account, session_account_owner_query
+from omnigent.db.compression import encode as encode_compressed_text
 from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlHost,
     SqlSessionPermission,
+    SqlSessionRecovery,
     current_workspace_id,
+    normalize_uuid,
 )
 from omnigent.db.enum_codecs import decode_host_status, encode_host_status
 from omnigent.db.utils import (
@@ -52,6 +56,9 @@ from omnigent.harness_availability import HarnessAvailability, is_harness_availa
 # (PING_INTERVAL_S * PING_MISS_THRESHOLD) so a healthy host that is
 # still heart-beating is never falsely aged out.
 HOST_LIVENESS_TTL_S = 90
+
+# Unknown provider work keeps an indexed host hold until an explicit new episode.
+_UNKNOWN_RECOVERY_LEASE_UNTIL = 2**63 - 1
 
 
 class _HostOwnershipError(IntegrityError):
@@ -111,6 +118,68 @@ class Host:
 
 ManagedSandboxScanCursor = tuple[str, int, str]
 ManagedSandboxScanRow = tuple[int, Host]
+
+
+@dataclass(frozen=True)
+class SessionRecovery:
+    """Latest recovery attempt for a session; outcomes remain opaque to the store."""
+
+    host_id: str
+    episode_key: str
+    attempts: int
+    next_attempt_at: int
+    lease_until: int | None
+    claim_id: str | None
+    outcome_json: str | None
+    terminal_reason: str | None
+
+
+def _validate_recovery_clock(now: int, lease_s: int) -> None:
+    if type(lease_s) is not int or not 1 <= lease_s <= 2**31 - 1:
+        raise ValueError("lease_s must be a positive 32-bit integer")
+    if type(now) is not int or not 0 <= now <= 2**63 - 1 - max(lease_s, 3600):
+        raise ValueError("now must be a nonnegative epoch within the 64-bit range")
+
+
+def _validate_recovery_outcome(outcome_json: str) -> None:
+    if not isinstance(outcome_json, str) or len(outcome_json.encode("utf-8")) >= 16384:
+        raise ValueError("outcome_json must be a string below 16384 UTF-8 bytes")
+    encoded = encode_compressed_text(outcome_json)
+    if encoded is not None and len(encoded) >= 16384:
+        raise ValueError("encoded outcome_json must be below 16384 bytes")
+
+
+def _lock_session_recovery(
+    session: Session, session_id: str, claim_id: str
+) -> SqlSessionRecovery | None:
+    """Fence a writer under host, binding and recovery locks, in that order."""
+    workspace_id = current_workspace_id()
+    host_id = session.scalar(
+        select(SqlSessionRecovery.host_id).where(
+            SqlSessionRecovery.workspace_id == workspace_id,
+            SqlSessionRecovery.session_id == session_id,
+            SqlSessionRecovery.claim_id == claim_id,
+        )
+    )
+    if host_id is None:
+        return None
+    host = session.get(SqlHost, (workspace_id, host_id), with_for_update=True)
+    if host is None or host.deleted_at is not None:
+        return None
+    metadata = session.get(
+        SqlConversationMetadata, (workspace_id, session_id), with_for_update=True
+    )
+    if metadata is None or metadata.host_id != host_id:
+        return None
+    recovery = session.get(SqlSessionRecovery, (workspace_id, session_id), with_for_update=True)
+    if (
+        recovery is None
+        or recovery.host_id != host_id
+        or recovery.claim_id != normalize_uuid(claim_id)
+        or recovery.lease_until is None
+    ):
+        return None
+    return recovery
 
 
 def host_is_live(host: Host, now: int | None = None) -> bool:
@@ -262,6 +331,183 @@ class HostStore:
             query_name_prefix="omnigent.host_store",
             immediate=True,
         )
+
+    def get_session_recovery(self, session_id: str) -> SessionRecovery | None:
+        """Read the latest attempt in this workspace, including released outcomes."""
+        with self._session("get_session_recovery") as session:
+            row = session.get(SqlSessionRecovery, (current_workspace_id(), session_id))
+            if row is None:
+                return None
+            return SessionRecovery(
+                host_id=row.host_id,
+                episode_key=row.episode_key,
+                attempts=row.attempts,
+                next_attempt_at=row.next_attempt_at,
+                lease_until=row.lease_until,
+                claim_id=row.claim_id,
+                outcome_json=row.outcome_json,
+                terminal_reason=row.terminal_reason,
+            )
+
+    def claim_session_recovery(
+        self,
+        host_id: str,
+        session_id: str,
+        episode_key: str,
+        *,
+        now: int,
+        lease_s: int,
+        max_attempts: int,
+        retry_backoff_s: int,
+    ) -> str | None:
+        """Claim one session attempt and exclude other live leases on its host.
+
+        Core supplies the original user-message digest. Only a changed episode
+        resets the session budget; changing hosts/runners cannot reset it or
+        steal an unexpired lease. Backoff doubles, capped at one hour.
+        """
+        if (
+            not isinstance(episode_key, str)
+            or len(episode_key) != 64
+            or any(char not in "0123456789abcdef" for char in episode_key)
+        ):
+            raise ValueError("episode_key must be a lowercase SHA-256 hex digest")
+        _validate_recovery_clock(now, lease_s)
+        for name, value in (("max_attempts", max_attempts), ("retry_backoff_s", retry_backoff_s)):
+            if type(value) is not int or not 1 <= value <= 2**31 - 1:
+                raise ValueError(f"{name} must be a positive 32-bit integer")
+        claim_id = uuid4().hex
+
+        def write(session: Session) -> str | None:
+            workspace_id = current_workspace_id()
+            host = session.get(SqlHost, (workspace_id, host_id), with_for_update=True)
+            if host is None or host.deleted_at is not None:
+                return None
+            metadata = session.get(
+                SqlConversationMetadata, (workspace_id, session_id), with_for_update=True
+            )
+            if metadata is None or metadata.host_id != host.host_id:
+                return None
+            recovery = session.get(
+                SqlSessionRecovery, (workspace_id, session_id), with_for_update=True
+            )
+            manual_retry = (
+                recovery is not None
+                and recovery.terminal_reason == "outcome_unknown"
+                and recovery.episode_key != episode_key
+            )
+            if recovery is not None and recovery.lease_until is not None:
+                if recovery.lease_until > now and not manual_retry:
+                    return None
+            if (
+                session.scalar(
+                    select(SqlSessionRecovery.session_id)
+                    .where(
+                        SqlSessionRecovery.workspace_id == workspace_id,
+                        SqlSessionRecovery.host_id == host_id,
+                        SqlSessionRecovery.lease_until > now,
+                        SqlSessionRecovery.session_id != session_id,
+                    )
+                    .limit(1)
+                )
+                is not None
+            ):
+                return None
+            attempts = 0
+            if recovery is not None and recovery.episode_key == episode_key:
+                if (
+                    recovery.terminal_reason is not None
+                    or recovery.attempts >= max_attempts
+                    or recovery.next_attempt_at > now
+                ):
+                    return None
+                attempts = recovery.attempts
+            if recovery is None:
+                recovery = SqlSessionRecovery(workspace_id=workspace_id, session_id=session_id)
+                session.add(recovery)
+            if recovery.episode_key != episode_key or recovery.host_id != host.host_id:
+                recovery.outcome_json = None
+            recovery.host_id = host.host_id
+            recovery.episode_key = episode_key
+            recovery.attempts = attempts + 1
+            recovery.next_attempt_at = now + min(retry_backoff_s * 2 ** min(attempts, 12), 3600)
+            recovery.lease_until = now + lease_s
+            recovery.claim_id = claim_id
+            recovery.terminal_reason = None
+            return claim_id
+
+        return run_write_transaction(self._lifecycle_session, "claim_session_recovery", write)
+
+    def renew_session_recovery(
+        self, session_id: str, claim_id: str, *, now: int, lease_s: int
+    ) -> bool:
+        """Extend the current claim only while its lease is unexpired."""
+        _validate_recovery_clock(now, lease_s)
+
+        def write(session: Session) -> bool:
+            recovery = _lock_session_recovery(session, session_id, claim_id)
+            if recovery is None or recovery.lease_until is None or recovery.lease_until <= now:
+                return False
+            recovery.lease_until = max(recovery.lease_until, now + lease_s)
+            return True
+
+        return run_write_transaction(self._lifecycle_session, "renew_session_recovery", write)
+
+    def save_session_recovery_outcome(
+        self, session_id: str, claim_id: str, outcome_json: str
+    ) -> bool:
+        """Persist opaque wake/runner facts before continuation, retaining the lease."""
+        _validate_recovery_outcome(outcome_json)
+
+        def write(session: Session) -> bool:
+            recovery = _lock_session_recovery(session, session_id, claim_id)
+            if recovery is None:
+                return False
+            recovery.outcome_json = outcome_json
+            return True
+
+        return run_write_transaction(
+            self._lifecycle_session, "save_session_recovery_outcome", write
+        )
+
+    def finish_session_recovery(
+        self,
+        session_id: str,
+        claim_id: str,
+        *,
+        outcome_json: str | None = None,
+        terminal_reason: str | None = None,
+    ) -> bool:
+        """Release the current claim, retaining its budget and saved outcome.
+
+        Core supplies a terminal reason on failure, never merely on the final
+        successful acknowledgement. Stale claims cannot overwrite newer attempts.
+        ``outcome_unknown`` retains the host hold until this session starts a new episode.
+        """
+        if outcome_json is not None:
+            _validate_recovery_outcome(outcome_json)
+        if terminal_reason is not None and (
+            not isinstance(terminal_reason, str)
+            or not 1 <= len(terminal_reason.encode("utf-8")) <= 128
+        ):
+            raise ValueError(
+                "terminal_reason must be a nonempty string of at most 128 UTF-8 bytes"
+            )
+
+        def write(session: Session) -> bool:
+            recovery = _lock_session_recovery(session, session_id, claim_id)
+            if recovery is None:
+                return False
+            if outcome_json is not None:
+                recovery.outcome_json = outcome_json
+            recovery.terminal_reason = terminal_reason
+            recovery.lease_until = (
+                _UNKNOWN_RECOVERY_LEASE_UNTIL if terminal_reason == "outcome_unknown" else None
+            )
+            recovery.claim_id = None
+            return True
+
+        return run_write_transaction(self._lifecycle_session, "finish_session_recovery", write)
 
     def upsert_on_connect(
         self,

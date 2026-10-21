@@ -5118,28 +5118,52 @@ def reconcile_orphaned_running_status(
     :returns: Whether this call performed the transition.
     """
     status: Literal["idle", "failed"] = "failed" if preserve_interruption else "idle"
-    if not conversation_store.settle_orphaned_live_status(session_id, stale_before, status=status):
-        return False
     error = (
         ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
         if preserve_interruption
         else None
     )
-    if error is not None:
-        try:
-            conversation_store.set_labels(
-                session_id,
-                _session_status_error_label_updates(error, owner_runner_id=owner_runner_id),
-            )
-        except Exception:  # noqa: BLE001
-            # A failure without its cause is never recovered; settle idle instead.
-            _logger.exception(
-                "Failed to persist disconnect labels for %s; settling idle",
-                session_id,
-                extra={"session_id": session_id},
-            )
-            status, error = "idle", None
-            session_live_state.persist_live_status(session_id, "idle")
+    cached_status = _session_status_cache.get(session_id)
+    try:
+        if not conversation_store.settle_orphaned_live_status(
+            session_id,
+            stale_before,
+            status=status,
+            error_labels=(
+                _session_status_error_label_updates(error, owner_runner_id=owner_runner_id)
+                if error is not None
+                else None
+            ),
+            expected_runner_id=owner_runner_id,
+        ):
+            return False
+    except Exception:  # noqa: BLE001
+        _logger.exception(
+            "Failed to reconcile orphaned session %s; will retry",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return False
+    # Reconnect may already have resumed or settled the turn after our commit.
+    # It owns the next edge; never undo it with another persisted status write.
+    try:
+        current = conversation_store.get_conversation(session_id)
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Cannot recheck session %s after orphan settlement",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return True
+    if (
+        current is None
+        or current.live_status != status
+        or (owner_runner_id is not None and current.runner_id != owner_runner_id)
+        or (current.runner_last_seen is not None and current.runner_last_seen >= stale_before)
+        or _session_status_cache.get(session_id) != cached_status
+    ):
+        return True
     _publish_status(
         session_id,
         status,
@@ -5148,50 +5172,7 @@ def reconcile_orphaned_running_status(
         scheduled_run_outcome="failed",
         failure_origin="orphaned_running_reconcile" if error is not None else None,
     )
-    if error is not None:
-        _yield_to_reconnected_runner(session_id, conversation_store, stale_before)
     return True
-
-
-def _yield_to_reconnected_runner(
-    session_id: str, conversation_store: ConversationStore, stale_before: int
-) -> None:
-    """Undo a disconnect settlement that raced a runner reconnect.
-
-    The status, labels, and cache are written one after another, so a runner
-    whose reconnect hook ran in between saw a half-written failure and neither
-    resumed nor cleared it. Its liveness stamp, written before that hook,
-    shows it is back; settle idle as the reconnect would have.
-    """
-    try:
-        binding = conversation_store.get_runner_liveness(session_id)
-    except Exception:  # noqa: BLE001
-        _logger.warning(
-            "Cannot recheck runner liveness for %s after orphan settlement",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return
-    if binding is None or binding[1] is None or binding[1] < stale_before:
-        return
-    # A newer edge (e.g. a resumed turn's ``running``) already superseded ours.
-    if _session_status_cache.get(session_id) != "failed":
-        return
-    _session_status_cache[session_id] = "idle"
-    session_live_state.persist_live_status(session_id, "idle")
-    event = SessionStatusEvent(
-        type="session.status", conversation_id=session_id, status="idle", error=None
-    )
-    session_stream.publish(session_id, event.model_dump())
-    try:
-        conversation_store.set_labels(session_id, _session_status_error_label_updates(None))
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Failed to clear session status error labels for %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
 
 
 def _truncate_label(value: str, limit: int = _LABEL_VALUE_MAX_LEN) -> str:

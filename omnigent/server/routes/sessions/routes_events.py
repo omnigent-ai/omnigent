@@ -598,6 +598,17 @@ async def _recover_retry_session(
     if conv is None:
         raise _session_not_found()
 
+    from uuid import uuid4
+
+    from omnigent.server.interrupted_session_recovery import auto_resume_enabled
+
+    if conv.host_id and auto_resume_enabled(getattr(request.app.state, "sandbox_config", None)):
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {"omnigent.recovery.manual_retry": uuid4().hex},
+        )
+
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
     was_connected = runner_client is not None

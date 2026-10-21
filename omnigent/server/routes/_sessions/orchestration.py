@@ -4647,6 +4647,13 @@ async def _maybe_relaunch_managed_sandbox(
                 app_state=app_state,
             )
         else:
+            from omnigent.onboarding.sandboxes.base import SandboxRecoveryRefusedError
+            from omnigent.server.interrupted_session_recovery import managed_recovery_context
+
+            if managed_recovery_context.get() is not None:
+                raise SandboxRecoveryRefusedError(
+                    "This provider requires a new sandbox. Send a message to recover explicitly."
+                )
             _kick_managed_relaunch(
                 session_id=session_id,
                 conv=conv,
@@ -5273,7 +5280,7 @@ def _kick_managed_relaunch(
         conv.host_id,
         extra={"session_id": session_id},
     )
-    tracker.begin(session_id)
+    launch = tracker.begin(session_id)
     # Seed the relaunch's progress indicator immediately — the user is
     # typically watching the session page when "wake the sandbox" runs.
     _publish_sandbox_status(session_id, "provisioning")
@@ -5300,6 +5307,7 @@ def _kick_managed_relaunch(
             agent_id=conv.agent_id,
         )
     )
+    launch.task = relaunch_task
     _managed_launch_tasks.add(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -5367,7 +5375,7 @@ def _kick_managed_wake_impl(
         session_id,
         extra={"session_id": session_id},
     )
-    tracker.begin(session_id)
+    launch = tracker.begin(session_id)
     # Seed the progress indicator immediately — the user is watching the
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
@@ -5393,6 +5401,7 @@ def _kick_managed_wake_impl(
             agent_id=conv.agent_id,
         )
     )
+    launch.task = wake_task
     _managed_launch_tasks.add(wake_task)
     wake_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -5443,7 +5452,8 @@ async def _run_managed_wake(
         built-in gate into the woken runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
     """
-    from omnigent.onboarding.sandboxes.base import SandboxGoneError
+    from omnigent.onboarding.sandboxes.base import SandboxGoneError, SandboxRecoveryRefusedError
+    from omnigent.server.interrupted_session_recovery import managed_recovery_context
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
         host_slice_key_enabled,
@@ -5454,6 +5464,7 @@ async def _run_managed_wake(
 
     sandbox_config = deployment_with_inference_snapshot(sandbox_config, conv.inference_snapshot)
     host_id = conv.host_id
+    recovery = managed_recovery_context.get()
     if host_id is None:
         reason = "managed session has no host binding"
         tracker.fail(session_id, reason)
@@ -5501,8 +5512,15 @@ async def _run_managed_wake(
                 on_stage=_on_stage,
                 agent_name=agent_name,
                 slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
+                launcher=recovery.launcher if recovery else None,
+                expected_sandbox_id=recovery.sandbox_id if recovery else None,
+                on_resumed=recovery.record_outcome if recovery else None,
             )
         except SandboxGoneError:
+            if recovery is not None:
+                raise SandboxRecoveryRefusedError(
+                    "The sandbox was deleted. Start a new session to restore work explicitly."
+                ) from None
             _logger.info(
                 "Managed host %s (session %s) sandbox is gone; recreating a fresh generation",
                 host_id,
@@ -5603,6 +5621,11 @@ async def _run_managed_wake(
                 return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
+    except SandboxRecoveryRefusedError as exc:
+        if recovery is not None:
+            recovery.refusal = str(exc)
+        tracker.fail(session_id, str(exc))
+        _publish_sandbox_status(session_id, "failed", str(exc))
     except OmnigentError as exc:
         tracker.fail(session_id, str(exc))
         _publish_sandbox_status(session_id, "failed", str(exc))

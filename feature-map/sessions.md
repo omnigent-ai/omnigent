@@ -83,6 +83,10 @@ the header menu), and each place is a separate entry point.
   initialize before delivery, including when an idle reconnect already restored
   the tunnel. Later messages reuse that generation's completed initialization;
   SDK sub-agents reuse their loaded session state.
+- `automatic-recovery`: with deployment policy and provider support enabled,
+  an interrupted managed root session can wake and continue without a message.
+  Stop/archive/delete take precedence. Failed attempts exhaust a durable budget;
+  an ambiguous timeout requires the user to check the provider before retrying.
 - `import-progress`: import recent sessions or one session by ID from an online
   machine. Settings shows a spinner and count; the sidebar heading retains
   progress after leaving Settings. Results stay compact, with expandable failure
@@ -262,6 +266,12 @@ action in the same dialog.
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
 and send a follow-up after its parent runner is replaced.
+
+**Automatic recovery, web/mobile/desktop/Canvas:** enable
+`sandbox.auto_resume_interrupted.enabled` with an opted-in provider, start a
+managed task, and interrupt its sandbox while the task is running. Observe the
+same conversation continue without sending input. After exhaustion, **Retry**
+or a confirmed user message grants a new budget; native transcript echoes do not.
 
 **Missing workspace, desktop and mobile:** open a conversation whose working
 directory is no longer available and choose **Continue in another directory…**
@@ -526,6 +536,13 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`reconnect`, spinner (own environment):**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
+- **`automatic-recovery`, coordinator and runner reconnect:**
+  `tests/server/test_interrupted_session_recovery.py` exercises durable retry
+  limits, cancellation, authorization ordering, restoration facts and user
+  Stop/archive/delete/generation races with real SQLite stores and mock wakes.
+  `tests/server/integration/test_sessions_tunnel_three_layer.py::test_on_runner_connect_resumes_interrupted_managed_session`
+  covers continuation through the runner tunnel. These checks do not establish
+  live provider compatibility or visual coverage on each app surface.
 - **`reconnect`, offline-host cause (own environment):**
   `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_native_host_preserves_failed_turn_and_retry`
   creates Claude/Codex native-wrapper sessions on a real disposable host, stops

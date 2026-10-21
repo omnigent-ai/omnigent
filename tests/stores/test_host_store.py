@@ -1866,3 +1866,384 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+@pytest.fixture()
+def recovery_session(host_store: HostStore, db_uri: str) -> tuple[str, str]:
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(host_id, "recovery-host", "alice")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session_id = conversations.create_conversation().id
+    conversations.set_host_id(session_id, host_id, workspace="/tmp")
+    return host_id, session_id
+
+
+@pytest.mark.parametrize("same_session", [True, False])
+def test_session_recovery_serializes_host_wakes(
+    db_uri: str, host_store: HostStore, recovery_session: tuple[str, str], same_session: bool
+) -> None:
+    host_id, session_id = recovery_session
+    conversations = SqlAlchemyConversationStore(db_uri)
+    other_id = session_id if same_session else conversations.create_conversation().id
+    conversations.set_host_id(other_id, host_id, workspace="/tmp")
+    barrier = threading.Barrier(2)
+
+    def claim(target: str) -> str | None:
+        with workspace_scope(0):
+            replica = HostStore(db_uri)
+            barrier.wait(timeout=10)
+            return replica.claim_session_recovery(
+                host_id,
+                target,
+                "a" * 64,
+                now=100,
+                lease_s=10,
+                max_attempts=3,
+                retry_backoff_s=30,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, [session_id, other_id]))
+    assert sum(value is not None for value in claims) == 1
+    winner_id = [session_id, other_id][0 if claims[0] else 1]
+    state = host_store.get_session_recovery(winner_id)
+    assert state is not None and state.attempts == 1
+    assert state.lease_until == 110 and state.next_attempt_at == 130
+    if not same_session:
+        loser_id = other_id if winner_id == session_id else session_id
+        assert host_store.get_session_recovery(loser_id) is None
+
+
+def test_session_recovery_fences_replicas_and_retains_budget_across_hosts_and_runners(
+    db_uri: str, host_store: HostStore, recovery_session: tuple[str, str]
+) -> None:
+    host_id, session_id = recovery_session
+    conversations = SqlAlchemyConversationStore(db_uri)
+
+    def claim(now: int, episode: str = "a" * 64) -> str | None:
+        return HostStore(db_uri).claim_session_recovery(
+            host_id,
+            session_id,
+            episode,
+            now=now,
+            lease_s=10,
+            max_attempts=3,
+            retry_backoff_s=30,
+        )
+
+    assert host_store.get_session_recovery(session_id) is None
+    first = claim(100)
+    assert first is not None
+    outcome = '{"runner_id":"runner-first","future_field":{"arbitrary":true}}'
+    assert host_store.save_session_recovery_outcome(session_id, first, outcome)
+    state = HostStore(db_uri).get_session_recovery(session_id)
+    assert state is not None and state.outcome_json == outcome
+    assert state.claim_id == first and state.lease_until == 110
+    assert claim(101, "b" * 64) is None
+    assert host_store.renew_session_recovery(session_id, first, now=109, lease_s=30)
+    assert host_store.renew_session_recovery(session_id, first, now=110, lease_s=1)
+    assert claim(130) is None  # Renewal never shortens the lease.
+    assert not host_store.renew_session_recovery(session_id, first, now=139, lease_s=30)
+    second = claim(139)
+    assert second is not None and second != first
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.outcome_json == outcome
+    assert not host_store.finish_session_recovery(session_id, first, terminal_reason="exhausted")
+    assert not host_store.save_session_recovery_outcome(session_id, first, "stale")
+    assert not host_store.renew_session_recovery(session_id, first, now=140, lease_s=30)
+    assert host_store.save_session_recovery_outcome(session_id, second, "opaque future format")
+    assert host_store.finish_session_recovery(session_id, second)
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.outcome_json == "opaque future format"
+    assert state.attempts == 2 and state.claim_id is None and state.lease_until is None
+    assert not host_store.save_session_recovery_outcome(session_id, second, "late")
+    assert not host_store.finish_session_recovery(session_id, second)
+    conversations.replace_runner_id(session_id, "replacement-runner")
+    host_id = uuid.uuid4().hex
+    host_store.upsert_on_connect(host_id, "replacement-host", "alice")
+    conversations.set_host_id(session_id, host_id, workspace="/tmp")
+    assert claim(198) is None
+    third = claim(199)
+    assert third is not None
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.attempts == 3 and state.host_id == host_id
+    assert state.outcome_json is None and state.next_attempt_at == 319
+    assert host_store.save_session_recovery_outcome(session_id, third, "latest outcome")
+    assert host_store.finish_session_recovery(session_id, third, terminal_reason="exhausted")
+    assert claim(1000) is None
+    # A terminal reason also blocks a caller offering a larger budget.
+    assert (
+        host_store.claim_session_recovery(
+            host_id,
+            session_id,
+            "a" * 64,
+            now=1000,
+            lease_s=10,
+            max_attempts=10,
+            retry_backoff_s=30,
+        )
+        is None
+    )
+    restarted = claim(1000, "b" * 64)
+    assert restarted is not None
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.attempts == 1 and state.terminal_reason is None
+    assert state.outcome_json is None
+
+
+def test_session_recovery_retains_outcome_after_finish(
+    host_store: HostStore, recovery_session: tuple[str, str]
+) -> None:
+    host_id, session_id = recovery_session
+    for now in (100, 130):
+        claim_id = host_store.claim_session_recovery(
+            host_id,
+            session_id,
+            "a" * 64,
+            now=now,
+            lease_s=10,
+            max_attempts=3,
+            retry_backoff_s=30,
+        )
+        assert claim_id is not None
+        if now == 100:
+            assert host_store.save_session_recovery_outcome(session_id, claim_id, "wake facts")
+        state = host_store.get_session_recovery(session_id)
+        assert state is not None and state.outcome_json == "wake facts"
+        assert host_store.finish_session_recovery(session_id, claim_id)
+
+
+def test_session_recovery_unknown_outcome_holds_host_until_manual_retry(
+    db_uri: str, host_store: HostStore, recovery_session: tuple[str, str]
+) -> None:
+    host_id, session_id = recovery_session
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sibling = conversations.create_conversation().id
+    conversations.set_host_id(sibling, host_id, workspace="/tmp")
+
+    def claim(target: str, episode: str, now: int) -> str | None:
+        return HostStore(db_uri).claim_session_recovery(
+            host_id,
+            target,
+            episode,
+            now=now,
+            lease_s=10,
+            max_attempts=3,
+            retry_backoff_s=30,
+        )
+
+    original = claim(session_id, "a" * 64, 100)
+    assert original is not None
+    assert host_store.finish_session_recovery(
+        session_id, original, terminal_reason="outcome_unknown"
+    )
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.claim_id is None
+    assert state.terminal_reason == "outcome_unknown"
+    assert not host_store.renew_session_recovery(session_id, original, now=101, lease_s=10)
+    assert claim(session_id, "a" * 64, 10_000) is None
+    assert claim(sibling, "b" * 64, 10_000) is None
+    retry = claim(session_id, "b" * 64, 10_000)
+    assert retry is not None
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.attempts == 1 and state.terminal_reason is None
+    assert state.lease_until == 10_010
+    assert not host_store.finish_session_recovery(session_id, original)
+    assert host_store.finish_session_recovery(session_id, retry)
+    assert claim(sibling, "b" * 64, 10_001) is not None
+
+
+@pytest.mark.parametrize("terminal_reason", [None, "exhausted"])
+def test_session_recovery_final_attempt_records_only_explicit_failure(
+    host_store: HostStore, recovery_session: tuple[str, str], terminal_reason: str | None
+) -> None:
+    host_id, session_id = recovery_session
+    claim_id = host_store.claim_session_recovery(
+        host_id,
+        session_id,
+        "a" * 64,
+        now=100,
+        lease_s=10,
+        max_attempts=1,
+        retry_backoff_s=2**31 - 1,
+    )
+    assert claim_id is not None
+    assert host_store.finish_session_recovery(
+        session_id, claim_id, outcome_json='{"ack":true}', terminal_reason=terminal_reason
+    )
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.terminal_reason == terminal_reason
+    assert state.outcome_json == '{"ack":true}' and state.attempts == 1
+    assert state.next_attempt_at == 3700  # Backoff is capped at one hour.
+
+
+@pytest.mark.parametrize(
+    "change", ["host-switch", "delete-host", "tombstone-host", "delete-session"]
+)
+def test_session_recovery_rejects_changed_binding_and_deleted_hosts(
+    db_uri: str, host_store: HostStore, recovery_session: tuple[str, str], change: str
+) -> None:
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    host_id, session_id = recovery_session
+    claim_id = host_store.claim_session_recovery(
+        host_id,
+        session_id,
+        "a" * 64,
+        now=100,
+        lease_s=10,
+        max_attempts=3,
+        retry_backoff_s=30,
+    )
+    assert claim_id is not None
+    if change == "host-switch":
+        other_host = uuid.uuid4().hex
+        host_store.upsert_on_connect(other_host, "other-host", "alice")
+        SqlAlchemyConversationStore(db_uri).set_host_id(session_id, other_host)
+    elif change == "delete-session":
+        with Session(get_or_create_engine(db_uri)) as session:
+            metadata = session.get(SqlConversationMetadata, (0, session_id))
+            assert metadata is not None
+            session.delete(metadata)
+            session.commit()
+    else:
+        if change == "tombstone-host":
+            host_store.bind_sandbox(host_id, provider="modal", sandbox_id="sandbox")
+        host_store.delete_host(host_id)
+    assert not host_store.renew_session_recovery(session_id, claim_id, now=101, lease_s=10)
+    assert not host_store.save_session_recovery_outcome(session_id, claim_id, "stale")
+    assert not host_store.finish_session_recovery(
+        session_id, claim_id, terminal_reason="exhausted"
+    )
+    assert (
+        host_store.claim_session_recovery(
+            host_id,
+            session_id,
+            "b" * 64,
+            now=200,
+            lease_s=10,
+            max_attempts=3,
+            retry_backoff_s=30,
+        )
+        is None
+    )
+    if change == "host-switch":
+        assert (
+            host_store.claim_session_recovery(
+                other_host,
+                session_id,
+                "a" * 64,
+                now=101,
+                lease_s=10,
+                max_attempts=3,
+                retry_backoff_s=30,
+            )
+            is None
+        )  # A transfer cannot steal an old host's live lease.
+        replacement = host_store.claim_session_recovery(
+            other_host,
+            session_id,
+            "a" * 64,
+            now=130,
+            lease_s=10,
+            max_attempts=3,
+            retry_backoff_s=30,
+        )
+        assert replacement is not None
+        state = host_store.get_session_recovery(session_id)
+        assert state is not None and state.attempts == 2
+
+
+def test_session_recovery_is_workspace_scoped(
+    db_uri: str, host_store: HostStore, recovery_session: tuple[str, str]
+) -> None:
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    host_id, session_id = recovery_session
+    claims = []
+    for workspace_id in (0, 42):
+        with workspace_scope(workspace_id):
+            if workspace_id:
+                host_store.upsert_on_connect(host_id, "same-host-id", "alice")
+                with Session(get_or_create_engine(db_uri)) as session:
+                    session.add(
+                        SqlConversationMetadata(id=session_id, host_id=host_id, workspace="/tmp")
+                    )
+                    session.commit()
+            assert host_store.get_session_recovery(session_id) is None
+            claim_id = host_store.claim_session_recovery(
+                host_id,
+                session_id,
+                "a" * 64,
+                now=100,
+                lease_s=10,
+                max_attempts=3,
+                retry_backoff_s=30,
+            )
+            assert claim_id is not None
+            claims.append(claim_id)
+    assert not host_store.save_session_recovery_outcome(session_id, claims[1], "wrong workspace")
+    assert not host_store.finish_session_recovery(session_id, claims[1])
+    assert not host_store.renew_session_recovery(session_id, claims[1], now=101, lease_s=10)
+    assert host_store.finish_session_recovery(session_id, claims[0])
+    with workspace_scope(42):
+        state = host_store.get_session_recovery(session_id)
+        assert state is not None and state.claim_id == claims[1] and state.lease_until == 110
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"episode_key": "A" * 64},
+        {"episode_key": "a" * 63},
+        {"episode_key": None},
+        {"lease_s": 0},
+        {"lease_s": 2**31},
+        {"max_attempts": True},
+        {"retry_backoff_s": -1},
+        {"now": -1},
+        {"now": 2**63 - 1},
+    ],
+)
+def test_session_recovery_validates_limits(host_store: HostStore, changes: dict) -> None:
+    arguments = {
+        "episode_key": "a" * 64,
+        "now": 100,
+        "lease_s": 10,
+        "max_attempts": 3,
+        "retry_backoff_s": 30,
+        **changes,
+    }
+    with pytest.raises(ValueError):
+        host_store.claim_session_recovery(uuid.uuid4().hex, uuid.uuid4().hex, **arguments)
+
+
+def test_session_recovery_bounds_payloads_and_preserves_state_on_invalid_input(
+    host_store: HostStore, recovery_session: tuple[str, str]
+) -> None:
+    host_id, session_id = recovery_session
+    claim_id = host_store.claim_session_recovery(
+        host_id,
+        session_id,
+        "a" * 64,
+        now=100,
+        lease_s=10,
+        max_attempts=3,
+        retry_backoff_s=30,
+    )
+    assert claim_id is not None
+    for payload in ("x" * 16384, "🙂" * 4096):
+        with pytest.raises(ValueError, match="outcome_json"):
+            host_store.save_session_recovery_outcome(session_id, claim_id, payload)
+        with pytest.raises(ValueError, match="outcome_json"):
+            host_store.finish_session_recovery(session_id, claim_id, outcome_json=payload)
+    for reason in ("", "🙂" * 33):
+        with pytest.raises(ValueError, match="terminal_reason"):
+            host_store.finish_session_recovery(session_id, claim_id, terminal_reason=reason)
+    for clock in ({"now": 100, "lease_s": 0}, {"now": 2**63 - 1, "lease_s": 10}):
+        with pytest.raises(ValueError):
+            host_store.renew_session_recovery(session_id, claim_id, **clock)
+    payload = "x" * 16383
+    assert host_store.save_session_recovery_outcome(session_id, claim_id, payload)
+    state = host_store.get_session_recovery(session_id)
+    assert state is not None and state.outcome_json == payload and state.claim_id == claim_id

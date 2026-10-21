@@ -41,6 +41,7 @@ import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -1429,7 +1430,10 @@ def _auto_resume_app_kwargs(enabled: bool) -> Callable[[str], dict[str, Any]]:
             "sandbox_config": ManagedSandboxDeployment.single(
                 ManagedSandboxConfig(
                     server_url="https://omnigent.example.com",
-                    launcher_factory=lambda: None,  # type: ignore[arg-type,return-value]
+                    launcher_factory=lambda: SimpleNamespace(
+                        provider="remote",
+                        background_recovery_context=lambda target: contextlib.nullcontext(),
+                    ),  # type: ignore[arg-type,return-value]
                     token_ttl_s=3600,
                     provider="remote",
                 ),
@@ -1483,6 +1487,18 @@ async def test_on_runner_connect_resumes_interrupted_managed_session(
         token_expires_at=2**31 - 1,
     )
     get_conversation_store().set_host_id(target, host.host_id, workspace="/work")
+    get_conversation_store().set_session_live_status(target, "failed")
+    if enabled:
+        from omnigent.server.interrupted_session_recovery import InterruptedSessionRecoverer
+
+        # This fixture bypasses lifespan; install its coordinator without the timer.
+        ap_app.state.interrupted_session_recoverer = InterruptedSessionRecoverer(
+            conversation_store=get_conversation_store(),
+            host_store=ap_app.state.host_store,
+            sandbox_config=ap_app.state.sandbox_config,
+            app_state=ap_app.state,
+            runner_router=ap_app.state.runner_router,
+        )
     posts: list[dict[str, Any]] = []
 
     try:
@@ -1496,9 +1512,11 @@ async def test_on_runner_connect_resumes_interrupted_managed_session(
             init = next(post for post in posts if post["session_id"] == target)["session_init"]
             other = next(post for post in posts if post["session_id"] == sibling)["session_init"]
             assert init["resume_interrupted_turn"] is enabled
-            assert init["recovery_prompt"] == (
-                "The host restarted; carry on." if enabled else None
-            )
+            if enabled:
+                assert init["recovery_prompt"].startswith("The host restarted; carry on.")
+                assert '"status": "unknown"' in init["recovery_prompt"]
+            else:
+                assert init["recovery_prompt"] is None
             assert other["resume_interrupted_turn"] is False
             # A started continuation clears the disconnect through its own
             # running edge; otherwise the reconnect clears it as before.

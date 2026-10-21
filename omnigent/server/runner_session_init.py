@@ -153,12 +153,15 @@ class RunnerSessionInitializer:
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
         recovery_prompt: str | None = None,
+        recovery_id: str | None = None,
     ) -> httpx.Response:
         """Initialize once for the current connection and persisted snapshot.
 
         ``recovery_prompt`` overrides the runner's continuation text when
         ``resume_interrupted_turn`` starts a recovery turn.
+        An explicit ``recovery_id`` owns its POST and drains it on cancellation.
         """
+        owns_recovery = resume_interrupted_turn and recovery_id is not None
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
@@ -193,7 +196,8 @@ class RunnerSessionInitializer:
             resume_interrupted_turn,
         )
         task = self._tasks.get(key)
-        if task is None and self._agent_store is not None:
+        new_claim = recovery_id is not None and self._recovery_ids.get(key) != recovery_id
+        if self._agent_store is not None and (task is None or new_claim):
             async with store_slots or nullcontext():
                 agent = await asyncio.to_thread(self._agent_store.get, agent_id)
             if agent is None:
@@ -215,9 +219,15 @@ class RunnerSessionInitializer:
                 )
             # Another caller may have started this initialization during the lookup.
             task = self._tasks.get(key)
+        if recovery_id is not None and self._recovery_ids.get(key) not in {None, recovery_id}:
+            if task is not None and not task.done():
+                raise ConnectionError("another recovery attempt is initializing this runner")
+            self._tasks.pop(key, None)
+            self._recovery_ids.pop(key, None)
+            task = None
         if task is None:
             recovery_id = (
-                self._recovery_ids.setdefault(key, uuid4().hex)
+                self._recovery_ids.setdefault(key, recovery_id or uuid4().hex)
                 if resume_interrupted_turn
                 else None
             )
@@ -283,7 +293,7 @@ class RunnerSessionInitializer:
 
             task.add_done_callback(_drop_failed)
         try:
-            response = await asyncio.shield(task)
+            response = await task if owns_recovery else await asyncio.shield(task)
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if task.cancelled() and current is not None and not current.cancelling():

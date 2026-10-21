@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 LAST_TASK_ERROR_CODE_LABEL_KEY = "omnigent.last_task_error_code"
 
 # Keyset position ``(live_status_code, workspace_id, conversation_id)`` for
-# :meth:`ConversationStore.list_interrupted_host_sessions`.
+# :meth:`ConversationStore.list_interrupted_host_session_candidates`.
 InterruptedSessionCursor: TypeAlias = tuple[int, int, str]
 
 # Label set on a fork of a session that had a working directory, or a
@@ -1621,42 +1621,39 @@ class ConversationStore(ABC):
         stale_before: int,
         *,
         status: Literal["idle", "failed"] = "idle",
+        error_labels: dict[str, str] | None = None,
+        expected_runner_id: str | None = None,
     ) -> bool:
         """Atomically settle a stale running session to ``status``.
 
         The update must require a bound runner, ``running``/``waiting`` live
         status, and a missing or older ``runner_last_seen`` stamp. It must not
-        bump ``updated_at``.
+        bump ``updated_at``. When supplied, error labels must be durable before
+        the new status becomes visible. A label write failure must leave the
+        status unchanged, including when labels live in a separate database.
 
         :param conversation_id: Session/conversation identifier.
         :param stale_before: Runner stamps at or after this epoch are fresh.
         :param status: Resting status to write, ``"idle"`` or ``"failed"``.
+        :param error_labels: Failure detail to persist with the transition.
+        :param expected_runner_id: Skip a session rebound to another runner.
         :returns: Whether this call performed the transition.
         """
         ...
 
     @abstractmethod
-    def list_interrupted_host_sessions(
+    def list_interrupted_host_session_candidates(
         self,
         *,
         stale_before: int,
         after: InterruptedSessionCursor | None,
         limit: int,
-    ) -> tuple[list[tuple[int, Conversation]], InterruptedSessionCursor | None]:
-        """Page host-bound top-level sessions a runner loss left mid-turn.
+    ) -> tuple[list[tuple[int, str, str]], InterruptedSessionCursor | None]:
+        """Return (workspace, session, host) candidate IDs and a scan cursor.
 
-        This privileged recovery scan spans workspaces. A session qualifies
-        when it is unarchived, has no parent, has ``host_id`` set, and either
-        reads ``running``/``waiting`` with a missing or older
-        ``runner_last_seen`` stamp, or reads ``failed`` with a persisted
-        ``runner_disconnected`` cause.
-
-        :param stale_before: Runner stamps at or after this epoch are fresh.
-        :param after: Exclusive keyset cursor returned by the prior page.
-        :param limit: Maximum candidate rows examined by this call.
-        :returns: ``(workspace_id, conversation)`` matches, which may be fewer
-            than ``limit``, and the cursor for the next page, or ``None`` once
-            the scan is complete.
+        This cross-workspace metadata scan must not hydrate session content.
+        Callers enter authorized context, then reload current eligibility.
+        Embedders translate session IDs/cursors at this store boundary.
         """
         ...
 

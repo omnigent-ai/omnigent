@@ -4087,19 +4087,21 @@ def create_app(
                         )
                     if initialize_runtime:
                         resume = await auto_resume_requested(conv, sandbox_config, host_store)
-                        response = await runner_session_initializer.initialize(
-                            conv,
-                            client,
-                            timeout=10.0,
-                            resume_interrupted_turn=resume,
-                            recovery_prompt=(
-                                sandbox_config.auto_resume_interrupted.recovery_prompt
-                                if resume and sandbox_config is not None
-                                else None
-                            ),
-                            generation=connection.generation,
-                            store_slots=store_slots,
-                        )
+                        if resume:
+                            recoverer = getattr(app.state, "interrupted_session_recoverer", None)
+                            if recoverer is None:
+                                return
+                            response = await recoverer.resume_connected(conv, client)
+                            if response is None:
+                                return
+                        else:
+                            response = await runner_session_initializer.initialize(
+                                conv,
+                                client,
+                                timeout=10.0,
+                                generation=connection.generation,
+                                store_slots=store_slots,
+                            )
                         # A removed agent was already logged as expected.
                         if is_session_agent_removed(response):
                             return
