@@ -186,10 +186,9 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Nested-sandbox /proc handling
 # ---------------------------------------------------------------------------
 
-# These outer sandboxes allow binding their existing procfs but deny mounting a
-# fresh one. Binding exposes outer process metadata, so the list is explicit:
-# Lakebox is single-tenant, and Phoenix must disable hostPID and shared process
-# namespaces. Unknown environments keep the safer fresh-proc behavior.
+# Binding outer procfs exposes process metadata, so only vetted backends opt in.
+# Phoenix requires a single-tenant PID namespace with hostPID and process sharing
+# disabled. Other environments keep fresh procfs; see _should_bind_host_proc.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
 # Marker directory the Databricks Lakebox runtime seeds inside every
