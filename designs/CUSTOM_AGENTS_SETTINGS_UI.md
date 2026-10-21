@@ -56,8 +56,11 @@ inactive until a field changes. Existing list/detail responses and multipart ins
    save of a field wins. Omitted fields are preserved, and the database still rejects
    changes that race with the write itself.
 
-The editor saves without `If-Match` when a proxy strips `ETag`. Keep the existing
-`custom_agents_settings_ui` flag off until both backend and UI support this behavior.
+The editor saves without `If-Match` when a proxy strips `ETag`. If a proxy strips
+`If-Match` from the request instead, the backend accepts the same partial edit
+without a stale-draft check. Neither revision header must survive the proxy.
+Keep the existing `custom_agents_settings_ui` flag off until both backend and UI
+support this behavior.
 Either can deploy first while the flag is off. With the flag enabled, a newer UI
 against an older backend can receive 428 without a tag; its draft is retained.
 

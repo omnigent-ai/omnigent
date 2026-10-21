@@ -11,10 +11,11 @@ from playwright.sync_api import Page, Route, expect
 from tests._helpers.session import bundle_files
 
 
+@pytest.mark.parametrize("strip_if_match", [False, True], ids=["if-match", "no-if-match"])
 @pytest.mark.parametrize("strip_etag", [False, True], ids=["etag", "no-etag"])
 @pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile"])
 def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
-    page: Page, live_server: str, mobile: bool, strip_etag: bool
+    page: Page, live_server: str, mobile: bool, strip_etag: bool, strip_if_match: bool
 ) -> None:
     name = f"edit-{uuid.uuid4().hex[:8]}"
     bundle = bundle_files(
@@ -45,13 +46,18 @@ def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
         agent_id = installed.json()["id"]
         path = f"/v1/agents/{agent_id}"
 
-        def without_etag(route: Route) -> None:
-            response = route.fetch()
-            headers = {key: value for key, value in response.headers.items() if key != "etag"}
-            route.fulfill(response=response, headers=headers)
+        def strip_revision_headers(route: Route) -> None:
+            request_headers = route.request.all_headers()
+            if strip_if_match:
+                request_headers.pop("if-match", None)
+            response = route.fetch(headers=request_headers)
+            response_headers = response.headers
+            if strip_etag:
+                response_headers.pop("etag", None)
+            route.fulfill(response=response, headers=response_headers)
 
-        if strip_etag:
-            page.route(f"**{path}{{,/config}}", without_etag)
+        if strip_etag or strip_if_match:
+            page.route(f"**{path}{{,/config}}", strip_revision_headers)
         try:
             page.goto(f"{live_server}/settings/custom-agents" + ("" if mobile else f"/{agent_id}"))
             if mobile:
@@ -103,7 +109,7 @@ def test_custom_agent_edit_preserves_fields_and_recovers_conflict(
             )
             competing.raise_for_status()
             form.get_by_role("button", name="Save changes").click()
-            if strip_etag:
+            if strip_etag or strip_if_match:
                 expect(form.get_by_role("button", name="Save changes")).to_be_disabled()
                 expect(form.get_by_role("button", name="Cancel", exact=True)).to_be_enabled()
                 latest = api.get(f"{path}/config")

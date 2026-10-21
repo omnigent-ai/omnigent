@@ -60,7 +60,8 @@ requires `user_owned: true` and `agent_config_edit: true`.
   saving: the first draft remains visible with Reload latest. Confirm reload, then verify the newer value.
   `tests/e2e_ui/sessions/test_custom_agent_edit.py` covers desktop and mobile
   persistence with and without revision headers, and conflict recovery against the
-  real API. It enables the UI release flag and optionally strips response ETags.
+  real API. It enables the UI release flag and independently strips response
+  `ETag`, request `If-Match`, or both.
   Cold desktop bookmarks and mobile list entry are covered. Manually check desktop list entry and normal Settings navigation.
 - Delete: cancel once and verify the agent remains, then delete and verify the
   list and API omit it. For an agent used by a session, verify the initial
