@@ -210,6 +210,16 @@ internal fun connectionErrorName(code: Int): String =
         else -> "ERROR_UNKNOWN"
     }
 
+internal fun failureClassName(error: Throwable?): String =
+    when (error) {
+        is java.net.UnknownHostException -> "UnknownHostException"
+        is java.net.ConnectException -> "ConnectException"
+        is java.net.SocketTimeoutException -> "SocketTimeoutException"
+        is java.io.IOException -> "IOException"
+        is DatabricksSessionException.NetworkUnavailable -> "NetworkUnavailable"
+        else -> "ERROR_UNKNOWN"
+    }
+
 internal fun isUpgradeRequiredTicket(ticket: String?): Boolean = ticket == "upgrade-required"
 
 internal fun isUpgradeRequiredResponse(

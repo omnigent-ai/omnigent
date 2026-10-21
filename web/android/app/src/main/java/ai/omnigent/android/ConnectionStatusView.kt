@@ -1,5 +1,7 @@
 package ai.omnigent.android
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.animation.ValueAnimator
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -51,11 +53,15 @@ internal class ConnectionStatusView(
     private val cancel: Button = scroll.findViewById(R.id.status_cancel)
     private var pendingRender: Runnable? = null
     private var pendingHide: Runnable? = null
+    private var fadeAnimator: ValueAnimator? = null
     private var firstRequestedAt = 0L
     private var lastShownAt = 0L
     private var transitionGeneration = 0
     private var topInset = 0
     private var renderedState: ConnectionStatus? = null
+    var isHiding: Boolean = false
+        private set
+    private var actionsInteractive = false
     var detailsExpanded: Boolean = false
         private set
 
@@ -95,10 +101,12 @@ internal class ConnectionStatusView(
         retainDetails: Boolean = false,
     ) {
         visibility = View.VISIBLE
+        isHiding = false
         pendingHide?.let(::removeCallbacks)
         pendingHide = null
-        content.animate().cancel()
         val generation = ++transitionGeneration
+        fadeAnimator?.cancel()
+        setActionsInteractive(false)
         pendingRender?.let(::removeCallbacks)
         if (retainDetails) {
             detailsExpanded = true
@@ -117,28 +125,21 @@ internal class ConnectionStatusView(
             Runnable {
                 pendingRender = null
                 if (renderedState != null && !immediate && ValueAnimator.areAnimatorsEnabled()) {
-                    content.animate().cancel()
-                    content
-                        .animate()
-                        .alpha(0f)
-                        .setDuration(90)
-                        .withEndAction {
-                            if (generation != transitionGeneration) return@withEndAction
-                            bind(state)
-                            lastShownAt = SystemClock.uptimeMillis()
-                            renderedState = state
-                            content
-                                .animate()
-                                .alpha(1f)
-                                .setDuration(210)
-                                .start()
-                        }.start()
+                    fade(0f, 90) {
+                        if (generation != transitionGeneration) return@fade
+                        bind(state)
+                        lastShownAt = SystemClock.uptimeMillis()
+                        renderedState = state
+                        fade(1f, 210)
+                        setActionsInteractive(true)
+                    }
                 } else {
-                    content.animate().cancel()
                     bind(state)
                     lastShownAt = SystemClock.uptimeMillis()
                     content.alpha = 1f
+                    actions.alpha = 1f
                     renderedState = state
+                    setActionsInteractive(true)
                 }
                 content.visibility = View.VISIBLE
                 actions.visibility = View.VISIBLE
@@ -152,6 +153,8 @@ internal class ConnectionStatusView(
     }
 
     fun hide(onHidden: () -> Unit = {}) {
+        isHiding = true
+        setActionsInteractive(false)
         transitionGeneration++
         pendingRender?.let(::removeCallbacks)
         pendingRender = null
@@ -177,14 +180,50 @@ internal class ConnectionStatusView(
     }
 
     private fun finishHide(onHidden: () -> Unit) {
-        content.animate().cancel()
+        fadeAnimator?.cancel()
         content.visibility = View.GONE
         actions.visibility = View.GONE
         visibility = View.GONE
         firstRequestedAt = 0L
         lastShownAt = 0L
         renderedState = null
+        isHiding = false
         onHidden()
+    }
+
+    private fun fade(
+        targetAlpha: Float,
+        durationMillis: Long,
+        onEnd: () -> Unit = {},
+    ) {
+        val animator = ValueAnimator.ofFloat(content.alpha, targetAlpha)
+        animator.duration = durationMillis
+        animator.addUpdateListener {
+            content.alpha = it.animatedValue as Float
+            actions.alpha = content.alpha
+        }
+        animator.addListener(
+            object : AnimatorListenerAdapter() {
+                private var cancelled = false
+
+                override fun onAnimationCancel(animation: Animator) {
+                    cancelled = true
+                }
+
+                override fun onAnimationEnd(animation: Animator) {
+                    if (!cancelled) onEnd()
+                }
+            },
+        )
+        fadeAnimator = animator
+        animator.start()
+    }
+
+    private fun setActionsInteractive(enabled: Boolean) {
+        actionsInteractive = enabled
+        for (button in listOf(primary, secondary, cancel, detailsToggle, copyDetails)) {
+            button.isEnabled = enabled
+        }
     }
 
     private fun updateAnchor() {
@@ -232,7 +271,7 @@ internal class ConnectionStatusView(
         bindAction(primary, presentation.primary, state)
         bindAction(secondary, presentation.secondary, state)
         cancel.visibility = if (presentation.cancel) View.VISIBLE else View.GONE
-        cancel.setOnClickListener { onAction(StatusAction.CANCEL) }
+        cancel.setOnClickListener { if (actionsInteractive) onAction(StatusAction.CANCEL) }
         ViewCompat.setAccessibilityPaneTitle(this, headline.text)
     }
 
@@ -270,7 +309,7 @@ internal class ConnectionStatusView(
                 }
             },
         )
-        button.setOnClickListener { onAction(action) }
+        button.setOnClickListener { if (actionsInteractive) onAction(action) }
     }
 
     private fun bindDetails(details: ConnectionFailureDetails) {
@@ -305,9 +344,28 @@ internal class ConnectionStatusView(
         value.replace(".", ".\u200b").replace("-", "-\u200b")
 
     private fun safeErrorName(value: String): String =
-        Regex("(?:net::)?ERR_[A-Z0-9_]{1,64}|ERROR_[A-Z0-9_]{1,64}|SSL_[A-Z0-9_]{1,64}")
-            .find(value)
-            ?.value ?: "ERROR_UNKNOWN"
+        value.takeIf {
+            it in
+                setOf(
+                    "ERROR_HOST_LOOKUP",
+                    "ERROR_CONNECT",
+                    "ERROR_IO",
+                    "ERROR_TIMEOUT",
+                    "ERROR_FAILED_SSL_HANDSHAKE",
+                    "SSL_NOTYETVALID",
+                    "SSL_EXPIRED",
+                    "SSL_IDMISMATCH",
+                    "SSL_UNTRUSTED",
+                    "SSL_DATE_INVALID",
+                    "SSL_INVALID",
+                    "UnknownHostException",
+                    "ConnectException",
+                    "SocketTimeoutException",
+                    "IOException",
+                    "NetworkUnavailable",
+                    "RENDERER_CRASH",
+                )
+        } ?: "ERROR_UNKNOWN"
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + .5f).toInt()
 }
