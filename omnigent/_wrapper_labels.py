@@ -90,3 +90,10 @@ DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
 # Value the ``omnigent hermes`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"
+
+# Label key for Arcaterm version recorded at session creation time when
+# the creating environment (e.g. a tmux pane launched by Arcaterm) exports
+# ARCATERM_VERSION. Codex app-servers launched for that session will
+# receive the version in their environment, enabling the Databricks-Arcaterm
+# header to be sent to gateways that support Arcaterm traffic identification.
+ARCATERM_VERSION_LABEL_KEY = "omnigent.arcaterm.version"

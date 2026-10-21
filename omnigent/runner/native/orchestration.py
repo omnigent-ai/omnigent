@@ -645,6 +645,9 @@ class _CodexNativeLaunchConfig:
         reads. A session the forwarder rotated onto carries the original
         session's id here. ``None`` when unlabelled: the bridge is then keyed
         by the session id.
+    :param arcaterm_version: Arcaterm version a terminal launch from an
+        Arcaterm pane stamped on the session, e.g. ``"1.16.0"``; ``None``
+        otherwise.
     """
 
     workspace: Path
@@ -661,6 +664,7 @@ class _CodexNativeLaunchConfig:
     turn_routing: bool = False
     reasoning_effort: str | None = None
     bridge_id: str | None = None
+    arcaterm_version: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1398,6 +1402,7 @@ async def _codex_native_launch_config(
     # Fork directives stamped on a clone at fork time. Only consulted when
     # the clone has no external_session_id of its own yet (see the
     # fork-source branch in _auto_create_codex_terminal); inert otherwise.
+    from omnigent._wrapper_labels import ARCATERM_VERSION_LABEL_KEY
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
@@ -1410,6 +1415,7 @@ async def _codex_native_launch_config(
     fork_source_external_id: str | None = None
     fork_carry_history = False
     bridge_id: str | None = None
+    arcaterm_version: str | None = None
     _harness_override = snapshot.get("harness_override")
     _cost_control = snapshot.get("cost_control_mode_override")
     # DANGEROUS opt-in: full approval/sandbox bypass, stored as a plain
@@ -1430,6 +1436,11 @@ async def _codex_native_launch_config(
         _bid = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
         if isinstance(_bid, str) and _bid:
             bridge_id = _bid
+        # Stamped by a terminal launch from an Arcaterm pane; becomes the
+        # app-server's ARCATERM_VERSION so its gateway requests identify Arcaterm.
+        _arcaterm = labels.get(ARCATERM_VERSION_LABEL_KEY)
+        if isinstance(_arcaterm, str) and _arcaterm:
+            arcaterm_version = _arcaterm
     # One derivation of the session's Smart Routing class, shared with the SDK
     # codex path, so "pinned" and "auto-harness" mean the same on both.
     routing_class = routing_class_from_snapshot(
@@ -1452,6 +1463,7 @@ async def _codex_native_launch_config(
         turn_routing=routing_class.turn_routing,
         reasoning_effort=reasoning_effort,
         bridge_id=bridge_id,
+        arcaterm_version=arcaterm_version,
     )
 
 
@@ -5026,7 +5038,10 @@ async def _auto_create_codex_terminal(
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     _codex_terminal_args = launch_config.terminal_launch_args or ()
     _codex_launch = resolve_native_codex_launch(
-        model=default_model, spec=_launch_spec, terminal_launch_args=_codex_terminal_args
+        model=default_model,
+        spec=_launch_spec,
+        terminal_launch_args=_codex_terminal_args,
+        arcaterm_version=launch_config.arcaterm_version,
     )
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
@@ -5042,6 +5057,7 @@ async def _auto_create_codex_terminal(
             model=None,
             spec=_launch_spec,
             terminal_launch_args=_codex_terminal_args,
+            arcaterm_version=launch_config.arcaterm_version,
         )
         _fresh_codex_catalog = fresh_codex_launch_catalog(
             codex_path=_codex_cli_path,
@@ -5082,6 +5098,7 @@ async def _auto_create_codex_terminal(
                     model=None,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
+                    arcaterm_version=launch_config.arcaterm_version,
                 )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
@@ -5126,6 +5143,7 @@ async def _auto_create_codex_terminal(
                     model=fallback_model,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
+                    arcaterm_version=launch_config.arcaterm_version,
                 )
                 pick_to_reset = pick if fresh_rows else None
                 outcome = (
@@ -5486,6 +5504,7 @@ async def _auto_create_codex_terminal(
         developer_instructions=_codex_developer_instructions,
         terminal_launch_args=launch_config.terminal_launch_args or (),
         reasoning_effort=launch_config.reasoning_effort,
+        arcaterm_version=launch_config.arcaterm_version,
         model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist

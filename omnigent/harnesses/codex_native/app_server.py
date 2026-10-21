@@ -3262,7 +3262,11 @@ class CodexDatabricksProfileMissingError(OmnigentError, OSError):
 
 
 def _databricks_launch_materialization(
-    *, model: str | None, profile: str, codex_path: str | None = None
+    *,
+    model: str | None,
+    profile: str,
+    codex_path: str | None = None,
+    arcaterm_version: str | None = None,
 ) -> _DatabricksLaunchMaterialization:
     """
     Resolve the Databricks-profile routing pieces of a Codex launch.
@@ -3275,6 +3279,9 @@ def _databricks_launch_materialization(
         catalog default.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
     :param codex_path: Executable whose shared catalog may resolve the model.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: The materialized overrides, pinned model, and host.
     :raises CodexDatabricksProfileMissingError: When the profile resolves no
         workspace host.
@@ -3289,6 +3296,7 @@ def _databricks_launch_materialization(
             model=resolved_model,
             base_url=_databricks_codex_base_url(host),
             auth_command=_databricks_codex_auth_command(host, profile),
+            arcaterm_version=arcaterm_version,
         ),
         model=resolved_model,
         host=host,
@@ -3406,6 +3414,7 @@ def build_codex_native_server(
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
     terminal_launch_args: Sequence[str] = (),
+    arcaterm_version: str | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -3464,6 +3473,9 @@ def build_codex_native_server(
     :param terminal_launch_args: Original CLI options used to select the Codex
         config-file profile (distinct from the Databricks routing profile)
         and the ``--add-dir`` roots the app-server owns.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -3478,12 +3490,15 @@ def build_codex_native_server(
             "installed on a PATH the host daemon didn't inherit (e.g. an "
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
-    env = _clean_codex_env()
+    env = _clean_codex_env(arcaterm_version=arcaterm_version)
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
         databricks = _databricks_launch_materialization(
-            model=model, profile=profile, codex_path=resolved_codex
+            model=model,
+            profile=profile,
+            codex_path=resolved_codex,
+            arcaterm_version=arcaterm_version,
         )
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
@@ -3740,7 +3755,11 @@ def _config_toml_provider_base_url(provider_name: str) -> str | None:
     return base_url if isinstance(base_url, str) else None
 
 
-def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCodexLaunch | None:
+def _codex_provider_launch(
+    entry: ProviderEntry,
+    model: str | None,
+    arcaterm_version: str | None = None,
+) -> NativeCodexLaunch | None:
     """Build a native-Codex launch that routes through a single provider entry.
 
     Mirrors the in-process codex harness routing for the ``openai`` surface:
@@ -3768,6 +3787,9 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
     :param model: An explicit/session model override that wins over the
         provider's default model, e.g. ``"gpt-5.5"``; ``None`` keeps the
         provider's default.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: A routable :class:`NativeCodexLaunch`, or ``None`` when *entry*
         cannot route without Codex's own login.
     """
@@ -3824,6 +3846,7 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         base_url=family.base_url,
         auth_command=auth_command,
         wire_api=family.wire_api or "responses",
+        arcaterm_version=arcaterm_version,
     )
     return NativeCodexLaunch(
         config_overrides=overrides,
@@ -3834,7 +3857,11 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
 
 
 def _first_routable_codex_provider(
-    config: dict[str, object], *, exclude: str, model: str | None
+    config: dict[str, object],
+    *,
+    exclude: str,
+    model: str | None,
+    arcaterm_version: str | None = None,
 ) -> NativeCodexLaunch | None:
     """Find a provider other than *exclude* that can route a native Codex launch.
 
@@ -3855,6 +3882,9 @@ def _first_routable_codex_provider(
     :param exclude: The provider name to skip — the dead subscription default,
         e.g. ``"codex"``.
     :param model: An explicit/session model override, or ``None``.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: The first routable :class:`NativeCodexLaunch`, or ``None`` when no
         other provider can route Codex.
     """
@@ -3876,7 +3906,7 @@ def _first_routable_codex_provider(
             continue
         if OPENAI_FAMILY not in provider_families(candidate):
             continue
-        launch = _codex_provider_launch(candidate, model)
+        launch = _codex_provider_launch(candidate, model, arcaterm_version)
         if launch is not None:
             _logger.warning(
                 "native-codex: subscription default %r has no usable Codex login; "
@@ -3933,7 +3963,10 @@ def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
 
 
 def _resolve_subscription_launch(
-    entry: ProviderEntry, model: str | None, explicit: dict[str, object]
+    entry: ProviderEntry,
+    model: str | None,
+    explicit: dict[str, object],
+    arcaterm_version: str | None = None,
 ) -> NativeCodexLaunch:
     """Resolve a native-Codex launch when the Codex default is a ``subscription``.
 
@@ -3951,6 +3984,9 @@ def _resolve_subscription_launch(
     :param explicit: The explicit parsed config mapping (``providers:`` block),
         used for the fall-through search over other configured/detected
         providers.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     # Pin codex's built-in ``openai`` provider: the bridged config.toml may
@@ -3970,7 +4006,9 @@ def _resolve_subscription_launch(
             profile=None,
             summary=f"Codex CLI login (subscription provider {entry.name!r}; Codex is logged in)",
         )
-    fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
+    fallback = _first_routable_codex_provider(
+        explicit, exclude=entry.name, model=model, arcaterm_version=arcaterm_version
+    )
     if fallback is not None:
         return fallback
     log_info_once(
@@ -3997,6 +4035,7 @@ def resolve_native_codex_launch(
     model: str | None,
     spec: AgentSpec | None = None,
     terminal_launch_args: Sequence[str] = (),
+    arcaterm_version: str | None = None,
 ) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
@@ -4044,6 +4083,9 @@ def resolve_native_codex_launch(
     :param terminal_launch_args: Codex CLI pass-through args; their
         ``--profile`` selects the config-file layer the bridged config is read
         through, as :func:`build_codex_native_server` applies it at start.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.inference_config import (
@@ -4074,7 +4116,7 @@ def resolve_native_codex_launch(
     )
     if bound is not None:
         selected = resolve_bound_model(explicit, "codex-native", model)
-        bound_launch = _codex_provider_launch(bound, selected)
+        bound_launch = _codex_provider_launch(bound, selected, arcaterm_version)
         if bound_launch is None:
             raise ValueError(
                 f"Configured provider {bound.name!r} cannot route Codex. "
@@ -4125,7 +4167,7 @@ def resolve_native_codex_launch(
                     summary=f"Codex CLI login (spec provider {spec_entry.name!r}; {state})",
                     login_required=not spec_codex_logged_in,
                 )
-            launch = _codex_provider_launch(spec_entry, model)
+            launch = _codex_provider_launch(spec_entry, model, arcaterm_version)
             if launch is not None:
                 if launch.profile is not None:
                     log_info_once(
@@ -4219,6 +4261,7 @@ def resolve_native_codex_launch(
                     auth_command=_databricks_codex_auth_command(
                         connect_host, HOST_DATABRICKS_PROFILE
                     ),
+                    arcaterm_version=arcaterm_version,
                 ),
                 model=resolved_model,
                 profile=None,
@@ -4267,9 +4310,9 @@ def resolve_native_codex_launch(
             login_required=not _codex_login_usable(),
         )
     if entry.kind == SUBSCRIPTION_KIND:
-        return _resolve_subscription_launch(entry, model, explicit)
+        return _resolve_subscription_launch(entry, model, explicit, arcaterm_version)
 
-    launch = _codex_provider_launch(entry, model)
+    launch = _codex_provider_launch(entry, model, arcaterm_version)
     if launch is not None:
         if launch.profile is not None:
             log_info_once(

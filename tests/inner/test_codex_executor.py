@@ -201,6 +201,61 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
 
+    def _arcaterm_headers(self, overrides: list[str], provider: str) -> object:
+        import tomllib
+
+        return tomllib.loads("\n".join(overrides))["model_providers"][provider].get(
+            "env_http_headers"
+        )
+
+    def test_databricks_codex_config_overrides_map_arcaterm_header_when_launched_from_arcaterm(
+        self,
+    ):
+        for version, expected in (
+            ("1.16.0", {"Databricks-Arcaterm": "ARCATERM_VERSION"}),
+            (None, None),
+        ):
+            overrides = _databricks_codex_config_overrides(
+                model="databricks-gpt-5-4-mini",
+                base_url="https://example.cloud.databricks.com/ai-gateway/codex/v1",
+                auth_command='databricks auth token --host "https://example.cloud.databricks.com"',
+                arcaterm_version=version,
+            )
+            self.assertEqual(self._arcaterm_headers(overrides, "omnigent_databricks"), expected)
+
+    def test_provider_codex_config_overrides_map_arcaterm_header_only_for_databricks_gateways(
+        self,
+    ):
+        cases = (
+            ("https://example.cloud.databricks.com/ai-gateway/codex/v1", "1.16.0", True),
+            ("https://adb-1.2.azuredatabricks.net/ai-gateway/codex/v1", "1.16.0", True),
+            ("https://1.gcp.databricks.com/ai-gateway/codex/v1", "1.16.0", True),
+            ("https://example.cloud.databricks.com/ai-gateway/codex/v1", None, False),
+            ("https://openrouter.ai/api/v1", "1.16.0", False),
+        )
+        for base_url, version, mapped in cases:
+            overrides = _provider_codex_config_overrides(
+                model="test-model",
+                base_url=base_url,
+                auth_command="printf %s token",
+                wire_api="responses",
+                arcaterm_version=version,
+            )
+            self.assertEqual(
+                self._arcaterm_headers(overrides, "omnigent_provider"),
+                {"Databricks-Arcaterm": "ARCATERM_VERSION"} if mapped else None,
+                base_url,
+            )
+
+    def test_clean_codex_env_sets_arcaterm_version_only_when_passed(self):
+        # An inherited ARCATERM_VERSION (e.g. a host daemon started in an Arcaterm
+        # pane) must not leak into every session's codex process.
+        with patch.dict("os.environ", {"ARCATERM_VERSION": "inherited"}):
+            self.assertNotIn("ARCATERM_VERSION", _clean_codex_env())
+            self.assertEqual(
+                _clean_codex_env(arcaterm_version="1.16.0")["ARCATERM_VERSION"], "1.16.0"
+            )
+
     def test_codex_config_overrides_neutralize_toml_breakout(self):
         """A model id full of TOML metacharacters stays a literal string.
 

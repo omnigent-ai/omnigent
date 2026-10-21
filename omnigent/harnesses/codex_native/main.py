@@ -27,6 +27,9 @@ import yaml
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_events import record_startup_event
 from omnigent._wrapper_labels import (
+    ARCATERM_VERSION_LABEL_KEY as _ARCATERM_VERSION_LABEL_KEY,
+)
+from omnigent._wrapper_labels import (
     CODEX_NATIVE_WRAPPER_VALUE as _WRAPPER_LABEL_VALUE,
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
@@ -1182,12 +1185,15 @@ async def _prepare_codex_terminal(
     async with open_server_client(base_url, headers=headers, timeout=timeout) as client:
         bridge_id: str
         thread_id: str | None = None
+        arcaterm_version: str | None = None
         if session_id is None:
             if session_bundle is None:
                 raise click.ClickException("Creating a Codex session requires a session bundle.")
             _update_startup_progress(startup_progress, "Creating Codex session...")
             bridge_id = secrets.token_urlsafe(24)
             session_id = await _create_codex_session(client, session_bundle, bridge_id=bridge_id)
+            # Record arcaterm_version at creation time
+            arcaterm_version = os.environ.get("ARCATERM_VERSION")
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
             payload = await _fetch_codex_session(client, session_id)
@@ -1200,6 +1206,10 @@ async def _prepare_codex_terminal(
                     f"Conversation {session_id!r} is not a codex-native session."
                 )
             bridge_id = str(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
+            # Retrieve arcaterm_version from session labels if present
+            arcaterm_version = (
+                labels.get(_ARCATERM_VERSION_LABEL_KEY) if isinstance(labels, dict) else None
+            )
             existing_terminal = await _find_running_codex_terminal(client, session_id)
             external_session_id = payload.get("external_session_id")
             thread_id = external_session_id if isinstance(external_session_id, str) else None
@@ -1244,7 +1254,11 @@ async def _prepare_codex_terminal(
         # so `omnigent codex` honors the provider selection like the
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
-        _codex_launch = resolve_native_codex_launch(model=model, terminal_launch_args=codex_args)
+        _codex_launch = resolve_native_codex_launch(
+            model=model,
+            terminal_launch_args=codex_args,
+            arcaterm_version=arcaterm_version,
+        )
         if thread_id is not None:
             await _ensure_local_codex_resume_rollout(
                 client,
@@ -1279,6 +1293,7 @@ async def _prepare_codex_terminal(
             ap_auth_headers=headers,
             developer_instructions=developer_instructions,
             terminal_launch_args=codex_args,
+            arcaterm_version=arcaterm_version,
         )
         app_server.listen_url = codex_ws_url
         event_client: CodexAppServerClient | None = None
@@ -1699,6 +1714,9 @@ async def _create_codex_session(
     labels = dict(_SESSION_LABELS)
     if bridge_id is not None:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
+    arcaterm_version = os.environ.get("ARCATERM_VERSION")
+    if arcaterm_version:
+        labels[_ARCATERM_VERSION_LABEL_KEY] = arcaterm_version
     metadata: _JsonObject = {
         "labels": labels,
     }

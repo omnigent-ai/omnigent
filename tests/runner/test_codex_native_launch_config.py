@@ -425,6 +425,33 @@ async def test_bypass_sandbox_defaults_off_unless_label_is_one(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({"omnigent.arcaterm.version": "1.16.0"}, "1.16.0"),
+        ({"omnigent.arcaterm.version": ""}, None),
+        ({}, None),
+        (None, None),
+    ],
+)
+async def test_arcaterm_version_comes_from_the_session_label(
+    monkeypatch: pytest.MonkeyPatch, labels: Any, expected: str | None
+) -> None:
+    """
+    A terminal launch from an Arcaterm pane stamps its version on the session.
+
+    The runner hands it to the Codex app-server as ``ARCATERM_VERSION``, so only
+    sessions launched from Arcaterm carry the ``Databricks-Arcaterm`` header.
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    snapshot: dict[str, Any] = {"workspace": "/tmp/repo"}
+    if labels is not None:
+        snapshot["labels"] = labels
+    cfg = await _run(_Client(_Resp(200, snapshot)))
+    assert cfg.arcaterm_version == expected
+
+
+@pytest.mark.asyncio
 async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) -> None:
     """A first-attempt read timeout is retried, and a follow-up 200 succeeds.
 

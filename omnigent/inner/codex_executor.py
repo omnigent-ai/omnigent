@@ -703,7 +703,10 @@ async def _create_subprocess_exec(
     )
 
 
-def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
+def _clean_codex_env(
+    extra_allow: Iterable[str] = (),
+    arcaterm_version: str | None = None,
+) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
 
@@ -723,6 +726,11 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     with ``launch_mode=omni``. Exporter endpoints and credentials remain filtered;
     Codex's own telemetry configuration controls whether and where it exports.
 
+    :param extra_allow: Additional environment variable names to allow through
+        the filter.
+    :param arcaterm_version: If provided, ``ARCATERM_VERSION`` is set in the
+        environment to this value for Arcaterm-originated sessions. ``None``
+        omits it.
     :returns: Filtered environment dict.
     """
     env = clean_agent_env(
@@ -752,6 +760,8 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
         if attribute.strip() and attribute.partition("=")[0].strip() != "launch_mode"
     ]
     env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join([*resource_attributes, "launch_mode=omni"])
+    if arcaterm_version:
+        env["ARCATERM_VERSION"] = arcaterm_version
     return env
 
 
@@ -2191,6 +2201,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    arcaterm_version: str | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2202,10 +2213,14 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
     auth_command_json = json.dumps(auth_command)
+    arcaterm_headers = _arcaterm_env_http_headers(arcaterm_version)
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2219,6 +2234,7 @@ def _databricks_codex_config_overrides(
             f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
+            f"{arcaterm_headers}"
             'wire_api="responses"}'
         ),
     ]
@@ -2230,6 +2246,7 @@ def _provider_codex_config_overrides(
     base_url: str,
     auth_command: str,
     wire_api: str,
+    arcaterm_version: str | None = None,
 ) -> list[str]:
     """Return Codex config overrides routing through a generic provider.
 
@@ -2253,6 +2270,9 @@ def _provider_codex_config_overrides(
         no longer supported``), so a ``"chat"`` value is coerced to
         ``"responses"`` — the only wire codex still speaks — before being
         emitted. See the inline note for the OpenRouter caveat.
+    :param arcaterm_version: Arcaterm version from session metadata if the
+        session was launched from an Arcaterm terminal. ``None`` omits the
+        header.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_provider"
@@ -2267,6 +2287,9 @@ def _provider_codex_config_overrides(
     # request time against a config codex can at least load, instead of failing
     # to start at all.
     effective_wire_api = "responses" if wire_api == "chat" else wire_api
+    arcaterm_headers = (
+        _arcaterm_env_http_headers(arcaterm_version) if _is_databricks_gateway(base_url) else ""
+    )
     overrides: list[str] = []
     if model:
         overrides.append(f"model={json.dumps(model)}")
@@ -2280,6 +2303,7 @@ def _provider_codex_config_overrides(
         f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
         f"refresh_interval_ms={_GATEWAY_AUTH_REFRESH_MS}"
         "},"
+        f"{arcaterm_headers}"
         f'wire_api="{effective_wire_api}"}}'
     )
     return overrides
@@ -2320,6 +2344,39 @@ def _parse_optional_int(value: str | None) -> int | None:
     except ValueError:
         logger.warning("Ignoring invalid integer value %r", value)
         return None
+
+
+def _is_databricks_gateway(base_url: str) -> bool:
+    """Check if a base URL targets the Databricks AI Gateway.
+
+    Matches AWS (.databricks.com), Azure (.azuredatabricks.net), and other
+    Databricks hosts that run an AI Gateway endpoint (/ai-gateway/ path).
+
+    :param base_url: Provider base URL, e.g.
+        ``"https://example.databricks.com/ai-gateway/codex/v1"`` or
+        ``"https://example.azuredatabricks.net/ai-gateway/codex/v1"``.
+    :returns: ``True`` when the base URL is a Databricks AI Gateway endpoint.
+    """
+    has_databricks_host = "databricks" in base_url.lower()
+    has_gateway_path = "/ai-gateway/" in base_url
+    return has_databricks_host and has_gateway_path
+
+
+def _arcaterm_env_http_headers(arcaterm_version: str | None = None) -> str:
+    """Build env_http_headers TOML fragment for Arcaterm integration.
+
+    Returns the env_http_headers fragment for Codex provider config when
+    the session is Arcaterm-originated, enabling Arcaterm traffic
+    identification in the Databricks AI Gateway.
+
+    :param arcaterm_version: Arcaterm version string from session metadata,
+        e.g. ``"1.16.0"``. ``None`` returns empty string.
+    :returns: TOML fragment for env_http_headers, or empty string when
+        arcaterm_version is not provided.
+    """
+    if not arcaterm_version:
+        return ""
+    return 'env_http_headers={Databricks-Arcaterm="ARCATERM_VERSION"},'
 
 
 def _tool_signature(tools: list[ToolSpec]) -> str:
