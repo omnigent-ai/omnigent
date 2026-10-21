@@ -410,6 +410,14 @@ fresh retry can converge. These cases extend the same `shared-client` recipe.
 The component matrix also covers causal offline edits, malformed or stale replies,
 identity changes, cancellation, local writers, sync locking, and outbox limits.
 Its HTTP transport is simulated; the mapped process test covers real transport.
+Prepared host and CLI runner handoffs are disposable: the runner claims its
+private file and host maintenance removes it after process exit. The saved-session
+process journey checks actual runner ownership, cleanup after Stop, and a fresh
+host resuming the unchanged server snapshot. Startup component tests cross a
+reduced legacy file cap without blocking prepared launches and use a real child
+process to verify live files survive while a dead owner's file is reclaimed.
+Legacy unprepared handoffs stay frozen and are never evicted automatically.
+
 Cache schema v4 records the negotiated protocol alongside namespace-bound host
 adoption without creating a CLI login profile. Existing v1–v3 snapshots, receipts
 and queued edits survive upgrade; older clients reject the newer cache version

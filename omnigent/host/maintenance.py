@@ -142,12 +142,18 @@ class HostMaintenanceJanitor:
 
             return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
 
+        async def _reap_preference_handoffs() -> object:
+            from omnigent.preference_runtime_files import prune_runtime_snapshots
+
+            return await _run_sync_stage(prune_runtime_snapshots)
+
         return cls(
             stages=(
                 ("harness_process_orphans", _reap_harness_processes),
                 ("codex_process_registry", _reconcile_codex_processes),
                 ("terminal_orphans", _reap_terminals),
                 ("native_bridge_orphans", _reap_native_bridge_dirs),
+                ("preference_handoffs", _reap_preference_handoffs),
             ),
             lock_path=data_dir().resolve() / "locks" / "host-maintenance.lock",
             stage_skip_reasons={"native_bridge_orphans": {"runner_superseded"}},

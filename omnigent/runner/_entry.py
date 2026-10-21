@@ -1543,6 +1543,9 @@ def create_app(
 
     _terminal_registry = TerminalRegistry(conversation_link_base_url=server_url)
     if not host_owns_global_cleanup:
+        from omnigent.preference_runtime_files import prune_runtime_snapshots
+
+        prune_runtime_snapshots()
         _reaped_terminals = reap_orphaned_terminals()
         if _reaped_terminals:
             _logger.info(
@@ -1736,6 +1739,9 @@ async def _run_tunnel_from_env() -> None:
         )
     )
 
+    from omnigent.preference_runtime_files import claim_runtime_snapshot
+
+    claim_runtime_snapshot()
     server_url = _server_url_from_env()
     auth_token_factory = _make_auth_token_factory()
     # Write the singleton to the canonical module so it is visible to all

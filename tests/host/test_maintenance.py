@@ -19,6 +19,7 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
         "codex_process_registry",
         "terminal_orphans",
         "native_bridge_orphans",
+        "preference_handoffs",
     ]
     assert janitor._stage_skip_reasons == {
         "native_bridge_orphans": frozenset({"runner_superseded"})

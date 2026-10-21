@@ -615,9 +615,14 @@ def test_saved_session_preferences_resume_on_fresh_host(
                     )
                     saved = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
                     assert saved.preference_snapshot == snapshot
-                    handoffs = list(host.home.rglob("preferences/sessions/*.json"))
+                    handoffs = list(
+                        host.home.rglob("preferences/runtime/launch-*/preferences.json")
+                    )
                     assert len(handoffs) == 1
                     assert json.loads(handoffs[0].read_text()) == snapshot
+                    from omnigent.native.owner_claim import read_owner_claim
+
+                    assert read_owner_claim(handoffs[0].parent).pid != host.proc.pid
                     assert (
                         "shared_preferences:"
                         not in (host.home / ".omnigent/config.yaml").read_text()
@@ -625,3 +630,6 @@ def test_saved_session_preferences_resume_on_fresh_host(
                     client.post(
                         f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
                     ).raise_for_status()
+                    poll_until(
+                        lambda path=handoffs[0]: not path.exists(), timeout_s=15, interval_s=0.2
+                    )

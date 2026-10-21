@@ -39,10 +39,16 @@ with jitter and five-second network budgets. Permanent failures retain edits for
 inspection. No preference request is added to message handling.
 
 Session handoffs use owner-only JSON files, bound to workspace/account and
-installation. Their directory admits at most 2,048 snapshots and fails visibly
-when full; discard files only for sessions you no longer intend to resume. It
-never evicts an active session to make room. Reusing a session keeps its frozen
-shared and machine values; project and session choices retain their precedence.
+installation. New host and CLI runner launches use disposable per-runner files;
+the runner claims ownership before startup. Host maintenance (or standalone
+runner startup) removes files only after proving their owner is dead in the same
+boot and PID namespace. Live, unknown and foreign owners are retained. Startup
+also recovers files left by a previous host exit. Saved session preferences in
+the server remain authoritative and can regenerate a handoff on a fresh host.
+
+Legacy unprepared host launches retain their frozen resume files and the 2,048
+snapshot cap; these are never pruned automatically. Reusing a session keeps its
+saved shared and machine values; project and session choices retain precedence.
 
 ## Verification and remaining integration
 

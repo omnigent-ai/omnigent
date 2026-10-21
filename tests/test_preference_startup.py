@@ -359,3 +359,56 @@ async def test_saved_handoff_rejects_changed_intent_and_runner_reuse(
     ):
         with pytest.raises(ValueError):
             PreferenceLaunch.model_validate({**snapshot, "machine": entries})
+
+
+@pytest.mark.asyncio
+async def test_disposable_handoffs_outlive_the_legacy_limit_and_reap_only_dead_owners(
+    startup, tmp_path, monkeypatch
+):
+    from omnigent.cli import _start_cli_runner_process, _stop_cli_runner_process
+    from omnigent.native.owner_claim import read_owner_claim
+    from omnigent.preference_runtime_files import prune_runtime_snapshots, write_runtime_snapshot
+    from omnigent.preference_startup import write_launch_snapshot
+    from tests._helpers.live_server import isolated_process_env
+    from tests._helpers.polling import poll_until_async
+
+    store, connection = startup
+    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+        await connection.workspace().client.sync(http)
+        connection.workspace().client.enqueue(MODEL, "saved")
+        await connection.workspace().client.sync(http)
+    launch = await prepare_preferences(connection)
+    environment = isolated_process_env(tmp_path / "runtime-child", {}, base_env={})
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", environment["OMNIGENT_DATA_DIR"])
+    monkeypatch.setattr("omnigent.preference_startup.MAX_SESSION_SNAPSHOTS", 1)
+    legacy = Path(environment["OMNIGENT_DATA_DIR"]) / "preferences" / "sessions" / "old.json"
+    write_launch_snapshot(legacy, launch)
+    first = write_runtime_snapshot(launch)
+    second = write_runtime_snapshot(launch)
+    assert first != second and prune_runtime_snapshots() == 0
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(first))
+    runner = _start_cli_runner_process(
+        server_url="http://127.0.0.1:1",
+        capture_logs=True,
+        log_dir=tmp_path / "logs",
+        extra_env=environment,
+    )
+    try:
+        handoffs = set(first.parent.parent.glob("launch-*/preferences.json")) - {first, second}
+        assert len(handoffs) == 1
+        handoff = handoffs.pop()
+        assert json.loads(handoff.read_text()) == launch.model_dump(mode="json")
+        await poll_until_async(
+            lambda: (
+                (claim := read_owner_claim(handoff.parent)) is not None
+                and claim.pid == runner.proc.pid
+            ),
+            timeout_s=30,
+            interval_s=0.1,
+        )
+        assert prune_runtime_snapshots() == 0
+    finally:
+        _stop_cli_runner_process(runner.proc, grace_timeout=1.0)
+    assert prune_runtime_snapshots() == 1
+    assert not handoff.exists() and first.exists() and second.exists() and legacy.exists()
+    assert prune_runtime_snapshots() == 0

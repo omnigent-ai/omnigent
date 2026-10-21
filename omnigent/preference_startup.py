@@ -248,9 +248,9 @@ async def host_preference_environment(
         launch = PreferenceLaunch.model_validate(snapshot)
         if owner_user_id is not None and launch.shared.identity.user_id != owner_user_id:
             raise ValueError("Session preferences belong to another account")
-        digest = hashlib.sha256(f"{server_url}\0{session_id}".encode()).hexdigest()
-        path = data_dir() / "preferences" / "sessions" / f"{digest}.json"
-        await asyncio.to_thread(write_launch_snapshot, path, launch)
+        from omnigent.preference_runtime_files import write_runtime_snapshot
+
+        path = await asyncio.to_thread(write_runtime_snapshot, launch)
         return {PREFERENCE_SNAPSHOT_ENV: str(path)}
     connection = await asyncio.to_thread(load_connection, server_url)
     digest = hashlib.sha256(session_id.encode()).hexdigest()
