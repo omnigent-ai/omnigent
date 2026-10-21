@@ -229,9 +229,24 @@ def main() -> int:
     parser.add_argument("--pr-number", type=int, required=True)
     parser.add_argument("--trusted-author", action="append", default=[])
     parser.add_argument("--trusted-successor", action="append", default=[])
+    parser.add_argument(
+        "--check-dependency-reports",
+        action="store_true",
+        help="Validate automatic dependency evidence for Merge Ready; retain human review rules",
+    )
     args = parser.parse_args()
 
+    if args.check_dependency_reports and os.environ.get("DEPENDABOT_AUTOMERGE_MODE") != "merge":
+        print("Automatic dependency reports do not apply in report mode.")
+        return 0
     pull = gh_json(["api", f"repos/{args.repository}/pulls/{args.pr_number}"])
+    if args.check_dependency_reports:
+        if (pull.get("user") or {}).get("login") != "dependabot[bot]":
+            print("Dependency reports do not apply to this author.")
+            return 0
+        if pull["head"]["sha"] != os.environ.get("EXPECTED_HEAD"):
+            print("::error::PR head changed during evaluation")
+            return 1
     reviews = paginated(f"repos/{args.repository}/pulls/{args.pr_number}/reviews")
     commits = paginated(f"repos/{args.repository}/pulls/{args.pr_number}/commits")
     timeline = paginated(f"repos/{args.repository}/issues/{args.pr_number}/timeline")
@@ -255,20 +270,47 @@ def main() -> int:
         os.environ.get("DEPENDABOT_AUTOMERGE_MODE") == "merge"
         and (pull.get("user") or {}).get("login") == "dependabot[bot]"
     ):
-        from dependabot_automerge import evaluate, require_current_candidate, require_reports
-
         try:
+            from dependabot_automerge import evaluate, require_current_candidate, require_reports
+
             candidate = evaluate(
                 args.repository,
                 args.pr_number,
                 os.environ.get("EXPECTED_HEAD") or pull["head"]["sha"],
             )
-            # Native auto-merge also consumes this required check. Grant the
-            # bot exception only after the worker's CI and advisory checks pass.
-            require_reports(args.repository, candidate)
+            # Merge Ready owns the evidence checks; approval only establishes
+            # eligibility for the automatic exemption.
+            if args.check_dependency_reports:
+                require_reports(args.repository, candidate)
             require_current_candidate(args.repository, args.pr_number, candidate)
-        except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as exc:
-            print(f"Dependabot update requires human review: {exc}")
+            if not args.check_dependency_reports:
+                # Invalidate older readiness evidence before granting the
+                # exemption. This workflow's completion refreshes Merge Ready.
+                subprocess.run(
+                    [
+                        "gh",
+                        "api",
+                        f"repos/{args.repository}/statuses/{candidate['head']}",
+                        "-f",
+                        "state=pending",
+                        "-f",
+                        "context=Merge Ready",
+                        "-f",
+                        "description=Rechecking dependency merge readiness",
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                )
+        except (
+            ImportError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OSError,
+            subprocess.CalledProcessError,
+        ) as exc:
+            print(f"Dependabot update requires human review or retry: {exc}")
+            return 1
         else:
             print(f"Dependabot update policy satisfied: {', '.join(candidate['packages'])}")
             return 0
