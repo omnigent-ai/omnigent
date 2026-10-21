@@ -27,9 +27,25 @@ export function newPendingSideChatId(): string {
  * on for all of them. Codex uses its native ephemeral fork
  * (:func:`usesNativeSideChatFork`); the rest fork server-side and run in the
  * parent's workspace. To withhold side chat from a future harness, gate it here.
+ * Whether a *session* that supports side chat can start one right now is a
+ * separate question (:func:`sideChatDisabledReason`).
  */
 export function supportsSideChat(harness: string | null | undefined): boolean {
   return typeof harness === "string" && harness.length > 0;
+}
+
+/**
+ * Why this session can't start a side chat right now, or `undefined` when it
+ * can. A generic side chat is a server-side fork of the parent, so it inherits
+ * the session's fork restriction (`sessionActionRestrictions`); Codex's native
+ * in-process fork never reaches the fork endpoint and stays available.
+ */
+export function sideChatDisabledReason(
+  harness: string | null | undefined,
+  restrictions: { sideChatDisabledReason?: string },
+): string | undefined {
+  if (usesNativeSideChatFork(harness)) return undefined;
+  return restrictions.sideChatDisabledReason;
 }
 
 /**

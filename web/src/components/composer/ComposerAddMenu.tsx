@@ -14,6 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
 
@@ -33,6 +34,7 @@ export function ComposerAddMenu({
   onPlan,
   planActive,
   onSideChat,
+  sideChatDisabledReason,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
 }: {
@@ -53,6 +55,9 @@ export function ComposerAddMenu({
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
+  /** Keeps the side-chat entry listed but disabled, explaining why it can't start
+   *  now. Only takes effect when `onSideChat` is also passed. */
+  sideChatDisabledReason?: string;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
@@ -163,7 +168,11 @@ export function ComposerAddMenu({
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
                   {onSideChat && (
-                    <DropdownMenuItem data-testid="composer-side-chat-action" onSelect={onSideChat}>
+                    <SessionActionMenuItem
+                      data-testid="composer-side-chat-action"
+                      disabledReason={sideChatDisabledReason}
+                      onSelect={onSideChat}
+                    >
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
                       </span>
@@ -171,7 +180,7 @@ export function ComposerAddMenu({
                       <span className="truncate text-xs leading-4 text-muted-foreground">
                         Ask without affecting this conversation
                       </span>
-                    </DropdownMenuItem>
+                    </SessionActionMenuItem>
                   )}
                   {showGoal && (
                     <DropdownMenuItem

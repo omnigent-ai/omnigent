@@ -34,6 +34,9 @@ vi.mock("./hooks/useTerminals", async (importOriginal) => ({
   useCreateTerminal: () => ({ mutate: () => {}, isPending: false, isError: false }),
 }));
 vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined }) }));
+vi.mock("./hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: () => ({}),
+}));
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.

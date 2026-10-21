@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { isSideChatCommand, supportsSideChat, usesNativeSideChatFork } from "./sideChat";
+import {
+  isSideChatCommand,
+  sideChatDisabledReason,
+  supportsSideChat,
+  usesNativeSideChatFork,
+} from "./sideChat";
 
 describe("isSideChatCommand", () => {
   it("matches a /side command with a question", () => {
@@ -36,5 +41,24 @@ describe("usesNativeSideChatFork", () => {
     expect(usesNativeSideChatFork("claude-native")).toBe(false);
     expect(usesNativeSideChatFork("codex-sdk")).toBe(false);
     expect(usesNativeSideChatFork(null)).toBe(false);
+  });
+});
+
+describe("sideChatDisabledReason", () => {
+  const restricted = { sideChatDisabledReason: "Side chat forks this sandbox session." };
+
+  it("passes the server-fork restriction through for generic harnesses", () => {
+    expect(sideChatDisabledReason("claude-native", restricted)).toBe(
+      restricted.sideChatDisabledReason,
+    );
+    expect(sideChatDisabledReason("codex-sdk", restricted)).toBe(restricted.sideChatDisabledReason);
+  });
+
+  it("keeps codex-native available because its fork never reaches the fork endpoint", () => {
+    expect(sideChatDisabledReason("codex-native", restricted)).toBeUndefined();
+  });
+
+  it("leaves an unrestricted generic session available", () => {
+    expect(sideChatDisabledReason("claude-native", {})).toBeUndefined();
   });
 });
