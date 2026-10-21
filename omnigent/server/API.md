@@ -597,6 +597,39 @@ This preserves the existing sessions API contract for clients that
 already uploaded or registered an agent. The response is the full
 `SessionResponse` shape with `id` set to the new conversation id.
 
+  initial_input (object or null)
+    When `/v1/info` advertises `durable_initial_input: true`, managed creates
+    can include one user `message` or SDK skill `slash_command` event. For example:
+    `{"type":"message","data":{"role":"user","content":[{"type":"input_text","text":"Run the tests"}]}}`.
+    The server saves the input before accepting the create (a create whose input
+    can't be saved is refused and leaves no session), then dispatches it
+    through the normal event handler on the replica holding the new host.
+    Closing the creating browser after acceptance does not cancel delivery.
+    Do not also POST that input to `/events`. `initial_items` keeps its existing
+    history-seeding behavior and cannot be combined with `initial_input`.
+    Attribution comes from the authenticated creator; EDIT permission and input
+    policies are checked again at dispatch. Pending input appears in the session
+    snapshot's `pending_inputs`. Additional messages sent to `/events` during
+    startup are also saved and acknowledged immediately, in submission order,
+    unless the launch already failed or the bound host is gone; those take the
+    ordinary error or relaunch path.
+    Up to 100 pending inputs are accepted per session; excess sends are refused.
+
+    Pending messages use the existing conversation items and status fields.
+    SDK dispatch activates them into ordinary history; native transcript echoes
+    replace their pending rows. The normal SDK history recovery is unchanged.
+    A failure before submission retains the saved input for `retry_session`.
+    After native submission, recovery restores receipt matching without resending
+    the prompt: a missing acknowledgement cannot prove it was not executed.
+    `interrupt` and `stop_session` cancel inputs that have not been submitted,
+    keeping them out of runner recovery history and forks.
+
+    To include files, send `multipart/form-data` with the same JSON request in a
+    `metadata` part and repeated `initial_files` file parts. Upload validation,
+    quotas and session file ownership match the ordinary file upload endpoint.
+    Bundled managed creates can also include `initial_input` in their metadata
+    and `initial_files` alongside the agent bundle.
+
   host_type (string, "external" | "managed", default "external")
     How the session's host is obtained. `"external"` (the default,
     and the pre-existing behavior): the session runs on
@@ -981,7 +1014,12 @@ Request body matches `SessionEventInput`:
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
-                                  starting a duplicate task
+                                  starting a duplicate task. Requires
+                                  LEVEL_OWNER or the session's bound
+                                  runner credential, also in batches;
+                                  editors and managers receive `403`.
+                                  Integrations that posted as an editor
+                                  must post as the owner or via the runner.
       - "external_output_text_delta"
                                 — internal terminal-observed assistant
                                   text delta; publishes a transient

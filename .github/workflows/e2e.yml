@@ -23,18 +23,21 @@ on:
     # (rerun-security-gate-run.yml falls back to this trigger). The concurrency
     # group key isolates label events so they never cancel a code-push run.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore:
-      - 'web/**'
-      - 'docs/**'
-      - 'designs/**'
-      - 'CHANGELOG.md'
-      - 'tests/browser_ui/**'
-      - 'tests/e2e_ui/**'
-      - 'tests/scripts/**'
-      - 'tests/github/**'
-      - '.github/scripts/polly-review-*.py'
-      - '.github/workflows/polly-review*.yml'
-      - '.github/workflows/*.js'
+    paths:
+      - '**'
+      - '!web/**'
+      - 'web/package.json'
+      - 'web/electron/package.json'
+      - '!docs/**'
+      - '!designs/**'
+      - '!CHANGELOG.md'
+      - '!tests/browser_ui/**'
+      - '!tests/e2e_ui/**'
+      - '!tests/scripts/**'
+      - '!tests/github/**'
+      - '!.github/scripts/polly-review-*.py'
+      - '!.github/workflows/polly-review*.yml'
+      - '!.github/workflows/*.js'
   workflow_dispatch:
     inputs:
       parallelism:
@@ -74,11 +77,14 @@ jobs:
       (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
   # default; draft PRs resolve to an empty matrix.
   setup:
-    name: E2E scope
+    name: E2E coverage scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -105,7 +111,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           RUN_TESTS: ${{ steps.scope.outputs.e2e }}
-          NUM_SHARDS: ${{ steps.scope.outputs.dependency == 'true' && '2' || '4' }}
+          NUM_SHARDS: "4"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   e2e:
@@ -141,7 +147,6 @@ jobs:
       - name: Run e2e suite
         uses: ./.github/actions/e2e-run
         with:
-          dependency_smoke: ${{ needs.setup.outputs.dependency }}
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
           parallelism: ${{ github.event.inputs.parallelism || '2' }}

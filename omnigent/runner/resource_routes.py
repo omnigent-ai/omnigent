@@ -62,6 +62,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -119,6 +120,7 @@ def register_resource_routes(
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _rebind_claude_bridge: Callable[[str, str], Coroutine[Any, Any, None]],
     _record_session_claude_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None],
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock],
     _repop_pending_cost_popup_on_attach: Callable[[str, str, str], Coroutine[Any, Any, None]],
@@ -396,6 +398,7 @@ def register_resource_routes(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                rebind_bridge=_rebind_claude_bridge,
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -647,12 +650,9 @@ def register_resource_routes(
         for a crashed pane) always restarts a fresh TUI. Either way the prior
         turns are guaranteed only in the server transcript.
 
-        Detection has two layers: (1) the reaper POPPING the registry entry
-        when it reaps (``registry.close()`` -> ``get()`` returns ``None``),
-        and (2) an ``is_alive()`` probe when the registry entry exists, catching
-        crashed-but-registered panes (tmux killed externally without
-        ``close()``). The probe runs only when a turn arrives, not on a
-        poll. Every native short-name this can target has a matching
+        Detect missing or dead panes and owned Codex panes whose app-server
+        stopped. Probe only when a turn arrives, not on a poll. Every native
+        short-name this can target has a matching
         ``ensure_native_terminal`` branch in ``create_session_terminal``
         (kept in lockstep with ``harness_aliases.NATIVE_HARNESSES``).
         """
@@ -663,9 +663,20 @@ def register_resource_routes(
         if terminal_registry is None:
             return
         instance = terminal_registry.get(conv_id, terminal_name, "main")
-        if instance is not None:
-            if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
+        if instance is not None and await instance.is_alive():
+            if terminal_name != "codex":
+                return
+            terminal_id = terminal_resource_id("codex", "main")
+            if (
+                resource_registry.terminal_resource_role(conv_id, terminal_id)
+                != CODEX_NATIVE_TERMINAL_ROLE
+            ):
+                return
+            resource = await resource_registry.get_terminal_resource(conv_id, terminal_id)
+            if resource is None or _is_runner_owned_codex_terminal(resource_registry, resource):
+                return
+            # The terminal ensure rechecks ownership under its launch lock.
+        elif instance is not None:
             _logger.info(
                 "native pane registered but dead for conv=%s harness=%s; closing stale entry",
                 conv_id,
@@ -1018,6 +1029,34 @@ def register_resource_routes(
             before=before,
             order=order,
         )
+
+    @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search")
+    async def search_environment_content(
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        include: str = Query(default="", max_length=4096),
+        exclude: str = Query(default="", max_length=4096),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> JSONResponse:
+        """Search live file contents inside the session's environment."""
+        from omnigent.runner.content_search import search_content
+
+        agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        result = await search_content(
+            env,
+            q,
+            case_sensitive=case_sensitive,
+            regex=regex,
+            include=include,
+            exclude=exclude,
+            limit=limit,
+        )
+        return JSONResponse(result)
 
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/search")
     async def search_environment_files(
@@ -1378,6 +1417,23 @@ def register_resource_routes(
             account=body.get("account"),
             remote=body.get("remote"),
             pr_url=body.get("pr_url"),
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/labels")
+    async def read_github_labels(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "pr_labels", pr_url=pr_url)
+
+    @app.post("/v1/sessions/{session_id}/resources/github/labels")
+    async def update_github_labels_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "update_pr_labels",
+            pr_url=body["pr_url"],
+            add=body.get("add", []),
+            remove=body.get("remove", []),
         )
 
     @app.get(

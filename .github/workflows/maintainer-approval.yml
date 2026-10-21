@@ -23,7 +23,7 @@ name: Maintainer Approval
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -40,6 +40,8 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
+      checks: read
+      statuses: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

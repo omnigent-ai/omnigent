@@ -56,6 +56,11 @@ def read_file(repository: str, sha: str, path: str) -> str:
     return base64.b64decode(blob["content"]).decode()
 
 
+def main_head(repository: str) -> str:
+    # A PR's base.sha can lag the live target branch.
+    return gh_json(["api", f"repos/{repository}/git/ref/heads/main"])["object"]["sha"]
+
+
 def evaluate(
     repository: str, number: int, expected_head: str | None = None, *, for_scan: bool = False
 ) -> dict:
@@ -67,7 +72,7 @@ def evaluate(
     )
     require(pull["head"]["repo"]["full_name"] == repository, "Fork PR requires review")
     require(pull["base"]["ref"] == "main", "Only main is covered by auto-merge")
-    head, base = pull["head"]["sha"], pull["base"]["sha"]
+    head, base = pull["head"]["sha"], main_head(repository)
     require(expected_head is None or head == expected_head, "PR head changed during evaluation")
     labels = {label["name"] for label in pull["labels"]}
     require(
@@ -104,7 +109,7 @@ def evaluate(
         if for_scan
         else evaluate_changes(read, paths, policy)
     )
-    return dict(decision, head=head, base=base)
+    return dict(decision, number=number, head=head, base=base)
 
 
 def require_advisory_policy(
@@ -175,6 +180,13 @@ def require_approval(repository: str, candidate: dict, mode: str) -> None:
     raise NeedsReview("Refreshed Maintainer Approval; waiting for the next sweep")
 
 
+def required_workflows(candidate: dict) -> set[str]:
+    workflows = set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}
+    if candidate["ecosystem"] in {"python", "github-actions"}:
+        workflows.add("windows.yml")
+    return workflows
+
+
 def require_reports(repository: str, candidate: dict) -> None:
     head = candidate["head"]
     # Merge Ready is a commit status, unlike the workflow job check runs.
@@ -195,7 +207,7 @@ def require_reports(repository: str, candidate: dict) -> None:
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
     policy = json.loads(POLICY.read_text())
-    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
+    for workflow in sorted(required_workflows(candidate)):
         latest, jobs = latest_workflow(repository, head, workflow)
         require(
             latest["head_sha"] == head
@@ -203,18 +215,58 @@ def require_reports(repository: str, candidate: dict) -> None:
             and latest["conclusion"] == "success",
             f"Latest {workflow} run did not succeed",
         )
-        required_jobs = (
+        require(
+            any(
+                pull.get("number") == candidate["number"]
+                and pull.get("head", {}).get("sha") == head
+                and pull.get("base", {}).get("sha") == candidate["base"]
+                for pull in latest.get("pull_requests", [])
+            ),
+            f"{workflow}: CI did not test the current PR head and base; rebase the PR",
+        )
+        target_jobs = (
+            policy.get("cargo", {})
+            .get("targets", {})
+            .get(candidate["target"], {})
+            .get("workflow_test_jobs", {})
+            if candidate["ecosystem"] == "cargo"
+            else {}
+        )
+        required_jobs = target_jobs.get(workflow) or (
             policy["dependency_workflow_test_jobs"]
             .get(candidate["ecosystem"], {})
             .get(workflow, policy["workflow_test_jobs"][workflow])
         )
-        # Older heads ran the full Python matrix before scope selection existed.
-        if required_jobs == ["CI scope"] and not any(job["name"] == "CI scope" for job in jobs):
-            required_jobs = policy["workflow_test_jobs"][workflow]
+        # Require coverage markers so incomplete runs cannot satisfy the gate.
+        coverage_marker = {
+            "ci.yml": "CI coverage scope",
+            "e2e.yml": "E2E coverage scope",
+            "e2e-ui.yml": "UI coverage scope",
+            "web-tests.yml": "Web coverage scope",
+        }.get(workflow)
+        if coverage_marker and candidate["ecosystem"] in {
+            "python",
+            "npm",
+            "cargo",
+            "github-actions",
+        }:
+            require(
+                any(
+                    job["name"] == coverage_marker and job["conclusion"] == "success"
+                    for job in jobs
+                ),
+                f"{workflow}: waiting for successful {coverage_marker}",
+            )
         for pattern in required_jobs:
             matching = [job for job in jobs if fnmatch.fnmatchcase(job["name"], pattern)]
+            # The CI aggregate checks every selected matrix leg; unrelated
+            # Rust/parity jobs may intentionally skip on a Python update.
+            aggregate_matrix = workflow == "ci.yml" and pattern == "Pytest (*)"
+            allowed = {"success", "skipped"} if aggregate_matrix else {"success"}
             require(
-                bool(matching) and all(job["conclusion"] == "success" for job in matching),
+                bool(matching)
+                and any(job["conclusion"] == "success" for job in matching)
+                and all(job["conclusion"] in allowed for job in matching),
                 f"{workflow}: waiting for successful {pattern} jobs",
             )
         completed_runs[workflow] = latest
@@ -239,12 +291,15 @@ def require_reports(repository: str, candidate: dict) -> None:
         ["api", f"repos/{repository}/actions/runs/{trivy_run['id']}/artifacts?per_page=100"]
     )
     require(artifacts["total_count"] <= 100, "Trivy artifact listing is incomplete")
+    target = candidate["target"]
+    scope = "dev-tools" if target.startswith("dev/") else "repository"
+    report_target = target.removeprefix("dev/") if scope == "dev-tools" else target
     reports = [
         a
         for a in artifacts["artifacts"]
-        if a["name"] == "trivy-cve-report-repository" and not a["expired"]
+        if a["name"] == f"trivy-cve-report-{scope}" and not a["expired"]
     ]
-    require(len(reports) == 1, "Missing or ambiguous Trivy repository report")
+    require(len(reports) == 1, f"Missing or ambiguous Trivy {scope} report")
     data = subprocess.run(
         ["gh", "api", f"repos/{repository}/actions/artifacts/{reports[0]['id']}/zip"],
         check=True,
@@ -255,11 +310,11 @@ def require_reports(repository: str, candidate: dict) -> None:
             require_advisory_policy(
                 json.loads(archive.read("trivy-results.json")),
                 candidate["packages"],
-                candidate["target"],
+                report_target,
                 candidate["scanner"],
             )
     except (zipfile.BadZipFile, zlib.error) as exc:
-        raise NeedsReview(f"Trivy repository report is unreadable: {exc}") from exc
+        raise NeedsReview(f"Trivy {scope} report is unreadable: {exc}") from exc
 
 
 def latest_workflow(repository: str, head: str, workflow: str) -> tuple[dict, list[dict]]:
@@ -292,7 +347,7 @@ def refresh_failed_gates(repository: str, candidate: dict, mode: str) -> None:
         "Waiting for successful Security Scan",
     )
     refreshed = []
-    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
+    for workflow in sorted(required_workflows(candidate)):
         run, jobs = latest_workflow(repository, candidate["head"], workflow)
         if run["status"] != "completed" or run["conclusion"] != "failure":
             continue
@@ -317,6 +372,30 @@ def refresh_failed_gates(repository: str, candidate: dict, mode: str) -> None:
         )
         refreshed.append(workflow)
     require(not refreshed, f"Refreshed blocked CI: {', '.join(refreshed)}; waiting for next sweep")
+
+
+def require_current_candidate(repository: str, number: int, candidate: dict) -> None:
+    current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
+    require(
+        current["head"]["sha"] == candidate["head"]
+        and current["base"]["ref"] == "main"
+        and main_head(repository) == candidate["base"],
+        "PR or main changed during evaluation",
+    )
+    require(
+        not current["draft"] and current["state"] == "open",
+        "PR is now closed or draft",
+    )
+    require(
+        not {label["name"] for label in current["labels"]}
+        & {"hold-automerge", "skip-security-scan"},
+        "PR was put on hold",
+    )
+    reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
+    require(
+        all(r["state"] != "CHANGES_REQUESTED" for r in latest_decisive_reviews(reviews).values()),
+        "A reviewer has requested changes",
+    )
 
 
 def sweep(repository: str, mode: str) -> None:
@@ -349,33 +428,11 @@ def sweep(repository: str, mode: str) -> None:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
-            require_approval(repository, decision, mode)
             refresh_failed_gates(repository, decision, mode)
             require_reports(repository, decision)
+            require_approval(repository, decision, mode)
             if mode == "merge":
-                current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
-                require(
-                    current["head"]["sha"] == decision["head"]
-                    and current["base"]["sha"] == decision["base"],
-                    "PR changed during evaluation",
-                )
-                require(
-                    not current["draft"] and current["state"] == "open",
-                    "PR is now closed or draft",
-                )
-                require(
-                    not {label["name"] for label in current["labels"]}
-                    & {"hold-automerge", "skip-security-scan"},
-                    "PR was put on hold",
-                )
-                reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
-                require(
-                    all(
-                        r["state"] != "CHANGES_REQUESTED"
-                        for r in latest_decisive_reviews(reviews).values()
-                    ),
-                    "A reviewer has requested changes",
-                )
+                require_current_candidate(repository, number, decision)
                 # No --admin or queued --auto: GitHub enforces required checks
                 # now, against precisely the head whose policy/report we read.
                 subprocess.run(

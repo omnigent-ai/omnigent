@@ -26,6 +26,9 @@ Payload contract:
   ``base_sha``, ``checks`` (``passing``, ``failing``, ``pending``, ``total``,
   and ``runs`` of ``{name, bucket, url}``), ``body``, and ``comments`` of
   ``{author, body, created_at, url}``.
+- With ``label_editing``, the repository's labels are a ``list`` of
+  ``{name, color, description}`` with ``has_more``, and a label edit returns a
+  ``session.github.pr_labels`` with the PR's resulting ``labels``.
 - Changed files are a ``list`` of ``session.github.changed_file`` objects:
   ``path``, ``name``, ``status`` (``created``, ``modified``, ``deleted``, or
   ``renamed``), ``lines_added``, and ``lines_removed``. The PR diff is a
@@ -44,6 +47,8 @@ Additive fields:
   may be null.
 - A comment may carry ``author_id``, the author's stable id on the provider; optional,
   may be null.
+- ``pr`` may carry ``labels`` of ``{name, color, description}``; ``color`` is six
+  lowercase hex digits or null, and ``description`` may be null.
 - A changed file's ``lines_added`` and ``lines_removed`` may be null.
 - Report lookup failures in ``warnings``. Mark incomplete checks/comments with
   ``checks.partial`` / ``comments_partial``; changed files use ``has_more`` or ``warning``.
@@ -68,6 +73,7 @@ INFO_OBJECT = "session.github.info"
 CHANGED_FILE_OBJECT = "session.github.changed_file"
 FILE_DIFF_OBJECT = "session.github.file_diff"
 PR_DIFF_OBJECT = "session.github.pr_diff"
+PR_LABELS_OBJECT = "session.github.pr_labels"
 # Info ``reason`` when no provider recognizes the workspace's git remote.
 UNSUPPORTED_REMOTE = "unsupported_remote"
 # PR diff ``unavailable_reason`` when the PR's repository is not the workspace's.
@@ -88,12 +94,15 @@ class ProviderCapabilities:
     :ivar linked_pr_diff: A PR linked from outside the workspace's repository
         still has a diff; without it :meth:`PullRequestFacet.pr_diff` returns
         ``unavailable_reason: "pr_outside_workspace"`` for such a PR.
+    :ivar label_editing: The user can add and remove the PR's labels through
+        :meth:`PullRequestFacet.repo_labels` and :meth:`PullRequestFacet.edit_labels`.
     """
 
     account_switching: bool
     base_remote_selection: bool
     line_counts: bool
     linked_pr_diff: bool
+    label_editing: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
@@ -300,6 +309,31 @@ class PullRequestFacet(Protocol):
 
         :raises ValueError: When asked for a choice that the provider's
             capabilities exclude.
+        """
+        ...
+
+    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Return the labels the PR's repository offers, as a ``list`` with ``has_more``.
+
+        The orchestrator calls it only with ``label_editing``.
+        """
+        ...
+
+    def edit_labels(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[str],
+        remove: Sequence[str],
+    ) -> dict[str, Any]:
+        """Add and remove existing repository labels on the PR.
+
+        The orchestrator calls it only with ``label_editing``, with disjoint
+        non-empty name lists. Removing a label the PR lacks is not an error.
+
+        :returns: A ``session.github.pr_labels`` with the PR's resulting ``labels``.
+        :raises ValueError: With a user-facing message when the provider refuses.
         """
         ...
 

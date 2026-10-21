@@ -1,11 +1,7 @@
 name: Windows (native)
 
-# Smoke + unit check that omnigent imports, the CLI loads, and the
-# cross-platform process/sandbox primitives work on native Windows. This is a
-# NON-BLOCKING signal while native Windows support stabilizes: it is not wired
-# into merge-ready.yml, and the broader unit sweep runs with continue-on-error
-# so POSIX-only gaps don't gate merges. The hard checks (import, --help, the
-# Windows-support unit tests) must pass.
+# Dependabot Python/Actions merges require the smoke + unit job.
+# The broader unit sweep remains nonblocking while Windows support stabilizes.
 
 on:
   pull_request:
@@ -58,6 +54,9 @@ concurrency:
 jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
     name: Windows scope
@@ -85,7 +84,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -121,7 +120,6 @@ jobs:
           -p no:cacheprovider -q
 
       - name: Broader unit sweep (non-blocking)
-        if: needs.scope.outputs.dependency != 'true'
         continue-on-error: true
         run: >-
           uv run pytest tests/inner tests/runtime/harnesses

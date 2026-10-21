@@ -49,56 +49,6 @@ DEPENDENCY_SCOPES = {
     "deploy/hf-spaces/Dockerfile": "docker",
 }
 
-DEPENDENCY_GROUPS = {
-    "runtime-harnesses",
-    "runtime-policies",
-    "runtime-core",
-    "repl-sdk",
-    "spec-llms",
-    "databricks",
-    "slack",
-    "tools",
-    "inner-rest",
-}
-
-DATABASE_PACKAGES = {
-    "sqlalchemy",
-    "alembic",
-    "psycopg",
-    "psycopg-binary",
-    "pymysql",
-    "sqlalchemy-cockroachdb",
-    "zstandard",
-}
-
-
-def database_changed(paths: set[str], read) -> bool:
-    if any(path.endswith("pyproject.toml") for path in paths):
-        return True
-    if not read or "uv.lock" not in paths:
-        return False
-    packages = []
-    for text in read("uv.lock"):
-        by_name = {}
-        for package in tomllib.loads(text).get("package", []):
-            by_name.setdefault(package["name"], []).append(package)
-        packages.append(by_name)
-    before, after = packages
-    changed = {
-        name for name in before.keys() | after.keys() if before.get(name) != after.get(name)
-    }
-    consumers = set(DATABASE_PACKAGES)
-    pending = list(consumers)
-    while pending:
-        name = pending.pop()
-        for index in packages:
-            for package in index.get(name, []):
-                for dependency in package.get("dependencies", []):
-                    if dependency["name"] not in consumers:
-                        consumers.add(dependency["name"])
-                        pending.append(dependency["name"])
-    return bool(changed & consumers)
-
 
 def pin_only(before: str, after: str, pattern: str) -> bool:
     """Require unchanged surrounding instructions and at least one changed pin."""
@@ -183,29 +133,9 @@ def file_scope(path: str, read=None) -> str:
     return scope
 
 
-def python_matrix(full: bool, backend: bool) -> str:
+def python_matrix(backend: bool) -> str:
     groups = json.loads(Path(__file__).with_name("python-matrix.json").read_text())
-    if not full:
-        groups = [group for group in groups if backend and group["group"] in DEPENDENCY_GROUPS]
-        if backend:
-            groups.append(
-                {
-                    "group": "dependency-adapters",
-                    "paths": "tests/harnesses tests/native",
-                    "dist": "worksteal",
-                }
-            )
-            groups.append(
-                {
-                    "group": "dependency-services",
-                    "paths": "tests/server/test_auth_mode.py tests/server/test_accounts.py "
-                    "tests/server/test_oidc.py tests/server/test_bundles.py tests/test_tls.py "
-                    "tests/db/test_compression.py tests/stores/test_project_store.py "
-                    "tests/stores/test_agent_store.py tests/stores/test_permission_store.py "
-                    "tests/onboarding/sandboxes",
-                }
-            )
-    return json.dumps({"include": groups}, separators=(",", ":"))
+    return json.dumps({"include": groups if backend else []}, separators=(",", ":"))
 
 
 def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str, str]:
@@ -217,9 +147,7 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
     backend = full or bool(scopes & {"python", "actions"})
     ui = (
         "full"
-        if full
-        else "dependency"
-        if scopes & {"python", "javascript", "actions"}
+        if full or scopes & {"python", "javascript", "actions"}
         else "sidecar"
         if "sidecar" in scopes
         else "none"
@@ -227,10 +155,10 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
     return {
         "dependency": str(not full).lower(),
         "backend": str(backend).lower(),
-        "python_matrix": python_matrix(full, backend),
-        "database": str(full or database_changed(paths, read)).lower(),
+        "python_matrix": python_matrix(backend),
+        "database": str(backend).lower(),
         "integration": str(backend).lower(),
-        "e2e": str(backend).lower(),
+        "e2e": str(backend or "javascript" in scopes).lower(),
         "windows": str(backend).lower(),
         "ios": str(
             full
@@ -240,7 +168,7 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
         "web": str(full or bool(scopes & {"javascript", "actions"})).lower(),
         "docker": str(
             full
-            or bool(scopes & {"javascript", "docker", "actions"})
+            or bool(scopes & {"python", "javascript", "docker", "actions"})
             or any(path.endswith("pyproject.toml") for path in paths)
         ).lower(),
         "omnidev": str(full or bool(scopes & {"omnidev", "actions"})).lower(),

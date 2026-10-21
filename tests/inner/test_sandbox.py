@@ -13,10 +13,12 @@ import re
 import shlex
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 
 from omnigent.inner.sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     SandboxPolicy,
     create_exec_launcher,
     run_launcher,
@@ -85,6 +87,24 @@ def test_exec_launcher_accepts_dedicated_scratch_directory(
         assert path.stat().st_mode & 0o777 == 0o700
     finally:
         path.unlink()
+
+
+def test_exec_launcher_freezes_phoenix_proc_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filtered child launcher does not need the Phoenix marker."""
+    captured: list[SandboxPolicy] = []
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type="linux_bwrap")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
+    monkeypatch.setattr(
+        "omnigent.inner.sandbox._launcher_inline_source",
+        lambda _target, resolved, *, cwd=None: captured.append(resolved) or "pass",
+    )
+
+    path = pathlib.Path(create_exec_launcher(sys.executable, policy))
+    path.unlink()
+
+    assert captured[0].bind_host_proc is True
 
 
 def test_run_launcher_emits_logger_checkpoints(caplog) -> None:
@@ -287,10 +307,15 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     """
     policy = _noop_policy()
     policy.spawn_env_allowlist = ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
+    policy.bind_host_proc = True
 
     decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
 
     assert decoded.spawn_env_allowlist == ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
+    assert decoded.bind_host_proc is True
+    assert SandboxPolicy.from_jsonable({}).bind_host_proc is None
+    assert SandboxPolicy.from_jsonable({"bind_host_proc": "false"}).bind_host_proc is None
+    assert SandboxPolicy.from_jsonable({"bind_host_proc": False}).bind_host_proc is False
     # Old payloads (no key) and unset policies must decode to None —
     # "no prune", not "prune everything".
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
@@ -476,6 +501,47 @@ def test_exec_launcher_prunes_inherited_env_to_spawn_allowlist(tmp_path) -> None
     assert child_env.get("PATH") == os.environ["PATH"]
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="bubblewrap is Linux-only")
+def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proc choice survives launcher environment pruning."""
+    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox._LAKEBOX_MARKER", tmp_path / "absent")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
+    monkeypatch.setattr(
+        "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name: "/usr/bin/bwrap"
+    )
+    policy = BwrapSandboxBackend().resolve(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        tmp_path,
+    )
+    policy = dataclasses.replace(policy, spawn_env_allowlist=["PATH"])
+    raw = json.dumps(policy.to_jsonable(), separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    captured: list[str] = []
+
+    def _capture_exec(_file: str, argv: list[str]) -> None:
+        captured.extend(argv)
+        raise SystemExit
+
+    monkeypatch.setattr("omnigent.inner.sandbox.create_private_tmpdir", lambda: scratch)
+    monkeypatch.setattr(os, "execvp", _capture_exec)
+
+    with mock.patch.dict(os.environ):
+        with pytest.raises(SystemExit):
+            run_launcher(encoded, sys.executable, ["-c", "pass"], cwd=str(tmp_path))
+        assert HOST_SANDBOX_BACKEND_ENV not in os.environ
+    assert any(
+        captured[index : index + 3] == ["--bind", "/proc", "/proc"]
+        for index in range(len(captured) - 2)
+    )
+
+
 def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     """A policy with ``spawn_env_allowlist=None`` (spawner didn't opt
     in) must NOT prune — existing launcher users (claude-sdk, terminal)
@@ -492,7 +558,11 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "DELIBERATE_EXTRA": "kept"},
+            env={
+                **os.environ,
+                "DELIBERATE_EXTRA": "kept",
+                HOST_SANDBOX_BACKEND_ENV: "phoenix-kubernetes",
+            },
         )
     finally:
         with contextlib.suppress(OSError):
@@ -502,6 +572,7 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     child_env = json.loads(out_file.read_text())
     # Opt-in contract: no allowlist, no prune.
     assert child_env.get("DELIBERATE_EXTRA") == "kept"
+    assert child_env[HOST_SANDBOX_BACKEND_ENV] == "phoenix-kubernetes"
 
 
 def _read_launcher(target: str) -> tuple[str, str]:

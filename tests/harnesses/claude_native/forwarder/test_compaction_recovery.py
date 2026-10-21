@@ -1039,7 +1039,10 @@ async def test_snapshot_failure_retries_and_can_recover(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_failure_backoff_does_not_repeat_read(tmp_path: Path) -> None:
+@pytest.mark.parametrize("status_post_fails", [False, True])
+async def test_snapshot_failure_backoff_does_not_repeat_read(
+    tmp_path: Path, status_post_fails: bool
+) -> None:
     bridge_dir = tmp_path / "bridge"
     await forwarder._note_precompact(
         bridge_dir, claude_session_id="claude-1", transcript_path=None
@@ -1048,10 +1051,17 @@ async def test_snapshot_failure_backoff_does_not_repeat_read(tmp_path: Path) -> 
     persist = AsyncMock(
         side_effect=forwarder._CompactionSnapshotError("Transcript is still incomplete")
     )
-    with patch.object(forwarder, "_persist_native_compaction_item", persist):
+    post_status = AsyncMock(
+        side_effect=[httpx.ConnectError("Unavailable"), None] if status_post_fails else None
+    )
+    client = AsyncMock()
+    with (
+        patch.object(forwarder, "_persist_native_compaction_item", persist),
+        patch.object(forwarder, "_post_external_compaction_status", post_status),
+    ):
         for _ in range(2):
             handled = await forwarder._handle_compact_summary_item(
-                AsyncMock(),
+                client,
                 session_id="conv_snapshot_backoff",
                 bridge_dir=bridge_dir,
                 item=_compact_summary_item(),
@@ -1059,7 +1069,54 @@ async def test_snapshot_failure_backoff_does_not_repeat_read(tmp_path: Path) -> 
             )
             assert handled is False
 
-    assert persist.await_count == 1
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": "SessionStart", "source": "compact", "session_id": "claude-1"},
+        )
+        state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=False, session_id="conv_snapshot_backoff"
+        )
+
+        async def poll_hooks() -> forwarder.HookForwardState:
+            return await forwarder._forward_available_status_events(
+                client=client,
+                session_id="conv_snapshot_backoff",
+                bridge_dir=bridge_dir,
+                state=state,
+                retry_tracker=tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+                task_subjects={},
+                task_statuses={},
+                task_order=[],
+            )
+
+        for _ in range(3):
+            state = await poll_hooks()
+            assert state.event_cursor == 0
+        assert persist.await_count == 1
+        status_attempts = 2 if status_post_fails else 1
+        assert post_status.await_count == status_attempts
+        post_status.side_effect = None
+
+        # Restart with the saved cursor and a fresh retry tracker.
+        state = await forwarder._ensure_hook_state(
+            bridge_dir, start_at_end=True, session_id="conv_snapshot_backoff"
+        )
+        tracker = forwarder._PostRetryTracker(base_delay_s=60, max_delay_s=60)
+        state = await poll_hooks()
+        assert state.event_cursor == 0
+        assert persist.await_count == 2
+        assert post_status.await_count == status_attempts
+
+        # Replacing the hook at the same cursor must not suppress its status.
+        (bridge_dir / "hooks.jsonl").write_text("", encoding="utf-8")
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": "SessionStart", "source": "compact", "session_id": "claude-2"},
+        )
+        await poll_hooks()
+        assert post_status.await_count == status_attempts + 1
+
     assert forwarder._read_compaction_state(bridge_dir).pending is not None
 
 
@@ -1131,8 +1188,10 @@ async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
             raise forwarder._CompactionSnapshotError("Invalid metadata")
 
     persist = AsyncMock(side_effect=persist_with_fallback)
+    post_status = AsyncMock()
     client = AsyncMock()
     hook_state = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+    dedupe = forwarder._ForwardDedupeState()
 
     async def hook_once() -> forwarder.HookForwardState:
         return await forwarder._forward_available_status_events(
@@ -1142,7 +1201,7 @@ async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
             state=hook_state,
             retry_tracker=hook_tracker,
             compaction_retry_tracker=tracker,
-            dedupe=forwarder._ForwardDedupeState(),
+            dedupe=dedupe,
             task_subjects={},
             task_statuses={},
             task_order=[],
@@ -1150,7 +1209,7 @@ async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
 
     with (
         patch.object(forwarder, "_persist_native_compaction_item", persist),
-        patch.object(forwarder, "_post_external_compaction_status", AsyncMock()),
+        patch.object(forwarder, "_post_external_compaction_status", post_status),
     ):
         for attempt in range(forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES):
             if first_path == "transcript" or (first_path == "alternating" and attempt % 2 == 0):
@@ -1188,6 +1247,9 @@ async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
             )
         assert persist.await_count == forwarder._COMPACTION_SNAPSHOT_MAX_FAILURES
 
+    post_status.assert_awaited_once_with(
+        client, session_id="conv_snapshot_exhausted", status="completed"
+    )
     assert all(
         call.kwargs.get("json", {}).get("type") != "compaction"
         for call in client.post.call_args_list
@@ -1196,7 +1258,10 @@ async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
         bridge_dir, claude_session_id="claude-1", transcript_path=None
     )
     successful = _persist_mock()
-    with patch.object(forwarder, "_persist_native_compaction_item", successful):
+    with (
+        patch.object(forwarder, "_persist_native_compaction_item", successful),
+        patch.object(forwarder, "_post_external_compaction_status", post_status),
+    ):
         assert await forwarder._handle_compact_summary_item(
             client,
             session_id="conv_snapshot_exhausted",
@@ -1205,6 +1270,13 @@ async def test_exhausted_snapshot_uses_fallback_and_next_cycle_recovers(
             retry_tracker=item_tracker,
             compaction_retry_tracker=tracker,
         )
+        record_hook_event(
+            bridge_dir,
+            {"hook_event_name": "SessionStart", "source": "compact", "session_id": "claude-1"},
+        )
+        hook_state = await hook_once()
+        assert hook_state.event_cursor == 2
+        assert post_status.await_count == 2
     successful.assert_awaited_once()
     recovered = forwarder._read_compaction_state(bridge_dir)
     assert recovered.persisted_seqs == (1, 2)

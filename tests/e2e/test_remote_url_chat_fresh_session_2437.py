@@ -5,7 +5,7 @@ agents registered, so the CLI has no local bundle to upload.  Session
 creation must therefore bind by ``agent_id`` through the JSON
 ``POST /v1/sessions`` route rather than the multipart bundle route.
 
-Three paths are covered:
+The following paths are covered:
 
 1. **Interactive fresh session.** ``_SessionsChatReplAdapter`` with
    ``session_bundle=None`` resolves the registered ``agent_id`` and creates
@@ -15,6 +15,11 @@ Three paths are covered:
 3. **Headless ``-p``.** ``_query_sessions_once`` with ``session_bundle=None``
    goes through the sessions API rather than the removed legacy
    ``/v1/responses`` endpoint.
+4. **Fresh server.** Agent discovery and the ``omnigent run --server`` one-shot
+   work against a server whose agents are registered but which has no
+   sessions yet, and a server without an online runner fails cleanly.
+5. **Connected host.** Both the one-shot CLI and the interactive terminal
+   launch a runner on this machine's host when no matching runner is online.
 
 Run locally (mock LLM, no real API key needed)::
 
@@ -25,6 +30,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +41,13 @@ import pytest
 import yaml as _yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.host import isolated_host
+from tests._helpers.live_server import (
+    isolated_local_server,
+    isolated_process_env,
+)
+from tests._helpers.polling import poll_until
+from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     find_free_port,
@@ -180,6 +194,9 @@ def _assistant_text(base_url: str, session_id: str) -> str:
 
 def test_repl_adapter_creates_session_without_bundle(
     registered_agent_server: _RegisteredAgentServer,
+    tmp_path: Path,
+    mock_llm_server_url: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The REPL adapter creates a session by agent_id when it has no bundle.
 
@@ -194,15 +211,40 @@ def test_repl_adapter_creates_session_without_bundle(
     """
     from omnigent_client import OmnigentClient
 
+    from omnigent.chat import _bundle_agent, _pick_agent
     from omnigent.repl._repl import _SessionsChatReplAdapter
 
     server = registered_agent_server
+    registered_id = server.agent_id()
+    local_spec = _write_agent_yaml(
+        tmp_path,
+        agent_name=server.agent_name,
+        model="mock-unused-upload",
+        mock_llm_server_url=mock_llm_server_url,
+    )
+    with server.client() as http:
+        uploaded = post_session_bundle(
+            http.post,
+            "/v1/sessions",
+            _bundle_agent(local_spec),
+            headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        assert uploaded.json()["agent_id"] != registered_id
+    monkeypatch.setattr("click.prompt", lambda *_args, **_kwargs: server.agent_name)
+    selected = _pick_agent(server.base_url)
+    assert selected.id == registered_id
+
+    async def _unexpected_lookup(_name: str) -> object:
+        raise AssertionError("the selected catalog entry must not be resolved again")
 
     async def _drive() -> str:
         async with OmnigentClient(base_url=server.base_url) as client:
+            monkeypatch.setattr(client.sessions, "resolve_agent", _unexpected_lookup)
             adapter = _SessionsChatReplAdapter(
                 client=client,
                 agent_name=server.agent_name,
+                registered_agent=selected,
                 session_bundle=None,
                 session_id=None,
                 runner_id=None,
@@ -488,3 +530,253 @@ def test_runner_adoption_matches_harness_aliases(agent_harness: str, advertised:
     assert asyncio.run(_resolve(lambda name: canonicalize_harness(name) or name)) == "r1"
     # Without canonicalization the alias would not match at all — the bug this guards.
     assert asyncio.run(_resolve(None)) is None
+
+
+# ---------------------------------------------------------------------------
+# Fresh server: registered agents, no sessions yet
+# ---------------------------------------------------------------------------
+
+_NO_SESSIONS_ERROR = "No sessions found on the server"
+_STALE_HOST_HINT = "stale host processes may be the cause"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _run_cli(home: Path, *args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
+    """Run ``omnigent <args>`` headlessly with CLI state isolated under *home*.
+
+    Enters through ``main()`` like the ``omnigent`` console script, so the
+    top-level error handling (hints, crash screen) is part of what is observed.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    # Strip ambient OMNIGENT_* settings so an outside config cannot steer the run.
+    env = isolated_process_env(home, {"TERM": "dumb"}, None)
+    return subprocess.run(
+        [sys.executable, "-c", "from omnigent.cli import main\n\nmain()\n", *args],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _session_count(base_url: str) -> int:
+    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+        resp = client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
+        resp.raise_for_status()
+        return len(resp.json()["data"])
+
+
+def test_run_one_shot_on_fresh_server_asks_for_agent_then_answers_with_it(
+    registered_agent_server: _RegisteredAgentServer,
+    tmp_path: Path,
+) -> None:
+    """Headless ambiguity fails without creating a session; an explicit agent replies.
+
+    Used and never-used registrations remain discoverable afterward.
+    """
+    server = registered_agent_server
+    with server.client() as client:
+        agents = client.get("/v1/agents", params={"limit": 1000}).json()["data"]
+    unused_name = next(a["name"] for a in agents if a["name"] != server.agent_name)
+    assert _session_count(server.base_url) == 0
+
+    proc = _run_cli(tmp_path / "cli-home", "run", "--server", server.base_url, "-p", "hi")
+    output = proc.stdout + proc.stderr
+
+    assert _NO_SESSIONS_ERROR not in output, output
+    assert _STALE_HOST_HINT not in output, output
+    assert "Aborted!" not in output, output
+    assert "Traceback (most recent call last)" not in output, output
+    assert proc.returncode != 0, output
+    assert "--agent <name>" in output, output
+    assert server.agent_name in output, output
+    assert _session_count(server.base_url) == 0
+
+    proc = _run_cli(
+        tmp_path / "cli-home",
+        "run",
+        "--server",
+        server.base_url,
+        "--agent",
+        server.agent_name,
+        "-p",
+        "Say hello briefly.",
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert server.marker in proc.stdout, proc.stdout + proc.stderr
+    with server.client() as client:
+        runners = client.get("/v1/runners").json()["data"]
+    assert any(r["runner_id"] == server.runner_id and r["online"] for r in runners)
+    assert _session_count(server.base_url) == 1
+
+    proc = _run_cli(tmp_path / "cli-home", "run", "--server", server.base_url, "-p", "hi")
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "--agent <name>" in output and server.agent_name in output, output
+    assert unused_name in proc.stderr, output
+    assert _session_count(server.base_url) == 1
+
+
+def test_run_one_shot_without_online_runner_fails_cleanly(tmp_path: Path) -> None:
+    """A server with no online runner yields a CLI error, not a crash screen."""
+    with isolated_local_server(
+        tmp_path / "server",
+        extra_args=["--agent", str(_REPO_ROOT / "examples" / "scribe")],
+    ) as base_url:
+        with httpx.Client(base_url=base_url, timeout=30.0) as client:
+            assert client.get("/v1/runners").json()["data"] == []
+
+        proc = _run_cli(
+            tmp_path / "cli-home", "run", "--server", base_url, "--agent", "scribe", "-p", "hi"
+        )
+
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0, output
+    assert "no online runner" in output, output
+    assert "Traceback (most recent call last)" not in output, output
+    assert "crash report" not in output, output
+
+
+# ---------------------------------------------------------------------------
+# Host launch: a connected host but no online runner
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("interactive", [False, True], ids=["one-shot", "interactive"])
+def test_run_launches_a_runner_on_this_machines_host(
+    mock_llm_server_url: str | None,
+    tmp_path: Path,
+    interactive: bool,
+) -> None:
+    """With only a connected host (no runner), the CLI has the server launch one there.
+
+    The CLI and ``omnigent host`` share a home, so the CLI is "this machine's"
+    host. Both entry points must answer through the launched runner. Only the
+    one-shot stops it on exit; interactive runners keep the host-owned lifecycle.
+    """
+    suffix = uuid.uuid4().hex[:6]
+    agent_name = f"host-launch-{suffix}"
+    model = f"mock-{suffix}"
+    marker = f"HOST_LAUNCH_OK_{suffix}"
+    yaml_path = _write_agent_yaml(
+        tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
+    )
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, [{"text": marker}] * 4, key=model)
+    with isolated_local_server(tmp_path / "server", extra_args=["--agent", str(yaml_path)]) as url:
+        with isolated_host(
+            tmp_path / "host",
+            url,
+            command=[
+                sys.executable,
+                "-c",
+                "from omnigent.cli import main\n\nmain()\n",
+                "host",
+                "--server",
+                url,
+                "--no-open",
+                "--non-interactive",
+            ],
+            env={"TERM": "dumb", "OPENAI_API_KEY": "mock-key"},
+        ) as host:
+            with httpx.Client(base_url=url, timeout=10.0) as client:
+                host.wait_online(client, timeout=90.0)
+                assert client.get("/v1/runners").json()["data"] == []
+                registered_id = next(
+                    agent["id"]
+                    for agent in client.get("/v1/agents").json()["data"]
+                    if agent["name"] == agent_name
+                )
+
+                if interactive:
+                    pexpect = pytest.importorskip("pexpect")
+                    config = host.home / ".omnigent" / "config.yaml"
+                    config.write_text(
+                        config.read_text()
+                        + "\nauto_open_conversation: false\ntui:\n  theme: dark\n"
+                    )
+                    env = isolated_process_env(
+                        host.home,
+                        {"TERM": "xterm-256color", "OMNIGENT_NO_UPDATE_CHECK": "1"},
+                        None,
+                    )
+                    with (tmp_path / "repl.log").open("w") as transcript:
+                        child = pexpect.spawn(
+                            sys.executable,
+                            [
+                                "-c",
+                                "from omnigent.cli import main\n\nmain()\n",
+                                "run",
+                                "--server",
+                                url,
+                                "--agent",
+                                agent_name,
+                            ],
+                            env=env,
+                            encoding="utf-8",
+                            dimensions=(40, 120),
+                            timeout=120,
+                        )
+                        child.logfile_read = transcript
+                        try:
+                            child.expect(r"Ctrl.C exit")
+                            child.send("hi\r")
+                            child.expect(marker)
+                            poll_until(
+                                lambda: any(
+                                    session.get("status") == "idle"
+                                    for session in client.get(
+                                        "/v1/sessions", params={"visibility": "all"}
+                                    ).json()["data"]
+                                ),
+                                timeout_s=30.0,
+                            )
+                            child.sendcontrol("d")
+                            child.expect(pexpect.EOF)
+                            child.close()
+                            assert child.exitstatus == 0
+                        finally:
+                            child.close(force=True)
+                else:
+                    proc = _run_cli(
+                        host.home,
+                        "run",
+                        "--server",
+                        url,
+                        "--agent",
+                        agent_name,
+                        "-p",
+                        "hi",
+                        timeout=180.0,
+                    )
+                    output = proc.stdout + proc.stderr
+                    assert proc.returncode == 0, output + host.log_path.read_text()
+                    assert marker in proc.stdout, output
+
+                sessions = client.get(
+                    "/v1/sessions", params={"visibility": "all", "limit": 10}
+                ).json()["data"]
+                assert len(sessions) == 1, sessions
+                assert sessions[0].get("host_id") == host.host_id, sessions
+                assert sessions[0]["agent_id"] == registered_id, sessions
+                assert sessions[0]["workspace"] == os.getcwd(), sessions
+                if interactive:
+                    assert marker in _assistant_text(url, sessions[0]["id"])
+                    assert any(
+                        runner.get("online") for runner in client.get("/v1/runners").json()["data"]
+                    )
+                    response = client.post(
+                        f"/v1/sessions/{sessions[0]['id']}/events",
+                        json={"type": "stop_session", "data": {}},
+                        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+                    )
+                    response.raise_for_status()
+                # The one-shot or the test stops only its own launched runner.
+                poll_until(
+                    lambda: (
+                        not any(r.get("online") for r in client.get("/v1/runners").json()["data"])
+                    ),
+                    timeout_s=60.0,
+                )

@@ -33,7 +33,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonicalize_harness
@@ -45,6 +44,7 @@ from omnigent.harness_availability import (
     HarnessAvailability,
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
+from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -106,12 +106,9 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # an API key in ``~/.kimi-code/config.toml`` (kimi has no login-status probe) —
 # ``kimi_auth_configured`` accepts either. The ``anthropic`` / ``openai``
 # families authenticate via subscription provider config and do not appear here.
-# Each lambda resolves through its module at call time so a test can monkeypatch
-# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_auth_configured``
-# and have the patch take effect without this dict caching the old function
-# object.
+# Resolve Kimi through its module so patches do not leave a cached function here.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
-    GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
+    GEMINI_FAMILY: antigravity_credentials_ready,
     KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 

@@ -209,6 +209,10 @@ def repl_env(
         "OMNIGENT_DATA_DIR": str(config_home),
         "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
         "OMNIGENT_SKIP_ONBOARD": "1",
+        # Test tool callables live in this repo's ``tests`` package.
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")))
+        ),
         # Force ANSI on — pexpect captures everything, stripping
         # happens per-assertion via _strip_ansi.
         "TERM": "xterm-256color",
@@ -445,7 +449,7 @@ def test_repl_single_approval_allows_llm_response(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -541,7 +545,7 @@ def test_repl_refusal_shows_deny_sentinel(
     _configure_mock_text(mock_llm_server_url, ["should not appear"], match="deny-sentinel")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -605,7 +609,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -724,7 +728,7 @@ def test_repl_approve_always_caches_for_later_turns(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -826,7 +830,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_GATE_DIR)],
+        ["run", str(_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -875,18 +879,13 @@ def test_repl_tool_call_refusal_blocks_tool(
     ap_cli: str,
     repl_env: dict[str, str],
     mock_llm_server_url: str,
+    repl_transcript: TextIO,
 ) -> None:
     """
-    TOOL_CALL ASK → explicit decline → turn aborts → tool NEVER runs.
+    Declining a tool call aborts its turn and leaves the REPL usable.
 
-    An explicit refusal (typing "n") now aborts the agent turn rather
-    than feeding a denial marker to the LLM and letting it continue.
-    The tool must never execute: its raw output must not appear in the
-    terminal or reach the mock LLM as a function_call_output.
-
-    The mock LLM is scripted to emit the ``echo`` ``function_call`` so
-    the TOOL_CALL ASK fires. (The follow-up text is never reached: the
-    turn aborts on decline before any second LLM call.)
+    The denied tool's output must never appear in the terminal or reach
+    the model. A separate user prompt must still receive its scripted reply.
     """
     _configure_mock_tool_then_text(
         mock_llm_server_url,
@@ -902,34 +901,39 @@ def test_repl_tool_call_refusal_blocks_tool(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_GATE_DIR)],
+        ["run", str(_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
         timeout=_LAUNCH_TIMEOUT,
     )
+    child.logfile_read = repl_transcript
     try:
         _wait_for_prompt_ready(child, timeout=_LAUNCH_TIMEOUT, welcome_pattern="e2e.tool.gate")
         child.send("testing456" + "\r")
         child.expect("approval required", timeout=45)
         child.send("n" + "\r")
         child.expect("refused", timeout=5)
-        # Turn is now aborted — wait for the REPL to return to idle.
-        _wait_for_turn_complete(child, timeout=30)
-        # The tool must never have run: raw echo output must not appear
-        # anywhere in the terminal buffer captured so far.
-        assert "echo: testing456" not in child.before, (
-            "Raw tool output appeared in REPL despite refusal — the tool "
-            "ran when it must not have."
-        )
-        # The mock LLM must NOT have received a second request carrying a
-        # function_call_output, because the turn was aborted before the
-        # denial reached the LLM.
         joined = _wait_for_function_call_outputs(mock_llm_server_url, timeout=5.0)
         assert "echo: testing456" not in joined, (
-            "Raw tool output leaked to the LLM despite refusal — "
+            "Raw tool output leaked to the LLM despite refusal: "
             f"function_call_outputs: {joined[:800]}"
+        )
+        # A reply to a new turn proves recovery even when the idle toolbar
+        # is repainted in fragments instead of emitting a complete marker.
+        recovery_prompt = "resume-after-tool-refusal"
+        recovery_reply = "RECOVERED_AFTER_TOOL_REFUSAL"
+        configure_mock_llm(mock_llm_server_url, [{"text": recovery_reply}], match=recovery_prompt)
+        child.send(recovery_prompt + "\r")
+        child.expect(recovery_reply, timeout=30)
+        repl_transcript.flush()
+        terminal_output = _strip_ansi(Path(repl_transcript.name).read_text())
+        assert "echo: testing456" not in terminal_output, (
+            "Raw tool output appeared in REPL despite refusal."
+        )
+        assert "tool-call-refuse-followup-marker" not in terminal_output, (
+            "The denied turn continued after refusal."
         )
     finally:
         try:
@@ -1031,7 +1035,7 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_SUBAGENT_GATE_DIR)],
+        ["run", str(_SUBAGENT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1123,7 +1127,7 @@ def test_repl_label_driven_ask_approves(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_LABEL_ASK_GATE_DIR)],
+        ["run", str(_LABEL_ASK_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1207,7 +1211,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_LABEL_ASK_GATE_DIR)],
+        ["run", str(_LABEL_ASK_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1281,7 +1285,7 @@ def test_repl_output_ask_does_not_prompt_in_repl(
     _configure_mock_text(mock_llm_server_url, [reply], match="output-noprompt")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_OUTPUT_GATE_DIR)],
+        ["run", str(_OUTPUT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1344,7 +1348,7 @@ def test_repl_output_ask_passes_reply_through_no_sentinel(
     _configure_mock_text(mock_llm_server_url, [reply], match="output-passthru")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_OUTPUT_GATE_DIR)],
+        ["run", str(_OUTPUT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1439,7 +1443,7 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_RESULT_GATE_DIR)],
+        ["run", str(_TOOL_RESULT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1527,7 +1531,7 @@ def test_repl_tool_result_ask_passes_output_through(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_RESULT_GATE_DIR)],
+        ["run", str(_TOOL_RESULT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1677,7 +1681,7 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_SUBAGENT_TOOL_GATE_DIR)],
+        ["run", str(_SUBAGENT_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",

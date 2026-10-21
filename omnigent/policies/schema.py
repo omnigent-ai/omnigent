@@ -115,6 +115,23 @@ USER_PERIOD_ASK_APPROVED_STATE_KEY = "_policy_user_period_ask_approved_usd"
 SESSION_COST_UNPRICED_APPROVED_KEY = "_policy_cost_unpriced_approved"
 
 
+AUTOMATIC_RUNTIME_STATE_KEYS = frozenset(
+    {
+        "_policy_spawn_bounds_dispatches",
+        "_policy_tool_call_count",
+        "_policy_loop_recent_hashes",
+    }
+)
+
+
+def is_reserved_state_key(key: str) -> bool:
+    """Approval checkpoints require an explicit human approval before writing."""
+    return key.startswith("_policy_") or key in {
+        "subagent_cost_ask_approved_usd",
+        "subagent_cost_over_budget_approved_usd",
+    }
+
+
 class UserDailyCostContext(TypedDict, total=False):
     """The session owner's per-UTC-day LLM cost rollup.
 

@@ -36,7 +36,7 @@ from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
-from omnigent.server.auth import AuthProvider, local_single_user_enabled
+from omnigent.server.auth import AuthProvider
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
@@ -394,7 +394,6 @@ def create_builtin_agents_router(
             },
             415: {"model": ErrorResponse, "description": "A JSON request body is required"},
             422: {"model": ErrorResponse, "description": "Invalid partial configuration"},
-            428: {"model": ErrorResponse, "description": "If-Match is required"},
         },
     )
     async def patch_agent_config(
@@ -404,16 +403,17 @@ def create_builtin_agents_router(
         response: Response,
         if_match: str | None = Header(default=None),
     ) -> AgentConfigObject | JSONResponse:
-        """Patch only supplied fields; require the ETag from GET /agents/{id}/config."""
+        """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
-        if if_match is None:
-            return _config_error(428, "precondition_required", "If-Match is required")
-        if len(request.headers.getlist("if-match")) != 1 or not (
-            len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
-        ):
-            return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
-        if if_match != _config_etag(agent):
-            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
+        if if_match is not None:
+            if len(request.headers.getlist("if-match")) != 1 or not (
+                len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
+            ):
+                return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
+            if if_match != _config_etag(agent):
+                return _config_error(
+                    412, "precondition_failed", "Agent changed; reload before saving"
+                )
         bundle, spec, location = await asyncio.to_thread(configuration, agent, body)
         if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
             raise _too_large()
@@ -543,7 +543,7 @@ def create_builtin_agents_router(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:  # validate_agent_bundle rejects this; narrows the type
             raise OmnigentError("agent spec has no name", code=ErrorCode.INVALID_INPUT)

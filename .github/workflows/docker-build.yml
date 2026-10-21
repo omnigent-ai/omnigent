@@ -55,6 +55,9 @@ jobs:
   # scan before the build runs on their code; trusted authors pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
     name: Docker scope
@@ -115,13 +118,13 @@ jobs:
           echo "prebuilt=$prebuilt" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       # Single-arch (amd64) build, no push. load: true imports the result into
       # the runner's Docker so the smoke step below can run it. Shares the same
       # type=gha cache the publish workflow writes, so warm PRs reuse layers.
       - name: Build server image (amd64, no push)
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -169,7 +172,7 @@ jobs:
 
       - name: Build UBI server image
         if: steps.cloudflare.outputs.ubi == 'true'
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile.ubi

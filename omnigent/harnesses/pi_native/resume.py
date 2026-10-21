@@ -36,6 +36,7 @@ import json
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,6 +201,19 @@ def _interrupted_response_ids(items: list[_JsonObject]) -> set[str]:
     return response_ids
 
 
+def _function_call_names(items: list[_JsonObject]) -> dict[str, str]:
+    """Index named tool calls so rebuilt results retain their tool name."""
+    names: dict[str, str] = {}
+    for item in items:
+        if item.get("type") != "function_call":
+            continue
+        name = item.get("name")
+        call_id = item.get("call_id")
+        if isinstance(name, str) and name and isinstance(call_id, str) and call_id:
+            names.setdefault(call_id, name)
+    return names
+
+
 def pi_session_records_from_session_items(
     items: list[_JsonObject],
     *,
@@ -224,9 +238,11 @@ def pi_session_records_from_session_items(
       adjacent to the message holding its call, which the Anthropic
       tool_use/tool_result pairing contract requires when Pi replays the
       rebuilt history.
-    - ``function_call_output`` -> Pi ``message`` with ``role: "toolResult"``.
-      Only the first output committed for a ``call_id`` is replayed: Anthropic
-      rejects a history with two ``tool_result`` blocks for one ``tool_use``.
+    - ``function_call_output`` -> Pi ``message`` with ``role: "toolResult"``
+      named after its ``function_call``, as Pi itself persists results; Gemini
+      rejects a replayed result whose name is empty. Only the first output
+      committed for a ``call_id`` is replayed: Anthropic rejects a history with
+      two ``tool_result`` blocks for one ``tool_use``.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -263,6 +279,7 @@ def pi_session_records_from_session_items(
     }
     entries: list[_JsonObject] = []
     skip_response_ids = _interrupted_response_ids(items)
+    tool_names = _function_call_names(items)
     replayed_call_ids: set[str] = set()
     group: _AssistantResponseGroup | None = None
 
@@ -302,6 +319,7 @@ def pi_session_records_from_session_items(
                 external_session_id=external_session_id,
                 index=index,
                 timestamp=timestamp,
+                tool_names=tool_names,
             )
             if entry is not None:
                 # Only a replayable entry ends the open response. An item that maps
@@ -426,6 +444,7 @@ def _pi_non_assistant_entry(
     external_session_id: str,
     index: int,
     timestamp: str,
+    tool_names: Mapping[str, str],
 ) -> _JsonObject | None:
     """Convert a user message or tool output item into a Pi session entry.
 
@@ -437,6 +456,8 @@ def _pi_non_assistant_entry(
     :param external_session_id: Pi session id (for synthetic ids).
     :param index: Zero-based index of *item* in the source list.
     :param timestamp: ISO timestamp to stamp on the entry.
+    :param tool_names: Tool name of each ``function_call`` by ``call_id``. A
+        result whose call is absent keeps an empty ``toolName``.
     :returns: Pi entry dict (without ``parentId``, which the caller links), or
         ``None`` for items with no Pi representation.
     """
@@ -481,7 +502,7 @@ def _pi_non_assistant_entry(
             "message": {
                 "role": "toolResult",
                 "toolCallId": call_id,
-                "toolName": "",
+                "toolName": tool_names.get(call_id, ""),
                 "content": [{"type": "text", "text": output}],
                 "isError": False,
                 "timestamp": 0,
