@@ -68,6 +68,7 @@ class OidcLoginManager {
         activity: Activity,
         origin: String,
         onSession: (String) -> Unit,
+        onUpdateRequired: () -> Unit = {},
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
@@ -100,6 +101,14 @@ class OidcLoginManager {
                     }
                 } catch (_: InterruptedException) {
                     // shutdown() interrupted the poll — the host is going away; drop.
+                } catch (_: UpgradeRequiredException) {
+                    main.post {
+                        if (generation == flowGeneration.get() &&
+                            !activity.isFinishing && !activity.isDestroyed
+                        ) {
+                            onUpdateRequired()
+                        }
+                    }
                 } catch (t: Throwable) {
                     authLog("login flow error: ${t.javaClass.simpleName}")
                 } finally {
@@ -140,6 +149,8 @@ class OidcLoginManager {
         val loginUrl: String,
     )
 
+    private class UpgradeRequiredException : Exception()
+
     private fun generateCodeVerifier(): String {
         val bytes = ByteArray(32)
         SecureRandom().nextBytes(bytes)
@@ -171,9 +182,25 @@ class OidcLoginManager {
                     .put("code_challenge_method", "S256")
                     .toString()
             conn.outputStream.use { it.write(body.toByteArray()) }
-            if (conn.responseCode != 200) return null
+            val responseCode = conn.responseCode
+            if (responseCode != 200) {
+                val errorBody =
+                    conn.errorStream
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                        .orEmpty()
+                if (isUpgradeRequiredResponse(
+                        responseCode,
+                        errorBody,
+                    )
+                ) {
+                    throw UpgradeRequiredException()
+                }
+                return null
+            }
             val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             val id = json.optString("ticket").ifEmpty { return null }
+            if (isUpgradeRequiredTicket(id)) throw UpgradeRequiredException()
             val loginUrl = json.optString("login_url").ifEmpty { return null }
             // The browser hand-off must stay on the pinned origin: [start]
             // concatenates this onto it, so only a relative path may pass — an
