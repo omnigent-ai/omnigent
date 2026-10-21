@@ -163,6 +163,97 @@ class MainActivityTest {
     }
 
     @Test
+    fun `legacy ticket browser wait shows the auth handoff instead of slow connecting`() {
+        LocalHttpServer { request ->
+            when (request.path) {
+                "/auth/cli-login" -> {
+                    LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+                }
+
+                "/auth/cli-poll" -> {
+                    LocalHttpServer.Response(202)
+                }
+
+                else -> {
+                    LocalHttpServer.Response(404)
+                }
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread {
+                    activity.declared<ConnectionStatus?>("connectionStatus") is
+                        ConnectionStatus.AuthTabHandoff
+                }
+                assertEquals(
+                    "${server.origin}/auth/login",
+                    shadowOf(activity).nextStartedActivity.dataString,
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10_500))
+                assertTrue(
+                    activity.declared<ConnectionStatus?>("connectionStatus") is
+                        ConnectionStatus.AuthTabHandoff,
+                )
+                assertEquals(
+                    activity.getString(R.string.status_opening_sign_in),
+                    activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+                )
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `legacy ticket network failure shows server unreachable`() {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("http://127.0.0.1:1")
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val webView = activity.webView()
+            webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+            awaitMainThread {
+                activity.declared<ConnectionStatus?>("connectionStatus") is
+                    ConnectionStatus.ServerUnreachable
+            }
+            val status = activity.declared<ConnectionStatus.ServerUnreachable>("connectionStatus")
+            assertEquals("ConnectException", status.details?.error)
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test
+    fun `legacy ticket rejection returns to sign in setup`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(503)
+            } else {
+                LocalHttpServer.Response(404)
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread { activity.isFinishing }
+                assertEquals(
+                    ConnectActivity::class.java.name,
+                    shadowOf(activity).nextStartedActivity.component?.className,
+                )
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
     fun `unreachable server offers retry then a successful commit clears the screen`() {
         var manifestReads = 0
         MainActivity.manifestReader = {
@@ -723,6 +814,30 @@ class MainActivityTest {
     }
 
     @Test
+    fun `legacy page load never resets slow connecting to connecting`() {
+        val activity = launch()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10_500))
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+        val host =
+            Class
+                .forName("ai.omnigent.android.MainActivity\$OidcHost")
+                .getDeclaredConstructor(MainActivity::class.java)
+                .apply { isAccessible = true }
+                .newInstance(activity) as OidcSessionController.Host
+
+        host.loadWithoutNativeSignIn("https://example.com/after-manifest")
+
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+        assertEquals(View.VISIBLE, activity.findViewById<Button>(R.id.status_secondary).visibility)
+    }
+
+    @Test
     fun `night configuration rebinds an expanded failure panel`() {
         val activity = launch()
         val webView = activity.webView()
@@ -753,6 +868,40 @@ class MainActivityTest {
         assertEquals(
             activity.getString(R.string.status_server_unreachable),
             activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+        )
+    }
+
+    @Test
+    fun `old deferred hide cannot expose WebView after configuration failure`() {
+        val activity = launch()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.invoke("hideStatus")
+        val oldOverlay = activity.declared<View>("connectionOverlay")
+        val dark =
+            Configuration(activity.resources.configuration).apply {
+                uiMode =
+                    (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                    Configuration.UI_MODE_NIGHT_YES
+            }
+        activity.onConfigurationChanged(dark)
+        activity.invoke(
+            "showUnreachable",
+            arrayOf(String::class.java, Boolean::class.javaPrimitiveType!!),
+            "ERROR_CONNECT",
+            false,
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+
+        assertNotSame(oldOverlay, activity.declared<View>("connectionOverlay"))
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ServerUnreachable,
+        )
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            activity.webView().importantForAccessibility,
         )
     }
 
@@ -847,6 +996,28 @@ class MainActivityTest {
         webView.webViewClient.onPageStarted(webView, "https://example.com/", null)
         webView.webViewClient.onPageCommitVisible(webView, "https://example.com/")
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+    }
+
+    @Test
+    fun `Databricks App cold start leaves foreign sign-in accessible`() {
+        ServerStore(ApplicationProvider.getApplicationContext())
+            .connect("https://myapp.databricksapps.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = activity.webView()
+        val loginUrl = "https://login.databricks.com/sign-in"
+
+        webView.webViewClient.onPageStarted(webView, loginUrl, null)
+        webView.webViewClient.onPageCommitVisible(webView, loginUrl)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(loginUrl),
+            FakeWebResourceError(-6, "net::ERR_CONNECTION_REFUSED"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10_500))
+
+        assertNull(activity.declared<ConnectionStatus?>("connectionStatus"))
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
     }
 
     @Test
@@ -1271,6 +1442,15 @@ class MainActivityTest {
     private fun launch(): MainActivity {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
         return Robolectric.buildActivity(MainActivity::class.java).setup().get()
+    }
+
+    private fun awaitMainThread(done: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (!done() && System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            Thread.sleep(5)
+        }
+        assertTrue("background result did not reach the main thread", done())
     }
 
     @Suppress("UNCHECKED_CAST")

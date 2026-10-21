@@ -48,6 +48,7 @@ import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.net.URI
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
@@ -351,9 +352,14 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         interactive: Boolean,
     ) {
-        if (serverAuthentication(originOf(serverUrl)) != ServerAuthentication.OIDC) {
+        val authentication = serverAuthentication(originOf(serverUrl))
+        if (authentication != ServerAuthentication.OIDC) {
             oidcSession?.stop()
-            showStatus(ConnectionStatus.Connecting(statusHost()))
+            if (authentication.usesInWebViewAuth) {
+                if (connectionStatus != null) hideStatus()
+            } else {
+                showStatus(ConnectionStatus.Connecting(statusHost()))
+            }
             loadShellPage(retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: serverUrl)
             retryRoute = null
             return
@@ -469,7 +475,11 @@ class MainActivity : AppCompatActivity() {
             val destination = retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: url
             retryRoute = null
             val connecting = ConnectionStatus.Connecting(statusHost())
-            if (connectionStatus != connecting) showStatus(connecting)
+            if (connectionStatus != connecting &&
+                connectionStatus !is ConnectionStatus.ConnectingSlow
+            ) {
+                showStatus(connecting)
+            }
             loadShellPage(destination)
         }
 
@@ -688,8 +698,11 @@ class MainActivity : AppCompatActivity() {
         slowConnection?.let(mainHandler::removeCallbacks)
         slowConnection = null
         connectionStatus = null
-        connectionOverlay.hide {
-            webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        val hidingOverlay = connectionOverlay
+        hidingOverlay.hide {
+            if (connectionOverlay === hidingOverlay && connectionStatus == null) {
+                webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+            }
         }
     }
 
@@ -1242,7 +1255,10 @@ class MainActivity : AppCompatActivity() {
                     retainDetails = expanded,
                 )
             }
-                ?: run { connectionOverlay.visibility = View.GONE }
+                ?: run {
+                    connectionOverlay.visibility = View.GONE
+                    webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+                }
         }
     }
 
@@ -1333,9 +1349,27 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!oidcLoginManager.start(this, origin, ::onSessionToken, onUpdateRequired = {
-                showStatus(ConnectionStatus.UpdateRequired(statusHost()))
-            })
+        if (!oidcLoginManager.start(
+                this,
+                origin,
+                ::onSessionToken,
+                onUpdateRequired = {
+                    showStatus(ConnectionStatus.UpdateRequired(statusHost()))
+                },
+                onBrowserOpened = {
+                    showStatus(ConnectionStatus.AuthTabHandoff(statusHost()))
+                },
+                onTicketFailure = { error ->
+                    if (error is IOException) {
+                        showUnreachable(failureClassName(error))
+                    } else {
+                        returnToSetup(
+                            origin,
+                            OidcSignInException.SignInRefused(statusHost(), null).message,
+                        )
+                    }
+                },
+            )
         ) {
             return
         }

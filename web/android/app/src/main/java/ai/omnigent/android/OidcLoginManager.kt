@@ -91,10 +91,22 @@ class OidcLoginManager {
         origin: String,
         onSession: (String) -> Unit,
         onUpdateRequired: () -> Unit = {},
+        onBrowserOpened: () -> Unit = {},
+        onTicketFailure: (Throwable) -> Unit = {},
     ): Boolean {
         if (!inFlight.compareAndSet(false, true)) return false
         sessionCallback = onSession
         val generation = flowGeneration.incrementAndGet()
+
+        fun postCurrent(action: () -> Unit) {
+            main.post {
+                if (generation == flowGeneration.get() &&
+                    !activity.isFinishing && !activity.isDestroyed
+                ) {
+                    action()
+                }
+            }
+        }
         currentTask =
             io.submit {
                 var token: String? = null
@@ -102,18 +114,18 @@ class OidcLoginManager {
                     val codeVerifier = generateCodeVerifier()
                     val ticket = requestTicket(origin, deriveCodeChallenge(codeVerifier))
                     authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
-                    if (ticket != null) {
-                        main.post {
-                            // Re-check at execution time: the flow may have been
-                            // cancelled/superseded, or the activity torn down,
-                            // while this launch sat in the queue.
-                            if (generation == flowGeneration.get() &&
-                                !activity.isFinishing &&
-                                !activity.isDestroyed
-                            ) {
-                                launchTab(activity, origin + ticket.loginUrl)
+                    if (ticket == null) {
+                        postCurrent {
+                            onTicketFailure(
+                                IllegalStateException("Ticket request rejected"),
+                            )
+                        }
+                    } else {
+                        postCurrent {
+                            if (launchTab(activity, origin + ticket.loginUrl)) {
+                                onBrowserOpened()
                             } else {
-                                authLog("skipping stale browser launch")
+                                onTicketFailure(IllegalStateException("Browser unavailable"))
                             }
                         }
                         token = pollForToken(origin, ticket.id, codeVerifier)
@@ -124,15 +136,10 @@ class OidcLoginManager {
                 } catch (_: InterruptedException) {
                     // shutdown() interrupted the poll — the host is going away; drop.
                 } catch (_: UpgradeRequiredException) {
-                    main.post {
-                        if (generation == flowGeneration.get() &&
-                            !activity.isFinishing && !activity.isDestroyed
-                        ) {
-                            onUpdateRequired()
-                        }
-                    }
+                    postCurrent(onUpdateRequired)
                 } catch (t: Throwable) {
                     authLog("login flow error: ${t.javaClass.simpleName}")
+                    postCurrent { onTicketFailure(t) }
                 } finally {
                     inFlight.set(false)
                 }
@@ -229,7 +236,7 @@ class OidcLoginManager {
     private fun launchTab(
         activity: Activity,
         url: String,
-    ) {
+    ): Boolean {
         // Full system browser (not a Custom Tab): the IdP flow page renders blank
         // in an in-app Custom Tab on some setups but works in the browser. Still
         // RFC 8252 — the system browser is the canonical external user-agent.
@@ -239,7 +246,7 @@ class OidcLoginManager {
                 Intent.ACTION_VIEW,
                 Uri.parse(url),
             ).addCategory(Intent.CATEGORY_BROWSABLE)
-        runCatching { activity.startActivity(intent) }
+        return runCatching { activity.startActivity(intent) }.isSuccess
     }
 
     private fun pollForToken(
