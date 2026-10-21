@@ -116,7 +116,8 @@ ALLOW_SKIP=(
   "Integration (codex)"
 )
 
-is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
+# Consume the full list so pipefail cannot turn an early match into a SIGPIPE failure.
+is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -xF "$1" > /dev/null; }
 
 # A result check may be absent on older workflows, but must run once its
 # selection job is present. An explicit skipped result is never green.
