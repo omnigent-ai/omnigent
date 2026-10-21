@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ProviderConnection
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
-from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
+from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError, build_secret_cipher
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
@@ -357,6 +357,18 @@ class McpRegistry:
                 failure.status_code,
             )
             raise failure from None
+
+
+def build_mcp_registry_from_env(db_uri: str) -> McpRegistry | None:
+    """Build the operator catalog named by ``OMNIGENT_MCP_REGISTRY``, or ``None`` when unset.
+
+    Invalid catalogs and missing ciphers raise so every server entrypoint fails at startup.
+    """
+    config = McpRegistryConfig.from_env()
+    if config is None:
+        return None
+    cipher = build_secret_cipher()
+    return McpRegistry(config, CredentialStore(db_uri, cipher) if cipher else None)
 
 
 class McpOAuthHooks:
