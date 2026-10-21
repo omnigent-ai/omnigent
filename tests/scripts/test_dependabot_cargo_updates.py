@@ -71,6 +71,7 @@ def cargo_update(policy_module, monkeypatch):
             "cargo": {
                 "default": "minor",
                 "manual": ["manual-*"],
+                "zero_minor": ["*"],
                 "targets": copy.deepcopy(TARGETS),
             },
         },
@@ -140,6 +141,58 @@ def test_cargo_keeps_existing_conditional_dependency_resolution(cargo_update, po
         evaluate()
 
 
+@pytest.mark.parametrize("fault", [None, "checksum", "source", "metadata", "multiple"])
+def test_cargo_upgrades_one_version_alongside_retained_sibling(cargo_update, policy_module, fault):
+    state, evaluate = cargo_update
+    for packages in (state["before"], state["after"]):
+        packages[0]["dependencies"][0] = f"anyhow {packages[1]['version']}"
+        packages[0]["dependencies"].append("anyhow 1.0.0")
+        packages.append(
+            {"name": "anyhow", "version": "1.0.0", "source": SOURCE, "checksum": "retained"}
+        )
+    sibling = state["after"][-1]
+    if fault == "multiple":
+        sibling["version"] = "1.0.1"
+    elif fault:
+        sibling[fault] = "changed"
+    if fault:
+        with pytest.raises(policy_module.NeedsReview):
+            evaluate()
+    else:
+        assert evaluate()["packages"] == ["anyhow==1.3.0", "new-leaf==0.8.1"]
+
+
+def test_cargo_zero_minor_with_exact_manifest_pin(cargo_update):
+    state, evaluate = cargo_update
+    for packages, pin in ((state["before"], "0.2.3"), (state["after"], "0.3.0")):
+        packages[1]["version"] = pin
+        packages[4]["dependencies"] = [f"anyhow {pin}"]
+    release = state["registry"].pop("https://crates.io/api/v1/crates/anyhow/1.3.0")
+    release["version"]["num"] = "0.3.0"
+    state["registry"]["https://crates.io/api/v1/crates/anyhow/0.3.0"] = release
+    state["files"][SIDECAR.replace("Cargo.lock", "Cargo.toml")] = (
+        '[dependencies]\nanyhow = "=0.2.3"\n',
+        '[dependencies]\nanyhow = "=0.3.0"\n',
+    )
+    assert "anyhow==0.3.0" in evaluate()["packages"]
+
+
+@pytest.mark.parametrize(
+    "old,new", [("=1.2.2", "=1.3.0"), ("=1.2.3", "=1.3.1"), ("=1.2.3", "^1.3.0")]
+)
+def test_cargo_exact_pin_requires_matching_lock_and_operator(
+    cargo_update, policy_module, old, new
+):
+    state, evaluate = cargo_update
+    state["files"][SIDECAR.replace("Cargo.lock", "Cargo.toml")] = (
+        f'[dependencies]\nanyhow = "{old}"\n',
+        f'[dependencies]\nanyhow = "{new}"\n',
+    )
+    with pytest.raises(policy_module.NeedsReview):
+        evaluate()
+    assert state["calls"] == []
+
+
 @pytest.fixture
 def existing_cargo_edge(cargo_update, request):
     state, evaluate = cargo_update
@@ -166,7 +219,7 @@ def existing_cargo_edge(cargo_update, request):
 
 @pytest.mark.parametrize(
     "existing_cargo_edge",
-    [("1.1.0", "1.0.0"), ("1.0.0", "2.0.0"), ("0.1.0", "0.2.0")],
+    [("1.1.0", "1.0.0"), ("1.0.0", "2.0.0")],
     indirect=True,
 )
 def test_cargo_upgraded_parent_preserves_edge_version_boundaries(
@@ -212,9 +265,7 @@ def test_cargo_validates_newly_consumed_existing_releases(
 
 
 @pytest.mark.parametrize("existing_cargo_edge", [("1.0.0", "1.1.0")], indirect=True)
-@pytest.mark.parametrize(
-    "old_pin,new_pin", [("1.1.0", "1.0.0"), ("1.0.0", "2.0.0"), ("0.1.0", "0.2.0")]
-)
+@pytest.mark.parametrize("old_pin,new_pin", [("1.1.0", "1.0.0"), ("1.0.0", "2.0.0")])
 def test_cargo_checks_existing_edge_descendants(
     existing_cargo_edge, policy_module, old_pin, new_pin
 ):
@@ -362,11 +413,7 @@ def test_cargo_manifest_versions_match_lock_upgrades(
         old,
         old.replace(old_version, new_version),
     )
-    if prefix == "=":
-        with pytest.raises(policy_module.NeedsReview, match="exact version pin"):
-            evaluate()
-    else:
-        assert evaluate()["ecosystem"] == "cargo"
+    assert evaluate()["ecosystem"] == "cargo"
 
 
 def test_cargo_preserves_unchanged_exact_manifest_pins(cargo_update):
@@ -389,10 +436,7 @@ def test_cargo_partial_manifest_versions(cargo_update, policy_module, old_pin, n
         old,
         old.replace(old_pin, new_pin),
     )
-    if old_pin.startswith("="):
-        with pytest.raises(policy_module.NeedsReview, match="exact version pin"):
-            evaluate()
-    elif new_pin == "2":
+    if new_pin == "2":
         with pytest.raises(policy_module.NeedsReview, match="Major"):
             evaluate()
     else:
@@ -491,9 +535,7 @@ def test_cargo_applies_package_policy_to_transitives(
         evaluate()
 
 
-@pytest.mark.parametrize(
-    "old_version,new_version", [("1.2.3", "2.0.0"), ("0.2.3", "0.3.0"), ("1.2.3", "1.2.2")]
-)
+@pytest.mark.parametrize("old_version,new_version", [("1.2.3", "2.0.0"), ("1.2.3", "1.2.2")])
 def test_cargo_rejects_incompatible_upgrades(
     cargo_update, policy_module, old_version, new_version
 ):

@@ -64,7 +64,7 @@ wheels = [{ url = "https://files.pythonhosted.org/helper.whl", hash = "sha256:he
     [
         ("unlisted-library", "1.2.3", "1.5.0", True),
         ("unlisted-library", "0.2.3", "0.2.4", True),
-        ("unlisted-library", "0.2.3", "0.3.0", False),
+        ("unlisted-library", "0.2.3", "0.3.0", True),
         ("unlisted-library", "1.2.3", "2.0.0", False),
         ("unlisted-library", "1.2.3", "1.3.0rc1", False),
         ("unlisted-library", "1.2.3", "1.2.2", False),
@@ -80,6 +80,69 @@ def test_default_updates_and_explicit_exceptions(
     else:
         with pytest.raises(policy_module.NeedsReview):
             policy_module.package_upgrade(name, old, new, ordinary_policy["python"])
+
+
+@pytest.mark.parametrize("ecosystem", ["python", "npm", "cargo", "actions"])
+def test_zero_minor_policy_is_explicit_and_overridable(policy_module, ordinary_policy, ecosystem):
+    policy = ordinary_policy[ecosystem]
+    policy_module.package_upgrade("ordinary", "0.2.0", "0.3.0", policy)
+    policy["manual"].append("ordinary")
+    with pytest.raises(policy_module.NeedsReview, match="requires human review"):
+        policy_module.package_upgrade("ordinary", "0.2.0", "0.3.0", policy)
+
+
+@pytest.mark.parametrize("pin,allowed", [("1.2.0", True), ("1.0.0", False), ("2.0.0", False)])
+def test_new_parallel_version_preserves_upgrade_policy(
+    policy_module, ordinary_policy, pin, allowed
+):
+    previous = [{"version": "1.1.0"}]
+    current = [*previous, {"version": pin}]
+    if allowed:
+        assert policy_module.package_pairs(
+            "ordinary", previous, current, ordinary_policy["python"]
+        )[-1] == ({}, {"version": pin})
+    else:
+        with pytest.raises(policy_module.NeedsReview):
+            policy_module.package_pairs("ordinary", previous, current, ordinary_policy["python"])
+
+
+@pytest.mark.parametrize("fault", [None, "hash", "source", "metadata", "duplicate", "multiple"])
+def test_upgrading_one_python_resolution_preserves_retained_sibling(
+    policy_module, ordinary_policy, python_graph_lock, fault
+):
+    before = tomllib.loads(python_graph_lock)
+    after = copy.deepcopy(before)
+    after["package"][0]["dependencies"][0]["version"] = "1.0.1"
+    after["package"][-2]["version"] = "1.0.1"
+    sibling = after["package"][-1]
+    if fault == "hash":
+        sibling["wheels"][0]["hash"] = "sha256:wrong"
+    elif fault == "source":
+        sibling["source"] = {"registry": "https://other.example/simple"}
+    elif fault == "metadata":
+        sibling["resolution-markers"] = ["sys_platform == 'linux'"]
+    elif fault == "duplicate":
+        after["package"].append(copy.deepcopy(sibling))
+    elif fault == "multiple":
+        sibling["version"] = "1.2.0"
+    if fault:
+        with pytest.raises(policy_module.NeedsReview):
+            policy_module.lock_changes(before, after, ordinary_policy)
+    else:
+        changes = policy_module.lock_changes(before, after, ordinary_policy)
+        assert {(p["name"], p["version"]) for p in changes} == {("helper", "1.0.1")}
+
+
+@pytest.mark.parametrize("suffix", ["", "; python_version >= '3.12'", ".*", ",<2"])
+def test_python_exact_pins_preserve_requirement_shape(policy_module, ordinary_policy, suffix):
+    before, after = f"ordinary==1.2.0{suffix}", f"ordinary==1.3.0{suffix}"
+    if suffix in {".*", ",<2"}:
+        with pytest.raises(policy_module.NeedsReview):
+            policy_module.python_requirement_upgrade(before, after, ordinary_policy["python"])
+    else:
+        assert policy_module.python_requirement_upgrade(
+            before, after, ordinary_policy["python"]
+        ) == ("ordinary", "==1.2.0", "==1.3.0")
 
 
 @pytest.mark.parametrize(
@@ -206,7 +269,7 @@ def test_new_transitive_conditional_versions_require_review(
                 "resolution-markers": [marker],
             }
         )
-    with pytest.raises(policy_module.NeedsReview, match="multiple conditional versions"):
+    with pytest.raises(policy_module.NeedsReview, match="multiple changed versions"):
         policy_module.lock_changes(before, after, ordinary_policy)
 
 
@@ -321,7 +384,8 @@ wheels = [{ url = "https://files.pythonhosted.org/bridge.whl", hash = "sha256:br
 @pytest.mark.parametrize(
     "finding", ["clean", "high", "missing-inventory", "young", "bad-hash", "unmatched-floor"]
 )
-def test_manifest_and_new_transitive_use_real_worker_checks(tmp_path, api, finding):
+@pytest.mark.parametrize("operator", [">=", "=="])
+def test_manifest_and_new_transitive_use_real_worker_checks(tmp_path, api, finding, operator):
     root = """
 [[package]]
 name = "workspace"
@@ -331,7 +395,7 @@ dependencies = [{ name = "ruff" }]
 [package.metadata]
 requires-dist = [{ name = "ruff", specifier = ">=0.15.1" }]
 """
-    old = LOCK + root
+    old = LOCK + root.replace(">=", operator)
     new = (
         old.replace("0.15.1", "0.15.2").replace(
             'source = { registry = "https://pypi.org/simple" }',
@@ -349,7 +413,7 @@ wheels = [
 ]
 """
     )
-    manifest = '[project]\ndependencies = ["ruff>=0.15.1"]\n'
+    manifest = f'[project]\ndependencies = ["ruff{operator}0.15.1"]\n'
     new_manifest = manifest.replace(
         "0.15.1", "0.15.3" if finding == "unmatched-floor" else "0.15.2"
     )

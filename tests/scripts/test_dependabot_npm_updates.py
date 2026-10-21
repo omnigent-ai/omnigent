@@ -166,7 +166,7 @@ def test_reused_child_edge_descendants_require_validation(
     [
         ("4.0.0", "4.1.0", True),
         ("4.0.0", "5.0.0", False),
-        ("0.2.0", "0.3.0", False),
+        ("0.2.0", "0.3.0", True),
         ("4.1.0", "4.0.0", False),
     ],
 )
@@ -255,7 +255,7 @@ def test_multiple_transitive_versions_preserve_upgrade_policy(evaluate_fixture):
 
 
 @pytest.mark.parametrize("retain_old", [False, True])
-@pytest.mark.parametrize("old,new", [("4.0.0", "5.0.0"), ("0.2.0", "0.3.0"), ("4.1.0", "4.0.0")])
+@pytest.mark.parametrize("old,new", [("4.0.0", "5.0.0"), ("4.1.0", "4.0.0")])
 def test_upgraded_parent_cannot_bypass_transitive_version_policy(
     evaluate_fixture, policy_module, retain_old, old, new
 ):
@@ -280,7 +280,7 @@ def test_upgraded_parent_cannot_bypass_transitive_version_policy(
         evaluate()
 
 
-@pytest.mark.parametrize("old,new", [("4.0.0", "5.0.0"), ("0.2.0", "0.3.0"), ("4.1.0", "4.0.0")])
+@pytest.mark.parametrize("old,new", [("4.0.0", "5.0.0"), ("4.1.0", "4.0.0")])
 def test_upgraded_parent_cannot_switch_to_an_ineligible_existing_resolution(
     evaluate_fixture, policy_module, old, new
 ):

@@ -14,8 +14,7 @@
       "pi-coding-agent"
     ],
     "zero_minor": [
-      "ruff",
-      "pyrefly"
+      "*"
     ]
   },
   "npm": {
@@ -34,7 +33,9 @@
       "react-pdf",
       "pdfjs-dist"
     ],
-    "zero_minor": []
+    "zero_minor": [
+      "*"
+    ]
   },
   "actions": {
     "default": "minor",
@@ -46,7 +47,9 @@
       "actions/attest*",
       "actions/create-github-app-token"
     ],
-    "zero_minor": []
+    "zero_minor": [
+      "*"
+    ]
   },
   "action_test_paths": {
     ".github/workflows/ci.yml": "ci.yml",
@@ -69,7 +72,9 @@
   "cargo": {
     "default": "minor",
     "manual": [],
-    "zero_minor": [],
+    "zero_minor": [
+      "*"
+    ],
     "targets": {
       "tests/codex_parity/sidecar/Cargo.lock": {
         "workflows": [

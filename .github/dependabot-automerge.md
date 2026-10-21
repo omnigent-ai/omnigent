@@ -16,24 +16,27 @@ fallback or branch-protection bypass.
 
 | Category | Automatic scope | Required compatibility evidence |
 | --- | --- | --- |
-| Python | Stable patches/minors, including existing manifest floor increases and corresponding transitive graph updates | Full selected Python matrix, database/Windows CI, integration and full E2E/UI workflows; PyPI artifact integrity and age |
+| Python | Stable patches/minors, including existing manifest floor and exact-pin increases and corresponding transitive graph updates | Full selected Python matrix, database/Windows CI, integration and full E2E/UI workflows; PyPI artifact integrity and age |
 | Web | Stable patches/minors in the web workspace, including necessary transitive graph updates | Frontend tests/types/build, browser contract and full browser E2E, production image build; npm integrity and age |
 | GitHub Actions | Same-identity SHA-pin upgrades to stable minor/patch releases, exercised by PR CI | Verified upstream release pins, mapped consuming workflow and required compatibility workflows |
 | Rust | Stable patches/minors in either Codex parity sidecar or omnidev, including corresponding manifest/graph updates | Actual tests for the affected workspace; sidecar updates also require browser E2E |
 | Pre-commit | Stable patches/minors of `pre-commit-hooks` | Unchanged hook settings and successful Lint |
 
-Every changed version, including transitives, must qualify. Majors, downgrades,
-prereleases and `0.x` minor changes require review. Named development tools
-(currently Ruff and Pyrefly) may receive `0.x` minors. There is no prerelease
+Every changed version, including transitives, must qualify. Stable `0.x` minors
+and ordinary exact-pin bumps qualify with the same required CI as other updates.
+Majors, downgrades and prereleases require review. There is no prerelease
 exception: the October 21 backlog audit found no prerelease targets.
 
 The policy's `manual` patterns cover harness SDKs/CLIs, native/desktop/mobile
 packages, publishing/release/token Actions, and compatibility-coupled PDF
-packages. Changes to existing exact pins, compatibility overrides, dependency
+packages. Changes to requirement operators, upper bounds, compatibility overrides, dependency
 sources, manifest scripts, Python extras/markers, workflow permissions or shell
 commands remain manual. New or removed direct dependencies remain manual;
 normal additions/removals of registry-backed transitive dependencies are allowed.
-Unsupported or ambiguous version resolutions also require review.
+A retained parallel version does not prevent upgrading one other resolution of
+the same package. Its metadata and dependency edges remain validated. Multiple
+simultaneous changed Python/Cargo versions, duplicate identities and other
+ambiguous resolutions require review.
 
 Web updates shared with another workspace consumer remain manual because the
 web suite does not establish that consumer's compatibility. Docker images remain

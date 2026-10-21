@@ -77,7 +77,10 @@ def require_package(name: str, policy: dict) -> None:
 def package_upgrade(name: str, old: str, new: str, policy: dict) -> None:
     require_package(name, policy)
     minor = policy.get("default") == "minor" or matches(name, policy.get("minor", []))
-    upgrade(old, new, minor, zero_minor=matches(name, policy.get("zero_minor", [])))
+    try:
+        upgrade(old, new, minor, zero_minor=matches(name, policy.get("zero_minor", [])))
+    except NeedsReview as exc:
+        raise NeedsReview(f"{name} {old} -> {new}: {exc}") from exc
 
 
 def registry_json(url: str) -> dict:
@@ -96,9 +99,12 @@ def aged(timestamp: str, days: int, now: datetime) -> None:
 
 
 def python_requirement_upgrade(old: str, new: str, policy: dict) -> tuple[str, str, str]:
-    pattern = r"([A-Za-z0-9_.-]+)(\[[^\]]+\])?(\s*>=\s*)([0-9]+(?:\.[0-9]+){0,3})(.*)"
+    pattern = r"([A-Za-z0-9_.-]+)(\[[^\]]+\])?(\s*(?:>=|==)\s*)([0-9]+(?:\.[0-9]+){0,3})(.*)"
     previous, current = re.fullmatch(pattern, old), re.fullmatch(pattern, new)
-    require(previous is not None and current is not None, "Only existing Python floors may rise")
+    require(
+        previous is not None and current is not None,
+        "Only existing Python floors or exact pins may rise",
+    )
     name, extras, operator, floor, remainder = previous.groups()
     new_name, new_extras, new_operator, new_floor, new_remainder = current.groups()
     require(
@@ -106,11 +112,14 @@ def python_requirement_upgrade(old: str, new: str, policy: dict) -> tuple[str, s
         "Python dependency extras, markers or range policy changed",
     )
     normalized = re.sub(r"[-_.]+", "-", name).lower()
+    operator = operator.strip()
+    suffix = remainder.split(";", 1)[0].rstrip()
+    require(operator != "==" or not suffix, "Python exact pins must name a single release")
     package_upgrade(normalized, floor, new_floor, policy)
     return (
         normalized,
-        f">={floor}{remainder.split(';', 1)[0].rstrip()}",
-        f">={new_floor}{remainder.split(';', 1)[0].rstrip()}",
+        f"{operator}{floor}{suffix}",
+        f"{operator}{new_floor}{suffix}",
     )
 
 
@@ -153,6 +162,31 @@ def python_manifest_changes(before: dict, after: dict, policy: dict) -> dict:
     return changes
 
 
+def package_pairs(
+    name: str, previous: list[dict], current: list[dict], policy: dict
+) -> list[tuple[dict, dict]]:
+    """Match retained releases before pairing a single changed resolution."""
+    old = {package["version"]: package for package in previous}
+    new = {package["version"]: package for package in current}
+    require(
+        len(old) == len(previous) and len(new) == len(current),
+        f"{name}: duplicate or ambiguous package versions",
+    )
+    removed, added = sorted(old.keys() - new.keys()), sorted(new.keys() - old.keys())
+    require(
+        len(removed) <= 1 and len(added) <= 1,
+        f"{name}: multiple changed versions need review",
+    )
+    if added and not removed and previous:
+        pin = added[0]
+        baselines = [entry for entry in old if version(entry)[0] == version(pin)[0]] or list(old)
+        package_upgrade(name, max(baselines, key=version), pin, policy)
+    pairs = [(old[pin], new[pin]) for pin in sorted(old.keys() & new.keys())]
+    if removed or added:
+        pairs.append((old[removed[0]] if removed else {}, new[added[0]] if added else {}))
+    return pairs
+
+
 def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=None) -> list[dict]:
     require(
         {k: v for k, v in before.items() if k != "package"}
@@ -170,26 +204,30 @@ def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=No
     old, new = indexes
     require(allow_graph or old.keys() == new.keys(), "Packages were added or removed")
     changes, replacements = [], {}
-    for name in old.keys() | new.keys():
-        previous, current = old.get(name, []), new.get(name, [])
+    pairs = [
+        (name, previous, current)
+        for name in sorted(old.keys() | new.keys())
+        if old.get(name) != new.get(name)
+        for previous, current in package_pairs(
+            name, old.get(name, []), new.get(name, []), policy["python"]
+        )
+    ]
+    for name, previous, current in pairs:
         if previous == current:
             continue
         if not previous or not current:
-            require(
-                len(previous) <= 1 and len(current) <= 1,
-                f"{name} has multiple conditional versions",
-            )
             require_package(name, policy["python"])
-            for package in previous + current:
+            for package in (previous, current):
+                if not package:
+                    continue
                 require(
                     package["source"] == {"registry": "https://pypi.org/simple"},
                     f"{name} is not from PyPI",
                 )
                 version(package["version"])
-            changes.extend(current)
+            if current:
+                changes.append(current)
             continue
-        require(len(previous) == len(current) == 1, f"{name} has multiple conditional versions")
-        previous, current = previous[0], current[0]
         require(previous["source"] == current["source"], f"{name} changed its source")
         if previous["version"] == current["version"]:
             continue
@@ -232,9 +270,7 @@ def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=No
         )
         return candidates[0]
 
-    pending_pairs = [
-        (old.get(name, [{}])[0], new[name][0]) for name in new if old.get(name) != new[name]
-    ]
+    pending_pairs = [(previous, current) for _, previous, current in pairs if current]
     compared = set()
     while pending_pairs:
         previous, current = pending_pairs.pop()
@@ -316,9 +352,8 @@ def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=No
             result["specifier"] = manifest_changes[name][1]
         return result
 
-    for name in old.keys() & new.keys():
-        previous, current = old[name], new[name]
-        if previous == current or name in replacements:
+    for name, previous, current in pairs:
+        if not previous or not current or previous["version"] != current["version"]:
             continue
         require(
             update_references(previous) == current, f"{name}: unchanged package metadata changed"
@@ -390,7 +425,7 @@ def python_changes(read, files: set[str], policy: dict) -> dict:
         "Python manifest floor has no matching lock upgrade",
     )
     for name, (_old_spec, new_spec) in manifest_changes.items():
-        floor = re.match(r">=([0-9.]+)", new_spec)[1]
+        floor = re.match(r"(?:>=|==)([0-9.]+)", new_spec)[1]
         require(
             any(
                 package["name"] == name and version(package["version"]) == version(floor)
@@ -656,11 +691,17 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         require(old.keys() == new.keys(), "Web manifest package set changed")
         for name, spec in old.items():
             if spec != new[name]:
+                previous_requirement = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", spec)
+                current_requirement = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", new[name])
                 require(
-                    spec[:1] in {"^", "~"} and new[name][:1] == spec[:1],
-                    f"{name}: explicit pin or range policy changed",
+                    previous_requirement is not None
+                    and current_requirement is not None
+                    and previous_requirement[1] == current_requirement[1],
+                    f"{name}: npm version requirement shape changed",
                 )
-                package_upgrade(name, spec[1:], new[name][1:], policy["npm"])
+                package_upgrade(
+                    name, previous_requirement[2], current_requirement[2], policy["npm"]
+                )
         if section in old_manifest:
             old_manifest[section] = new
     require(old_manifest == new_manifest, "Web manifest scripts or other settings changed")
@@ -679,14 +720,19 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
                 or dependency["specifier"] != current["specifier"]
             ):
                 require(
-                    dependency["specifier"][:1] in {"^", "~"},
-                    f"{name}: explicit pin or catalog",
+                    re.fullmatch(r"[\^~]?[0-9]+(?:\.[0-9]+){2}", dependency["specifier"]),
+                    f"{name}: npm version requirement needs review",
                 )
             require(
                 dependency["specifier"] == old_manifest.get(section, {}).get(name)
                 and current["specifier"] == new_manifest.get(section, {}).get(name),
                 "Manifest/lock mismatch",
             )
+            if re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", current["specifier"]):
+                require(
+                    reference(name, current["version"]) == f"{name}@{current['specifier']}",
+                    f"{name}: exact manifest pin does not match the lockfile",
+                )
             replacement(name, dependency["version"], current["version"])
             dependency["version"] = current["version"]
             dependency["specifier"] = current["specifier"]
@@ -845,25 +891,23 @@ def cargo_changes(read, files: set[str], policy: dict) -> dict:
         return {reference.split()[0] for reference in package.get("dependencies", [])}
 
     packages, upgrades = [], {}
-    for name in sorted(old.keys() | new.keys()):
-        previous, current = old.get(name, []), new.get(name, [])
+    pairs = [
+        (name, previous, current)
+        for name in sorted(old.keys() | new.keys())
+        if old.get(name) != new.get(name)
+        for previous, current in package_pairs(name, old.get(name, []), new.get(name, []), cargo)
+    ]
+    for name, previous, current in pairs:
         if previous == current:
             continue
-        require(
-            len(previous) <= 1 and len(current) <= 1,
-            f"{name}: multiple conditional Cargo versions need review",
-        )
         if not current:
             require_package(name, cargo)
             require(
-                previous[0].get("source")
-                == "registry+https://github.com/rust-lang/crates.io-index",
+                previous.get("source") == "registry+https://github.com/rust-lang/crates.io-index",
                 f"{name}: removing a local or git package requires review",
             )
             continue
-        current = current[0]
         if previous:
-            previous = previous[0]
             upgraded = previous["version"] != current["version"]
             mutable = {"dependencies"}
             if upgraded:
@@ -988,34 +1032,13 @@ def cargo_changes(read, files: set[str], policy: dict) -> dict:
     packages = sorted(
         inventory.values(), key=lambda package: (package["name"], package["version"])
     )
-    for current in packages:
-        name = current["name"]
-        require(
-            current.get("source") == "registry+https://github.com/rust-lang/crates.io-index",
-            "Only crates.io packages qualify",
-        )
-        require_package(name, cargo)
-        version(current["version"])
-        release = registry_json(f"https://crates.io/api/v1/crates/{name}/{current['version']}")[
-            "version"
-        ]
-        require(release["num"] == current["version"], "Crate version mismatch")
-        require(
-            not release["yanked"] and release["checksum"] == current.get("checksum"),
-            "Crate integrity mismatch",
-        )
-        aged(release["created_at"], policy["cooldown_days"], datetime.now(UTC))
 
     if manifest in files:
         old_manifest, new_manifest = (tomllib.loads(text) for text in read(manifest))
         expected = copy.deepcopy(old_manifest)
 
         def requirement(value):
-            require(
-                not value.lstrip().startswith("="),
-                "Cargo exact version pin changes require review",
-            )
-            match = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){0,2})", value)
+            match = re.fullmatch(r"([\^~=]?)([0-9]+(?:\.[0-9]+){0,2})", value)
             require(match is not None, f"Cargo version requirement needs review: {value}")
             prefix, pin = match.groups()
             components = pin.split(".")
@@ -1023,6 +1046,8 @@ def cargo_changes(read, files: set[str], policy: dict) -> dict:
 
         def satisfies(pin, prefix, precision, lower):
             resolved, minimum = version(pin), version(lower)
+            if prefix == "=":
+                return resolved[:precision] == minimum[:precision]
             boundary = 0 if precision == 1 else 1
             if prefix != "~":
                 boundary = next((i for i, part in enumerate(minimum) if part), precision - 1)
@@ -1093,6 +1118,24 @@ def cargo_changes(read, files: set[str], policy: dict) -> dict:
         )
 
     require(bool(upgrades), "No eligible Cargo package upgrades")
+    for current in packages:
+        name = current["name"]
+        require(
+            current.get("source") == "registry+https://github.com/rust-lang/crates.io-index",
+            "Only crates.io packages qualify",
+        )
+        require_package(name, cargo)
+        version(current["version"])
+        release = registry_json(f"https://crates.io/api/v1/crates/{name}/{current['version']}")[
+            "version"
+        ]
+        require(release["num"] == current["version"], "Crate version mismatch")
+        require(
+            not release["yanked"] and release["checksum"] == current.get("checksum"),
+            "Crate integrity mismatch",
+        )
+        aged(release["created_at"], policy["cooldown_days"], datetime.now(UTC))
+
     required = cargo["targets"][target]
     return decision(
         "cargo",

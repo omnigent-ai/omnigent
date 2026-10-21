@@ -1004,6 +1004,49 @@ def test_update_policy_respects_version_boundaries(policy_module, old, new, mino
             policy_module.upgrade(old, new, minor)
 
 
+@pytest.mark.parametrize("expanded_update", ["npm", "cargo"], indirect=True)
+@pytest.mark.parametrize("fault", [None, "mismatch", "high"])
+def test_exact_manifest_pins_use_production_worker(tmp_path, expanded_update, fault):
+    ecosystem, api = expanded_update
+    if ecosystem == "npm":
+        for path in ("web/package.json", "pnpm-lock.yaml"):
+            api["files"][path] = tuple(
+                text.replace("^2.1.", "2.1.") for text in api["files"][path]
+            )
+        if fault == "mismatch":
+            for path in ("web/package.json", "pnpm-lock.yaml"):
+                old, new = api["files"][path]
+                api["files"][path] = (
+                    old,
+                    new.replace("2.1.1", "2.1.2")
+                    if path.endswith("json")
+                    else new.replace("specifier: 2.1.1", "specifier: 2.1.2"),
+                )
+        set_changed_files(api, dict(api["files"]))
+    else:
+        manifest = '[dependencies]\nanyhow = "=1.0.0"\n'
+        files = dict(api["files"])
+        files["tests/codex_parity/sidecar/Cargo.toml"] = (
+            manifest,
+            manifest.replace("1.0.0", "1.0.2" if fault == "mismatch" else "1.0.1"),
+        )
+        set_changed_files(api, files)
+    if fault == "high":
+        report = api["report"]["Results"][0]
+        package = report["Packages"][0]
+        report["Vulnerabilities"].append(
+            {
+                "PkgName": package["Name"],
+                "InstalledVersion": package["Version"],
+                "Severity": "HIGH",
+                "VulnerabilityID": "pin-advisory",
+            }
+        )
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) is (fault is None), process.stdout
+
+
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
 @pytest.mark.parametrize(
     "fault",
@@ -1028,7 +1071,8 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
         files["web/package.json"] = (old, new.replace("vitest", "curl attacker"))
     elif fault == "pin":
         for path in ("web/package.json", "pnpm-lock.yaml"):
-            files[path] = tuple(text.replace("^2.1.", "2.1.") for text in files[path])
+            old, new = files[path]
+            files[path] = (old, new.replace("^2.1.", "2.1."))
     elif fault in {"integrity", "source", "young"}:
         metadata = api["registry"]["https://registry.npmjs.org/clsx"]
         if fault == "young":
