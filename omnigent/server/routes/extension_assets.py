@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
@@ -30,6 +30,7 @@ def create_extension_assets_router(
     bundles: Mapping[str, ResolvedBundle],
     *,
     auth_provider: AuthProvider | None = None,
+    enabled: Callable[[str], bool] | None = None,
 ) -> APIRouter:
     """Build the authenticated extension asset router, mounted under ``/v1``."""
     router = APIRouter()
@@ -56,6 +57,8 @@ def create_extension_assets_router(
     ) -> Response:
         """Return a declared asset only when its bundle digest still matches."""
         require_user(request, auth_provider)
+        if enabled is not None and not enabled(extension_id):
+            raise _not_found()
         if asset_name not in ASSET_MEDIA_TYPES:
             raise _not_found()
         bundle = bundles.get(extension_id)

@@ -125,6 +125,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
+- [Team extensions](./extensions.md) covers package authoring, activation,
+  portable agent installs, lifecycle observers, and diagnostics.
 
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
@@ -205,8 +207,7 @@ map an area, remove it here in the same change.
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,
   `omnigent copilot`
 - Installing reusable agents: `omnigent agent`
-- Integrations, extensions, and remote sandboxes: `omnigent integration`,
-  `omnigent extensions`, `omnigent sandbox`
+- Integrations and remote sandboxes: `omnigent integration`, `omnigent sandbox`
 
 **Partly mapped:** embedded authentication covers project writes and supporting
 account-context tests; other resource APIs and real identity-provider journeys

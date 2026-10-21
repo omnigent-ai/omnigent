@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import io
 import tarfile
 from pathlib import Path, PurePosixPath
@@ -11,6 +12,26 @@ DEFAULT_MAX_BYTES = 500 * 1024 * 1024
 
 # Maximum number of entries to prevent zip-bomb style attacks
 DEFAULT_MAX_ENTRIES = 10_000
+
+
+def normalize_tarinfo(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Remove host-specific metadata so identical agent directories hash alike."""
+    tarinfo.mtime = 0
+    tarinfo.uid = tarinfo.gid = 0
+    tarinfo.uname = tarinfo.gname = ""
+    tarinfo.mode = 0o755 if tarinfo.isdir() else 0o644
+    return tarinfo
+
+
+def pack_directory(bundle_dir: Path) -> bytes:
+    """Pack a materialized agent directory into a reproducible gzipped tarball."""
+    output = io.BytesIO()
+    with (
+        gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed,
+        tarfile.open(fileobj=compressed, mode="w") as archive,
+    ):
+        archive.add(str(bundle_dir), arcname=".", filter=normalize_tarinfo)
+    return output.getvalue()
 
 
 class ExtractionError(Exception):

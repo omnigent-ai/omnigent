@@ -61,6 +61,7 @@ from omnigent.extensions.assets import (
     build_asset_index,
     parse_dev_bundle_overrides,
 )
+from omnigent.extensions.manager import ExtensionLifecycleMiddleware, ExtensionManager
 from omnigent.extensions.registry import plugin_state as load_extension_plugin_state
 from omnigent.harness_plugins import (
     NativeHarnessProvider,
@@ -792,13 +793,9 @@ def _normalize_tarinfo(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
     :param tarinfo: The tar member header to normalize.
     :returns: The same header with mtime, ownership, and mode pinned.
     """
-    tarinfo.mtime = 0
-    tarinfo.uid = 0
-    tarinfo.gid = 0
-    tarinfo.uname = ""
-    tarinfo.gname = ""
-    tarinfo.mode = 0o755 if tarinfo.isdir() else 0o644
-    return tarinfo
+    from omnigent.spec.tar_utils import normalize_tarinfo
+
+    return normalize_tarinfo(tarinfo)
 
 
 def _tar_gz_dir(bundle_dir: Path) -> bytes:
@@ -815,18 +812,9 @@ def _tar_gz_dir(bundle_dir: Path) -> bytes:
     :returns: Reproducible gzipped tarball bytes suitable for the
         artifact store.
     """
-    import gzip
-    import io
+    from omnigent.spec.tar_utils import pack_directory
 
-    buf = io.BytesIO()
-    with (
-        gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz,
-        tarfile.open(fileobj=gz, mode="w") as tf,
-    ):
-        # tarfile.add recurses in sorted(os.listdir) order, so member order
-        # is stable across machines; _normalize_tarinfo zeroes the metadata.
-        tf.add(str(bundle_dir), arcname=".", filter=_normalize_tarinfo)
-    return buf.getvalue()
+    return pack_directory(bundle_dir)
 
 
 def _ensure_builtin_agent(
@@ -1522,7 +1510,13 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
-    resolved_extension_state = _resolve_extension_state(extension_state)
+    from omnigent.policies.registry import load_registry
+
+    load_registry(extra_modules=policy_modules)
+    extension_manager = ExtensionManager(
+        _resolve_extension_state(extension_state), resolved_server_config.get("extensions")
+    )
+    resolved_extension_state = extension_manager.state
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
     # First-boot admin bootstrap for the accounts auth provider.
@@ -1709,12 +1703,6 @@ def create_app(
 
         _ensure_default_agents(agent_store, artifact_store, agent_cache)
 
-        # Populate the policy registry (builtins + user-configured
-        # modules) so GET /v1/policy-registry serves the catalog.
-        from omnigent.policies.registry import load_registry
-
-        load_registry(extra_modules=policy_modules)
-
         # Accounts first-run: open the browser after uvicorn has bound
         # the port. bootstrap_admin sets open_url to the loopback base
         # URL on a needs-setup boot so the browser lands on the
@@ -1824,8 +1812,10 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         try:
+            await extension_manager.start()
             yield
         finally:
+            await extension_manager.stop()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -1872,6 +1862,8 @@ def create_app(
     )
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    app.state.extension_manager = extension_manager
+    app.add_middleware(ExtensionLifecycleMiddleware, manager=extension_manager)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -3369,6 +3361,10 @@ def create_app(
             asset_errors=extension_asset_errors,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            manager=extension_manager,
+            agent_store=agent_store,
+            artifact_store=artifact_store,
+            agent_cache=agent_cache,
         ),
         prefix="/v1",
         tags=["extensions"],
@@ -3377,6 +3373,7 @@ def create_app(
         create_extension_assets_router(
             extension_bundles,
             auth_provider=auth_provider,
+            enabled=lambda extension_id: extension_id in extension_manager.active,
         ),
         prefix="/v1",
         tags=["extensions"],

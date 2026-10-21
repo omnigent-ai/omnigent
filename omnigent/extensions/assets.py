@@ -32,6 +32,7 @@ MAX_ASSET_BYTES = 4 * 1024 * 1024
 
 _logger = logging.getLogger(__name__)
 _SAFE_PART = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+_SAFE_RESOURCE_PART = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class ExtensionAssetError(ValueError):
@@ -63,7 +64,7 @@ class ResolvedBundle:
         return f"/v1/extensions/{self.extension_id}/assets/{self.digest}/{name}"
 
 
-def _safe_parts(declared: str) -> tuple[str, ...]:
+def _safe_parts(declared: str, *, allow_hidden: bool = False) -> tuple[str, ...]:
     """Validate an already-declared resource path again at the I/O boundary."""
     if not isinstance(declared, str) or not declared.isprintable():
         raise ExtensionAssetError("extension asset path is invalid")
@@ -73,7 +74,11 @@ def _safe_parts(declared: str) -> tuple[str, ...]:
         or declared.startswith("./")
         or declared != path.as_posix()
         or len(path.parts) > 16
-        or any(not _SAFE_PART.fullmatch(part) for part in path.parts)
+        or any(
+            part in {".", ".."}
+            or not (_SAFE_RESOURCE_PART if allow_hidden else _SAFE_PART).fullmatch(part)
+            for part in path.parts
+        )
     ):
         raise ExtensionAssetError(f"unsafe extension asset path {declared!r}")
     return path.parts
@@ -122,8 +127,10 @@ def _resource_root(package: str) -> Traversable:
     return root
 
 
-def _read_asset(root: Traversable, declared: str, max_bytes: int) -> bytes:
-    parts = _safe_parts(declared)
+def _read_asset(
+    root: Traversable, declared: str, max_bytes: int, *, allow_hidden: bool = False
+) -> bytes:
+    parts = _safe_parts(declared, allow_hidden=allow_hidden)
     if isinstance(root, Path):
         return _read_filesystem_asset(root, parts, max_bytes)
     return _read_traversable_asset(root, parts, max_bytes)

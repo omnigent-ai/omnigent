@@ -150,10 +150,62 @@ def test_extension_permission_values_include_read_only_sessions() -> None:
         "projects.write",
         "sessions.read",
         "storage.user",
+        "events.subscribe",
     }
     registry.validate_manifest(
         replace(_manifest(), permissions=frozenset({ExtensionPermission.SESSIONS_READ}))
     )
+
+
+def test_reference_team_manifest_validates(incident_manifest: ExtensionManifest) -> None:
+    registry.validate_manifest(incident_manifest)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"owner": None}, "must declare owner"),
+        ({"owner": "  "}, "non-empty and trimmed"),
+        ({"agents": []}, "agents must be a tuple"),
+        ({"policies": (object(),)}, "invalid contribution types"),
+        ({"dependencies": []}, "dependencies must be a tuple"),
+    ],
+)
+def test_rejects_invalid_team_metadata(incident_manifest, change, message) -> None:
+    with pytest.raises(registry.ExtensionValidationError, match=message):
+        registry.validate_manifest(replace(incident_manifest, **change))
+
+
+@pytest.mark.parametrize("path", ["../agents/triage", "/tmp/agent", "agents//triage", "a/./b"])
+def test_rejects_unsafe_agent_paths(incident_manifest, path) -> None:
+    agent = replace(incident_manifest.agents[0], path=path)
+    with pytest.raises(registry.ExtensionValidationError, match="safe relative path"):
+        registry.validate_manifest(replace(incident_manifest, agents=(agent,)))
+
+
+def test_contribution_ids_are_unique_across_browser_and_pack(incident_manifest) -> None:
+    command = CommandContribution(id=incident_manifest.agents[0].id, title="Conflicting command")
+    with pytest.raises(registry.ExtensionValidationError, match="duplicate contribution ids"):
+        registry.validate_manifest(replace(incident_manifest, commands=(command,)))
+
+
+@pytest.mark.parametrize("entrypoint", ["os.system", "os:system()", "x:y.z", " x:y"])
+def test_rejects_invalid_server_entrypoint(incident_manifest, entrypoint) -> None:
+    with pytest.raises(registry.ExtensionValidationError):
+        registry.validate_manifest(
+            replace(incident_manifest, entrypoints=ExtensionEntrypoints(server=entrypoint))
+        )
+
+
+def test_rejects_self_dependency_and_invalid_version(incident_manifest) -> None:
+    from omnigent.extensions import ExtensionDependency
+
+    for dependency in (
+        ExtensionDependency(incident_manifest.id, ">=1"),
+        ExtensionDependency("acme.other", "banana"),
+    ):
+        with pytest.raises(registry.ExtensionValidationError):
+            registry.validate_manifest(replace(incident_manifest, dependencies=(dependency,)))
 
 
 def test_discovers_and_caches_valid_manifest(monkeypatch: pytest.MonkeyPatch) -> None:

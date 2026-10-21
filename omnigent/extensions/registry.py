@@ -17,12 +17,15 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent.extensions.api import (
     EXTENSION_API_VERSION,
+    AgentContribution,
     CommandContribution,
+    ExtensionDependency,
     ExtensionEntrypoints,
     ExtensionManifest,
     ExtensionPermission,
     ExtensionPluginState,
     PageContribution,
+    PolicyContribution,
     PrimaryNavigationContribution,
 )
 from omnigent.version import VERSION
@@ -44,6 +47,7 @@ _SYMBOL_RE = _ASSET_SEGMENT_RE
 _ACTIVATION_EVENT_RE = re.compile(r"^(onPage|onCommand):(.+)$")
 _MAX_TEXT_LENGTH = 512
 _MAX_ASSET_DEPTH = 16
+_PYTHON_ENTRYPOINT_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*$")
 
 
 class ExtensionValidationError(ValueError):
@@ -208,7 +212,15 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     """Validate one manifest independently of other installed extensions."""
     if not isinstance(manifest.entrypoints, ExtensionEntrypoints):
         raise ExtensionValidationError("entrypoints must be ExtensionEntrypoints")
-    for field_name in ("pages", "primary_navigation", "commands", "activation_events"):
+    for field_name in (
+        "pages",
+        "primary_navigation",
+        "commands",
+        "activation_events",
+        "dependencies",
+        "agents",
+        "policies",
+    ):
         if not isinstance(getattr(manifest, field_name), tuple):
             raise ExtensionValidationError(f"{field_name} must be a tuple")
     if not isinstance(manifest.permissions, frozenset):
@@ -217,6 +229,9 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         ("pages", manifest.pages, PageContribution),
         ("primary_navigation", manifest.primary_navigation, PrimaryNavigationContribution),
         ("commands", manifest.commands, CommandContribution),
+        ("dependencies", manifest.dependencies, ExtensionDependency),
+        ("agents", manifest.agents, AgentContribution),
+        ("policies", manifest.policies, PolicyContribution),
     ):
         invalid = [
             type(value).__name__ for value in values if not isinstance(value, expected_type)
@@ -231,6 +246,39 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
     _require_text(manifest.distribution, "distribution")
     _require_text(manifest.version, "version")
     _require_text(manifest.requires_omnigent, "requires_omnigent")
+    if manifest.owner is not None:
+        _require_text(manifest.owner, "owner")
+    if manifest.agents or manifest.policies or manifest.entrypoints.server is not None:
+        if manifest.owner is None:
+            raise ExtensionValidationError("backend contributions must declare owner")
+    if manifest.entrypoints.server is not None:
+        _require_text(manifest.entrypoints.server, "server entrypoint")
+        if not _PYTHON_ENTRYPOINT_RE.fullmatch(manifest.entrypoints.server):
+            raise ExtensionValidationError("server entrypoint must use module:callable syntax")
+    for dependency in manifest.dependencies:
+        _validate_extension_id(dependency.id)
+        if dependency.id == manifest.id:
+            raise ExtensionValidationError("an extension cannot depend on itself")
+        _require_text(dependency.version, "dependency version")
+        try:
+            SpecifierSet(dependency.version)
+        except InvalidSpecifier as exc:
+            raise ExtensionValidationError("invalid extension dependency version") from exc
+    _reject_duplicates((item.id for item in manifest.dependencies), "dependency ids")
+    for kind, contributions in (("agent", manifest.agents), ("policy", manifest.policies)):
+        for item in contributions:
+            _validate_contribution_id(manifest.id, item.id, kind)
+            _require_text(item.title, f"{kind} title")
+            _validate_relative_path(item.path, f"{kind} path")
+        _reject_duplicates((item.id for item in contributions), f"{kind} ids")
+    for agent in manifest.agents:
+        if not isinstance(agent.policies, tuple):
+            raise ExtensionValidationError("agent policies must be a tuple")
+        for preset in agent.policies:
+            _require_text(preset, "agent policy preset id")
+            if not _CONTRIBUTION_ID_RE.fullmatch(preset):
+                raise ExtensionValidationError("agent policy preset id must be namespaced")
+        _reject_duplicates(agent.policies, "agent policy preset ids")
 
     try:
         Version(manifest.version)
@@ -324,7 +372,13 @@ def validate_manifest(manifest: ExtensionManifest) -> None:
         "primary navigation ids",
     )
     _reject_duplicates(
-        (*page_ids, *command_ids, *navigation_ids),
+        (
+            *page_ids,
+            *command_ids,
+            *navigation_ids,
+            *(item.id for item in manifest.agents),
+            *(item.id for item in manifest.policies),
+        ),
         "contribution ids",
     )
 
@@ -376,6 +430,8 @@ def _manifest_claims(manifest: ExtensionManifest) -> tuple[str, ...]:
         *(page.id for page in manifest.pages),
         *(command.id for command in manifest.commands),
         *(item.id for item in manifest.primary_navigation),
+        *(item.id for item in manifest.agents),
+        *(item.id for item in manifest.policies),
     )
     return (
         f"extension:{manifest.id}",

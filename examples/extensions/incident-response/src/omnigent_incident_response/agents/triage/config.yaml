@@ -1,0 +1,7 @@
+spec_version: 1
+name: incident-triage
+description: Collect incident evidence and prepare a reviewable response plan.
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
