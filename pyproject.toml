@@ -34,7 +34,7 @@ dependencies = [
     "json5>=0.10,<1",
     # openai-agents<0.18.2 omits a field required by openai>=2.45.
     # Keep this cap until the websockets<15 compatibility pin can be lifted.
-    "openai>=1.0,<2.45",
+    "openai>=1.0,<3.32",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
     "rich>=14,<16",
     "prompt_toolkit>=3.0,<4",
