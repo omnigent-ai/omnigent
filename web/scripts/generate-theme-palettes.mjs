@@ -36,10 +36,9 @@ function androidColor(value, role) {
   if (/^#[0-9a-f]{6}$/i.test(value)) return value.toLowerCase();
 
   const component = "([+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+))";
-  const match = new RegExp(
-    `^oklch\\(\\s*${component}\\s+${component}\\s+${component}\\s*\\)$`,
-    "i",
-  ).exec(value);
+  const match = value.match(
+    new RegExp(`^oklch\\(\\s*${component}\\s+${component}\\s+${component}\\s*\\)$`, "i"),
+  );
   if (!match) throw new Error(`Unsupported Android palette colour for ${role}: ${value}`);
 
   const lightness = Number(match[1]);
