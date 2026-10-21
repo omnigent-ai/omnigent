@@ -215,6 +215,4 @@ internal fun isUpgradeRequiredTicket(ticket: String?): Boolean = ticket == "upgr
 internal fun isUpgradeRequiredResponse(
     status: Int,
     body: String,
-): Boolean =
-    status == 400 && body.contains("code_challenge (S256) is required.") &&
-        body.contains("Upgrade Omnigent to sign in")
+): Boolean = status == 400 && body.contains("code_challenge (S256) is required.")
