@@ -94,6 +94,7 @@ def policy_gate_agent(
         _E2E_POLICY_GATE_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
         databricks_profile=databricks_profile_or_none,
+        operator_authored=True,
     )
 
 
@@ -109,13 +110,14 @@ def label_gate_agent(
         _E2E_LABEL_GATE_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
         databricks_profile=databricks_profile_or_none,
+        operator_authored=True,
     )
 
 
 @pytest.fixture(scope="session")
 def ask_demo_agent(http_client: httpx.Client) -> str:
     """Upload the ``ask-demo`` example agent — always-ASK on INPUT."""
-    return upload_agent(http_client, _ASK_DEMO_DIR)
+    return upload_agent(http_client, _ASK_DEMO_DIR, operator_authored=True)
 
 
 @pytest.fixture(scope="session")
@@ -130,6 +132,7 @@ def prompt_policy_agent(
         _E2E_PROMPT_POLICY_DIR,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
         databricks_profile=databricks_profile_or_none,
+        operator_authored=True,
     )
 
 
@@ -195,6 +198,7 @@ def test_policy_gate_allows_clean_message(
                 },
             },
         },
+        operator_authored=True,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -335,6 +339,7 @@ def test_label_gate_taint_persists_across_turns(
         prompt="You are a minimal test agent. Respond briefly.",
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
         extra_config=_LABEL_GATE_EXTRA_CONFIG,
+        operator_authored=True,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -395,6 +400,7 @@ def test_label_gate_untainted_conversation_passes(
         prompt="You are a minimal test agent. Respond briefly.",
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
         extra_config=_LABEL_GATE_EXTRA_CONFIG,
+        operator_authored=True,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -442,6 +448,7 @@ def test_label_gate_persisted_labels_in_store(
         prompt="You are a minimal test agent. Respond briefly.",
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
         extra_config=_LABEL_GATE_EXTRA_CONFIG,
+        operator_authored=True,
     )
     configure_mock_llm(
         mock_llm_server_url,
@@ -593,6 +600,7 @@ def test_prompt_policy_allow_path_reaches_llm(
         prompt="You are a minimal test agent. Reply briefly.",
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
         extra_config=_DENY_CANADA_POLICY_CONFIG,
+        operator_authored=True,
     )
     session_id = create_runner_bound_session(
         http_client, agent_name=agent_name, runner_id=live_runner_id
@@ -651,6 +659,7 @@ def test_prompt_policy_deny_path_short_circuits(
         prompt="You are a minimal test agent. Reply briefly.",
         mock_llm_base_url=f"{mock_llm_server_url}/v1",
         extra_config=_DENY_CANADA_POLICY_CONFIG,
+        operator_authored=True,
     )
     session_id = create_runner_bound_session(
         http_client, agent_name=agent_name, runner_id=live_runner_id

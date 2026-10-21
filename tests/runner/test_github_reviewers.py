@@ -1,4 +1,4 @@
-"""GitHub PR reviewer shaping and panel integration coverage."""
+"""GitHub PR reviewer and label shaping and panel integration coverage."""
 
 from __future__ import annotations
 
@@ -119,13 +119,25 @@ def _pr_data() -> dict[str, object]:
         "comments": [],
         "latestReviews": [_review("alice", "APPROVED")],
         "reviewRequests": [{"__typename": "Team", "slug": "platform"}],
+        "labels": [
+            {"id": "LA_1", "name": "size/XS", "color": "EDEDED", "description": "Tiny"},
+            {"id": "LA_2", "name": "bug", "color": "d73a4a", "description": ""},
+        ],
     }
+
+
+# The shaped form of ``_pr_data()["labels"]``.
+_PR_LABELS = [
+    {"name": "size/XS", "color": "ededed", "description": "Tiny"},
+    {"name": "bug", "color": "d73a4a", "description": None},
+]
 
 
 def _assert_reviewer_fields(argv: list[str]) -> None:
     fields = argv[argv.index("--json") + 1].split(",")
     assert "latestReviews" in fields
     assert "reviewRequests" in fields
+    assert "labels" in fields
 
 
 def test_workspace_info_shapes_reviewers_with_one_gh_request() -> None:
@@ -150,6 +162,7 @@ def test_workspace_info_shapes_reviewers_with_one_gh_request() -> None:
         {"login": "alice", "kind": "user", "state": "APPROVED"},
         {"login": "platform", "kind": "team", "state": "PENDING"},
     ]
+    assert payload["pr"]["labels"] == _PR_LABELS
     assert len(gh_calls) == 1
     _assert_reviewer_fields(gh_calls[0])
     list_accounts.assert_not_called()
@@ -187,6 +200,7 @@ def test_reference_info_shapes_reviewers_with_one_gh_request() -> None:
         {"login": "alice", "kind": "user", "state": "APPROVED"},
         {"login": "platform", "kind": "team", "state": "PENDING"},
     ]
+    assert payload["pr"]["labels"] == _PR_LABELS
     assert len(gh_calls) == 1
     _assert_reviewer_fields(gh_calls[0])
     fields = gh_calls[0][gh_calls[0].index("--json") + 1].split(",")

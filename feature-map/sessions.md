@@ -9,6 +9,10 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
+  conversation to split left/right or top/bottom with a hover preview. Up to four
+  independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
+  and are saved only in this browser, scoped to server and user.
 - `pin`: pinned sessions move to their own section and back.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
@@ -128,6 +132,29 @@ the header menu), and each place is a separate entry point.
   a flat Display filter and the tooltip keeps its plain layout.
 
 ## How to get to it (user POV)
+
+**Session grids:** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
+to preview, then drop. Split a remaining full-width or full-height pane again
+to reach three or four panes. Alternatively, use a row's menu or right-click
+menu → **Open in grid** and choose the pane and direction. Each pane has its own
+transcript and composer; one shared Workspace panel follows the active cell. Open the session full screen
+for additional controls; close a pane to expand its neighbor. Closing down to
+one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
+their `/grid/<id>` URL on the same browser. Double-click a grid title or use
+its Rename menu action to edit it inline.
+Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
+in a cell (or focus its controls) to activate it: its outline and inverted header
+identify the session shown in Workspace. The grid header toggles the shared
+panel; its width is saved per grid and stays fixed when switching sessions.
+Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
+fills the grid area. Drag a cell titlebar onto another cell to swap positions,
+or focus the title and press Space, choose a cell with the arrow keys, and
+press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
+only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
+Grids wait for account identity; if it is unavailable, use Reload to retry.
+Failed sends restore text and supported attachments unless the cell has a newer draft.
+Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
 sessions** on the empty landing. Choose a machine, harness, and recent count
@@ -307,6 +334,21 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 Tests that stop a runner, restart the server, or read the database cannot run
 through `verify-env run`. They are marked "own environment" below; run them with
 plain `uv run pytest`, which starts a private server for the test.
+
+- **`session-grid` (browser contract):**
+  `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
+  the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
+  keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
+  shared workspace contents and width persistence, grid-wide maximize, rejected
+  drops without navigation, sidebar
+  reopening/deletion, titlebar rearrangement and cancellation, narrow-view
+  workspaces, identity recovery, and missing/disabled grid routes. With the flag absent or false,
+  ordinary session routes retain native link dragging and expose no grid menus,
+  drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
+  Layout combinations and malformed local storage have unit coverage in
+  `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
+  `grid_sessions_display_ui` on the isolated server. Also check a collapsed
+  sidebar and narrow viewport manually.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`

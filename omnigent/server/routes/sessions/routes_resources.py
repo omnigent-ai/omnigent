@@ -52,6 +52,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -131,6 +132,10 @@ class _RunnerStreamResponse(StreamingResponse):
         finally:
             await self._upstream.aclose()
 
+
+# Runner wait for a PR label request, above the runner's 15-second budget for all of
+# its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
+_LABEL_PROXY_TIMEOUT_S = 20.0
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -453,6 +458,8 @@ def register_resources_routes(
         path: str,
         conversation: Conversation,
         params: dict[str, str] | None = None,
+        timeout: float = 10.0,
+        unsupported_endpoint_message: str | None = None,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -461,8 +468,11 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
+        :param timeout: Seconds to wait for the runner response.
+        :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
         :returns: Parsed JSON response body.
-        :raises OmnigentError: Typed ``not_found`` (404) or
+        :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
+            typed ``not_found`` (404) or
             ``session_agent_missing`` (410) re-derived from the runner body.
         :raises HTTPException: 502 on any other runner failure.
         """
@@ -476,7 +486,7 @@ def register_resources_routes(
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.get(path, params=params, timeout=10.0)
+            resp = await runner_client.get(path, params=params, timeout=timeout)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
@@ -489,6 +499,11 @@ def register_resources_routes(
                 status_code=502, detail="runner resource endpoint returned invalid JSON"
             ) from exc
         if resp.status_code == 404:
+            if unsupported_endpoint_message and response_payload == {"detail": "Not Found"}:
+                raise OmnigentError(
+                    unsupported_endpoint_message,
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             message = "Resource not found"
             if isinstance(response_payload, dict):
                 error = response_payload.get("error")
@@ -523,6 +538,7 @@ def register_resources_routes(
         runner_path: str,
         runner_params: dict[str, str] | None = None,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+        runner_timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -538,7 +554,8 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
-            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
+            ``"github_labels"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -552,6 +569,7 @@ def register_resources_routes(
             has nothing for this to resolve against. Resolving it eagerly
             would refuse absolute browsing on exactly those sessions even
             though the online runner can serve them.
+        :param runner_timeout: Seconds to wait for the runner's response.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -563,6 +581,7 @@ def register_resources_routes(
                 runner_path,
                 conversation,
                 params=runner_params,
+                timeout=runner_timeout,
             )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
@@ -948,7 +967,8 @@ def register_resources_routes(
         The write counterpart of :func:`_read_workspace_via_host`, for when the
         runner is offline but the host holding the workspace is connected.
 
-        :param op: Host-side write op — currently ``"github_set_preference"``.
+        :param op: Host-side write op — ``"github_set_preference"``,
+            ``"github_prs_update"``, or ``"github_labels_update"``.
         :param host_params: Op-specific args for the host writer.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
@@ -989,6 +1009,8 @@ def register_resources_routes(
         path: str,
         body: dict[str, Any],
         conversation: Conversation,
+        *,
+        timeout: float = 10.0,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a POST request to the runner and return status + JSON.
 
@@ -996,6 +1018,7 @@ def register_resources_routes(
         :param path: Runner-relative URL path.
         :param body: JSON body to forward.
         :param conversation: Conversation loaded during authorization.
+        :param timeout: Seconds to wait for the runner's response.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
@@ -1012,7 +1035,7 @@ def register_resources_routes(
             resp = await runner_client.post(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=timeout,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
@@ -2441,6 +2464,44 @@ def register_resources_routes(
         )
 
     @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+        response_model=None,
+    )
+    async def search_environment_content(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        include: str = Query(default="", max_length=4096),
+        exclude: str = Query(default="", max_length=4096),
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """Search the session workspace with the same access gate as file reads."""
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH):
+            raise HTTPException(status_code=404, detail="Workspace content search is disabled")
+        conv = await _authorize_browse_read(session_id, request)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+            conv,
+            params={
+                "q": q,
+                "case_sensitive": str(case_sensitive).lower(),
+                "regex": str(regex).lower(),
+                "include": include,
+                "exclude": exclude,
+                "limit": str(limit),
+            },
+            timeout=25.0,
+            unsupported_endpoint_message=(
+                "Session runner does not support content search; update the host and restart the session"
+            ),
+        )
+
+    @router.get(
         "/sessions/{session_id}/resources/environments/{environment_id}/search",
         response_model=None,
     )
@@ -3131,6 +3192,84 @@ def register_resources_routes(
             raise OmnigentError(
                 error.get("message", f"GitHub preference update failed (HTTP {status})"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+    )
+    async def list_session_github_labels(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the labels the selected PR's repository offers, for the label picker.
+
+        Requires edit access, like the label edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{name, color, description}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_labels",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            runner_timeout=_LABEL_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_labels(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Add and remove labels on the selected PR with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` name lists.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        params = {
+            "pr_url": body["pr_url"],
+            "add": body.get("add", []),
+            "remove": body.get("remove", []),
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/labels",
+                params,
+                conv,
+                timeout=_LABEL_PROXY_TIMEOUT_S,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_labels_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update labels")
             )
         return result
 

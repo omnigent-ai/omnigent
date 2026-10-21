@@ -4083,7 +4083,7 @@ describe("Composer reply quotes", () => {
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
   });
 
-  it("empties the composer when a restored failed send turns out delivered", () => {
+  it.each(["none", "failed", "delivered"])("retracts after a second send: %s", (secondSend) => {
     const stableId = "c".repeat(32);
     render(<Composer {...composerProps()} />);
     act(() =>
@@ -4097,19 +4097,49 @@ describe("Composer reply quotes", () => {
       }),
     );
     expect(textarea()).toHaveValue("resend me");
-    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId,
+      delivered: false,
+    });
 
-    // The send's committed item arrived (see retractDeliveredSendDraft):
-    // the message was delivered, so the untouched restore must go away.
+    if (secondSend !== "none") {
+      const secondId = "second-send";
+      if (secondSend === "delivered")
+        act(() =>
+          handleSessionEvent({
+            type: "session_input_consumed",
+            itemId: secondId,
+            itemType: "message",
+            data: { role: "user", content: [{ type: "input_text", text: "second message" }] },
+          }),
+        );
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "second message",
+            files: [],
+            stableId: secondId,
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("resend me");
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+        stableId,
+        delivered: false,
+      });
+      expect(useChatStore.getState().pendingRetryStableId).toBe(
+        secondSend === "delivered" ? stableId : null,
+      );
+    }
+
+    // Delivery of the first send still retracts its unchanged draft.
     act(() =>
-      useChatStore.setState({
-        restoredSendDraft: {
-          conversationId: "conv_test",
-          stableId,
-          text: "resend me",
-          files: [],
-          delivered: true,
-        },
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
       }),
     );
     expect(textarea()).toHaveValue("");

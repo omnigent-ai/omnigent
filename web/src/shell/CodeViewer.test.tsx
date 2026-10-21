@@ -6,7 +6,7 @@ import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -27,7 +27,9 @@ vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null 
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: () => <div data-testid="monaco-editor-stub" />,
+  MonacoCodeEditor: ({ largeMarkdown }: { largeMarkdown?: boolean }) => (
+    <div data-testid="monaco-editor-stub" data-large-markdown={String(!!largeMarkdown)} />
+  ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
@@ -107,6 +109,7 @@ function renderViewer(
   opts: {
     viewMode?: "editor" | "preview" | "source" | "diff";
     truncated?: boolean;
+    markdownSourceFallback?: boolean;
     mediaActive?: boolean;
     position?: { line: number };
     onRequestEditMode?: () => void;
@@ -118,6 +121,7 @@ function renderViewer(
   // a .md path to exercise the remaining Shiki path.
   return render(
     <CodeViewer
+      markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
       conversationId="conv_1"
       path={path}
@@ -190,6 +194,7 @@ describe("CodeViewer find-in-file shortcut", () => {
       <>
         <textarea aria-label="Prompt" />
         <CodeViewer
+          markdownSourceFallback={false}
           conversationId="conv_1"
           path="notes.md"
           fileQuery={makeFileQuery("hello")}
@@ -443,6 +448,7 @@ describe("CodeViewer markdown preview links", () => {
     render(
       <FileViewerContext.Provider value={PREVIEW_FILE_VIEWER}>
         <CodeViewer
+          markdownSourceFallback={false}
           conversationId="conv_1"
           path={path}
           fileQuery={makeFileQuery(content)}
@@ -834,6 +840,7 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
     const fileQuery = makeFileQuery("# heading");
     const build = (viewMode: "preview" | "source") => (
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path="notes.md"
         fileQuery={fileQuery}
@@ -866,6 +873,7 @@ describe("CodeViewer rendered previews skip Shiki highlighting", () => {
     const fileQuery = makeFileQuery(MINIMAL_NB);
     const build = (path: string) => (
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={fileQuery}
@@ -915,6 +923,7 @@ describe("CodeViewer image rendering", () => {
   function renderImage(contentType: string, path = "logo.png", truncated = false) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makeImageQuery(contentType, truncated)}
@@ -960,6 +969,7 @@ describe("CodeViewer image rendering", () => {
     render(
       <ImageLightboxProvider>
         <CodeViewer
+          markdownSourceFallback={false}
           conversationId="conv_1"
           path="assets/logo.png"
           fileQuery={makeImageQuery("image/png")}
@@ -999,6 +1009,7 @@ describe("CodeViewer PDF routing", () => {
   ) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makePdfQuery(contentType, truncated)}
@@ -1076,6 +1087,7 @@ describe("CodeViewer 3D model routing", () => {
   function renderModel(path: string, encoding: "base64" | "utf-8", contentType: string | null) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makeModelQuery(encoding, contentType)}
@@ -1183,3 +1195,17 @@ it.each([true, false])(
     }
   },
 );
+
+describe("large Markdown source fallback", () => {
+  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+    vi.mocked(highlightCode).mockClear();
+    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", {
+      viewMode,
+      markdownSourceFallback: true,
+    });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
+    expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
+  });
+});

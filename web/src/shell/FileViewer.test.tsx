@@ -35,12 +35,14 @@ vi.mock("./CodeViewer", () => ({
     path,
     position,
     viewMode,
+    markdownSourceFallback,
     searchOpen,
     onDirtyChange,
   }: {
     path: string;
     position?: { line: number };
     viewMode: string;
+    markdownSourceFallback?: boolean;
     searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => {
@@ -49,6 +51,7 @@ vi.mock("./CodeViewer", () => ({
       <div
         data-testid="code-viewer"
         data-view-mode={viewMode}
+        data-markdown-source={String(!!markdownSourceFallback)}
         data-search-open={String(!!searchOpen)}
       >
         <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
@@ -185,6 +188,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
+import { MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
@@ -227,6 +231,7 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  syncUrl?: boolean;
   frameless?: boolean;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
@@ -255,6 +260,7 @@ interface RenderProps {
  * the current params after state changes.
  */
 function viewerTree({
+  syncUrl,
   frameless,
   mobileOverlay,
   position,
@@ -273,6 +279,7 @@ function viewerTree({
       <MemoryRouter initialEntries={[url]}>
         <LocationDisplay />
         <FileViewer
+          syncUrl={syncUrl}
           frameless={frameless}
           mobileOverlay={mobileOverlay}
           position={position}
@@ -2232,4 +2239,73 @@ describe("file position navigation", () => {
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
     },
   );
+});
+
+describe("large Markdown file routing", () => {
+  const large = "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1);
+  const setContent = (content: string | undefined) => {
+    vi.mocked(useFileContent).mockReturnValue({
+      data: content === undefined ? undefined : { content, encoding: "utf-8" },
+    } as ReturnType<typeof useFileContent>);
+  };
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+  afterEach(() => setContent(""));
+
+  it.each(["editor", "preview", "source"] as const)(
+    "overrides %s without changing the preference",
+    (mode) => {
+      writeFileViewPreferences({
+        diffActive: false,
+        diffLayout: "unified",
+        previewableViewMode: mode,
+        hideWhitespace: false,
+        wrapLines: false,
+      });
+      setContent(large);
+      const view = render(viewerTree({ open: true, path: "large.md" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "true");
+      expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
+      vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
+      fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-search-open", "true");
+      setContent("# Small");
+      view.rerender(viewerTree({ open: true, path: "small.md" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", mode);
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "false");
+    },
+  );
+
+  it.each([true, false])(
+    "keeps the initial editor across size-changing saves (large=%s)",
+    (initiallyLarge) => {
+      setContent(undefined);
+      const props = { open: true, path: "changing.md" };
+      const view = render(viewerTree(props));
+      setContent(initiallyLarge ? large : "# Small");
+      view.rerender(viewerTree(props));
+      setContent(initiallyLarge ? "# Small" : large);
+      view.rerender(viewerTree(props));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute(
+        "data-markdown-source",
+        String(initiallyLarge),
+      );
+    },
+  );
+});
+
+it("keeps grid file viewers independent of shared URL parameters and copies a session link", () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal("navigator", { clipboard: { writeText } });
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  renderViewer({ open: true, syncUrl: false, initialSearch: "diff=1&comment=other-cell" });
+  expect(screen.queryByTestId("diff-viewer")).toBeNull();
+  expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1&comment=other-cell");
+  fireEvent.click(screen.getByRole("button", { name: "Copy link to file" }));
+  const copied = new URL(writeText.mock.calls[0][0]);
+  expect(copied.pathname).toBe("/c/conv_1");
+  expect(copied.searchParams.get("file")).toBe("file1.py");
+  expect(copied.searchParams.has("comment")).toBe(false);
 });

@@ -13,6 +13,10 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPr
 const isNativeShell = vi.fn(() => false);
 const isElectronShell = vi.fn(() => false);
 const supportsBrowser = vi.fn(() => false);
+const contentSearchEnabled = vi.fn(() => false);
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ features: { workspace_content_search: contentSearchEnabled() } }),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
   isElectronShell: () => isElectronShell(),
@@ -26,6 +30,7 @@ beforeEach(() => {
   isNativeShell.mockReturnValue(false);
   isElectronShell.mockReturnValue(false);
   supportsBrowser.mockReturnValue(false);
+  contentSearchEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -87,6 +92,16 @@ describe("KeyboardShortcutsList settings layout", () => {
 });
 
 describe("KeyboardShortcutsDialog", () => {
+  it("shows the workspace search shortcut only when the feature is enabled", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Search workspace contents")).toBeNull();
+    expect(keysFor("Select a workspace tab")).toContain("1…4");
+    contentSearchEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Search workspace contents")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Select a workspace tab")).toContain("1…5");
+  });
+
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);

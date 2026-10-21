@@ -403,9 +403,11 @@ async def test_codex_native_launch_config_reads_the_bridge_id_label(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
+@pytest.mark.parametrize("dependency", ["launch-routing", "gateway-host"])
+async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credential_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    dependency: str,
 ) -> None:
     """A blocking builder dependency must not stop the runner's event loop."""
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
@@ -415,10 +417,25 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     lookup_release = threading.Event()
     loop_progressed: list[bool] = []
 
-    def resolve_host(profile: str | None) -> None:
-        assert profile == "test-profile"
+    def wait_for_loop() -> None:
         loop.call_soon_threadsafe(lookup_started.set)
         loop_progressed.append(lookup_release.wait(timeout=1.0))
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        if dependency == "gateway-host":
+            wait_for_loop()
+
+    launch_resolutions = 0
+
+    def resolve_launch(
+        *, model: str | None, spec: Any = None, terminal_launch_args: Any = ()
+    ) -> codex_app_mod.NativeCodexLaunch:
+        nonlocal launch_resolutions
+        launch_resolutions += 1
+        if dependency == "launch-routing" and launch_resolutions == 1:
+            wait_for_loop()
+        return codex_app_mod.NativeCodexLaunch([], model, "test-profile")
 
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
@@ -436,13 +453,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
     monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
-    monkeypatch.setattr(
-        codex_app_mod,
-        "resolve_native_codex_launch",
-        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
-            [], model, "test-profile"
-        ),
-    )
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", resolve_launch)
 
     task = asyncio.create_task(
         _auto_create_codex_terminal(
@@ -461,7 +472,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         lookup_release.set()
         await asyncio.gather(task, return_exceptions=True)
 
-    assert loop_progressed == [True], "profile resolution blocked the runner's event loop"
+    assert loop_progressed == [True], f"{dependency} resolution blocked the runner's event loop"
 
 
 @pytest.mark.asyncio

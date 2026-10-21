@@ -80,6 +80,9 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
+# Ops without side effects: safe to send again if the helper died before replying.
+_REPLAY_SAFE_OPS = frozenset({"read"})
+
 logger = logging.getLogger(__name__)
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
@@ -469,19 +472,41 @@ class _HelperProcessClient:
         try:
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
+        except OSError as exc:
+            # The helper never received the request, so any op can be sent again.
+            return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
+        try:
             line = self._proc.stdout.readline()
             if not line:
                 raise RuntimeError(self._helper_exit_detail_locked())
             result = json.loads(line)
-            if isinstance(result, dict):
-                return result
-            return {"error": f"Helper returned non-object response: {result!r}"}
         except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
+            op = payload.get("op")
+            if op in _REPLAY_SAFE_OPS:
+                return self._resend_on_new_helper_locked(payload, allow_retry=allow_retry, exc=exc)
             self._stop_locked()
-            if allow_retry and not self._closed:
-                self._ensure_started_locked()
-                return self._request_locked(payload, allow_retry=False)
-            return {"error": f"os_env helper failed: {exc}"}
+            return {
+                "error": (
+                    f"Lost the os_env helper during {op!r}; it may already have run, "
+                    f"so it was not sent again: {exc}"
+                )
+            }
+        if isinstance(result, dict):
+            return result
+        return {"error": f"Helper returned non-object response: {result!r}"}
+
+    def _resend_on_new_helper_locked(
+        self,
+        payload: OpRequest,
+        *,
+        allow_retry: bool,
+        exc: Exception,
+    ) -> OpResult:
+        self._stop_locked()
+        if allow_retry and not self._closed:
+            self._ensure_started_locked()
+            return self._request_locked(payload, allow_retry=False)
+        return {"error": f"os_env helper failed: {exc}"}
 
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:

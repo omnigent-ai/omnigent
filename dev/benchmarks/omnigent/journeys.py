@@ -29,7 +29,8 @@ new-conversation cold path: it spawns a host daemon once, then per iteration
 creates a host-bound session (which fires ``host.launch_runner``), attaches the
 SSE stream, sends the first message, and times to the first output-text delta —
 so the span includes the on-demand runner launch + reverse-tunnel handshake the
-UI's first message races, exactly as a real new chat pays it.
+UI's first message races, exactly as a real new chat pays it. Each sample's
+runner is stopped off the clock before the next, so runners don't accumulate.
 
 ``session_cold_restart`` reuses one existing host-bound session. Before every
 timed message it stops that session's runner outside the measured span; the
@@ -577,15 +578,39 @@ async def _setup_turn_agent(env: BenchEnvironment, *, stream: bool = False) -> s
     return await env.agent_id(name)
 
 
-async def _setup_cold_start_agent(env: BenchEnvironment) -> str:
-    """Register a streaming-reply agent for the cold-start journey; return its id.
+@dataclass
+class _ColdStartContext:
+    """The cold-start agent and the session whose runner the last sample launched.
+
+    :param agent_id: Agent each fresh session binds to.
+    :param session_id: Session created by the last sample, until its runner stops.
+    """
+
+    agent_id: str
+    session_id: str | None = None
+
+
+async def _setup_cold_start_agent(env: BenchEnvironment) -> JourneyContext:
+    """Register a streaming-reply agent for the cold-start journey.
 
     No session and no warm-up turn — the cold-start measure creates a fresh
     host-bound session each iteration. The reply streams deltas so the measured
     op can return on the first ``response.output_text.delta`` (the UI's
     first-token signal).
     """
-    return await _setup_turn_agent(env, stream=True)
+    return _ColdStartContext(await _setup_turn_agent(env, stream=True))
+
+
+async def _stop_cold_start_runner(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the runner the last cold-start sample launched, outside the timer.
+
+    Otherwise every sample of every run keeps a runner alive until the suite
+    ends, which runs a same-runner baseline-and-candidate job out of memory.
+    """
+    cold = cast(_ColdStartContext, ctx)  # _setup_cold_start_agent
+    session_id, cold.session_id = cold.session_id, None
+    if session_id is not None:
+        await env.stop_session_runner(session_id)
 
 
 async def _setup_cold_restart_session(env: BenchEnvironment) -> str:
@@ -707,17 +732,12 @@ async def _measure_session_cold_start(env: BenchEnvironment, ctx: JourneyContext
     connect + first-token pipeline.
 
     Each iteration is its own fresh session with its own host-launched runner.
-    The server never stops an external-host runner on idle (only on an explicit
-    stop/delete, neither of which the UI first-message path does), so each
-    iteration's runner stays connected until the daemon is SIGTERM'd at env
-    teardown, which reaps them together. That is bounded — ``_COLD_MAX_ITERATIONS``
-    (+ warmups) runners at most, all cleaned up at the end — so we deliberately
-    skip per-iteration teardown: stopping the runner would add a
-    stop-round-trip to a journey whose whole point is to time the fresh-launch
-    cost, and would not reflect what a real first message does.
+    The server never stops an external-host runner on idle, so ``prepare``
+    stops the previous sample's runner and ``teardown`` stops the last one,
+    both off the clock.
     """
-    agent_id = cast(str, ctx)  # _setup_turn_agent (stream=True)
-    await env.cold_start_first_delta(agent_id, _TURN_PROMPT)
+    cold = cast(_ColdStartContext, ctx)  # _setup_cold_start_agent
+    cold.session_id = await env.cold_start_first_delta(cold.agent_id, _TURN_PROMPT)
 
 
 async def _measure_session_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
@@ -1162,6 +1182,8 @@ ALL_JOURNEYS: dict[str, Journey] = {
             kind="latency",
             measure=_measure_session_cold_start,
             setup=_setup_cold_start_agent,
+            prepare=_stop_cold_start_runner,
+            teardown=_stop_cold_start_runner,
             needs_runner=True,
             needs_host=True,
             max_iterations=_COLD_MAX_ITERATIONS,

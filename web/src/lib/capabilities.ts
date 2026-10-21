@@ -64,7 +64,9 @@ export type FeatureKey =
   | "arca_shutdown_warnings"
   | "import_review"
   | "custom_agents_settings_ui"
-  | "sidebar_grouping_ui";
+  | "sidebar_grouping_ui"
+  | "workspace_content_search"
+  | "grid_sessions_display_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

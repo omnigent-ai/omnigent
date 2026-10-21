@@ -28,6 +28,8 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "import_review": False,
         "custom_agents_settings_ui": False,
         "sidebar_grouping_ui": False,
+        "workspace_content_search": False,
+        "grid_sessions_display_ui": False,
     }
 
 

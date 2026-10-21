@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RefObject } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -43,12 +44,21 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView }: { flatView: boolean }) => (
-    <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+    <div
+      data-testid="files-panel-stub"
+      data-session={conversationId}
+      data-flat-view={String(flatView)}
+    />
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
+}));
+vi.mock("./ContentSearchPanel", () => ({
+  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => (
+    <input data-testid="content-search-stub" ref={inputRef} />
+  ),
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId, active }: { conversationId: string; active?: boolean }) => (
@@ -88,10 +98,15 @@ const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
+beforeEach(() => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+});
+
 afterEach(() => {
   cleanup();
   localStorage.clear();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
   isMobileMock.mockReturnValue(false);
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
@@ -111,14 +126,17 @@ afterEach(() => {
  * onRightRailTabChange) alongside the render result.
  */
 function renderWorkspace(
-  overrides: {
+  initialOverrides: {
+    conversationId?: string;
+    contained?: boolean;
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
-    showFilesPanel?: boolean;
     selectedFilePath?: string | null;
     openFiles?: string[];
     changedCount?: number;
     showGithubTab?: boolean;
+    showContentSearch?: boolean;
+    showFilesPanel?: boolean;
     showBrowserTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
@@ -132,19 +150,21 @@ function renderWorkspace(
     mobileSideChatsOpen?: boolean;
   } = {},
 ) {
+  let overrides = initialOverrides;
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onClosePanel = vi.fn();
-  const onBrowserTabOpened = vi.fn();
+  const onReveal = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
   const onMobileSideChatsOpenChange = vi.fn();
-  const view = render(
+  const tree = () => (
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
-        conversationId="conv_ws"
+        conversationId={overrides.conversationId ?? "conv_ws"}
+        contained={overrides.contained}
         width={360}
         open={overrides.open}
         animateVisibility={overrides.animateVisibility}
@@ -162,9 +182,10 @@ function renderWorkspace(
         openPanels={overrides.openPanels ?? []}
         onClosePanel={onClosePanel}
         showFilesPanel={overrides.showFilesPanel ?? true}
+        showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
-        onBrowserTabOpened={onBrowserTabOpened}
+        onReveal={onReveal}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -191,14 +212,19 @@ function renderWorkspace(
         mobileSideChatsOpen={overrides.mobileSideChatsOpen}
         onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
       />
-    </TooltipProvider>,
+    </TooltipProvider>
   );
+  const view = render(tree());
   return {
+    rerender: (next: typeof overrides) => {
+      overrides = { ...overrides, ...next };
+      view.rerender(tree());
+    },
     openFileViewer,
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
-    onBrowserTabOpened,
+    onReveal,
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
@@ -249,6 +275,99 @@ describe("WorkspacePanel surface presentation", () => {
     expect(screen.getByRole("menuitem", { name: "Agents" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Pull Requests" })).toBeNull();
+  });
+
+  it.each(["tab", "conversation"])(
+    "cancels a deferred search focus after changing %s",
+    (changed) => {
+      const { rerender } = renderWorkspace({
+        showContentSearch: true,
+        rightRailTab: "content-search",
+        open: true,
+        inert: true,
+      });
+      const chord = { code: "KeyF", ctrlKey: true, shiftKey: true };
+      fireEvent.keyDown(window, chord);
+      rerender(changed === "tab" ? { rightRailTab: "files" } : { conversationId: "other" });
+      rerender({ rightRailTab: "content-search", inert: false });
+      expect(screen.getByTestId("content-search-stub")).not.toHaveFocus();
+      fireEvent.keyDown(window, chord);
+      expect(screen.getByTestId("content-search-stub")).toHaveFocus();
+    },
+  );
+
+  it.each([
+    { showContentSearch: false },
+    { showContentSearch: true, showFilesPanel: false },
+    { showContentSearch: true, pending: true },
+  ])("leaves the content-search shortcut alone when unavailable: %j", (overrides) => {
+    const { onRightRailTabChange, onReveal } = renderWorkspace(overrides);
+    expect(fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true })).toBe(true);
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(onReveal).not.toHaveBeenCalled();
+  });
+
+  it("ignores content-search shortcuts on mobile and unrelated chords on desktop", () => {
+    isMobileMock.mockReturnValue(true);
+    const mobile = renderWorkspace({ showContentSearch: true });
+    fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true });
+    expect(mobile.onReveal).not.toHaveBeenCalled();
+    mobile.view.unmount();
+    isMobileMock.mockReturnValue(false);
+    const desktop = renderWorkspace({ showContentSearch: true });
+    for (const modifiers of [
+      { shiftKey: false },
+      { altKey: true },
+      { metaKey: true },
+      { repeat: true },
+      { isComposing: true },
+    ]) {
+      expect(
+        fireEvent.keyDown(window, {
+          code: "KeyF",
+          ctrlKey: true,
+          shiftKey: true,
+          ...modifiers,
+        }),
+      ).toBe(true);
+    }
+    expect(desktop.onReveal).not.toHaveBeenCalled();
+    expect(fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true })).toBe(false);
+    expect(desktop.onReveal).toHaveBeenCalledOnce();
+    expect(desktop.onRightRailTabChange).toHaveBeenCalledWith("content-search");
+  });
+
+  it("gates content search and exposes it in the tab strip and panel picker", async () => {
+    const disabled = renderWorkspace();
+    expect(screen.queryByRole("tab", { name: "Content search" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("content-search-stub")).not.toBeInTheDocument();
+    disabled.view.unmount();
+    const enabled = renderWorkspace({ showContentSearch: true, showGithubTab: true });
+    expect(screen.getByTestId("content-search-stub")).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Content search" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(enabled.onRightRailTabChange).toHaveBeenCalledWith("content-search");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    const searchMenuItem = await screen.findByRole("menuitem", { name: "Content search" });
+    enabled.onRightRailTabChange.mockClear();
+    fireEvent.click(searchMenuItem);
+    expect(enabled.onRightRailTabChange).toHaveBeenCalledWith("content-search");
+    const searchTab = screen.getByRole("tab", { name: "Content search" });
+    expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 5"));
+    enabled.onRightRailTabChange.mockClear();
+    fireEvent.keyDown(searchTab, { key: "5" });
+    expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith("content-search");
+
+    writePinnedWorkspaceTabs([]);
+    enabled.rerender({ rightRailTab: "content-search" });
+    expect(screen.getAllByRole("tab")).toHaveLength(1);
+    expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 1"));
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("flex");
   });
 
   it("sits flush to the window edge with a left divider, no floating card frame", () => {
@@ -578,7 +697,9 @@ describe("WorkspacePanel shell tabs", () => {
 
   it("surfaces the active shell's xterm in the content slot", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
-    renderWorkspace({
+    const { rerender } = renderWorkspace({
+      showContentSearch: true,
+      rightRailTab: "content-search",
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
@@ -590,6 +711,14 @@ describe("WorkspacePanel shell tabs", () => {
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
+    rerender({ openTerminals: [] });
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("flex");
+    fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true });
+    expect(screen.getByTestId("content-search-stub")).toHaveFocus();
+    rerender({ openTerminals: [termKey] });
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
@@ -693,23 +822,27 @@ describe('WorkspacePanel "+" new-tab menu', () => {
   });
 
   it("renders exactly one '+' — after the nav tabs with no open tabs, trailing the tabs otherwise", () => {
+    // No open tabs → "+" follows the nav tabs, outside the right-pinned group.
     declaresShell();
-    // No open tabs → single "+", sitting after the nav tabs.
     renderWorkspace({ openFiles: [] });
     expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+    const leadingPlus = screen.getByRole("button", { name: "Open new" });
+    expect(leadingPlus.closest(".ml-auto")).toBeNull();
+    expect(
+      screen.getByRole("tablist").compareDocumentPosition(leadingPlus) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     cleanup();
 
-    // With an open file tab → still exactly one "+", now trailing the tabs. It
-    // sits OUTSIDE the scrolling tabs region (as its next sibling) so it stays
-    // pinned when the tabs overflow instead of scrolling/overlapping.
+    // With open tabs "+" leads the right-pinned group, outside the scrolling
+    // tabs region so it stays put when the tabs overflow.
     declaresShell();
     renderWorkspace({ openFiles: ["src/App.tsx"] });
+    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
     const plus = screen.getByRole("button", { name: "Open new" });
-    expect(plus).toBeInTheDocument();
-    // The scrolling tabs region (holds the file tab's close button) is the
-    // "+" wrapper's immediately-preceding sibling — the "+" is not inside it.
-    const plusWrapper = plus.parentElement!;
-    const tabsRegion = plusWrapper.previousElementSibling as HTMLElement;
+    const trailing = plus.closest(".ml-auto")!;
+    expect(trailing.firstElementChild).toContainElement(plus);
+    const tabsRegion = trailing.previousElementSibling as HTMLElement;
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
     expect(tabsRegion).not.toContainElement(plus);
   });
@@ -961,33 +1094,30 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
   // The row containing the fixed nav tabs — the tab strip.
   const strip = () => screen.getByRole("tab", { name: /files/i }).closest("div.border-b")!;
 
-  it("keeps exactly one ml-auto in the strip with no open tabs (picker pins trailing controls right)", () => {
+  it("keeps exactly one ml-auto in the strip with no open tabs (trailing group pins right)", () => {
     // Two ml-auto siblings split the free space and strand the nav group
-    // mid-strip. With no open tabs the single ml-auto lives on the panel picker
-    // wrapper; the nav group must NOT also carry one.
+    // mid-strip. The single ml-auto lives on the trailing control group; the
+    // nav group must NOT also carry one.
     renderWorkspace({ openFiles: [], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
-    // The picker pins the trailing controls right.
     const picker = screen.getByRole("button", { name: "Select panel" });
-    expect(picker.parentElement).toHaveClass("ml-auto");
+    expect(picker.closest(".ml-auto")).not.toBeNull();
     // The nav tablist stays left — no ml-auto.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
   });
 
-  it("keeps exactly one ml-auto in the strip with open tabs (picker pins trailing controls right)", () => {
+  it("keeps exactly one ml-auto in the strip with open tabs (trailing group pins right)", () => {
     // The nav tabs stay anchored on the LEFT with open tabs — the open-tabs
-    // region renders to their right and the panel picker keeps the row's
-    // single ml-auto. Two ml-auto siblings would split the free space.
+    // region renders to their right and the trailing control group keeps the
+    // row's single ml-auto. Two ml-auto siblings would split the free space.
     renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
     // The nav tablist stays left — no ml-auto of its own.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
-    // The panel picker owns the single ml-auto, pinning the controls right.
-    expect(screen.getByRole("button", { name: "Select panel" }).parentElement).toHaveClass(
-      "ml-auto",
-    );
+    // The trailing control group owns the single ml-auto, pinning it right.
+    expect(screen.getByRole("button", { name: "Select panel" }).closest(".ml-auto")).not.toBeNull();
     // The divider is present (separating the nav tabs from the open tabs) and
     // stays container-query gated to the ≥500px anchored case.
     const divider = strip().querySelector(".bg-border-strong");
@@ -1004,8 +1134,8 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     renderWorkspace({ openFiles: ["src/App.tsx"] });
 
     const plus = screen.getByRole("button", { name: "Open new" });
-    // Scroller is the "+" wrapper's preceding sibling; it holds only the tabs.
-    const tabsRegion = plus.parentElement!.previousElementSibling as HTMLElement;
+    // Scroller precedes the trailing group holding "+"; it holds only the tabs.
+    const tabsRegion = plus.closest(".ml-auto")!.previousElementSibling as HTMLElement;
     expect(tabsRegion.children).toHaveLength(1);
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
   });
@@ -1021,7 +1151,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 
 describe("WorkspacePanel browser tab", () => {
   it("opens a browser tab with Ctrl+Alt+B", () => {
-    const { onRightRailTabChange, onBrowserTabOpened } = renderWorkspace({
+    const { onRightRailTabChange, onReveal } = renderWorkspace({
       showBrowserTab: true,
     });
 
@@ -1029,7 +1159,7 @@ describe("WorkspacePanel browser tab", () => {
 
     expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
     expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-    expect(onBrowserTabOpened).toHaveBeenCalledOnce();
+    expect(onReveal).toHaveBeenCalledOnce();
   });
 
   it("offers browsers without shell access and creates multiple closable tabs", async () => {
@@ -1322,4 +1452,15 @@ describe("WorkspacePanel panel picker", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
     expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
   });
+});
+
+it("keeps a contained workspace inline on narrow viewports and scopes its file browser", () => {
+  isMobileMock.mockReturnValue(true);
+  renderWorkspace({ contained: true, maximized: true });
+  expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass(
+    "absolute",
+    "inset-0",
+    "flex",
+  );
+  expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-session", "conv_ws");
 });

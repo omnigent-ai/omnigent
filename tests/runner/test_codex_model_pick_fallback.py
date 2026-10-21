@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -245,6 +246,7 @@ async def test_equivalent_gateway_pick_launches_without_reset(
 async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
     agent_model: str | None,
     codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fresh evidence retires a pick only after its replacement terminal exists."""
     harness = codex_launch_harness
@@ -259,8 +261,21 @@ async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
         ]
     )
 
+    loop = asyncio.get_running_loop()
+    resolve_launch = codex_app.resolve_native_codex_launch
+    loop_progressed: list[bool] = []
+
+    def resolve_without_blocking_loop(**kwargs: Any) -> codex_app.NativeCodexLaunch:
+        if kwargs.get("model") != _RETIRED_PICK:
+            released = threading.Event()
+            loop.call_soon_threadsafe(released.set)
+            loop_progressed.append(released.wait(timeout=1.0))
+        return resolve_launch(**kwargs)
+
+    monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_without_blocking_loop)
     await harness.launch()
 
+    assert loop_progressed and all(loop_progressed), "fallback routing blocked the event loop"
     assert harness.builds[0]["model"] == (agent_model or _PROVIDER_DEFAULT)
     assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
     assert harness.snapshot["model_override"] is None

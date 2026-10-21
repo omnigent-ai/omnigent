@@ -1828,3 +1828,82 @@ describe("ApprovalCard — gating message emphasis", () => {
     expect(card.querySelector("strong, em")).toBeNull();
   });
 });
+
+describe("Kiro approval delivery", () => {
+  const props = {
+    elicitationId: "kiro-request",
+    message: "Kiro wants approval for Running: pwd",
+    phase: "pre_tool_use",
+    policyName: "kiro_native_permission",
+    contentPreview: "Running: pwd",
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("keeps sending distinct from delivered and retries only the current attempt", () => {
+    const submit = vi.fn();
+    const { rerender } = render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "sending", attempt: "first", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Waiting for Kiro to confirm")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    rerender(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "unconfirmed", attempt: "second", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/previous attempt may still be pending/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending approval" }));
+    expect(submit).toHaveBeenCalledExactlyOnceWith("kiro-request", "accept", undefined, {
+      native_delivery_attempt: "second",
+    });
+    rerender(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            status="responded"
+            response={{ action: "auto_resolved" }}
+            nativeDelivery={{ state: "unconfirmed", attempt: "second", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Resolved in Kiro")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it("retries a rejection without turning it into an approval", () => {
+    const submit = vi.fn();
+    render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "unconfirmed", attempt: "reject-attempt", action: "decline" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending rejection" }));
+    expect(submit).toHaveBeenCalledExactlyOnceWith("kiro-request", "decline", undefined, {
+      native_delivery_attempt: "reject-attempt",
+    });
+  });
+});

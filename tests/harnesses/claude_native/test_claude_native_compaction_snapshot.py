@@ -252,6 +252,86 @@ def test_retained_turn_and_tool_pair_survive_save_and_resume(
     assert all(record["parentUuid"] == parent["uuid"] for parent, record in pairwise(records))
 
 
+@pytest.mark.parametrize(
+    "summary_source_id", [None, "summary:0:compact_summary"], ids=["hook", "transcript"]
+)
+def test_attachment_chain_preserves_compaction_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary_source_id: str | None,
+) -> None:
+    entries = _transcript()
+    summary = entries.pop()
+    parent_uuid = "boundary"
+    for attachment_type in ("instructions", "session_context", "date"):
+        attachment_uuid = f"attachment-{attachment_type}"
+        entries.append(
+            {
+                "type": "attachment",
+                "uuid": attachment_uuid,
+                "parentUuid": parent_uuid,
+                "attachment": {"type": attachment_type},
+            }
+        )
+        parent_uuid = attachment_uuid
+    summary["parentUuid"] = parent_uuid
+    entries.append(summary)
+    bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
+    posted: list[dict[str, Any]] = []
+
+    _persist(bridge, posted, summary_source_id=summary_source_id)
+
+    assert len(posted) == 1
+    assert posted[0]["type"] == "compaction"
+    messages = posted[0]["data"]["compacted_messages"]
+    assert [message["content"] for message in messages] == [
+        summary["message"]["content"],
+        entries[1]["message"]["content"],
+        entries[2]["message"]["content"],
+        entries[3]["message"]["content"],
+    ]
+    resumed = _records(messages)
+    assert [record["message"]["content"] for record in resumed[1:]] == [
+        message["content"] for message in messages
+    ]
+    assert all(record["parentUuid"] == parent["uuid"] for parent, record in pairwise(resumed))
+
+
+@pytest.mark.parametrize(
+    "invalid_ancestor",
+    [
+        None,
+        {"type": "attachment", "parentUuid": "attachment"},
+        {"type": "attachment", "parentUuid": 123},
+        {"type": "user", "parentUuid": "boundary"},
+        {"type": "system", "subtype": "other", "parentUuid": "boundary"},
+    ],
+    ids=["missing", "cycle", "invalid-parent", "message", "other-system"],
+)
+def test_summary_boundary_rejects_invalid_attachment_chain(
+    invalid_ancestor: dict[str, Any] | None,
+) -> None:
+    records = {entry["uuid"]: entry for entry in _transcript()}
+    records["summary"]["parentUuid"] = "attachment"
+    if invalid_ancestor is not None:
+        records["attachment"] = {"uuid": "attachment", **invalid_ancestor}
+
+    assert forwarder._compaction_summary_boundary(records, records["summary"]) is None
+
+
+def test_hook_snapshot_rejects_attachment_chain_to_an_older_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = _transcript()
+    entries.insert(0, {"uuid": "older-boundary", "type": "system", "subtype": "compact_boundary"})
+    entries[-1]["parentUuid"] = "attachment"
+    entries.append({"uuid": "attachment", "type": "attachment", "parentUuid": "older-boundary"})
+    _, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+
+    with pytest.raises(ValueError, match="Claude compaction summary is not available yet"):
+        forwarder._restore_preserved_compaction_messages(transcript, [])
+
+
 @pytest.mark.parametrize("missing", ["request", "summary"])
 def test_incomplete_snapshot_is_not_persisted_and_can_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
@@ -291,7 +371,10 @@ def test_valid_empty_retained_content_is_skipped(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completion_path", ["transcript", "hook", "alternating"])
 async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completion_path: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion_path: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
@@ -385,7 +468,17 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
         "summary of older context"
     ]
     assert any(event["type"] == "external_session_todos" for event in posted)
+    assert [
+        event["data"]["status"]
+        for event in posted
+        if event["type"] == "external_compaction_status"
+    ] == ["completed"]
     assert not snapshot_tracker.has_retry_state("compaction-snapshot:1")
+    [fallback_log] = [
+        record for record in caplog.records if "snapshot retry budget exhausted" in record.message
+    ]
+    assert fallback_log.exc_info is not None
+    assert str(fallback_log.exc_info[1]) == "Claude retained message is not available yet"
 
 
 @pytest.mark.parametrize("failure", ["missing_file", "invalid_utf8", "sdk_error", "mismatch"])
