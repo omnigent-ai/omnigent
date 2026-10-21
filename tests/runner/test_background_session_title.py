@@ -475,6 +475,16 @@ async def test_claude_native_title_uses_tool_free_print_mode(
             "claude-opus-4-8": "deployment-17",
         },
     )
+    loop = asyncio.get_running_loop()
+    lookup_started = asyncio.Event()
+    lookup_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def resolve_config(*, spec: object = None) -> ClaudeNativeUcodeConfig:
+        assert spec is None
+        loop.call_soon_threadsafe(lookup_started.set)
+        loop_progressed.append(lookup_release.wait(timeout=1.0))
+        return claude_config
 
     class FakeProcess:
         returncode = 0
@@ -488,7 +498,7 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
-        lambda spec=None: claude_config,
+        resolve_config,
     )
     monkeypatch.setattr(
         "omnigent.claude_launcher.resolve_claude_launch",
@@ -496,17 +506,27 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
 
-    title = await claude_native_titles.generate_background_title(
-        BackgroundTitleContext(
-            prompt="please investigate the authentication timeout",
-            harness="claude-native",
-            spawn_env={},
-            process_manager=None,
-            cwd=tmp_path,
-            model_override="claude-sonnet-4-6",
+    task = asyncio.create_task(
+        claude_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="please investigate the authentication timeout",
+                harness="claude-native",
+                spawn_env={},
+                process_manager=None,
+                cwd=tmp_path,
+                model_override="claude-sonnet-4-6",
+            )
         )
     )
+    try:
+        await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
+        lookup_release.set()
+        title = await task
+    finally:
+        lookup_release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
+    assert loop_progressed == [True], "title provider resolution blocked the runner's event loop"
     assert title == "Debug authentication timeout"
     assert captured["command"] == "claude"
     args = list(captured["args"])
@@ -736,11 +756,13 @@ async def test_background_title_uses_native_codex_without_spawning_headless_harn
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_stage", ["launch", "server"])
 @pytest.mark.parametrize("cancel_during_lookup", [False, True])
 async def test_codex_native_title_keeps_loop_responsive_during_profile_resolution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     cancel_during_lookup: bool,
+    lookup_stage: str,
 ) -> None:
     """Title preparation must not block unrelated runner tasks on profile lookup."""
     loop = asyncio.get_running_loop()
@@ -749,15 +771,26 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     lookup_finished = threading.Event()
     loop_progressed: list[bool] = []
 
-    def resolve_host(profile: str | None) -> None:
-        assert profile == "test-profile"
+    def wait_for_lookup() -> None:
         loop.call_soon_threadsafe(lookup_started.set)
         loop_progressed.append(lookup_release.wait(timeout=1.0))
         lookup_finished.set()
 
+    def resolve_launch(*, model: str | None, spec: object = None) -> NativeCodexLaunch:
+        assert model is None
+        assert spec is None
+        if lookup_stage == "launch":
+            wait_for_lookup()
+        return NativeCodexLaunch([], model, "test-profile")
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        if lookup_stage == "server":
+            wait_for_lookup()
+
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch",
-        lambda *, model, spec=None: NativeCodexLaunch([], model, "test-profile"),
+        resolve_launch,
     )
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server._find_codex_cli", lambda: "codex"
@@ -790,7 +823,8 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     try:
         await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
         title_roots = list(tmp_path.glob("omnigent-codex-title-*"))
-        assert len(title_roots) == 1
+        if lookup_stage == "server":
+            assert len(title_roots) == 1
         if cancel_during_lookup:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -805,7 +839,7 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
         assert await asyncio.to_thread(lookup_finished.wait, 2.0)
 
     assert loop_progressed == [True], "title profile resolution blocked the runner's event loop"
-    assert not title_roots[0].exists()
+    assert not list(tmp_path.glob("omnigent-codex-title-*"))
 
 
 @pytest.mark.asyncio
