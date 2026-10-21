@@ -309,6 +309,38 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
+    const user = userEvent.setup();
+    state.info!.data!.pr!.checks = {
+      passing: 0,
+      failing: 0,
+      pending: 0,
+      cancelled: 1,
+      skipped: 2,
+      total: 3,
+      runs: [
+        { name: "cancelled job", bucket: "cancelled", url: null },
+        { name: "skipped job", bucket: "skipped", url: null },
+        { name: "another skipped job", bucket: "skipped", url: null },
+      ],
+    };
+    renderPanel();
+
+    for (const label of ["1 cancelled", "2 skipped"]) {
+      expect(screen.getByRole("button", { name: label })).toHaveClass(
+        "bg-muted",
+        "text-muted-foreground",
+        "rounded-full",
+      );
+    }
+    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+
+    await user.hover(screen.getByRole("button", { name: "2 skipped" }));
+    const rows = await screen.findAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual(["skipped job", "another skipped job"]);
   });
 
   it("shows each assigned reviewer with its current state and team kind", () => {
@@ -782,7 +814,9 @@ describe("PullRequestPanel", () => {
       "Checks can’t be read with this GitHub token. Fine-grained personal access tokens can’t read check runs; use a classic token or a GitHub App.",
     );
     expect(screen.queryByText(/Some checks are unavailable/)).toBeNull();
-    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /passed|failed|pending|cancelled|skipped/ }),
+    ).toBeNull();
     expect(screen.getByText("No description provided.")).toBeInTheDocument();
   });
 
