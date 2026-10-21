@@ -1265,8 +1265,9 @@ def register_events_routes(
             )
             and await startup.accepts(conv, request.app)
         ):
+            # Deferred authorization needs the identity even when attribution is hidden.
             saved = await startup.enqueue(
-                session_id, body, user_id=created_by, headers=request.headers, first=False
+                session_id, body, user_id=user_id, headers=request.headers, first=False
             )
             if conv.host_id is not None:
                 startup.host_changed(request.app, conv.host_id)

@@ -49,6 +49,8 @@ _PR_TITLE_LOOKUP_SECONDS = 2.0
 _PR_TITLE_REQUEST_SECONDS = 8.0
 # A git config key that pins a workspace to one provider id.
 _PROVIDER_CONFIG_KEY = "omnigent.gitprovider"
+# GitHub allows at most 100 labels on a pull request, so no larger edit can apply.
+_MAX_LABEL_EDIT = 100
 
 _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
 _DISCOVERY_LOCK = Lock()
@@ -534,6 +536,84 @@ def set_pr_preference(
     if reference is not None:
         return pr_info(root, session_id=session_id, pr_url=pr_url)
     return pr_info(root, session_id=session_id)
+
+
+def _label_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[PullRequestFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must support label editing."""
+    if not session_id or not pr_url:
+        raise ValueError("Select a pull request to edit its labels")
+    reference = _selected_pr(session_id, pr_url)
+    facet = _facet(reference.provider)
+    if facet is None or not facet.capabilities.label_editing:
+        display = provider_display(reference.provider)
+        kind = (
+            f"{display['display_name']} {display['request_name']}"
+            if display
+            else f"{reference.provider} pull request"
+        )
+        raise ValueError(f"Editing {kind} labels is not supported")
+    return facet, reference
+
+
+def _label_names(value: object, field: str) -> list[str]:
+    """Return a request field's label names, without case-insensitive repeats, in order.
+
+    GitHub label names ignore case, so the first spelling sent is kept.
+    """
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(name, str) and name.strip() for name in value
+    ):
+        raise ValueError(f"Expected {field} to be a list of label names")
+    unique: dict[str, str] = {}
+    for name in value:
+        unique.setdefault(name.casefold(), name)
+    return list(unique.values())
+
+
+def pr_labels(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
+    """List the labels the selected PR's repository offers.
+
+    :raises ValueError: Without a selected tracked PR, or when its provider
+        cannot edit labels.
+    """
+    facet, reference = _label_target(session_id, pr_url)
+    return facet.repo_labels(root, reference)
+
+
+def update_pr_labels(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    add: object = (),
+    remove: object = (),
+) -> dict[str, Any]:
+    """Add and remove labels on the selected PR.
+
+    :param add: Names of existing repository labels to add.
+    :param remove: Names of labels to remove; one the PR lacks is ignored.
+    :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
+    :raises ValueError: On an empty, overlapping, or oversized edit, a removal
+        named ``.`` or ``..``, without a selected tracked PR, or when the
+        provider refuses the change.
+    """
+    add_names = _label_names(add, "add")
+    remove_names = _label_names(remove, "remove")
+    if not add_names and not remove_names:
+        raise ValueError("Expected labels to add or remove")
+    if {name.casefold() for name in add_names} & {name.casefold() for name in remove_names}:
+        raise ValueError("A label cannot be both added and removed")
+    # A removal names the label in the URL path, where these are dot segments.
+    if {".", ".."} & set(remove_names):
+        raise ValueError("Remove labels named . or .. on GitHub")
+    if len(add_names) + len(remove_names) > _MAX_LABEL_EDIT:
+        raise ValueError(f"Edit at most {_MAX_LABEL_EDIT} labels at once")
+    facet, reference = _label_target(session_id, pr_url)
+    return facet.edit_labels(root, reference, add=add_names, remove=remove_names)
 
 
 def pr_changed_files(

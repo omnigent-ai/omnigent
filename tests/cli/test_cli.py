@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os
@@ -2330,7 +2331,7 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
         captured["create_app_kwargs"] = kwargs
         return _original_create_app(**kwargs)
 
-    def _fake_server_run(self: Any) -> None:
+    def _fake_server_run(self: Any, **kwargs: Any) -> None:
         """Skip the blocking server loop; capture config as flat kwargs dict.
 
         :param self: The uvicorn Server instance whose config holds all options.
@@ -2427,14 +2428,14 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     captured: dict[str, str] = {}
 
-    def _fake_server_run(self: object) -> None:
+    def _fake_server_run(self: object, **kwargs: Any) -> None:
         del self
         captured["config"] = os.environ["OMNIGENT_CONFIG"]
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     # Config precedence does not depend on a machine-global port being free.
-    bind_probe = Mock()
-    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
+    bind_probe = Mock(return_value=contextlib.nullcontext(Mock()))
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", bind_probe)
 
     result = CliRunner().invoke(
         cli,
@@ -2488,7 +2489,7 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
         captured["create_app_kwargs"] = kwargs
         return _original_create_app(**kwargs)
 
-    def _fake_server_run(self: Any) -> None:
+    def _fake_server_run(self: Any, **kwargs: Any) -> None:
         """Skip the blocking server loop, record that it was called.
 
         :param self: The uvicorn Server instance.
@@ -2517,8 +2518,8 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
 
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_register)
     # The dedicated server is stubbed; occupied-port behavior has its own test.
-    bind_probe = Mock()
-    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
+    bind_probe = Mock(return_value=contextlib.nullcontext(Mock()))
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", bind_probe)
 
     db_path = tmp_path / "chat.db"
     result = CliRunner().invoke(
@@ -2569,7 +2570,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
 
     captured: dict[str, Any] = {}
 
-    def _fake_server_run(self: Any) -> None:
+    def _fake_server_run(self: Any, **kwargs: Any) -> None:
         """
         Skip the blocking server loop.
 
@@ -2597,9 +2598,10 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
 
     bind_probes: list[tuple[str, int]] = []
 
-    def _spy_port_bindable(host: str, port: int) -> None:
+    def _spy_port_bindable(host: str, port: int) -> contextlib.AbstractContextManager:
         """Record the preflight bind probe without opening a real socket."""
         bind_probes.append((host, port))
+        return contextlib.nullcontext(Mock())
 
     from omnigent.host import local_server as _local_server_mod
 
@@ -2607,7 +2609,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     monkeypatch.setattr(_local_server_mod, "local_server_url_if_healthy", _must_not_check_existing)
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_touch_pidfile)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", _must_not_touch_pidfile)
-    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", _spy_port_bindable)
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", _spy_port_bindable)
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
 
@@ -2666,22 +2668,13 @@ def test_server_command_explicit_occupied_port_fails() -> None:
     assert "Starting omnigent server" not in result.output
 
 
-def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
+@pytest.mark.parametrize("fail_startup", [False, True])
+def test_server_command_keeps_explicit_port_bound_through_startup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    fail_startup: bool,
 ) -> None:
-    """
-    A refused client connection does not make an explicit port unavailable.
-
-    A connect-based probe would classify this free port as unusable
-    because the pre-test client connection is refused. The CLI should
-    use a bind probe instead, continue startup, and pass the requested
-    port to uvicorn unchanged.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Per-test data directory for the SQLite store.
-    :returns: None.
-    """
+    """No competing listener can take the port during app initialization."""
     import socket
 
     import uvicorn
@@ -2689,14 +2682,11 @@ def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
 
     captured: dict[str, Any] = {}
 
-    def _fake_server_run(self: Any) -> None:
-        """
-        Skip the blocking server loop.
-
-        :param self: The uvicorn Server instance.
-        :returns: None.
-        """
+    def _fake_server_run(self: Any, sockets: list[socket.socket] | None = None) -> None:
+        assert sockets is not None and len(sockets) == 1
+        assert sockets[0].getsockname()[1] == port
         captured["uvicorn_kwargs"] = {"port": self.config.port}
+        captured["listener"] = sockets[0]
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -2705,6 +2695,20 @@ def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
     with pytest.raises(OSError):
         socket.create_connection(("127.0.0.1", port), timeout=0.01)
 
+    from omnigent.server import app as app_module
+
+    real_create_app = app_module.create_app
+
+    def create_app_with_competing_listener(**kwargs: Any) -> Any:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as competitor:
+            with pytest.raises(OSError):
+                competitor.bind(("127.0.0.1", port))
+        captured["reserved_during_startup"] = True
+        if fail_startup:
+            raise RuntimeError("test startup failure")
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", create_app_with_competing_listener)
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
 
@@ -2726,9 +2730,16 @@ def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    assert captured["uvicorn_kwargs"]["port"] == port
-    assert f"Starting omnigent server on 127.0.0.1:{port}" in result.output
+    assert captured.get("reserved_during_startup"), result.exception
+    assert result.exit_code == (1 if fail_startup else 0), result.output
+    if fail_startup:
+        assert str(result.exception) == "test startup failure"
+    else:
+        assert captured["uvicorn_kwargs"]["port"] == port
+        assert captured["listener"].fileno() == -1
+        assert f"Starting omnigent server on 127.0.0.1:{port}" in result.output
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as released:
+        released.bind(("127.0.0.1", port))
     assert "port is unavailable" not in result.output
 
 
