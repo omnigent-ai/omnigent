@@ -16,6 +16,7 @@ def _run(
     *,
     eval_outcome: str = "failure",
     failed: str = FAILED,
+    dependency_outcome: str = "success",
 ) -> dict[str, str]:
     """Run compute-gate.sh with the given env and parse its GITHUB_OUTPUT.
 
@@ -30,6 +31,7 @@ def _run(
         {
             "EVAL": eval_outcome,
             "FAILED": failed,
+            "DEPENDENCY_EVAL": dependency_outcome,
             "GITHUB_OUTPUT": str(out_file),
         }
     )
@@ -85,3 +87,10 @@ def test_short_desc_never_exceeds_140_chars(tmp_path: Path) -> None:
     """The 140-char commit status limit is respected."""
     out = _run(tmp_path, eval_outcome="failure")
     assert len(out["short_desc"]) <= 140
+
+
+def test_dependency_evidence_must_succeed_even_when_ci_is_green(tmp_path: Path) -> None:
+    for outcome in ("failure", "skipped", "cancelled", ""):
+        out = _run(tmp_path, eval_outcome="success", dependency_outcome=outcome)
+        assert out["state"] == "failure"
+        assert "Dependency policy/reports" in out["long_desc"]

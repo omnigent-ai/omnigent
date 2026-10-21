@@ -15,12 +15,16 @@
 #   success  | success  | all required checks green
 #   failure  | failure  | a required check is red
 #
-# Env in: EVAL, FAILED
+# Env in: EVAL, FAILED, DEPENDENCY_EVAL
 # Out:    state, short_desc, long_desc on $GITHUB_OUTPUT
 
 set -euo pipefail
 
-if [[ "$EVAL" == "success" ]]; then
+if [[ "$DEPENDENCY_EVAL" != "success" ]]; then
+  FAILED+=$'\n- Dependency policy/reports (see Evaluate dependency reports)\n'
+fi
+
+if [[ "$EVAL" == "success" && "$DEPENDENCY_EVAL" == "success" ]]; then
   STATE=success
   SHORT="All required checks green"
   LONG=":white_check_mark: gate is green, merging now."
