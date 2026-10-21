@@ -1062,10 +1062,12 @@ def test_permission_request_hook_does_not_retry_rejections(
     assert "rejected" in captured.err
 
 
+@pytest.mark.parametrize("empty_response", [False, True], ids=["transport-failed", "timed-out"])
 def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    empty_response: bool,
 ) -> None:
     """
     An AskUserQuestion the hook can't forward is denied with a chat-text hint.
@@ -1076,11 +1078,12 @@ def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     holds: list[object] = []
-    monkeypatch.setattr(
-        claude_native_hook,
-        "_post_hook_with_reattach",
-        lambda *_a, **kwargs: holds.append(kwargs.get("hold_through_outages")),
-    )
+
+    def _no_verdict(*_args: object, **kwargs: object) -> httpx.Response | None:
+        holds.append(kwargs.get("hold_through_outages"))
+        return httpx.Response(200) if empty_response else None
+
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _no_verdict)
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_ask_lost")
     payload = {
         "hook_event_name": "PermissionRequest",
@@ -1100,10 +1103,12 @@ def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     assert holds == [True], "a question must be held through outages before it is denied"
 
 
+@pytest.mark.parametrize("empty_response", [False, True], ids=["transport-failed", "timed-out"])
 def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    empty_response: bool,
 ) -> None:
     """
     Other tools the hook can't forward still fall back to Claude's own prompt.
@@ -1114,11 +1119,12 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     holds: list[object] = []
-    monkeypatch.setattr(
-        claude_native_hook,
-        "_post_hook_with_reattach",
-        lambda *_a, **kwargs: holds.append(kwargs.get("hold_through_outages")),
-    )
+
+    def _no_verdict(*_args: object, **kwargs: object) -> httpx.Response | None:
+        holds.append(kwargs.get("hold_through_outages"))
+        return httpx.Response(200) if empty_response else None
+
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _no_verdict)
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_bash_lost")
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))

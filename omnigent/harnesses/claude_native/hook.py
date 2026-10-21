@@ -999,7 +999,8 @@ def _main_permission_request(argv: list[str]) -> int:
         # the web card comes back as soon as Omnigent answers again.
         hold_through_outages=is_question,
     )
-    if resp is None:
+    # The server returns an empty 200 when the question wait expires.
+    if resp is None or not resp.content:
         if is_question:
             decision = {"behavior": "deny", "message": _ASK_USER_QUESTION_UNAVAILABLE_MESSAGE}
             sys.stdout.write(
@@ -1013,8 +1014,7 @@ def _main_permission_request(argv: list[str]) -> int:
                 )
             )
         return 0
-    if resp.content:
-        sys.stdout.write(resp.text)
+    sys.stdout.write(resp.text)
     return 0
 
 
