@@ -25,7 +25,11 @@ from omnigent.preference_controls import (
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.preference_broker import PreferenceBrokerGrant
-from omnigent.server.preference_requests import read_preference_payload, run_preference_work
+from omnigent.server.preference_requests import (
+    DEFAULT_PREFERENCE_POLICY,
+    PreferencePolicy,
+    read_preference_payload,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.stores.host_store import HostStore
@@ -40,6 +44,7 @@ async def retry_host_preferences(
     conn: HostConnection,
     store: PreferenceStore,
     user_id: str | None,
+    policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
 ) -> None:
     """One bounded reconnect pass; idle hosts never start a polling loop."""
     import random
@@ -48,11 +53,11 @@ async def retry_host_preferences(
 
     for attempt in range(4):
         await asyncio.sleep(random.uniform(0, 2**attempt))
-        if registry.get(conn.host_id) is not conn:
+        if registry.get(conn.host_id) is not conn or not policy.is_enabled():
             return
         try:
             result = await run_preference_control(
-                registry, conn, store, user_id, PreferenceInspect(action="sync")
+                registry, conn, store, user_id, PreferenceInspect(action="sync"), policy=policy
             )
             if not result.pending:
                 return
@@ -69,11 +74,13 @@ def create_preference_controls_router(
     preference_store: PreferenceStore,
     *,
     auth_provider: AuthProvider | None = None,
+    policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
 ) -> APIRouter:
     router = APIRouter()
 
     @router.post("/hosts/{host_id}/preferences", response_model=PreferenceControlResult)
     async def control(request: Request, host_id: str) -> PreferenceControlResult:
+        policy.require_enabled()
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(
             resolve_host_owner, user_id=user_id, host_id=host_id, host_store=host_store
@@ -90,7 +97,9 @@ def create_preference_controls_router(
             action = PREFERENCE_CONTROL.validate_json(payload)
         except ValidationError as exc:
             raise HTTPException(422, "Invalid preference action") from exc
-        return await run_preference_control(host_registry, conn, preference_store, user_id, action)
+        return await run_preference_control(
+            host_registry, conn, preference_store, user_id, action, policy=policy
+        )
 
     return router
 
@@ -101,16 +110,17 @@ async def run_preference_control(
     preference_store: PreferenceStore,
     user_id: str | None,
     action: PreferenceControl,
+    *,
+    policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
 ) -> PreferenceControlResult:
     """Run an already-authorized owner action on this exact tunnel generation."""
+    policy.require_enabled()
     identity = preference_store.identity(user_id)
     shared = None
     if action.action == "prepare":
         if CAP_PREFERENCE_PREPARE not in conn.hello.capabilities:
             raise HTTPException(501, "Update this host to prepare shared preferences")
-        shared = await run_preference_work(
-            user_id, partial(read_store_snapshot, preference_store, user_id)
-        )
+        shared = await policy.run(user_id, partial(read_store_snapshot, preference_store, user_id))
         if shared.revision == 0:
             raise HTTPException(
                 409, "Choose shared defaults once in Settings, or use temporary defaults"
@@ -123,7 +133,7 @@ async def run_preference_control(
     broker = CAP_PREFERENCE_BROKER in conn.hello.capabilities and action.action != "prepare"
     if broker:
         conn.preference_brokers[request_id] = PreferenceBrokerGrant(
-            preference_store, user_id, conn.host_id, action
+            preference_store, user_id, conn.host_id, action, policy=policy
         )
     try:
         host_registry.send_text(

@@ -102,6 +102,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -1360,6 +1361,7 @@ def create_app(
     host_sharded: bool = False,
     *,
     preference_store: PreferenceStore | None = None,
+    preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1394,6 +1396,7 @@ def create_app(
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
     :param preference_store: Optional shared-preference API; no launcher adoption.
+    :param preference_policy: Request rollout and background-task ownership hooks.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -3179,7 +3182,8 @@ def create_app(
                 "request_managed_sandbox_host_id": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
-                "shared_preferences": preference_store is not None,
+                "shared_preferences": preference_store is not None
+                and preference_policy.is_enabled(),
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "branding": branding_snapshot.config(),
@@ -3506,7 +3510,7 @@ def create_app(
 
     if preference_store is not None:
         app.include_router(
-            create_preferences_router(preference_store, auth_provider),
+            create_preferences_router(preference_store, auth_provider, policy=preference_policy),
             prefix="/v1",
             tags=["preferences"],
         )
@@ -4202,16 +4206,21 @@ def create_app(
 
         async def _on_host_connected(host_id: str, owner: str | None) -> None:
             await _on_hosts_changed(host_id, owner)
-            if preference_store is None:
+            if preference_store is None or not preference_policy.is_enabled():
                 return
             from omnigent.host.frames import CAP_PREFERENCE_BROKER
             from omnigent.server.routes.preference_controls import retry_host_preferences
 
             conn = host_registry.get(host_id)
             if conn is not None and CAP_PREFERENCE_BROKER in conn.hello.capabilities:
-                task = asyncio.create_task(
-                    retry_host_preferences(host_registry, conn, preference_store, owner)
+                work = retry_host_preferences(
+                    host_registry, conn, preference_store, owner, preference_policy
                 )
+                try:
+                    task = preference_policy.create_task(work)
+                except BaseException:
+                    work.close()
+                    raise
                 conn.preference_broker_tasks.add(task)
                 task.add_done_callback(conn.preference_broker_tasks.discard)
 
@@ -4272,6 +4281,7 @@ def create_app(
                     host_store,
                     preference_store,
                     auth_provider=auth_provider,
+                    policy=preference_policy,
                 ),
                 prefix="/v1",
                 tags=["preferences"],

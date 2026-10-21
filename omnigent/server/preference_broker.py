@@ -13,7 +13,7 @@ from omnigent.errors import OmnigentError
 from omnigent.preference_broker import PreferenceRead, PreferenceReply, PreferenceRequest
 from omnigent.preference_client import MAX_PENDING_OPERATIONS
 from omnigent.preference_controls import PreferenceApply, PreferenceControl
-from omnigent.server.preference_requests import run_preference_work
+from omnigent.server.preference_requests import PreferencePolicy
 from omnigent.stores.preference_store import PreferenceStore
 
 
@@ -23,6 +23,7 @@ class PreferenceBrokerGrant:
     user_id: str | None
     installation_id: str
     control: PreferenceControl
+    policy: PreferencePolicy = field(default_factory=PreferencePolicy, kw_only=True)
     context: Context = field(default_factory=copy_context)
     remaining: int = 2 * MAX_PENDING_OPERATIONS
     busy: bool = False
@@ -33,8 +34,9 @@ class PreferenceBrokerGrant:
             return PreferenceReply(status=429)
         self.remaining -= 1
         try:
+            self.policy.require_enabled()
             if isinstance(request, PreferenceRead):
-                page = await run_preference_work(
+                page = await self.policy.run(
                     self.user_id,
                     partial(
                         self.store.read,
@@ -69,7 +71,7 @@ class PreferenceBrokerGrant:
                     != reviewed
                 ):
                     return PreferenceReply(status=403)
-            result = await run_preference_work(
+            result = await self.policy.run(
                 self.user_id, partial(self.store.apply, operation, user_id=self.user_id)
             )
             return PreferenceReply(status=200, result=result)

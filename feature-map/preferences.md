@@ -265,6 +265,21 @@ explanations, project precedence, and unchanged files. CLI and host launches ado
 these layers through the startup recipe above. Before activation, complete browser,
 managed-startup and per-harness availability journeys for each user entry point.
 
+**Embedded rollout and request lifetime (component coverage):**
+
+```sh
+uv run --no-sync pytest tests/server/routes/test_preferences.py \
+  tests/server/routes/test_preference_controls.py tests/server/test_preference_requests.py \
+  tests/test_preference_broker.py --reruns 0 -q
+```
+
+The same app can disable and re-enable sharing per request. Capability discovery,
+HTTP edits, owner controls and existing tunnel grants must respect the gate;
+disabled reconnects send no work. A blocked SQL worker retains its background
+lease, request context and admission slot after its HTTP caller is cancelled.
+These tests use SQLite and an injected lease factory; managed Barnacle/MySQL
+integration requires the corresponding managed tests.
+
 **Shared operations (own environment, real server processes):**
 
 ```sh

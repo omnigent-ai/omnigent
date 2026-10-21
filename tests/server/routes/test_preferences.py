@@ -8,6 +8,7 @@ import pytest
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.preference_requests import PreferencePolicy
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -15,7 +16,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
 
 
-@pytest.mark.parametrize("auth_mode", ["keyword", "positional", "disabled"])
+@pytest.mark.parametrize("auth_mode", ["keyword", "positional", "disabled", "rollout"])
 async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch, auth_mode):
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
@@ -28,17 +29,26 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
         AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
     ]
     provider = None if auth_mode == "disabled" else UnifiedAuthProvider(source="header")
+    enabled = auth_mode != "rollout"
+    policy = PreferencePolicy(enabled=lambda: enabled)
     # Exercise positional auth while keeping preference_store keyword-only.
     app = (
         create_app(*stores, *([None] * 6), provider, preference_store=store)
         if auth_mode == "positional"
-        else create_app(*stores, auth_provider=provider, preference_store=store)
+        else create_app(
+            *stores, auth_provider=provider, preference_store=store, preference_policy=policy
+        )
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        assert (await client.get("/v1/info")).json()["shared_preferences"] is True
         path = "/v1/preferences/shared"
+        if auth_mode == "rollout":
+            assert (await client.get("/v1/info")).json()["shared_preferences"] is False
+            assert (await client.get(path)).status_code == 404
+            assert (await client.post(path + "/operations", content=b"invalid")).status_code == 404
+            enabled = True
+        assert (await client.get("/v1/info")).json()["shared_preferences"] is True
         if auth_mode != "disabled":
             assert (await client.get(path)).status_code == 401
             if auth_mode == "positional":
@@ -57,6 +67,14 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
             "expected_version": 0,
             "value": "pi-native",
         }
+        if auth_mode == "rollout":
+            enabled = False
+            assert (await client.get("/v1/info")).json()["shared_preferences"] is False
+            assert (
+                await client.post(path + "/operations", json=operation, headers=alice)
+            ).status_code == 404
+            assert store.read(user_id="alice@example.test").revision == 0
+            enabled = True
         if auth_mode == "disabled":
             assert initial["identity"]["user_id"] == "local"
             saved = await client.post(path + "/operations", json=operation)

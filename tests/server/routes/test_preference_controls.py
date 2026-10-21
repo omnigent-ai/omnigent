@@ -22,6 +22,7 @@ from omnigent.host.frames import (
 from omnigent.preference_controls import PreferenceControlResult
 from omnigent.preference_sync import PreferenceSnapshot
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.preference_requests import PreferencePolicy
 from omnigent.server.routes.preference_controls import create_preference_controls_router
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
@@ -36,14 +37,25 @@ class Auth:
 
 
 @pytest.fixture
-def controls(db_uri):
+def preference_gate():
+    return {"enabled": True}
+
+
+@pytest.fixture
+def controls(db_uri, preference_gate):
     registry = HostRegistry()
     hosts = HostStore(db_uri)
     hosts.upsert_on_connect(HOST, "machine", "owner")
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="test")
     app = FastAPI()
     app.include_router(
-        create_preference_controls_router(registry, hosts, store, auth_provider=Auth()),
+        create_preference_controls_router(
+            registry,
+            hosts,
+            store,
+            auth_provider=Auth(),
+            policy=PreferencePolicy(enabled=lambda: preference_gate["enabled"]),
+        ),
         prefix="/v1",
     )
 
@@ -222,3 +234,28 @@ async def test_prepare_binds_authoritative_snapshot_and_requires_ack(controls, r
         response = await task
         assert response.status_code == (200 if reply == "valid" else 502)
         assert not connection.pending_preferences
+
+
+async def test_disabled_controls_and_reconnect_do_not_contact_host(
+    controls, preference_gate, monkeypatch
+):
+    from omnigent.server.routes.preference_controls import retry_host_preferences
+
+    app, registry, connection, store = controls
+    preference_gate["enabled"] = False
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        for action in ("status", "sync", "prepare", "connect"):
+            response = await client.post(
+                URL, json={"action": action}, headers={"x-test-user": "owner"}
+            )
+            assert response.status_code == 404
+    monkeypatch.setattr("random.uniform", lambda *_: 0)
+    await retry_host_preferences(
+        registry, connection, store, "owner", PreferencePolicy(enabled=lambda: False)
+    )
+    assert connection.outbound_queue.empty()
+    assert not connection.preference_brokers
+    assert not connection.pending_preferences
+    assert store.read(user_id="owner").revision == 0

@@ -21,6 +21,19 @@ With a provider, requests require its authenticated user identity. Workspace
 identity comes from the trusted workspace context. An installation ID describes
 the source of an edit; it is not an authorization grant.
 
+Managed embedders can also pass `preference_policy=PreferencePolicy(...)`.
+Its `enabled` callback evaluates the trusted request's rollout context for the
+capability response, HTTP operations, owner controls and reconnect/broker work.
+Disabled requests return 404 before reading or writing preferences. This does
+not revoke an SQL operation already admitted or change a running session.
+
+The optional `create_task` hook wraps background SQL workers and reconnects.
+Deployments with request-owned database handles must acquire their background
+lease synchronously when creating the task, retain the captured request context,
+and release the lease when the task completes, including cancellation before
+startup. Cancelling an HTTP caller does not cancel an admitted SQL worker or
+release its concurrency slot. The default uses ordinary asyncio tasks.
+
 ## Read and edit
 
 `GET /v1/preferences/shared?protocol_version=2` returns protocol version `2`, the authenticated

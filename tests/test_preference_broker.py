@@ -17,11 +17,12 @@ from omnigent.preference_controls import PreferenceApply, PreferenceInspect
 from omnigent.preference_sync import PreferenceMutation, SharedPreferenceKey
 from omnigent.preference_workspace import ImportChange, ImportPreview
 from omnigent.server.preference_broker import PreferenceBrokerGrant
+from omnigent.server.preference_requests import PreferencePolicy
 from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
 
 
 @pytest.mark.parametrize(
-    "fault", [None, "read_only", "identity", "installation", "unreviewed", "budget"]
+    "fault", [None, "read_only", "identity", "installation", "unreviewed", "budget", "rollout"]
 )
 async def test_broker_grant_limits_publication(db_uri, fault):
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="broker")
@@ -35,6 +36,12 @@ async def test_broker_grant_limits_publication(db_uri, fault):
         value="requested",
     )
     grant = PreferenceBrokerGrant(store, "alice", "host", PreferenceInspect(action="sync"))
+    if fault == "rollout":
+        enabled = True
+        grant.policy = PreferencePolicy(enabled=lambda: enabled)
+        assert (await grant.execute(PreferenceRead())).status == 200
+        enabled = False
+        assert (await grant.execute(PreferenceRead())).status == 404
     if fault == "read_only":
         grant.control = PreferenceInspect(action="status")
     elif fault == "identity":
@@ -48,7 +55,9 @@ async def test_broker_grant_limits_publication(db_uri, fault):
     elif fault == "budget":
         grant.remaining = 0
     response = await grant.execute(PreferenceWrite(operation=operation))
-    assert response.status == (200 if fault is None else 429 if fault == "budget" else 403)
+    assert response.status == (
+        200 if fault is None else 429 if fault == "budget" else 404 if fault == "rollout" else 403
+    )
     assert store.read(user_id="alice").revision == (1 if fault is None else 0)
     assert store.read(user_id="bob").revision == 0
     if fault == "unreviewed":
