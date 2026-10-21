@@ -92,6 +92,37 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `certificate failure before page start uses the pending WebView URL`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        webView.currentUrl = PINNED_URL
+        var tls = 0
+        var committed = 0
+        val client =
+            client(
+                onMainFrameSslError = { _, _ -> tls++ },
+                onMainFrameCommitted = { committed++ },
+            )
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(
+            webView,
+            handler,
+            SslError(
+                SslError.SSL_UNTRUSTED,
+                SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+                PINNED_URL,
+            ),
+        )
+        client.onPageCommitVisible(webView, PINNED_URL)
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(1, tls)
+        assertEquals(0, committed)
+    }
+
+    @Test
     fun `pinned main-frame client and server errors report their status to the shell`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val reportedStatuses = mutableListOf<Int>()

@@ -73,6 +73,9 @@ class ConnectionStatusTest {
             "net::ERR_FOO?x=1",
             "https://example.com/net::ERR_CONNECTION_REFUSED",
             "net::ERR_${"A".repeat(65)}",
+            "net::ERR_X\n",
+            "net::err_connection_refused",
+            "net::ЕRR_X",
         )) {
             assertEquals("ERROR_CONNECT", webViewErrorName(-6, description))
         }

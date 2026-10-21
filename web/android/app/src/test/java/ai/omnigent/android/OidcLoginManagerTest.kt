@@ -16,6 +16,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.io.ByteArrayInputStream
 import java.net.InetSocketAddress
 import java.security.MessageDigest
 import java.util.Base64
@@ -26,6 +27,24 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class OidcLoginManagerTest {
+    @Test
+    fun `ticket errors inspect only a capped 400 body`() {
+        var streamRequests = 0
+        assertFalse(
+            isUpgradeRequiredErrorResponse(502) {
+                streamRequests++
+                ByteArrayInputStream("unneeded".toByteArray())
+            },
+        )
+        assertEquals(0, streamRequests)
+
+        val prefix = "code_challenge (S256) is required."
+        val oversizedBody = ("x".repeat(8_000) + prefix + "y".repeat(12_000)).toByteArray()
+        val body = ByteArrayInputStream(oversizedBody)
+        assertTrue(isUpgradeRequiredErrorResponse(400) { body })
+        assertEquals(8 * 1024, oversizedBody.size - body.available())
+    }
+
     @Test
     fun `PKCE update notice opens no browser and asks the shell to show upgrade`() {
         LocalHttpServer { request ->
