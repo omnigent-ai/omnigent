@@ -4,7 +4,6 @@ import android.animation.ValueAnimator
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.os.Build
 import android.os.SystemClock
 import android.text.format.DateFormat
 import android.view.LayoutInflater
@@ -20,7 +19,6 @@ import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import java.time.Instant
 import java.util.Date
 import kotlin.math.max
 import kotlin.math.min
@@ -37,6 +35,7 @@ internal class ConnectionStatusView(
     private val column: LinearLayout = scroll.findViewById(R.id.status_column)
     private val anchorGap: View = scroll.findViewById(R.id.status_anchor_gap)
     private val content: View = scroll.findViewById(R.id.status_content)
+    private val actions: View = scroll.findViewById(R.id.status_actions)
     private val progress: ProgressBar = scroll.findViewById(R.id.status_progress)
     private val icon: ImageView = scroll.findViewById(R.id.status_icon)
     private val headline: TextView = scroll.findViewById(R.id.status_headline)
@@ -51,6 +50,7 @@ internal class ConnectionStatusView(
     private val secondary: Button = scroll.findViewById(R.id.status_secondary)
     private val cancel: Button = scroll.findViewById(R.id.status_cancel)
     private var pendingRender: Runnable? = null
+    private var pendingHide: Runnable? = null
     private var firstRequestedAt = 0L
     private var lastShownAt = 0L
     private var transitionGeneration = 0
@@ -95,6 +95,8 @@ internal class ConnectionStatusView(
         retainDetails: Boolean = false,
     ) {
         visibility = View.VISIBLE
+        pendingHide?.let(::removeCallbacks)
+        pendingHide = null
         content.animate().cancel()
         val generation = ++transitionGeneration
         pendingRender?.let(::removeCallbacks)
@@ -139,6 +141,7 @@ internal class ConnectionStatusView(
                     renderedState = state
                 }
                 content.visibility = View.VISIBLE
+                actions.visibility = View.VISIBLE
             }
         if (delay == 0L) {
             render.run()
@@ -148,16 +151,40 @@ internal class ConnectionStatusView(
         }
     }
 
-    fun hide() {
+    fun hide(onHidden: () -> Unit = {}) {
         transitionGeneration++
         pendingRender?.let(::removeCallbacks)
         pendingRender = null
+        pendingHide?.let(::removeCallbacks)
+        pendingHide = null
+        val remaining =
+            if (renderedState != null && ValueAnimator.areAnimatorsEnabled()) {
+                (500L - (SystemClock.uptimeMillis() - lastShownAt)).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+        if (remaining > 0L) {
+            val deferred =
+                Runnable {
+                    pendingHide = null
+                    finishHide(onHidden)
+                }
+            pendingHide = deferred
+            postDelayed(deferred, remaining)
+        } else {
+            finishHide(onHidden)
+        }
+    }
+
+    private fun finishHide(onHidden: () -> Unit) {
         content.animate().cancel()
         content.visibility = View.GONE
+        actions.visibility = View.GONE
         visibility = View.GONE
         firstRequestedAt = 0L
         lastShownAt = 0L
         renderedState = null
+        onHidden()
     }
 
     private fun updateAnchor() {
@@ -169,6 +196,9 @@ internal class ConnectionStatusView(
         val maxWidth = min(width - dp(48), dp(400))
         if (maxWidth > 0 && content.layoutParams.width != maxWidth) {
             content.layoutParams = content.layoutParams.apply { this.width = maxWidth }
+        }
+        if (maxWidth > 0 && actions.layoutParams.width != maxWidth) {
+            actions.layoutParams = actions.layoutParams.apply { this.width = maxWidth }
         }
     }
 
@@ -255,26 +285,17 @@ internal class ConnectionStatusView(
             )
         detailsText.text =
             listOf(
-                context.getString(R.string.status_server) to details.origin,
-                context.getString(R.string.status_error) to details.error,
+                context.getString(R.string.status_server) to originOf(details.origin).orEmpty(),
+                context.getString(R.string.status_error) to safeErrorName(details.error),
                 context.getString(R.string.status_time) to localTime,
                 context.getString(R.string.status_app_version_label) to version,
             ).joinToString("\n\n") { (label, value) -> "$label\n$value" }
         copyDetails.setOnClickListener {
-            val copied = "${detailsText.text}\n${context.getString(
-                R.string.status_utc,
-            )}: ${Instant.ofEpochMilli(
-                details.timeMillis,
-            )}\n${context.getString(
-                R.string.status_android_api,
-            )}: ${Build.VERSION.SDK_INT}\n${context.getString(
-                R.string.status_webview,
-            )}: ${android.webkit.WebView.getCurrentWebViewPackage()?.versionName.orEmpty()}"
             val clipboard = ContextCompat.getSystemService(context, ClipboardManager::class.java)
             clipboard?.setPrimaryClip(
-                ClipData.newPlainText(context.getString(R.string.status_details), copied),
+                ClipData.newPlainText(context.getString(R.string.status_details), detailsText.text),
             )
-            if (Build.VERSION.SDK_INT <= 32) {
+            if (android.os.Build.VERSION.SDK_INT <= 32) {
                 Toast.makeText(context, R.string.status_copied, Toast.LENGTH_SHORT).show()
             }
         }
@@ -282,6 +303,11 @@ internal class ConnectionStatusView(
 
     private fun breakableHost(value: String): String =
         value.replace(".", ".\u200b").replace("-", "-\u200b")
+
+    private fun safeErrorName(value: String): String =
+        Regex("(?:net::)?ERR_[A-Z0-9_]{1,64}|ERROR_[A-Z0-9_]{1,64}|SSL_[A-Z0-9_]{1,64}")
+            .find(value)
+            ?.value ?: "ERROR_UNKNOWN"
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + .5f).toInt()
 }
