@@ -4166,6 +4166,22 @@ def create_app(
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
                     # Idle trees reinitialize on demand; active trees recover now.
+                    if not initialize_runtime:
+                        if conv.agent_id is None:
+                            reason = "no_agent"
+                        elif conv.archived:
+                            reason = "archived"
+                        else:
+                            reason = "idle"
+                        _logger.info(
+                            "Deferred runner session init until first use: session=%s reason=%s",
+                            conv.id,
+                            reason,
+                            extra=debug_event(
+                                "runner_session_init_deferred",
+                                reason=reason,
+                            ),
+                        )
                     if initialize_runtime:
                         response = await runner_session_initializer.initialize(
                             conv,

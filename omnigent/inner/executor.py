@@ -641,6 +641,14 @@ def classify_tool_result(
 # ---------------------------------------------------------------------------
 
 
+class InjectionDeliveryAmbiguous(Exception):
+    """A live message may already have reached the harness, so it must not be resent.
+
+    :meth:`Executor.enqueue_session_message` raises this when the harness's reply
+    to a submission it may have accepted was lost.
+    """
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -697,7 +705,10 @@ class Executor:
         return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        :raises InjectionDeliveryAmbiguous: The harness may have accepted the message.
+        """
         return False
 
     def supports_live_message_queue(self) -> bool:
