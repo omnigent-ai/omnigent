@@ -1377,9 +1377,9 @@ async def _resolve_agent_spec_from_server(
     # See omnigent.spec.load.
     try:
         spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    except FileNotFoundError:
-        # Temp cleanup can leave a version directory without its bundle.
-        # Validate privately before replacing an incomplete cache entry.
+    except Exception:  # noqa: BLE001 — the downloaded bundle must validate before replacement
+        # Cached files can be missing, truncated, or malformed. Validate the
+        # downloaded bundle privately before replacing any cached files.
         spec_cache_root.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
             staging = Path(staging_dir)
