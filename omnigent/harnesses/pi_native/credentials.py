@@ -394,7 +394,9 @@ class PiProviderConfig:
         for provider_id, payload in providers.items():
             if is_databricks_ai_gateway_url(payload["baseUrl"]):
                 # Copy rather than mutate: additional payloads are shared across renders.
-                headers = with_gateway_attribution(payload.get("headers"), PI_AGENT)
+                headers = with_gateway_attribution(
+                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                )
                 providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
 

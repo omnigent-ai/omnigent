@@ -1377,7 +1377,7 @@ def materialize_codex_provider_config(
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
             headers = provider_config.get("http_headers")
             provider_config["http_headers"] = with_gateway_attribution(
-                headers if isinstance(headers, Mapping) else None, CODEX_AGENT
+                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
             )
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))

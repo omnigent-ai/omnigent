@@ -122,16 +122,26 @@ def gateway_attribution_headers(coding_agent: str, *, via_ug: bool = False) -> d
     return {CODING_AGENT_HEADER: coding_agent, CLIENT_SURFACES_HEADER: surfaces}
 
 
+def is_ug_route(base_url: str) -> bool:
+    """Whether ug has configured the workspace that serves *base_url*."""
+    from omnigent.onboarding.ucode_state import read_ucode_state
+
+    hostname = urlparse(base_url).hostname
+    return hostname is not None and read_ucode_state(f"https://{hostname}") is not None
+
+
 def with_gateway_attribution(
-    headers: Mapping[str, _HeaderValue] | None, coding_agent: str
+    headers: Mapping[str, _HeaderValue] | None, coding_agent: str, base_url: str
 ) -> dict[str, _HeaderValue | str]:
     """Return a provider's static *headers* plus the attribution headers.
 
-    A ug ``User-Agent`` among *headers* marks the provider as ug's.
+    The provider is ug's when ug configured its workspace or wrote its ``User-Agent``.
     """
     existing: dict[str, _HeaderValue | str] = dict(headers or {})
     user_agent = existing.get("User-Agent")
-    via_ug = isinstance(user_agent, str) and user_agent.startswith(_UG_USER_AGENT_PREFIX)
+    via_ug = (
+        isinstance(user_agent, str) and user_agent.startswith(_UG_USER_AGENT_PREFIX)
+    ) or is_ug_route(base_url)
     return {**existing, **gateway_attribution_headers(coding_agent, via_ug=via_ug)}
 
 

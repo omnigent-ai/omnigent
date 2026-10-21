@@ -47,6 +47,7 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
     is_databricks_ai_gateway_url,
+    is_ug_route,
     with_gateway_attribution_lines,
 )
 from omnigent.inner import _proc
@@ -1265,7 +1266,9 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV], CLAUDE_CODE_AGENT
+            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(base_url),
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"

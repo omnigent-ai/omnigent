@@ -198,7 +198,9 @@ def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, obje
                 stamped_models[model_id] = {
                     **model,
                     "headers": with_gateway_attribution(
-                        headers if isinstance(headers, Mapping) else None, OPENCODE_AGENT
+                        headers if isinstance(headers, Mapping) else None,
+                        OPENCODE_AGENT,
+                        base_url,
                     ),
                 }
         stamped[provider_id] = {**provider, "models": stamped_models}

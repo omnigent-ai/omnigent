@@ -86,6 +86,7 @@ from omnigent.conversation_browser import conversation_url, open_conversation_li
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
     is_databricks_ai_gateway_url,
+    is_ug_route,
     with_gateway_attribution_lines,
 )
 from omnigent.entities.session_resources import terminal_resource_id
@@ -3096,7 +3097,9 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
     if is_databricks_ai_gateway_url(family.base_url):
         # Keep any headers the user already sends; the config env replaces theirs.
         attribution_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV), CLAUDE_CODE_AGENT
+            os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(family.base_url),
         )
     return ClaudeNativeUcodeConfig(
         env={
