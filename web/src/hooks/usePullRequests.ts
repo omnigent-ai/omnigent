@@ -39,7 +39,7 @@ import {
 export interface PullRequestCheckRun {
   name: string;
   bucket: "passing" | "failing" | "pending";
-  /** Link to the run on GitHub, or null when unknown. */
+  /** Link to the run on the provider or external CI, or null when unknown. */
   url: string | null;
 }
 

@@ -79,6 +79,7 @@ import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
+import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchPullRequestFileContents,
@@ -525,11 +526,13 @@ function listKeys<T>(items: readonly T[], identity: (item: T) => readonly unknow
   });
 }
 
+const CHECK_ROW_CLASS = "flex items-center gap-2 px-1.5 py-1.5";
+
 /**
  * A CI-status pill (e.g. "✓ 66 passed"); hovering it reveals the individual job
  * names in that bucket, each with the status icon and a divider between rows.
- * Renders nothing when the bucket is empty. The full list shows — the card is
- * height-capped and scrolls.
+ * A job with an http(s) run URL links to it. Renders nothing when the bucket
+ * is empty. The full list shows — the card is height-capped and scrolls.
  */
 function CheckPill({
   label,
@@ -572,14 +575,33 @@ function CheckPill({
           <p className="px-1.5 py-1 text-muted-foreground">No job details.</p>
         ) : (
           <ul className="divide-y divide-border">
-            {names.map((r, i) => (
-              <li key={keys[i]} className="flex items-center gap-2 px-1.5 py-1.5">
-                <span className="shrink-0">{icon}</span>
-                <span className="truncate" title={r.name}>
-                  {r.name}
-                </span>
-              </li>
-            ))}
+            {names.map((r, i) => {
+              const href = r.url ? parseHttpUrl(r.url)?.href : undefined;
+              const row = (
+                <>
+                  <span className="shrink-0">{icon}</span>
+                  <span className="truncate" title={r.name}>
+                    {r.name}
+                  </span>
+                </>
+              );
+              return (
+                <li key={keys[i]}>
+                  {href ? (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noreferrer"
+                      className={cn(CHECK_ROW_CLASS, "cursor-pointer hover:underline")}
+                    >
+                      {row}
+                    </a>
+                  ) : (
+                    <div className={CHECK_ROW_CLASS}>{row}</div>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         )}
       </HoverCardContent>
@@ -1053,25 +1075,24 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
+  const refresh = async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all(
+        ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
+          queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
+        ),
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  };
+  const refreshIcon = (
+    <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} aria-hidden="true" />
+  );
   const refreshButton = (
-    <Button
-      size="sm"
-      variant="ghost"
-      disabled={refreshing}
-      onClick={async () => {
-        setRefreshing(true);
-        try {
-          await Promise.all(
-            ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
-              queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
-            ),
-          );
-        } finally {
-          setRefreshing(false);
-        }
-      }}
-    >
-      <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} />
+    <Button size="sm" variant="ghost" disabled={refreshing} onClick={refresh}>
+      {refreshIcon}
       Refresh
     </Button>
   );
@@ -1256,8 +1277,10 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
               </TooltipProvider>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
-              {refreshButton}
               <TooltipProvider delayDuration={0}>
+                <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+                  {refreshIcon}
+                </IconButton>
                 <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>

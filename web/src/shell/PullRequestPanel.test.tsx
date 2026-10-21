@@ -1424,29 +1424,41 @@ describe("PullRequestPanel", () => {
         expect(keyWarnings()).toEqual([]);
       });
 
-      it("lists every check in the hover card when checks share a build URL or a name", async () => {
+      it("lists every check in the hover card and links only http(s) run URLs, even when checks share a URL or a name", async () => {
         const user = userEvent.setup();
         const keyWarnings = watchKeyWarnings();
         const buildUrl = "https://forge.example.test/contoso/web/_build/results?buildId=41";
         state.info!.data = withPr({
           checks: {
-            passing: 4,
+            passing: 5,
             failing: 0,
             pending: 0,
-            total: 4,
+            total: 5,
             runs: [
               { name: "Build", bucket: "passing", url: buildUrl },
               { name: "Lint", bucket: "passing", url: buildUrl },
               { name: "Deploy", bucket: "passing", url: null },
               { name: "Deploy", bucket: "passing", url: null },
+              // A status poster controls its target URL, so a script URL must not render.
+              { name: "Status", bucket: "passing", url: "javascript:alert(1)" },
             ],
           },
         });
         renderPanel();
 
-        await user.hover(screen.getByRole("button", { name: /4\s*passed/ }));
+        await user.hover(screen.getByRole("button", { name: /5\s*passed/ }));
         const rows = await screen.findAllByRole("listitem");
-        expect(rows.map((row) => row.textContent)).toEqual(["Build", "Lint", "Deploy", "Deploy"]);
+        expect(rows.map((row) => row.textContent)).toEqual([
+          "Build",
+          "Lint",
+          "Deploy",
+          "Deploy",
+          "Status",
+        ]);
+        expect(
+          rows.map((row) => within(row).queryByRole("link")?.getAttribute("href") ?? null),
+        ).toEqual([buildUrl, buildUrl, null, null, null]);
+        expect(within(rows[0]).getByRole("link")).toHaveAttribute("target", "_blank");
         expect(keyWarnings()).toEqual([]);
       });
     });
@@ -1871,6 +1883,7 @@ describe("session PR selection", () => {
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveTextContent(/^$/);
     expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
