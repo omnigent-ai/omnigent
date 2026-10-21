@@ -141,9 +141,11 @@ def test_project_settings_model_default_round_trips(
     needs: pick Claude Code as the default agent, choose "Opus" in the model
     control, Save (``PATCH /v1/projects/{id}``), then reopen — the stored
     config must carry the chosen model and the reopened dialog must seed the
-    control back to it. Today this fails at the same missing-control
-    assertion as the visibility test; after the fix it proves the write
-    actually reaches the server rather than a dummy field rendering.
+    control back to it. This proves the write actually reaches the server
+    rather than a dummy field rendering.
+
+    Picking the Agent menu's "No default" row then clears the agent and its
+    model, like the Host and Model fields' own "No default" options.
     """
     base_url, session_id = seeded_session
     agent = _resolve_builtin_agent(base_url, "claude-native-ui")
@@ -182,3 +184,17 @@ def test_project_settings_model_default_round_trips(
     # Reopen — the stored default seeds the control back.
     _open_project_settings(page, project)
     expect(page.get_by_test_id("project-settings-model")).to_contain_text("Opus")
+
+    agent_trigger = page.get_by_test_id("project-settings-agent").get_by_test_id(
+        "new-chat-landing-agent-select"
+    )
+    agent_trigger.click()
+    page.get_by_role("menu").get_by_text("No default", exact=True).click()
+    expect(agent_trigger).to_contain_text("No default")
+    expect(page.get_by_test_id("project-settings-model")).to_have_count(0)
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    assert _get_project_config(base_url, project_id) == {}
+
+    _open_project_settings(page, project)
+    expect(agent_trigger).to_contain_text("No default")

@@ -495,21 +495,14 @@ export function ProjectSettingsDialog({
                 // the host / effort dropdowns instead of floating mid-row.
                 triggerClassName="h-8 w-full justify-between rounded-md border border-input bg-transparent px-3 text-foreground hover:bg-transparent hover:text-foreground"
                 triggerLabelClassName="max-w-none text-ui"
-              />
-              {agentId && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-auto p-0 text-muted-foreground text-sm hover:bg-transparent"
-                  onClick={() => {
+                noneOption={{
+                  label: "No default",
+                  onSelect: () => {
                     setAgentId(null);
                     setModel(NONE);
-                  }}
-                >
-                  Clear
-                </Button>
-              )}
+                  },
+                }}
+              />
             </div>
           </Field>
 

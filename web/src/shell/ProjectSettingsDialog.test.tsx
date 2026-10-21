@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -358,6 +358,28 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("clears a stored default agent from the agent dropdown's No default option", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Claude Code"),
+    );
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(within(screen.getByRole("menu")).getByText("No default"));
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("No default");
+    expect(screen.queryByTestId("project-settings-model")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    // The agent's model default goes with it.
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
   it("round-trips a stored model default on save", async () => {
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
     getProjectMock.mockResolvedValue({
@@ -419,5 +441,29 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
     );
+  });
+
+  it("clears a stored default agent that hasn't resolved from discovery", async () => {
+    availableAgentsMock.mockReturnValue({ data: [] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", model: "opus" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("No agents");
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(within(screen.getByRole("menu")).getByText("No default"));
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("No default");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
   });
 });
