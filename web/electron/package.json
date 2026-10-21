@@ -33,7 +33,7 @@
     "prebuild:win": "pnpm run build:overlay"
   },
   "devDependencies": {
-    "electron": "^42.11.12",
+    "electron": "^42.11.16",
     "electron-builder": "^26.0.0",
     "jsdom": "^29.1.1",
     "playwright": "^1.62.1"

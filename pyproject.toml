@@ -109,7 +109,8 @@ dependencies = [
     # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
     # python-build-standalone interpreters whose OpenSSL has no default cert
     # path; previously only transitive, pinned here now that we import it.
-    "certifi>=2023.7",
+    # 2026.10.19 drops the roots behind the compromised eMudhra intermediates.
+    "certifi>=2026.10.19",
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.

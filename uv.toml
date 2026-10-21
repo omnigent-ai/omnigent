@@ -32,4 +32,6 @@ exclude-newer = "P7D"
 # - databricks-sdk: 0.153.0 (published 2026-10-15) is the first release with
 #   streaming Sandbox command execution, which the Databricks Sandbox provider
 #   uses. Drop once aged past P7D (2026-10-22).
-exclude-newer-package = { databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
+# - certifi: 2026.10.19 (tagged 2026-10-20) removes the roots chaining to the
+#   compromised eMudhra intermediate CAs. Drop once aged past P7D (2026-10-28).
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z", databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
