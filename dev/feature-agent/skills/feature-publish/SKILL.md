@@ -61,19 +61,30 @@ Aim for fewer than 800 visible words. If the checkout has
 
 ## Upload the demo
 
-`gh pr create` and `gh pr edit` cannot attach files, so upload the clips in a PR
-comment, then copy their URLs into the description:
+Wait for recording and rendering to finish before uploading. Upload the clips
+in a PR comment, then copy their returned URLs into the description:
 
 1. Write a comment body with a `### CUJ-n` heading per covered CUJ, each
-   followed by `![CUJ-n](<path to the rendered clip>)`.
-2. Post it with `gh pr comment <pr> --body-file <file> --attach <clip> …`, or
-   with the helper's `comment --attach` in checked mode. Each reference becomes
-   a `https://github.com/user-attachments/assets/…` URL that plays inline.
+   followed by `![CUJ-n](<path to the rendered clip>)` on its own unindented
+   line outside code blocks, inline code, and HTML comments. Cite each path
+   exactly as passed to `--attach`, without `..` components. For example,
+   `--attach recordings/demo.mp4` needs `![CUJ-1](recordings/demo.mp4)`.
+2. **Checked mode (`.omnigent/pr-gate.json` exists):** use the supplied helper:
+   `python <helper-dir>/pr.py comment --number <pr> --body-file <file> --attach <clip>`.
+   Repeat `--attach` for additional clips. The host uploads with its dedicated
+   media credential and posts as the bot. Use the returned `assets` mapping
+   (path to URL) to match clips to CUJs. Do not fall back to `gh` or seek tokens.
+   **Direct mode:** check `gh pr comment --help` for attachment support, then
+   use `gh pr comment <pr> --body-file <file> --attach <clip> …` with the supplied
+   credential. If uploading is unavailable, report the recording blocker and
+   manual test steps; do not change credentials.
 3. Put those URLs under the matching `### CUJ-n` headings in the Demo section,
-   and update the description with `gh pr edit --body-file` or the helper.
+   each on its own line so videos play inline. Update the description with
+   the helper in checked mode or `gh pr edit --body-file` in direct mode.
 
-Only these uploaded URLs count as recordings. Local `recordings/` paths and CI
-artifact links do not.
+Only these uploaded URLs count as recordings: they must be
+`https://github.com/user-attachments/assets/…` URLs. Local `recordings/` paths
+and CI artifact links do not.
 
 ## Drive the PR (direct publication)
 
