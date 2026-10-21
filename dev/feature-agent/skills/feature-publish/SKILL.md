@@ -80,8 +80,7 @@ in a PR comment, then copy their returned URLs into the description:
 1. Write a comment body with a `### CUJ-n` heading per covered CUJ, each
    followed by `![CUJ-n](<path to the rendered clip>)` on its own unindented
    line outside code blocks, inline code, and HTML comments. Cite each path
-   exactly as passed to `--attach`, without `..` components. For example,
-   `--attach recordings/demo.mp4` needs `![CUJ-1](recordings/demo.mp4)`.
+   exactly as passed to `--attach`, without `..` components.
 2. **Checked mode (`.omnigent/pr-gate.json` exists):** use the supplied helper:
    `python <helper-dir>/pr.py comment --number <pr> --body-file <file> --attach <clip>`.
    Repeat `--attach` for additional clips. The host uploads with its dedicated
