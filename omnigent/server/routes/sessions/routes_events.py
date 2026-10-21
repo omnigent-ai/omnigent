@@ -40,6 +40,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -187,6 +188,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
+    _native_coding_agent_for_session,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -553,6 +555,17 @@ def _host_offline_message() -> str:
     return (
         "The host for this session is offline. "
         f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+    )
+
+
+def _hostless_runner_gone_message(conv: Conversation, agent: NativeCodingAgent | None) -> str:
+    """Return the refusal text for a send whose host-less runner is gone."""
+    message = "No host can restart this session's runner, so your message was not sent."
+    if agent is None:
+        return f"{message} Resume the session from the machine that ran it."
+    return (
+        f"{message} Resume it from the machine that ran it with "
+        f"`{cli_invocation()} {agent.key} --resume {conv.id}`, then send the message again."
     )
 
 
@@ -2883,6 +2896,20 @@ def register_events_routes(
                     raise OmnigentError(
                         "The host for this session is not responding. "
                         "Wait for it to reconnect and send the message again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                if (
+                    conv.host_id is None
+                    and conv.runner_id is not None
+                    and conv.kind != "sub_agent"
+                    and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY) != "1"
+                    and not exit_cause
+                ):
+                    # A runner bound without a host (a local terminal) can't be relaunched;
+                    # refuse so the client keeps the message.
+                    agent = await asyncio.to_thread(_native_coding_agent_for_session, conv)
+                    raise OmnigentError(
+                        _hostless_runner_gone_message(conv, agent),
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
                 if host_offline and _client_holds_host_offline_sends(request.headers):
