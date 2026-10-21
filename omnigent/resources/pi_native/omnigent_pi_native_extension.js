@@ -53,6 +53,9 @@ const _PARK_REATTACH_MIN_ELAPSED_MS = _PARK_ATTEMPT_TIMEOUT_MS - 5_000;
 // the rounds and then deny, instead of riding the 24h park ceiling to a
 // fail-open. The brief inter-round sleep means this bounds wall-time too.
 const _MAX_RAW_ASK_ROUNDS = 50;
+
+// Allow the 5s routing call and 6s relay to fail open before the 8s client deadline.
+const _ROUTE_TURN_TIMEOUT_MS = 8_000;
 // Reason surfaced when the tool-call gate cannot obtain a usable verdict and
 // fails CLOSED. PHASE_TOOL_CALL is the sole enforcement point for a native
 // connector tool, so an unevaluable policy must block, not proceed — matching
@@ -1159,6 +1162,28 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
 }
 
+/**
+ * Route native TUI input before Pi binds its model; composer input is routed upstream.
+ * Errors and timeouts return null, preserving the current model.
+ * @returns {Promise<{action: string, model?: string, terminal?: boolean} | null>}
+ */
+async function routeTurn(config, prompt, model) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function")
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/route-turn`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: headers(config),
+      body: JSON.stringify({ harness: "pi-native", prompt, model: model || null }),
+      signal: AbortSignal.timeout(_ROUTE_TURN_TIMEOUT_MS),
+    });
+    return resp.ok ? await resp.json() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 async function postModelChangeError(config, message) {
   await postEvent(config, {
     type: "external_conversation_item",
@@ -1444,6 +1469,10 @@ module.exports = function (pi) {
   let agentRunning = false;
   let compacting = false;
   let latestContext = null;
+  // Promise of the last inbox model_change, awaited by ``input``.
+  let pendingModelChange = null;
+  // Set once route-turn gives a final answer for this session (see ``input``).
+  let turnRoutingDone = false;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -2022,7 +2051,11 @@ module.exports = function (pi) {
           compacting = false;
         }
       },
-      (model) => applyModelChange(pi, config, latestContext, model),
+      (model) => {
+        // Await the composer's async model switch before input binds the turn's model.
+        pendingModelChange = applyModelChange(pi, config, latestContext, model);
+        return pendingModelChange;
+      },
       (level) => pi.setThinkingLevel(level),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
@@ -2252,6 +2285,22 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
+    if (pendingModelChange) {
+      const pending = pendingModelChange;
+      pendingModelChange = null;
+      await pending.catch(() => {});
+    }
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
+    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
+      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
+      if (!decision || decision.terminal || decision.action === "route") {
+        turnRoutingDone = true;
+      }
+      if (decision && decision.action === "route" && decision.model) {
+        await applyModelChange(pi, config, ctx, decision.model);
+      }
+    }
     await postEvent(config, {
       type: "external_conversation_item",
       data: {

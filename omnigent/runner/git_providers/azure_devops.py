@@ -1114,6 +1114,31 @@ class AzureDevOpsPullRequests:
         if account is not None or remote is not None:
             raise ValueError("Azure DevOps pull requests have no account or base remote choice")
 
+    def repo_labels(
+        self,
+        root: str,  # noqa: ARG002 - labels are unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - labels are unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps label editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request labels is not supported yet.")
+
+    def edit_labels(
+        self,
+        root: str,  # noqa: ARG002 - labels are unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - labels are unsupported
+        *,
+        add: Sequence[str],  # noqa: ARG002 - labels are unsupported
+        remove: Sequence[str],  # noqa: ARG002 - labels are unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps label editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request labels is not supported yet.")
+
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``az repos pr`` command, in order."""
         return azure_devops_observer.shell_pr_operations(segments)

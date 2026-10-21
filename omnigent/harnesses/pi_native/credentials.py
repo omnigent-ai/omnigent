@@ -36,7 +36,9 @@ from omnigent._platform import default_shell_argv
 from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
+    PI_AGENT,
     is_databricks_ai_gateway_url,
+    with_gateway_attribution,
 )
 from omnigent.harnesses.pi_native.auth_command import (
     AUTH_DIR_ENV,
@@ -173,6 +175,7 @@ class _PiProviderPayload(TypedDict):
     models: list[_PiModelEntry]
     authHeader: NotRequired[bool]
     compat: NotRequired[_PiProviderCompat]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -391,6 +394,13 @@ class PiProviderConfig:
             provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
+        for provider_id, payload in providers.items():
+            if is_databricks_ai_gateway_url(payload["baseUrl"]):
+                # Copy rather than mutate: additional payloads are shared across renders.
+                headers = with_gateway_attribution(
+                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                )
+                providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
 
     def _register_on_surface(
@@ -2013,4 +2023,7 @@ def pi_native_provider_launch(
             thinking = to_pi_thinking_level(effort)
     if thinking is not None:
         args.extend(["--thinking", thinking])
+    from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+    args.extend(pi_gateway_extension_args(agent_dir, rendered))
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

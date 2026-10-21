@@ -965,6 +965,47 @@ def test_to_models_config_shape() -> None:
     assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
 
 
+def test_to_models_config_attributes_unity_gateway_providers() -> None:
+    """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    ug_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
+        "apiKey": "!get-token",
+        "api": "openai-responses",
+        "models": [{"id": "system.ai.gpt-5-5"}],
+        "headers": {"User-Agent": "ucode/0.1.0 pi/0.80.0"},
+    }
+    other_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-test",
+        "api": "openai-completions",
+        "models": [{"id": "qwen/qwen3"}],
+    }
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://dbc-1.cloud.databricks.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="system.ai.claude-sonnet-5",
+        api_key="!get-token",
+        auth_header=True,
+        additional_providers={"ug-openai": ug_provider, "other": other_provider},
+    )
+
+    providers = provider.to_models_config()["providers"]
+
+    assert providers["omnigent"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert providers["ug-openai"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 pi/0.80.0",
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert "headers" not in providers["other"]
+    # The configured payload is shared across renders, so it stays unstamped.
+    assert ug_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
+
+
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
     """models.json is written 0600 in a 0700 dir (it may hold a literal key)."""
     provider = creds.PiProviderConfig(

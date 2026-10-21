@@ -17,6 +17,8 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
+- `smart-routing`: Pi applies the chosen route before inference from the
+  composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -35,6 +37,9 @@ implements them separately, so a fix for one harness does not reach the others.
   stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `subagent-discovery`: Claude children appear under the agent that spawned
+  them, including delayed spawns; an unresolved spawn does not keep an idle
+  runner re-reading unchanged conversations.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
@@ -73,8 +78,18 @@ Repeat the Chat and header-menu Terminal paths at phone width. A locally
 launched `omnigent claude` session is a separate launch path; inspect its linked
 Chat session as well as the local terminal.
 
+**Pi Smart Routing:** enable Smart Routing for the session, then send a task
+from Chat or type it into the native Pi terminal. Follow a completed tool call
+with a question about its result; verify the routed model and retained history.
+
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Claude sub-agents:** from a web-launched Claude session or a locally launched
+`omnigent claude` session, ask Claude to delegate through its Agent tool. Open
+the linked session's Agents panel and check the child under its parent. Ask a
+child to delegate again to check nested ownership; completed children remain
+visible while the runner idles.
 
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
@@ -152,6 +167,15 @@ and record each harness's missing or blocked checks, not just its passing ones.
 verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
+
+**Pi Smart Routing (own environment):**
+`tests/e2e/test_pi_native_smart_routing.py::test_pi_native_smart_routing_applies_pick`
+starts the real CLI/server/runner/Pi with scripted routing and model replies.
+It covers composer API and session-owned TUI input, verifies the actual served
+model, then checks the follow-up request retains the tool result and first answer.
+Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
+does not cover browser clicks; scripted routing does not establish live judge
+quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
 
 **Launch settings (own environment):** connect a host with Claude/Codex
 configured, and put a command and two args under
@@ -435,11 +459,15 @@ Cross-harness journeys:
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
-  If shell mode or the prompt-history search still occupies Claude Code's input
-  box after Omnigent tries to dismiss it with Escape, the web message is refused
-  with a notice to open the terminal, dismiss it, and resend. No message text is
-  typed into the pane.
-  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear`
+  Before typing, Omnigent dismisses shell mode and the prompt-history search
+  with Escape. A typed shell command keeps the box in shell mode through
+  Escape, so it is cleared with Ctrl+U instead and never runs;
+  `tests/harnesses/claude_native/test_claude_native_shell_mode_draft.py` covers
+  it with a fake input box (plain `uv run pytest`). If either surface still
+  occupies Claude Code's input box afterwards, the web message is refused with a
+  notice to open the terminal, dismiss it, and resend. No message text is typed
+  into the pane.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear`
   covers the refusal with a fake tmux (plain `uv run pytest`);
   `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
   (own environment; a scripted stand-in for the Claude TUI and real tmux) checks
@@ -533,6 +561,33 @@ Cross-harness journeys:
   the original failure remains in the session response and durable labels,
   with no additional turn-failure edge. Run with plain `uv run pytest`; no
   vendor CLI, browser, or model is needed.
+
+- **`subagent-discovery`, Claude (component checks, no vendor CLI):** run
+  `uv run --no-sync pytest tests/harnesses/claude_native/forwarder/test_subagent_discovery.py --reruns 0`.
+  `test_spawn_record_landing_after_idle_polls_registers_the_subagent[root|helper]`
+  checks repeated idle polls with unresolved metadata, no parsing of unchanged
+  transcripts, then registration under the right parent when the spawn arrives.
+  The same module covers cache invalidation on append and same-size rewrites,
+  eviction, deleted files, transient read failures, and existing Task/fork and
+  restart behavior. These use real transcript files and forwarder code with a
+  mocked HTTP peer; they do not measure runner CPU or prove browser rendering.
+- **`subagent-discovery`, Claude (manual runner performance):** use an isolated
+  server/runner from this checkout, with real Claude Code and tmux and a scripted
+  model endpoint. Follow the native prerequisites above; do not use a developer
+  daemon or modify machine-managed provider settings. For both web and local CLI
+  launch, create three delegated helpers and wait for parent and children to
+  finish. In that isolated session's transcript directory, append valid inert
+  JSONL records until the root is about 16 MB and each helper about 20 MB. Add
+  one extra `agent-<id>.meta.json`, copying a helper's shape but giving it a
+  unique `toolUseId` absent from all transcripts. Sample the session's runner
+  CPU and read rate for 60 seconds, then repeat with helper JSONL files moved
+  outside the watched directory and restored. Compare with the same runner's
+  idle baseline: unchanged large files should not cause sustained extra parsing
+  or CPU. Delegate again and check that the new child appears once under the
+  right parent in Agents. Record revision, OS, Claude version, mock routing,
+  sandbox and launch path with the measurements and UI evidence; a Linux run
+  does not establish the reporter's macOS result. This is a manual recipe,
+  not maintained real-runner automation.
 
 - **`plugin-inventory` (component and host tests):**
   `tests/e2e/test_host_plugins_e2e.py::test_host_plugin_inventory` starts a real

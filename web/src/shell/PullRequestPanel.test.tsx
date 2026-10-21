@@ -17,6 +17,7 @@ import type {
   PullRequestComment,
   PullRequestDiffResponse,
   PullRequestInfo,
+  PullRequestRepoLabels,
 } from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
@@ -48,31 +49,46 @@ const state = vi.hoisted(() => ({
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
+  canEdit: true,
+  repoLabels: {
+    data: undefined as PullRequestRepoLabels | undefined,
+    isPending: true,
+    isError: false,
+    error: null as Error | null,
+  },
+  updateLabels: { mutate: vi.fn(), isError: false, error: null as Error | null },
 }));
 
-vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
-  // The panel reads every info payload through the real normalizer.
-  normalizePullRequestInfo: (await importOriginal<typeof UsePullRequestsModule>())
-    .normalizePullRequestInfo,
-  usePullRequestInfo: vi.fn(() => state.info),
-  usePullRequestChangedFiles: vi.fn(() => state.changes),
-  usePullRequestDiff: () => ({
-    data: state.diff,
-    isLoading: false,
-    error: state.diffError,
-    isFetching: false,
-  }),
-  fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
-  // The account selector (shown in the repo-unresolved empty state) calls this;
-  // stub the mutation shape it reads.
-  useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useSetPullRequestPreference: () => ({
-    mutate: () => {},
-    isPending: false,
-    isError: false,
-    error: null,
-  }),
-}));
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
+  const original = await importOriginal<typeof UsePullRequestsModule>();
+  return {
+    // The panel reads every info payload through the real normalizer.
+    normalizePullRequestInfo: original.normalizePullRequestInfo,
+    applyPullRequestLabelChange: original.applyPullRequestLabelChange,
+    pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
+    usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
+    useUpdatePullRequestLabels: () => state.updateLabels,
+    usePullRequestInfo: vi.fn(() => state.info),
+    usePullRequestChangedFiles: vi.fn(() => state.changes),
+    usePullRequestDiff: () => ({
+      data: state.diff,
+      isLoading: false,
+      error: state.diffError,
+      isFetching: false,
+    }),
+    fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
+    // The account selector (shown in the repo-unresolved empty state) calls this;
+    // stub the mutation shape it reads.
+    useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useSetPullRequestPreference: () => ({
+      mutate: () => {},
+      isPending: false,
+      isError: false,
+      error: null,
+    }),
+  };
+});
+vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
 // we only assert a section renders one diff per parsed file. parsePatchFiles is
@@ -98,7 +114,11 @@ vi.mock("@/components/ai-elements/message", () => ({
   ),
 }));
 
-import { usePullRequestInfo, usePullRequestChangedFiles } from "@/hooks/usePullRequests";
+import {
+  usePullRequestInfo,
+  usePullRequestChangedFiles,
+  usePullRequestRepoLabels,
+} from "@/hooks/usePullRequests";
 
 import {
   PullRequestPanel,
@@ -247,6 +267,9 @@ beforeEach(() => {
   state.parsedFiles = [{ name: "hello.py" }, { name: "src/app.ts" }];
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
+  state.canEdit = true;
+  state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
+  state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
 });
 
 afterEach(() => {
@@ -333,6 +356,106 @@ describe("PullRequestPanel", () => {
     expect(
       screen.getByRole("listitem", { name: "Team platform-team: Approved" }),
     ).toBeInTheDocument();
+  });
+
+  describe("labels", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+    const bug = { name: "bug", color: "d73a4a", description: "Something isn't working" };
+    const docs = { name: "Docs", color: "0075ca", description: null };
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.pr!.labels = [docs, bug];
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        label_editing: true,
+      };
+    });
+
+    it("lists the PR's labels by name between reviewers and checks", () => {
+      state.info!.data!.pr!.reviewers = [];
+      renderPanel();
+
+      const list = screen.getByRole("list", { name: "Labels" });
+      expect(
+        within(list)
+          .getAllByRole("listitem")
+          .map((item) => item.textContent),
+      ).toEqual(["bug", "Docs"]);
+      expect(within(list).getAllByRole("listitem")[0]).toHaveAttribute(
+        "title",
+        "Something isn't working",
+      );
+      const labels = list.closest("section")!;
+      const reviewers = screen.getByRole("heading", { name: "Reviewers" }).closest("section")!;
+      const checks = screen.getByText("Checks").closest("section")!;
+      expect(
+        reviewers.compareDocumentPosition(labels) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it("wires editing to the selected PR: chips remove, and the picker loads on open", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove label bug" }));
+      expect(state.updateLabels.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [],
+        remove: [bug],
+      });
+      expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, false);
+      fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
+      expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, true);
+      expect(screen.getByRole("combobox", { name: "Filter labels" })).toBeInTheDocument();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without label editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+    ])("shows labels read-only for %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.getByRole("list", { name: "Labels" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit labels" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^Remove label/ })).toBeNull();
+    });
+
+    it.each([
+      [
+        "does not report labels",
+        () => {
+          delete state.info!.data!.pr!.labels;
+        },
+      ],
+      [
+        "names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("omits labels when the host %s", (_case, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("heading", { name: "Labels" })).toBeNull();
+    });
   });
 
   it.each([
@@ -1301,29 +1424,41 @@ describe("PullRequestPanel", () => {
         expect(keyWarnings()).toEqual([]);
       });
 
-      it("lists every check in the hover card when checks share a build URL or a name", async () => {
+      it("lists every check in the hover card and links only http(s) run URLs, even when checks share a URL or a name", async () => {
         const user = userEvent.setup();
         const keyWarnings = watchKeyWarnings();
         const buildUrl = "https://forge.example.test/contoso/web/_build/results?buildId=41";
         state.info!.data = withPr({
           checks: {
-            passing: 4,
+            passing: 5,
             failing: 0,
             pending: 0,
-            total: 4,
+            total: 5,
             runs: [
               { name: "Build", bucket: "passing", url: buildUrl },
               { name: "Lint", bucket: "passing", url: buildUrl },
               { name: "Deploy", bucket: "passing", url: null },
               { name: "Deploy", bucket: "passing", url: null },
+              // A status poster controls its target URL, so a script URL must not render.
+              { name: "Status", bucket: "passing", url: "javascript:alert(1)" },
             ],
           },
         });
         renderPanel();
 
-        await user.hover(screen.getByRole("button", { name: /4\s*passed/ }));
+        await user.hover(screen.getByRole("button", { name: /5\s*passed/ }));
         const rows = await screen.findAllByRole("listitem");
-        expect(rows.map((row) => row.textContent)).toEqual(["Build", "Lint", "Deploy", "Deploy"]);
+        expect(rows.map((row) => row.textContent)).toEqual([
+          "Build",
+          "Lint",
+          "Deploy",
+          "Deploy",
+          "Status",
+        ]);
+        expect(
+          rows.map((row) => within(row).queryByRole("link")?.getAttribute("href") ?? null),
+        ).toEqual([buildUrl, buildUrl, null, null, null]);
+        expect(within(rows[0]).getByRole("link")).toHaveAttribute("target", "_blank");
         expect(keyWarnings()).toEqual([]);
       });
     });
@@ -1748,6 +1883,7 @@ describe("session PR selection", () => {
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveTextContent(/^$/);
     expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };

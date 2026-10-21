@@ -130,6 +130,38 @@ def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
     assert parsed["provider"]["databricks-gateway"]["options"]["apiKey"] == "tok"
 
 
+def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -> None:
+    """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
+    config = {
+        "provider": {
+            "databricks": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/ai-gateway/mlflow/v1"},
+                "models": {
+                    "system.ai.glm-5": {"headers": {"User-Agent": "ucode/0.1.0 opencode/1.2.0"}},
+                },
+            },
+            "serving": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/serving-endpoints"},
+                "models": {"databricks-x": {"name": "databricks-x"}},
+            },
+        }
+    }
+
+    path = write_opencode_provider_config(tmp_path, config)
+
+    providers = json.loads(path.read_text())["provider"]
+    assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 opencode/1.2.0",
+        "Databricks-Custom-Coding-Agent": "opencode",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
+    # The caller's config is left as it was.
+    assert config["provider"]["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 opencode/1.2.0"
+    }
+
+
 @pytest.mark.parametrize(
     "model_id,expected",
     [

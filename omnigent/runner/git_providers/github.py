@@ -28,6 +28,7 @@ _CAPABILITIES = ProviderCapabilities(
     base_remote_selection=True,
     line_counts=True,
     linked_pr_diff=True,
+    label_editing=True,
 )
 
 
@@ -146,6 +147,25 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         github_resource._set_preference(root, reference, account=account, remote=remote)
+
+    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """List the repository's labels with ``gh label list``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._repo_labels(root, reference)
+
+    def edit_labels(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[str],
+        remove: Sequence[str],
+    ) -> dict[str, Any]:
+        """Add and remove the PR's labels through GitHub's issue labels API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_labels(root, reference, add=add, remove=remove)
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``gh pr`` or ``gh api`` segment."""

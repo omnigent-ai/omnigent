@@ -11700,17 +11700,17 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     assert tails[-1] == "Enter"
 
 
-def test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear(
+def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A shell-mode draft that outlives the reclaim is refused, not waited out.
 
-    Escape does not take a typed shell command out of the box, so the
+    When clearing does not take the typed shell command out of the box, the
     readiness gate would poll its whole slow-boot budget for a ``❯`` that
     cannot appear, and the delivery timeout then kills the healthy pane.
-    Only the dismissal Escapes may reach the pane.
+    Only the clearing keys may reach the pane: nothing that submits.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
     shell_draft_pane = (
@@ -11731,7 +11731,9 @@ def test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear(
         inject_user_message(bridge_dir, content="hello from the web")
 
     tails = [args[-1] for args in sends]
-    assert tails and set(tails) == {"Escape"}, f"Only dismissal Escapes may be sent; got {tails}."
+    assert tails and set(tails) == {claude_native_bridge._CLEAR_LINE_KEY}, (
+        f"Only the clearing keys may be sent; got {tails}."
+    )
 
 
 _MCP_APPROVAL_DIALOG_PANE = """\

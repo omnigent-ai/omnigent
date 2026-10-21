@@ -83,6 +83,12 @@ from omnigent._wrapper_labels import (
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.databricks_ai_gateway import (
+    CLAUDE_CODE_AGENT,
+    is_databricks_ai_gateway_url,
+    is_ug_route,
+    with_gateway_attribution_lines,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -2910,7 +2916,9 @@ def _ucode_config_for_profile(
         # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
         # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
-        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
+            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
+        ),
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
@@ -3085,10 +3093,19 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
             pin_env.setdefault(default_env_var, family.default_model)
+    attribution_env: dict[str, str] = {}
+    if is_databricks_ai_gateway_url(family.base_url):
+        # Keep any headers the user already sends; the config env replaces theirs.
+        attribution_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(family.base_url),
+        )
     return ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
+            **attribution_env,
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(
@@ -3357,6 +3374,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     model = _connect_broker_default_model()
+    adopted_ug_route = False
 
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -3379,6 +3397,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 if k in _CONNECT_BROKER_UCODE_ENV_ALLOWLIST
             }
             env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
+            adopted_ug_route = True
             # The served model is adopted only alongside a trusted (guarded) base
             # URL; a model with no/off-host URL falls back to the catalog default
             # rather than trusting a half-validated state entry.
@@ -3390,6 +3409,11 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 "connected workspace host) — using the profile-derived gateway route.",
             )
 
+    env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+        env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+        CLAUDE_CODE_AGENT,
+        via_ug=adopted_ug_route,
+    )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
 
