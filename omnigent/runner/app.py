@@ -1420,6 +1420,9 @@ def create_runner_app(
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
+    # Harnesses that may still hold a turn the runner stopped streaming.
+    _stale_harness_turns: set[str] = set()
+    app.state.stale_harness_turns = _stale_harness_turns
     # Required-terminal exits whose handler released the session's harness
     # subprocess. The release closes the httpx client an in-flight
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
@@ -3401,6 +3404,7 @@ def create_runner_app(
         _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
+        _stale_harness_turns.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
@@ -3894,6 +3898,7 @@ def create_runner_app(
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
+            _stale_harness_turns.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
@@ -4019,7 +4024,7 @@ def create_runner_app(
                 )
         return True
 
-    async def _forward_harness_interrupt(conv_id: str, *, turn_epoch: int) -> None:
+    async def _forward_harness_interrupt(conv_id: str, *, turn_epoch: int) -> bool:
         """Best-effort POST ``{"type":"interrupt"}`` to a conversation's harness.
 
         Releases the harness's parked policy/tool future so its ``run_turn``
@@ -4028,25 +4033,38 @@ def create_runner_app(
 
         :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
         :param turn_epoch: Turn generation captured before resolving its harness.
+        :returns: Whether the harness acknowledged the interrupt or had nothing left to
+            interrupt (no live harness process, no in-flight turn, or a newer turn).
         """
         if process_manager is None:
-            return
+            return True
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
             if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
-                return
-            await harness_client.post(
+                return True
+            response = await harness_client.post(
                 f"/v1/sessions/{conv_id}/events",
                 json={"type": "interrupt"},
                 # Bounded under the Omnigent server's 5s stop deadline.
                 timeout=3.0,
             )
+            if response.status_code == 404:
+                # The harness has no in-flight turn: nothing left to interrupt.
+                _logger.debug(
+                    "Interrupt forward for %s found no in-flight harness turn",
+                    conv_id,
+                    extra={"session_id": conv_id},
+                )
+                return True
+            response.raise_for_status()
+            return True
         except NoLiveHarnessError:
             _logger.debug(
                 "Interrupt forward skipped for %s: no live harness",
                 conv_id,
                 extra={"session_id": conv_id},
             )
+            return True
         except Exception:  # noqa: BLE001 — best-effort: harness may have exited
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
@@ -4054,6 +4072,29 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
+            return False
+
+    async def _reconcile_stale_harness_turn(manager: HarnessProcessManager, conv_id: str) -> None:
+        """Clear a turn the harness kept after the runner stopped streaming it.
+
+        A harness that does not acknowledge the interrupt is released, so the
+        delivery that follows respawns it rather than injecting into the stale turn.
+
+        :param manager: Process manager that owns the conversation's harness.
+        :param conv_id: Session about to receive a fresh delivery, e.g. ``"conv_abc123"``.
+        """
+        if conv_id not in _stale_harness_turns:
+            return
+        if not await _forward_harness_interrupt(
+            conv_id, turn_epoch=_turn_bind_epoch.get(conv_id, 0)
+        ):
+            _logger.warning(
+                "restarting harness for %s: its stale turn could not be interrupted",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            await manager.release(conv_id)
+        _stale_harness_turns.discard(conv_id)
 
     async def _cancel_inprocess_turn(conv_id: str) -> None:
         # Distinguish "no live turn" (absent) from a stream-mode turn (present as
@@ -4124,6 +4165,7 @@ def create_runner_app(
             extra={"session_id": conv_id},
         )
         _desynced_sessions.add(conv_id)
+        _stale_harness_turns.add(conv_id)
         # Capture entry epoch; an advance during teardown means a replacement ran.
         _entry_epoch = _turn_bind_epoch.get(conv_id, 0)
         # Release markers before any await so concurrent callers see no live turn.
@@ -5422,6 +5464,9 @@ def create_runner_app(
         dispatch: TurnDispatch | None = None,
     ) -> Response:
         manager = cast(HarnessProcessManager, process_manager)
+        # A harness that missed its dropped stream still holds that turn and would
+        # treat this fresh delivery as an injection (204), so clear that turn first.
+        await _reconcile_stale_harness_turn(manager, conv_id)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))

@@ -10718,7 +10718,7 @@ class _DeadInterruptHarnessClient(_RecoveryScriptedHarnessClient):
 
 @pytest.mark.asyncio
 async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
-    """Stream-mode sentinel clears and buffer drains even on a dead interrupt."""
+    """Stream-mode sentinel clears, the buffer drains, and the dead harness is restarted."""
     conv = "conv_recovery_streammode_dead"
     harness = _DeadInterruptHarnessClient([])
     pm = _RecoveryFakeProcessManager(harness)
@@ -10745,9 +10745,11 @@ async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> N
         await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
 
         deadline = loop.time() + 3.0
-        while loop.time() < deadline and conv in app.state.desynced_sessions:
+        while loop.time() < deadline and conv in app.state.stale_harness_turns:
             await asyncio.sleep(0.02)
         assert conv not in app.state.desynced_sessions
+        assert conv not in app.state.stale_harness_turns
+        assert pm.released == [conv]
 
 
 class _InterruptEndsStreamHarnessClient(_RecoveryScriptedHarnessClient):
@@ -11510,7 +11512,7 @@ class _HarnessInterruptClient:
             task = self._pm.consume_task
             if task is not None and not task.done():
                 task.cancel()
-        return httpx.Response(200, json={})
+        return httpx.Response(200, json={}, request=httpx.Request("POST", _url))
 
     def stream(self, _method: str, _url: str, **_kwargs: Any) -> _ChainEmptyStream:
         return _ChainEmptyStream()
