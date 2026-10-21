@@ -62,13 +62,14 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
 from omnigent.runner import pr_resource
-from omnigent.runner.git_providers import local_git
+from omnigent.runner.git_providers import PR_LABELS_OBJECT, local_git
 from omnigent.runner.session_prs import PullRequestRef
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
@@ -84,11 +85,12 @@ _pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess. ``body`` + ``comments`` feed the Summary tab;
-# both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
+# non-interactive subprocess. ``body``, ``comments``, and ``labels`` feed the
+# Summary tab; all are accepted by ``gh pr list`` too, so the fork-fallback path
+# shares them.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
-    ",reviewRequests,latestReviews"
+    ",reviewRequests,latestReviews,labels"
 )
 _PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
 # Reading check runs needs the Checks permission, which a fine-grained personal
@@ -164,8 +166,13 @@ def _in_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
-def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, max_seconds: float | None = None
+) -> tuple[int | None, str, str]:
+    """Run ``gh`` in ``cwd``; ``max_seconds`` caps the timeout for a caller with a budget."""
     timeout = _gh_timeout_seconds()
+    if max_seconds is not None:
+        timeout = min(timeout, max_seconds)
     if (deadline := _pr_title_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
@@ -476,6 +483,41 @@ def _shape_comments(raw: Any) -> list[dict[str, Any]]:
     return shaped
 
 
+# GitHub label colors are six hex digits; the panel puts them in inline styles.
+_LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
+# ``gh label list`` pages through the repository's labels up to this many.
+_MAX_REPO_LABELS = 1000
+# One label edit's ``gh`` calls share this budget, under the host tunnel's 20-second wait.
+_LABEL_EDIT_SECONDS = 15.0
+_LABEL_EDIT_TIMED_OUT = "GitHub took too long to update the labels. Refresh to see which applied."
+
+
+def _shape_labels(raw: Any) -> list[dict[str, str | None]]:
+    """Shape GitHub labels into ``{name, color, description}``, skipping malformed entries.
+
+    Accepts both ``gh pr view --json labels`` and REST label objects.
+    """
+    shaped: list[dict[str, str | None]] = []
+    for label in raw if isinstance(raw, list) else []:
+        name = label.get("name") if isinstance(label, dict) else None
+        if not isinstance(name, str) or not name:
+            continue
+        color = label.get("color")
+        description = label.get("description")
+        shaped.append(
+            {
+                "name": name,
+                "color": color.lower()
+                if isinstance(color, str) and _LABEL_COLOR.fullmatch(color)
+                else None,
+                "description": description
+                if isinstance(description, str) and description
+                else None,
+            }
+        )
+    return shaped
+
+
 def _head_commit_shas(root: str) -> list[str]:
     """Candidate commit SHAs to resolve the PR by identity, most-pushed first.
 
@@ -730,6 +772,8 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         }
         if _PR_REVIEW_FIELDS.issubset(data):
             payload["pr"]["reviewers"] = _shape_reviewers(data)
+        if "labels" in data:
+            payload["pr"]["labels"] = _shape_labels(data["labels"])
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
         payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
@@ -833,6 +877,8 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     }
     if _PR_REVIEW_FIELDS.issubset(data):
         info["pr"]["reviewers"] = _shape_reviewers(data)
+    if "labels" in data:
+        info["pr"]["labels"] = _shape_labels(data["labels"])
     return info
 
 
@@ -1283,3 +1329,110 @@ def _pr_file_contents(
         "before": contents(reference.repository, merge_base, previous_path or path),
         "after": contents(head_repository, current_head, path),
     }
+
+
+def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """List the PR repository's labels by name for the label picker.
+
+    :raises ValueError: When ``gh`` cannot list them.
+    """
+    _host_args(root, reference)
+    rc, out, _ = _gh(
+        [
+            "label",
+            "list",
+            "-R",
+            _repo_argument(reference),
+            "--json",
+            "name,color,description",
+            "--limit",
+            str(_MAX_REPO_LABELS),
+        ],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        raise ValueError("GitHub could not list this repository's labels. Refresh to retry.")
+    try:
+        raw = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned an unexpected label list") from exc
+    labels = sorted(_shape_labels(raw), key=lambda label: str(label["name"]).casefold())
+    return {
+        "object": "list",
+        "data": labels,
+        "has_more": isinstance(raw, list) and len(raw) >= _MAX_REPO_LABELS,
+    }
+
+
+def _labels_api(
+    root: str,
+    host: list[str],
+    token: str | None,
+    args: list[str],
+    *,
+    deadline: float,
+    missing_ok: bool = False,
+) -> list[Any] | None:
+    """Run one ``gh api`` issue-labels request and return the PR's labels after it.
+
+    :param deadline: ``time.monotonic()`` value the request must finish by.
+    :param missing_ok: Return ``None`` when GitHub reports that the PR lacks the
+        label being removed.
+    :raises ValueError: With a user-facing message when GitHub refuses the
+        request or the deadline passes.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    rc, out, err = _gh(["api", *host, *args], cwd=root, token=token, max_seconds=remaining)
+    if rc is None and err == "timed out":
+        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    try:
+        body = json.loads(out) if out.strip() else None
+    except ValueError:
+        body = None
+    if rc == 0 and isinstance(body, list):
+        return body
+    message = body.get("message") if isinstance(body, dict) else None
+    if missing_ok and message == "Label does not exist":
+        return None
+    if re.search(r"\(HTTP 40[134]\)", err):
+        raise ValueError("The GitHub account on the host cannot edit this pull request's labels.")
+    if isinstance(message, str) and "(HTTP 422)" in err:
+        raise ValueError(f"GitHub rejected the label change: {message}")
+    raise ValueError("GitHub could not update the labels. Refresh to retry.")
+
+
+def _edit_labels(
+    root: str, reference: PullRequestRef, *, add: Sequence[str], remove: Sequence[str]
+) -> dict[str, Any]:
+    """Remove, then add, the PR's labels through GitHub's issue labels API.
+
+    Each request returns the PR's labels afterwards, so the last one is the
+    result; a final read supplies it when every removed label was already absent.
+    The requests share :data:`_LABEL_EDIT_SECONDS`.
+    """
+    host = _host_args(root, reference)
+    token = _pr_token(root, reference)
+    deadline = time.monotonic() + _LABEL_EDIT_SECONDS
+    endpoint = f"repos/{reference.repository}/issues/{reference.number}/labels"
+    labels: list[Any] | None = None
+    for name in remove:
+        removed = _labels_api(
+            root,
+            host,
+            token,
+            ["-X", "DELETE", f"{endpoint}/{quote(name, safe='')}"],
+            deadline=deadline,
+            missing_ok=True,
+        )
+        labels = removed if removed is not None else labels
+    if add:
+        fields = [arg for name in add for arg in ("-f", f"labels[]={name}")]
+        labels = _labels_api(
+            root, host, token, ["-X", "POST", endpoint, *fields], deadline=deadline
+        )
+    if labels is None:
+        labels = _labels_api(root, host, token, [f"{endpoint}?per_page=100"], deadline=deadline)
+    return {"object": PR_LABELS_OBJECT, "labels": _shape_labels(labels)}

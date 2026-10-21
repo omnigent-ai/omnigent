@@ -893,3 +893,54 @@ async def test_content_search_distinguishes_older_runner_from_missing_resource(
         if missing_endpoint
         else "Environment not found"
     )
+
+
+_LABELS_PATH = "/v1/sessions/conv_share/resources/github/labels"
+_LABELS_PR_URL = "https://github.com/acme/widgets/pull/17"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_pr_label_routes_require_edit(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """Listing and editing PR labels act with the host's account, so viewers are refused."""
+    headers = {"X-Forwarded-Email": caller}
+    listed = await client.get(_LABELS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers)
+    edited = await client.post(
+        _LABELS_PATH,
+        json={"pr_url": _LABELS_PR_URL, "add": ["bug"], "session_id": "untrusted"},
+        headers=headers,
+    )
+
+    assert (listed.status_code, edited.status_code) == (expected, expected), edited.text
+    if expected == 403:
+        assert runner_client.gets == runner_client.posts == []
+        return
+    assert runner_client.gets == [_LABELS_PATH]
+    assert runner_client.get_params == [{"pr_url": _LABELS_PR_URL}]
+    assert runner_client.posts == [
+        (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"], "remove": []})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pr_label_edit_requires_a_json_body(
+    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    """A cross-site form post cannot change labels with the host's account."""
+    resp = await client.post(
+        _LABELS_PATH,
+        content=f'{{"pr_url": "{_LABELS_PR_URL}", "add": ["bug"]}}',
+        headers={"X-Forwarded-Email": "owner@example.com", "Content-Type": "text/plain"},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert runner_client.posts == []
