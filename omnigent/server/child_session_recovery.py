@@ -79,7 +79,8 @@ def is_parent_owned_subagent(conv: Conversation) -> bool:
     )
 
 
-def _restorable(conv: Conversation) -> bool:
+def session_is_restorable(conv: Conversation) -> bool:
+    """Whether recovery may re-initialize *conv*: open, unarchived, not stopped on purpose."""
     from omnigent.server.routes._sessions.common import (
         _intentional_stop_sessions,
         _interrupt_fenced_sessions,
@@ -94,7 +95,8 @@ def _restorable(conv: Conversation) -> bool:
     )
 
 
-def _interrupted(conv: Conversation) -> bool:
+def session_was_interrupted(conv: Conversation) -> bool:
+    """Whether *conv* was mid-turn when its runner went away."""
     from omnigent.server.routes._sessions.common import _session_status_cache
     from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
@@ -120,7 +122,7 @@ async def restore_active_children(
     from omnigent.runtime import get_runner_router
     from omnigent.server.routes.sessions import _ensure_runner_relay
 
-    if parent.runner_id is None or not _restorable(parent):
+    if parent.runner_id is None or not session_is_restorable(parent):
         return
     runner_id = parent.runner_id
     if generation is None:
@@ -168,7 +170,7 @@ async def restore_active_children(
                     and router is not None
                     and router.runner_is_online(row.runner_id)
                 )
-                or not _restorable(row)
+                or not session_is_restorable(row)
                 or is_side_chat_child(row.labels)
             ):
                 continue
@@ -177,7 +179,9 @@ async def restore_active_children(
     if initializer.generation_for(runner_id, client) != generation:
         _logger.info("Stopped restoring children of %s: runner tunnel changed", parent.id)
         return
-    active = {row.id for row in tree.values() if row.id != parent.id and _interrupted(row)}
+    active = {
+        row.id for row in tree.values() if row.id != parent.id and session_was_interrupted(row)
+    }
     needed = set(active)
     for row in reversed(list(tree.values())):
         if row.id in needed and row.parent_conversation_id in tree:
@@ -250,15 +254,15 @@ async def restore_active_children(
             if (
                 owner is None
                 or owner.runner_id != parent.runner_id
-                or not _restorable(owner)
+                or not session_is_restorable(owner)
                 or child is None
                 or child.runner_id is None
                 or child.runner_id != snapshot.runner_id
                 or child.parent_conversation_id != owner.id
                 or child.host_id is not None
                 or is_side_chat_child(child.labels)
-                or not _restorable(child)
-                or (snapshot.id in active and not _interrupted(child))
+                or not session_is_restorable(child)
+                or (snapshot.id in active and not session_was_interrupted(child))
                 or (mirror_only and not is_parent_owned_subagent(child))
             ):
                 return False
@@ -288,8 +292,8 @@ async def restore_active_children(
                         child,
                         client,
                         timeout=10.0,
-                        suppress_recovery_turn=not _interrupted(child),
-                        resume_interrupted_turn=_interrupted(child),
+                        suppress_recovery_turn=not session_was_interrupted(child),
+                        resume_interrupted_turn=session_was_interrupted(child),
                         generation=generation,
                         store_slots=store_slots,
                     )

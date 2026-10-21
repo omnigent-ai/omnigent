@@ -269,6 +269,36 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
     assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
 
 
+@pytest.mark.asyncio
+async def test_recovery_prompt_rides_only_a_resume_init() -> None:
+    registry, client = _Registry(), _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conv = _conversation()
+    await initializer.initialize(conv, client, timeout=10, recovery_prompt="ignored")  # type: ignore[arg-type]
+    await initializer.initialize(  # type: ignore[arg-type]
+        conv, client, timeout=10, resume_interrupted_turn=True, recovery_prompt="Host restarted."
+    )
+    assert client.calls[0]["session_init"]["recovery_prompt"] is None
+    assert client.calls[1]["session_init"]["recovery_prompt"] == "Host restarted."
+    envelope = parse_runner_session_init_envelope(client.calls[1])
+    assert envelope is not None
+    assert envelope.recovery_prompt == "Host restarted."
+
+
+def test_envelope_without_recovery_prompt_keeps_runner_default() -> None:
+    payload = build_runner_session_init_payload(
+        _conversation(), server_version="old", resume_interrupted_turn=True
+    )
+    raw = payload["session_init"]
+    assert isinstance(raw, dict)
+    raw.pop("recovery_prompt")
+    envelope = parse_runner_session_init_envelope(payload)
+    assert envelope is not None
+    assert envelope.resume_interrupted_turn is True
+    assert envelope.recovery_prompt is None
+
+
 class _AdvertisedRunner:
     generation = 1
 

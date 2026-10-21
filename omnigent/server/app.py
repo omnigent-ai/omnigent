@@ -89,6 +89,7 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.interrupted_session_recovery import InterruptedSessionRecoverer
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -1813,6 +1814,24 @@ def create_app(
             # endpoints (see routes/scheduled_tasks.py); there is no startup
             # sweep and no periodic reconcile.
 
+        interrupted_session_recoverer: InterruptedSessionRecoverer | None = None
+        if sandbox_config is not None and sandbox_config.auto_resume_interrupted.enabled:
+            if host_store is None:
+                _logger.warning(
+                    "Interrupted session auto-resume is enabled but no host store is "
+                    "configured; the recoverer will not run"
+                )
+            else:
+                interrupted_session_recoverer = InterruptedSessionRecoverer(
+                    conversation_store=conversation_store,
+                    host_store=host_store,
+                    sandbox_config=sandbox_config,
+                    app_state=app_inst.state,
+                    runner_router=runner_router,
+                )
+                app_inst.state.interrupted_session_recoverer = interrupted_session_recoverer
+                await interrupted_session_recoverer.start()
+
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
         if sandbox_config is not None and sandbox_config.reaper.enabled:
             if host_store is None:
@@ -1833,6 +1852,8 @@ def create_app(
         finally:
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
+            if interrupted_session_recoverer is not None:
+                await interrupted_session_recoverer.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -3812,10 +3833,14 @@ def create_app(
         from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
         from omnigent.server.child_session_recovery import (
             RECOVERY_STORE_CONCURRENCY,
-            _interrupted,
-            _restorable,
             is_parent_owned_subagent,
             restore_active_children,
+            session_is_restorable,
+            session_was_interrupted,
+        )
+        from omnigent.server.interrupted_session_recovery import (
+            auto_resume_requested,
+            init_started_turn,
         )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
@@ -3969,7 +3994,9 @@ def create_app(
         frontier = {
             conv.id: conv.id
             for conv, _ in roots
-            if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
+            if conv.agent_id is not None
+            and session_is_restorable(conv)
+            and conv.id not in eager_root_ids
         }
         idle_root_ids = set(frontier.values())
         try:
@@ -4002,7 +4029,7 @@ def create_app(
                                 row is None
                                 or row.host_id is not None
                                 or row.runner_id is None
-                                or not _restorable(row)
+                                or not session_is_restorable(row)
                                 or is_side_chat_child(row.labels)
                             ):
                                 continue
@@ -4010,7 +4037,7 @@ def create_app(
                                 row.runner_id
                             ):
                                 continue
-                            if row.runner_id != runner_id and _interrupted(row):
+                            if row.runner_id != runner_id and session_was_interrupted(row):
                                 eager_root_ids.add(root_id)
                                 break
                             next_frontier[row.id] = root_id
@@ -4040,6 +4067,7 @@ def create_app(
                         and not conv.archived
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
+                    resumed_turn = False
                     # Idle trees reinitialize on demand; active trees recover now.
                     if not initialize_runtime:
                         if conv.agent_id is None:
@@ -4058,10 +4086,17 @@ def create_app(
                             ),
                         )
                     if initialize_runtime:
+                        resume = await auto_resume_requested(conv, sandbox_config, host_store)
                         response = await runner_session_initializer.initialize(
                             conv,
                             client,
                             timeout=10.0,
+                            resume_interrupted_turn=resume,
+                            recovery_prompt=(
+                                sandbox_config.auto_resume_interrupted.recovery_prompt
+                                if resume and sandbox_config is not None
+                                else None
+                            ),
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
@@ -4069,13 +4104,17 @@ def create_app(
                         if is_session_agent_removed(response):
                             return
                         response.raise_for_status()
+                        resumed_turn = resume and init_started_turn(response)
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.
                     # Children retain interruption evidence until continuation runs.
-                    async with store_slots:
-                        await _publish_runner_recovered_status(
-                            conv.id, conversation_store, require_disconnect_code=True
-                        )
+                    # A resumed turn's own running edge clears the disconnect; an
+                    # idle edge here could land after it and hide the live turn.
+                    if not resumed_turn:
+                        async with store_slots:
+                            await _publish_runner_recovered_status(
+                                conv.id, conversation_store, require_disconnect_code=True
+                            )
                     if initialize_runtime:
                         await restore_active_children(
                             conv,

@@ -48,6 +48,12 @@ stores into ``create_app``):
            enabled: true          # default: false
            terminate_after_offline_days: 30  # default: 30 days
            sweep_interval_s: 86400            # default: 1 day
+         auto_resume_interrupted: # optional; deployment-wide, not per-provider
+           enabled: true          # default: false
+           sweep_interval_s: 60   # default: 60 seconds
+           max_attempts: 3        # default: 3 wake attempts per session
+           max_interrupted_age_s: 86400  # default: 1 day; older sessions stay put
+           recovery_prompt: "..." # default: DEFAULT_AUTO_RESUME_RECOVERY_PROMPT
          host_config:             # optional; provider-agnostic. Verbatim
                                   # in-sandbox ~/.omnigent/config.yaml content,
                                   # installed before `omnigent host` starts
@@ -733,6 +739,39 @@ _SHUTDOWN_DRAIN_ERROR = (
 )
 
 
+DEFAULT_AUTO_RESUME_RECOVERY_PROMPT = (
+    "The host machine restarted while you were working and this session was resumed "
+    "on the same workspace. Background processes you started (background shells, dev "
+    "servers, watchers, monitors) were stopped. Check `git status` and the workspace "
+    "to see how far the task got, restart any background processes it still needs, "
+    "then continue the existing task from its current state. Check any interrupted "
+    "operation's outcome before repeating it."
+)
+
+
+@dataclass(frozen=True)
+class ManagedSandboxAutoResumeConfig:
+    """Deployment-wide auto-resume of sessions interrupted by a host restart.
+
+    :param enabled: Whether interrupted top-level managed sessions resume with a
+        continuation turn once their runner reconnects, and whether the server
+        lifespan starts the recoverer loop that wakes them. Disabled by default.
+    :param sweep_interval_s: Seconds between recoverer sweeps.
+    :param max_attempts: Wake attempts per interrupted session before the
+        recoverer gives up on it until the session changes state again.
+    :param max_interrupted_age_s: Only sessions active within this many seconds
+        resume, so enabling the policy or restarting the server never revives
+        abandoned work.
+    :param recovery_prompt: Continuation prompt sent to the resumed session.
+    """
+
+    enabled: bool = False
+    sweep_interval_s: int = 60
+    max_attempts: int = 3
+    max_interrupted_age_s: int = 24 * 60 * 60
+    recovery_prompt: str = DEFAULT_AUTO_RESUME_RECOVERY_PROMPT
+
+
 @dataclass
 class ManagedSandboxDeployment:
     """
@@ -760,6 +799,8 @@ class ManagedSandboxDeployment:
         (this one has stopped accepting connections), so ``0`` (no wait)
         suits a single replica. A multi-replica deployment sizes it, plus
         uvicorn's graceful shutdown, inside its termination grace period.
+    :param auto_resume_interrupted: Deployment-wide policy for resuming
+        sessions a host restart interrupted.
     """
 
     configs: tuple[ManagedSandboxConfig, ...]
@@ -767,6 +808,9 @@ class ManagedSandboxDeployment:
         default_factory=ManagedSandboxReaperConfig
     )
     shutdown_drain_s: float = 0.0
+    auto_resume_interrupted: ManagedSandboxAutoResumeConfig = dataclass_field(
+        default_factory=ManagedSandboxAutoResumeConfig
+    )
 
     def __post_init__(self) -> None:
         # Enforce the "never empty" invariant the accessors rely on
@@ -786,6 +830,7 @@ class ManagedSandboxDeployment:
         *,
         reaper: ManagedSandboxReaperConfig | None = None,
         shutdown_drain_s: float = 0.0,
+        auto_resume_interrupted: ManagedSandboxAutoResumeConfig | None = None,
     ) -> ManagedSandboxDeployment:
         """
         Wrap one provider config as a one-provider deployment.
@@ -797,12 +842,14 @@ class ManagedSandboxDeployment:
         :param config: The single provider's config.
         :param reaper: Optional deployment-wide reaper policy.
         :param shutdown_drain_s: See :attr:`shutdown_drain_s`.
+        :param auto_resume_interrupted: Optional deployment-wide auto-resume policy.
         :returns: A deployment offering exactly *config*.
         """
         return cls(
             configs=(config,),
             reaper=reaper or ManagedSandboxReaperConfig(),
             shutdown_drain_s=shutdown_drain_s,
+            auto_resume_interrupted=(auto_resume_interrupted or ManagedSandboxAutoResumeConfig()),
         )
 
     @property
@@ -1431,15 +1478,67 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
         shutdown_drain_s = float(raw_drain)
     except OverflowError:
         raise ValueError(_SHUTDOWN_DRAIN_ERROR) from None
+    auto_resume = _parse_managed_sandbox_auto_resume_config(raw)
     if "providers" in raw:
         return replace(
-            _parse_multi_provider_sandbox_config(raw, reaper=reaper),
+            _parse_multi_provider_sandbox_config(
+                raw, reaper=reaper, auto_resume_interrupted=auto_resume
+            ),
             shutdown_drain_s=shutdown_drain_s,
         )
     return ManagedSandboxDeployment.single(
         _parse_single_provider_sandbox_config(raw),
         reaper=reaper,
         shutdown_drain_s=shutdown_drain_s,
+        auto_resume_interrupted=auto_resume,
+    )
+
+
+def _positive_int_setting(raw: dict[str, object], key: str, default: int, path: str) -> int:
+    value = raw.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"server config '{path}.{key}' must be a positive integer")
+    return value
+
+
+def _parse_managed_sandbox_auto_resume_config(
+    raw: dict[str, object],
+) -> ManagedSandboxAutoResumeConfig:
+    """Parse the deployment-wide ``sandbox.auto_resume_interrupted`` block."""
+    path = "sandbox.auto_resume_interrupted"
+    block = raw.get("auto_resume_interrupted")
+    if block is None:
+        return ManagedSandboxAutoResumeConfig()
+    if not isinstance(block, dict):
+        raise ValueError(f"server config '{path}' must be a mapping")
+    _reject_unknown_keys(
+        block,
+        {
+            "enabled",
+            "sweep_interval_s",
+            "max_attempts",
+            "max_interrupted_age_s",
+            "recovery_prompt",
+        },
+        path,
+    )
+    enabled = block.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"server config '{path}.enabled' must be a boolean")
+    defaults = ManagedSandboxAutoResumeConfig()
+    recovery_prompt = block.get("recovery_prompt", defaults.recovery_prompt)
+    if not isinstance(recovery_prompt, str) or not recovery_prompt.strip():
+        raise ValueError(f"server config '{path}.recovery_prompt' must be a non-empty string")
+    return ManagedSandboxAutoResumeConfig(
+        enabled=enabled,
+        sweep_interval_s=_positive_int_setting(
+            block, "sweep_interval_s", defaults.sweep_interval_s, path
+        ),
+        max_attempts=_positive_int_setting(block, "max_attempts", defaults.max_attempts, path),
+        max_interrupted_age_s=_positive_int_setting(
+            block, "max_interrupted_age_s", defaults.max_interrupted_age_s, path
+        ),
+        recovery_prompt=recovery_prompt,
     )
 
 
@@ -1490,6 +1589,7 @@ def _parse_multi_provider_sandbox_config(
     raw: dict[str, object],
     *,
     reaper: ManagedSandboxReaperConfig,
+    auto_resume_interrupted: ManagedSandboxAutoResumeConfig,
 ) -> ManagedSandboxDeployment:
     """
     Parse the ``sandbox.providers`` list shape into a deployment.
@@ -1518,7 +1618,8 @@ def _parse_multi_provider_sandbox_config(
     shared = {
         key: value
         for key, value in raw.items()
-        if key not in {"providers", "provider", "reaper", "shutdown_drain_s"}
+        if key
+        not in {"providers", "provider", "reaper", "shutdown_drain_s", "auto_resume_interrupted"}
     }
     parsed: list[ManagedSandboxConfig] = []
     seen: set[str] = set()
@@ -1532,7 +1633,7 @@ def _parse_multi_provider_sandbox_config(
             raise ValueError(
                 f"server config 'sandbox.providers[{index}]' must not nest 'providers'"
             )
-        for key in ("reaper", "shutdown_drain_s"):
+        for key in ("reaper", "shutdown_drain_s", "auto_resume_interrupted"):
             if key in entry:
                 raise ValueError(
                     f"server config 'sandbox.{key}' is deployment-wide and must be set "
@@ -1545,7 +1646,11 @@ def _parse_multi_provider_sandbox_config(
             raise ValueError(f"server config 'sandbox.providers' lists {name!r} more than once")
         seen.add(name)
         parsed.append(config)
-    return ManagedSandboxDeployment(configs=tuple(parsed), reaper=reaper)
+    return ManagedSandboxDeployment(
+        configs=tuple(parsed),
+        reaper=reaper,
+        auto_resume_interrupted=auto_resume_interrupted,
+    )
 
 
 def _parse_git_clone_options(raw: object) -> GitCloneOptions:

@@ -1880,6 +1880,22 @@ def register_core_routes(
                 orphan_liveness = await asyncio.to_thread(
                     liveness_lookup, [conv.id for conv in orphan_suspects]
                 )
+                from omnigent.server.interrupted_session_recovery import (
+                    auto_resume_enabled,
+                    managed_host_ids,
+                    preserves_interruption,
+                )
+
+                sandbox_config = getattr(request.app.state, "sandbox_config", None)
+                host_store = getattr(request.app.state, "host_store", None)
+                managed_hosts: set[str] = set()
+                if auto_resume_enabled(sandbox_config) and host_store is not None:
+                    # One lookup per distinct host, not one per orphaned session.
+                    managed_hosts = await asyncio.to_thread(
+                        managed_host_ids,
+                        host_store,
+                        (conv.host_id for conv in orphan_suspects if conv.host_id is not None),
+                    )
                 for conv in orphan_suspects:
                     result = orphan_liveness.get(conv.id)
                     # runner_online is False only once the runner is gone from
@@ -1887,11 +1903,19 @@ def register_core_routes(
                     # stale past the TTL), so this fires for a genuinely
                     # orphaned runner, never one mid-reconnect within grace.
                     if result is not None and not result.runner_online:
+                        preserve = await preserves_interruption(
+                            conv,
+                            sandbox_config,
+                            host_store,
+                            managed_hosts=managed_hosts,
+                        )
                         await asyncio.to_thread(
                             reconcile_orphaned_running_status,
                             conv.id,
                             conversation_store,
                             int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                            preserve_interruption=preserve,
+                            owner_runner_id=conv.runner_id,
                         )
         # Build items after reconciliation so each settled row reads its new
         # status straight from the (now-updated) cache.
