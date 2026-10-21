@@ -330,9 +330,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Daily")
 
     time_input = page.get_by_test_id("schedule-time")
-    time_input.fill("")
     time_input.click()
-    page.keyboard.type("9:37")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    expect(time_input).to_be_focused()
+    time_input.press("ControlOrMeta+A")
+    time_input.press_sequentially("9:37")
     assert time_input.input_value() == "9:37"
     # force=True: focusing the time input opened the picker popover, so a normal
     # click here can resolve to the dialog overlay (see _pick_minute's note). A
@@ -374,9 +376,13 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     assert submit_box is not None
     assert submit_box["y"] + submit_box["height"] <= dialog_box["y"] + dialog_box["height"] + 1
 
-    time_input.fill("")
+    expect(time_input).to_have_value("09:00 AM")
     time_input.click()
-    page.keyboard.type("10:37")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    expect(time_input).to_be_focused()
+    time_input.press("ControlOrMeta+A")
+    time_input.press_sequentially("10:37")
+    assert time_input.input_value() == "10:37"
     # force=True: the time input's focus reopened the picker popover, so blur it
     # with a forced click that can't be swallowed by the dialog overlay.
     page.get_by_test_id("task-name-input").click(force=True)
