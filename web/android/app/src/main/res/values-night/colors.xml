@@ -4,4 +4,5 @@
 
     <!-- Not generated: keep in sync with the CSS destructive colour in web/src/index.css. -->
     <color name="brand_error">#e65b77</color>
+    <color name="omnigents_wordmark">#FFFFFF</color>
 </resources>
