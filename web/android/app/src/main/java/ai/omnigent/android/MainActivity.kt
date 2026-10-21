@@ -353,14 +353,19 @@ class MainActivity : AppCompatActivity() {
         if (serverAuthentication(originOf(serverUrl)) != ServerAuthentication.OIDC) {
             oidcSession?.stop()
             showStatus(ConnectionStatus.Connecting(statusHost()))
-            webView.loadUrl(retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: serverUrl)
+            loadShellPage(retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: serverUrl)
             retryRoute = null
             return
         }
         // A page left running under the cover keeps calling its server and could start a
         // sign-in of its own; the session's page loads fresh once it is ready.
-        if (webView.url != null) webView.loadUrl(BLANK_PAGE)
+        if (webView.url != null) loadShellPage(BLANK_PAGE)
         oidcController().connect(serverUrl, interactive)
+    }
+
+    private fun loadShellPage(url: String) {
+        (webView.webViewClient as OmnigentWebViewClient).beginShellLoad(url)
+        webView.loadUrl(url)
     }
 
     private fun oidcController(): OidcSessionController =
@@ -443,7 +448,7 @@ class MainActivity : AppCompatActivity() {
 
         override fun showSignInRequired(message: String) {
             // The signed-out page under the prompt would keep asking to sign in.
-            webView.loadUrl(BLANK_PAGE)
+            loadShellPage(BLANK_PAGE)
             showStatus(ConnectionStatus.SignInRequired(statusHost(), message, false))
         }
 
@@ -458,12 +463,13 @@ class MainActivity : AppCompatActivity() {
             historyCleared = false
             val destination = retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: url
             retryRoute = null
-            showStatus(ConnectionStatus.Connecting(statusHost()))
-            webView.loadUrl(destination)
+            val connecting = ConnectionStatus.Connecting(statusHost())
+            if (connectionStatus != connecting) showStatus(connecting)
+            loadShellPage(destination)
         }
 
         override fun reloadPage(url: String) {
-            webView.loadUrl(url)
+            loadShellPage(url)
         }
 
         override fun returnToSetup(message: String?) {
@@ -584,7 +590,7 @@ class MainActivity : AppCompatActivity() {
                     pinnedOrigin = originOf(session.pageUri.toString())
                     removeBridge()
                     installBridge()
-                    webView.loadUrl(session.pageUri.toString())
+                    loadShellPage(session.pageUri.toString())
                     return@runOnUiThread
                 }
                 if (error is DatabricksSessionException.ReauthenticationRequired) {
@@ -1142,7 +1148,7 @@ class MainActivity : AppCompatActivity() {
         // Reload the user's route; a blank or foreign URL falls back to the root.
         val reloadUrl =
             if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
-        webView.loadUrl(reloadUrl)
+        loadShellPage(reloadUrl)
     }
 
     /**
@@ -1360,7 +1366,7 @@ class MainActivity : AppCompatActivity() {
             // budget on a failure that retrying can't fix. Stay put instead.
             if (!accepted) return@setCookie
             cookies.flush()
-            webView.loadUrl(origin)
+            loadShellPage(origin)
         }
         startActivity(
             Intent(this, MainActivity::class.java)
