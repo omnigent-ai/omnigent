@@ -63,9 +63,6 @@
     <string name="status_time">Time</string>
     <string name="status_app_version_label">App version</string>
     <string name="status_app_version">%1$s (%2$d)</string>
-    <string name="status_utc">UTC</string>
-    <string name="status_android_api">Android API</string>
-    <string name="status_webview">WebView</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>
     <string name="menu_sign_out_workspace">Sign Out of Workspace</string>
