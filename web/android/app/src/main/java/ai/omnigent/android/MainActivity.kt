@@ -352,14 +352,9 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String,
         interactive: Boolean,
     ) {
-        val authentication = serverAuthentication(originOf(serverUrl))
-        if (authentication != ServerAuthentication.OIDC) {
+        if (serverAuthentication(originOf(serverUrl)) != ServerAuthentication.OIDC) {
             oidcSession?.stop()
-            if (authentication.usesInWebViewAuth) {
-                if (connectionStatus != null) hideStatus()
-            } else {
-                showStatus(ConnectionStatus.Connecting(statusHost()))
-            }
+            showStatus(ConnectionStatus.Connecting(statusHost()))
             loadShellPage(retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: serverUrl)
             retryRoute = null
             return
@@ -867,6 +862,7 @@ class MainActivity : AppCompatActivity() {
         serverUrl: String?,
         error: String?,
     ) {
+        oidcLoginManager.cancel()
         ServerStore(this).clearCurrent()
         startActivity(
             Intent(this, ConnectActivity::class.java).apply {
