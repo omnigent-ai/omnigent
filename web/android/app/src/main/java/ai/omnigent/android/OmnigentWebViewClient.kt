@@ -214,7 +214,11 @@ internal class OmnigentWebViewClient(
         url: String?,
     ) {
         super.onPageCommitVisible(view, url)
-        if (url == activeMainFrameUrl && acceptedMainFrame(url) && !failedNavigation) {
+        if (sameMainFrameUrl(url, activeMainFrameUrl) &&
+            !sameMainFrameUrl(url, shellStoppedUrl) &&
+            !failedNavigation &&
+            (acceptedMainFrame(url) || isForeignInWebViewAuthPage(url))
+        ) {
             onMainFrameCommitted(view)
         }
     }
@@ -226,6 +230,12 @@ internal class OmnigentWebViewClient(
     ) {
         super.onReceivedError(view, request, error)
         val url = request.url.toString()
+        if (request.isForMainFrame && sameMainFrameUrl(url, activeMainFrameUrl) &&
+            isForeignInWebViewAuthPage(url)
+        ) {
+            failedNavigation = true
+            return
+        }
         if (!request.isForMainFrame || !sameMainFrameUrl(url, activeMainFrameUrl) ||
             sameMainFrameUrl(url, shellStoppedUrl) ||
             failedNavigation || !acceptedMainFrame(url) ||
@@ -245,6 +255,10 @@ internal class OmnigentWebViewClient(
         handler.cancel()
         val url = error.url
         val mainFrameUrl = activeMainFrameUrl ?: view.url
+        if (sameMainFrameUrl(url, mainFrameUrl) && isForeignInWebViewAuthPage(url)) {
+            failedNavigation = true
+            return
+        }
         if (!sameMainFrameUrl(url, mainFrameUrl) || sameMainFrameUrl(url, shellStoppedUrl) ||
             failedNavigation ||
             !acceptedMainFrame(url)
@@ -277,6 +291,14 @@ internal class OmnigentWebViewClient(
         val firstPath = firstUri.encodedPath.orEmpty().ifEmpty { "/" }
         val secondPath = secondUri.encodedPath.orEmpty().ifEmpty { "/" }
         return firstPath == secondPath && firstUri.encodedQuery == secondUri.encodedQuery
+    }
+
+    private fun isForeignInWebViewAuthPage(url: String?): Boolean {
+        val pageUrl = url ?: return false
+        val origin = originOf(pageUrl) ?: return false
+        val pinned = pinnedOrigin() ?: return false
+        return origin != pinned && isHttpScheme(Uri.parse(pageUrl).scheme) &&
+            serverAuthentication(pinned).usesInWebViewAuth
     }
 
     private fun acceptedMainFrame(url: String?): Boolean {
