@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.onboarding.codex_auth_readiness import (
+    codex_config_declared_env_key,
     codex_config_effective_auth,
     effective_codex_model_provider,
     load_codex_config,
@@ -155,3 +156,20 @@ def test_auth_headers_are_self_contained_for_adoption(header: str) -> None:
 
 def test_env_key_is_not_self_contained_for_adoption() -> None:
     assert not provider_table_has_self_contained_auth({"env_key": "GATEWAY_TOKEN"})
+
+
+def test_declared_env_key_names_the_provider_credential(tmp_path: Path) -> None:
+    assert codex_config_declared_env_key(_config(tmp_path, _ENV_KEY_CONFIG)) == "GATEWAY_TOKEN"
+
+
+@pytest.mark.parametrize(
+    "env_key", ["OMNIGENT_HOST_TOKEN", "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"]
+)
+def test_framework_env_key_is_never_a_provider_credential(tmp_path: Path, env_key: str) -> None:
+    """A config naming an Omnigent control-plane token gets no forwarding and no readiness."""
+    path = _config(tmp_path, _ENV_KEY_CONFIG.replace("GATEWAY_TOKEN", env_key))
+    assert codex_config_declared_env_key(path) is None
+    assert (
+        codex_config_effective_auth(path, env={env_key: "framework-secret"})
+        == "provider-auth-missing"
+    )

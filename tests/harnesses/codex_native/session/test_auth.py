@@ -316,15 +316,28 @@ def test_codex_auth_unavailable_reason_missing_provider_env_ignores_auth_json(
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 
 
+@pytest.mark.parametrize(
+    ("env_key", "value"),
+    [
+        ("OPENAI_API_KEY", "sk-test-secret"),
+        ("OMNIGENT_HOST_TOKEN", "framework-secret"),
+        ("DATABRICKS_TOKEN", "dbx-host-secret"),
+    ],
+)
 def test_codex_auth_unavailable_reason_config_env_key_scrubbed_needs_auth(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, env_key: str, value: str
 ) -> None:
     """An ``env_key`` the launch env scrubs is not reported as available.
 
     Readiness resolves the variable in the same filtered env the launch hands
-    the CLI, so a variable outside Codex's allowed env families (here a bare
-    ``EXAMPLE_GATEWAY_TOKEN``) cannot mark the harness ready and then 401 on the
-    first turn.
+    the CLI. ``OPENAI_API_KEY`` stays denied (it would bill a developer key), an
+    ``OMNIGENT_`` control-plane token is never a provider credential, and a
+    protected host secret such as ``DATABRICKS_TOKEN`` is never forwarded as a
+    Codex credential. A config naming any of them therefore cannot mark the
+    harness ready and then 401 on the first turn, even though the host process
+    holds the value. A provider's own declared ``env_key`` is forwarded and
+    credited (see ``test_codex_auth_unavailable_reason_config_env_key_available``);
+    this guards the names that stay scrubbed.
     """
     auth_path = tmp_path / "codex-home" / "auth.json"  # never created
     _point_codex_auth_check_at(
@@ -332,10 +345,10 @@ def test_codex_auth_unavailable_reason_config_env_key_scrubbed_needs_auth(
         auth_path,
         binary_present=True,
         config_toml=_ENV_KEY_CONFIG_TOML.replace(
-            'env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"', 'env_key = "EXAMPLE_GATEWAY_TOKEN"'
+            'env_key = "OPENAI_EXAMPLE_GATEWAY_TOKEN"', f'env_key = "{env_key}"'
         ),
     )
-    monkeypatch.setenv("EXAMPLE_GATEWAY_TOKEN", "gw-token")
+    monkeypatch.setenv(env_key, value)
 
     assert codex_native._codex_auth_unavailable_reason() == "needs-auth"
 

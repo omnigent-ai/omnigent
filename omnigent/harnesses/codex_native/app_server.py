@@ -80,6 +80,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
+    _CODEX_PROVIDER_CREDENTIAL_ENV_VARS,
     _CODEX_ROUTER_HOOK_MODULE,
     _clean_codex_env,
     _codex_cli_version,
@@ -90,6 +91,7 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
+    codex_config_declared_env_key_allowance,
     codex_extended_catalog_requested,
     codex_minimal_config_requested,
     codex_router_bridge_dir,
@@ -1406,11 +1408,14 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         port = _allocate_loopback_port()
         listen_url = f"ws://127.0.0.1:{port}"
         env = _clean_codex_env()
+        # Discovery runs against an empty CODEX_HOME with no auth command, so
+        # no provider credential the launch env carries may reach it.
+        provider_credentials = {
+            *_CODEX_PROVIDER_CREDENTIAL_ENV_VARS,
+            *codex_config_declared_env_key_allowance(),
+        }
         for name in tuple(env):
-            if name.startswith("OPENAI_") or name in {
-                "DATABRICKS_BEARER",
-                "DATABRICKS_CODEX_TOKEN",
-            }:
+            if name.startswith("OPENAI_") or name in provider_credentials:
                 env.pop(name)
         env["CODEX_HOME"] = str(codex_home)
         discovery = await _start_codex_model_discovery_process(
@@ -3932,6 +3937,35 @@ def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
     return effective_self_sufficient_builtin_provider(config)
 
 
+def _codex_own_config_carries_launch(config_overrides: list[str]) -> bool:
+    """Return whether an unpinned launch is authenticated by Codex's own custom provider.
+
+    Asks the same question host readiness asks
+    (:func:`~omnigent.onboarding.codex_auth_readiness.codex_config_effective_auth`
+    against the env the launch receives), so the router and the picker agree.
+    Built-in providers (Bedrock, Ollama, LM Studio) are left to
+    :func:`_ambient_builtin_codex_provider`, which pins them and honors ``--profile``.
+
+    :param config_overrides: The launch's ``-c`` overrides; a
+        ``model_provider`` pin overrides the config's selection.
+    :returns: ``True`` when a custom provider in Codex's config carries the
+        launch on its own.
+    """
+    from omnigent.onboarding.codex_auth_readiness import (
+        codex_config_effective_auth,
+        effective_custom_provider_table,
+        load_codex_config,
+    )
+
+    if any(override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX) for override in config_overrides):
+        return False
+    config_path = _codex_home_config_source_from_env() / "config.toml"
+    config = load_codex_config(config_path)
+    if config is None or effective_custom_provider_table(config) is None:
+        return False
+    return codex_config_effective_auth(config_path, env=_clean_codex_env()) == "provider-ready"
+
+
 def _resolve_subscription_launch(
     entry: ProviderEntry, model: str | None, explicit: dict[str, object]
 ) -> NativeCodexLaunch:
@@ -4189,6 +4223,24 @@ def resolve_native_codex_launch(
             summary=f"Codex config.toml provider {provider_id!r} (ambient fallback)",
         )
 
+    if entry is None and _codex_own_config_carries_launch(no_provider_overrides):
+        # Codex's own config authenticates the launch; it beats the managed
+        # broker below, which is a last resort when nothing declares credentials.
+        log_info_once(
+            _logger,
+            "native-codex routing: Codex's own config.toml provider (no provider "
+            "configured for the Codex harness; the config's credential takes precedence).",
+        )
+        return NativeCodexLaunch(
+            config_overrides=no_provider_overrides,
+            model=model,
+            profile=None,
+            summary=(
+                "Codex's own config.toml provider (no provider configured for the "
+                "codex harness; the config's credential takes precedence)"
+            ),
+        )
+
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
@@ -4254,17 +4306,21 @@ def resolve_native_codex_launch(
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
             "through a provider.",
         )
+        login_usable = _codex_login_usable()
+        summary = (
+            "Codex CLI login (no provider configured for the codex harness, no Databricks profile)"
+        )
+        if not login_usable:
+            summary += (
+                " — the TUI likely renders the ChatGPT sign-in screen and never starts a "
+                f"thread; run `{cli_invocation()} setup` to route through a provider"
+            )
         return NativeCodexLaunch(
             config_overrides=no_provider_overrides,
             model=model,
             profile=None,
-            summary=(
-                "Codex CLI login (no provider configured for the codex harness, no "
-                "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
-                f"screen and never starts a thread; run `{cli_invocation()} setup` "
-                "to route through a provider"
-            ),
-            login_required=not _codex_login_usable(),
+            summary=summary,
+            login_required=not login_usable,
         )
     if entry.kind == SUBSCRIPTION_KIND:
         return _resolve_subscription_launch(entry, model, explicit)
@@ -4281,22 +4337,30 @@ def resolve_native_codex_launch(
             )
         return launch
     # Default provider can't route on its own (no openai surface / no usable
-    # credential / unresolvable secret) → Codex's own login.
+    # credential / unresolvable secret) → Codex's own config or login.
+    config_carries = _codex_own_config_carries_launch(no_provider_overrides)
+    login_usable = _codex_login_usable()
     _logger.warning(
         "native-codex: provider %r is the Codex default but has no usable openai "
-        "credential — falling back to Codex's own login.",
+        "credential — falling back to Codex's own %s.",
         entry.name,
+        "config.toml provider" if config_carries else "login",
     )
+    unroutable = (
+        f"provider {entry.name!r} is the codex default but has no usable openai credential"
+    )
+    if config_carries:
+        summary = f"Codex's own config.toml provider ({unroutable})"
+    else:
+        summary = f"Codex CLI login ({unroutable})"
+        if not login_usable:
+            summary += " — the TUI likely renders the sign-in screen and never starts a thread"
     return NativeCodexLaunch(
         config_overrides=no_provider_overrides,
         model=model,
         profile=None,
-        summary=(
-            f"Codex CLI login (provider {entry.name!r} is the codex default but has no "
-            "usable openai credential) — the TUI likely renders the sign-in screen "
-            "and never starts a thread"
-        ),
-        login_required=not _codex_login_usable(),
+        summary=summary,
+        login_required=not (config_carries or login_usable),
     )
 
 
