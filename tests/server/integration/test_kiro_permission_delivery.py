@@ -246,6 +246,7 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
     client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
     receipt: bool,
     disconnected: bool,
 ) -> None:
@@ -254,6 +255,7 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
 
     monkeypatch.setattr(sessions, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.2)
     grace_expired = asyncio.Event()
+    request.addfinalizer(grace_expired.set)
 
     async def controlled_sleep(delay: float, result=None):
         if delay == sessions._HARNESS_ELICITATION_REPARK_GRACE_S:
