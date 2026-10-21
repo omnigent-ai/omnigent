@@ -1,0 +1,17 @@
+---
+# Fair-share cap for ONE user's sandboxes. A launch past the quota fails with the
+# apiserver's quota message surfaced in the session error.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: omnigent-tenant
+  namespace: omnigent-u-alice
+  labels:
+    omnigent.ai/tenant: alice
+spec:
+  hard:
+    pods: "10"
+    requests.cpu: "8"
+    requests.memory: 32Gi
+    limits.cpu: "16"
+    limits.memory: 64Gi

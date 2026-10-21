@@ -5876,3 +5876,152 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+# ── kubernetes per-user namespaces (dual-layer data plane) ──
+
+
+def test_parse_kubernetes_namespace_tenancy_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The documented per-user namespace block parses and reaches the launcher verbatim."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "namespace_strategy": "per-user",
+                "namespace_template": "team-{owner}-runners",
+                "namespace_provisioning": "server",
+                "namespace_labels": {"omnigent.ai/team": "{owner}", "cost-centre": "cc-42"},
+                "namespace_defaults": {
+                    "resource_quota": {"pods": 10, "requests.cpu": "8", "requests.memory": "32Gi"},
+                    "network_policy": "default-deny-ingress",
+                    "pod_security": "restricted",
+                },
+                "server_service_account": "control/omnigent-server",
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    assert cfg.default.launcher_factory() is fake
+    assert fake.namespace_strategy == "per-user"
+    assert fake.namespace_template == "team-{owner}-runners"
+    assert fake.namespace_provisioning == "server"
+    assert fake.namespace_labels == {"omnigent.ai/team": "{owner}", "cost-centre": "cc-42"}
+    # Quota values are normalized to strings (YAML ints are fine for `pods`).
+    assert fake.namespace_defaults == {
+        "resource_quota": {"pods": "10", "requests.cpu": "8", "requests.memory": "32Gi"},
+        "network_policy": "default-deny-ingress",
+        "pod_security": "restricted",
+    }
+    assert fake.server_service_account == "control/omnigent-server"
+
+
+def test_parse_kubernetes_namespace_tenancy_defaults_to_the_shared_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent keys reproduce today's single shared namespace exactly."""
+    cfg = parse_sandbox_config(
+        {"provider": "kubernetes", "server_url": "http://s.svc.cluster.local"}
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    cfg.default.launcher_factory()
+    assert fake.namespace_strategy == "shared"
+    assert fake.namespace_template == "omnigent-u-{owner}"
+    assert fake.namespace_provisioning == "external"
+    assert fake.namespace_labels is None
+    assert fake.namespace_defaults is None
+    assert fake.server_service_account == "omnigent/omnigent-server"
+
+
+@pytest.mark.parametrize(
+    ("block", "needle"),
+    [
+        ({"namespace_strategy": "per-team"}, "namespace_strategy"),
+        ({"namespace_provisioning": "auto"}, "namespace_provisioning"),
+        ({"namespace_template": "omnigent-sandboxes"}, "{owner}"),
+        ({"namespace_template": "{owner}.{owner}"}, "{owner}"),
+        ({"namespace_template": "Omnigent_{owner}"}, "lowercase"),
+        ({"namespace_template": "x" * 60 + "{owner}"}, "too few"),
+        ({"namespace_labels": {"bad key!": "v"}}, "invalid label key"),
+        ({"namespace_defaults": "restricted"}, "must be a mapping"),
+        ({"namespace_defaults": {"limit_range": {}}}, "unknown keys"),
+        ({"namespace_defaults": {"resource_quota": {}}}, "non-empty"),
+        ({"namespace_defaults": {"resource_quota": {"pods": "lots"}}}, "quantity"),
+        ({"namespace_defaults": {"network_policy": "allow-all"}}, "network_policy"),
+        ({"namespace_defaults": {"pod_security": "strict"}}, "pod_security"),
+        ({"server_service_account": "omnigent-server"}, "namespace/name"),
+        ({"server_service_account": "Bad NS/omnigent-server"}, "server_service_account"),
+    ],
+)
+def test_parse_kubernetes_namespace_tenancy_invalid_fails_loud(
+    block: dict[str, object], needle: str
+) -> None:
+    """A malformed tenancy key is rejected at parse time, naming the key."""
+    with pytest.raises(ValueError, match=re.escape(needle)):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": block,
+            }
+        )
+
+
+class _OwnerRecordingFake(FakeSandboxLauncher):
+    """Records the owner bound to it and the owner visible when provisioning."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.bound_owner: str | None = None
+        self.owner_at_provision: str | None = None
+
+    def bind_owner(self, owner: str) -> None:
+        self.bound_owner = owner
+
+    def provision(self, name: str) -> str:
+        self.owner_at_provision = self.bound_owner
+        return super().provision(name)
+
+
+async def test_launch_managed_host_binds_the_owner_before_provisioning(db_uri: str) -> None:
+    """
+    The owner reaches the launcher before ``provision``, so a per-tenant launcher
+    (Kubernetes per-user namespaces) resolves its namespace for the right user.
+    """
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _OwnerRecordingFake(on_host_start=_register)
+    await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
+    assert fake.bound_owner == _OWNER
+    assert fake.owner_at_provision == _OWNER
+
+
+def test_launcher_for_teardown_binds_the_host_owner(db_uri: str) -> None:
+    """Terminate/resume/relaunch/reaper launchers are bound to the host row's owner."""
+    from omnigent.server.managed_hosts import _launcher_for_teardown
+
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="a5c1d0f3e2b84c6f9d7e8a1b2c3d4e5f",
+        name="managed-teardown-owner",
+        user_id="bob@example.com",
+        token="teardown-owner-token",
+        provider="modal",
+        sandbox_id="sb-teardown-owner",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = _OwnerRecordingFake()
+    launcher = _launcher_for_teardown(host, _injected_config(fake))
+    assert launcher is fake
+    assert fake.bound_owner == "bob@example.com"

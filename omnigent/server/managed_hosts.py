@@ -1743,6 +1743,12 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
                     "service_account",
                     "node_selector",
                     "tolerations",
+                    "namespace_strategy",
+                    "namespace_template",
+                    "namespace_provisioning",
+                    "namespace_labels",
+                    "namespace_defaults",
+                    "server_service_account",
                     "kubeconfig",
                     "in_cluster",
                     "resources",
@@ -1777,6 +1783,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             ),
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
             home_size_limit=_parse_kubernetes_home_size_limit(raw),
+            namespace_tenancy=_parse_kubernetes_namespace_tenancy(raw),
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     elif provider == "microsandbox":
@@ -3153,6 +3160,142 @@ def _parse_kubernetes_resources(raw: dict[str, object]) -> dict[str, object] | N
     return normalized
 
 
+# Mirrors the enumerations in omnigent.onboarding.sandboxes.kubernetes (not
+# imported: the server never pays for the kubernetes SDK at config-parse time).
+_K8S_NAMESPACE_STRATEGIES: tuple[str, ...] = ("shared", "per-user")
+_K8S_NAMESPACE_PROVISIONING_MODES: tuple[str, ...] = ("external", "server")
+_K8S_NETWORK_POLICY_TEMPLATES: tuple[str, ...] = ("default-deny-ingress",)
+_K8S_POD_SECURITY_LEVELS: tuple[str, ...] = ("privileged", "baseline", "restricted")
+_K8S_DEFAULT_NAMESPACE_TEMPLATE: str = "omnigent-u-{owner}"
+_K8S_DEFAULT_SERVER_SERVICE_ACCOUNT: str = "omnigent/omnigent-server"
+
+
+@dataclass(frozen=True)
+class KubernetesNamespaceTenancy:
+    """
+    Validated ``sandbox.kubernetes.namespace_*`` block: where each owner's
+    sandboxes live and who creates that namespace.
+
+    The defaults reproduce today's single shared namespace exactly.
+    """
+
+    strategy: str = "shared"
+    template: str = _K8S_DEFAULT_NAMESPACE_TEMPLATE
+    provisioning: str = "external"
+    labels: dict[str, str] | None = None
+    defaults: dict[str, object] | None = None
+    server_service_account: str = _K8S_DEFAULT_SERVER_SERVICE_ACCOUNT
+
+
+def _parse_kubernetes_namespace_tenancy(raw: dict[str, object]) -> KubernetesNamespaceTenancy:
+    """
+    Extract and validate the optional per-user namespace keys.
+
+    ``namespace_template`` must hold ``{owner}`` once inside DNS-label-safe
+    fixed text; ``namespace_labels`` are Kubernetes label keys to string values
+    (``{owner}`` allowed in a value); ``namespace_defaults`` carries
+    ``resource_quota`` (string→quantity), ``network_policy`` (a bundled
+    template name or ``null``) and ``pod_security`` (a Pod Security level).
+
+    :param raw: The raw ``sandbox`` mapping.
+    :returns: The validated block (all defaults when the keys are absent).
+    :raises ValueError: When a key has the wrong shape or an unknown value.
+    """
+    section = _parse_provider_section(raw, "kubernetes") or {}
+    prefix = "server config 'sandbox.kubernetes."
+
+    strategy = section.get("namespace_strategy", "shared")
+    if strategy not in _K8S_NAMESPACE_STRATEGIES:
+        raise ValueError(
+            f"{prefix}namespace_strategy' must be one of "
+            f"{', '.join(_K8S_NAMESPACE_STRATEGIES)}: {strategy!r}"
+        )
+    provisioning = section.get("namespace_provisioning", "external")
+    if provisioning not in _K8S_NAMESPACE_PROVISIONING_MODES:
+        raise ValueError(
+            f"{prefix}namespace_provisioning' must be one of "
+            f"{', '.join(_K8S_NAMESPACE_PROVISIONING_MODES)}: {provisioning!r}"
+        )
+    template = section.get("namespace_template", _K8S_DEFAULT_NAMESPACE_TEMPLATE)
+    if not isinstance(template, str) or template.count("{owner}") != 1:
+        raise ValueError(
+            f"{prefix}namespace_template' must be a string containing '{{owner}}' "
+            f"exactly once: {template!r}"
+        )
+    fixed = template.replace("{owner}", "")
+    if fixed and not re.fullmatch(r"[a-z0-9-]+", fixed):
+        raise ValueError(
+            f"{prefix}namespace_template' may only use lowercase letters, digits "
+            f"and '-' around '{{owner}}': {template!r}"
+        )
+    if len(fixed) > 63 - 10:
+        raise ValueError(f"{prefix}namespace_template' leaves too few characters for the owner")
+
+    labels = _parse_provider_str_mapping(raw, "kubernetes", "namespace_labels")
+    for key in labels or {}:
+        if not _validate_label_key(key):
+            raise ValueError(f"{prefix}namespace_labels' has an invalid label key: {key!r}")
+
+    defaults_raw = section.get("namespace_defaults")
+    defaults: dict[str, object] | None = None
+    if defaults_raw is not None:
+        if not isinstance(defaults_raw, dict):
+            raise ValueError(f"{prefix}namespace_defaults' must be a mapping")
+        unknown = set(defaults_raw) - {"resource_quota", "network_policy", "pod_security"}
+        if unknown:
+            raise ValueError(f"{prefix}namespace_defaults' has unknown keys: {sorted(unknown)}")
+        defaults = {}
+        quota = defaults_raw.get("resource_quota")
+        if quota is not None:
+            if not isinstance(quota, dict) or not quota:
+                raise ValueError(
+                    f"{prefix}namespace_defaults.resource_quota' must be a non-empty "
+                    "mapping of ResourceQuota 'hard' entries, e.g. {'pods': '10'}"
+                )
+            for key, value in quota.items():
+                text = str(value)
+                if not isinstance(key, str) or not key.strip() or not _K8S_QUANTITY_RE.match(text):
+                    raise ValueError(
+                        f"{prefix}namespace_defaults.resource_quota[{key!r}]' is not a "
+                        f"valid Kubernetes quantity: {value!r}"
+                    )
+            defaults["resource_quota"] = {str(k): str(v) for k, v in quota.items()}
+        policy = defaults_raw.get("network_policy")
+        if policy is not None:
+            if policy not in _K8S_NETWORK_POLICY_TEMPLATES:
+                raise ValueError(
+                    f"{prefix}namespace_defaults.network_policy' must be one of "
+                    f"{', '.join(_K8S_NETWORK_POLICY_TEMPLATES)} or null: {policy!r}"
+                )
+            defaults["network_policy"] = policy
+        level = defaults_raw.get("pod_security")
+        if level is not None:
+            if level not in _K8S_POD_SECURITY_LEVELS:
+                raise ValueError(
+                    f"{prefix}namespace_defaults.pod_security' must be one of "
+                    f"{', '.join(_K8S_POD_SECURITY_LEVELS)} or null: {level!r}"
+                )
+            defaults["pod_security"] = level
+
+    server_sa = section.get("server_service_account", _K8S_DEFAULT_SERVER_SERVICE_ACCOUNT)
+    if not isinstance(server_sa, str) or server_sa.count("/") != 1:
+        raise ValueError(
+            f"{prefix}server_service_account' must be 'namespace/name': {server_sa!r}"
+        )
+    sa_namespace, sa_name = server_sa.split("/", 1)
+    _validate_dns1123_label(sa_namespace, "server_service_account")
+    _validate_dns1123_subdomain(sa_name, "server_service_account")
+
+    return KubernetesNamespaceTenancy(
+        strategy=strategy,
+        template=template,
+        provisioning=provisioning,
+        labels=labels,
+        defaults=defaults,
+        server_service_account=server_sa,
+    )
+
+
 def _parse_kubernetes_home_size_limit(raw: dict[str, object]) -> str | None:
     """
     Extract and validate the optional ``sandbox.kubernetes.home_size_limit``.
@@ -3452,6 +3595,7 @@ def _kubernetes_launcher_factory(
     pod_ready_timeout_s: int | None,
     runtime_class: str | None,
     home_size_limit: str | None,
+    namespace_tenancy: KubernetesNamespaceTenancy | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -3493,12 +3637,16 @@ def _kubernetes_launcher_factory(
         isolation), or ``None`` for the cluster's default runtime.
     :param home_size_limit: Resolved ``sizeLimit`` for every runner Pod's
         writable-HOME emptyDir, or ``None`` for an unbounded emptyDir.
+    :param namespace_tenancy: Validated ``namespace_strategy`` /
+        ``namespace_template`` / ``namespace_provisioning`` / labels /
+        defaults block, or ``None`` for today's single shared namespace.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
     _validate_kubernetes_identifiers(
         namespace, secret_name, service_account, node_selector, runtime_class
     )
+    tenancy = namespace_tenancy or KubernetesNamespaceTenancy()
 
     def _build() -> SandboxHostLauncher:
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
@@ -3527,6 +3675,12 @@ def _kubernetes_launcher_factory(
             pod_ready_timeout_s=pod_ready_timeout_s,
             runtime_class=runtime_class,
             home_size_limit=home_size_limit,
+            namespace_strategy=tenancy.strategy,
+            namespace_template=tenancy.template,
+            namespace_provisioning=tenancy.provisioning,
+            namespace_labels=tenancy.labels,
+            namespace_defaults=tenancy.defaults,
+            server_service_account=tenancy.server_service_account,
         )
 
     return _build
@@ -3620,6 +3774,7 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
+    launcher.bind_owner(owner)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
@@ -4057,6 +4212,7 @@ def _launcher_for_teardown(
         return None
     if launcher.provider != host.sandbox_provider:
         return None
+    launcher.bind_owner(host.user_id)
     return launcher
 
 

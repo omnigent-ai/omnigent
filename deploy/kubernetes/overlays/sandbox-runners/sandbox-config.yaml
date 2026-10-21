@@ -32,6 +32,17 @@ data:
       kubernetes:
         # Runner-Pod namespace (secret_name / service_account resolve here).
         namespace: omnigent-sandboxes
+        # Per-user namespaces instead of this one shared namespace — see README
+        # "Per-user namespaces". Defaults keep today's single-namespace behaviour.
+        # namespace_strategy: per-user             # shared | per-user
+        # namespace_template: "omnigent-u-{owner}" # {owner} once; label-normalized + hash suffix when lossy
+        # namespace_provisioning: external         # external (operator pre-creates) | server (created on first launch)
+        # namespace_labels: {omnigent.ai/team: "{owner}"}   # server mode
+        # namespace_defaults:                      # server mode, applied on first creation only
+        #   resource_quota: {pods: "10", requests.cpu: "8", requests.memory: "32Gi"}
+        #   network_policy: default-deny-ingress   # or null
+        #   pod_security: restricted               # privileged | baseline | restricted | null
+        # server_service_account: omnigent/omnigent-server  # RoleBinding subject in server mode
         # Harness LLM/git creds projected into every Pod via envFrom. Created out
         # of band (see README "Apply") — separate from the per-Pod launch-token Secret.
         secret_name: omnigent-creds

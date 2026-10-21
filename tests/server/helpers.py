@@ -218,6 +218,12 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.namespace: str | None = None
         self.secret_name: str | None = None
         self.service_account: str | None = None
+        self.namespace_strategy: str = "shared"
+        self.namespace_template: str | None = None
+        self.namespace_provisioning: str = "external"
+        self.namespace_labels: dict[str, str] | None = None
+        self.namespace_defaults: dict[str, object] | None = None
+        self.server_service_account: str | None = None
         self.node_selector: dict[str, str] | None = None
         self.kubeconfig: str | None = None
         self.in_cluster: bool | None = None
@@ -605,7 +611,8 @@ def install_fake_kubernetes_launcher(
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
     kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
-    tolerations=…, pod_ready_timeout_s=…, runtime_class=…, home_size_limit=…)``;
+    tolerations=…, pod_ready_timeout_s=…, runtime_class=…, home_size_limit=…,
+    namespace_strategy=…, …)``;
     the shim records those constructor args on the
     fake and hands it back, so production code runs unmodified against it.
 
@@ -631,8 +638,20 @@ def install_fake_kubernetes_launcher(
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
         home_size_limit: str | None = None,
+        namespace_strategy: str = "shared",
+        namespace_template: str | None = None,
+        namespace_provisioning: str = "external",
+        namespace_labels: dict[str, str] | None = None,
+        namespace_defaults: dict[str, object] | None = None,
+        server_service_account: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
+        fake.namespace_strategy = namespace_strategy
+        fake.namespace_template = namespace_template
+        fake.namespace_provisioning = namespace_provisioning
+        fake.namespace_labels = namespace_labels
+        fake.namespace_defaults = namespace_defaults
+        fake.server_service_account = server_service_account
         fake.image = image
         fake.env = env
         fake.namespace = namespace

@@ -50,6 +50,12 @@ class _RecordingLauncher:
         self.identity_threads: list[int] = []
         self.terminated: list[str] = []
         self.termination_threads: list[int] = []
+        self.bound_owners: list[str] = []
+
+    def bind_owner(self, owner: str) -> None:
+        # Part of the launcher surface the reaper drives: a per-tenant launcher
+        # (Kubernetes per-user namespaces) needs the host's owner before terminate.
+        self.bound_owners.append(owner)
 
     @contextlib.contextmanager
     def reaper_identity(self, workspace_id: int) -> Iterator[None]:
