@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.RestrictionsManager
 import android.content.res.Configuration
 import android.net.Uri
+import android.net.http.SslCertificate
+import android.net.http.SslError
 import android.os.Bundle
 import android.os.Looper
 import android.text.TextUtils
@@ -13,6 +15,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.FakeWebResourceError
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -37,6 +40,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowRestrictionsManager
+import org.robolectric.shadows.ShadowSslErrorHandler
 import java.net.URI
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
@@ -222,6 +226,60 @@ class MainActivityTest {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
         assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `retry after rejected certificate shows TLS failure again without page start`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com"
+        val callbackUrl = "$url/"
+        val certificate = SslCertificate("host", "issuer", java.util.Date(), java.util.Date())
+        val error = SslError(SslError.SSL_UNTRUSTED, certificate, callbackUrl)
+        val firstHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        webView.webViewClient.onReceivedSslError(webView, firstHandler, error)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertEquals(
+            UnreachableKind.TLS,
+            (
+                activity.declared<ConnectionStatus?>("connectionStatus") as
+                    ConnectionStatus.ServerUnreachable
+            ).kind,
+        )
+
+        activity.findViewById<Button>(R.id.status_primary).performClick()
+        assertEquals(url, shadowOf(webView).lastLoadedUrl)
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+        val secondHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+        webView.webViewClient.onReceivedSslError(webView, secondHandler, error)
+
+        assertEquals(
+            UnreachableKind.TLS,
+            (
+                activity.declared<ConnectionStatus?>("connectionStatus") as
+                    ConnectionStatus.ServerUnreachable
+            ).kind,
+        )
+        listOf(firstHandler, secondHandler).forEach { handler ->
+            val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+            assertTrue(shadow.wasCancelCalled())
+            assertFalse(shadow.wasProceedCalled())
+        }
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.findViewById<Button>(R.id.status_primary).performClick()
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(callbackUrl),
+            FakeWebResourceError(-6, "net::ERR_CONNECTION_REFUSED"),
+        )
+        val transportFailure =
+            activity.declared<ConnectionStatus?>("connectionStatus") as
+                ConnectionStatus.ServerUnreachable
+        assertTrue(transportFailure.details!!.error.contains("ERROR_CONNECT"))
     }
 
     @Test
@@ -571,6 +629,31 @@ class MainActivityTest {
     }
 
     @Test
+    fun `cold start becomes slow ten seconds after the first Connecting`() {
+        val pending = mutableListOf<Runnable>()
+        MainActivity.oidcWorker = Executor { pending += it }
+        val activity = launch()
+        assertEquals(1, pending.size)
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(5_000))
+        pending.single().run()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(4_900))
+        assertFalse(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+    }
+
+    @Test
     fun `post sign in page load becomes slow connecting after ten seconds`() {
         val activity = launch()
         val host =
@@ -723,8 +806,8 @@ class MainActivityTest {
         assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
         assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
         val webView = activity.webView()
-        webView.webViewClient.onPageStarted(webView, "https://example.com", null)
-        webView.webViewClient.onPageCommitVisible(webView, "https://example.com")
+        webView.webViewClient.onPageStarted(webView, "https://example.com/", null)
+        webView.webViewClient.onPageCommitVisible(webView, "https://example.com/")
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
     }
 
