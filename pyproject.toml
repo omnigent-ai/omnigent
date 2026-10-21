@@ -227,14 +227,10 @@ agents-sdk = [
     "openai-agents>=0.1,<1",
     "opentelemetry-instrumentation-openai-agents-v2>=0.1",
 ]
-# Google Antigravity SDK harness (`harness: antigravity`). Optional: the
-# harness module imports the SDK lazily on first turn, so only users of the
-# harness need this extra. Early SDK (v0.1.x) — pin minor.
-# google-antigravity ships proto gencode compiled against protobuf 7.x, so
-# the runtime must satisfy >=7 when this extra is installed; the core allows
-# >=6,<8, so this constraint selects the 7.x slot and prevents the
-# "gencode/runtime version mismatch" error at import time.
-antigravity = ["google-antigravity>=0.1,<1", "protobuf>=7,<8"]
+# Google Antigravity SDK harness (`harness: antigravity`). Floor 0.1.20: the first
+# release routing `run_command` through the pre-tool approval hook; later 0.x is
+# allowed. protobuf>=7: the SDK's gencode is compiled against 7.x (core: >=6,<8).
+antigravity = ["google-antigravity>=0.1.20,<1", "protobuf>=7,<8"]
 # GitHub Copilot SDK harness (`harness: copilot`). Optional: the harness module
 # imports the SDK lazily on first turn, so only users of the harness need this
 # extra. The wheel bundles the Copilot CLI binary it drives (~90MB), which is
