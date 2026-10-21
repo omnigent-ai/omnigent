@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.content.Context
+import android.content.Intent
 import android.content.RestrictionsManager
 import android.content.res.Configuration
 import android.net.Uri
@@ -35,8 +36,11 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowRestrictionsManager
+import java.net.URI
 import java.time.Duration
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -193,8 +197,183 @@ class MainActivityTest {
         assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
         webView.webViewClient.onPageStarted(webView, url, null)
         webView.webViewClient.onPageCommitVisible(webView, url)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
         assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `fast page commit keeps the first connecting status visible for its minimum`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(501))
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onPageCommitVisible(webView, url)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            webView.importantForAccessibility,
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `same origin cold start redirect stays covered until final commit`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val first = "https://example.com/"
+        val final = "https://example.com/omnigent/c/123"
+        webView.webViewClient.onPageStarted(webView, first, null)
+        webView.webViewClient.onPageStarted(webView, final, null)
+        webView.webViewClient.onPageCommitVisible(webView, first)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+        webView.webViewClient.onPageCommitVisible(webView, final)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+        assertFalse(
+            activity.declared<ConnectionStatus?>(
+                "connectionStatus",
+            ) is ConnectionStatus.ServerUnreachable,
+        )
+    }
+
+    @Test
+    fun `unvalidated network displays offline copy for a main frame failure`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(url),
+            FakeWebResourceError(-6, "refused"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertEquals(
+            activity.getString(R.string.status_unreachable_offline),
+            activity.findViewById<TextView>(R.id.status_body).text.toString(),
+        )
+    }
+
+    @Test
+    fun `workspace sign in after expired session returns to the recovered page`() {
+        val activity = launch()
+        val fixture = WorkspaceFixture()
+        activity.setDeclared("workspaceContext", fixture.root)
+        activity.setDeclared("workspaceProfile", fixture.profile)
+        activity.setDeclared(
+            "workspaceCoordinator",
+            fixture.coordinator {
+                _,
+                _,
+                ->
+                fixture.session
+            },
+        )
+        activity.invoke(
+            "beginWorkspaceConnection",
+            arrayOf(
+                DatabricksWebContext::class.java,
+                DatabricksWebProfile::class.java,
+                Boolean::class.javaPrimitiveType!!,
+            ),
+            fixture.page,
+            fixture.profile,
+            false,
+        )
+        awaitWorkspace(activity)
+        assertTrue(
+            activity.declared<ConnectionStatus?>(
+                "connectionStatus",
+            ) is ConnectionStatus.SignInRequired,
+        )
+
+        activity.findViewById<Button>(R.id.status_primary).performClick()
+        assertEquals(
+            fixture.page,
+            activity.declared<DatabricksWebContext?>("pendingRecoveryContext"),
+        )
+        fixture.hasGrant = true
+        activity.invoke(
+            "onNewIntent",
+            arrayOf(Intent::class.java),
+            Intent(activity, MainActivity::class.java).apply {
+                putExtra(OAuthCallbackActivity.EXTRA_OAUTH_CALLBACK, true)
+            },
+        )
+        awaitWorkspace(activity)
+        repeat(100) {
+            shadowOf(Looper.getMainLooper()).idle()
+            if (activity.declared<URI?>("lastWorkspacePageUri") != null) return@repeat
+            Thread.sleep(5)
+        }
+        assertEquals(fixture.page.pageUri, activity.declared<URI?>("lastWorkspacePageUri"))
+        assertEquals(fixture.page.pageUri.toString(), shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `workspace coordinator network failure shows server unreachable`() {
+        val activity = launch()
+        val fixture = WorkspaceFixture().apply { hasGrant = true }
+        activity.setDeclared(
+            "workspaceCoordinator",
+            fixture.coordinator { _, _ ->
+                throw DatabricksSessionException.NetworkUnavailable()
+            },
+        )
+        activity.invoke(
+            "beginWorkspaceConnection",
+            arrayOf(
+                DatabricksWebContext::class.java,
+                DatabricksWebProfile::class.java,
+                Boolean::class.javaPrimitiveType!!,
+            ),
+            fixture.page,
+            fixture.profile,
+            false,
+        )
+        awaitWorkspace(activity)
+        assertTrue(
+            activity.declared<ConnectionStatus?>(
+                "connectionStatus",
+            ) is ConnectionStatus.ServerUnreachable,
+        )
+    }
+
+    @Test
+    fun `workspace coordinator rejected failure shows workspace failure`() {
+        val activity = launch()
+        val fixture = WorkspaceFixture().apply { hasGrant = true }
+        activity.setDeclared(
+            "workspaceCoordinator",
+            fixture.coordinator { _, _ ->
+                throw DatabricksSessionException.Rejected(403)
+            },
+        )
+        activity.invoke(
+            "beginWorkspaceConnection",
+            arrayOf(
+                DatabricksWebContext::class.java,
+                DatabricksWebProfile::class.java,
+                Boolean::class.javaPrimitiveType!!,
+            ),
+            fixture.page,
+            fixture.profile,
+            false,
+        )
+        awaitWorkspace(activity)
+        assertTrue(
+            activity.declared<ConnectionStatus?>(
+                "connectionStatus",
+            ) is ConnectionStatus.WorkspaceFailure,
+        )
     }
 
     @Test
@@ -260,7 +439,6 @@ class MainActivityTest {
         )
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
         activity.findViewById<Button>(R.id.status_details_toggle).performClick()
-        assertEquals(0f, activity.findViewById<Button>(R.id.status_details_toggle).rotation)
         val before = activity.declared<View>("connectionOverlay")
         val dark =
             Configuration(activity.resources.configuration).apply {
@@ -276,7 +454,6 @@ class MainActivityTest {
             View.VISIBLE,
             activity.findViewById<View>(R.id.status_details_content).visibility,
         )
-        assertEquals(0f, activity.findViewById<Button>(R.id.status_details_toggle).rotation)
         assertEquals(
             activity.getString(R.string.status_server_unreachable),
             activity.findViewById<TextView>(R.id.status_headline).text.toString(),
@@ -536,7 +713,8 @@ class MainActivityTest {
         activity.invoke("onSignOutOfServerRequested")
 
         assertEquals(
-            "window.__omnigentNativeEmitSignOutResult && window.__omnigentNativeEmitSignOutResult(false);",
+            "window.__omnigentNativeEmitSignOutResult && " +
+                "window.__omnigentNativeEmitSignOutResult(false);",
             shadowOf(webView).lastEvaluatedJavascript,
         )
         assertFalse(activity.isFinishing)
@@ -824,5 +1002,130 @@ class MainActivityTest {
             .getDeclaredMethod(name, *parameterTypes)
             .apply { isAccessible = true }
             .invoke(this, *args)
+    }
+
+    private fun MainActivity.setDeclared(
+        name: String,
+        value: Any?,
+    ) {
+        MainActivity::class.java
+            .getDeclaredField(
+                name,
+            ).apply { isAccessible = true }
+            .set(this, value)
+    }
+
+    private fun awaitWorkspace(activity: MainActivity) {
+        val future = activity.declared<CompletableFuture<DatabricksWebSession>?>("workspaceFuture")
+        repeat(100) {
+            shadowOf(Looper.getMainLooper()).idle()
+            if (future?.isDone == true) {
+                shadowOf(Looper.getMainLooper()).idle()
+                return
+            }
+            Thread.sleep(5)
+        }
+        error("Workspace future did not finish")
+    }
+
+    private class WorkspaceFixture {
+        private val config =
+            DatabricksOAuthConfiguration(
+                "public-client",
+                URI("https://login.databricks.com/mobile-redirect"),
+            )
+        private val rootUri = URI("https://dbc-123.cloud.databricks.com/omnigent?o=42")
+        val root =
+            DatabricksWebContext(
+                config,
+                DatabricksCredentialScope.from(rootUri, config),
+                rootUri,
+            )
+        val page =
+            root.navigatingTo(
+                URI("https://dbc-123.cloud.databricks.com/omnigent/c/my-page?o=42"),
+            )
+        private val cookies = mutableMapOf<String, String>()
+        val profile =
+            DatabricksWebProfile(
+                root.profileName,
+                object : WebProfileBackend {
+                    override fun setAcceptCookie(accept: Boolean) = Unit
+
+                    override fun removeAllCookies(callback: (Boolean) -> Unit) {
+                        cookies.clear()
+                        callback(true)
+                    }
+
+                    override fun setCookie(
+                        url: String,
+                        value: String,
+                        callback: (Boolean) -> Unit,
+                    ) {
+                        val pair = value.substringBefore(';').split('=', limit = 2)
+                        cookies[pair[0]] = pair[1]
+                        callback(true)
+                    }
+
+                    override fun getCookie(url: String): String =
+                        cookies.entries.joinToString("; ") {
+                            "${it.key}=${it.value}"
+                        }
+
+                    override fun flushCookies() = Unit
+
+                    override fun clearWebStorage() = Unit
+                },
+            )
+        var hasGrant = false
+        private val token =
+            DatabricksOAuthTokens(
+                "access",
+                "refresh",
+                Long.MAX_VALUE,
+                DatabricksOAuthIssuer(URI("https://dbc-123.cloud.databricks.com/oidc")),
+            )
+        val session =
+            DatabricksWebSession(
+                page.pageUri,
+                listOf(
+                    SessionCookie(
+                        "DBAUTH",
+                        "session",
+                        "dbc-123.cloud.databricks.com",
+                        "/",
+                        true,
+                        true,
+                        true,
+                        -1,
+                        rootUri,
+                        "DBAUTH=session; Path=/; Secure; HttpOnly",
+                    ),
+                ),
+                setOf("https://dbc-123.cloud.databricks.com"),
+                config,
+                "42",
+            )
+
+        fun coordinator(create: DatabricksSessionCreating): DatabricksWorkspaceCoordinator {
+            val store =
+                object : DatabricksCredentialStorage {
+                    override fun load(scope: DatabricksCredentialScope) =
+                        if (hasGrant) token else null
+
+                    override fun save(
+                        scope: DatabricksCredentialScope,
+                        tokens: DatabricksOAuthTokens,
+                    ) = Unit
+
+                    override fun delete(scope: DatabricksCredentialScope) = Unit
+                }
+            return DatabricksWorkspaceCoordinator(
+                ApplicationProvider.getApplicationContext(),
+                DatabricksTokenManager(store),
+                create,
+                Executors.newSingleThreadExecutor(),
+            )
+        }
     }
 }

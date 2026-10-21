@@ -111,8 +111,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connectionOverlay: ConnectionStatusView
     private var connectionStatus: ConnectionStatus? = null
     private var retryRoute: String? = null
-    private var navigationFailed = false
-    private var navigationCommitted = false
     private var slowConnection: Runnable? = null
     private var pinnedOrigin: String? = null
 
@@ -591,6 +589,7 @@ class MainActivity : AppCompatActivity() {
                     if (allowInteractive) {
                         beginInteractiveWorkspaceSignIn(context, profile)
                     } else {
+                        pendingRecoveryContext = context
                         showStatus(ConnectionStatus.SignInRequired(statusHost(), null, true))
                     }
                     return@runOnUiThread
@@ -665,9 +664,7 @@ class MainActivity : AppCompatActivity() {
         if (status is ConnectionStatus.Connecting) {
             val runnable =
                 Runnable {
-                    if (connectionStatus == status &&
-                        !navigationCommitted && !navigationFailed
-                    ) {
+                    if (connectionStatus == status) {
                         showStatus(ConnectionStatus.ConnectingSlow(status.host))
                     }
                 }
@@ -680,8 +677,9 @@ class MainActivity : AppCompatActivity() {
         slowConnection?.let(mainHandler::removeCallbacks)
         slowConnection = null
         connectionStatus = null
-        connectionOverlay.hide()
-        webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        connectionOverlay.hide {
+            webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+        }
     }
 
     private fun showUnreachable(
@@ -706,7 +704,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             StatusAction.SIGN_IN -> {
-                val context = workspaceContext
+                val context = pendingRecoveryContext ?: workspaceContext
                 val profile = workspaceProfile
                 if (context != null &&
                     profile != null
@@ -720,8 +718,6 @@ class MainActivity : AppCompatActivity() {
             StatusAction.RETRY -> {
                 retryRoute = webView.url?.takeIf { originOf(it) == pinnedOrigin }
                     ?: lastWorkspacePageUri?.toString()?.takeIf { originOf(it) == pinnedOrigin }
-                navigationFailed = false
-                navigationCommitted = false
                 rendererCrashes = 0
                 val context = workspaceContext
                 val profile = workspaceProfile
@@ -1002,25 +998,18 @@ class MainActivity : AppCompatActivity() {
                     },
                     onPageReady = ::onPageReady,
                     onNavigationStarted = {
-                        navigationFailed = false
-                        navigationCommitted = false
                         armServerSwitcherWatchdog()
                     },
                     onMainFrameCommitted = { view ->
-                        if (view === webView && !navigationFailed) {
-                            navigationCommitted = true
-                            hideStatus()
-                        }
+                        if (view === webView) hideStatus()
                     },
                     onMainFrameUnreachable = { view, code, description ->
-                        if (view === webView && !navigationFailed) {
-                            navigationFailed = true
+                        if (view === webView) {
                             showUnreachable("$description (${connectionErrorName(code)})")
                         }
                     },
                     onMainFrameSslError = { view, description ->
-                        if (view === webView && !navigationFailed) {
-                            navigationFailed = true
+                        if (view === webView) {
                             showUnreachable(description, tls = true)
                         }
                     },

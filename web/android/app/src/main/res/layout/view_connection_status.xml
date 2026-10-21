@@ -151,11 +151,27 @@
                 </LinearLayout>
             </LinearLayout>
 
+        </LinearLayout>
+
+        <View
+            android:id="@+id/status_action_spacer"
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:layout_weight="1"
+            android:importantForAccessibility="no" />
+
+        <LinearLayout
+            android:id="@+id/status_actions"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:orientation="vertical"
+            android:visibility="gone">
+
             <Button
                 android:id="@+id/status_primary"
                 android:layout_width="match_parent"
                 android:layout_height="48dp"
-                android:layout_marginTop="32dp"
                 android:background="@drawable/bg_button_primary"
                 android:textAllCaps="false"
                 android:textColor="@color/brand_on_primary"
