@@ -890,6 +890,9 @@ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn
 
 
 _STREAM_CUT = "API Error: Connection lost mid-response. The response above may be incomplete."
+_SLEEP_STREAM_CUT = (
+    "API Error: Your computer went to sleep mid-response. The response above may be incomplete."
+)
 
 
 async def _forward_hooks(
@@ -936,8 +939,11 @@ def _stop_failure(bridge_dir: Path, details: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_detail", [_STREAM_CUT, _SLEEP_STREAM_CUT], ids=["disconnect", "sleep"]
+)
 async def test_stream_cut_turn_is_continued_once_instead_of_failing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_detail: str
 ) -> None:
     """A mid-response connection loss is continued in the pane, once per run of cuts."""
     injected: list[str] = []
@@ -949,19 +955,20 @@ async def test_stream_cut_turn_is_continued_once_instead_of_failing(
     bridge_dir = tmp_path / "bridge"
     dedupe = forwarder._ForwardDedupeState()
 
-    _stop_failure(bridge_dir, _STREAM_CUT)
+    _stop_failure(bridge_dir, failure_detail)
     assert await _forward_hooks(bridge_dir, dedupe) == []
     assert injected == [forwarder.STREAM_CUT_CONTINUE_TEXT]
 
     # The continuation was cut too: fail as before rather than loop.
-    _stop_failure(bridge_dir, _STREAM_CUT)
+    next_failure = _SLEEP_STREAM_CUT if failure_detail == _STREAM_CUT else _STREAM_CUT
+    _stop_failure(bridge_dir, next_failure)
     [failed] = await _forward_hooks(bridge_dir, dedupe)
     assert failed["data"]["status"] == "failed"
     assert len(injected) == 1
 
     # A finished turn re-arms it for a later cut.
     record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "claude-session"})
-    _stop_failure(bridge_dir, _STREAM_CUT)
+    _stop_failure(bridge_dir, failure_detail)
     [idle] = await _forward_hooks(bridge_dir, dedupe)
     assert idle["data"]["status"] == "idle"
     assert len(injected) == 2
@@ -990,25 +997,35 @@ async def test_other_upstream_failures_still_fail_the_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_detail", [_STREAM_CUT, _SLEEP_STREAM_CUT], ids=["disconnect", "sleep"]
+)
 async def test_stream_cut_still_fails_when_continuation_cannot_be_delivered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_detail: str
 ) -> None:
     """A pane that can't take the continuation (gone, dialog open) keeps today's failure."""
 
+    attempts: list[str] = []
+
     def refuse(_bridge_dir: Path, *, content: str, timeout_s: float) -> None:
+        attempts.append(content)
         raise RuntimeError("Claude's input prompt never rendered")
 
     monkeypatch.setattr(forwarder, "inject_user_message", refuse)
     bridge_dir = tmp_path / "bridge"
-    _stop_failure(bridge_dir, _STREAM_CUT)
+    _stop_failure(bridge_dir, failure_detail)
     [failed] = await _forward_hooks(bridge_dir, forwarder._ForwardDedupeState())
     assert failed["data"]["status"] == "failed"
-    assert failed["data"]["failure_detail"] == _STREAM_CUT
+    assert failed["data"]["failure_detail"] == failure_detail
+    assert attempts == [forwarder.STREAM_CUT_CONTINUE_TEXT]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_detail", [_STREAM_CUT, _SLEEP_STREAM_CUT], ids=["disconnect", "sleep"]
+)
 async def test_stream_cut_continuation_can_be_turned_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_detail: str
 ) -> None:
     """Setting the opt-out env var restores the failed turn."""
     injected: list[str] = []
@@ -1019,7 +1036,7 @@ async def test_stream_cut_continuation_can_be_turned_off(
     )
     monkeypatch.setenv(forwarder.STREAM_CUT_CONTINUE_ENV_VAR, "0")
     bridge_dir = tmp_path / "bridge"
-    _stop_failure(bridge_dir, _STREAM_CUT)
+    _stop_failure(bridge_dir, failure_detail)
     [failed] = await _forward_hooks(bridge_dir, forwarder._ForwardDedupeState())
     assert failed["data"]["status"] == "failed"
     assert injected == []

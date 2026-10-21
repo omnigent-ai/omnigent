@@ -3622,9 +3622,11 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
-# Claude Code's StopFailure text when the model stream drops after output began.
-# It never retries such a turn; asking it to continue usually completes it.
-_STREAM_CUT_FRAGMENT = "connection lost mid-response"
+# Claude Code does not retry a response interrupted by a disconnect or sleep.
+_STREAM_CUT_FRAGMENTS = (
+    "connection lost mid-response",
+    "your computer went to sleep mid-response",
+)
 STREAM_CUT_CONTINUE_TEXT = "Please continue from where you left off."
 # Set to "0" to fail a cut turn as before instead of continuing it once.
 STREAM_CUT_CONTINUE_ENV_VAR = "OMNIGENT_CLAUDE_CONTINUE_AFTER_STREAM_CUT"
@@ -3632,10 +3634,13 @@ _STREAM_CUT_CONTINUE_TIMEOUT_S = 15.0
 
 
 def _is_stream_cut(failure_detail: str | None) -> bool:
-    """Report whether a ``StopFailure`` is Claude's mid-response connection loss."""
+    """Report whether a ``StopFailure`` is an interrupted native response."""
     if os.environ.get(STREAM_CUT_CONTINUE_ENV_VAR, "1") == "0":
         return False
-    return failure_detail is not None and _STREAM_CUT_FRAGMENT in failure_detail.lower()
+    if failure_detail is None:
+        return False
+    lowered = failure_detail.lower()
+    return any(fragment in lowered for fragment in _STREAM_CUT_FRAGMENTS)
 
 
 async def _continue_after_stream_cut(bridge_dir: Path, *, session_id: str) -> bool:
