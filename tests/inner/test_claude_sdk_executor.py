@@ -2449,28 +2449,41 @@ async def test_hermetic_turn_carries_user_settings_env_under_omnigent_env(
     assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32"
 
 
-@pytest.mark.parametrize(
-    "make_executor",
-    [_default_executor, _databricks_opus_executor],
-    ids=["default-model", "adaptive-thinking-model"],
-)
-async def test_output_token_cap_reaches_cli_with_thinking_disabled(make_executor) -> None:
-    options = await _turn_options(make_executor(), ExecutorConfig(extra={"max_tokens": 32}))
+async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "claude-config").mkdir(parents=True)
+    (workspace / "claude-config" / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}})
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "claude-config")
+    executor = _default_executor(skills_filter="none", cwd=str(workspace))
 
-    assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32"
-    assert options.thinking == {"type": "disabled"}
+    options = await _turn_options(executor)
+
+    assert options.env.get("ANTHROPIC_BEDROCK_BASE_URL") == "https://gateway.example"
 
 
 @pytest.mark.parametrize(
     ("make_executor", "max_tokens", "expected_thinking"),
     [
+        (_default_executor, 32, {"type": "disabled"}),
+        (_databricks_opus_executor, 32, {"type": "disabled"}),
         (_default_executor, 1024, {"type": "disabled"}),
         (_default_executor, 1025, None),
         (_databricks_opus_executor, 32000, {"type": "adaptive", "display": "summarized"}),
     ],
-    ids=["largest-cap-without-room", "smallest-cap-with-room", "large-cap-adaptive-model"],
+    ids=[
+        "title-cap",
+        "title-cap-adaptive-model",
+        "largest-cap-without-room",
+        "smallest-cap-with-room",
+        "large-cap-adaptive-model",
+    ],
 )
-async def test_output_token_cap_keeps_thinking_when_a_budget_fits(
+async def test_output_token_cap_reaches_cli_and_keeps_thinking_when_a_budget_fits(
     make_executor, max_tokens: int, expected_thinking: dict[str, str] | None
 ) -> None:
     options = await _turn_options(
