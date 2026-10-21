@@ -44,6 +44,7 @@ from omnigent.host.frames import (
     HostMcpServersResultFrame,
     HostMcpToolsResultFrame,
     HostPluginsResultFrame,
+    HostPreferencesResultFrame,
     HostSkillContentResultFrame,
     HostSkillsResultFrame,
 )
@@ -118,6 +119,13 @@ def _fail_pending_imports(conn: HostConnection) -> None:
                 },
             )
         )
+
+
+def _fail_pending_preferences(conn: HostConnection) -> None:
+    while conn.pending_preferences:
+        _, future = conn.pending_preferences.popitem()
+        if not future.done():
+            future.set_exception(ConnectionError("host disconnected"))
 
 
 def _fail_pending_plugins(conn: HostConnection) -> None:
@@ -489,6 +497,9 @@ class HostConnection:
     pending_harness_startup: dict[str, asyncio.Future[HarnessStartup | None]] = field(
         default_factory=dict
     )
+    pending_preferences: dict[str, asyncio.Future[HostPreferencesResultFrame]] = field(
+        default_factory=dict
+    )
     pending_plugins: dict[str, asyncio.Future[HostPluginsResultFrame]] = field(
         default_factory=dict
     )
@@ -611,6 +622,7 @@ class HostRegistry:
                 old.outbound_queue.put_nowait(None)
                 _fail_pending_imports(old)
                 _fail_pending_harness_startup(old)
+                _fail_pending_preferences(old)
                 _fail_pending_plugins(old)
                 _fail_pending_skill_content(old)
                 _fail_pending_mcp_tools(old)
@@ -660,6 +672,7 @@ class HostRegistry:
         removed.outbound_queue.put_nowait(None)
         _fail_pending_imports(removed)
         _fail_pending_harness_startup(removed)
+        _fail_pending_preferences(removed)
         _fail_pending_plugins(removed)
         _fail_pending_skill_content(removed)
         _fail_pending_mcp_tools(removed)

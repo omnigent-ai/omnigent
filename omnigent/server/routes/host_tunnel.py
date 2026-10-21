@@ -54,6 +54,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
+    HostPreferencesResultFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -1040,6 +1041,11 @@ async def _receive_loop(
             mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostPreferencesResultFrame):
+            preferences_future = conn.pending_preferences.pop(frame.request_id, None)
+            if preferences_future is not None and not preferences_future.done():
+                preferences_future.set_result(frame)
             continue
         if isinstance(frame, HostPluginsResultFrame):
             plugins_future = conn.pending_plugins.pop(frame.request_id, None)

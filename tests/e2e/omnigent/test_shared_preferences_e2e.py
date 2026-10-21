@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import httpx
+import pytest
 
 from tests._helpers.live_server import isolated_local_server, isolated_process_env
 
@@ -267,7 +268,8 @@ def test_durable_preference_clients_offline_reconnect_and_restart(tmp_path, db_u
         assert drive("remote", restarted)["snapshot"] == cleared
 
 
-def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri):
+@pytest.mark.parametrize("surface", ["cli", "host"])
+def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, surface):
     config = tmp_path / "cli-server.yaml"
     config.write_text("shared_preferences_authority_id: cli-preference-test\n")
     arguments = ("--config", str(config), "--database-uri", db_uri)
@@ -286,7 +288,16 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri):
         "model: imported-model\nharness:\n  default: pi-native\n"
         "  pi-native:\n    args: []\n    command: private-command\n"
     )
-    with isolated_local_server(tmp_path / "cli-server", extra_args=arguments) as server:
+    from contextlib import ExitStack
+
+    import yaml
+
+    from tests._helpers.host import isolated_host
+
+    with ExitStack() as stack:
+        server = stack.enter_context(
+            isolated_local_server(tmp_path / "cli-server", extra_args=arguments)
+        )
 
         def cli(*args):
             result = subprocess.run(
@@ -298,6 +309,62 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri):
             )
             assert result.returncode == 0, result.stdout + result.stderr
             return result.stdout
+
+        if surface == "host":
+            host = stack.enter_context(
+                isolated_host(
+                    tmp_path / "host",
+                    server,
+                    config=yaml.safe_load(source.read_text()),
+                    env={"CLAUDE_CONFIG_DIR": str(native)},
+                    base_env={"PATH": os.environ["PATH"]},
+                )
+            )
+            client = stack.enter_context(
+                httpx.Client(base_url=server, timeout=20, trust_env=False)
+            )
+            host.wait_online(client)
+
+            def action(payload):
+                response = client.post(f"/v1/hosts/{host.host_id}/preferences", json=payload)
+                assert response.status_code == 200, (
+                    response.text + host.log_path.read_text()[-2000:]
+                )
+                return response.json()
+
+            assert action({"action": "status"})["connected"] is False
+            initial = action({"action": "preview_import", "plugins": ["claude"]})
+            assert initial["preview"]["changes"] and initial["connected"] is False
+            assert action({"action": "status"})["connected"] is False
+            assert "shared_preferences" not in (host.home / ".omnigent/config.yaml").read_text()
+
+            def cli(*args):
+                from omnigent.preference_commands import _key
+
+                command = args[0]
+                if command == "import":
+                    return json.dumps(
+                        action({"action": "preview_import", "plugins": ["claude"]})["preview"]
+                    )
+                if command == "restore":
+                    return json.dumps(action({"action": "preview_restore"})["preview"])
+                if command == "apply":
+                    from pathlib import Path
+
+                    payload = {
+                        "action": "apply_import",
+                        "preview": json.loads(Path(args[1]).read_text()),
+                    }
+                elif command == "set":
+                    assert args[1:3] == ("--scope", "machine")
+                    payload = {
+                        "action": "set_machine",
+                        "key": _key(args[3]).model_dump(mode="json"),
+                        "value": json.loads(args[4]),
+                    }
+                else:
+                    payload = {"action": "status" if command == "show" else command}
+                return json.dumps(action(payload))
 
         cli("connect")
         before = json.loads(cli("show"))

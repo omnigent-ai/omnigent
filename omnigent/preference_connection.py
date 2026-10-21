@@ -122,7 +122,12 @@ async def open_preference_http(server_url: str) -> httpx.AsyncClient:
     return open_server_client(server_url, bearer_token=bearer, timeout=5)
 
 
-async def connect_preferences(server_url: str) -> PreferenceConnection:
+async def connect_preferences(
+    server_url: str,
+    *,
+    expected_identity: PreferenceNamespace | None = None,
+    persist: bool = True,
+) -> PreferenceConnection:
     """Explicitly bind to the authenticated server without importing any local values."""
     parsed = urlsplit(server_url)
     if (
@@ -136,6 +141,8 @@ async def connect_preferences(server_url: str) -> PreferenceConnection:
     initial_context = account_context(server_url)
     async with await open_preference_http(server_url) as http:
         snapshot = await read_preference_snapshot(http)
+        if expected_identity is not None and snapshot.identity != expected_identity:
+            raise ValueError("Host login does not match the requesting account and workspace")
         if account_context(server_url) != initial_context:
             raise ValueError("Login changed while connecting preferences; retry")
         from omnigent.host.identity import load_or_create_host_identity
@@ -149,8 +156,13 @@ async def connect_preferences(server_url: str) -> PreferenceConnection:
         )
         workspace = await asyncio.to_thread(connection.workspace)
         await _disk_call(workspace.client._accept_snapshot, snapshot)
-    save_global_config(
-        {"shared_preferences": {connection_key(server_url): connection.model_dump(mode="json")}},
-        deep_merge_keys=("shared_preferences",),
-    )
+    if persist:
+        save_global_config(
+            {
+                "shared_preferences": {
+                    connection_key(server_url): connection.model_dump(mode="json")
+                }
+            },
+            deep_merge_keys=("shared_preferences",),
+        )
     return connection

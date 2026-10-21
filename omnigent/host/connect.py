@@ -101,6 +101,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostPreferencesFrame,
+    HostPreferencesResultFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -5150,6 +5152,24 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await self._send_text(ws, encode_host_frame(skills_result))
+        elif isinstance(frame, HostPreferencesFrame):
+            from omnigent.host.preferences import control_preferences
+
+            try:
+                async with asyncio.timeout(12):
+                    result = await control_preferences(
+                        self._server_url, frame.identity, frame.control
+                    )
+                reply = HostPreferencesResultFrame(frame.request_id, result=result)
+            except Exception:  # noqa: BLE001 — do not disclose host files or credentials
+                reply = HostPreferencesResultFrame(
+                    frame.request_id,
+                    error=(
+                        "Preference action failed. "
+                        "Check this host's login, pending edits and connection, then retry."
+                    ),
+                )
+            await self._send_text(ws, encode_host_frame(reply))
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)
             await self._send_text(ws, encode_host_frame(plugins_result))

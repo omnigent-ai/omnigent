@@ -31,6 +31,12 @@ from pydantic import ValidationError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.preference_controls import (
+    PREFERENCE_CONTROL,
+    PreferenceControl,
+    PreferenceControlResult,
+)
+from omnigent.preference_sync import PreferenceNamespace
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -60,6 +66,7 @@ CAP_CODEX_SIDE_CHAT = "codex_side_chat"
 CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
+CAP_PREFERENCES = "preferences"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
@@ -70,6 +77,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PLUGINS,
+    CAP_PREFERENCES,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
     CAP_MCP_REGISTRY,
@@ -163,6 +171,8 @@ class HostFrameKind(str, Enum):
     MODEL_OPTIONS_RESULT = "host.model_options_result"
     SKILLS = "host.skills"
     SKILLS_RESULT = "host.skills_result"
+    PREFERENCES = "host.preferences"
+    PREFERENCES_RESULT = "host.preferences_result"
     PLUGINS = "host.plugins"
     PLUGINS_RESULT = "host.plugins_result"
     SKILL_CONTENT = "host.skill_content"
@@ -1118,6 +1128,22 @@ class HostMcpServersResultFrame:
 
 
 @dataclass
+class HostPreferencesFrame:
+    """Server → host: owner action bound to the authenticated namespace."""
+
+    request_id: str
+    identity: PreferenceNamespace
+    control: PreferenceControl
+
+
+@dataclass
+class HostPreferencesResultFrame:
+    request_id: str
+    result: PreferenceControlResult | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostPluginsFrame:
     """Server → host: list installed Claude plugins."""
 
@@ -1339,6 +1365,8 @@ HostFrame = (
     | HostModelOptionsResultFrame
     | HostSkillsFrame
     | HostSkillsResultFrame
+    | HostPreferencesFrame
+    | HostPreferencesResultFrame
     | HostPluginsFrame
     | HostPluginsResultFrame
     | HostSkillContentFrame
@@ -1781,6 +1809,24 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
                 "agent_id": frame.agent_id,
+            }
+        )
+    if isinstance(frame, HostPreferencesFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PREFERENCES.value,
+                "request_id": frame.request_id,
+                "identity": frame.identity.model_dump(mode="json"),
+                "control": frame.control.model_dump(mode="json"),
+            }
+        )
+    if isinstance(frame, HostPreferencesResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PREFERENCES_RESULT.value,
+                "request_id": frame.request_id,
+                "result": frame.result.model_dump(mode="json") if frame.result else None,
+                "error": frame.error,
             }
         )
     if isinstance(frame, HostPluginsFrame):
@@ -2262,6 +2308,22 @@ def _decode_known_host_frame(
             return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.MCP_SERVERS_RESULT:
             return _decode_mcp_servers_result(msg)
+        case HostFrameKind.PREFERENCES:
+            return HostPreferencesFrame(
+                request_id=_required_str(msg, "request_id"),
+                identity=PreferenceNamespace.model_validate(msg.get("identity")),
+                control=PREFERENCE_CONTROL.validate_python(msg.get("control")),
+            )
+        case HostFrameKind.PREFERENCES_RESULT:
+            try:
+                result = PreferenceControlResult.model_validate(msg.get("result"))
+            except ValidationError:
+                result = None
+            return HostPreferencesResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                result=result,
+                error=_optional_nullable_str(msg, "error"),
+            )
         case HostFrameKind.PLUGINS:
             return HostPluginsFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.PLUGINS_RESULT:

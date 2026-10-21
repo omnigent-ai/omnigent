@@ -38,6 +38,8 @@ Saved native arguments are applied once by the runner, including browser launche
   frozen handoff; reconnect retries pending edits with bounded jitter.
 - `shared-cli`: connect to an authenticated workspace, inspect shared/machine values,
   preview/apply an import or restore, retry edits and resolve conflicts.
+- `shared-host-controls`: inspect adoption without changing it, preview portable
+  host defaults, apply a reviewed import/restore, and set or remove machine overrides.
 - `shared-plugins`: import explicit native user toggles, apply installed plugins
   independently in concurrent sessions, and retain unavailable selections with warnings.
 - `shared-models`: apply the frozen model at native startup; retain an unavailable
@@ -95,6 +97,15 @@ new CLI sessions follow the workspace. An unused workspace requires an import or
 warning; a fresh machine offers Retry or `omnigent --temporary-preferences COMMAND`.
 A deployment can opt new machines into discovery with `OMNIGENT_SHARED_PREFERENCES=1`;
 the default is off. See the [startup guide](../docs/shared-preferences-startup.md).
+
+**Host preference controls:** on an opted-in server, an owner can call
+`POST /v1/hosts/{host_id}/preferences` with `status`, `connect`, `sync`,
+`preview_import`, `apply_import`, `preview_restore`, `set_machine`, or `discard`.
+Status and import preview do not adopt the machine. Import reads only portable
+user defaults and explicitly requested native plugin toggles. Older, disconnected
+or differently authenticated hosts report a failure. See the
+[host controls guide](../docs/shared-preferences-host-controls.md). Browser controls
+are the next integration surface; this route alone does not provide a settings UI.
 
 **Shared plugins:** add `--plugins claude --plugins codex` to the import preview
 to include explicit native user toggles. After adoption, native and SDK sessions use
@@ -206,9 +217,27 @@ managed-startup and per-harness availability journeys for each user entry point.
 uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reruns 0 -q -rs
 ```
 
-The CLI scenario also crosses separate command processes: connect, preview/apply
+The CLI/host scenario has two variants: separate CLI processes, and real HTTP
+through the server and host tunnel into a daemon with isolated config/cache.
+Both drive the same import/override/restore assertions. The host variant also
+checks status and preview leave adoption off and omit local commands.
+These scenarios cover: connect, preview/apply
 a portable YAML/native-plugin import, set/remove a machine override, and restore
 the import. Native toggles require the explicit `--plugins` options.
+
+**Host preference controls (component coverage):**
+
+```sh
+uv run --no-sync pytest tests/server/routes/test_preference_controls.py \
+  tests/host/test_preference_controls.py tests/host/test_frames.py \
+  tests/server/test_host_registry.py --reruns 0 -q
+```
+
+These checks cover ownership, authenticated identity, typed frame round trips,
+old hosts, disconnect/timeout cleanup, bounded requests and concurrent actions,
+invalid replies, and durable retry after an outage. The shared operations recipe
+above exercises the real server/host process boundary; no browser or managed
+credential broker is involved.
 
 **Shared plugins (own environment):**
 

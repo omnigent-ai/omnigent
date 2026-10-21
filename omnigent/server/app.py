@@ -4244,6 +4244,21 @@ def create_app(
             prefix="/v1",
             tags=["hosts"],
         )
+        if preference_store is not None:
+            from omnigent.server.routes.preference_controls import (
+                create_preference_controls_router,
+            )
+
+            app.include_router(
+                create_preference_controls_router(
+                    host_registry,
+                    host_store,
+                    preference_store,
+                    auth_provider=auth_provider,
+                ),
+                prefix="/v1",
+                tags=["preferences"],
+            )
         app.include_router(
             create_plugins_router(host_registry, host_store, auth_provider=auth_provider),
             prefix="/v1",
