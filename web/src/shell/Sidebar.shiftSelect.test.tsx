@@ -99,6 +99,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // reads as "not owned" (drives the mixed-ownership Delete-count assertion).
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
+  subscribeIdentity: () => () => {},
   getCurrentUserId: () => "viewer",
   resolveIdentity: () => Promise.resolve("viewer"),
 }));

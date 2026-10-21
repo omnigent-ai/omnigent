@@ -43,8 +43,24 @@ export interface HostPreferences {
   pending: PreferenceOperation[];
   preview: PreferencePreview | null;
   warning: string | null;
+  launch?: PreferenceLaunch | null;
+  defaults?: PreferenceDefaults | null;
+}
+export interface PreferenceLaunch {
+  protocol_version: 1;
+  shared: PreferenceSnapshot;
+  installation_id: string;
+  machine: PreferenceEntry[];
+  state: "current" | "cached";
+  warning: string | null;
+}
+export interface PreferenceDefaults {
+  model?: string | null;
+  opencode_model?: string | null;
+  default_harness?: string | null;
 }
 export type HostPreferenceAction =
+  | { action: "prepare"; workspace?: string }
   | { action: "status" | "connect" | "sync" | "preview_restore" }
   | { action: "preview_import"; plugins: ("claude" | "codex")[] }
   | { action: "apply_import"; preview: PreferencePreview }
@@ -77,7 +93,7 @@ export function preferenceValueLabel(value: PreferenceValue): string {
 
 // Pages depend on the preceding revision-bound cursor.
 /* eslint-disable no-await-in-loop */
-export async function readSharedPreferences(): Promise<PreferenceSnapshot> {
+export async function readSharedPreferences(signal?: AbortSignal): Promise<PreferenceSnapshot> {
   let snapshot: PreferenceSnapshot | undefined;
   let cursor: string | null = null;
   const cursors = new Set<string>();
@@ -86,6 +102,7 @@ export async function readSharedPreferences(): Promise<PreferenceSnapshot> {
   do {
     const response = await authenticatedFetch(
       `/v1/preferences/shared${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+      { signal },
     );
     if (!response.ok) throw await apiErrorFromResponse(response);
     const page = (await response.json()) as PreferenceSnapshot & { next_cursor: string | null };
@@ -135,11 +152,13 @@ export async function writeSharedPreference(
 export async function hostPreferenceAction(
   hostId: string,
   action: HostPreferenceAction,
+  signal?: AbortSignal,
 ): Promise<HostPreferences> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/preferences`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(action),
+    signal,
   });
   if (!response.ok) throw await apiErrorFromResponse(response);
   return response.json();

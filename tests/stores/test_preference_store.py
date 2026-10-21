@@ -341,8 +341,10 @@ def test_account_deletion_cleans_preferences_and_revokes_stale_write(store, db_u
 
 @pytest.mark.parametrize("limit", [1, 3, 100])
 def test_pages_cover_values_conflicts_and_tombstones(store, limit):
+    from omnigent.stores.preference_store import read_store_snapshot
+
     values = []
-    for index in range(7):
+    for index in range(107 if limit == 100 else 7):
         operation = mutation(
             store,
             key={
@@ -362,7 +364,7 @@ def test_pages_cover_values_conflicts_and_tombstones(store, limit):
     cursor = None
     while True:
         page = store.read(user_id="alice", limit=limit, cursor=cursor)
-        assert page.revision == 12
+        assert page.revision == len(values) + len(conflicts) + 1
         assert 0 < len(page.entries) + len(page.conflicts) <= limit
         entries.extend(page.entries)
         alternatives.extend(page.conflicts)
@@ -373,6 +375,10 @@ def test_pages_cover_values_conflicts_and_tombstones(store, limit):
         cursor = page.next_cursor
     assert entries == sorted(values, key=lambda entry: entry.key.storage_key())
     assert alternatives == sorted(conflicts, key=lambda operation: operation.operation_id.hex)
+    prepared = read_store_snapshot(store, "alice")
+    assert prepared.entries == entries
+    assert prepared.conflicts == alternatives
+    assert prepared.revision == page.revision
 
 
 def test_page_cursor_rejects_revision_or_identity_changes(store):

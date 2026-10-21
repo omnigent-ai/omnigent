@@ -36,7 +36,7 @@ from omnigent.preference_controls import (
     PreferenceControl,
     PreferenceControlResult,
 )
-from omnigent.preference_sync import PreferenceNamespace
+from omnigent.preference_sync import PreferenceNamespace, PreferenceSnapshot
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -67,6 +67,7 @@ CAP_MCP_INVENTORY = "mcp_inventory"
 CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_PREFERENCES = "preferences"
+CAP_PREFERENCE_PREPARE = "preference_prepare"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
@@ -78,6 +79,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_PLUGINS,
     CAP_PREFERENCES,
+    CAP_PREFERENCE_PREPARE,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
     CAP_MCP_REGISTRY,
@@ -1136,6 +1138,7 @@ class HostPreferencesFrame:
     request_id: str
     identity: PreferenceNamespace
     control: PreferenceControl
+    shared: PreferenceSnapshot | None = None
 
 
 @dataclass
@@ -1823,6 +1826,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "identity": frame.identity.model_dump(mode="json"),
                 "control": frame.control.model_dump(mode="json"),
+                "shared": frame.shared.model_dump(mode="json") if frame.shared else None,
             }
         )
     if isinstance(frame, HostPreferencesResultFrame):
@@ -2318,6 +2322,9 @@ def _decode_known_host_frame(
                 request_id=_required_str(msg, "request_id"),
                 identity=PreferenceNamespace.model_validate(msg.get("identity")),
                 control=PREFERENCE_CONTROL.validate_python(msg.get("control")),
+                shared=PreferenceSnapshot.model_validate(msg["shared"])
+                if msg.get("shared") is not None
+                else None,
             )
         case HostFrameKind.PREFERENCES_RESULT:
             try:

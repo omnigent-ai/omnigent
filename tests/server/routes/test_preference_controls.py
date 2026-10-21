@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_PREFERENCE_PREPARE,
     CAP_PREFERENCES,
     HostHelloFrame,
     HostPreferencesFrame,
@@ -56,7 +57,7 @@ def controls(db_uri):
             version="test",
             frame_protocol_version=1,
             name="machine",
-            capabilities=[CAP_PREFERENCES],
+            capabilities=[CAP_PREFERENCES, CAP_PREFERENCE_PREPARE],
         ),
         owner="owner",
     )
@@ -99,6 +100,7 @@ async def test_owner_controls_cross_typed_wire(controls, user, status):
     "failure",
     [
         "old_host",
+        "old_prepare_host",
         "disconnect",
         "timeout",
         "wrong_identity",
@@ -114,6 +116,10 @@ async def test_control_failures_preserve_context_and_cleanup(controls, monkeypat
     action = {"action": "status"}
     if failure == "old_host":
         connection.hello.capabilities.clear()
+        expected = 501
+    elif failure == "old_prepare_host":
+        connection.hello.capabilities.remove(CAP_PREFERENCE_PREPARE)
+        action = {"action": "prepare"}
         expected = 501
     elif failure == "timeout":
         monkeypatch.setattr(
@@ -157,4 +163,55 @@ async def test_control_failures_preserve_context_and_cleanup(controls, monkeypat
     assert response.status_code == expected, response.text
     assert "private-secret" not in response.text
     if failure != "busy":
+        assert not connection.pending_preferences
+
+
+@pytest.mark.parametrize("reply", ["valid", "missing", "changed"])
+async def test_prepare_binds_authoritative_snapshot_and_requires_ack(controls, reply):
+    from uuid import uuid4
+
+    from omnigent.preference_startup import PreferenceLaunch
+    from omnigent.preference_sync import PreferenceMutation, SharedPreferenceKey
+
+    app, _, connection, store = controls
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app), base_url="http://test"
+    ) as client:
+        headers = {"x-test-user": "owner"}
+        response = await client.post(URL, json={"action": "prepare"}, headers=headers)
+        assert response.status_code == 409
+        assert connection.outbound_queue.empty()
+        store.apply(
+            PreferenceMutation(
+                protocol_version=1,
+                identity=store.identity("owner"),
+                operation_id=uuid4(),
+                installation_id="source",
+                expected_version=0,
+                key=SharedPreferenceKey(kind="harness", name="default"),
+                value="pi-native",
+            ),
+            user_id="owner",
+        )
+        task = asyncio.create_task(client.post(URL, json={"action": "prepare"}, headers=headers))
+        frame = decode_host_frame(
+            (await asyncio.wait_for(connection.outbound_queue.get(), 2)).data
+        )
+        assert isinstance(frame, HostPreferencesFrame)
+        assert frame.shared.identity == store.identity("owner")
+        assert frame.shared.entries[0].value == "pi-native"
+        shared = (
+            frame.shared if reply != "changed" else frame.shared.model_copy(update={"entries": []})
+        )
+        result = PreferenceControlResult(
+            connected=True,
+            launch=None
+            if reply == "missing"
+            else PreferenceLaunch(shared=shared, installation_id=HOST, state="current"),
+        )
+        connection.pending_preferences[frame.request_id].set_result(
+            HostPreferencesResultFrame(frame.request_id, result)
+        )
+        response = await task
+        assert response.status_code == (200 if reply == "valid" else 502)
         assert not connection.pending_preferences

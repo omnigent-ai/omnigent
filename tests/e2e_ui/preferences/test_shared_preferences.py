@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -200,3 +201,97 @@ def test_settings_import_scopes_conflicts_and_restore(
                 json.loads((native / "settings.json").read_text())["enabledPlugins"]["review@team"]
                 is False
             )
+
+
+@pytest.mark.parametrize("width", [1280, 390])
+def test_composer_preserves_requested_choices_and_explicit_recovery(
+    page, built_spa, tmp_path, output_path, width
+):
+    page.set_viewport_size({"width": width, "height": 1000})
+    config = tmp_path / "server.yaml"
+    config.write_text("shared_preferences_authority_id: composer-preferences\n")
+    evidence = Path(output_path)
+    evidence.mkdir(parents=True, exist_ok=True)
+    with isolated_local_server(
+        tmp_path / "server", extra_args=("--config", str(config))
+    ) as server:
+        with (
+            httpx.Client(base_url=server, timeout=20, trust_env=False) as client,
+            isolated_host(
+                tmp_path / "host",
+                server,
+                name="Composer machine",
+                base_env={"PATH": os.environ["PATH"]},
+            ) as host,
+        ):
+            host.wait_online(client)
+            initial = client.get("/v1/preferences/shared").json()
+            for key, value in [
+                ({"kind": "harness", "name": "default"}, "pi-native"),
+                ({"kind": "model", "name": "model"}, "unavailable-saved-model"),
+                ({"kind": "harness_args", "name": "pi-native"}, []),
+                (
+                    {
+                        "kind": "plugin",
+                        "name": {"ecosystem": "claude", "source": "team", "name": "review"},
+                    },
+                    False,
+                ),
+            ]:
+                client.post(
+                    "/v1/preferences/shared/operations",
+                    json={
+                        "protocol_version": 1,
+                        "identity": initial["identity"],
+                        "operation_id": str(uuid4()),
+                        "installation_id": "source",
+                        "key": key,
+                        "value": value,
+                        "expected_version": 0,
+                    },
+                ).raise_for_status()
+            revision = client.get("/v1/preferences/shared").json()["revision"]
+            preparations = []
+
+            def record_request(request):
+                if request.method == "POST" and request.url.endswith("/preferences"):
+                    preparations.append(request.post_data_json)
+
+            page.on("request", record_request)
+            page.goto(server)
+            notice = page.get_by_test_id("new-session-preferences")
+            expect(notice).to_be_visible(timeout=30_000)
+            expect(notice).not_to_contain_text("Loading shared preferences", timeout=20_000)
+            expect(page.get_by_role("button", name=re.compile("^Pi")).first).to_be_visible()
+            expect(page.get_by_test_id("new-chat-landing-harness-fallback")).not_to_be_visible()
+            page.screenshot(path=str(evidence / f"composer-adopted-{width}.png"))
+            assert client.get("/v1/preferences/shared").json()["revision"] == revision
+            count = len(preparations)
+            page.get_by_test_id("new-chat-landing-input").fill("Do not send this draft")
+            page.wait_for_timeout(500)
+            assert len(preparations) == count
+
+            def unavailable(route):
+                route.abort("failed")
+
+            page.route("**/v1/hosts/*/preferences", unavailable)
+            page.reload()
+            expect(page.get_by_role("button", name="Retry preferences", exact=True)).to_be_visible(
+                timeout=15_000
+            )
+            expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+            page.screenshot(path=str(evidence / f"composer-recovery-{width}.png"))
+            page.unroute("**/v1/hosts/*/preferences", unavailable)
+            page.get_by_role("button", name="Retry preferences", exact=True).click()
+            expect(
+                page.get_by_role("button", name="Use temporary defaults", exact=True)
+            ).not_to_be_visible(timeout=15_000)
+            expect(page.get_by_role("button", name=re.compile("^Pi")).first).to_be_visible()
+            page.route("**/v1/hosts/*/preferences", unavailable)
+            page.reload()
+            page.get_by_role("button", name="Use temporary defaults", exact=True).click(
+                timeout=15_000
+            )
+            expect(notice).to_contain_text("Temporary defaults for this session")
+            page.screenshot(path=str(evidence / f"composer-temporary-{width}.png"))
+            assert client.get("/v1/preferences/shared").json()["revision"] == revision

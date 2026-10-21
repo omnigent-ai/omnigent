@@ -62,6 +62,7 @@ const REPO = "/Users/corey/projects/alpha";
 // screen stays mounted; only the param changes).
 let searchParams = new URLSearchParams("project=Alpha");
 vi.mock("@/lib/routing", () => ({
+  Link: ({ children, to }: { children: ReactNode; to: string }) => <a href={to}>{children}</a>,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -72,6 +73,7 @@ vi.mock("@/store/chatStore", () => ({
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
+  subscribeIdentity: () => () => {},
   getCurrentUserId: vi.fn(() => null),
   resolveIdentity: vi.fn(async () => null),
 }));
@@ -178,8 +180,12 @@ function setRepoIsGit(): void {
   });
 }
 
-function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+function renderLanding(sharedPreferences = false): {
+  rerender: (ui: ReactNode) => void;
+  unmount: () => void;
+} {
   const info: ServerInfo = {
+    shared_preferences: sharedPreferences,
     accounts_enabled: false,
     single_user: false,
     login_url: null,
@@ -1125,5 +1131,175 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();
+  });
+});
+
+describe("adopted new-session preferences", () => {
+  const launch = {
+    protocol_version: 1,
+    installation_id: "host_1",
+    state: "current",
+    warning: null,
+    shared: {
+      identity: { authority_id: "test", user_id: "alice", workspace_id: "workspace" },
+      revision: 1,
+      entries: [],
+      conflicts: [],
+    },
+    machine: [],
+  };
+  function configure(defaults: { model: string; default_harness: string }) {
+    searchParams = new URLSearchParams();
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent({
+          id: "ag_claude",
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+        agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi", harness: "pi-native" }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "requested", displayName: "Requested" },
+        { id: "alternative", displayName: "Alternative" },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (String(url).endsWith("/preferences"))
+        return Response.json({ connected: true, launch, defaults });
+      return Response.json({ id: "created" });
+    });
+  }
+  it("uses the requested harness and carries the prepared snapshot without publishing", async () => {
+    configure({ model: "requested", default_harness: "pi-native" });
+    localStorage.setItem("omnigent:last-agent-id", "ag_claude");
+    renderLanding(true);
+    await screen.findByText("Following shared preferences for this workspace.");
+    expect(screen.getByRole("button", { name: /^Pi/ })).toBeVisible();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(
+        vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url) === "/v1/sessions"),
+      ).toBe(true),
+    );
+    const call = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.find(([url]) => String(url) === "/v1/sessions")!;
+    const body = JSON.parse(call[1]!.body as string);
+    expect(body.agent_id).toBe("ag_pi");
+    expect(body.model_override).toBe("requested");
+    expect(body.preference_snapshot).toEqual(launch);
+    expect(body.labels?.["omnigent.preferences.temporary"]).toBeUndefined();
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).includes("/operations")),
+    ).toBe(false);
+  });
+  it("keeps project choices ahead of workspace defaults", async () => {
+    configure({ model: "requested", default_harness: "pi-native" });
+    searchParams = new URLSearchParams("project=Alpha");
+    setProjectConfig({
+      host_id: "host_1",
+      workspace: REPO,
+      agent_id: "ag_claude",
+      model: "alternative",
+    });
+    renderLanding(true);
+    await screen.findByText("Following shared preferences for this workspace.");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Claude Code/);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(
+        vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url) === "/v1/sessions"),
+      ).toBe(true),
+    );
+    const call = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.find(([url]) => String(url) === "/v1/sessions")!;
+    const body = JSON.parse(call[1]!.body as string);
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.agent_id).toBeUndefined();
+    expect(body.model_override).toBe("alternative");
+    expect(body.preference_snapshot).toEqual(launch);
+  });
+  it("keeps an explicit session model after loading shared defaults", async () => {
+    configure({ model: "requested", default_harness: "claude-native" });
+    const { unmount } = renderLanding(true);
+    await screen.findByText("Following shared preferences for this workspace.");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-ag_claude"));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternative" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    unmount();
+    renderLanding(true);
+    await screen.findByText("Following shared preferences for this workspace.");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(
+        vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url) === "/v1/sessions"),
+      ).toBe(true),
+    );
+    const call = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.find(([url]) => String(url) === "/v1/sessions")!;
+    const body = JSON.parse(call[1]!.body as string);
+    expect(body.model_override).toBe("alternative");
+    expect(body.preference_snapshot).toEqual(launch);
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).includes("/operations")),
+    ).toBe(false);
+  });
+  it.each([
+    {
+      model: "missing-model",
+      default_harness: "pi-native",
+      text: "Selected model missing-model is unavailable",
+    },
+    {
+      model: "requested",
+      default_harness: "missing-harness",
+      text: "Saved harness missing-harness is unavailable",
+    },
+  ])("preserves an unavailable choice: $text", async ({ text, ...defaults }) => {
+    configure(defaults);
+    renderLanding(true);
+    await screen.findByText(new RegExp(text));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.queryByTestId("new-chat-landing-harness-fallback")).toBeNull();
+  });
+  it("requires an explicit temporary choice after a preparation failure", async () => {
+    configure({ model: "requested", default_harness: "pi-native" });
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      if (String(url).endsWith("/preferences")) throw new Error("offline");
+      return Response.json({ id: "created" });
+    });
+    renderLanding(true);
+    await screen.findByText("offline");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "hello" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Use temporary defaults" }));
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(
+        vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url) === "/v1/sessions"),
+      ).toBe(true),
+    );
+    const call = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.find(([url]) => String(url) === "/v1/sessions")!;
+    const body = JSON.parse(call[1]!.body as string);
+    expect(body.preference_snapshot).toBeUndefined();
+    expect(body.labels["omnigent.preferences.temporary"]).toBe("true");
   });
 });

@@ -92,7 +92,7 @@ function PreferenceControls({ host }: { host?: Host }) {
   const hostKey = ["host-preferences", serverIdentity, user, host?.host_id];
   const shared = useQuery({
     queryKey: sharedKey,
-    queryFn: readSharedPreferences,
+    queryFn: () => readSharedPreferences(),
     staleTime: Infinity,
     refetchOnMount: "always",
     refetchOnWindowFocus: false,

@@ -5161,7 +5161,7 @@ class HostProcess:
             try:
                 async with asyncio.timeout(12):
                     result = await control_preferences(
-                        self._server_url, frame.identity, frame.control
+                        self._server_url, frame.identity, frame.control, shared=frame.shared
                     )
                 reply = HostPreferencesResultFrame(frame.request_id, result=result)
             except Exception:  # noqa: BLE001 — do not disclose host files or credentials

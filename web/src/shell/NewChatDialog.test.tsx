@@ -175,6 +175,7 @@ describe("ComposerAddMenu", () => {
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   authenticatedFetch: vi.fn(),
+  subscribeIdentity: () => () => {},
   getCurrentUserId: vi.fn(() => null),
   resolveIdentity: vi.fn(async () => null),
 }));

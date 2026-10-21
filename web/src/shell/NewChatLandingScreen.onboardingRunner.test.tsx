@@ -52,6 +52,7 @@ vi.mock("@/lib/routing", () => ({
 vi.mock("@/store/chatStore", () => ({ setPendingInitialPrompt: vi.fn() }));
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
+  subscribeIdentity: () => () => {},
   getCurrentUserId: vi.fn(() => null),
   resolveIdentity: vi.fn(async () => null),
 }));

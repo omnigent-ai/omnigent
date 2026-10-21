@@ -70,3 +70,67 @@ async def test_host_checks_authenticated_identity_before_adopting(tmp_path, monk
     with pytest.raises(ValueError, match="login changed"):
         await control(alice, action="status")
     assert (await control(alice, action="connect")).connected
+
+
+async def test_prepare_uses_owner_snapshot_without_copying_login(tmp_path, monkeypatch, db_uri):
+    from uuid import uuid4
+
+    from omnigent.preference_connection import PreferenceConnection
+    from omnigent.preference_sync import PreferenceMutation, PreferenceSnapshot
+    from omnigent.stores.preference_store import read_store_snapshot
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="prepare")
+    identity = store.identity("alice")
+    store.apply(
+        PreferenceMutation(
+            protocol_version=1,
+            identity=identity,
+            operation_id=uuid4(),
+            installation_id="source",
+            key=SharedPreferenceKey(kind="model", name="model"),
+            expected_version=0,
+            value="shared",
+        ),
+        user_id="alice",
+    )
+    shared = read_store_snapshot(store, "alice")
+    project = tmp_path / "project"
+    (project / ".omnigent").mkdir(parents=True)
+    (project / ".omnigent/config.yaml").write_text(
+        "model: project\nharness:\n  default: pi-native\n"
+    )
+    save_global_config({"model": "legacy", "api_key": "private"})
+    from omnigent.host.identity import load_or_create_host_identity
+
+    load_or_create_host_identity()
+    original = load_global_config()
+
+    async def no_credentials(*args, **kwargs):
+        pytest.fail("Preparing through an owner tunnel must not request user credentials")
+
+    monkeypatch.setattr("omnigent.host.preferences.open_preference_http", no_credentials)
+    action = PREFERENCE_CONTROL.validate_python({"action": "prepare", "workspace": str(project)})
+    prepared = await control_preferences("http://server", identity, action, shared=shared)
+    assert prepared.launch.shared == shared
+    assert prepared.defaults.model == "project"
+    assert prepared.defaults.default_harness == "pi-native"
+    assert load_global_config() == original
+    assert "private" not in prepared.model_dump_json()
+    workspace = PreferenceConnection(
+        server_url="http://server",
+        identity=identity,
+        installation_id=prepared.launch.installation_id,
+    ).workspace()
+    workspace.set_machine(SharedPreferenceKey(kind="model", name="model"), "machine")
+    plain = PREFERENCE_CONTROL.validate_python({"action": "prepare"})
+    prepared = await control_preferences("http://server", identity, plain, shared=shared)
+    assert prepared.defaults.model == "machine"
+    assert prepared.launch.machine[0].value == "machine"
+    with pytest.raises(ValueError, match="Choose shared defaults"):
+        await control_preferences("http://server", store.identity("bob"), plain, shared=shared)
+    with pytest.raises(ValueError, match="Choose shared defaults"):
+        await control_preferences(
+            "http://server", identity, plain, shared=PreferenceSnapshot(identity=identity)
+        )

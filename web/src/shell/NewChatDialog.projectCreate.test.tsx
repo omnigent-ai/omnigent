@@ -80,6 +80,7 @@ vi.mock("@/store/chatStore", () => ({
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
+  subscribeIdentity: () => () => {},
   getCurrentUserId: vi.fn(() => null),
   resolveIdentity: vi.fn(async () => null),
 }));

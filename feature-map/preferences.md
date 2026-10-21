@@ -5,8 +5,9 @@ and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
 and an opt-in server API for durable edits and conflicts. Explicit shared/machine scope controls and import previews are available through
 the CLI and Settings → Shared preferences. Connected CLI launches and user-owned
-hosts consume saved choices at startup; browser launch selection and managed
-startup remain separate integration work. Pending edits
+hosts consume saved choices at startup. New-session composers prepare the selected
+host’s defaults once, preserve unavailable choices, and offer explicit recovery.
+Managed deployment wiring remains separate integration work. Pending edits
 retry on host reconnect without polling between messages.
 Claude/Codex native and SDK sessions also apply plugin toggles in private settings.
 Native startup applies adopted model defaults and retains known-unavailable choices.
@@ -44,6 +45,9 @@ Saved native arguments are applied once by the runner, including browser launche
   preview/apply an import or restore, retry edits and resolve conflicts.
 - `shared-browser`: review/import all four groups, edit shared or machine values,
   remove overrides, resolve conflicts and safely retry uncertain saves in Settings.
+- `shared-composer`: prepare defaults once per account/target; project and explicit
+  choices win. Keep unavailable choices, retry a failed load or explicitly start
+  with temporary defaults; carry the prepared snapshot into JSON/bundle creates.
 - `shared-host-controls`: inspect adoption without changing it, preview portable
   host defaults, apply a reviewed import/restore, and set or remove machine overrides.
 - `shared-plugins`: import explicit native user toggles, apply installed plugins
@@ -95,7 +99,7 @@ resolves only the named conflict. `discard UUID` abandons the first pending edit
 Use `import SOURCE.yaml > plan.json`, review that file, then `apply plan.json`.
 `restore > undo.json` previews undoing the most recent import; review and apply it
 in the same way. The [CLI guide](../docs/shared-preferences-workflows.md) covers
-key spelling, scopes and recovery. Browser controls remain unavailable.
+key spelling, scopes and recovery. Settings provides the same explicit scope and import controls.
 
 **Shared startup:** after `preferences connect` and the first explicit import/edit,
 new CLI sessions follow the workspace. An unused workspace requires an import or
@@ -113,8 +117,18 @@ Competing edits show accepted and proposed values for an explicit choice. Merely
 opening Settings, previewing or changing a session picker never publishes defaults.
 The section is available only when the server advertises shared-preference support.
 
+**New-session defaults:** on a server advertising shared preferences, open a new
+session and choose a connected machine or managed target. Existing workspace
+choices apply automatically; an unused workspace links to the one-time choice in
+Settings. Machine preparation uses the authenticated owner tunnel and reads project
+YAML without copying user credentials. No CLI offline profile is created by this
+operation. Project and explicit session choices take priority. Unavailable Pi,
+harnesses and models remain requested. A five-second wait offers Retry or explicit
+temporary defaults; typing messages and reconnecting an existing session do not
+refresh defaults. The exact launch is included in JSON and uploaded-bundle creates.
+
 **Host preference controls:** on an opted-in server, an owner can call
-`POST /v1/hosts/{host_id}/preferences` with `status`, `connect`, `sync`,
+`POST /v1/hosts/{host_id}/preferences` with `prepare`, `status`, `connect`, `sync`,
 `preview_import`, `apply_import`, `preview_restore`, `set_machine`, or `discard`.
 Status and import preview do not adopt the machine. Import reads only portable
 user defaults and explicitly requested native plugin toggles. Older, disconnected
@@ -257,6 +271,23 @@ checks status and preview leave adoption off and omit local commands.
 These scenarios cover: connect, preview/apply
 a portable YAML/native-plugin import, set/remove a machine override, and restore
 the import. Native toggles require the explicit `--plugins` options.
+
+**New-session preparation and recovery:**
+
+```sh
+NODE_OPTIONS=--no-experimental-webstorage pnpm --filter web exec vitest run src/hooks/useNewSessionPreferences.test.tsx src/shell/NewChatDialog.projectPrefill.test.tsx
+pnpm --filter web run build
+uv run --no-sync pytest tests/e2e_ui/preferences/test_shared_preferences.py::test_composer_preserves_requested_choices_and_explicit_recovery --ui-skip-build --reruns 0 -q --video=on
+```
+
+Desktop and mobile browser clicks use a real server and host to preserve an
+unavailable Pi choice, verify no preference writes or refresh on message typing,
+and recover from an injected transport failure via Retry or temporary defaults.
+No session is submitted in this browser scenario. Component tests cover exact
+JSON create metadata, project/explicit precedence, unavailable choices, bounded
+wait and account changes. The saved-session real-process recipe above obtains its
+snapshot through the actual preparation route, then creates and resumes on two
+hosts with scripted model replies. No live vendor or managed runtime is covered.
 
 **Shared browser settings (own environment):**
 

@@ -397,8 +397,6 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, su
 
 def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_llm_server_url):
     """Real server → two independent hosts → runner init; deterministic provider only."""
-    from omnigent.preference_startup import PreferenceLaunch
-    from omnigent.preference_sync import PreferenceNamespace, PreferenceSnapshot
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from tests._helpers.host import isolated_host
     from tests._helpers.polling import poll_until
@@ -432,36 +430,12 @@ def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_l
                 "value": model,
             }
             client.post("/v1/preferences/shared/operations", json=operation).raise_for_status()
-            page = client.get("/v1/preferences/shared").json()
-            launch = PreferenceLaunch(
-                shared=PreferenceSnapshot(
-                    identity=PreferenceNamespace(**identity),
-                    revision=page["revision"],
-                    entries=page["entries"],
-                ),
-                installation_id="original-machine",
-                state="current",
-            )
-            snapshot = launch.model_dump(mode="json")
-            created = post_session_bundle(
-                client.post, "/v1/sessions", bundle, metadata={"preference_snapshot": snapshot}
-            )
-            assert created.status_code == 201, created.text
-            session_id = created.json()["session_id"]
-            client.post(
-                "/v1/preferences/shared/operations",
-                json={
-                    **operation,
-                    "operation_id": str(uuid4()),
-                    "expected_version": 1,
-                    "value": "later-default",
-                },
-            ).raise_for_status()
             host_env = {
                 "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
                 "OPENAI_API_KEY": "mock-key",
                 "OMNIGENT_SHARED_PREFERENCES": "1",
             }
+            session_id = ""
             for name in ("original", "replacement"):
                 reply = f"{name} runner used the saved session"
                 configure_mock_llm(mock_llm_server_url, [{"text": reply}], key=model)
@@ -479,6 +453,31 @@ def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_l
                         ).raise_for_status()
                     workspace = host.home / "workspace"
                     workspace.mkdir()
+                    if name == "original":
+                        prepared = client.post(
+                            f"/v1/hosts/{host.host_id}/preferences",
+                            json={"action": "prepare", "workspace": str(workspace)},
+                        )
+                        assert prepared.status_code == 200, prepared.text
+                        snapshot = prepared.json()["launch"]
+                        assert prepared.json()["defaults"]["model"] == model
+                        created = post_session_bundle(
+                            client.post,
+                            "/v1/sessions",
+                            bundle,
+                            metadata={"preference_snapshot": snapshot},
+                        )
+                        assert created.status_code == 201, created.text
+                        session_id = created.json()["session_id"]
+                        client.post(
+                            "/v1/preferences/shared/operations",
+                            json={
+                                **operation,
+                                "operation_id": str(uuid4()),
+                                "expected_version": 1,
+                                "value": "later-default",
+                            },
+                        ).raise_for_status()
                     response = client.post(
                         f"/v1/hosts/{host.host_id}/runners",
                         json={"session_id": session_id, "workspace": str(workspace)},
@@ -510,9 +509,9 @@ def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_l
                     ).raise_for_status()
                     last = {}
 
-                    def answered(expected=reply):
+                    def answered(expected=reply, saved_session=session_id):
                         nonlocal last
-                        last = client.get(f"/v1/sessions/{session_id}").json()
+                        last = client.get(f"/v1/sessions/{saved_session}").json()
                         return last.get("status") == "failed" or expected in json.dumps(
                             last.get("items", [])
                         )

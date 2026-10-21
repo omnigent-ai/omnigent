@@ -148,6 +148,7 @@ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
 // to revoke.
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
+  subscribeIdentity: () => () => {},
   getCurrentUserId: () => mocks.viewerId,
   resolveIdentity: () => Promise.resolve(mocks.viewerId),
 }));

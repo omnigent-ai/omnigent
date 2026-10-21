@@ -235,6 +235,7 @@ import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
   nativeCodingAgentForAvailableAgent,
+  nativeCodingAgentForHarness,
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import {
@@ -256,6 +257,7 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
+import { useNewSessionPreferences } from "@/hooks/useNewSessionPreferences";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
@@ -2099,6 +2101,8 @@ interface LandingDraft {
   devinPermissionMode: string;
   pickedHarness: string | null;
   pickedModel: string;
+  agentExplicitlySelected: boolean;
+  modelExplicitlySelected: boolean;
   pickedEffort: string;
   costControlMode: CostControlMode;
   // Whether the agent / workspace slots still hold an untouched project-config
@@ -2282,6 +2286,8 @@ export function NewChatLandingScreen() {
       : {
           ...landingDraft,
           pickedAgentId: null,
+          agentExplicitlySelected: false,
+          modelExplicitlySelected: false,
           pickedHarness: null,
           selectedHostId: null,
           sandboxSelected: false,
@@ -2395,7 +2401,8 @@ export function NewChatLandingScreen() {
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(
     () => restoredDraft?.pickedAgentId ?? (projectParam !== "" ? null : readLastAgentId()),
   );
-  const agentExplicitlySelectedRef = useRef(false);
+  const agentExplicitlySelectedRef = useRef(restoredDraft?.agentExplicitlySelected ?? false);
+  const userPickedModelRef = useRef(restoredDraft?.modelExplicitlySelected ?? false);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(
     () => restoredDraft?.selectedHostId ?? null,
   );
@@ -2518,6 +2525,11 @@ export function NewChatLandingScreen() {
   const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
   const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const sessionPreferences = useNewSessionPreferences(
+    selectedHostId,
+    sandboxSelected,
+    workspace.trim(),
+  );
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2685,6 +2697,8 @@ export function NewChatLandingScreen() {
     pickedModel,
     pickedEffort,
     costControlMode,
+    agentExplicitlySelected: sessionPreferences.enabled && agentExplicitlySelectedRef.current,
+    modelExplicitlySelected: sessionPreferences.enabled && userPickedModelRef.current,
     agentFromConfig: agentFromConfigRef.current,
     workspaceFromConfig: workspaceFromConfigRef.current,
   };
@@ -2806,6 +2820,7 @@ export function NewChatLandingScreen() {
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
+    if (projectChanged) userPickedModelRef.current = false;
     setWorkspace("");
     setBranchName("");
     setAutoSeededBranch("");
@@ -3079,7 +3094,22 @@ export function NewChatLandingScreen() {
       ),
     [harnessEntries, harnessWarningHost, rememberedNativeAgent?.harness],
   );
+  const sharedHarness =
+    !agentExplicitlySelectedRef.current && prefillConfig?.agentId == null
+      ? sessionPreferences.defaults?.default_harness
+      : null;
+  const sharedHarnessAgent = sharedHarness
+    ? harnessEntries.find(
+        (agent) =>
+          agent.harness === sharedHarness ||
+          (nativeCodingAgentForHarness(sharedHarness) != null &&
+            nativeCodingAgentForAvailableAgent(agent)?.key ===
+              nativeCodingAgentForHarness(sharedHarness)?.key),
+      )
+    : undefined;
+  const sharedHarnessUnavailable = !!sharedHarness && !sharedHarnessAgent;
   const automaticHarnessFallback =
+    !sessionPreferences.launch &&
     projectParam === "" &&
     !sandboxSelected &&
     !agentExplicitlySelectedRef.current &&
@@ -3098,7 +3128,13 @@ export function NewChatLandingScreen() {
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
             : (agentList[0]?.id ?? null);
-  const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
+  const effectiveAgentId = sharedHarness
+    ? (sharedHarnessAgent?.id ?? null)
+    : sessionPreferences.launch &&
+        !agentExplicitlySelectedRef.current &&
+        prefillConfig?.agentId == null
+      ? (agentList[0]?.id ?? null)
+      : (automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId);
   const selectedAgent = useMemo(
     () =>
       effectiveAgentId === PENDING_AGENT_ID && pendingAgent
@@ -4095,7 +4131,6 @@ export function NewChatLandingScreen() {
   // (via the model picker). Once set, an async project-config arrival or
   // cache refresh must not reseed the project default over the user's choice;
   // an agent switch starts a fresh visit and re-arms the seed.
-  const userPickedModelRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
@@ -4116,6 +4151,14 @@ export function NewChatLandingScreen() {
       : prefillConfig === undefined && cachedPickerOptions?.agent.id === effectiveAgentId
         ? cachedPickerOptions.model
         : null;
+  const adoptedDefaultModel =
+    sessionPreferences.launch && selectedNativeHarness
+      ? (projectDefaultModel ??
+        (selectedNativeHarness === "opencode-native"
+          ? (sessionPreferences.defaults?.opencode_model ?? sessionPreferences.defaults?.model)
+          : sessionPreferences.defaults?.model) ??
+        null)
+      : null;
   // The same default validated against the selected harness's current vocab.
   // An unknown/retired stored id must behave as "no project default": the
   // model seed falls back to the remembered pick, and the remembered-routing
@@ -4253,6 +4296,9 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
+    if (sessionPreferences.launch && !userPickedModelRef.current) {
+      setPickedModel(adoptedDefaultModel ?? "");
+    }
     // Reseed on harness changes, when the selected host's catalog resolves,
     // and when the project's configured default model settles (its config
     // loads async, so the first run may see it as null); capability flags are
@@ -4265,6 +4311,8 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    adoptedDefaultModel,
+    sessionPreferences.launch,
   ]);
   useEffect(() => {
     if (!sandboxDefaultModelsEnabled || !previewHarness) return;
@@ -4278,7 +4326,11 @@ export function NewChatLandingScreen() {
         ? projectDefaultModel
         : saved.model;
     const model = sandboxCatalog?.find((row) => row.id === candidate);
-    setPickedModel(model?.id ?? "");
+    setPickedModel(
+      sessionPreferences.launch && !userPickedModelRef.current
+        ? (adoptedDefaultModel ?? "")
+        : (model?.id ?? ""),
+    );
     setPickedEffort(
       saved.effort &&
         codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id).includes(saved.effort)
@@ -4292,15 +4344,23 @@ export function NewChatLandingScreen() {
     sandboxCatalog,
     pickerEdits,
     projectDefaultModel,
+    adoptedDefaultModel,
+    sessionPreferences.launch,
     setPickedModel,
   ]);
   useEffect(() => {
-    if (!sandboxInferenceConfigured || sandboxModels.data?.status !== "ready") return;
+    if (
+      sessionPreferences.launch ||
+      !sandboxInferenceConfigured ||
+      sandboxModels.data?.status !== "ready"
+    )
+      return;
     if (pickedModel && !sandboxCatalog?.some((row) => row.id === pickedModel)) {
       setPickedModel("");
       setPickedEffort("");
     }
   }, [
+    sessionPreferences.launch,
     sandboxInferenceConfigured,
     sandboxModels.data?.configuration_revision,
     sandboxModels.data?.status,
@@ -4324,7 +4384,11 @@ export function NewChatLandingScreen() {
     // remembered routing "on" must not re-enter routing and clear it (the
     // setter drops the model pick when routing turns on). An invalid stored
     // id never seeds a pin, so it must not suppress the remembered routing.
-    if (projectDefaultModelValid != null && !userPickedModelRef.current) return;
+    if (
+      (sessionPreferences.launch || projectDefaultModelValid != null) &&
+      !userPickedModelRef.current
+    )
+      return;
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
@@ -4337,6 +4401,7 @@ export function NewChatLandingScreen() {
     effectiveAgentId,
     autoRoutingSelected,
     projectDefaultModelValid,
+    sessionPreferences.launch,
     setCostControlMode,
     pickerEdits,
   ]);
@@ -4993,7 +5058,19 @@ export function NewChatLandingScreen() {
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
+  const adoptedSelectionError = sharedHarnessUnavailable
+    ? `Saved harness ${sharedHarness} is unavailable. Your default is unchanged; choose a harness for this session or fix its setup.`
+    : sessionPreferences.launch &&
+        pickedModel &&
+        pickerModelOptions.length > 0 &&
+        !pickerModelOptions.some(
+          (option) => option.id === pickedModel || option.model === pickedModel,
+        )
+      ? `Selected model ${pickedModel} is unavailable. Your default is unchanged; choose a model for this session or fix its provider.`
+      : null;
   const canSubmit =
+    !sessionPreferences.blocked &&
+    adoptedSelectionError === null &&
     (message.trim().length > 0 || files.length > 0) &&
     !mcpAuthorizing &&
     mcpSelectionError === null &&
@@ -5013,29 +5090,31 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : mcpAuthorizing || mcpSelectionError
-      ? (mcpSelectionError ?? "Finish signing in to the MCP service…")
-      : pendingSkillCompletion
-        ? "Loading skills…"
-        : pickerLoading || workspaceStartLoading || worktreeRequestPending
-          ? "Loading session configuration…"
-          : pickerSelectionError || sandboxCatalogError
-            ? (pickerSelectionError ?? sandboxCatalogError)
-            : sandboxSelected && sandboxRepoOverCap
-              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                  maxSandboxRepos === 1 ? "repository" : "repositories"
-                } — remove the extras`
-              : sandboxSelected && !sandboxRepoValid
-                ? "Please enter a valid repository URL"
-                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                  ? "Selected host is unavailable. Reconnect it or choose another host."
-                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                    ? "Please choose a host and working directory"
-                    : configuredAgentUnavailable && selectedAgent == null
-                      ? "This project's configured agent is unavailable — pick an agent to continue"
-                      : message.trim().length === 0 && files.length === 0
-                        ? "Enter a message to get started"
-                        : null;
+    : sessionPreferences.blocked || adoptedSelectionError
+      ? (sessionPreferences.error ?? adoptedSelectionError ?? "Loading shared preferences…")
+      : mcpAuthorizing || mcpSelectionError
+        ? (mcpSelectionError ?? "Finish signing in to the MCP service…")
+        : pendingSkillCompletion
+          ? "Loading skills…"
+          : pickerLoading || workspaceStartLoading || worktreeRequestPending
+            ? "Loading session configuration…"
+            : pickerSelectionError || sandboxCatalogError
+              ? (pickerSelectionError ?? sandboxCatalogError)
+              : sandboxSelected && sandboxRepoOverCap
+                ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                    maxSandboxRepos === 1 ? "repository" : "repositories"
+                  } — remove the extras`
+                : sandboxSelected && !sandboxRepoValid
+                  ? "Please enter a valid repository URL"
+                  : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                    ? "Selected host is unavailable. Reconnect it or choose another host."
+                    : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                      ? "Please choose a host and working directory"
+                      : configuredAgentUnavailable && selectedAgent == null
+                        ? "This project's configured agent is unavailable — pick an agent to continue"
+                        : message.trim().length === 0 && files.length === 0
+                          ? "Enter a message to get started"
+                          : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5122,9 +5201,11 @@ export function NewChatLandingScreen() {
     ? SMART_ROUTING_LABEL
     : selectedAgent
       ? selectedAgent.display_name
-      : configuredAgentUnavailable
-        ? "Agent unavailable"
-        : "Select agent";
+      : sharedHarnessUnavailable
+        ? sharedHarness!
+        : configuredAgentUnavailable
+          ? "Agent unavailable"
+          : "Select agent";
   // Rows for the trigger's hover tooltip: the pick itself plus its model /
   // effort / connection summary — the same union the session composer's pill
   // tooltip shows. Rows only render for native-harness picks (a Model/Effort
@@ -5505,7 +5586,7 @@ export function NewChatLandingScreen() {
       // SAME way here — otherwise Create would send a combo Devin no longer
       // offers while the picker showed a different one.
       const submittedModel =
-        fusionSelected && pickerFusion !== undefined
+        !sessionPreferences.launch && fusionSelected && pickerFusion !== undefined
           ? currentFusionCombo(pickerFusion, fusionModelUid).modelUid
           : pickedModel;
       const normalizedModelOverride =
@@ -5591,14 +5672,16 @@ export function NewChatLandingScreen() {
       // "Sessions" section while the search-indexed session list catches up to
       // the move. A `project_id` create needs no label: the row is born with
       // first-class membership (and a label would go stale on project rename).
-      const createLabels =
-        selectedProject && createProjectId === null
+      const createLabels = {
+        ...(sessionPreferences.temporary ? { "omnigent.preferences.temporary": "true" } : {}),
+        ...(selectedProject && createProjectId === null
           ? {
               ...(baseLabels ?? {}),
               [PROJECT_LABEL_KEY]: selectedProject,
               ...composerContextLabels,
             }
-          : { ...(baseLabels ?? {}), ...composerContextLabels };
+          : { ...(baseLabels ?? {}), ...composerContextLabels }),
+      };
 
       const skill = isNativeTerminalAgent
         ? null
@@ -5620,7 +5703,10 @@ export function NewChatLandingScreen() {
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agents upload their bundle with the session, then launch on the host below.
         const bundle = await buildAgentBundle(pendingAgent);
-        const metadata: Record<string, unknown> = { labels: createLabels };
+        const metadata: Record<string, unknown> = {
+          labels: createLabels,
+          ...(sessionPreferences.launch ? { preference_snapshot: sessionPreferences.launch } : {}),
+        };
         if (mcpServicesForLaunch.length) {
           metadata.mcp_registry_services = mcpServicesForLaunch;
         }
@@ -5694,6 +5780,7 @@ export function NewChatLandingScreen() {
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createPayload = JSON.stringify({
+          ...(sessionPreferences.launch ? { preference_snapshot: sessionPreferences.launch } : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
           // server default-fills it from the project config.
@@ -7235,6 +7322,43 @@ export function NewChatLandingScreen() {
               launch, so submitting surfaces a specific error if it
               really can't run. Normal-flow directly under the composer
               (like the createError line below) so it reads as part of it. */}
+          {sessionPreferences.enabled && (
+            <div className="space-y-2 text-sm" data-testid="new-session-preferences">
+              <p role={sessionPreferences.error || adoptedSelectionError ? "alert" : "status"}>
+                {sessionPreferences.error ??
+                  adoptedSelectionError ??
+                  (sessionPreferences.temporary
+                    ? "Temporary defaults for this session. Shared defaults are unchanged."
+                    : sessionPreferences.blocked
+                      ? "Loading shared preferences…"
+                      : (sessionPreferences.launch?.warning ??
+                        "Following shared preferences for this workspace."))}
+              </p>
+              <div className="flex flex-wrap gap-3">
+                {(sessionPreferences.error || sessionPreferences.temporary) && (
+                  <button type="button" className="underline" onClick={sessionPreferences.retry}>
+                    Retry preferences
+                  </button>
+                )}
+                {sessionPreferences.error && (
+                  <button
+                    type="button"
+                    className="underline"
+                    onClick={sessionPreferences.useTemporary}
+                  >
+                    Use temporary defaults
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => navigate("/settings/preferences")}
+                >
+                  Review shared defaults
+                </button>
+              </div>
+            </div>
+          )}
           {selectedAgentUnconfigured && (
             <HarnessSetupNotice
               agentName={selectedAgent?.display_name}
