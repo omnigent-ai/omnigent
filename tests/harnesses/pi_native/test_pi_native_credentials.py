@@ -813,8 +813,8 @@ def test_to_models_config_shape() -> None:
 
 
 def test_to_models_config_attributes_unity_gateway_providers() -> None:
-    """Gateway providers name Pi and Omnigent (plus ucode for ucode's own headers)."""
-    ucode_provider: creds._PiProviderPayload = {
+    """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    ug_provider: creds._PiProviderPayload = {
         "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
         "apiKey": "!get-token",
         "api": "openai-responses",
@@ -834,7 +834,7 @@ def test_to_models_config_attributes_unity_gateway_providers() -> None:
         model="system.ai.claude-sonnet-5",
         api_key="!get-token",
         auth_header=True,
-        additional_providers={"ucode-openai": ucode_provider, "other": other_provider},
+        additional_providers={"ug-openai": ug_provider, "other": other_provider},
     )
 
     providers = provider.to_models_config()["providers"]
@@ -843,14 +843,14 @@ def test_to_models_config_attributes_unity_gateway_providers() -> None:
         "Databricks-Custom-Coding-Agent": "pi",
         "Databricks-Custom-Client-Surfaces": "omnigent",
     }
-    assert providers["ucode-openai"]["headers"] == {
+    assert providers["ug-openai"]["headers"] == {
         "User-Agent": "ucode/0.1.0 pi/0.80.0",
         "Databricks-Custom-Coding-Agent": "pi",
         "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
     assert "headers" not in providers["other"]
     # The configured payload is shared across renders, so it stays unstamped.
-    assert ucode_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
+    assert ug_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:

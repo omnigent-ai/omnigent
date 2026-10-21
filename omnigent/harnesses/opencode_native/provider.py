@@ -169,7 +169,7 @@ def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, obje
     """
     Add usage-attribution headers to each model of a Unity Gateway provider.
 
-    Per-model ``headers`` are where ucode puts its own: OpenCode merges them
+    Per-model ``headers`` are where ug puts its own: OpenCode merges them
     last, after its built-in ``User-Agent``.
 
     :param config: An ``opencode.json`` dict; it is not modified.

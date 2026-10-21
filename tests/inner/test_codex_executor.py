@@ -4557,7 +4557,7 @@ def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouc
 def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     tmp_path: Path,
 ) -> None:
-    """Unity Gateway providers name Codex and Omnigent (plus ucode for its own table)."""
+    """Unity Gateway providers name Codex and Omnigent (plus ug for its own table)."""
     import tomllib
 
     from omnigent.inner.codex_executor import (

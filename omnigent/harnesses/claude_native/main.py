@@ -3371,7 +3371,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     model = _connect_broker_default_model()
-    adopted_ucode_route = False
+    adopted_ug_route = False
 
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -3394,7 +3394,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 if k in _CONNECT_BROKER_UCODE_ENV_ALLOWLIST
             }
             env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
-            adopted_ucode_route = True
+            adopted_ug_route = True
             # The served model is adopted only alongside a trusted (guarded) base
             # URL; a model with no/off-host URL falls back to the catalog default
             # rather than trusting a half-validated state entry.
@@ -3409,7 +3409,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
         env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
         CLAUDE_CODE_AGENT,
-        via_ug=adopted_ucode_route,
+        via_ug=adopted_ug_route,
     )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)

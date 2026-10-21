@@ -11693,7 +11693,7 @@ def test_connect_fallback_prefers_ucode_state(
     # ucode's base URL + discovered model win over the hand-built defaults.
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
     assert config.model == "system.ai.claude-sonnet-4-6"
-    # ucode's own header lines survive, and the route is attributed to it.
+    # ug's own header lines survive, and the route is attributed to it.
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "User-Agent: ucode/0.1.0 claude/2.1.0",
         "Databricks-Custom-Coding-Agent: claude-code",

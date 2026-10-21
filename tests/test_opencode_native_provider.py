@@ -131,7 +131,7 @@ def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
 
 
 def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -> None:
-    """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ucode)."""
+    """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
     config = {
         "provider": {
             "databricks": {
