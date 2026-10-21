@@ -383,7 +383,12 @@ def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
     _wire(
         monkeypatch,
         launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="databricks"),
+        host=SimpleNamespace(
+            user_id="alice",
+            sandbox_attached=False,
+            sandbox_id="sbx1",
+            sandbox_provider="databricks",
+        ),
     )
     managed_host_keepalive._sandbox_config.owner_credentials = {  # type: ignore[union-attr]
         "databricks": lambda user: seen.append(user)
