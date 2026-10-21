@@ -23,6 +23,8 @@ DEPENDENCY_SCOPES = {
     "sdks/python-client/pyproject.toml": "python",
     "sdks/ui/pyproject.toml": "python",
     "integrations/slack/pyproject.toml": "python",
+    "integrations/discord/pyproject.toml": "python",
+    "integrations/bot-core/pyproject.toml": "python",
     "pnpm-lock.yaml": "javascript",
     "pnpm-workspace.yaml": "javascript",
     "package.json": "javascript",
@@ -57,6 +59,8 @@ DEPENDENCY_GROUPS = {
     "spec-llms",
     "databricks",
     "slack",
+    "discord",
+    "bot-core",
     "tools",
     "inner-rest",
 }

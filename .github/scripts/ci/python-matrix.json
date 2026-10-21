@@ -75,5 +75,15 @@
     "group": "slack",
     "paths": "integrations/slack/tests",
     "extra": "slack"
+  },
+  {
+    "group": "discord",
+    "paths": "integrations/discord/tests",
+    "extra": "discord"
+  },
+  {
+    "group": "bot-core",
+    "paths": "integrations/bot-core/tests",
+    "extra": "discord"
   }
 ]

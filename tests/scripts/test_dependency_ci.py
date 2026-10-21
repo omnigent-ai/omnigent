@@ -173,7 +173,8 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     assert selection["dependency"] == "false"
     assert selection["ui"] == "full"
     assert selection["database"] == "true"
-    assert len(json.loads(selection["python_matrix"])["include"]) == 16
+    all_lanes = json.loads(Path(scope_module.__file__).with_name("python-matrix.json").read_text())
+    assert json.loads(selection["python_matrix"])["include"] == all_lanes
 
 
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
