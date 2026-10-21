@@ -13,6 +13,7 @@ import re
 import subprocess
 import zipfile
 import zlib
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from pathlib import Path
 from urllib.parse import urlencode
@@ -196,6 +197,24 @@ def require_merge_ready(repository: str, candidate: dict, mode: str) -> None:
         return
     if mode == "merge":
         require_current_candidate(repository, candidate["number"], candidate)
+        query = urlencode(
+            {
+                "event": "workflow_dispatch",
+                "created": ">=" + (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                "per_page": 100,
+            }
+        )
+        runs = gh_json(
+            ["api", f"repos/{repository}/actions/workflows/merge-ready.yml/runs?{query}"]
+        )
+        require(runs["total_count"] <= 100, "Readiness refresh history is incomplete")
+        title = f"Merge Ready #{candidate['number']} ({head})"
+        attempts = [run for run in runs["workflow_runs"] if run["display_title"] == title]
+        require(
+            all(run["status"] == "completed" for run in attempts),
+            "Merge Ready refresh is already running",
+        )
+        require(len(attempts) < 3, "Merge Ready refresh limit reached for this head in 24 hours")
         # Cooldown expiry and registry recovery do not emit workflow events.
         subprocess.run(
             [

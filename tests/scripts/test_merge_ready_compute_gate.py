@@ -17,6 +17,8 @@ def _run(
     eval_outcome: str = "failure",
     failed: str = FAILED,
     dependency_outcome: str = "success",
+    dependency_required: str = "true",
+    post_red: str = "false",
 ) -> dict[str, str]:
     """Run compute-gate.sh with the given env and parse its GITHUB_OUTPUT.
 
@@ -32,6 +34,8 @@ def _run(
             "EVAL": eval_outcome,
             "FAILED": failed,
             "DEPENDENCY_EVAL": dependency_outcome,
+            "DEPENDENCY_REQUIRED": dependency_required,
+            "POST_RED": post_red,
             "GITHUB_OUTPUT": str(out_file),
         }
     )
@@ -94,3 +98,33 @@ def test_dependency_evidence_must_succeed_even_when_ci_is_green(tmp_path: Path) 
         out = _run(tmp_path, eval_outcome="success", dependency_outcome=outcome)
         assert out["state"] == "failure"
         assert "Dependency policy/reports" in out["long_desc"]
+
+
+def test_unneeded_dependency_evaluation_does_not_change_ci_outcome(tmp_path: Path) -> None:
+    for outcome in ("failure", "skipped", "cancelled", ""):
+        out = _run(
+            tmp_path,
+            eval_outcome="success",
+            dependency_outcome=outcome,
+            dependency_required="false",
+        )
+        assert out["state"] == "success"
+        assert out["post_status"] == "true"
+
+
+def test_red_status_posts_only_for_opt_in_or_dependency_failure(tmp_path: Path) -> None:
+    for post_red in ("true", "false"):
+        for dependency_required in ("true", "false"):
+            for outcome in ("success", "failure", "skipped"):
+                out = _run(
+                    tmp_path,
+                    eval_outcome="failure",
+                    dependency_outcome=outcome,
+                    dependency_required=dependency_required,
+                    post_red=post_red,
+                )
+                expected = post_red == "true" or (
+                    dependency_required == "true" and outcome != "success"
+                )
+                assert out["state"] == "failure"
+                assert (out["post_status"] == "true") == expected

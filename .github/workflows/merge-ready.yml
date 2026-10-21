@@ -1,4 +1,5 @@
 name: Merge Ready
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Merge Ready #{0} ({1})', inputs.pr, inputs.sha) || '' }}"
 
 # Posts the "Merge Ready" commit status on the PR head SHA -- the single
 # readiness branch-protection check, separate from Maintainer Approval.
@@ -196,10 +197,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
+          DEPENDABOT_AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'report' }}
         run: |
           PULL=$(gh api "repos/$REPO/pulls/$PR")
           NAMES=$(jq -r '.labels[].name' <<<"$PULL")
-          echo "dependabot=$(jq -r '.user.login == "dependabot[bot]"' <<<"$PULL")" >> "$GITHUB_OUTPUT"
+          AUTHOR=$(jq -r '.user.login' <<<"$PULL")
+          if [[ "$AUTHOR" == 'dependabot[bot]' && "$DEPENDABOT_AUTOMERGE_MODE" == 'merge' ]]; then
+            echo "dependency_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependency_required=false" >> "$GITHUB_OUTPUT"
+          fi
           if echo "$NAMES" | grep -qx "automerge"; then
             echo "automerge=true" >> "$GITHUB_OUTPUT"
           else
@@ -237,7 +244,7 @@ jobs:
 
       - name: Install trusted policy parser
         id: parser
-        if: steps.ctx.outputs.skip != 'true' && steps.labels.outputs.dependabot == 'true'
+        if: steps.ctx.outputs.skip != 'true' && steps.labels.outputs.dependency_required == 'true'
         continue-on-error: true
         run: |
           python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
@@ -248,7 +255,7 @@ jobs:
         id: dependency
         if: >-
           steps.ctx.outputs.skip != 'true' &&
-          (steps.labels.outputs.dependabot != 'true' || steps.parser.outcome == 'success')
+          steps.labels.outputs.dependency_required == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -272,6 +279,8 @@ jobs:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
           DEPENDENCY_EVAL: ${{ steps.dependency.outcome }}
+          DEPENDENCY_REQUIRED: ${{ steps.labels.outputs.dependency_required }}
+          POST_RED: ${{ steps.eligible.outputs.post_red }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
       # Dependency failures always revoke an earlier green status, including
@@ -280,11 +289,7 @@ jobs:
         if: >-
           steps.ctx.outputs.skip != 'true' &&
           steps.eligible.outputs.run == 'true' &&
-          (
-            steps.eligible.outputs.post_red == 'true' ||
-            steps.dependency.outcome != 'success' ||
-            steps.gate.outputs.state == 'success'
-          )
+          steps.gate.outputs.post_status == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO:     ${{ github.repository }}

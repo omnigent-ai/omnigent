@@ -236,6 +236,8 @@ elif args[:3] == ['api', '--method', 'POST']:
 elif args[0] == 'api':
     assert os.environ['GH_TOKEN'] == 'test-only'
     endpoint = args[1]
+    if endpoint.endswith('/pulls/123') and data.get('pull_api_exit'):
+        sys.exit(data['pull_api_exit'])
     if '/artifacts/' in endpoint and endpoint.endswith('/zip'):
         count = sum(json.loads(line) == args
                     for line in (root / 'calls.jsonl').read_text().splitlines())
@@ -252,7 +254,13 @@ elif args[0] == 'api':
     else:
         if '/check-runs?' in endpoint:
             endpoint = parse_qs(urlsplit(endpoint).query)['check_name'][0]
-        value = data['routes'][endpoint]
+        if '/merge-ready.yml/runs?' in endpoint:
+            query = parse_qs(urlsplit(endpoint).query)
+            assert query['event'] == ['workflow_dispatch']
+            assert query['created'][0].startswith('>=')
+            value = data.get('readiness_dispatches', {'total_count': 0, 'workflow_runs': []})
+        else:
+            value = data['routes'][endpoint]
         if endpoint.endswith('/pulls/123') and 'pull_after' in data:
             count = sum(json.loads(line) == args
                         for line in (root / 'calls.jsonl').read_text().splitlines())
@@ -270,8 +278,14 @@ else:
     )
     gh.chmod(0o755)
     (tmp_path / "sitecustomize.py").write_text("""
-import io, json, os, urllib.request
+import io, json, os, sys, urllib.request
 from pathlib import Path
+if json.loads((Path(os.environ['PILOT_FIXTURES']) / 'api.json').read_text()).get('parser_missing'):
+    class MissingParser:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == 'yaml':
+                raise ModuleNotFoundError('simulated unavailable PyYAML')
+    sys.meta_path.insert(0, MissingParser())
 def fixture_urlopen(url, timeout):
     url = getattr(url, "full_url", url)
     root = Path(os.environ['PILOT_FIXTURES'])
@@ -323,8 +337,33 @@ urllib.request.urlopen = fixture_urlopen
         EXPECTED_HEAD=HEAD,
         SHA=HEAD,
     )
-    process = subprocess.run(args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=90)
     if readiness:
+        labels = next(s for s in steps if s.get("id") == "labels")
+        label_outputs = tmp_path / "label-outputs"
+        process = subprocess.run(
+            ["bash", "-e", "-c", labels["run"]],
+            cwd=ROOT,
+            env=dict(env, GITHUB_OUTPUT=str(label_outputs)),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        labels_succeeded = process.returncode == 0
+        if labels_succeeded:
+            context = dict(line.split("=", 1) for line in label_outputs.read_text().splitlines())
+            if context["dependency_required"] == "true":
+                process = subprocess.run(
+                    args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=90
+                )
+            else:
+                process = subprocess.CompletedProcess(
+                    args, 0, "Dependency reports not applicable\n", ""
+                )
+    else:
+        process = subprocess.run(
+            args, cwd=ROOT, env=env, text=True, capture_output=True, timeout=90
+        )
+    if readiness and labels_succeeded:
         gate_outputs = tmp_path / "gate-outputs"
         gate = next(s for s in steps if s.get("id") == "gate")
         result = subprocess.run(
@@ -334,7 +373,11 @@ urllib.request.urlopen = fixture_urlopen
                 env,
                 EVAL=api.get("ci_eval", "success"),
                 FAILED="CI failure",
-                DEPENDENCY_EVAL="success" if process.returncode == 0 else "failure",
+                DEPENDENCY_EVAL=("success" if process.returncode == 0 else "failure")
+                if context["dependency_required"] == "true"
+                else "skipped",
+                DEPENDENCY_REQUIRED=context["dependency_required"],
+                POST_RED=api.get("post_red", "false"),
                 GITHUB_OUTPUT=str(gate_outputs),
             ),
             text=True,
@@ -345,14 +388,15 @@ urllib.request.urlopen = fixture_urlopen
             line.split("=", 1) for line in gate_outputs.read_text().splitlines() if "=" in line
         )
         post = next(s for s in steps if s["name"] == "Post Merge Ready status on PR head SHA")
-        subprocess.run(
-            ["bash", "-e", "-c", post["run"]],
-            cwd=ROOT,
-            env=dict(env, STATE=outputs["state"], DESC=outputs["short_desc"]),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
+        if outputs["post_status"] == "true":
+            subprocess.run(
+                ["bash", "-e", "-c", post["run"]],
+                cwd=ROOT,
+                env=dict(env, STATE=outputs["state"], DESC=outputs["short_desc"]),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
         process = subprocess.CompletedProcess(
             process.args, process.returncode, process.stdout + result.stdout, process.stderr
         )
@@ -446,7 +490,7 @@ def test_merge_mode_never_falls_back_to_workflow_token(tmp_path, api):
 @pytest.mark.parametrize("entry", ["merge", "approval", "readiness"])
 def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change, entry):
     api["pull_after"] = copy.deepcopy(api["routes"][f"{PREFIX}/pulls/123"])
-    api["pull_after_reads"] = 1 if entry == "merge" else 2
+    api["pull_after_reads"] = {"merge": 1, "approval": 2, "readiness": 3}[entry]
     if change == "head":
         api["pull_after"]["head"]["sha"] = "c" * 40
     elif change == "main":
@@ -496,8 +540,12 @@ def test_real_approval_entry_point_preserves_review_unless_pilot_enabled(
         api["pypi_timeout"] = True
     process, calls = run_cli(tmp_path, api, mode=mode, approval=True)
     assert process.returncode == expected, process.stdout + process.stderr
-    if expected:
-        assert "awaiting approval" in process.stdout or "requires human review" in process.stdout
+    expected_message = {
+        "hold": "A hold or scan-waiver label is present",
+        "timestamp": "Registry timestamp has no timezone",
+        "timeout": "simulated PyPI timeout",
+    }.get(fault, "awaiting approval from a maintainer" if expected else "policy satisfied")
+    assert expected_message in process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
 
@@ -1609,10 +1657,13 @@ def test_manual_dependency_review_uses_existing_approval_rules(tmp_path, api, en
     api["routes"][f"{PREFIX}/pulls/123"]["labels"] = [{"name": "skip-security-scan"}]
     api["pypi_timeout"] = True
     api["ci_eval"] = "failure"
+    api["post_red"] = "true"
     process, calls = run_cli(
         tmp_path, api, mode=mode, approval=entry == "approval", readiness=entry == "readiness"
     )
-    assert process.returncode == (0 if review == "current" else 1), process.stdout
+    automatic_evidence_required = entry == "approval" or mode == "merge"
+    expected = 1 if automatic_evidence_required and review != "current" else 0
+    assert process.returncode == expected, process.stdout
     assert not (tmp_path / "pypi-called").exists()
     if entry == "readiness":
         # A human can waive the automatic policy, but cannot waive required CI.
@@ -1688,15 +1739,120 @@ def test_dependency_readiness_workflow_covers_evidence_and_authorization_events(
     gate = next(s for s in steps if s.get("id") == "gate")
     assert gate["env"]["DEPENDENCY_EVAL"] == "${{ steps.dependency.outcome }}"
     post = next(s for s in steps if s["name"] == "Post Merge Ready status on PR head SHA")
-    assert "steps.dependency.outcome != 'success'" in post["if"]
+    assert "steps.gate.outputs.post_status == 'true'" in post["if"]
+    dependency = next(s for s in steps if s.get("id") == "dependency")
+    assert "steps.labels.outputs.dependency_required == 'true'" in dependency["if"]
+    assert "parser.outcome" not in dependency["if"]
     approval_workflow = yaml.safe_load(
         (ROOT / ".github/workflows/maintainer-approval.yml").read_text()
     )
     assert approval_workflow["jobs"]["approve"]["permissions"]["statuses"] == "write"
     approval_step = approval_workflow["jobs"]["approve"]["steps"][-1]
+    for parser_step in (
+        next(s for s in steps if s.get("id") == "parser"),
+        next(
+            s
+            for s in approval_workflow["jobs"]["approve"]["steps"]
+            if s.get("name") == "Install trusted policy parser"
+        ),
+    ):
+        assert parser_step["continue-on-error"]
     evidence_step = next(s for s in steps if s.get("id") == "dependency")
     for flag in [
         "--trusted-author 'omni-resolve-agent[bot]'",
         "--trusted-successor 'omni-resolve-agent[bot]'",
     ]:
         assert flag in approval_step["run"] and flag in evidence_step["run"]
+
+
+@pytest.mark.parametrize("entry", ["approval", "readiness"])
+@pytest.mark.parametrize("review", [True, False])
+def test_missing_parser_preserves_manual_readiness_and_denies_automatic_exemption(
+    tmp_path, api, review, entry
+):
+    api["parser_missing"] = True
+    if review:
+        api["routes"][f"{PREFIX}/pulls/123/reviews?per_page=100&page=1"] = [
+            {"user": {"login": "maintainer"}, "state": "APPROVED", "commit_id": HEAD}
+        ]
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", readiness=entry == "readiness", approval=entry == "approval"
+    )
+    assert process.returncode == (0 if review else 1), process.stdout + process.stderr
+    if entry == "readiness":
+        assert ("state=success" if review else "state=failure") in calls[-1]
+    else:
+        assert not any("state=pending" in call for call in calls)
+    assert (
+        "Current head approved" if review else "simulated unavailable PyYAML"
+    ) in process.stdout
+    assert not (tmp_path / "pypi-called").exists()
+
+
+@pytest.mark.parametrize("author,mode", [("contributor", "merge"), ("dependabot[bot]", "report")])
+@pytest.mark.parametrize("fault", ["ci_red", "api_failure"])
+def test_ordinary_and_report_mode_readiness_do_not_post_incidental_failures(
+    tmp_path, api, author, mode, fault
+):
+    api["routes"][f"{PREFIX}/pulls/123"]["user"]["login"] = author
+    api["ci_eval"] = "failure"
+    if fault == "api_failure":
+        api["pull_api_exit"] = 1
+    process, calls = run_cli(tmp_path, api, mode=mode, readiness=True)
+    assert process.returncode == (1 if fault == "api_failure" else 0), process.stderr
+    assert calls == [["api", f"{PREFIX}/pulls/123"]]
+    assert not (tmp_path / "pypi-called").exists()
+
+
+@pytest.mark.parametrize("post_red", ["true", "false"])
+def test_successful_dependency_evidence_preserves_existing_ci_posting_policy(
+    tmp_path, api, post_red
+):
+    api["ci_eval"] = "failure"
+    api["post_red"] = post_red
+    process, calls = run_cli(tmp_path, api, mode="merge", readiness=True)
+    assert process.returncode == 0, process.stdout + process.stderr
+    posts = [c for c in calls if c[:2] == ["api", f"{PREFIX}/statuses/{HEAD}"]]
+    assert len(posts) == (1 if post_red == "true" else 0)
+    if posts:
+        assert "state=failure" in posts[0]
+
+
+@pytest.mark.parametrize(
+    "condition", ["running", "limit", "available", "other_pr", "other_head", "incomplete"]
+)
+def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition):
+    api["routes"][f"{PREFIX}/commits/{HEAD}/statuses?per_page=100&page=1"] = []
+    title = f"Merge Ready #123 ({HEAD})"
+    if condition == "other_pr":
+        title = f"Merge Ready #456 ({HEAD})"
+    elif condition == "other_head":
+        title = f"Merge Ready #123 ({BASE})"
+    runs = [{"display_title": title, "status": "completed"} for _ in range(3)]
+    if condition == "running":
+        runs = [{"display_title": title, "status": "in_progress"}]
+    elif condition == "available":
+        runs = runs[:2]
+    api["readiness_dispatches"] = {
+        "total_count": 101 if condition == "incomplete" else len(runs),
+        "workflow_runs": runs,
+    }
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(c[:2] == ["workflow", "run"] for c in calls) == (
+        condition in {"available", "other_pr", "other_head"}
+    )
+    reason = {
+        "running": "refresh is already running",
+        "limit": "refresh limit reached",
+        "incomplete": "refresh history is incomplete",
+    }.get(condition, "Waiting for successful Merge Ready")
+    assert reason in process.stdout
+    assert not any(c[:2] == ["pr", "merge"] for c in calls)
+    workflow = yaml.safe_load((ROOT / ".github/workflows/dependabot-automerge.yml").read_text())
+    mint_token = next(
+        s for s in workflow["jobs"]["evaluate"]["steps"] if s.get("id") == "merge-token"
+    )
+    assert mint_token["with"]["permission-actions"] == "write"
+    readiness = yaml.safe_load((ROOT / ".github/workflows/merge-ready.yml").read_text())
+    assert "format('Merge Ready #{0} ({1})', inputs.pr, inputs.sha)" in readiness["run-name"]

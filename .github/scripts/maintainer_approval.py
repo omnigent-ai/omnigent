@@ -236,6 +236,9 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.check_dependency_reports and os.environ.get("DEPENDABOT_AUTOMERGE_MODE") != "merge":
+        print("Automatic dependency reports do not apply in report mode.")
+        return 0
     pull = gh_json(["api", f"repos/{args.repository}/pulls/{args.pr_number}"])
     if args.check_dependency_reports:
         if (pull.get("user") or {}).get("login") != "dependabot[bot]":
@@ -267,9 +270,9 @@ def main() -> int:
         os.environ.get("DEPENDABOT_AUTOMERGE_MODE") == "merge"
         and (pull.get("user") or {}).get("login") == "dependabot[bot]"
     ):
-        from dependabot_automerge import evaluate, require_current_candidate, require_reports
-
         try:
+            from dependabot_automerge import evaluate, require_current_candidate, require_reports
+
             candidate = evaluate(
                 args.repository,
                 args.pr_number,
@@ -298,7 +301,14 @@ def main() -> int:
                     check=True,
                     stdout=subprocess.DEVNULL,
                 )
-        except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as exc:
+        except (
+            ImportError,
+            ValueError,
+            KeyError,
+            TypeError,
+            OSError,
+            subprocess.CalledProcessError,
+        ) as exc:
             print(f"Dependabot update requires human review or retry: {exc}")
             return 1
         else:
