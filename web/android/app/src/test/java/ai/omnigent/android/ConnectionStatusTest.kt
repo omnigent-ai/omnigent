@@ -65,6 +65,17 @@ class ConnectionStatusTest {
         assertEquals(UnreachableKind.OFFLINE, unreachableKind(validated = false, tls = false))
         assertEquals(UnreachableKind.TLS, unreachableKind(validated = false, tls = true))
         assertEquals("ERROR_CONNECT", connectionErrorName(-6))
+        assertEquals(
+            "net::ERR_CONNECTION_REFUSED (ERROR_CONNECT)",
+            webViewErrorName(-6, "net::ERR_CONNECTION_REFUSED"),
+        )
+        for (description in listOf(
+            "net::ERR_FOO?x=1",
+            "https://example.com/net::ERR_CONNECTION_REFUSED",
+            "net::ERR_${"A".repeat(65)}",
+        )) {
+            assertEquals("ERROR_CONNECT", webViewErrorName(-6, description))
+        }
     }
 
     @Test
@@ -76,6 +87,26 @@ class ConnectionStatusTest {
         )
         assertEquals("ConnectException", failureClassName(java.net.ConnectException(privateUrl)))
         assertEquals("IOException", failureClassName(java.io.IOException(privateUrl)))
+        assertEquals(
+            "NetworkUnavailable",
+            failureClassName(OidcSignInException.Network(privateUrl)),
+        )
+        val workspaceFailures =
+            listOf(
+                DatabricksSessionException.InvalidResponse() to "InvalidResponse",
+                DatabricksSessionException.UnsafeRedirect() to "UnsafeRedirect",
+                DatabricksSessionException.WorkspaceChanged() to "WorkspaceChanged",
+                DatabricksSessionException.UnsafeCookie() to "UnsafeCookie",
+                DatabricksSessionException.MissingCookie() to "MissingCookie",
+                DatabricksSessionException.UnexpectedLanding() to "UnexpectedLanding",
+                DatabricksSessionException.NetworkUnavailable() to "NetworkUnavailable",
+                DatabricksSessionException.Rejected(403) to "Rejected",
+                DatabricksSessionException.WorkspaceRequired() to "WorkspaceRequired",
+                DatabricksSessionException.UnsupportedWebView() to "UnsupportedWebView",
+            )
+        for ((failure, label) in workspaceFailures) {
+            assertEquals(label, failureClassName(failure))
+        }
         assertEquals("ERROR_UNKNOWN", failureClassName(IllegalStateException(privateUrl)))
     }
 
