@@ -2443,7 +2443,7 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize(
-    "scenario", ["reconnect", "expired", "host_back_without_runner", "host_online"]
+    "scenario", ["reconnect", "expired", "host_back_without_runner", "unreadable", "host_online"]
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
     tunnel_three_layer_stack: _TunnelStack,
@@ -2454,26 +2454,32 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
     A sleeping laptop takes its runner along and resumes the turn on wake, so
     the turn fails only when the hold expires or the host returns without its
-    runner. A host that stayed online fails the turn at the grace, as before.
+    runner. An unreadable host row mid-hold keeps holding. A host that stayed
+    online fails the turn at the grace, as before.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
 
     ap_app = tunnel_three_layer_stack.ap_app
     grace = 0.2
-    hold = 30.0 if scenario in ("reconnect", "host_back_without_runner") else 0.6
+    hold = 1.0 if scenario == "expired" else 30.0
     monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
     monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 0.05)
     _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
     host_checks: list[str] = []
+    # What the host row reads: offline, back online, or unreadable.
+    host_row: list[bool | None] = [scenario != "host_online"]
 
-    async def scripted_host_row_offline(host_store: object, host_id: str) -> bool:
+    async def scripted_host_row_offline(host_store: object, host_id: str) -> bool | None:
         host_checks.append(host_id)
-        if scenario == "host_online":
-            return False
-        # The host returns on its third check in the host-back scenario.
-        return not (scenario == "host_back_without_runner" and len(host_checks) > 2)
+        return host_row[0]
+
+    async def _host_checked(times: int) -> None:
+        # The hold re-checks the host every HOST_OFFLINE_RECHECK_S.
+        target = len(host_checks) + times
+        while len(host_checks) < target:
+            await asyncio.sleep(0.01)
 
     monkeypatch.setattr(sessions_module, "_host_row_offline", scripted_host_row_offline)
 
@@ -2510,12 +2516,19 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         if scenario == "host_online":
             await asyncio.wait_for(_failed(), timeout=budget(5.0))
             return
-        # Well past the grace, the turn is held rather than failed.
-        await asyncio.sleep(grace * 2)
+        # Past the grace and re-checking the host, the turn is held rather than failed.
+        await asyncio.wait_for(_host_checked(3), timeout=budget(5.0))
         assert sessions_module._session_status_cache.get(session_id) == "running"
         assert host_checks[0] == host_id
 
-        if scenario == "reconnect":
+        if scenario == "unreadable":
+            # Re-checks that can't read the host row outlast the grace twice over.
+            host_row[0] = None
+            await asyncio.wait_for(_host_checked(10), timeout=budget(5.0))
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+        if scenario == "host_back_without_runner":
+            host_row[0] = False
+        if scenario in ("reconnect", "unreadable"):
             reconnect = await _connect_runner_tunnel(ap_app, runner_id)
             await _send_hello_and_wait(
                 reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]

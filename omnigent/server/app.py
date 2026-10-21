@@ -3669,16 +3669,23 @@ def create_app(
             )
         await _mark_runner_sessions_offline(affected, error, conversation_store)
 
-    async def _session_host_offline(conv: "Conversation") -> bool:
-        """Whether *conv*'s user-run host is disconnected from every replica."""
+    async def _routing_host_id(convs: "list[Conversation]") -> str | None:
+        """Return the host *convs*' shared runner runs on, or ``None`` when unknown."""
         from omnigent.runner.routing import routing_host_id
+
+        own = next((conv.host_id for conv in convs if conv.host_id is not None), None)
+        if own is not None or not convs:
+            return own
+        try:
+            return await asyncio.to_thread(routing_host_id, convs[0], conversation_store)
+        except Exception:  # noqa: BLE001 — an unreadable ancestor leaves the host unknown
+            _logger.warning("Host lookup failed for session=%s", convs[0].id, exc_info=True)
+            return None
+
+    async def _host_offline(host_id: str | None) -> bool | None:
+        """Whether a user-run host is gone from every replica; ``None`` when unreadable."""
         from omnigent.server.routes.sessions import _host_row_offline
 
-        try:
-            host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
-        except Exception:  # noqa: BLE001 — an unreadable ancestor leaves the host unknown
-            _logger.warning("Host lookup failed for session=%s", conv.id, exc_info=True)
-            return False
         if host_id is None or host_registry.get(host_id) is not None:
             return False
         return await _host_row_offline(host_store, host_id)
@@ -3710,7 +3717,8 @@ def create_app(
             if conv.id not in _intentional_stop_sessions
             and _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES
         ]
-        if not held or not await _session_host_offline(held[0]):
+        host_id = await _routing_host_id(held)
+        if not held or await _host_offline(host_id) is not True:
             return None
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -3726,6 +3734,7 @@ def create_app(
                     "runner_disconnect_held_host_offline",
                     session_id=conv.id,
                     runner_id=runner_id,
+                    host_id=host_id,
                     hold_s=HOST_OFFLINE_HOLD_S,
                 ),
             )
@@ -3746,7 +3755,8 @@ def create_app(
                 if shutdown_state.server_shutting_down():
                     outcome = "server_shutdown"
                     break
-                if not host_back and not await _session_host_offline(held[0]):
+                # An unreadable host row keeps holding; only a live one ends it early.
+                if not host_back and await _host_offline(host_id) is False:
                     # The host is back; give its runner one more grace to follow.
                     host_back = True
                     deadline = min(deadline, loop.time() + RUNNER_DISCONNECT_GRACE_S)
@@ -3776,7 +3786,7 @@ def create_app(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
             return False
-        return conv is not None and await _session_host_offline(conv)
+        return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
 
     set_relay_host_offline_probe(_relay_turn_held_for_host)
 

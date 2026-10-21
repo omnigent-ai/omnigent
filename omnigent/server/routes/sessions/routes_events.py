@@ -244,7 +244,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
-    _host_row_offline,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -1727,16 +1726,7 @@ def register_events_routes(
                         if host_conn is not None and stop_host_registry is not None
                         else None
                     )
-                    # An offline host and its runner can't be reached by any
-                    # replica; the backstop below settles the stale turn.
-                    host_offline = (
-                        not stop_delivered
-                        and host_conn is None
-                        and await _host_row_offline(
-                            getattr(request.app.state, "host_store", None), stop_conv.host_id
-                        )
-                    )
-                    if runner_status not in {"dead", "unknown"} and not host_offline:
+                    if runner_status not in {"dead", "unknown"}:
                         raise OmnigentError(
                             "Couldn't confirm the session's runner stopped. Please try again.",
                             code=ErrorCode.RUNNER_UNAVAILABLE,

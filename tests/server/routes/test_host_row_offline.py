@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -27,14 +28,17 @@ def _host(*, status: str = "offline", sandbox_provider: str | None = None) -> Ho
 
 
 class _HostStore:
-    def __init__(self, host: Host | None = None, *, error: Exception | None = None) -> None:
+    def __init__(
+        self, host: Callable[[], Host] | None = None, *, error: Exception | None = None
+    ) -> None:
+        # Build the row at read time so its last-seen is fresh when the test runs.
         self.host = host
         self.error = error
 
     def get_host(self, host_id: str) -> Host | None:
         if self.error is not None:
             raise self.error
-        return self.host
+        return self.host() if self.host is not None else None
 
 
 @pytest.mark.asyncio
@@ -42,17 +46,18 @@ class _HostStore:
     ("store", "expected"),
     [
         # A laptop that went to sleep, gracefully or not.
-        (_HostStore(_host()), True),
-        (_HostStore(replace(_host(status="online"), updated_at=0)), True),
+        (_HostStore(_host), True),
+        (_HostStore(lambda: replace(_host(status="online"), updated_at=0)), True),
         # Live by its row, possibly on another replica.
-        (_HostStore(_host(status="online")), False),
-        # A managed sandbox has its own wake path; nothing known proves nothing.
-        (_HostStore(_host(sandbox_provider="e2b")), False),
+        (_HostStore(lambda: _host(status="online")), False),
+        # A managed sandbox has its own wake path; a missing row has no host to wait on.
+        (_HostStore(lambda: _host(sandbox_provider="e2b")), False),
         (_HostStore(), False),
-        (_HostStore(error=RuntimeError("store down")), False),
         (None, False),
+        # An unreadable row is inconclusive either way.
+        (_HostStore(error=RuntimeError("store down")), None),
     ],
 )
-async def test_host_row_offline(store: _HostStore | None, expected: bool) -> None:
+async def test_host_row_offline(store: _HostStore | None, expected: bool | None) -> None:
     """Only a user-run host whose row reads gone counts as offline."""
     assert await _host_row_offline(store, _HOST_ID) is expected  # type: ignore[arg-type]

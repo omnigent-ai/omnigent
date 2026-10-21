@@ -8204,14 +8204,14 @@ def set_relay_host_offline_probe(probe: Callable[[str, str], Awaitable[bool]] | 
     _relay_turn_held_for_host = probe
 
 
-async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool:
+async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool | None:
     """
     Report whether a user-run host's row shows it offline on every replica.
 
     :param host_store: Persistent host registrations, or ``None`` without hosts.
     :param host_id: The host to check.
     :returns: ``True`` for a stale non-sandbox host; ``False`` when it is live,
-        managed, missing, or its row can't be read.
+        managed, or missing; ``None`` when its row can't be read.
     """
     if host_store is None:
         return False
@@ -8219,7 +8219,7 @@ async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool:
         host = await asyncio.to_thread(host_store.get_host, host_id)
     except Exception:  # noqa: BLE001 — an unreadable row proves nothing
         _logger.warning("Host lookup failed for host=%s", host_id, exc_info=True)
-        return False
+        return None
     return host is not None and host.sandbox_provider is None and not host_is_live(host)
 
 
@@ -8793,8 +8793,7 @@ async def _relay_runner_stream(
                     extra={"session_id": session_id},
                 )
             elif decision == "held_host_offline":
-                # The disconnect task holds the turn until the host returns;
-                # the runner's reconnect restarts this relay.
+                # The disconnect task holds the turn; the reconnect restarts the relay.
                 pass
             elif decision == "idle_no_failure":
                 # No evidence of an interrupted turn. Liveness drives the
