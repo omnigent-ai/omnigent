@@ -7567,8 +7567,10 @@ def _is_runner_owned_codex_terminal(
         != CODEX_NATIVE_TERMINAL_ROLE
     ):
         return False
-    if resource.session_id in _AUTO_CODEX_APP_SERVERS:
-        return True
+    app_server = _AUTO_CODEX_APP_SERVERS.get(resource.session_id)
+    if app_server is not None:
+        process = getattr(app_server, "proc", None)
+        return process is None or process.returncode is None
     return read_bridge_startup_error(codex_native_bridge_dir(resource.session_id)) is None
 
 
