@@ -4088,6 +4088,8 @@ async def _mark_runner_sessions_offline_once(
                 if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
                     _intentional_stop_sessions.pop(conv.id, None)
             continue
+        turn_id = _session_active_response_cache.get(conv.id)
+        decision_stop_runner_id = _intentional_stop_sessions.get(conv.id)
         if not await _runner_disconnect_requires_failure(
             conv.id,
             conversation_store,
@@ -4097,7 +4099,32 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
-        turn_id = _session_active_response_cache.get(conv.id)
+        decision_status = _session_status_cache.get(conv.id)
+        binding_unavailable = False
+        try:
+            binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Cannot confirm runner ownership for %s during offline sweep",
+                conv.id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+            binding_unavailable = True
+            binding = None
+        # A status read or ownership check can yield to a replacement turn or Stop.
+        if (
+            _runner_relay_tasks.get(conv.id) is not handle
+            or _session_active_response_cache.get(conv.id) != turn_id
+            or _intentional_stop_sessions.get(conv.id) != decision_stop_runner_id
+            or _session_status_cache.get(conv.id) != decision_status
+        ):
+            continue
+        if binding_unavailable:
+            retry.append(conv)
+            continue
+        if binding is None or binding[0] != conv.runner_id:
+            continue
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
