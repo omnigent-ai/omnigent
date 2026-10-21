@@ -3,7 +3,6 @@ package ai.omnigent.android
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
@@ -112,7 +111,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connectionOverlay: ConnectionStatusView
     private var connectionStatus: ConnectionStatus? = null
     private var retryRoute: String? = null
-    private var slowGeneration = 0
     private var navigationFailed = false
     private var navigationCommitted = false
     private var slowConnection: Runnable? = null
@@ -664,11 +662,10 @@ class MainActivity : AppCompatActivity() {
         webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
         slowConnection?.let(mainHandler::removeCallbacks)
         slowConnection = null
-        val generation = ++slowGeneration
         if (status is ConnectionStatus.Connecting) {
             val runnable =
                 Runnable {
-                    if (slowGeneration == generation && connectionStatus == status &&
+                    if (connectionStatus == status &&
                         !navigationCommitted && !navigationFailed
                     ) {
                         showStatus(ConnectionStatus.ConnectingSlow(status.host))
@@ -682,7 +679,6 @@ class MainActivity : AppCompatActivity() {
     private fun hideStatus() {
         slowConnection?.let(mainHandler::removeCallbacks)
         slowConnection = null
-        slowGeneration++
         connectionStatus = null
         connectionOverlay.hide()
         webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
@@ -693,7 +689,7 @@ class MainActivity : AppCompatActivity() {
         tls: Boolean = false,
     ) {
         if (isFinishing || isDestroyed) return
-        val network = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val network = getSystemService<ConnectivityManager>()
         val validated =
             network
                 ?.activeNetwork
