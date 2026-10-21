@@ -308,11 +308,16 @@ Cross-harness journeys:
   see also [composer](./composer.md) for effort.
 - **`model-and-effort`, managed sandbox before a host exists:**
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py::test_sandbox_codex_picker_offers_gateway_models_before_a_host_exists`,
-  `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
+  `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`,
+  `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_sandbox_harness_without_reachable_models_blocks_launch`.
   The picker offers the sandbox gateway's models for native and SDK agents with
   a Harness default row; efforts come from the listing's reasoning metadata, and
-  an unavailable listing keeps Harness default launchable. Connected-host
-  discovery and bound (`inference_models`) targets are unchanged.
+  an unavailable listing keeps Harness default launchable. An `unsupported`
+  listing (the provider is certain no model can serve the harness) grays out
+  the harness row and blocks launch; agent rows are never grayed out. The
+  connected-host picker catalog and bound (`inference_models`) targets are
+  unchanged. Databricks codex launch discovery skips models whose
+  `supported_api_types` list omits `codex/v1/responses`.
 - **`model-and-effort`, Codex runtime settings:**
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_clamps_unsupported_effort`,
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_preserves_supported_effort`,

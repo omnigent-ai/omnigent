@@ -684,6 +684,23 @@ def _make_auth_token_factory(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     )
 
+    # Behind the Databricks Apps proxy (header auth) the server cannot mint a
+    # runner token and the proxy admits only the owner's own Databricks token,
+    # so that launcher-refreshed bearer is the runner's credential, for its server only.
+    from omnigent.util.proxy_bearer import (
+        proxy_bearer_allowed_for,
+        proxy_bearer_configured,
+        read_proxy_bearer,
+    )
+
+    if (
+        proxy_bearer_configured()
+        and resolved_server_url
+        and proxy_bearer_allowed_for(resolved_server_url)
+    ):
+        os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, None)
+        return lambda: read_proxy_bearer(resolved_server_url)
+
     initial_token = (
         os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()
         if _allow_initial_token
@@ -1377,9 +1394,9 @@ async def _resolve_agent_spec_from_server(
     # See omnigent.spec.load.
     try:
         spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    except FileNotFoundError:
-        # Temp cleanup can leave a version directory without its bundle.
-        # Validate privately before replacing an incomplete cache entry.
+    except Exception:  # noqa: BLE001 — the downloaded bundle must validate before replacement
+        # Cached files can be missing, truncated, or malformed. Validate the
+        # downloaded bundle privately before replacing any cached files.
         spec_cache_root.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
             staging = Path(staging_dir)

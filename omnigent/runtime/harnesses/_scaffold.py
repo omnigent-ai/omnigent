@@ -840,12 +840,9 @@ class HarnessApp:
     .. code-block:: python
 
         class MyHarnessApp(HarnessApp):
-            async def run_turn(
-                self, request: CreateResponseRequest, ctx: TurnContext
-            ) -> None:
-                ctx.emit(OutputTextDeltaEvent(
-                    type="response.output_text.delta", delta="hi"
-                ))
+            async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+                ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="hi"))
+
 
         def create_app() -> FastAPI:
             return MyHarnessApp().build()

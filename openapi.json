@@ -2875,6 +2875,28 @@
         "title": "FailedResponseObject",
         "type": "object"
       },
+      "FilesystemAttachmentsInfo": {
+        "description": "Which uploads native sessions receive as files, for client-side checks.",
+        "properties": {
+          "all_types": {
+            "title": "All Types",
+            "type": "boolean"
+          },
+          "extensions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Extensions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "extensions",
+          "all_types"
+        ],
+        "title": "FilesystemAttachmentsInfo",
+        "type": "object"
+      },
       "FunctionCallData": {
         "description": "Data for a function_call item.\n\n**Parameters**\n\n- `agent` \u2014 Agent name. Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -5761,6 +5783,16 @@
             },
             "title": "Features",
             "type": "object"
+          },
+          "filesystem_attachments": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FilesystemAttachmentsInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",

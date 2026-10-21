@@ -154,8 +154,7 @@ async def _close_unregistered_instance(instance: TerminalInstance) -> _Unregiste
                 cancel_requests = current.cancelling()
                 caller_cancelled = True
             # Otherwise ``close()`` itself ended cancelled and the loop exits.
-        except Exception:
-            # The failure is read back from the task below.
+        except Exception:  # noqa: BLE001 — the failure is read back from the task below
             break
     if not close_task.done():
         # A loop that closed with a pending close never runs its done callbacks.

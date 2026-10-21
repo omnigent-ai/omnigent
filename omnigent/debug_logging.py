@@ -532,9 +532,12 @@ def debug_event(
     string-valued attributes map, and pass ``session_id`` (and ``turn_id`` once
     it is wired) explicitly so the row is correlated to its session, e.g.::
 
-        _logger.info("dispatching tool", extra=debug_event(
-            "tool_call_dispatched", session_id=session_id,
-            tool_call_id=tc.id, model=model))
+        _logger.info(
+            "dispatching tool",
+            extra=debug_event(
+                "tool_call_dispatched", session_id=session_id, tool_call_id=tc.id, model=model
+            ),
+        )
 
     Explicit fields win over ambient lifecycle context. The sink enriches
     ordinary logs too: session/request/runner scopes on the server and host,

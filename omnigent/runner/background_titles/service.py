@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -52,9 +53,19 @@ _BACKGROUND_TITLE_MODELS: dict[str, str] = {
 }
 
 
+#: Claude-family override for the economy title arm, e.g. ``sonnet`` where haiku
+#: won't follow the "return only the title" instruction.
+_CLAUDE_TITLE_MODEL_ENV = "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL"
+
+
 def background_title_model(harness: str) -> str | None:
-    """Return the economy-tier title model for a canonical harness, if registered."""
-    return _BACKGROUND_TITLE_MODELS.get(harness)
+    """Return the economy title model for a harness; Claude harnesses honor the env override."""
+    model = _BACKGROUND_TITLE_MODELS.get(harness)
+    if model is not None and harness in ("claude-sdk", "claude-native"):
+        override = os.environ.get(_CLAUDE_TITLE_MODEL_ENV, "").strip()
+        if override:
+            return override
+    return model
 
 
 def _operator_title_instructions(additional_instructions: str | None) -> str:

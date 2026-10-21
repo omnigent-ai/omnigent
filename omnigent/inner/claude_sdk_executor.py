@@ -106,6 +106,8 @@ logger = logging.getLogger(__name__)
 # producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+# Claude Code floors a thinking budget at this size and requires max_tokens above it.
+_CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
@@ -373,7 +375,9 @@ def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ig
     """If ``value`` contains an inline ``data:*;base64,...`` URI, return its
     ``(media_type, base64_char_count)``; otherwise ``None``.
 
-    A resolved attachment block looks like::
+    A resolved attachment block looks like:
+
+    .. code-block:: text
 
         {"type": "input_image",
          "filename": "screenshot.png",
@@ -1146,6 +1150,35 @@ def _claude_settings_payload(
     if model_overrides:
         settings["modelOverrides"] = model_overrides
     return json.dumps(settings, separators=(",", ":")) if settings else None
+
+
+def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
+    """Read the ``env`` block of Claude Code's user ``settings.json``.
+
+    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
+    relative value is relative to the CLI's working directory.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: The string-valued entries, e.g.
+        ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
+        when the file is missing, unreadable, or has no ``env`` object.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
+    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    env = settings.get("env") if isinstance(settings, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {
+        key: value for key, value in env.items() if isinstance(key, str) and isinstance(value, str)
+    }
 
 
 def _resolve_gateway_env(
@@ -2694,6 +2727,13 @@ class ClaudeSDKExecutor(Executor):
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
         if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+        if resolved.setting_sources == [] and not self._gateway:
+            # The CLI then skips the user settings env, which may hold the only provider endpoint.
+            env = {**_claude_user_settings_env(self._cwd), **env}
+        max_output_tokens = cfg.extra.get("max_tokens")
+        if max_output_tokens is not None:
+            max_output_tokens = int(max_output_tokens)
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -2730,6 +2770,11 @@ class ClaudeSDKExecutor(Executor):
             options_kwargs["setting_sources"] = resolved.setting_sources
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
+        if (
+            max_output_tokens is not None
+            and max_output_tokens <= _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS
+        ):
+            options_kwargs["thinking"] = {"type": "disabled"}
         # Databricks opus/fable endpoints reject thinking.type="enabled"
         # (HTTP 400); they require "adaptive" instead (those tiers are
         # adaptive-only). Sonnet is fine, so scope to those tiers only.

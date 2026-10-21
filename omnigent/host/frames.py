@@ -30,7 +30,10 @@ from pydantic import ValidationError
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+    CAP_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -45,6 +48,12 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+# when the host's launch handler raised before any runner process was spawned
+# (a post-spawn fault is not reported as a failure). Unlike the codes above
+# this is not a categorical refusal: the server cannot describe the cause from
+# its own state, so it stays a generic failure.
+LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
 
 # Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
 # tail, whose last line the server keeps when it shortens the report for storage.
@@ -69,6 +78,7 @@ CAP_MCP_REGISTRY = "mcp_registry"
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,

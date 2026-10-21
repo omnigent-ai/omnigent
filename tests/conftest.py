@@ -310,6 +310,20 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests off the network: the host's workspace probe answers "unknown".
+
+    Any CLI path that starts or checks a host daemon on a server URL probes
+    that server. Tests that need an answer patch the probe themselves.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.daemon_lifecycle.probe_workspace_id", lambda url, **_kwargs: None
+    )
+
+
+@pytest.fixture(autouse=True)
 def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     """
     Clear smart routing's per-session runner-catalog cache after every test.

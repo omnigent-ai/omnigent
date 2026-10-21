@@ -181,6 +181,7 @@ from omnigent.server.routes._sessions.helpers import (
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _filesystem_attachment_in_history,
+    _filesystem_attachment_policy,
     _forward_session_change_to_runner,
     _get_runner_client,
     _get_runner_client_for_resource_access,
@@ -1193,14 +1194,30 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        # Set when this message sends a file outside the default extensions, which
+        # the bound runtime must be able to deliver as a file.
+        outgoing_needs_delivery_capability = False
         if body.type in ("message", _SLASH_COMMAND_TYPE):
             from omnigent.inner.native_attachments import (
+                DELIVERY_KEY,
                 inline_filesystem_attachment_name,
                 requires_filesystem,
+                uses_filesystem_delivery,
             )
+            from omnigent.runtime.content_resolver import attachment_delivery
 
             content = body.data.get("content")
-            inline_name = inline_filesystem_attachment_name(content)
+            if isinstance(content, list):
+                # Only the upload's stored record decides delivery; a client's
+                # claim would put inline bytes on disk past the upload checks.
+                for block in content:
+                    if isinstance(block, dict):
+                        block.pop(DELIVERY_KEY, None)
+            policy = _filesystem_attachment_policy(request.app.state)
+            inline_name = inline_filesystem_attachment_name(
+                content,
+                lambda name, mime: attachment_delivery(name, mime, policy) == "filesystem",
+            )
             if inline_name is not None:
                 raise OmnigentError(
                     f"Attachment {inline_name!r} must be uploaded to the session's "
@@ -1209,6 +1226,7 @@ def register_events_routes(
                 )
             # Unsent uploads survive a switch or fork without appearing in history.
             if file_store is not None and isinstance(content, list):
+                filesystem_name: str | None = None
                 for block in content:
                     file_id = block.get("file_id") if isinstance(block, dict) else None
                     if not isinstance(file_id, str):
@@ -1216,9 +1234,14 @@ def register_events_routes(
                     stored = await asyncio.to_thread(file_store.get, file_id)
                     if stored is None or stored.session_id not in (None, session_id):
                         continue
-                    if stored.filename is not None and requires_filesystem(stored.filename):
-                        await _require_filesystem_attachment_harness(conv, stored.filename)
-                        break
+                    if stored.filename is not None and uses_filesystem_delivery(
+                        stored.filename, stored.source_metadata
+                    ):
+                        filesystem_name = filesystem_name or stored.filename
+                        if not requires_filesystem(stored.filename):
+                            outgoing_needs_delivery_capability = True
+                if filesystem_name is not None:
+                    await _require_filesystem_attachment_harness(conv, filesystem_name)
         # Fail fast on malformed tools at the boundary. The raw dicts
         # (not the parsed objects) are what the runner stores — the
         # parse call is purely a validator.
@@ -3088,6 +3111,8 @@ def register_events_routes(
                 content=content if isinstance(content, list) else [],
             )
             if attachment is not None:
+                from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+
                 await asyncio.to_thread(
                     require_filesystem_attachment_runtime,
                     host_id=conv.host_id,
@@ -3095,6 +3120,13 @@ def register_events_routes(
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
                     runner_router=runner_router,
+                    # Retained files only need restoring; files sent now must
+                    # also reach the harness as files.
+                    capability=(
+                        CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+                        if outgoing_needs_delivery_capability
+                        else None
+                    ),
                 )
         native_terminal_ready = False
         initializer = getattr(request.app.state, "runner_session_initializer", None)

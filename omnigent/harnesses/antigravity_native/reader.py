@@ -463,7 +463,9 @@ def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) ->
     root — so the type alone cannot tell them apart (live-verified, agy 1.1.9).
     The distinction lives in ``trajectoryMetadata``, where a child carries a
     ``parentConversationId`` and a ``rootConversationId`` pointing at its PARENT,
-    while a root's ``rootConversationId`` is its own id::
+    while a root's ``rootConversationId`` is its own id:
+
+    .. code-block:: text
 
         root:  {"rootConversationId": "<self>"}
         child: {"parentConversationId": "<parent>", "rootConversationId": "<parent>",
