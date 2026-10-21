@@ -62,7 +62,7 @@ export interface ScheduledTask {
   lastRunAt: number | null;
   /**
    * Status of the task's MOST RECENT run (`succeeded` / `failed` / `skipped` /
-   * `running` / `scheduled` / `incomplete`), or `null` when the task has never
+   * `starting` / `running` / `scheduled` / `incomplete`), or `null` when the task has never
    * run. Server-computed from the latest run row so the list can show a
    * completion badge without a per-row `/runs` fetch.
    */

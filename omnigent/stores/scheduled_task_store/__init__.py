@@ -185,7 +185,7 @@ class ScheduledTaskStore(ABC):
         cleanup or completion finishes. Such tasks cannot be edited or fired.
 
         :param scheduled_task_id: Opaque task identifier.
-        :returns: ``True`` if removed; ``False`` if not found.
+        :returns: ``True`` if newly deleted; ``False`` if missing or already deleted.
         """
         ...
 

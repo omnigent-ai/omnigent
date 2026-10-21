@@ -1379,29 +1379,44 @@ def test_dispatch_insert_failure_rolls_back_schedule(store: SqlAlchemyScheduledT
     assert store.list_runs(task.id)[0] == []
 
 
-def test_dispatch_pagination_and_workspace_isolation(store: SqlAlchemyScheduledTaskStore) -> None:
+def test_dispatch_pagination_with_equal_times(store: SqlAlchemyScheduledTaskStore) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
     tasks = []
     for workspace in (31, 32, 33):
         with workspace_scope(workspace):
-            tasks.append(_due_task(store))
+            for seed in ("first", "second"):
+                tasks.append(_due_task(store, seed))
     cutoff = max(task.next_run_at for task in tasks)
-    first = store.list_due_tasks(cutoff, limit=1)[0]
-    remaining = store.list_due_tasks(
-        cutoff, after=(first.next_run_at, first.workspace_id, first.id)
-    )
-    assert {task.workspace_id for task in [first, *remaining]} == {31, 32, 33}
+    with store._session_immediate("test_equal_due_times") as session:
+        session.execute(update(SqlScheduledTask).values(next_run_at=cutoff))
+    seen = []
+    cursor = None
+    while page := store.list_due_tasks(cutoff, after=cursor, limit=1):
+        task = page[0]
+        seen.append((task.workspace_id, task.id))
+        cursor = (task.next_run_at, task.workspace_id, task.id)
+    assert seen == sorted((task.workspace_id, task.id) for task in tasks)
+
+
+def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTaskStore) -> None:
+    with workspace_scope(31):
+        task = _due_task(store)
+    now = task.next_run_at
     assert (
         store.claim_scheduled_run(
-            first, now=cutoff, next_run_at=cutoff + 3600, host_id=first.host_id, lease_seconds=120
+            task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
         )
         is None
     )
-    with workspace_scope(first.workspace_id):
+    with workspace_scope(task.workspace_id):
         run = store.claim_scheduled_run(
-            first, now=cutoff, next_run_at=cutoff + 3600, host_id=first.host_id, lease_seconds=120
+            task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
         )
-    assert store.renew_starting_run(run.id, now=lambda: cutoff + 30, lease_seconds=120) is None
-    assert store.transition_starting_run(run, now=lambda: cutoff + 30, status="failed") is None
+    assert store.renew_starting_run(run.id, now=lambda: now + 30, lease_seconds=120) is None
+    assert store.transition_starting_run(run, now=lambda: now + 30, status="failed") is None
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
@@ -1609,3 +1624,116 @@ def test_delete_racing_claim_preserves_any_claim_that_won(
     else:
         assert store.get(task.id).state == "deleted"
         assert store.list_expired_starting_runs(task.next_run_at + 120) == [run]
+
+
+def test_cursor_reset_commits_bounded_pages_and_can_resume(store, monkeypatch):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+    from omnigent.db.enum_codecs import encode_scheduled_task_state
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(store, "_cleanup_batch_size", 2)
+    tasks = []
+    for workspace in (31, 32):
+        with workspace_scope(workspace):
+            for index in range(3):
+                tasks.append(_due_task(store, f"reset-{index}"))
+    with store._session_immediate("test_paused_cursor") as session:
+        session.execute(
+            update(SqlScheduledTask)
+            .where(SqlScheduledTask.workspace_id == 32)
+            .values(state=encode_scheduled_task_state("paused"))
+        )
+    original = sqlalchemy_store.run_write_transaction
+    pages = 0
+
+    def fail_second_page(maker, operation, callback):
+        nonlocal pages
+        if operation == "reset_dispatch_cursor_page":
+            pages += 1
+            if pages == 2:
+                raise RuntimeError("reset interrupted")
+        return original(maker, operation, callback)
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", fail_second_page)
+    with pytest.raises(RuntimeError, match="reset interrupted"):
+        store.reset_dispatch_cursors()
+    remaining = []
+    for task in tasks:
+        with workspace_scope(task.workspace_id):
+            remaining.append(store.get(task.id).next_run_at)
+    assert remaining.count(None) == 2
+    store.reset_dispatch_cursors()
+    store.reset_dispatch_cursors()
+    for task in tasks:
+        with workspace_scope(task.workspace_id):
+            assert store.get(task.id).next_run_at is None
+
+
+def test_uninitialized_discovery_pages_across_workspaces(store):
+    tasks = []
+    for workspace in (31, 32):
+        with workspace_scope(workspace):
+            for seed in ("a", "b"):
+                task = _due_task(store, seed)
+                tasks.append(task)
+            store.update(task.id, state="paused")
+    store.reset_dispatch_cursors()
+    cursor = None
+    seen = []
+    while page := store.list_uninitialized_tasks(after=cursor, limit=1):
+        task = page[0]
+        seen.append((task.workspace_id, task.id))
+        cursor = (task.workspace_id, task.id)
+        with workspace_scope(task.workspace_id):
+            assert store.initialize_next_run_at(task, task.created_at + 3600)
+    assert seen == sorted((task.workspace_id, task.id) for task in tasks[::2])
+    assert store.list_uninitialized_tasks() == []
+
+
+def test_interrupted_history_cleanup_resumes_without_losing_live_claim(store, monkeypatch):
+    monkeypatch.setattr(store, "_cleanup_batch_size", 2)
+    with workspace_scope(31):
+        task = _due_task(store, "cleanup")
+        run = store.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+        for index in range(7):
+            store.create_run(_uid(f"old-{index}"), task.id, "succeeded", index)
+        original = store._purge_deleted_task_page
+        pages = 0
+
+        def fail_second_page(task_id, *, after=None):
+            nonlocal pages
+            pages += 1
+            if pages == 2:
+                raise RuntimeError("cleanup interrupted")
+            return original(task_id, after=after)
+
+        monkeypatch.setattr(store, "_purge_deleted_task_page", fail_second_page)
+        with pytest.raises(RuntimeError, match="cleanup interrupted"):
+            store.delete(task.id)
+        assert store.get(task.id).state == "deleted"
+        assert len(store.list_runs(task.id)[0]) == 6
+    # The background retry crosses workspace boundaries, but preserves the live run.
+    for _ in range(5):
+        store.purge_deleted_tasks(limit=1)
+    with workspace_scope(31):
+        assert store.list_runs(task.id)[0] == [run]
+        store.transition_starting_run(run, now=lambda: task.next_run_at, status="failed")
+        assert store.get(task.id) is None
+
+
+def test_dispatch_support_rejects_d1(store, monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        store, "_engine", SimpleNamespace(dialect=SimpleNamespace(name="cloudflare_d1"))
+    )
+    with pytest.raises(NotImplementedError, match="multi-statement transactions"):
+        store.check_dispatch_support()

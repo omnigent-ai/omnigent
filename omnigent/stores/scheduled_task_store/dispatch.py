@@ -9,6 +9,7 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 
 # Ordered exactly like the due-task and expired-startup indexes.
 DispatchCursor = tuple[int, int, str]
+TaskCursor = tuple[int, str]
 
 
 @runtime_checkable
@@ -27,7 +28,15 @@ class ScheduledTaskDispatchStore(Protocol):
         """Clear all persisted cursors before starting legacy timers after a rollback."""
         ...
 
-    def list_active_all_workspaces(self) -> list[ScheduledTask]: ...
+    def list_uninitialized_tasks(
+        self, *, after: TaskCursor | None = None, limit: int = 100
+    ) -> list[ScheduledTask]: ...
+
+    def purge_deleted_tasks(
+        self, *, after: TaskCursor | None = None, limit: int = 100
+    ) -> TaskCursor | None:
+        """Clean one bounded page of retained deleted tasks; return the next scan cursor."""
+        ...
 
     def initialize_next_run_at(self, task: ScheduledTask, next_run_at: int) -> bool:
         """Initialize a legacy NULL schedule only if the task is still unchanged."""
@@ -50,7 +59,11 @@ class ScheduledTaskDispatchStore(Protocol):
         host_id: str | None,
         lease_seconds: int,
     ) -> ScheduledTaskRun | None:
-        """Atomically advance an unchanged task and insert its unique starting run."""
+        """Advance an unchanged task and insert its unique starting run atomically.
+
+        An already-recorded occurrence advances the cursor but returns None,
+        as does a changed task. Neither case starts another run.
+        """
         ...
 
     def renew_starting_run(
