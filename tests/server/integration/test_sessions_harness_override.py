@@ -360,9 +360,7 @@ async def test_patch_bind_side_chat_init_suppresses_recovery_turn(
 ) -> None:
     """Binding a side chat must not resume the source's unanswered turn.
 
-    The web binds a side chat with ``PATCH {runner_id}`` right after the fork
-    copies the source's history. When the source is mid-turn, that history ends
-    with its unanswered request, which a recovery turn would answer again.
+    A mid-turn source's copied history ends with a request recovery would rerun.
     """
     captured = _stub_late_runner_bind(monkeypatch)
 

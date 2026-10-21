@@ -12541,9 +12541,7 @@ async def test_side_chat_turns_compose_side_conversation_instruction(
 ) -> None:
     """Every side-chat turn tells the model its copied history is reference only.
 
-    The side-chat label reaches the runner either through the session-init
-    envelope or through the session snapshot fetch; both composition paths and
-    both the gated and ungated instruction builds must append the boundary.
+    Covers labels from the snapshot fetch and the init envelope on both builds.
     """
     conv = f"conv_side_{init_source}_{harness}_{stream}"
 
