@@ -9,18 +9,15 @@ runner's tmux socket is not reachable from the test.
 
 from __future__ import annotations
 
-import asyncio
-import json
 import time
 from collections.abc import Iterator
 
 import httpx
-import pyte
 import pytest
 import websockets
 from playwright.sync_api import Page, expect
 
-from tests._helpers.async_thread import run_in_fresh_loop
+from tests._helpers.terminal_attach import render_terminal_screen, terminal_resource_id
 from tests.e2e_ui.conftest import native_claude_mock_session_context
 
 _TARGET_MODE = "acceptEdits"
@@ -53,43 +50,6 @@ def native_claude_dont_ask_session(
         yield session
 
 
-def _terminal_id(base_url: str, session_id: str) -> str | None:
-    """Return the session's Claude terminal resource id once the runner has launched it."""
-    resp = httpx.get(f"{base_url}/v1/sessions/{session_id}/resources", timeout=10.0)
-    resp.raise_for_status()
-    for resource in resp.json().get("data", []):
-        if resource.get("type") == "terminal":
-            return str(resource["id"])
-    return None
-
-
-def _render_terminal(
-    base_url: str, session_id: str, terminal_id: str, settle_s: float = 3.0
-) -> str:
-    """Attach read-only to the terminal and return the screen text it renders."""
-    ws_url = (
-        base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
-        + f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?read_only=true"
-    )
-    screen = pyte.Screen(_PANE_COLS, _PANE_ROWS)
-    stream = pyte.ByteStream(screen)
-
-    async def _collect() -> None:
-        async with websockets.connect(ws_url, max_size=None, open_timeout=20) as ws:
-            await ws.send(json.dumps({"type": "resize", "cols": _PANE_COLS, "rows": _PANE_ROWS}))
-            deadline = time.monotonic() + settle_s
-            while (remaining := deadline - time.monotonic()) > 0:
-                try:
-                    frame = await asyncio.wait_for(ws.recv(), timeout=remaining)
-                except TimeoutError:
-                    break
-                if isinstance(frame, bytes):
-                    stream.feed(frame)
-
-    run_in_fresh_loop(_collect())
-    return "\n".join(screen.display)
-
-
 def _wait_for_footer(base_url: str, session_id: str, footer: str, timeout_s: float) -> str:
     """Poll the rendered terminal until its mode footer contains *footer*; return the screen."""
     deadline = time.monotonic() + timeout_s
@@ -97,9 +57,11 @@ def _wait_for_footer(base_url: str, session_id: str, footer: str, timeout_s: flo
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            terminal_id = _terminal_id(base_url, session_id)
+            terminal_id = terminal_resource_id(base_url, session_id)
             if terminal_id is not None:
-                screen = _render_terminal(base_url, session_id, terminal_id)
+                screen = render_terminal_screen(
+                    base_url, session_id, terminal_id, cols=_PANE_COLS, rows=_PANE_ROWS
+                )
                 if footer in screen.lower():
                     return screen
         except (httpx.HTTPError, websockets.WebSocketException, OSError) as exc:
