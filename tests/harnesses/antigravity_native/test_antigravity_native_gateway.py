@@ -290,10 +290,14 @@ def test_selected_databricks_profile_never_falls_back(
         + (f"host = {host}\n" if invalid != "hostless" else "")
         + ("token = selected-token\n" if invalid != "tokenless" else "")
     )
+    if invalid in {"missing", "hostless"}:
+        with pytest.raises(OmnigentError):
+            databricks_token_source("selected")
+        return
+    source = databricks_token_source("selected")
+    if invalid == "changed-host":
+        cfg.write_text(cfg.read_text().replace(host, host + "/other-workspace"))
     with pytest.raises(OmnigentError):
-        source = databricks_token_source("selected")
-        if invalid == "changed-host":
-            cfg.write_text(cfg.read_text().replace(host, host + "/other-workspace"))
         source.resolve()
 
 
@@ -381,19 +385,19 @@ async def test_proxy_preserves_tool_payload_stream_and_refreshes_token() -> None
             for tick in (0.0, 11.0):
                 now[0] = tick
                 response = await client.post(
-                    "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse",
+                    "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent?alt=sse&key=local-secret",
                     headers={"x-goog-api-key": gateway.key},
                     content=payload,
                 )
                 assert response.status_code == 200
                 assert response.content == stream
-            for path, headers in [
-                ("/v1beta/models/gemini-3.1-pro-preview:generateContent", {}),
-                ("/v1beta/models/missing:generateContent", {"x-goog-api-key": gateway.key}),
-                ("/api/2.0/token/create", {"x-goog-api-key": gateway.key}),
+            for path, headers, status in [
+                ("/v1beta/models/gemini-3.1-pro-preview:generateContent", {}, 401),
+                ("/v1beta/models/missing:generateContent", {"x-goog-api-key": gateway.key}, 404),
+                ("/api/2.0/token/create", {"x-goog-api-key": gateway.key}, 404),
             ]:
                 response = await client.post(path, headers=headers)
-                assert response.status_code in (401, 404)
+                assert response.status_code == status
     assert len(requests) == 2
     assert [r.headers["Authorization"] for r in requests] == [
         "Bearer first-token",
@@ -449,3 +453,31 @@ def test_auth_process_rejects_profile_changed_to_http_before_sdk(monkeypatch, tm
     monkeypatch.setattr("omnigent.inner.databricks_token._sdk_bearer", authenticate)
     assert main() == 1
     authenticate.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["token", "connection"])
+async def test_gateway_failure_is_sanitized(failure, caplog):
+    def token():
+        if failure == "token":
+            raise ValueError("private-auth-marker")
+        return "fake-token"
+
+    def upstream_request(request):
+        raise httpx.ConnectError("private-transport-marker", request=request)
+
+    source = SimpleNamespace(workspace_url="https://workspace.example", resolve=token)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream_request)) as upstream:
+        gateway = GeminiDatabricksGateway(source, ("system.ai.gemini-3-1-pro",), upstream)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=gateway.app), base_url="http://gateway"
+        ) as client:
+            response = await client.post(
+                "/v1beta/models/gemini-3.1-pro-preview:streamGenerateContent",
+                headers={"x-goog-api-key": gateway.key},
+                json={"contents": []},
+            )
+    assert response.status_code == 502
+    assert response.json() == {"error": {"message": "Databricks gateway request failed"}}
+    assert "databricks auth login" in caplog.text
+    assert "private-" not in caplog.text + response.text
+    assert not any(record.exc_info for record in caplog.records)

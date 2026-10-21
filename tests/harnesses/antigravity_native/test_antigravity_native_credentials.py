@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import ensure_agy_feedback_survey_disabled
 from omnigent.harnesses.antigravity_native.credentials import (
     antigravity_credentials_ready,
@@ -139,7 +139,9 @@ def test_legacy_listing_url_is_not_used_for_native_requests(tmp_path: Path) -> N
     assert resolve_antigravity_credentials().base_url == GEMINI_API_BASE_URL
 
 
-def test_legacy_setup_key_is_usable_by_native_agy(tmp_path: Path) -> None:
+def test_legacy_setup_key_is_usable_by_native_agy(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-fake")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://ambient.example/gemini")
     secrets.store_secret("antigravity", "legacy-fake")
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:antigravity"}})
@@ -341,3 +343,17 @@ def test_cli_and_readiness_handle_malformed_databricks_profile(
     assert "private-malformed-secret" not in result.output
     assert not isinstance(result.exception, OmnigentError)
     assert not antigravity_credentials_ready()
+
+
+def test_host_setup_hint_falls_back_for_unexpected_credential_error(monkeypatch):
+    from omnigent.onboarding.harness_install import harness_setup_hint
+
+    def fail():
+        raise OmnigentError("private-error-marker", code=ErrorCode.INTERNAL_ERROR)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.credentials.resolve_antigravity_credentials", fail
+    )
+    hint = harness_setup_hint("antigravity-native")
+    assert "private-error-marker" not in hint
+    assert "install" in hint

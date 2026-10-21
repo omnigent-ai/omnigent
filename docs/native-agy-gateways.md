@@ -156,7 +156,10 @@ incompatible URL fails with a setup error rather than falling back to OAuth.
 Update it to a native Gemini API root, or replace `default: true` with an explicit
 list of its other families (for example `default: [anthropic, openai]`) in
 `config.yaml`. Excluding Gemini restores OAuth for new sessions while preserving
-the other harness defaults. You can also select another Gemini default in setup.
+the other harness defaults. You can also select another Gemini default in setup. If activation creates a
+conflict with an existing Gemini default, setup first asks which provider to
+keep as the Gemini default. Other provider scopes and credentials are preserved.
+Canceling leaves that conflict unresolved and does not select a provider.
 
 Setup does not automatically save a detected Gemini key whose companion
 `GOOGLE_GEMINI_BASE_URL` is incompatible. Correct that environment variable and
@@ -190,7 +193,9 @@ saved incompatible entries also fail at launch with guidance instead of falling
 back to ambient credentials.
 
 An explicitly selected Gemini credential takes precedence over ambient keys.
-Without one, the existing Antigravity key or `GEMINI_API_KEY` /
+Without one, a stored legacy `antigravity.api_key_ref` takes precedence over
+ambient keys and uses Google's API root. Remove that legacy key in setup before
+switching to an ambient gateway. Otherwise the `GEMINI_API_KEY` /
 `GOOGLE_GEMINI_BASE_URL` environment pair is used. Without an API key, agy keeps
 its existing OAuth/ADC behavior. Claude, Codex, and Pi defaults remain separate.
 

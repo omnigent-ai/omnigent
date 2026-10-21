@@ -3906,6 +3906,50 @@ def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, 
     assert secrets.load_secret("gemini") is None
 
 
+@pytest.mark.parametrize("choice", ["1", "2", "q"])
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, kind):
+    config_path = isolated_config / "config.yaml"
+    original = {
+        "providers": {
+            "gateway": {
+                "kind": kind,
+                "default": True,
+                "openai": {"base_url": "https://gateway.example/v1", "api_key": "fake"},
+                "gemini": {"base_url": "https://gateway.example/gemini", "api_key": "fake"},
+            },
+            "google": {
+                "kind": "key",
+                "default": True,
+                "gemini": {
+                    "base_url": "https://generativelanguage.googleapis.com",
+                    "api_key": "fake",
+                },
+            },
+        }
+    }
+    config_path.write_text(yaml.safe_dump(original))
+    before = config_path.read_bytes()
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
+    assert result.exit_code == 0, result.output
+    assert "Multiple defaults for Gemini" in result.output
+    assert "Traceback" not in result.output
+    if choice == "q":
+        assert config_path.read_bytes() == before
+    else:
+        config = load_config()
+        assert get_default_provider(config, "gemini").name == (
+            "gateway" if choice == "1" else "google"
+        )
+        assert get_default_provider(config, "openai").name == "gateway"
+        assert load_providers(config)["gateway"].default_families - {"gemini"} == {"openai"}
+        assert all(
+            {key: value for key, value in config["providers"][name].items() if key != "default"}
+            == {key: value for key, value in entry.items() if key != "default"}
+            for name, entry in original["providers"].items()
+        )
+
+
 @pytest.mark.parametrize(
     "profile_text",
     [

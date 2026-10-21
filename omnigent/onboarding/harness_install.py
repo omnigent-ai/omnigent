@@ -728,9 +728,10 @@ def harness_setup_hint(harness: str | None) -> str:
         try:
             resolve_antigravity_credentials()
         except OmnigentError as exc:
-            if exc.code != ErrorCode.INVALID_INPUT:
-                raise
-            return exc.message + " Run omni setup on the host to repair the Gemini configuration."
+            if exc.code == ErrorCode.INVALID_INPUT:
+                return (
+                    exc.message + " Run omni setup on the host to repair the Gemini configuration."
+                )
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:

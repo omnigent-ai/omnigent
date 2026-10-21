@@ -22,6 +22,8 @@ Two surfaces:
 
 from __future__ import annotations
 
+import logging
+
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
@@ -44,6 +46,7 @@ from omnigent.onboarding.provider_config import (
 )
 from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 
+_logger = logging.getLogger(__name__)
 # The families auto-default resolution walks, in a stable order. ``gemini``
 # is included so a detected-only GEMINI_API_KEY (the antigravity-sdk harness's
 # credential) auto-becomes the gemini-family default in the read-time merge,
@@ -209,6 +212,9 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
                 try:
                     base_url = validate_gemini_base_url(endpoint[1])
                 except OmnigentError:
+                    _logger.debug(
+                        "Skipping detected Gemini key: GOOGLE_GEMINI_BASE_URL is invalid"
+                    )
                     return None
         return build_key_provider_entry(
             det.family, base_url, api_key_ref, default_model, wire_api=wire_api

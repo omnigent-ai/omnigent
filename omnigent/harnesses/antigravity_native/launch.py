@@ -257,6 +257,8 @@ def build_agy_launch(
         environment.
     :raises ValueError: When ``resume=True`` but *conversation_id* is ``None``
         or empty (agy needs a real id to resume).
+    :raises OmnigentError: When saved credentials need repair through setup.
+    :raises RuntimeError: When the agy executable cannot be found.
     """
     launch = resolve_native_antigravity_launch(model=model)
     model = launch.model

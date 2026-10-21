@@ -1028,7 +1028,9 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             )
         native_gemini = raw.get("native_gemini", False)
         if not isinstance(native_gemini, bool):
-            raise OmnigentError("native_gemini must be a boolean", code=ErrorCode.INVALID_INPUT)
+            raise OmnigentError(
+                f"provider {name!r}: native_gemini must be a boolean", code=ErrorCode.INVALID_INPUT
+            )
         if native_gemini and connection_raw is not None:
             raise OmnigentError(
                 f"provider {name!r}: native Gemini requires a local Databricks profile; "

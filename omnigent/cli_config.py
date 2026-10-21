@@ -3662,6 +3662,33 @@ def _manage_opencode_harness() -> None:
             status = None
 
 
+def _repair_conflicting_provider_defaults() -> bool:
+    """Resolve ambiguous defaults before adoption or menu construction; allow cancellation."""
+    from rich.markup import escape
+
+    from omnigent.onboarding.configure_models import family_label
+    from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.provider_config import load_providers
+
+    entries = load_providers(_load_global_config())
+    families = sorted({family for entry in entries.values() for family in entry.default_families})
+    for family in families:
+        candidates = sorted(
+            name for name, entry in entries.items() if family in entry.default_families
+        )
+        if len(candidates) < 2:
+            continue
+        choice = select(
+            f"Multiple defaults for {family_label(family)} — choose one to keep",
+            [escape(name) for name in candidates],
+        )
+        if choice < 0:
+            click.echo("Default conflict left unresolved. Run omni setup again to choose.")
+            return False
+        _set_harness_default(candidates[choice], family)
+    return True
+
+
 def _run_configure_harnesses_interactive() -> None:
     """Run the interactive model/credential three-level picker.
 
@@ -3739,6 +3766,8 @@ def _run_configure_harnesses_interactive() -> None:
     # what was auto-configured and from where. No progress spinner here: a
     # transient spinner over the (fast) detection left a cleared-region gap and
     # a residual line directly above the menu on first paint.
+    if not _repair_conflicting_provider_defaults():
+        return
     _adopt_ambient_credentials()
 
     # Level 1: pick a harness. The cursor moves between Claude, Codex, Pi, and

@@ -97,7 +97,7 @@ def resolve_antigravity_credentials() -> AntigravityCredentials | None:
         key = (family.api_key or "").strip() if family is not None else ""
         if family is None or not key:
             raise OmnigentError(
-                "The selected Gemini provider has no usable API key. Run omni setup.",
+                "The selected Gemini provider has no usable API key.",
                 code=ErrorCode.INVALID_INPUT,
             )
         base_url = family.base_url

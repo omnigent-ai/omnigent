@@ -2,7 +2,7 @@
 
 from urllib.parse import urlsplit
 
-from omnigent.databricks_ai_gateway import DATABRICKS_TRUSTED_HOST_SUFFIXES
+from omnigent.databricks_ai_gateway import _under_trusted_domain
 from omnigent.errors import ErrorCode, OmnigentError
 
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
@@ -35,7 +35,7 @@ def validate_gemini_base_url(value: str) -> str:
             code=ErrorCode.INVALID_INPUT,
         )
     hostname = (parsed.hostname or "").rstrip(".")
-    if hostname.endswith(DATABRICKS_TRUSTED_HOST_SUFFIXES):
+    if _under_trusted_domain(hostname):
         raise OmnigentError(
             "Choose Databricks — profile for a Databricks workspace. "
             "Its native Gemini API needs profile authentication and model-name mapping; "

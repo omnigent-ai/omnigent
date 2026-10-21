@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -24,14 +25,16 @@ from starlette.routing import Route
 from omnigent.harnesses.antigravity_native.credentials import databricks_token_source
 from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
 from omnigent.models.databricks_model_discovery import discover_databricks_gemini_models
+from omnigent.onboarding.gemini_gateway import GEMINI_BASE_URL_ENV
 
+_logger = logging.getLogger(__name__)
 PROFILE_ENV = "OMNIGENT_AGY_DATABRICKS_PROFILE"
 _GENERATE_PATH = re.compile(r"/v1beta/models/([^/:]+):(generateContent|streamGenerateContent)$")
 _RESPONSE_HEADERS = {"content-type", "content-encoding", "content-length"}
 
 
 def wrap_agy_gateway_launch(argv: list[str], env: dict[str, str]) -> list[str]:
-    """Put an opted-in Databricks launch under its transport supervisor."""
+    """Wrap a Databricks launch, removing the consumed profile marker from *env*."""
     profile = env.pop(PROFILE_ENV, None)
     if profile is None:
         return argv
@@ -88,7 +91,7 @@ class GeminiDatabricksGateway:
                 self.client.build_request(
                     "POST",
                     url,
-                    params=request.query_params,
+                    params=[(k, v) for k, v in request.query_params.multi_items() if k != "key"],
                     headers={
                         "Authorization": f"Bearer {token}",
                         "Content-Type": "application/json",
@@ -98,6 +101,11 @@ class GeminiDatabricksGateway:
                 stream=True,
             )
         except Exception:
+            # Auth and transport exceptions can contain credentials or request URLs.
+            _logger.warning(
+                "Databricks gateway request failed; check workspace connectivity and "
+                "refresh the selected profile with databricks auth login --profile <profile>."
+            )
             return JSONResponse({"error": {"message": "Databricks gateway request failed"}}, 502)
         return StreamingResponse(
             upstream.aiter_raw(),
@@ -143,7 +151,7 @@ async def run(profile: str, argv: list[str]) -> int:
                 env = {
                     **os.environ,
                     "GEMINI_API_KEY": gateway.key,
-                    "GOOGLE_GEMINI_BASE_URL": f"http://127.0.0.1:{port}",
+                    GEMINI_BASE_URL_ENV: f"http://127.0.0.1:{port}",
                 }
                 env.pop(PROFILE_ENV, None)
                 child = await asyncio.create_subprocess_exec(*argv, env=env)
