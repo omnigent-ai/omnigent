@@ -114,16 +114,29 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             parts: list[dict] = [{"text": "GATEWAY_SETUP_OK"}]
             if request.get("tools"):
                 if not tool_requested.is_set():
+                    file_tool = next(
+                        declaration
+                        for tool in request["tools"]
+                        for declaration in tool.get("functionDeclarations", [])
+                        if declaration["name"] in {"read_file", "view_file"}
+                    )
+                    path_argument = "Path" if file_tool["name"] == "read_file" else "AbsolutePath"
+                    arguments = {path_argument: str(tool_file)}
+                    properties = file_tool.get(
+                        "parametersJsonSchema", file_tool.get("parameters", {})
+                    ).get("properties", {})
+                    for name, value in {
+                        "toolSummary": "Gateway file check",
+                        "toolAction": "Reading test file",
+                    }.items():
+                        if name in properties:
+                            arguments[name] = value
                     tool_requested.set()
                     parts = [
                         {
                             "functionCall": {
-                                "name": "view_file",
-                                "args": {
-                                    "AbsolutePath": str(tool_file),
-                                    "toolSummary": "Gateway file check",
-                                    "toolAction": "Reading test file",
-                                },
+                                "name": file_tool["name"],
+                                "args": arguments,
                             }
                         }
                     ]
