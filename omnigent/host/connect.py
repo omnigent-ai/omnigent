@@ -1924,11 +1924,12 @@ class HostProcess:
                         frame, str(exc), error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE
                     )
         if not harness_ready:
+            setup_hint = await asyncio.to_thread(harness_setup_hint, frame.harness)
             return self._launch_failed(
                 frame,
                 (
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
+                    f"{self._identity.name!r} — {setup_hint}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
@@ -3719,6 +3720,8 @@ class HostProcess:
             )
         if op == "github_pr_diff":
             return r.github_pr_diff(session_id, cast("str | None", params.get("pr_url")))
+        if op == "github_labels":
+            return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3804,6 +3807,14 @@ class HostProcess:
                 str(params["session_id"]),
                 str(params["url"]),
                 str(params.get("action", "attach")),
+            )
+        if op == "github_labels_update":
+            return pr_resource.update_pr_labels(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                add=params.get("add", []),
+                remove=params.get("remove", []),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 

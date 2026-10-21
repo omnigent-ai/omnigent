@@ -172,7 +172,8 @@ map an area, remove it here in the same change.
   terminal journeys are mapped)
 - Approvals, permission cards, and the inbox: `tests/e2e_ui/approvals/` (only
   native edit-tool approvals are mapped)
-- Sub-agents and the agent info popover: `tests/e2e_ui/agents/`
+- Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
+  discovery and idle-runner performance are mapped in Native harnesses)
 - Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
 - Comments: `tests/e2e_ui/comments/`
 - Sharing and session permissions: `tests/e2e_ui/collaboration/`

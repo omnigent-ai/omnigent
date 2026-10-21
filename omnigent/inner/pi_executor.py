@@ -2412,6 +2412,10 @@ class PiExecutor(Executor):
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
             )
+            from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+            assert models_json is not None
+            extra_args.extend(pi_gateway_extension_args(pathlib.Path(tmp_dir), models_json))
 
         # Pi natively supports retry config via ``.pi/settings.json``
         # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway

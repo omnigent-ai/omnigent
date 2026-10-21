@@ -981,15 +981,16 @@ class HostFsWriteFrame:
     The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
     this carries the small set of writes the host can serve when the session's
     runner is offline — currently the pull request panel's account/base
-    preference (``op="github_set_preference"``) and PR attach/remove
-    (``op="github_prs_update"``), for every git provider; the op names are
+    preference (``op="github_set_preference"``), PR attach/remove
+    (``op="github_prs_update"``), and label edits (``op="github_labels_update"``),
+    for every git provider; the op names are
     stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
-    :param op: Write op name — ``"github_set_preference"`` or
-        ``"github_prs_update"``.
+    :param op: Write op name — ``"github_set_preference"``,
+        ``"github_prs_update"``, or ``"github_labels_update"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.

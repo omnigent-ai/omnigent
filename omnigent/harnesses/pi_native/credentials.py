@@ -2023,4 +2023,7 @@ def pi_native_provider_launch(
             thinking = to_pi_thinking_level(effort)
     if thinking is not None:
         args.extend(["--thinking", thinking])
+    from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+    args.extend(pi_gateway_extension_args(agent_dir, rendered))
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

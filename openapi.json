@@ -16727,6 +16727,98 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/labels": {
+      "get": {
+        "description": "List the labels the selected PR's repository offers, for the label picker.\n\nRequires edit access, like the label edit it feeds. Falls back to the\nhost tunnel when the runner is offline.\n\n**Returns:** A list of `{name, color, description}` with `has_more`.",
+        "operationId": "list_session_github_labels_v1_sessions__session_id__resources_github_labels_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Add and remove labels on the selected PR with the host's provider account.\n\nServed by the runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_labels` with the PR's resulting labels.",
+        "operationId": "update_session_github_labels_v1_sessions__session_id__resources_github_labels_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/preferences": {
       "post": {
         "description": "Apply the GitHub panel's account (and optional base) selection.\n\nPersists the choice \u2014 a per-workspace account preference in the user\nconfig, and `gh repo set-default` when a base is given \u2014 then returns the\nrefreshed `session.github.info`. Served by the runner when it's online,\nelse by the host over its tunnel (both run the same\n`github_resource.set_github_preference` against the local config +\nworkspace), so a preference change works with the runner asleep.\n\n**Returns:** The refreshed `session.github.info` object.",
