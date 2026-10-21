@@ -4449,6 +4449,10 @@ def test_inject_user_message_pastes_content_then_submits(
         ("/exit", " /exit"),
         ("/quit now", " /quit now"),
         ("  /help", "   /help"),
+        # Panels that write no transcript record, so their delivery is never confirmed.
+        ("/export", " /export"),
+        ("/rewind", " /rewind"),
+        ("/usage", " /usage"),
         ("/clear", "/clear"),
         ("/compact", "/compact"),
         ("/model sonnet-4", "/model sonnet-4"),

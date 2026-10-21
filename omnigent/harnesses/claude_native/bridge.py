@@ -8772,7 +8772,9 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #
 # - DROPPED — pure UI affordances (``/help``, ``/login``) and local
 #   config (``/permissions``, ``/add-dir``). No conversation-visible
-#   effect; surfacing them in the web UI is noise.
+#   effect; surfacing them in the web UI is noise. This includes the
+#   panels (``/export``, ``/usage``) that leave no transcript record, so a
+#   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
 #   ``/model``, ``/ultrareview``). A web observer needs to see these,
@@ -8789,6 +8791,7 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "cost",
         "doctor",
         "exit",
+        "export",
         "fast",
         "feedback",
         "help",
@@ -8798,6 +8801,7 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "logout",
         "mcp",
         "memory",
+        "mobile",
         "onboarding",
         "permissions",
         "plugin",
@@ -8805,10 +8809,17 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "quit",
         "release-notes",
         "resume",
+        "rewind",
+        "sandbox",
         "save",
+        "skills",
+        "stats",
         "status",
+        "tasks",
         "terminal-setup",
+        "theme",
         "upgrade",
+        "usage",
         "verbose",
     }
 )
