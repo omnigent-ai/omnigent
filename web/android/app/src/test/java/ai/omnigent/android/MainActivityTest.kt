@@ -9,10 +9,12 @@ import android.os.Looper
 import android.text.TextUtils
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.FakeWebResourceError
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.widget.Button
 import android.widget.TextView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
@@ -39,6 +41,246 @@ import java.util.concurrent.Executor
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class MainActivityTest {
+    @Test
+    fun `native OIDC network failure stays on the recovery screen`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val origin = "http://127.0.0.1:1"
+        val grantStore =
+            object : OidcCredentialStorage {
+                override fun load(origin: String): OidcRefreshGrant? =
+                    OidcRefreshGrant("stored-grant", null)
+
+                override fun save(
+                    origin: String,
+                    grant: OidcRefreshGrant,
+                ) = Unit
+
+                override fun delete(origin: String) = Unit
+            }
+        val credentials =
+            OidcCredentials(
+                grantStore,
+                OidcPendingSignInStore(context),
+                executor = Executor { it.run() },
+            )
+        OidcCredentials::class.java.getDeclaredField("shared").apply {
+            isAccessible = true
+            set(null, credentials)
+        }
+        MainActivity.manifestReader = {
+            ServerManifest(
+                1.0,
+                ServerManifest.Auth(
+                    ServerManifest.Mode.OIDC,
+                    "ap_session",
+                    listOf(OidcRedirect.REDIRECT_URI),
+                ),
+            )
+        }
+        ServerStore(context).connect(origin)
+
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+
+        assertTrue(
+            activity.declared<ConnectionStatus?>(
+                "connectionStatus",
+            ) is ConnectionStatus.ServerUnreachable,
+        )
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        assertFalse(activity.isFinishing)
+    }
+
+    @Test
+    fun `reserved login ticket shows update instructions and keeps change server available`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(
+                    200,
+                    """{"ticket":"upgrade-required","login_url":"/auth/cli-upgrade"}""",
+                )
+            } else {
+                LocalHttpServer.Response(404)
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+            val webView = activity.webView()
+            webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+            val deadline = System.currentTimeMillis() + 10_000
+            while (activity.declared<ConnectionStatus?>(
+                    "connectionStatus",
+                ) !is ConnectionStatus.UpdateRequired &&
+                System.currentTimeMillis() < deadline
+            ) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(5)
+            }
+            assertTrue(
+                activity.declared<ConnectionStatus?>(
+                    "connectionStatus",
+                ) is ConnectionStatus.UpdateRequired,
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+            assertEquals(
+                activity.getString(R.string.status_update_required),
+                activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+            )
+            assertEquals(
+                activity.getString(R.string.status_how_to_update),
+                activity.findViewById<Button>(R.id.status_primary).text.toString(),
+            )
+            assertEquals(
+                activity.getString(R.string.status_change_server),
+                activity.findViewById<Button>(R.id.status_secondary).text.toString(),
+            )
+
+            activity.findViewById<Button>(R.id.status_primary).performClick()
+            assertEquals(
+                "${server.origin}/auth/cli-upgrade",
+                shadowOf(activity).nextStartedActivity.dataString,
+            )
+            activity.findViewById<Button>(R.id.status_secondary).performClick()
+            assertEquals(
+                ConnectActivity::class.java.name,
+                shadowOf(activity).nextStartedActivity.component?.className,
+            )
+        }
+    }
+
+    @Test
+    fun `unreachable server offers retry then a successful commit clears the screen`() {
+        var manifestReads = 0
+        MainActivity.manifestReader = {
+            manifestReads++
+            ServerManifest.BASELINE
+        }
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/chat/123"
+        webView.loadUrl(url)
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(url),
+            FakeWebResourceError(-6, "net::ERR_CONNECTION_REFUSED"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+
+        assertEquals(
+            activity.getString(R.string.status_server_unreachable),
+            activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+        )
+        assertEquals(
+            activity.getString(R.string.status_retry),
+            activity.findViewById<Button>(R.id.status_primary).text.toString(),
+        )
+        assertEquals(
+            activity.getString(R.string.status_change_server),
+            activity.findViewById<Button>(R.id.status_secondary).text.toString(),
+        )
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            webView.importantForAccessibility,
+        )
+        activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        val details = activity.findViewById<TextView>(R.id.status_details_text).text.toString()
+        assertTrue(details.contains("https://example.com"))
+        assertFalse(details.contains("/chat/123"))
+
+        activity.findViewById<Button>(R.id.status_primary).performClick()
+        assertEquals(2, manifestReads)
+        assertEquals(url, shadowOf(webView).lastLoadedUrl)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onPageCommitVisible(webView, url)
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `change server from failure opens setup and action Back finishes`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(url),
+            FakeWebResourceError(-6, "refused"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.onBackPressedDispatcher.onBackPressed()
+        assertTrue(activity.isFinishing)
+
+        val another = launch()
+        val anotherWebView = another.webView()
+        anotherWebView.webViewClient.onPageStarted(anotherWebView, url, null)
+        anotherWebView.webViewClient.onReceivedError(
+            anotherWebView,
+            request(url),
+            FakeWebResourceError(-6, "refused"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        another.findViewById<Button>(R.id.status_secondary).performClick()
+        assertEquals(
+            ConnectActivity::class.java.name,
+            shadowOf(another).nextStartedActivity.component?.className,
+        )
+    }
+
+    @Test
+    fun `a slow cold start offers change server and Back cancels`() {
+        val activity = launch()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10_500))
+
+        assertEquals(
+            activity.getString(R.string.status_still_trying, "example.\u200bcom"),
+            activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+        )
+        assertEquals(View.VISIBLE, activity.findViewById<Button>(R.id.status_secondary).visibility)
+        assertEquals(View.VISIBLE, activity.findViewById<Button>(R.id.status_cancel).visibility)
+
+        activity.onBackPressedDispatcher.onBackPressed()
+        assertEquals(
+            ConnectActivity::class.java.name,
+            shadowOf(activity).nextStartedActivity.component?.className,
+        )
+    }
+
+    @Test
+    fun `night configuration rebinds an expanded failure panel`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(url),
+            FakeWebResourceError(-6, "refused"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        val before = activity.declared<View>("connectionOverlay")
+        val dark =
+            Configuration(activity.resources.configuration).apply {
+                uiMode =
+                    (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                    Configuration.UI_MODE_NIGHT_YES
+            }
+
+        activity.onConfigurationChanged(dark)
+
+        assertNotSame(before, activity.declared<View>("connectionOverlay"))
+        assertEquals(
+            View.VISIBLE,
+            activity.findViewById<View>(R.id.status_details_content).visibility,
+        )
+        assertEquals(
+            activity.getString(R.string.status_server_unreachable),
+            activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+        )
+    }
+
     @Before
     fun readManifestsWithoutTheNetwork() {
         MainActivity.manifestReader = { ServerManifest.BASELINE }
@@ -49,6 +291,10 @@ class MainActivityTest {
     fun restoreManifestReader() {
         MainActivity.manifestReader = { ServerManifest.fetch(it) }
         MainActivity.oidcWorker = null
+        OidcCredentials::class.java.getDeclaredField("shared").apply {
+            isAccessible = true
+            set(null, null)
+        }
     }
 
     @Test
@@ -72,12 +318,13 @@ class MainActivityTest {
         // Nothing of the server loads; a prompt blanks the page underneath.
         assertTrue(shadowOf(activity.webView()).lastLoadedUrl in setOf(null, "about:blank"))
         assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
         // Still renewing, or asking: a relaunch never opens the browser by itself.
         assertTrue(
-            activity.declared<TextView>("connectionMessage").text.toString() in
+            activity.findViewById<TextView>(R.id.status_headline).text.toString() in
                 setOf(
                     activity.getString(R.string.oidc_signing_in),
-                    "Sign in to native.example.test to continue.",
+                    activity.getString(R.string.status_sign_in_required),
                 ),
         )
     }
@@ -114,12 +361,16 @@ class MainActivityTest {
     }
 
     @Test
-    fun `a server without native sign-in loads at once, uncovered`() {
+    fun `a server without native sign-in remains covered until page commit`() {
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
 
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
 
         assertEquals("https://example.com", shadowOf(activity.webView()).lastLoadedUrl)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        val webView = activity.webView()
+        webView.webViewClient.onPageStarted(webView, "https://example.com", null)
+        webView.webViewClient.onPageCommitVisible(webView, "https://example.com")
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
     }
 
@@ -434,11 +685,11 @@ class MainActivityTest {
             dead = rebuilt
         }
 
-        // Over budget: the live WebView shows the offline recovery page (no route
-        // reload), so the crash loop can't continue while recovery stays possible.
-        assertTrue(
-            "over-budget recovery must load the local error page, not the route",
-            shadowOf(dead).lastLoadDataWithBaseURL?.data?.contains("Reload") == true,
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertEquals(
+            activity.getString(R.string.status_crash_recovery),
+            activity.findViewById<TextView>(R.id.status_headline).text.toString(),
         )
     }
 
@@ -459,11 +710,11 @@ class MainActivityTest {
             dead = activity.webView()
         }
 
-        // The 4th crash exceeded the budget even though every cycle had a healthy
-        // load in between: the recovery page is shown, breaking the loop.
-        assertTrue(
-            "load-then-crash loop must still trip the budget",
-            shadowOf(dead).lastLoadDataWithBaseURL?.data?.contains("Reload") == true,
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertEquals(
+            activity.getString(R.string.status_crash_recovery),
+            activity.findViewById<TextView>(R.id.status_headline).text.toString(),
         )
     }
 
