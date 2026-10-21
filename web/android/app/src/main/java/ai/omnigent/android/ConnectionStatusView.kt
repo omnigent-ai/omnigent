@@ -57,6 +57,7 @@ internal class ConnectionStatusView(
     private val cancel: Button = scroll.findViewById(R.id.status_cancel)
     private var pendingRender: Runnable? = null
     private var pendingHide: Runnable? = null
+    private var hideDeadlineMillis = 0L
     private var fadeAnimator: ValueAnimator? = null
     private var firstRequestedAt = 0L
     private var lastShownAt = 0L
@@ -96,6 +97,7 @@ internal class ConnectionStatusView(
         detailsToggle.setOnClickListener {
             detailsExpanded = !detailsExpanded
             detailsContent.visibility = if (detailsExpanded) View.VISIBLE else View.GONE
+            detailsToggle.compoundDrawablesRelative[2]?.level = if (detailsExpanded) 1 else 0
         }
     }
 
@@ -108,6 +110,7 @@ internal class ConnectionStatusView(
         isHiding = false
         pendingHide?.let(::removeCallbacks)
         pendingHide = null
+        hideDeadlineMillis = 0L
         val generation = ++transitionGeneration
         fadeAnimator?.cancel()
         setActionsInteractive(false)
@@ -157,6 +160,41 @@ internal class ConnectionStatusView(
     }
 
     fun hide(onHidden: () -> Unit = {}) {
+        val remaining =
+            if (renderedState != null && ValueAnimator.areAnimatorsEnabled()) {
+                (500L - (SystemClock.uptimeMillis() - lastShownAt)).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+        hideUntil(SystemClock.uptimeMillis() + remaining, onHidden)
+    }
+
+    data class DeferredHide(
+        val state: ConnectionStatus,
+        val deadlineMillis: Long,
+    )
+
+    fun pendingHideSnapshot(): DeferredHide? =
+        if (pendingHide !=
+            null
+        ) {
+            renderedState?.let { DeferredHide(it, hideDeadlineMillis) }
+        } else {
+            null
+        }
+
+    fun restorePendingHide(
+        snapshot: DeferredHide,
+        onHidden: () -> Unit,
+    ) {
+        show(snapshot.state, immediate = true)
+        hideUntil(snapshot.deadlineMillis, onHidden)
+    }
+
+    private fun hideUntil(
+        deadlineMillis: Long,
+        onHidden: () -> Unit,
+    ) {
         isHiding = true
         setActionsInteractive(false)
         transitionGeneration++
@@ -164,13 +202,9 @@ internal class ConnectionStatusView(
         pendingRender = null
         pendingHide?.let(::removeCallbacks)
         pendingHide = null
-        val remaining =
-            if (renderedState != null && ValueAnimator.areAnimatorsEnabled()) {
-                (500L - (SystemClock.uptimeMillis() - lastShownAt)).coerceAtLeast(0L)
-            } else {
-                0L
-            }
+        val remaining = (deadlineMillis - SystemClock.uptimeMillis()).coerceAtLeast(0L)
         if (remaining > 0L) {
+            hideDeadlineMillis = deadlineMillis
             val deferred =
                 Runnable {
                     pendingHide = null
@@ -188,6 +222,7 @@ internal class ConnectionStatusView(
         content.visibility = View.GONE
         actions.visibility = View.GONE
         visibility = View.GONE
+        hideDeadlineMillis = 0L
         firstRequestedAt = 0L
         lastShownAt = 0L
         renderedState = null
@@ -271,6 +306,7 @@ internal class ConnectionStatusView(
         detailsPanel.visibility = if (details == null) View.GONE else View.VISIBLE
         detailsContent.visibility =
             if (details != null && detailsExpanded) View.VISIBLE else View.GONE
+        detailsToggle.compoundDrawablesRelative[2]?.level = if (detailsExpanded) 1 else 0
         if (details != null) bindDetails(details)
         bindAction(primary, presentation.primary, state)
         bindAction(secondary, presentation.secondary, state)
