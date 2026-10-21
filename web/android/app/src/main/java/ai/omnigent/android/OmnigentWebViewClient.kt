@@ -244,7 +244,8 @@ internal class OmnigentWebViewClient(
         handler.cancel()
         val url = error.url
         val mainFrameUrl = activeMainFrameUrl ?: view.url
-        if (url != mainFrameUrl || url == shellStoppedUrl || failedNavigation ||
+        if (!sameMainFrameUrl(url, mainFrameUrl) || sameMainFrameUrl(url, shellStoppedUrl) ||
+            failedNavigation ||
             !acceptedMainFrame(url)
         ) {
             return
@@ -260,6 +261,21 @@ internal class OmnigentWebViewClient(
                 else -> "SSL_INVALID"
             }
         onMainFrameSslError(view, reason)
+    }
+
+    private fun sameMainFrameUrl(
+        first: String?,
+        second: String?,
+    ): Boolean {
+        val firstUrl = first ?: return false
+        val secondUrl = second ?: return false
+        val origin = originOf(firstUrl) ?: return false
+        if (origin != originOf(secondUrl)) return false
+        val firstUri = Uri.parse(firstUrl)
+        val secondUri = Uri.parse(secondUrl)
+        val firstPath = firstUri.encodedPath.orEmpty().ifEmpty { "/" }
+        val secondPath = secondUri.encodedPath.orEmpty().ifEmpty { "/" }
+        return firstPath == secondPath && firstUri.encodedQuery == secondUri.encodedQuery
     }
 
     private fun acceptedMainFrame(url: String?): Boolean {
