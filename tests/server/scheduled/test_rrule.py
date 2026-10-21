@@ -239,7 +239,7 @@ def test_position_selection_consumes_work() -> None:
         next(iter_bounded(parsed, max_steps=4, max_seconds=1))
 
 
-def test_search_stops_at_elapsed_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_stops_at_cpu_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     from itertools import count
 
     for evaluate in (
@@ -248,9 +248,27 @@ def test_search_stops_at_elapsed_time_limit(monkeypatch: pytest.MonkeyPatch) -> 
     ):
         # Advance only the recurrence clock; no real delay or costly input is needed.
         ticks = count()
-        monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", ticks.__next__)
+        monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", ticks.__next__)
         with pytest.raises(RRuleValidationError, match="time limit"):
             evaluate("FREQ=DAILY")
+
+
+def test_search_time_limit_ignores_time_spent_off_cpu() -> None:
+    import time
+
+    from dateutil.rrule import rrulestr
+
+    from omnigent.server.scheduled._bounded_rrule import iter_bounded
+
+    # A stalled thread (loaded host, GIL wait, GC elsewhere) must not reject a valid rule.
+    parsed = rrulestr("FREQ=HOURLY", dtstart=_dt(2026, 1, 1))
+    occurrences = []
+    for occurrence in iter_bounded(parsed, max_steps=100, max_seconds=0.05):
+        occurrences.append(occurrence)
+        if len(occurrences) == 3:
+            break
+        time.sleep(0.1)
+    assert occurrences == [_dt(2026, 1, 1, hour) for hour in range(3)]
 
 
 def test_yearly_leap_day_rule_is_supported() -> None:
