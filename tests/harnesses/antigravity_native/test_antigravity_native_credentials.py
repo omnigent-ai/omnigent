@@ -257,10 +257,14 @@ def test_agy_cli_reports_invalid_credentials_without_crash_reporting(
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])
 @pytest.mark.parametrize("compatible", [True, False])
+@pytest.mark.parametrize("legacy_key", [False, True], ids=["oauth", "legacy-key"])
 def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
-    monkeypatch, tmp_path, kind, compatible
+    monkeypatch, tmp_path, kind, compatible, legacy_key
 ):
-    from omnigent.onboarding.provider_config import default_provider_for_harness
+    from omnigent.onboarding.provider_config import (
+        default_provider_for_harness,
+        set_default_provider,
+    )
 
     config = {
         "providers": {
@@ -277,11 +281,28 @@ def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
             }
         }
     }
+    if legacy_key:
+        secrets.store_secret("legacy", "legacy-key")
+        config["antigravity"] = {"api_key_ref": "keychain:legacy"}
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))
     before = path.read_bytes()
     monkeypatch.setattr("omnigent.onboarding.gemini_auth.gemini_login_detected", lambda: True)
     assert default_provider_for_harness(config, "native-codex").name == "existing"
+    assert default_provider_for_harness(config, "antigravity-native") is None
+    assert antigravity_credentials_ready()
+    expected_env = (
+        {"GEMINI_API_KEY": "legacy-key", "GOOGLE_GEMINI_BASE_URL": GEMINI_API_BASE_URL}
+        if legacy_key
+        else {}
+    )
+    assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == expected_env
+    assert path.read_bytes() == before
+
+    # Selecting Gemini explicitly activates the gateway without disturbing Codex.
+    config["providers"] = set_default_provider(config["providers"], "existing", "gemini")
+    path.write_text(yaml.safe_dump(config))
+    before = path.read_bytes()
     if compatible:
         _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
         assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
@@ -292,7 +313,7 @@ def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
     # Remove only Gemini's default to recover OAuth without changing Codex routing.
     config["providers"]["existing"]["default"] = ["openai"]
     path.write_text(yaml.safe_dump(config))
-    assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == {}
+    assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == expected_env
     assert default_provider_for_harness(config, "native-codex").name == "existing"
 
 
@@ -345,11 +366,19 @@ def test_cli_and_readiness_handle_malformed_databricks_profile(
     assert not antigravity_credentials_ready()
 
 
-def test_host_setup_hint_falls_back_for_unexpected_credential_error(monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [
+        OmnigentError("private-error-marker", code=ErrorCode.INTERNAL_ERROR),
+        OSError("private-error-marker"),
+        ValueError("private-error-marker"),
+    ],
+)
+def test_host_setup_hint_falls_back_for_unexpected_credential_error(monkeypatch, error):
     from omnigent.onboarding.harness_install import harness_setup_hint
 
     def fail():
-        raise OmnigentError("private-error-marker", code=ErrorCode.INTERNAL_ERROR)
+        raise error
 
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.credentials.resolve_antigravity_credentials", fail

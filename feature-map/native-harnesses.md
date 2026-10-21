@@ -207,15 +207,12 @@ OpenAI Responses and Chat Completions endpoints are not supported.
 `tests/e2e_ui/shells/test_antigravity_gateway_setup.py` owns fresh daemon/host
 processes and a fake Gemini upstream. With agy and tmux installed, run
 `OMNIGENT_E2E_ANTIGRAVITY=mock uv run pytest tests/e2e_ui/shells/test_antigravity_gateway_setup.py --ui-skip-build`.
-The journeys check setup, browser replies, a file tool, recall after reload, and repair guidance
-when saved credentials become invalid after host connection. They do not prove
-compatibility with a live external gateway. See [the gateway guide](../docs/native-agy-gateways.md)
-for live setup, tool, and resume smoke steps. The gateway browser journey also
-stops its own agy terminal, clicks **Resume session**, and sends another recall
-turn. It checks that prior message and tool IDs remain unchanged and only the
-new turn is appended. The reader/server regression
-`tests/server/integration/test_sessions_external_item_idempotency.py::test_agy_reader_restart_preserves_messages_and_tool_pairs`
-covers replay, repeated user text and distinct cascades without a live model.
+The journeys check setup, file tools, reload/recall, process resume without
+duplicate history, and browser repair guidance. They use simulated upstreams;
+live external-gateway compatibility remains unverified. See [the gateway
+guide](../docs/native-agy-gateways.md) for live smoke steps.
+The reader/server replay regression is
+`tests/server/integration/test_sessions_external_item_idempotency.py::test_agy_reader_restart_preserves_messages_and_tool_pairs`.
 
 Cross-harness journeys:
 

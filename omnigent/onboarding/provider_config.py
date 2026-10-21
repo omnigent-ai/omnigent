@@ -5,7 +5,8 @@ endpoint (a vendor API key, a subscription CLI login, a gateway like
 OpenRouter, a local Ollama, or a Databricks profile), the ``providers:``
 block in ``~/.omnigent/config.yaml`` is the source of truth for the
 active model selection. Defaults are **per family**: a provider marked
-**``default: true``** is the default for the family/families it serves,
+**``default: true``** is the default for the family/families it serves
+(gateway/local Gemini routing requires an explicit ``default: gemini`` scope),
 so a Claude (``anthropic``) default and a Codex (``openai``) default
 coexist (at most one default per family). This mirrors how multi-model
 tools key defaults by purpose — Zed's per-feature model pointers,
@@ -1062,6 +1063,12 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             code=ErrorCode.INVALID_INPUT,
         )
     served_for_default = set(families)
+    if kind in {GATEWAY_KIND, LOCAL_KIND} and (
+        default_raw is True
+        or (isinstance(default_raw, str) and default_raw.strip().lower() == "true")
+    ):
+        # Legacy gateway/local Gemini blocks must not take over agy on upgrade.
+        served_for_default.discard(GEMINI_FAMILY)
     return ProviderEntry(
         name=name,
         kind=kind,
@@ -1689,14 +1696,17 @@ def set_default_provider(
             result[provider_name] = entry
             continue
         parsed = _parse_provider(provider_name, entry)
-        served = provider_families(parsed)
+        served = set(provider_families(parsed))
+        if parsed.kind in {GATEWAY_KIND, LOCAL_KIND}:
+            # Preserve Gemini's explicit opt-in when serializing new defaults.
+            served.discard(GEMINI_FAMILY)
         if provider_name == name:
             new_defaults = parsed.default_families | scope
         else:
             # Other providers lose exactly the scoped family/families.
             new_defaults = parsed.default_families - scope
         body = {k: v for k, v in entry.items() if k != "default"}
-        raw_value = _default_raw_value(new_defaults, set(served))
+        raw_value = _default_raw_value(new_defaults, served)
         if raw_value is not None:
             body["default"] = raw_value
         result[provider_name] = body

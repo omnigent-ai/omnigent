@@ -308,10 +308,14 @@ async def test_supervisor_closes_gateway_when_real_child_exits(monkeypatch, tmp_
     source = SimpleNamespace(workspace_url="https://workspace.example", resolve=lambda: "token")
     monkeypatch.setattr(gateway_module, "databricks_token_source", lambda _: source)
     monkeypatch.setattr(gateway_module, "discover_databricks_gemini_models", lambda *a: ("model",))
+    monkeypatch.setenv("DATABRICKS_TOKEN", "private-ambient-token")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "private-ambient-secret")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_TOKEN", "private-ambient-omni-token")
     endpoint_file = tmp_path / "endpoint"
     child_code = """
 import os, sys, urllib.request, urllib.error
 from pathlib import Path
+assert not any(key.startswith(('DATABRICKS_', 'OMNIGENT_DATABRICKS_')) for key in os.environ)
 url = os.environ['GOOGLE_GEMINI_BASE_URL']
 Path(sys.argv[1]).write_text(url)
 request = urllib.request.Request(url + '/unsupported', data=b'{}', headers={
@@ -332,7 +336,8 @@ sys.exit(7)
 
 
 @pytest.mark.asyncio
-async def test_proxy_preserves_tool_payload_stream_and_refreshes_token() -> None:
+@pytest.mark.parametrize("upstream_status", [200, 401, 429])
+async def test_proxy_preserves_tool_payload_stream_and_refreshes_token(upstream_status) -> None:
     now = [0.0]
     tokens = iter(["first-token", "refreshed-token"])
     source = DatabricksProfileTokenProvider(
@@ -348,6 +353,9 @@ async def test_proxy_preserves_tool_payload_stream_and_refreshes_token() -> None
         b'[{"text":"ok","thoughtSignature":"opaque"}]}}]}\n\n'
     )
 
+    if upstream_status != 200:
+        stream = b'{"error":{"message":"upstream error"}}'
+
     class Chunks(httpx.AsyncByteStream):
         async def __aiter__(self):
             yield stream[:20]
@@ -355,7 +363,15 @@ async def test_proxy_preserves_tool_payload_stream_and_refreshes_token() -> None
 
     async def handle(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Chunks())
+        return httpx.Response(
+            upstream_status,
+            headers={
+                "content-type": "text/event-stream"
+                if upstream_status == 200
+                else "application/json"
+            },
+            stream=Chunks(),
+        )
 
     payload = json.dumps(
         {
@@ -389,7 +405,7 @@ async def test_proxy_preserves_tool_payload_stream_and_refreshes_token() -> None
                     headers={"x-goog-api-key": gateway.key},
                     content=payload,
                 )
-                assert response.status_code == 200
+                assert response.status_code == upstream_status
                 assert response.content == stream
             for path, headers, status in [
                 ("/v1beta/models/gemini-3.1-pro-preview:generateContent", {}, 401),
@@ -481,3 +497,48 @@ async def test_gateway_failure_is_sanitized(failure, caplog):
     assert "databricks auth login" in caplog.text
     assert "private-" not in caplog.text + response.text
     assert not any(record.exc_info for record in caplog.records)
+
+
+@pytest.mark.parametrize("expected_error", [False, True])
+def test_gateway_startup_failure_is_sanitized(monkeypatch, capsys, expected_error):
+    from omnigent.errors import OmnigentError
+    from omnigent.harnesses.antigravity_native import gateway
+
+    async def fail(*args):
+        if expected_error:
+            raise OmnigentError("Run omni setup to repair the selected profile.")
+        raise ValueError("private-startup-token https://private-workspace.example")
+
+    monkeypatch.setattr(gateway, "run", fail)
+    monkeypatch.setattr(sys, "argv", ["gateway", "--profile", "test", "--", "agy"])
+    with pytest.raises(SystemExit) as exit_info:
+        gateway.main()
+    assert exit_info.value.code == 1
+    stderr = capsys.readouterr().err
+    assert "Cannot start the Databricks Gemini gateway" in stderr
+    assert "private-" not in stderr
+    assert "Traceback" not in stderr
+    if expected_error:
+        assert "Run omni setup" in stderr
+
+
+def test_gateway_startup_without_models_does_not_launch_child(monkeypatch, capsys):
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.antigravity_native import gateway
+
+    source = SimpleNamespace(workspace_url="https://workspace.example", resolve=lambda: "token")
+    monkeypatch.setattr(gateway, "databricks_token_source", lambda _: source)
+    monkeypatch.setattr(gateway, "discover_databricks_gemini_models", lambda *args: ())
+    child = AsyncMock()
+    monkeypatch.setattr(
+        gateway,
+        "asyncio",
+        SimpleNamespace(**{**vars(gateway.asyncio), "create_subprocess_exec": child}),
+    )
+    monkeypatch.setattr(sys, "argv", ["gateway", "--profile", "test", "--", "agy"])
+    with pytest.raises(SystemExit) as exit_info:
+        gateway.main()
+    assert exit_info.value.code == 1
+    assert "no Gemini model services" in capsys.readouterr().err
+    child.assert_not_called()

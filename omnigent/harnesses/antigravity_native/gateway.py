@@ -22,6 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.antigravity_native.credentials import databricks_token_source
 from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
 from omnigent.models.databricks_model_discovery import discover_databricks_gemini_models
@@ -129,7 +130,10 @@ async def run(profile: str, argv: list[str]) -> int:
         discover_databricks_gemini_models, source.workspace_url, token
     )
     if not models:
-        raise ValueError("The selected Databricks profile exposes no Gemini model services.")
+        raise OmnigentError(
+            "The selected Databricks profile exposes no Gemini model services.",
+            code=ErrorCode.INVALID_INPUT,
+        )
     timeout = httpx.Timeout(connect=15, read=None, write=60, pool=15)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
         gateway = GeminiDatabricksGateway(source, models, client)
@@ -149,7 +153,11 @@ async def run(profile: str, argv: list[str]) -> int:
                             raise RuntimeError("Gemini gateway did not start")
                         await asyncio.sleep(0.01)
                 env = {
-                    **os.environ,
+                    **{
+                        key: value
+                        for key, value in os.environ.items()
+                        if not key.startswith(("DATABRICKS_", "OMNIGENT_DATABRICKS_"))
+                    },
                     "GEMINI_API_KEY": gateway.key,
                     GEMINI_BASE_URL_ENV: f"http://127.0.0.1:{port}",
                 }
@@ -201,8 +209,15 @@ def main() -> None:
         parser.error("an agy command is required")
     try:
         code = asyncio.run(run(args.profile, command))
-    except Exception as exc:
-        print(f"Cannot start the Databricks Gemini gateway: {exc}", file=sys.stderr)
+    except OmnigentError as exc:
+        print(f"Cannot start the Databricks Gemini gateway: {exc.message}", file=sys.stderr)
+        code = 1
+    except Exception:
+        print(
+            "Cannot start the Databricks Gemini gateway. "
+            "Check workspace connectivity and profile authentication.",
+            file=sys.stderr,
+        )
         code = 1
     raise SystemExit(code)
 

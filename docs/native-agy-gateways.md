@@ -140,6 +140,11 @@ The Databricks option uses the separate native Gemini route. Availability throug
 Responses alone is insufficient: the native route and models must be accessible
 to the selected profile. Support must be verified in your workspace.
 
+Setup verifies profile authentication. Gemini model availability is checked
+when agy starts; a profile with no accessible Gemini services cannot launch a
+session. The model catalog is discovered once at startup. Start a new session
+to pick up models added later.
+
 If OAuth refresh fails, run `databricks auth login --profile work` again in the
 same environment. `DATABRICKS_AUTH_STORAGE=plaintext` is not required by
 Omnigent; some CLI versions use it to access an older file credential cache.
@@ -149,17 +154,21 @@ existing local host daemon after changing its authentication environment.
 
 ## Select and verify the connection
 
-On upgrade, a `gemini:` block in an existing `kind: gateway` or `kind: local`
-provider becomes usable by native agy. If that provider has `default: true`,
-Gemini is included in its defaults and takes precedence over agy OAuth. An
-incompatible URL fails with a setup error rather than falling back to OAuth.
-Update it to a native Gemini API root, or replace `default: true` with an explicit
-list of its other families (for example `default: [anthropic, openai]`) in
-`config.yaml`. Excluding Gemini restores OAuth for new sessions while preserving
-the other harness defaults. You can also select another Gemini default in setup. If activation creates a
-conflict with an existing Gemini default, setup first asks which provider to
-keep as the Gemini default. Other provider scopes and credentials are preserved.
-Canceling leaves that conflict unresolved and does not select a provider.
+Existing gateway/local providers keep their pre-upgrade routing: `default: true`
+does not activate a `gemini:` block for native agy. Select **Make default for
+Gemini** in setup, or explicitly include `gemini` in the default scope (for
+example `default: [anthropic, openai, gemini]`). Setup preserves the other
+families when selecting Gemini and writes an explicit scope. Until then,
+existing Gemini-key, legacy-key, ambient-key, and OAuth routing stays in effect.
+
+An explicitly selected Gemini provider with an incompatible URL fails with a
+repair hint; it does not silently fall back to another identity. If two
+providers explicitly claim Gemini, setup first asks which default to keep.
+Canceling leaves the conflict unresolved without rewriting the configuration.
+
+New Gemini-only gateway entries and Databricks `native_gemini` entries are not
+compatible with older Omnigent versions that lack this feature. Before
+downgrading, remove those new entries or restore your previous configuration.
 
 Setup does not automatically save a detected Gemini key whose companion
 `GOOGLE_GEMINI_BASE_URL` is incompatible. Correct that environment variable and

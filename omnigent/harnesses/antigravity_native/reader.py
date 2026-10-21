@@ -1894,8 +1894,7 @@ def _is_settled(step: dict[str, object]) -> bool:
     A step is settled when re-emitting it can produce nothing new, so recording
     its identity in ``seen`` will not drop later content:
 
-    * a USER_INPUT step (always terminal; maps to ``[]`` permanently — the user
-      turn is persisted by the direct ``POST /events``);
+    * a USER_INPUT step (always terminal; maps to one user message);
     * any step whose ``status`` is terminal — DONE (the mapper emits its content)
       or ERROR (the command failed before producing output, so none is coming).
 

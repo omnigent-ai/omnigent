@@ -565,8 +565,10 @@ def _family_credential_label(  # type: ignore[explicit-any]  # config is a yaml-
     :returns: A human label, e.g. ``"Anthropic API Key ($ANTHROPIC_API_KEY)"``
         when disambiguation applies, else ``"Anthropic API Key"``.
     """
-    from omnigent.onboarding.provider_config import KEY_KIND
+    from omnigent.onboarding.provider_config import GATEWAY_KIND, GEMINI_FAMILY, KEY_KIND
 
+    if family == GEMINI_FAMILY and entry.kind == GATEWAY_KIND:
+        return name
     base = _credential_label(name, entry)
     if entry.kind != KEY_KIND or _family_key_count(config, family) <= 1:
         return base
@@ -1038,6 +1040,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             return None
         name = f"databricks-gemini-{profile}"
         entry = {**build_databricks_provider_entry(profile), "native_gemini": True}
+        console.print("  Gemini model availability is checked when agy starts.")
 
     else:  # databricks
         # Gate on the `databricks` extra: a `kind: databricks` provider mints

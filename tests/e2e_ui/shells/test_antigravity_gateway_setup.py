@@ -50,6 +50,10 @@ def _wait(check, message: str, timeout: float = 90):
 def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tmp_path: Path, databricks: bool, page, built_spa
 ) -> None:
+    """Read a file, reload/recall, then stop and resume the owned terminal.
+
+    Earlier message/tool IDs stay unchanged and only the new turn is appended.
+    """
     from playwright.sync_api import expect
 
     assert shutil.which("agy") and shutil.which("tmux"), "install agy and tmux"

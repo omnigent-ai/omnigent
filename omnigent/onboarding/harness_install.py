@@ -732,6 +732,8 @@ def harness_setup_hint(harness: str | None) -> str:
                 return (
                     exc.message + " Run omni setup on the host to repair the Gemini configuration."
                 )
+        except (OSError, ValueError):
+            pass
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:

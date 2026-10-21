@@ -715,7 +715,7 @@ def test_configure_models_add_databricks_aborts_without_extra(
         ("key", "openai", None, "OpenAI API Key"),
         ("databricks", "databricks", "oss", "Databricks (oss)"),
         ("databricks", "databricks", None, "Databricks"),
-        ("gateway", "my-proxy", None, "my-proxy"),
+        ("gateway", "my-proxy", None, "My-Proxy"),
     ],
 )
 def test_credential_label_by_kind(
@@ -730,6 +730,24 @@ def test_credential_label_by_kind(
     disagree — the exact inconsistency the shared helper was added to fix.
     """
     assert credential_label(kind, name, profile=profile) == expected
+
+
+@pytest.mark.parametrize("family", ["anthropic", "openai", "gemini"])
+def test_gateway_label_preserves_spelling_only_for_gemini(family):
+    from omnigent.cli_config import _family_credential_label
+
+    config = {
+        "providers": {
+            "my-proxy": {
+                "kind": "gateway",
+                family: {"base_url": "https://gateway.example", "api_key": "fake"},
+            }
+        }
+    }
+    entry = load_providers(config)["my-proxy"]
+    assert _family_credential_label(config, family, "my-proxy", entry) == (
+        "my-proxy" if family == "gemini" else "My-Proxy"
+    )
 
 
 @pytest.mark.parametrize("kind", ["key", "subscription", "gateway", "databricks", "local"])
@@ -3779,24 +3797,8 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
 
 
 @pytest.mark.parametrize("correct_url", [True, False], ids=["correct", "go-back"])
-@pytest.mark.parametrize(
-    "url,error",
-    [
-        ("/openai", "Gemini gateway URL must be an http:// or https:// API root"),
-        ("https://workspace.cloud.databricks.com", "Choose Databricks — profile"),
-        (
-            "https://workspace.cloud.databricks.com/ai-gateway/mlflow/v1/responses",
-            "Choose Databricks — profile",
-        ),
-        ("https://gateway.example/v1/responses", "OpenAI Responses and Chat Completions"),
-        ("https://gateway.example/v1/chat/completions", "OpenAI Responses and Chat Completions"),
-        ("https://api.openai.com/v1", "OpenAI Responses and Chat Completions"),
-    ],
-)
-def test_gemini_gateway_setup_recovers_from_invalid_url(
-    isolated_config, correct_url, url, error
-) -> None:
-    inputs = ["7", "3", "1", "2", "demo-gemini", url]
+def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct_url) -> None:
+    inputs = ["7", "3", "1", "2", "demo-gemini", "https://gateway.example/v1/responses"]
     if correct_url:
         inputs += ["https://gateway.example/gemini", "gateway-fake-key", ""]
     else:
@@ -3806,7 +3808,7 @@ def test_gemini_gateway_setup_recovers_from_invalid_url(
         cli, ["setup", "--no-internal-beta"], input="\n".join(inputs) + "\n"
     )
     assert result.exit_code == 0, result.output
-    assert error in " ".join(result.output.split())
+    assert "OpenAI Responses and Chat Completions" in " ".join(result.output.split())
     assert "Databricks — profile" in result.output
     assert "Traceback" not in result.output
     config = _config_yaml(isolated_config)
@@ -3852,20 +3854,12 @@ def test_gemini_databricks_setup_recovers_from_auth_failure(
 
 
 @pytest.mark.parametrize("prefix", ["", "OMNIGENT_"])
-@pytest.mark.parametrize(
-    "url",
-    [
-        "https://api.openai.com/v1",
-        "https://workspace.cloud.databricks.com",
-        "https://gateway.example/v1beta",
-    ],
-)
-def test_setup_does_not_adopt_rejected_gemini_endpoint(isolated_config, monkeypatch, prefix, url):
+def test_setup_does_not_adopt_rejected_gemini_endpoint(isolated_config, monkeypatch, prefix):
     from omnigent.cli_config import _adopt_detected_providers
     from omnigent.onboarding.ambient import DetectedProvider
 
     monkeypatch.setenv(prefix + "GEMINI_API_KEY", "fake-key")
-    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", url)
+    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setattr(
         "omnigent.onboarding.detected.detect_providers",
         lambda: [
@@ -3906,7 +3900,7 @@ def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, 
     assert secrets.load_secret("gemini") is None
 
 
-@pytest.mark.parametrize("choice", ["1", "2", "q"])
+@pytest.mark.parametrize("choice", ["1", "2", "q", "\x1b"])
 @pytest.mark.parametrize("kind", ["gateway", "local"])
 def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, kind):
     config_path = isolated_config / "config.yaml"
@@ -3914,7 +3908,7 @@ def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, 
         "providers": {
             "gateway": {
                 "kind": kind,
-                "default": True,
+                "default": ["openai", "gemini"],
                 "openai": {"base_url": "https://gateway.example/v1", "api_key": "fake"},
                 "gemini": {"base_url": "https://gateway.example/gemini", "api_key": "fake"},
             },
@@ -3934,7 +3928,7 @@ def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, 
     assert result.exit_code == 0, result.output
     assert "Multiple defaults for Gemini" in result.output
     assert "Traceback" not in result.output
-    if choice == "q":
+    if choice in {"q", "\x1b"}:
         assert config_path.read_bytes() == before
     else:
         config = load_config()

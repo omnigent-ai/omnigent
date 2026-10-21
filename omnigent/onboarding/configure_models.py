@@ -342,8 +342,8 @@ def credential_label(
     surface — the ``configure harness`` menus/listing and the ``/model``
     REPL readout — so a subscription always reads as ``"Subscription"``
     (never the raw ``"claude"`` / brand name), a vendor key names the
-    vendor + ``"API Key"``, and Databricks names its profile. Custom gateway
-    labels keep their original spelling. Pair with :func:`kind_glyph` for
+    vendor + ``"API Key"``, and Databricks names its profile.
+    Pair with :func:`kind_glyph` for
     the glyph prefix.
 
     :param kind: The provider kind, e.g. ``"key"``, ``"subscription"``,
@@ -368,8 +368,6 @@ def credential_label(
         return "Subscription"
     if kind == DATABRICKS_KIND:
         return f"Databricks ({profile})" if profile else "Databricks"
-    if kind == GATEWAY_KIND:
-        return provider_name
     if kind == CLI_CONFIG_KIND:
         # Use the entry name (e.g. "isaac-databricks-codex" → "Isaac-Databricks-Codex")
         # so cli-config providers show consistently alongside other provider kinds.
@@ -553,9 +551,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     :returns: The surfaces this option can configure — a subset of
         ``{"anthropic", "openai", "gemini", "pi"}``.
     """
-    if opt.kind == GATEWAY_KIND:
-        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
-    if opt.kind == DATABRICKS_KIND:
+    if opt.kind in {GATEWAY_KIND, DATABRICKS_KIND}:
         return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic

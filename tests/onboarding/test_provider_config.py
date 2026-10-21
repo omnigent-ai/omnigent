@@ -440,6 +440,13 @@ def test_gateway_local_serves_declared_gemini_surface(kind: str) -> None:
     assert default_provider_for_harness(config, "antigravity-native") == entry
     assert default_provider_for_harness(config, "claude-native") is None
     assert default_provider_for_harness(config, "pi") is None
+    for legacy_default in (True, "true"):
+        raw["default"] = legacy_default
+        assert default_provider_for_harness(config, "antigravity-native") is None
+        assert default_provider_for_harness(config, "claude-native").name == "gw"
+    config["providers"] = set_default_provider(config["providers"], "gw", GEMINI_FAMILY)
+    assert default_provider_for_harness(config, "antigravity-native").name == "gw"
+    assert default_provider_for_harness(config, "claude-native").name == "gw"
 
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])
@@ -447,7 +454,7 @@ def test_gemini_only_gateway_local_defaults_native_agy_only(kind: str) -> None:
     raw = {
         "kind": kind,
         "gemini": {"base_url": "https://gw/gemini", "api_key_ref": "env:G"},
-        "default": True,
+        "default": ["gemini"],
     }
     config = {"providers": {"gw": raw}}
     entry = load_providers(config)["gw"]
