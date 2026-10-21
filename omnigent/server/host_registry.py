@@ -186,6 +186,16 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
 
 
+def _fail_pending_worktrees(conn: HostConnection) -> None:
+    """Fail worktree requests as soon as their host disappears."""
+    for pending in (
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+    ):
+        _fail_pending_inventory(pending, conn.host_id)
+
+
 # How long a runner exit report stays answerable, and how many are kept.
 # Reports only matter while a client is still waiting for the runner to
 # come online (a 60s window today); 10 minutes covers slow retries with
@@ -616,6 +626,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_worktrees(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
                 self._interactive_shells[host_id] = normalize_interactive_shells(
@@ -665,6 +676,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_worktrees(removed)
         return True
 
     def mark_frame_seen(self, conn: HostConnection) -> bool:

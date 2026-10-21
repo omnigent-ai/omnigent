@@ -37,11 +37,15 @@ from omnigent.host.connect import (
     run_host_process,
 )
 from omnigent.host.frames import (
+    CAP_WORKTREE_CREATE_BUDGET,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
+    HostCreateWorktreeFrame,
+    HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
@@ -83,6 +87,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
@@ -3750,6 +3755,62 @@ def test_host_subprocess_op_guard_is_reentrant_and_balanced(tmp_path: Path) -> N
             assert host._owned_subprocess_ops == 1
             raise RuntimeError("worktree op blew up")
     assert host._owned_subprocess_ops == 0, "guard leaked a ref on exception — reaper wedged"
+
+
+@pytest.mark.parametrize(
+    ("frame_timeout_s", "expected_timeout_s"),
+    [(1234.0, 1234.0), (None, 120.0)],
+    ids=["server-budget", "legacy-server"],
+)
+async def test_handle_create_worktree_uses_server_budget_or_legacy_bound(
+    monkeypatch: pytest.MonkeyPatch, frame_timeout_s: float | None, expected_timeout_s: float
+) -> None:
+    """The host spends the budget the server sent, or stays within an older server's deadline."""
+    host = _make_host_process()
+    captured: dict[str, object] = {}
+
+    def _fake_create_worktree(**kwargs: object) -> CreatedWorktree:
+        captured.update(kwargs)
+        return CreatedWorktree(worktree_path="/wt", branch="feature/login", workspace="/wt")
+
+    monkeypatch.setattr("omnigent.host.connect.create_worktree", _fake_create_worktree)
+
+    result = await host._handle_create_worktree(
+        HostCreateWorktreeFrame(
+            request_id="r1",
+            repo_path="/repo",
+            branch_name="feature/login",
+            timeout_s=frame_timeout_s,
+        )
+    )
+
+    assert isinstance(result, HostCreateWorktreeResultFrame)
+    assert result.status == "ok"
+    assert captured["timeout_s"] == expected_timeout_s
+    # The server outwaits the budget only for hosts that advertise honouring it.
+    assert CAP_WORKTREE_CREATE_BUDGET in HOST_CAPABILITIES
+
+
+async def test_handle_create_worktree_replies_on_filesystem_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filesystem error fails the request at once instead of leaving the server waiting."""
+    host = _make_host_process()
+
+    def _fail_create_worktree(**kwargs: object) -> CreatedWorktree:
+        raise PermissionError(13, "Permission denied", "/repo-worktrees")
+
+    monkeypatch.setattr("omnigent.host.connect.create_worktree", _fail_create_worktree)
+
+    result = await host._handle_create_worktree(
+        HostCreateWorktreeFrame(request_id="r1", repo_path="/repo", branch_name="feature/login")
+    )
+
+    assert isinstance(result, HostCreateWorktreeResultFrame)
+    assert result.request_id == "r1"
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "Permission denied" in result.error
 
 
 def test_reap_orphans_is_noop_without_wnohang(
