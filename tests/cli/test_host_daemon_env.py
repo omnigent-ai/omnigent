@@ -31,6 +31,12 @@ _PROXY_ENV: Final = {
     "https_proxy": "http://lower-https-proxy.example.com:3128",
     "all_proxy": "socks5://lower-proxy.example.com:1080",
     "no_proxy": "localhost,127.0.0.2",
+    "Http_Proxy": "http://mixed-http-proxy.example.com:3128",
+    "Https_Proxy": "http://mixed-https-proxy.example.com:3128",
+    "All_Proxy": "http://mixed-proxy.example.com:3128",
+    "No_Proxy": "direct.example.com",
+    "HTTP_proxy": "",
+    "NO_proxy": "",
 }
 
 
@@ -160,6 +166,7 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "corp")
     monkeypatch.setenv("OPENAI_API_KEY", "local-provider-secret")
+    monkeypatch.setenv("UNRELATED_PROXY", "private-value")
 
     # When
     env = _build_host_daemon_env(server_url=server_url)
@@ -168,6 +175,7 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     assert {name: env.get(name) for name in _PROXY_ENV} == _PROXY_ENV
     assert env["DATABRICKS_CONFIG_PROFILE"] == "corp"
     assert ("OPENAI_API_KEY" in env) is keeps_provider_secret
+    assert "UNRELATED_PROXY" not in env
 
 
 def test_runner_env_excludes_proxy_vars_by_default() -> None:
@@ -192,7 +200,7 @@ def test_runner_env_excludes_proxy_vars_by_default() -> None:
 def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
     """Runner proxy forwarding remains opt-in through the existing passthrough."""
     # Given
-    explicit_names = {"HTTPS_PROXY", "http_proxy"}
+    explicit_names = {"HTTPS_PROXY", "http_proxy", "Http_Proxy", "HTTP_proxy", "NO_proxy"}
     base_env = {
         "PATH": "/usr/bin",
         **_PROXY_ENV,
