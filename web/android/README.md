@@ -164,8 +164,9 @@ connections, with **Clear Session Cookie** and **Clear Refresh Token**.
 
 #### Native connection/status screen
 
-Build `./gradlew assembleDebug -PapplicationIdSuffix=.dev` and install
-`app/build/outputs/apk/debug/app-debug.apk` on an isolated emulator. Save a
+Build `./gradlew assembleDebug` and install
+`app/build/outputs/apk/debug/app-debug.apk` on an isolated emulator. The upstream
+debug build installs as `ai.omnigent.android`. Save a
 local server URL on the Connect screen, then cold-start the app. Connecting
 should remain visible until the server's main page commits. Stop the server,
 relaunch, and verify the native “Can’t reach the server” screen has **Retry**,

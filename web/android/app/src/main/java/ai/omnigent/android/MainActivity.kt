@@ -1212,6 +1212,7 @@ class MainActivity : AppCompatActivity() {
             val parent = connectionOverlay.parent as? ViewGroup
             val index = parent?.indexOfChild(connectionOverlay) ?: -1
             val expanded = connectionOverlay.detailsExpanded
+            val deferredHide = connectionOverlay.pendingHideSnapshot()
             parent?.removeView(connectionOverlay)
             connectionOverlay = ConnectionStatusView(this, ::handleStatusAction)
             if (parent != null && index >= 0) parent.addView(connectionOverlay, index)
@@ -1223,6 +1224,16 @@ class MainActivity : AppCompatActivity() {
                 )
             }
                 ?: run {
+                    if (deferredHide != null) {
+                        val rebuiltOverlay = connectionOverlay
+                        rebuiltOverlay.restorePendingHide(deferredHide) {
+                            if (connectionOverlay === rebuiltOverlay && connectionStatus == null) {
+                                webView.importantForAccessibility =
+                                    View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+                            }
+                        }
+                        return
+                    }
                     connectionOverlay.visibility = View.GONE
                     webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
                 }
