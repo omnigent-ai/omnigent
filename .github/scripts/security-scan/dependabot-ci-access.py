@@ -16,8 +16,12 @@ from maintainer_approval import gh_json, paginated
 
 
 def main() -> int:
-    repository, number, head = os.environ["REPO"], int(os.environ["PR"]), os.environ["HEAD_SHA"]
     try:
+        repository, number, head = (
+            os.environ["REPO"],
+            int(os.environ["PR"]),
+            os.environ["HEAD_SHA"],
+        )
         pull = gh_json(["api", f"repos/{repository}/pulls/{number}"])
         require(
             pull["user"]["login"] == "dependabot[bot]" and pull["user"]["type"] == "Bot",

@@ -68,6 +68,9 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Compute the shard matrix once. A skipped run (draft / fork pull_request)
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.

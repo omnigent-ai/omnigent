@@ -437,7 +437,14 @@ def test_web_can_upgrade_without_changing_another_consumers_old_version(evaluate
 
 
 @pytest.mark.parametrize(
-    "selector", ["picocolors", "picocolors@>=1.0.0 <2.0.0", "clsx>picocolors"]
+    "selector",
+    [
+        "picocolors",
+        "picocolors@>=1.0.0 <2.0.0",
+        "clsx>picocolors",
+        "clsx>unchanged-child",
+        "clsx@>=2>unchanged-child",
+    ],
 )
 def test_transitive_compatibility_overrides_remain_manual(
     evaluate_fixture, policy_module, selector

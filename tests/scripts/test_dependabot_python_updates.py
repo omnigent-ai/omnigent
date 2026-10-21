@@ -106,7 +106,9 @@ def test_new_parallel_version_preserves_upgrade_policy(
             policy_module.package_pairs("ordinary", previous, current, ordinary_policy["python"])
 
 
-@pytest.mark.parametrize("fault", [None, "hash", "source", "metadata", "duplicate", "multiple"])
+@pytest.mark.parametrize(
+    "fault", [None, "artifact-metadata", "source", "metadata", "duplicate", "multiple"]
+)
 def test_upgrading_one_python_resolution_preserves_retained_sibling(
     policy_module, ordinary_policy, python_graph_lock, fault
 ):
@@ -115,7 +117,7 @@ def test_upgrading_one_python_resolution_preserves_retained_sibling(
     after["package"][0]["dependencies"][0]["version"] = "1.0.1"
     after["package"][-2]["version"] = "1.0.1"
     sibling = after["package"][-1]
-    if fault == "hash":
+    if fault == "artifact-metadata":
         sibling["wheels"][0]["hash"] = "sha256:wrong"
     elif fault == "source":
         sibling["source"] = {"registry": "https://other.example/simple"}
@@ -384,8 +386,10 @@ wheels = [{ url = "https://files.pythonhosted.org/bridge.whl", hash = "sha256:br
 @pytest.mark.parametrize(
     "finding", ["clean", "high", "missing-inventory", "young", "bad-hash", "unmatched-floor"]
 )
-@pytest.mark.parametrize("operator", [">=", "=="])
-def test_manifest_and_new_transitive_use_real_worker_checks(tmp_path, api, finding, operator):
+@pytest.mark.parametrize("operator,suffix", [(">=", ""), ("==", ""), (">=", ", <1")])
+def test_manifest_and_new_transitive_use_real_worker_checks(
+    tmp_path, api, finding, operator, suffix
+):
     root = """
 [[package]]
 name = "workspace"
@@ -395,6 +399,8 @@ dependencies = [{ name = "ruff" }]
 [package.metadata]
 requires-dist = [{ name = "ruff", specifier = ">=0.15.1" }]
 """
+    if suffix:
+        root = root.replace(">=0.15.1", "<1,>=0.15.1")
     old = LOCK + root.replace(">=", operator)
     new = (
         old.replace("0.15.1", "0.15.2").replace(
@@ -413,7 +419,7 @@ wheels = [
 ]
 """
     )
-    manifest = f'[project]\ndependencies = ["ruff{operator}0.15.1"]\n'
+    manifest = f'[project]\ndependencies = ["ruff{operator}0.15.1{suffix}"]\n'
     new_manifest = manifest.replace(
         "0.15.1", "0.15.3" if finding == "unmatched-floor" else "0.15.2"
     )

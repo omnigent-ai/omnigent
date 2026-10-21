@@ -51,6 +51,9 @@ jobs:
   # scan; trusted authors / non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
     name: CI coverage scope
@@ -394,16 +397,13 @@ jobs:
         id: rustc
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      # The sidecar source is frozen and its deps are rev-pinned, so the binary is
-      # a pure function of sidecar/** + the toolchain. Cache the built binary (not
-      # the 1.6 GB target dir) and skip the ~3 min compile below on a hit; the key
-      # self-invalidates when the source, Cargo.lock, or rustc changes.
-      - name: Cache parity sidecar binary
+      # Cache compiled dependencies and test binaries, but execute tests on every run.
+      - name: Cache parity sidecar build
         id: sidecar-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          path: .tmp-codex-parity-target
+          key: codex-parity-tests-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
         # This job never runs pnpm install, so caching the (empty) pnpm store

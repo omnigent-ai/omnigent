@@ -504,6 +504,10 @@ def test_workflows_connect_selection_to_jobs():
     )
     assert matrix["env"]["NUM_SHARDS"] == "4"
     jobs = workflows["ci"]["jobs"]
+    sidecar_cache = next(
+        step for step in jobs["codex-parity"]["steps"] if step.get("id") == "sidecar-cache"
+    )
+    assert sidecar_cache["with"]["path"] == ".tmp-codex-parity-target"
     for job, manifest in (
         ("omnidev", "dev/omnidev/Cargo.toml"),
         ("codex-parity", "tests/codex_parity/sidecar/Cargo.toml"),
@@ -847,7 +851,17 @@ def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "fault", ["valid", "incompatible", "missing", "optional", "baseline", "context"]
+    "fault",
+    [
+        "valid",
+        "incompatible",
+        "missing",
+        "optional",
+        "baseline",
+        "context",
+        "prerelease",
+        "prerelease-outside-range",
+    ],
 )
 def test_changed_npm_peer_gate_uses_candidate_lock_and_npm_semver(merged_repo, fault):
     repo, git = merged_repo
@@ -875,6 +889,10 @@ def test_changed_npm_peer_gate_uses_candidate_lock_and_npm_semver(merged_repo, f
             snapshot["dependencies"].clear()
             if fault == "optional":
                 metadata["peerDependenciesMeta"] = {"vite": {"optional": True}}
+        elif fault.startswith("prerelease"):
+            snapshot["dependencies"]["vite"] = (
+                "8.1.0-rc.1" if fault == "prerelease" else "9.0.0-rc.1"
+            )
     path.write_text(yaml.safe_dump(lock))
     git("add", ".")
     git("commit", "--allow-empty", "-qm", "update peers")
@@ -885,6 +903,6 @@ def test_changed_npm_peer_gate_uses_candidate_lock_and_npm_semver(merged_repo, f
         capture_output=True,
         timeout=30,
     )
-    assert (process.returncode == 0) == (fault in {"valid", "optional", "baseline"}), (
-        process.stdout + process.stderr
-    )
+    assert (process.returncode == 0) == (
+        fault in {"valid", "optional", "baseline", "prerelease"}
+    ), process.stdout + process.stderr

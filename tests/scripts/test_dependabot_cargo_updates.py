@@ -6,9 +6,11 @@ import copy
 import json
 
 import pytest
+import yaml
 
 from tests.scripts.test_dependabot_automerge import (
     PREFIX,
+    ROOT,
     run_cli,
     set_changed_files,
 )
@@ -600,7 +602,20 @@ def test_cargo_rejects_multiple_or_untested_targets(cargo_update, policy_module,
         evaluate()
 
 
-@pytest.mark.parametrize("entry", ["merge", "approval", "scan", "skipped-consumer"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "merge",
+        "approval",
+        "scan",
+        "skipped-consumer",
+        "high",
+        "missing-report",
+        "expired-report",
+        "wrong-target",
+        "missing-inventory",
+    ],
+)
 @pytest.mark.parametrize("target", [SIDECAR, OMNIDEV])
 def test_cargo_graph_updates_use_trusted_cli(tmp_path, api, cargo_update, target, entry):
     state, _evaluate = cargo_update
@@ -616,8 +631,16 @@ def test_cargo_graph_updates_use_trusted_cli(tmp_path, api, cargo_update, target
         },
     )
     api["registry"] = state["registry"]
-    api["report"]["Results"][0].update(
-        Target=target,
+    workflow = yaml.safe_load((ROOT / ".github/workflows/trivy.yml").read_text())
+    scan = workflow["jobs"]["scan"]
+    scopes = scan["strategy"]["matrix"]["include"]
+    scope = max(
+        (item for item in scopes if item["path"] == "." or target.startswith(item["path"] + "/")),
+        key=lambda item: len(item["path"]),
+    )
+    report = copy.deepcopy(api["report"])
+    report["Results"][0].update(
+        Target=target if scope["path"] == "." else target.removeprefix(scope["path"] + "/"),
         Type="cargo",
         Packages=[
             {"Name": package["name"], "Version": package["version"]}
@@ -625,6 +648,17 @@ def test_cargo_graph_updates_use_trusted_cli(tmp_path, api, cargo_update, target
             if "checksum" in package
         ],
     )
+    if scope["scope"] == "repository":
+        api["report"] = report
+    else:
+        upload = next(
+            step for step in scan["steps"] if step.get("name") == "Upload vulnerability reports"
+        )
+        artifact = upload["with"]["name"].replace("${{ matrix.scope }}", scope["scope"])
+        listing = api["routes"][f"{PREFIX}/actions/runs/11/artifacts?per_page=100"]
+        listing["total_count"] += 1
+        listing["artifacts"].append({"name": artifact, "id": 13, "expired": False})
+        api["artifact_reports"] = {"13": report}
     api["routes"]["Rust tests (omnidev)"] = copy.deepcopy(api["routes"]["Pytest (codex-parity)"])
     api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"].append(
         {"name": "Rust tests (omnidev)", "conclusion": "success"}
@@ -635,11 +669,31 @@ def test_cargo_graph_updates_use_trusted_cli(tmp_path, api, cargo_update, target
         for job in api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"]:
             if job["name"] == required_check:
                 job["conclusion"] = "skipped"
+    elif entry in {"missing-report", "expired-report"}:
+        artifacts = api["routes"][f"{PREFIX}/actions/runs/11/artifacts?per_page=100"]["artifacts"]
+        selected = next(item for item in artifacts if item["name"].endswith(scope["scope"]))
+        if entry == "missing-report":
+            artifacts.remove(selected)
+        else:
+            selected["expired"] = True
+    elif entry == "wrong-target":
+        report["Results"][0]["Target"] = "another/Cargo.lock"
+    elif entry == "missing-inventory":
+        report["Results"][0]["Packages"] = []
+    elif entry == "high":
+        report["Results"][0]["Vulnerabilities"].append(
+            {
+                "PkgName": "anyhow",
+                "InstalledVersion": "1.3.0",
+                "Severity": "HIGH",
+                "VulnerabilityID": "GHSA-scoped-report",
+            }
+        )
     process, calls = run_cli(
         tmp_path,
         api,
         mode="merge",
-        sweep=entry in {"merge", "skipped-consumer"},
+        sweep=entry not in {"approval", "scan"},
         approval=entry == "approval",
         scan=entry == "scan",
     )
@@ -648,8 +702,17 @@ def test_cargo_graph_updates_use_trusted_cli(tmp_path, api, cargo_update, target
         assert calls[-1][:2] == ["pr", "merge"], process.stdout
     elif entry == "approval":
         assert "policy satisfied" in process.stdout
-    elif entry == "skipped-consumer":
+    elif entry != "scan":
         assert "human review or retry required" in process.stdout
         assert not any(call[:2] == ["pr", "merge"] for call in calls)
+        reason = {
+            "skipped-consumer": "Waiting for successful",
+            "high": "GHSA-scoped-report requires human review",
+            "missing-report": "Missing or ambiguous Trivy",
+            "expired-report": "Missing or ambiguous Trivy",
+            "wrong-target": "Trivy did not inventory every changed package",
+            "missing-inventory": "Trivy did not inventory every changed package",
+        }[entry]
+        assert reason in process.stdout
     else:
         assert "eligible=" not in (tmp_path / "outputs").read_text()

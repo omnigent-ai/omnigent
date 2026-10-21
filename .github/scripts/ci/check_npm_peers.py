@@ -40,6 +40,8 @@ def validate_peers(checks: list[dict]) -> None:
     # Node's npm distribution carries the same semver evaluator npm uses.
     npm_root = subprocess.check_output(["npm", "root", "-g"], text=True).strip()
     semver = Path(npm_root) / "npm/node_modules/semver"
+    if not (semver / "package.json").is_file():
+        raise ValueError(f"npm peer validation requires npm's semver package at {semver}")
     process = subprocess.run(
         [
             "node",
@@ -48,7 +50,7 @@ def validate_peers(checks: list[dict]) -> None:
             "const checks = JSON.parse(fs.readFileSync(0, 'utf8')); "
             "process.stdout.write(JSON.stringify(checks.filter(c => "
             "!semver.valid(c.resolved) || !semver.validRange(c.wanted) || "
-            "!semver.satisfies(c.resolved, c.wanted))));",
+            "!semver.satisfies(c.resolved, c.wanted, {includePrerelease: true}))));",
             str(semver),
         ],
         input=json.dumps(checks),

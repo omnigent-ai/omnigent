@@ -260,8 +260,13 @@ print(json.dumps(value))
     )
 
 
-def _run_access(tmp_path, api):
+def _run_access(tmp_path, api, **environment):
     env = _access_environment(tmp_path, api)
+    for name, value in environment.items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     step = next(
         step
         for step in _steps("security-gate.yml", "gate")
@@ -289,6 +294,26 @@ def test_package_ci_does_not_wait_for_scan_or_advisories(tmp_path, api):
         f"{PREFIX}/pulls/123",
         f"{PREFIX}/pulls/123/files?per_page=100&page=1",
     ]
+
+
+@pytest.mark.parametrize(
+    "environment", [{"PR": ""}, {"PR": "not-a-number"}, {"REPO": None}, {"HEAD_SHA": None}]
+)
+def test_invalid_pr_environment_has_access_denied_annotation(tmp_path, api, environment):
+    result = _run_access(tmp_path, api, **environment)
+    assert result.returncode == 1
+    assert "::error::Dependabot CI access denied" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_security_gate_callers_grant_metadata_read_permission():
+    for path in (_ROOT / ".github/workflows").glob("*.yml"):
+        workflow = yaml.safe_load(path.read_text())
+        for job in workflow.get("jobs", {}).values():
+            if job.get("uses") == "./.github/workflows/security-gate.yml":
+                permissions = job.get("permissions", workflow.get("permissions", {}))
+                assert permissions["contents"] == "read", path
+                assert permissions["pull-requests"] in {"read", "write"}, path
 
 
 @pytest.mark.parametrize("fault", ["head", "fork", "spoof", "inventory", "api"])
@@ -460,11 +485,20 @@ def test_trusted_bootstrap_fetches_main_without_running_changed_actions(tmp_path
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
-def test_manual_major_action_upgrade_can_run_ci_after_validation(tmp_path, expanded_update):
+@pytest.mark.parametrize(
+    "action",
+    [
+        "actions/setup-node",
+        "softprops/action-gh-release",
+        "actions/create-github-app-token",
+        "actions/attest",
+        "pypa/gh-action-pypi-publish",
+    ],
+)
+def test_action_ci_access_preserves_manual_exceptions(tmp_path, expanded_update, action):
     _, api = expanded_update
     path = ".github/workflows/ci.yml"
     old, new = api["files"][path]
-    action = "softprops/action-gh-release"
     set_changed_files(
         api,
         {path: (old.replace("actions/checkout", action), new.replace("actions/checkout", action))},
@@ -477,8 +511,11 @@ def test_manual_major_action_upgrade_can_run_ci_after_validation(tmp_path, expan
     tags = api["routes"][f"repos/{action}/tags?per_page=100&page=1"]
     tags[1]["name"] = "v5.0.0"
     result = _run_access(tmp_path, api)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "structural and release pin checks" in result.stdout
+    allowed = action == "actions/setup-node"
+    assert result.returncode == (0 if allowed else 1), result.stdout + result.stderr
+    assert (
+        "structural and release pin checks" if allowed else "requires human review"
+    ) in result.stdout
 
 
 @pytest.mark.parametrize(

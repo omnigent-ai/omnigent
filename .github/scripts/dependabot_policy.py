@@ -48,6 +48,8 @@ def read_yaml(text: str) -> dict:
 def version(value: str) -> tuple[int, ...]:
     require(bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", value)), f"Unstable version: {value}")
     parts = tuple(map(int, value.split(".")))
+    while len(parts) > 3 and parts[-1] == 0:
+        parts = parts[:-1]
     return parts + (0,) * max(0, 3 - len(parts))
 
 
@@ -96,6 +98,10 @@ def aged(timestamp: str, days: int, now: datetime) -> None:
     published = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     require(published.tzinfo is not None, "Registry timestamp has no timezone")
     require(published <= now - timedelta(days=days), "Release has not completed the cooldown")
+
+
+def canonical_specifier(value: str) -> str:
+    return ",".join(sorted(re.sub(r"\s+", "", value).split(",")))
 
 
 def python_requirement_upgrade(old: str, new: str, policy: dict) -> tuple[str, str, str]:
@@ -339,24 +345,31 @@ def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=No
                         pending_pairs.append(({}, resolved))
                     changes.append(resolved)
 
-    def update_references(value):
+    def update_references(value, *, replace=True):
         if isinstance(value, list):
-            return [update_references(item) for item in value]
+            return [update_references(item, replace=replace) for item in value]
         if not isinstance(value, dict):
             return value
-        result = {key: update_references(item) for key, item in value.items()}
+        result = {key: update_references(item, replace=replace) for key, item in value.items()}
+        if "specifier" in result:
+            result["specifier"] = canonical_specifier(result["specifier"])
         name = value.get("name")
-        if name in replacements and value.get("version") == replacements[name][0]:
+        if replace and name in replacements and value.get("version") == replacements[name][0]:
             result["version"] = replacements[name][1]
-        if name in manifest_changes and value.get("specifier") == manifest_changes[name][0]:
-            result["specifier"] = manifest_changes[name][1]
+        if (
+            replace
+            and name in manifest_changes
+            and result.get("specifier") == canonical_specifier(manifest_changes[name][0])
+        ):
+            result["specifier"] = canonical_specifier(manifest_changes[name][1])
         return result
 
     for name, previous, current in pairs:
         if not previous or not current or previous["version"] != current["version"]:
             continue
         require(
-            update_references(previous) == current, f"{name}: unchanged package metadata changed"
+            update_references(previous) == update_references(current, replace=False),
+            f"{name}: unchanged package metadata changed",
         )
     pending = [package for package in after["package"] if "registry" not in package["source"]]
     seen = set()
@@ -443,7 +456,7 @@ def python_changes(read, files: set[str], policy: dict) -> dict:
         changes,
         "uv.lock",
         "uv",
-        ["ci.yml", "lint.yml", "integration.yml", "e2e.yml", "e2e-ui.yml"],
+        ["ci.yml", "lint.yml", "integration.yml", "e2e.yml", "e2e-ui.yml", "docker-build.yml"],
         ["Pre-commit checks", "Pytest (runtime-core)", "Integration (openai-agents)"],
     )
 
@@ -546,7 +559,9 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
     def eligible(name):
         require_package(name, policy["npm"])
         # Overrides can select a parent, a version range, or a scoped package.
-        selectors = [re.split(r">(?=@?[A-Za-z])", selector)[-1] for selector in overrides]
+        selectors = [
+            part for selector in overrides for part in re.split(r">(?=@?[A-Za-z])", selector)
+        ]
         require(
             not any(
                 matches(name, [selector]) or selector.startswith(name + "@")
@@ -766,7 +781,7 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         [dict(zip(("name", "version"), npm_key(key), strict=True)) for key in sorted(inventory)],
         "pnpm-lock.yaml",
         "pnpm",
-        ["ci.yml", "lint.yml", "web-tests.yml", "e2e-ui.yml", "docker-build.yml"],
+        ["ci.yml", "lint.yml", "web-tests.yml", "e2e.yml", "e2e-ui.yml", "docker-build.yml"],
         ["Pre-commit checks", "web test", "Browser Contract UI", "Docker build"],
     )
 
@@ -818,8 +833,12 @@ def action_changes(read, files: set[str], policy: dict, *, for_scan: bool = Fals
             )
             require(old_sha != new_sha, "Only action SHA upgrades qualify")
             changes.add((name, old_sha, new_sha))
+            require_package(name, policy["actions"])
             if not for_scan:
-                require_package(name, policy["actions"])
+                require(
+                    path in policy["action_test_paths"],
+                    f"{path}: Action changes need mapped PR CI",
+                )
             if path in policy["action_test_paths"]:
                 exercised.add((name, old_sha, new_sha))
                 workflows.add(policy["action_test_paths"][path])

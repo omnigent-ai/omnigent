@@ -11,7 +11,7 @@ description: >
 
 inputs:
   dependency_smoke:
-    description: Run the existing cross-component compatibility smoke suite.
+    description: Deprecated; removal in 0.21.0. Run compatibility smoke only.
     required: false
     default: "false"
   shard_id:
