@@ -186,6 +186,7 @@ function NewTabMenu({
   onCreateStart,
   onCreateError,
   liveness,
+  menuAlign,
 }: {
   conversationId: string;
   panels: readonly DefaultWorkspaceTab[];
@@ -205,6 +206,8 @@ function NewTabMenu({
   /** Open session's derived liveness — drives the "Shell" item's connect
    *  affordance. Absent is treated as ready. */
   liveness?: SessionLiveness;
+  /** Menu edge to line up with the trigger: "end" once "+" sits at the right edge. */
+  menuAlign: "start" | "end";
 }) {
   const { data: agent } = useSessionAgent(conversationId);
   const create = useCreateTerminal(conversationId);
@@ -297,7 +300,7 @@ function NewTabMenu({
           ("Reconnecting…" + spinner, and the sub-trigger's chevron) — the
           default min-w-32 tracks the 32px "+" trigger and clips it. */}
       <DropdownMenuContent
-        align="end"
+        align={menuAlign}
         className="min-w-56"
         // On close, Radix restores focus to the "+" trigger, which re-opens its
         // tooltip for a frame before blur dismisses it — a visible flash after a
@@ -1048,6 +1051,20 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
+  const newTabMenu = (menuAlign: "start" | "end") => (
+    <NewTabMenu
+      conversationId={conversationId}
+      panels={unpinnedTabs}
+      onOpenPanel={selectPermanentTab}
+      onOpenBrowser={showBrowserTab ? addBrowser : undefined}
+      onOpenSideChat={onNewSideChat}
+      onOpenTerminal={openTerminalTab}
+      onCreateStart={onShellCreateStart}
+      onCreateError={onShellCreateFailed}
+      liveness={liveness}
+      menuAlign={menuAlign}
+    />
+  );
   const effectiveHandleProps = pending
     ? {
         ...handleProps,
@@ -1488,22 +1505,12 @@ function WorkspacePanelImpl({
               </WorkspaceTabsScroller>
             </>
           )}
-          {/* "+", the picker, and the fullscreen toggle form the trailing control
-            group, pinned right outside the scrolling viewport. */}
+          {/* With no open tabs, "+" sits right after the nav tabs. */}
+          {!pending && !showOpenTabs && newTabMenu("start")}
+          {/* The picker and fullscreen toggle form the trailing control group,
+            pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-            {!pending && (
-              <NewTabMenu
-                conversationId={conversationId}
-                panels={unpinnedTabs}
-                onOpenPanel={selectPermanentTab}
-                onOpenBrowser={showBrowserTab ? addBrowser : undefined}
-                onOpenSideChat={onNewSideChat}
-                onOpenTerminal={openTerminalTab}
-                onCreateStart={onShellCreateStart}
-                onCreateError={onShellCreateFailed}
-                liveness={liveness}
-              />
-            )}
+            {showOpenTabs && newTabMenu("end")}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {

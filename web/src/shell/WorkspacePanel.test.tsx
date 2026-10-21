@@ -692,28 +692,30 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
   });
 
-  it("renders exactly one '+' in the trailing controls, with or without open tabs", () => {
-    const expectTrailingPlus = () => {
-      const plus = screen.getByRole("button", { name: "Open new" });
-      expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
-      // "+" leads the right-pinned group, ahead of the picker and fullscreen toggle.
-      const trailing = plus.closest(".ml-auto")!;
-      expect(trailing.firstElementChild).toContainElement(plus);
-      expect(trailing).toContainElement(screen.getByRole("button", { name: "Full screen" }));
-      return trailing;
-    };
+  it("renders exactly one '+' — after the nav tabs with no open tabs, trailing the tabs otherwise", () => {
+    // No open tabs → "+" follows the nav tabs, outside the right-pinned group.
     declaresShell();
     renderWorkspace({ openFiles: [] });
-    expectTrailingPlus();
+    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+    const leadingPlus = screen.getByRole("button", { name: "Open new" });
+    expect(leadingPlus.closest(".ml-auto")).toBeNull();
+    expect(
+      screen.getByRole("tablist").compareDocumentPosition(leadingPlus) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     cleanup();
 
-    // With open tabs the "+" stays OUTSIDE the scrolling tabs region so it stays
-    // pinned when the tabs overflow instead of scrolling/overlapping.
+    // With open tabs "+" leads the right-pinned group, outside the scrolling
+    // tabs region so it stays put when the tabs overflow.
     declaresShell();
     renderWorkspace({ openFiles: ["src/App.tsx"] });
-    const tabsRegion = expectTrailingPlus().previousElementSibling as HTMLElement;
+    expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
+    const plus = screen.getByRole("button", { name: "Open new" });
+    const trailing = plus.closest(".ml-auto")!;
+    expect(trailing.firstElementChild).toContainElement(plus);
+    const tabsRegion = trailing.previousElementSibling as HTMLElement;
     expect(tabsRegion).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
-    expect(tabsRegion).not.toContainElement(screen.getByRole("button", { name: "Open new" }));
+    expect(tabsRegion).not.toContainElement(plus);
   });
 
   it.each([false, true])(
