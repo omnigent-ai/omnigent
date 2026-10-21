@@ -7,8 +7,10 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Rect
 import android.os.Looper
+import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.ImageView
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.test.core.app.ApplicationProvider
@@ -28,6 +30,29 @@ import java.time.Duration
 @Config(sdk = [35])
 class ConnectionStatusViewTest {
     private val context = ApplicationProvider.getApplicationContext<Context>()
+
+    @Test
+    fun `host chip and details use the approved icons and alignment`() {
+        val view = ConnectionStatusView(context) {}
+        view.show(
+            ConnectionStatus.ServerUnreachable(
+                "example.com",
+                UnreachableKind.GENERIC,
+                ConnectionFailureDetails("https://example.com", "ERROR_CONNECT", 1234L),
+            ),
+            immediate = true,
+        )
+        val host = view.findViewById<TextView>(R.id.status_host)
+        val details = view.findViewById<Button>(R.id.status_details_toggle)
+        assertTrue(host.compoundDrawablesRelative[0] != null)
+        assertEquals(Gravity.START or Gravity.CENTER_VERTICAL, details.gravity)
+        assertTrue(details.compoundDrawablesRelative[2] != null)
+        assertEquals(0f, details.compoundDrawablesRelative[2].level.toFloat(), 0f)
+        details.performClick()
+        assertEquals(View.VISIBLE, view.findViewById<View>(R.id.status_details_content).visibility)
+        assertEquals(1, details.compoundDrawablesRelative[2].level)
+        assertTrue(view.findViewById<ImageView>(R.id.status_icon).drawable != null)
+    }
 
     @After
     fun resetAnimations() = setDurationScale(1f)

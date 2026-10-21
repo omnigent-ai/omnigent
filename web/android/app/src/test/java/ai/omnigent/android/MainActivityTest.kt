@@ -10,6 +10,7 @@ import android.net.http.SslCertificate
 import android.net.http.SslError
 import android.os.Bundle
 import android.os.Looper
+import android.os.SystemClock
 import android.text.TextUtils
 import android.view.View
 import android.view.ViewGroup
@@ -632,6 +633,47 @@ class MainActivityTest {
         )
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `rotation preserves the remaining successful commit hold`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(501))
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onPageCommitVisible(webView, url)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
+        val oldOverlay = activity.declared<View>("connectionOverlay")
+        val originalDeadline =
+            (oldOverlay as ConnectionStatusView).pendingHideSnapshot()!!.deadlineMillis
+
+        activity.onConfigurationChanged(
+            Configuration(activity.resources.configuration).apply {
+                uiMode =
+                    (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                    Configuration.UI_MODE_NIGHT_YES
+            },
+        )
+
+        val rebuilt = activity.declared<View>("connectionOverlay")
+        assertNotSame(oldOverlay, rebuilt)
+        assertEquals(View.VISIBLE, rebuilt.visibility)
+        assertEquals(
+            activity.getString(R.string.oidc_connecting),
+            activity.findViewById<TextView>(R.id.status_headline).text.toString(),
+        )
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            webView.importantForAccessibility,
+        )
+        val remaining = originalDeadline - SystemClock.uptimeMillis()
+        assertTrue(remaining > 1)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(remaining - 1))
+        assertEquals(View.VISIBLE, rebuilt.visibility)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(1))
+        assertEquals(View.GONE, rebuilt.visibility)
         assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
     }
 

@@ -309,8 +309,9 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   tests: `OidcSessionControllerTest.kt`, `OidcCredentialsTest.kt`, and
   `ServerManifestTest.kt` in `web/android/app/src/test/java/ai/omnigent/android/`;
   server flow: `tests/server/integration/test_oidc_native_login.py`.
-- **`android-connection-status` (Android app, own emulator):** build the debug
-  app with `-PapplicationIdSuffix=.dev` and follow the connection/status manual
+- **`android-connection-status` (Android app, own emulator):** build with
+  `./gradlew assembleDebug`; the upstream debug APK installs as
+  `ai.omnigent.android`, so use an isolated emulator. Follow the connection/status manual
   verification in `web/android/README.md`. Start a saved server and observe
   Connecting until its page commits; stop the server, relaunch and use Retry,
   then Change server. Hold a connection open past ten seconds, and repeat in
