@@ -85,6 +85,7 @@ class _RecordingCodexAppServerClient:
         self.closed = False
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.model_list_responses: list[dict[str, Any]] = []
+        self.model_config: dict[str, Any] | None = None
 
     async def connect(self) -> None:
         """
@@ -104,6 +105,8 @@ class _RecordingCodexAppServerClient:
         :returns: Empty successful JSON-RPC result.
         """
         self.requests.append((method, params))
+        if method == "config/read" and self.model_config is not None:
+            return {"result": {"config": self.model_config}}
         if method == "model/list" and self.model_list_responses:
             return self.model_list_responses.pop(0)
         return {"result": {}}
@@ -517,6 +520,7 @@ async def test_codex_native_model_switch_inherits_an_effort_whose_config_write_f
         ),
     )
     fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_config = {"model_provider": "openai"}
     fake.model_list_responses = [
         {
             "result": {
@@ -575,6 +579,22 @@ async def test_codex_native_model_switch_inherits_an_effort_whose_config_write_f
         ("gpt-6-sol", "medium", {"type": "effort_change", "effort": "max"}, "gpt-6-sol", "max"),
         ("gpt-5.4", None, {"type": "model_change", "model": "glm-5-2"}, "glm-5-2", "medium"),
         pytest.param(
+            "gpt-6-sol",
+            "high",
+            {"type": "model_change", "model": "system.ai.gpt-5-4"},
+            "gpt-5.4",
+            "high",
+            id="account_model_alias",
+        ),
+        pytest.param(
+            "system.ai.gpt-5-4",
+            "high",
+            {"type": "effort_change", "effort": "high"},
+            "gpt-5.4",
+            "high",
+            id="inherited_account_alias",
+        ),
+        pytest.param(
             "gpt-5.4",
             "high",
             {"type": "model_change", "model": "gpt-6-sol"},
@@ -625,6 +645,7 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
         f'model = "{initial_model}"\n'
         + (f'model_reasoning_effort = "{initial_effort}"\n' if initial_effort else "")
     )
+    (codex_home / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
     codex_native_bridge.write_bridge_state(
         bridge_dir,
         codex_native_bridge.CodexNativeBridgeState(
@@ -635,6 +656,7 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
         ),
     )
     fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_config = {"model_provider": "openai"}
     fake.model_list_responses = [
         {
             "result": {
@@ -744,6 +766,7 @@ async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
         ),
     )
     fake = _RecordingCodexAppServerClient(transport, "effort-test")
+    fake.model_config = {"model_provider": "openai"}
     fake.model_list_responses = [
         {
             "result": {

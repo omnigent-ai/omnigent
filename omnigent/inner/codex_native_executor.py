@@ -27,6 +27,7 @@ from omnigent.harnesses.codex_native.app_server import (
     is_compaction_steer_refusal,
     is_server_draining_error,
     is_stale_active_turn_error,
+    resolve_codex_chatgpt_model,
     resolve_codex_effort_for_model,
 )
 from omnigent.harnesses.codex_native.bridge import (
@@ -349,6 +350,14 @@ async def _start_codex_turn(
         or unmirrored.get("model")
         or await asyncio.to_thread(read_codex_config_model, bridge_dir)
     )
+    model_catalog: object = None
+    if isinstance(model, str):
+        account_model, model_catalog = await resolve_codex_chatgpt_model(
+            client, model, codex_home=Path(state.codex_home), transport=state.socket_path
+        )
+        if account_model != model:
+            model = account_model
+            settings_overrides["model"] = account_model
     effort = (
         settings_overrides.get("effort")
         or unmirrored.get("effort")
@@ -356,7 +365,7 @@ async def _start_codex_turn(
     )
     if isinstance(model, str) and isinstance(effort, str):
         resolved_effort = await resolve_codex_effort_for_model(
-            client, effort, model, transport=state.socket_path
+            client, effort, model, transport=state.socket_path, catalog=model_catalog
         )
         if resolved_effort != effort:
             settings_overrides["effort"] = resolved_effort

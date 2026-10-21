@@ -2224,7 +2224,53 @@ def test_model_settings_update_mirrors_model_into_config_toml(
     assert read_codex_config_model(tmp_path) == "gpt-5.6-luna"
 
 
-def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
+@pytest.mark.parametrize("source", ["explicit", "inherited"])
+@pytest.mark.parametrize("provider", ["openai", "gateway", "null", "omitted"])
+def test_dispatch_uses_account_model_ids_without_an_effort_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str, provider: str
+) -> None:
+    """Both direct picks and saved gateway aliases use the account's own outbound model ID."""
+    config = (
+        {}
+        if provider == "omitted"
+        else {"model_provider": None if provider == "null" else provider}
+    )
+    client = _catalog_client([], config=config)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.app_server.CodexAppServerClient", client)
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    alias = "system.ai.gpt-5-6-sol"
+    initial = alias if source == "inherited" else "gpt-5.6-sol"
+    uses_account = provider != "gateway"
+    copied_provider = "gateway" if uses_account else "openai"
+    (home / "config.toml").write_text(
+        f'model_provider = "{copied_provider}"\nmodel = "{initial}"\n'
+    )
+    (home / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+
+    _run_turn_with_config(
+        CodexNativeExecutor(bridge_dir=tmp_path),
+        "hello",
+        ExecutorConfig(model=alias if source == "explicit" else None),
+    )
+
+    assert client.requests[0] == ("config/read", {"includeLayers": False})
+    expected = "gpt-5.6-sol" if uses_account else alias
+    updates = [params for method, params in client.requests if method == "thread/settings/update"]
+    assert updates == (
+        [{"threadId": "thread_123", "model": expected}]
+        if uses_account or source == "explicit"
+        else []
+    )
+    assert sum(method == "model/list" for method, _ in client.requests) == int(uses_account)
+    assert client.requests[-1][0] == "turn/start"
+    assert read_codex_config_model(tmp_path) == expected
+
+
+def _catalog_client(
+    supported: list[str], *, config: dict[str, object] | None = None
+) -> type[_FakeCodexNativeClient]:
     """Return a fresh fake whose catalog lists ``gpt-5.6-sol`` with *supported* efforts."""
 
     class CatalogClient(_FakeCodexNativeClient):
@@ -2233,6 +2279,9 @@ def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
         next_turn = 1
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "config/read" and config is not None:
+                type(self).requests.append((method, params))
+                return {"result": {"config": config}}
             if method == "model/list":
                 type(self).requests.append((method, params))
                 return {

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
+import tomllib
 import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
@@ -787,26 +788,84 @@ def clamp_codex_effort_for_model(
     return resolved
 
 
+def _codex_uses_chatgpt_models(
+    codex_home: Path,
+    config_overrides: Sequence[str] = (),
+    *,
+    config: _JsonObject | None = None,
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Recognize a usable ChatGPT login on the effective built-in OpenAI route."""
+    from omnigent.onboarding.ambient import codex_auth_effective_mode
+    from omnigent.onboarding.codex_auth_readiness import (
+        effective_codex_model_provider,
+        load_codex_config,
+    )
+
+    if (os.environ if env is None else env).get("OPENAI_BASE_URL"):
+        return False
+    config = (
+        copy.deepcopy(config)
+        if config is not None
+        else load_codex_config(codex_home / "config.toml")
+    )
+    if config is None:
+        return False
+    try:
+        for override in config_overrides:
+            _merge_tables(config, tomllib.loads(override))
+        if effective_codex_model_provider(config) not in (None, "openai"):
+            return False
+        provider = config.get("model_provider")
+        if provider is not None and (not isinstance(provider, str) or not provider.strip()):
+            return False
+        providers = config.get("model_providers")
+        if providers is not None and not isinstance(providers, dict):
+            return False
+        openai = providers.get("openai") if isinstance(providers, dict) else None
+        if openai is not None and not isinstance(openai, dict):
+            return False
+        if isinstance(openai, dict) and openai.get("base_url") is not None:
+            return False
+        if config.get("openai_base_url") is not None:
+            return False
+        return codex_auth_effective_mode(codex_home / "auth.json") == "chatgpt"
+    except (ValueError, UnicodeError):
+        return False
+
+
+def codex_chatgpt_model_id(
+    model: str | None,
+    catalog: object,
+    *,
+    codex_home: Path,
+    config_overrides: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Use an account's catalog spelling only for its built-in OpenAI route."""
+    if model is None or not model.startswith(("system.ai.", "databricks-")):
+        return model
+    if not _codex_uses_chatgpt_models(codex_home, config_overrides, env=env):
+        return model
+    models = catalog.get("models") if isinstance(catalog, dict) else catalog
+    if not isinstance(models, list):
+        return model
+    return codex_reachable_model_slug(model, models) or model
+
+
 _effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, ttl=60.0)
 # Models a fresh catalog lacked, so an unlisted model does not refetch on every turn.
 _effort_catalog_misses: TTLCache[str, set[str]] = TTLCache(maxsize=128, ttl=60.0)
+_MODEL_CATALOG_UNREAD = object()
 
 
-async def resolve_codex_effort_for_model(
+async def _codex_model_capabilities(
     client: CodexAppServerClient,
-    effort: str | None,
     model: str | None,
     *,
     transport: str | None = None,
-) -> str:
-    """Resolve against live capabilities, reusing successful discovery for one minute.
-
-    A transport key lets successive turn clients share the catalog for their
-    app-server. New server transports and expired entries fetch fresh rows;
-    discovery failures are never cached. Explicit levels retain the gateway
-    fallback; resets raise without a discoverable model default because Codex
-    treats a null effort in ``thread/settings/update`` as unchanged.
-    """
+) -> list[_JsonObject] | None:
+    """Reuse successful model discovery for one minute; failures are not cached."""
     catalog = _effort_catalog_cache.get(transport) if transport is not None else None
     if (
         catalog is not None
@@ -835,6 +894,56 @@ async def resolve_codex_effort_for_model(
                 transport,
                 exc_info=True,
             )
+    return catalog
+
+
+async def resolve_codex_chatgpt_model(
+    client: CodexAppServerClient,
+    model: str,
+    *,
+    codex_home: Path,
+    transport: str | None = None,
+) -> tuple[str, object]:
+    """Translate an account alias and share its capability read with effort validation."""
+    if not model.startswith(("system.ai.", "databricks-")):
+        return model, _MODEL_CATALOG_UNREAD
+    from omnigent.onboarding.ambient import codex_auth_effective_mode
+
+    try:
+        mode = await asyncio.to_thread(codex_auth_effective_mode, codex_home / "auth.json")
+    except (OSError, ValueError, UnicodeError):
+        return model, _MODEL_CATALOG_UNREAD
+    if mode != "chatgpt":
+        return model, _MODEL_CATALOG_UNREAD
+    try:
+        config = await asyncio.wait_for(
+            _read_codex_effective_config(client), timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS
+        )
+    except Exception:  # noqa: BLE001 - missing route evidence leaves the model unchanged
+        return model, _MODEL_CATALOG_UNREAD
+    if config is None or not await asyncio.to_thread(
+        _codex_uses_chatgpt_models, codex_home, config=config
+    ):
+        return model, _MODEL_CATALOG_UNREAD
+    catalog = await _codex_model_capabilities(client, model, transport=transport)
+    return codex_reachable_model_slug(model, catalog or []) or model, catalog
+
+
+async def resolve_codex_effort_for_model(
+    client: CodexAppServerClient,
+    effort: str | None,
+    model: str | None,
+    *,
+    transport: str | None = None,
+    catalog: object = _MODEL_CATALOG_UNREAD,
+) -> str:
+    """Clamp against live capabilities, retaining the gateway fallback on discovery failure.
+
+    A reset requires the model's advertised default because Codex treats a
+    null effort in ``thread/settings/update`` as unchanged.
+    """
+    if catalog is _MODEL_CATALOG_UNREAD:
+        catalog = await _codex_model_capabilities(client, model, transport=transport)
     if effort is None:
         entry = _codex_model_catalog_entry(catalog, model) if model else None
         if entry is None:
@@ -1759,6 +1868,13 @@ async def probe_codex_model_options(
 
 async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
     """Read Codex's effective explicit default; older servers defer to catalog shaping."""
+    config = await _read_codex_effective_config(client)
+    model = config.get("model") if config is not None else None
+    return model if isinstance(model, str) and model else None
+
+
+async def _read_codex_effective_config(client: CodexAppServerClient) -> _JsonObject | None:
+    """Read the app-server's effective config, including its command-line overrides."""
     try:
         try:
             response = await client.request("config/read", {"includeLayers": False})
@@ -1775,8 +1891,7 @@ async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
         return None
     result = response.get("result")
     config = result.get("config") if isinstance(result, dict) else None
-    model = config.get("model") if isinstance(config, dict) else None
-    return model if isinstance(model, str) and model else None
+    return cast(_JsonObject, config) if isinstance(config, dict) else None
 
 
 def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:
@@ -2165,6 +2280,23 @@ class CodexNativeAppServer:
             mcp_servers=mcp_servers,
             routed_spawns=routed_spawns,
         )
+        selected_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
+        account_model = await asyncio.to_thread(
+            codex_chatgpt_model_id,
+            selected_model,
+            catalog,
+            codex_home=self.codex_home,
+            config_overrides=self.config_overrides,
+            env=self.env,
+        )
+        if account_model is not None and account_model != selected_model:
+            self.pinned_model = account_model
+            self.config_overrides = [
+                override
+                for override in self.config_overrides
+                if override.partition("=")[0].strip() != "model"
+            ]
+            self.config_overrides.append(f"model={json.dumps(account_model)}")
         if self.pinned_model:
             _pin_codex_config_model(self.codex_home, self.pinned_model)
             if model_migration_target is not None:

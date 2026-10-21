@@ -486,6 +486,88 @@ async def test_start_clamps_effort_to_catalog(
 
 
 @pytest.mark.parametrize(
+    "route",
+    [
+        "chatgpt",
+        "api-key",
+        "custom",
+        "openai-base-url",
+        "profile",
+        "missing-model",
+        "environment",
+        "override-custom",
+        "override-base-url",
+    ],
+)
+async def test_start_uses_chatgpt_catalog_model_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """Account aliases use the catalog ID in config and both server and terminal argv."""
+    from omnigent.harnesses.codex_native import app_server
+
+    source_home = tmp_path / "source"
+    source_home.mkdir()
+    original = 'model_provider = "openai"\n'
+    if route == "custom":
+        original = 'model_provider = "gateway"\n'
+    elif route == "openai-base-url":
+        original += '[model_providers.openai]\nbase_url = "https://gateway.example.test/v1"\n'
+    (source_home / "config.toml").write_text(original)
+    (source_home / "auth.json").write_text(
+        json.dumps(
+            {"OPENAI_API_KEY": "test-key"}
+            if route == "api-key"
+            else {"tokens": {"refresh_token": "test-refresh-token"}}
+        )
+    )
+    if route == "profile":
+        (source_home / "team.config.toml").write_text('model_provider = "gateway"\n')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", tmp_path)
+    selected = "system.ai.gpt-5-4"
+    server.pinned_model = selected
+    server.config_overrides = [f"model={json.dumps(selected)}"]
+    if route == "environment":
+        server.env["OPENAI_BASE_URL"] = "https://gateway.example.test/v1"
+    elif route == "override-custom":
+        server.config_overrides.append('model_provider="gateway"')
+    elif route == "override-base-url":
+        server.config_overrides.append(
+            'model_providers.openai.base_url="https://gateway.example.test/v1"'
+        )
+    if route == "profile":
+        server.config_profile = "team"
+    server.model_catalog_rows = [{"id": "gpt-5.4"}] if route != "missing-model" else []
+    argv: list[str] = []
+    build_argv = app_server._build_native_codex_app_server_argv
+
+    def record_argv(**kwargs: Any) -> list[str]:
+        rendered = build_argv(**kwargs)
+        argv.extend(rendered)
+        return rendered
+
+    monkeypatch.setattr(app_server, "_build_native_codex_app_server_argv", record_argv)
+    try:
+        await server.start()
+        expected = "gpt-5.4" if route == "chatgpt" else selected
+        config = tomllib.loads((server.codex_home / "config.toml").read_text())
+        assert config["model"] == expected
+        assert server.pinned_model == expected
+        assert f"model={json.dumps(expected)}" in argv
+        terminal_args = app_server.build_codex_remote_args(
+            codex_args=(),
+            thread_id=None,
+            remote_url="ws://127.0.0.1:1",
+            config_overrides=server.config_overrides,
+        )
+        assert f"model={json.dumps(expected)}" in terminal_args
+        assert (source_home / "config.toml").read_text() == original
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize(
     ("write_failure", "symlink_config"),
     [
         (None, False),

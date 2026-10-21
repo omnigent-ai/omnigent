@@ -442,6 +442,7 @@ def build_native_controls(
         from omnigent.harnesses.codex_native.app_server import (
             CodexAppServerResponseError,
             client_for_transport,
+            resolve_codex_chatgpt_model,
             resolve_codex_effort_for_model,
         )
         from omnigent.harnesses.codex_native.bridge import (
@@ -546,6 +547,17 @@ def build_native_controls(
                     retry_unreachable=False,
                 )
             if "model" in settings or "effort" in settings:
+                model_catalog: object = None
+                if isinstance(model, str):
+                    account_model, model_catalog = await resolve_codex_chatgpt_model(
+                        codex_client,
+                        model,
+                        codex_home=Path(state.codex_home),
+                        transport=state.socket_path,
+                    )
+                    if account_model != model:
+                        model = account_model
+                        settings["model"] = account_model
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
                     settings["effort"]
@@ -565,7 +577,11 @@ def build_native_controls(
                     isinstance(effort, str) or ("effort" in settings and effort is None)
                 ):
                     resolved = await resolve_codex_effort_for_model(
-                        codex_client, effort, model, transport=state.socket_path
+                        codex_client,
+                        effort,
+                        model,
+                        transport=state.socket_path,
+                        catalog=model_catalog,
                     )
                     settings["effort"] = resolved
             update_pending = False

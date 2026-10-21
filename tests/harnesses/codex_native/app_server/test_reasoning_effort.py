@@ -153,6 +153,83 @@ async def test_live_effort_validation_reads_hidden_models_and_later_pages() -> N
     ]
 
 
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({}, "gpt-5.4"),
+        ({"model_provider": None}, "gpt-5.4"),
+        ({"model_provider": "openai"}, "gpt-5.4"),
+        ({"model_providers": {"openai": {"base_url": None}}}, "gpt-5.4"),
+        ({"model_provider": "gateway"}, "system.ai.gpt-5-4"),
+        ({"model_provider": []}, "system.ai.gpt-5-4"),
+        (None, "system.ai.gpt-5-4"),
+        ({"openai_base_url": "https://gateway.example.test/v1"}, "system.ai.gpt-5-4"),
+        ({"chatgpt_base_url": "https://chatgpt.com/backend-api/"}, "gpt-5.4"),
+        (
+            {"model_providers": {"openai": {"base_url": "https://gateway.example.test/v1"}}},
+            "system.ai.gpt-5-4",
+        ),
+    ],
+)
+async def test_account_alias_uses_the_live_provider_config(
+    tmp_path: Path, config: object, expected: str
+) -> None:
+    """Live route evidence wins over copied config; null means the built-in default."""
+    (tmp_path / "config.toml").write_text('model_provider = "copied-gateway"\n')
+    (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = [
+        {"result": {"config": config}},
+        {"result": {"data": [{"id": "gpt-5.4"}]}},
+    ]
+    model, _catalog = await app_server.resolve_codex_chatgpt_model(
+        client, "system.ai.gpt-5-4", codex_home=tmp_path
+    )
+    assert model == expected
+    assert client.request.call_count == (2 if expected == "gpt-5.4" else 1)
+
+
+async def test_account_alias_route_discovery_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unresponsive config/read leaves the requested model unchanged."""
+    (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+
+    async def stalled(*_args: object) -> None:
+        await asyncio.Event().wait()
+
+    client.request.side_effect = stalled
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.01)
+    model, _catalog = await app_server.resolve_codex_chatgpt_model(
+        client, "system.ai.gpt-5-4", codex_home=tmp_path
+    )
+    assert model == "system.ai.gpt-5-4"
+    assert client.request.await_args_list == [call("config/read", {"includeLayers": False})]
+
+
+@pytest.mark.parametrize("catalog_failure", [False, True], ids=["empty", "failed"])
+async def test_alias_and_effort_share_unavailable_capabilities(
+    tmp_path: Path, catalog_failure: bool
+) -> None:
+    """One settings request never repeats a failed or empty model/list call."""
+    (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = [
+        {"result": {"config": {"model_provider": "openai"}}},
+        RuntimeError("discovery unavailable") if catalog_failure else {"result": {"data": []}},
+    ]
+    model, catalog = await app_server.resolve_codex_chatgpt_model(
+        client, "system.ai.gpt-5-4", codex_home=tmp_path
+    )
+    effort = await app_server.resolve_codex_effort_for_model(client, "max", model, catalog=catalog)
+    assert (model, effort) == ("system.ai.gpt-5-4", "max")
+    assert client.request.await_args_list == [
+        call("config/read", {"includeLayers": False}),
+        call("model/list", {"includeHidden": True}),
+    ]
+
+
 @pytest.mark.parametrize("default", ["high", None])
 async def test_effort_reset_requires_the_models_advertised_default(default: str | None) -> None:
     """A reset uses the actual default or fails instead of sending Codex a null no-op."""
