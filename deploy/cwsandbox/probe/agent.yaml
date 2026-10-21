@@ -1,0 +1,9 @@
+name: e2e-probe
+prompt: Answer arithmetic questions with only the number.
+executor:
+  harness: openai-agents
+  model: REPLACE_WITH_OPENAI_MODEL
+  auth:
+    type: api_key
+    api_key: ${OPENAI_API_KEY}
+    base_url: https://api.openai.com/v1
