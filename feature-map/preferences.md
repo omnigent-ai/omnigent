@@ -50,7 +50,8 @@ tab shows inventory; both are covered in [Native harnesses](./native-harnesses.m
 `POST /v1/preferences/shared/operations` with the server's normal authentication.
 The [API guide](../docs/shared-preferences-api.md) covers requests, conflict
 resolution, identity, and limits. These endpoints do not adopt preferences into
-launchers or turn on sync.
+launchers or turn on sync. Embedded apps opt in with `create_app(preference_store=...)`;
+omitting an auth provider uses the reserved `local` user namespace.
 
 **Shared scope controls:** the CLI and UI do not yet offer importing/reimporting
 preferences, saving shared or machine defaults, removing a machine override,
@@ -135,15 +136,12 @@ uv run --no-sync pytest tests/stores/test_preference_store.py \
   tests/server/routes/test_preferences.py tests/test_preference_sync.py --reruns 0 -q
 ```
 
-The standard component matrix also checks page boundaries, malformed/foreign
-cursors, edits during and between pages, partial conflict resolution, and
-wrong-key rejection without consuming the operation ID. A SQLite query-plan/VM
-check adds 10,000 receipt rows and verifies page work stays bounded. Route tests
-cover keyword authentication, a separate positional-auth check, overlong user
-IDs, and authority mismatch. Store tests cover simultaneous delivery of one
-operation ID, compact receipts at the UTF-8 value limit, and unresolved conflicts
-at the operation cap. These are store/HTTP
-checks; the process recipe above covers replica and restart transport.
+The [store matrix](../tests/stores/test_preference_store.py) covers bounded
+pages, concurrent edits, limits, atomic rejection, and stable retry receipts.
+The [route matrix](../tests/server/routes/test_preferences.py) covers authenticated
+and no-auth embedding, identity validation, and HTTP status mapping. The
+[protocol tests](../tests/test_preference_sync.py) own key/value validation.
+Use the process recipe above for replica and restart transport.
 
 For later slices, continue live verification of each newly connected path on an
 isolated deployment. Record the candidate/runtime versions, configuration,

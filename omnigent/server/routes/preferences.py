@@ -27,8 +27,10 @@ def create_preferences_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    def user_id(request: Request) -> str:
+    def user_id(request: Request) -> str | None:
         authenticated = require_user(request, auth_provider)
+        if authenticated is None:
+            return None
         try:
             return _USER_ID.validate_python(authenticated)
         except ValidationError as exc:

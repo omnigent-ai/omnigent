@@ -14,10 +14,10 @@ separate deployments must use different IDs. Keep the ID across restarts and
 URL changes. Existing stored state rejects an inconsistent authority.
 
 Embedded deployments opt in by passing a `PreferenceStore` to `create_app`.
-The server derives
-user identity from its configured authentication provider and workspace identity
-from the existing trusted workspace context. An installation ID describes the
-source of an edit; it is not proof of machine identity or an authorization grant.
+With no auth provider, requests use the reserved `local` user namespace.
+With a provider, requests require its authenticated user identity. Workspace
+identity comes from the trusted workspace context. An installation ID describes
+the source of an edit; it is not an authorization grant.
 
 ## Read and edit
 
@@ -26,14 +26,11 @@ source of an edit; it is not proof of machine identity or an authorization grant
 `next_cursor`. Pass `limit` (1–100, default 100) and the opaque `cursor` from the
 previous page until `next_cursor` is null. Conflicts precede values; each range
 uses deterministic key order. The combined entry/conflict count is at most
-`limit`. Metadata is a point lookup, and indexed key ranges exclude receipt
-history; work per page is O(limit), independent of receipt count.
+`limit`; receipt history is excluded.
 
 Every cursor binds the authenticated namespace and revision. If any edit commits
 between pages, the server returns 409: discard all collected pages and restart
-from page one. Each page is one SQL statement combining a metadata point lookup with up to two
-independently limited index ranges; after a value cursor only the value range remains.
-Its rows come from one consistent view. Only publish a complete
+from page one. Each page is internally consistent. Only publish a complete
 snapshot from one revision; never adopt a partial page. Malformed or foreign
 cursors return 400; cursors over 4,096 characters return 422. A cursor is not an
 authorization credential. Authenticated user IDs that do not fit the namespace
@@ -102,33 +99,26 @@ in `resolves`. Only the named alternatives are removed. A stale resolution
 creates another conflict and retains the originals. Missing or wrong-key conflict
 IDs, a future version, and exhausted limits return HTTP 409 without consuming the
 operation. Foreign identities return 403; malformed payloads return 422.
+If the complete stored record exceeds 16,000 bytes, the response is 400
+(`invalid_input`), even when the value alone fits. Nothing is committed and
+the operation ID remains reusable with a smaller request.
 
 ## Storage and limits
 
-The existing `preferences` table holds separate records for current values,
-operation receipts, conflicts, and namespace counters under `shared.v1.*` keys.
-An account lock (where applicable) precedes the namespace lock. SQLite uses an
-immediate write transaction; the other backends lock the namespace row. The
-existing transaction helper retries supported database serialization/deadlock
-failures. Value, conflict, counter, and receipt updates commit together.
+Values, conflicts and retry receipts commit atomically in the existing
+`preferences` table. See the [store](../omnigent/stores/preference_store/sqlalchemy_store.py)
+for locking and bounded-query details.
 
 Per user/workspace, version 1 allows 512 distinct keys including deletions,
 128 unresolved conflicts, and 10,000 consumed operations. Each JSON-encoded
 `{"value": ...}` is limited to 8,192 UTF-8 bytes. Names are at most 128 characters;
-individual raw JSON records are capped at 16,000 UTF-8 bytes, below 16 KiB with
-room for storage framing. A receipt stores a SHA-256 fingerprint of the canonical
-request and its original result; it does not duplicate the submitted value.
-An oversized full record is rejected without consuming the operation.
+the full-record cap above includes JSON escaping and request metadata.
 
-Receipts and deletions do not expire. Hitting a limit rejects further work rather
-than discarding history; existing reads and receipt retries still work. The
-10,000-operation cap permanently blocks every new operation ID in that namespace,
-including unchanged edits and conflict resolutions. Open conflicts remain visible
-but cannot be resolved once the cap is reached. There is no automatic reset or
-compaction. Receipt retention/compaction requires a migration and retry-identity
-design before broad activation. Account deletion currently uses the existing
-single-transaction cleanup of all user preference rows; bounded cleanup remains
-a prerequisite for broad activation.
+Receipts and deletions do not expire. At 10,000 consumed operations, all new IDs
+are permanently blocked, including unchanged edits and conflict resolutions.
+Reads and identical retries still work; open conflicts remain visible but cannot
+be resolved. Retention/compaction and bounded account-deletion batches are
+prerequisites for broad activation; neither is implemented yet.
 
 The version-1 key encoding is explicit and pinned by digest tests. Changing its
 encoding, harness aliases, or stored-record validation requires a migration or a

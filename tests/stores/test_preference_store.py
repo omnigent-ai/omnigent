@@ -2,16 +2,19 @@
 
 import json
 from concurrent.futures import ThreadPoolExecutor
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import event, func, select
+from sqlalchemy import LargeBinary, event, func, select, type_coerce
 
 from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlPreference, workspace_scope
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.preference_sync import PreferenceMutation, PreferenceSnapshot
-from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
+from omnigent.stores.preference_store.sqlalchemy_store import (
+    SqlAlchemyPreferenceStore,
+    _fingerprint,
+)
 
 
 @pytest.fixture
@@ -29,6 +32,22 @@ def mutation(store, *, user="alice", key=None, value="model-a", version=0, resol
         expected_version=version,
         value=value,
         resolves=list(resolves),
+    )
+
+
+def test_receipt_fingerprint_is_stable():
+    operation = PreferenceMutation(
+        protocol_version=1,
+        identity={"authority_id": "a", "user_id": "u", "workspace_id": "0"},
+        operation_id=UUID(int=1),
+        installation_id="laptop",
+        key={"kind": "harness_args", "name": "claude"},
+        expected_version=2,
+        value=["--profile", "工具"],
+        resolves=[UUID(int=2)],
+    )
+    assert _fingerprint(operation) == (
+        "00fc8acaa5a97271a412cef2f4a68acccc9ebef1c2f2f304dc479889495fec12"
     )
 
 
@@ -77,9 +96,16 @@ def test_independent_keys_and_delayed_receipt(store):
         "model": "model-b",
         "harness": "pi-native",
     }
-    changed_retry = original.model_copy(update={"value": "model-c"})
-    with pytest.raises(OmnigentError, match="Operation ID"):
-        store.apply(changed_retry, user_id="alice")
+    for changes in (
+        {"value": "model-c"},
+        {"installation_id": "desktop"},
+        {"expected_version": 1},
+        {"resolves": [uuid4()]},
+    ):
+        with pytest.raises(OmnigentError, match="Operation ID"):
+            store.apply(original.model_copy(update=changes), user_id="alice")
+    assert store.read(user_id="alice") == snapshot
+    assert store.apply(original, user_id="alice") == receipt
 
 
 def test_maximum_value_has_compact_durable_receipt(store, db_uri):
@@ -88,12 +114,48 @@ def test_maximum_value_has_compact_durable_receipt(store, db_uri):
     reopened = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
     assert reopened.apply(operation, user_id="alice") == result
     with store._session("inspect_record_sizes") as session:
-        rows = session.scalars(select(SqlPreference)).all()
+        rows = session.execute(
+            select(SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary))
+        ).all()
+    assert all(len(row.value) < 16384 for row in rows)
     assert all(len((decode(row.value) or "").encode()) < 16384 for row in rows)
     receipt = next(row for row in rows if row.key.startswith("shared.v1.receipt."))
     body = json.loads(decode(receipt.value))
     assert "operation" not in body
     assert len(body["fingerprint"]) == 64
+
+
+def test_oversized_conflict_preserves_state_and_operation_id(db_uri):
+    # Escaped names and many resolution IDs can exceed the full-record cap.
+    name = "\x01" * 128
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id=name)
+    key = {"kind": "harness_args", "name": name}
+    store.apply(mutation(store, user=name, key=key, value=[]), user_id=name)
+    conflicts = [mutation(store, user=name, key=key, value=["alternative"]) for _ in range(127)]
+    for conflict in conflicts:
+        assert store.apply(conflict, user_id=name).status == "conflict"
+    oversized = mutation(
+        store,
+        user=name,
+        key=key,
+        value=["x" * 8178],
+        resolves=[conflict.operation_id for conflict in conflicts],
+    ).model_copy(update={"installation_id": name})
+    assert len(oversized.model_dump_json(include={"value"}).encode()) == 8192
+    assert len(oversized.model_dump_json().encode()) > 16000
+    with store._session("inspect_before_rejected_edit") as session:
+        before = session.execute(select(SqlPreference.key, SqlPreference.value)).all()
+    with pytest.raises(OmnigentError, match="storage limit") as error:
+        store.apply(oversized, user_id=name)
+    assert error.value.code == ErrorCode.INVALID_INPUT
+    with store._session("inspect_after_rejected_edit") as session:
+        assert dict(session.execute(select(SqlPreference.key, SqlPreference.value)).all()) == dict(
+            before
+        )
+    corrected = oversized.model_copy(update={"value": ["small"], "resolves": []})
+    accepted = store.apply(corrected, user_id=name)
+    assert accepted.status == "conflict"
+    assert store.apply(corrected, user_id=name) == accepted
 
 
 @pytest.mark.parametrize("initial_write", [False, True])

@@ -15,8 +15,8 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
 
 
-@pytest.mark.parametrize("positional_auth", [False, True])
-async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch, positional_auth):
+@pytest.mark.parametrize("auth_mode", ["keyword", "positional", "disabled"])
+async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch, auth_mode):
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -27,23 +27,26 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
         artifacts,
         AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
     ]
-    provider = UnifiedAuthProvider(source="header")
+    provider = None if auth_mode == "disabled" else UnifiedAuthProvider(source="header")
     # Exercise positional auth while keeping preference_store keyword-only.
     app = (
         create_app(*stores, *([None] * 6), provider, preference_store=store)
-        if positional_auth
+        if auth_mode == "positional"
         else create_app(*stores, auth_provider=provider, preference_store=store)
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         path = "/v1/preferences/shared"
-        assert (await client.get(path)).status_code == 401
-        if positional_auth:
-            return
-        alice = {"X-Forwarded-Email": "alice@example.test"}
+        if auth_mode != "disabled":
+            assert (await client.get(path)).status_code == 401
+            if auth_mode == "positional":
+                return
+        alice = {} if auth_mode == "disabled" else {"X-Forwarded-Email": "alice@example.test"}
         bob = {"X-Forwarded-Email": "bob@example.test"}
-        initial = (await client.get(path, headers=alice)).json()
+        response = await client.get(path, headers=alice)
+        assert response.status_code == 200, response.text
+        initial = response.json()
         operation = {
             "protocol_version": 1,
             "identity": initial["identity"],
@@ -53,6 +56,15 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
             "expected_version": 0,
             "value": "pi-native",
         }
+        if auth_mode == "disabled":
+            assert initial["identity"]["user_id"] == "local"
+            saved = await client.post(path + "/operations", json=operation)
+            assert saved.status_code == 200, saved.text
+            assert (await client.get(path)).json()["entries"] == [saved.json()["entry"]]
+            assert store.read(user_id=None).entries[0].value == "pi-native"
+            foreign = {**operation, "identity": {**initial["identity"], "user_id": "alice"}}
+            assert (await client.post(path + "/operations", json=foreign)).status_code == 403
+            return
         assert (await client.post(path + "/operations", json=operation)).status_code == 401
         overlong = {"X-Forwarded-Email": "a" * 123 + "@example.test"}
         assert (await client.get(path, headers=overlong)).status_code == 400
