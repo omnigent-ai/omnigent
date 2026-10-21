@@ -231,6 +231,8 @@ export interface ServerInfo {
   agent_detail?: boolean;
   /** Owner-only configuration reads and conditional PATCH updates. */
   agent_config_edit?: boolean;
+  /** Shared defaults API is configured; adoption is still explicit. */
+  shared_preferences?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -407,6 +409,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
+          shared_preferences: data.shared_preferences === true,
           agent_config_edit: data.agent_config_edit === true,
           branding: parseBranding(data.branding),
         };

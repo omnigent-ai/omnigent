@@ -37,6 +37,7 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
+        assert (await client.get("/v1/info")).json()["shared_preferences"] is True
         path = "/v1/preferences/shared"
         if auth_mode != "disabled":
             assert (await client.get(path)).status_code == 401

@@ -213,6 +213,7 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    shared_preferences: bool = False
     branding: BrandingInfo
 
 
@@ -3178,6 +3179,7 @@ def create_app(
                 "request_managed_sandbox_host_id": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
+                "shared_preferences": preference_store is not None,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "branding": branding_snapshot.config(),

@@ -1,5 +1,11 @@
 import type { ReactNode } from "react";
-import { DropdownMenuCheckboxItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
+import { Link } from "@/lib/routing";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import {
+  DropdownMenuCheckboxItem,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { PickerSectionHeader } from "./HarnessMenuRow";
 
 /** One checkbox row in a Models or Effort section. */
@@ -72,6 +78,7 @@ export function ComposerConfigSections({
   // Lead / Effort / Sidekick selectors. Each gets its own separator + header.
   extra?: readonly ComposerConfigSection[];
 }) {
+  const info = useServerInfo();
   const sections = [
     ...(sdk ? [sdk] : []),
     ...(models ? [models] : []),
@@ -80,6 +87,11 @@ export function ComposerConfigSections({
   ];
   return (
     <>
+      {info !== "loading" && info.shared_preferences && (
+        <DropdownMenuItem asChild>
+          <Link to="/settings/preferences">Manage shared defaults…</Link>
+        </DropdownMenuItem>
+      )}
       {sections.map((section, index) => (
         <div key={section.testId} data-testid={section.testId}>
           {index > 0 && <DropdownMenuSeparator />}

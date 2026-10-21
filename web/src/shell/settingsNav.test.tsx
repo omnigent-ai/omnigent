@@ -77,6 +77,18 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("settingsNavGroups", () => {
+  it("shows shared preferences only when the server supports them", () => {
+    expect(
+      settingsNavGroups(false, false)
+        .flatMap((group) => group.items)
+        .some((item) => item.id === "preferences"),
+    ).toBe(false);
+    expect(
+      settingsNavGroups(false, false, false, false, false, false, false, true)
+        .flatMap((group) => group.items)
+        .find((item) => item.id === "preferences")?.label,
+    ).toBe("Shared preferences");
+  });
   it("starts general preferences with a General gear entry", () => {
     const general = settingsNavGroups(false, false).find((group) => group.title === "General");
     expect(general?.items[0]).toMatchObject({

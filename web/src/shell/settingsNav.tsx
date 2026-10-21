@@ -36,6 +36,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
+  | "preferences"
   | "harnesses"
   | "custom-agents"
   | "general"
@@ -55,6 +56,7 @@ export type SettingsSectionId =
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "harnesses",
+  "preferences",
   "custom-agents",
   "general",
   "git",
@@ -101,6 +103,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
+  sharedPreferencesEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -115,6 +118,8 @@ export function settingsNavGroups(
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
   if (!customAgentsEnabled) general.splice(2, 0, harnesses);
+  if (sharedPreferencesEnabled)
+    general.splice(2, 0, { id: "preferences", label: "Shared preferences", icon: Share2Icon });
   // Provider credentials and MCP accounts have separate settings pages.
   if (integrationsEnabled) {
     general.splice(2, 0, {
@@ -266,6 +271,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
+    info !== "loading" && info.shared_preferences === true,
   );
 
   return (

@@ -1,9 +1,15 @@
+import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ComposerConfigSections, type ComposerConfigSection } from "./ComposerConfigSections";
 import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
 
-afterEach(cleanup);
+const capabilities = vi.hoisted(() => ({ shared_preferences: false }));
+vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => capabilities }));
+afterEach(() => {
+  cleanup();
+  capabilities.shared_preferences = false;
+});
 
 // The checkbox rows need a menu context; render the sections inside an open
 // menu, the same way both harness pickers mount them.
@@ -14,11 +20,13 @@ function renderSections(props: {
   extra?: ComposerConfigSection[];
 }) {
   return render(
-    <DropdownMenu open>
-      <DropdownMenuContent>
-        <ComposerConfigSections {...props} />
-      </DropdownMenuContent>
-    </DropdownMenu>,
+    <MemoryRouter>
+      <DropdownMenu open>
+        <DropdownMenuContent>
+          <ComposerConfigSections {...props} />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </MemoryRouter>,
   );
 }
 
@@ -45,6 +53,17 @@ const modelsSection = (testId: string): ComposerConfigSection => ({
 });
 
 describe("ComposerConfigSections", () => {
+  it("keeps scoped settings separate from ordinary session choices", () => {
+    capabilities.shared_preferences = true;
+    const section = modelsSection("session-models");
+    renderSections({ models: section });
+    expect(screen.getByRole("menuitem", { name: "Manage shared defaults…" })).toHaveAttribute(
+      "href",
+      "/settings/preferences",
+    );
+    fireEvent.click(screen.getByTestId("session-models-opus"));
+    expect(section.choices[1].onSelect).toHaveBeenCalledOnce();
+  });
   it("renders Agent SDK before Models with separators between sections", () => {
     renderSections({
       sdk: {

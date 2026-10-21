@@ -4,8 +4,9 @@ Users can save local model and harness defaults, override them for a project,
 and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
 and an opt-in server API for durable edits and conflicts. Explicit shared/machine scope controls and import previews are available through
-the CLI. Connected CLI launches and user-owned hosts adopt cached/shared defaults
-at startup; browser controls and managed startup remain separate. Pending edits
+the CLI and Settings → Shared preferences. Connected CLI launches and user-owned
+hosts adopt cached/shared defaults at startup; browser launch selection and managed
+startup remain separate integration work. Pending edits
 retry on host reconnect without polling between messages.
 Claude/Codex native and SDK sessions also apply plugin toggles in private settings.
 Native startup applies adopted model defaults and retains known-unavailable choices.
@@ -38,6 +39,8 @@ Saved native arguments are applied once by the runner, including browser launche
   frozen handoff; reconnect retries pending edits with bounded jitter.
 - `shared-cli`: connect to an authenticated workspace, inspect shared/machine values,
   preview/apply an import or restore, retry edits and resolve conflicts.
+- `shared-browser`: review/import all four groups, edit shared or machine values,
+  remove overrides, resolve conflicts and safely retry uncertain saves in Settings.
 - `shared-host-controls`: inspect adoption without changing it, preview portable
   host defaults, apply a reviewed import/restore, and set or remove machine overrides.
 - `shared-plugins`: import explicit native user toggles, apply installed plugins
@@ -98,14 +101,23 @@ warning; a fresh machine offers Retry or `omnigent --temporary-preferences COMMA
 A deployment can opt new machines into discovery with `OMNIGENT_SHARED_PREFERENCES=1`;
 the default is off. See the [startup guide](../docs/shared-preferences-startup.md).
 
+**Shared browser settings:** open Settings → Shared preferences on web, desktop
+or mobile. Both composer configuration menus link to it with Manage shared defaults.
+Select a machine, preview its defaults, then Apply and follow; or explicitly use
+existing workspace defaults. The Follow me scope changes shared defaults; This
+machine saves an override. Review restore previews undoing the last import.
+Competing edits show accepted and proposed values for an explicit choice. Merely
+opening Settings, previewing or changing a session picker never publishes defaults.
+The section is available only when the server advertises shared-preference support.
+
 **Host preference controls:** on an opted-in server, an owner can call
 `POST /v1/hosts/{host_id}/preferences` with `status`, `connect`, `sync`,
 `preview_import`, `apply_import`, `preview_restore`, `set_machine`, or `discard`.
 Status and import preview do not adopt the machine. Import reads only portable
 user defaults and explicitly requested native plugin toggles. Older, disconnected
 or differently authenticated hosts report a failure. See the
-[host controls guide](../docs/shared-preferences-host-controls.md). Browser controls
-are the next integration surface; this route alone does not provide a settings UI.
+[host controls guide](../docs/shared-preferences-host-controls.md). Settings uses this route for machine controls and the shared API for versioned
+shared edits.
 
 **Shared plugins:** add `--plugins claude --plugins codex` to the import preview
 to include explicit native user toggles. After adoption, native and SDK sessions use
@@ -224,6 +236,23 @@ checks status and preview leave adoption off and omit local commands.
 These scenarios cover: connect, preview/apply
 a portable YAML/native-plugin import, set/remove a machine override, and restore
 the import. Native toggles require the explicit `--plugins` options.
+
+**Shared browser settings (own environment):**
+
+```sh
+uv run --no-sync pytest tests/e2e_ui/preferences/test_shared_preferences.py \
+  --ui-skip-build --reruns 0 -q --video=on --output=/tmp/preference-ui-evidence
+```
+
+Build this checkout first. The journey starts an isolated server and host with
+shared storage enabled and uses real browser clicks at desktop and mobile widths.
+It verifies preview without adoption, all four imported groups, machine override
+removal, competing edits, and restore preserving newer changes. Another-machine
+edit is submitted through the real API. A dropped browser reply is injected after
+a real commit; Retry reuses the exact mutation without incrementing revision.
+No model request or managed deployment is involved. The shared composer-menu
+component is covered by its existing frontend test; live composer launch adoption
+and unavailable-choice recovery belong to the next launch slice.
 
 **Host preference controls (component coverage):**
 
