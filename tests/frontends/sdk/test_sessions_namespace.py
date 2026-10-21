@@ -32,7 +32,7 @@ What each test claims to prove (and what failure indicates):
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any, Literal
 
 import httpx
@@ -1468,3 +1468,245 @@ async def test_list_preserves_host_id_on_rows() -> None:
     assert by_id["conv_unbound"].parent_session_id is None
     assert by_id["conv_child"].host_id is None
     assert by_id["conv_child"].parent_session_id == "conv_host_bound"
+
+
+# ── session metadata: cost / usage / lineage / kind ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_parses_cost_usage_and_lineage_metadata() -> None:
+    usage_by_model = {
+        "claude-sonnet-4-6": {
+            "input_tokens": 12000,
+            "output_tokens": 800,
+            "total_tokens": 12800,
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=_session_response_body()
+            | {
+                "total_cost_usd": 0.42,
+                "usage_included": True,
+                "usage_by_model": usage_by_model,
+                "parent_session_id": "conv_parent",
+                "root_conversation_id": "conv_root",
+                "kind": "sub_agent",
+                "sub_agent_name": "summarizer",
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.total_cost_usd == 0.42
+    assert session.usage_included is True
+    assert session.usage_by_model == usage_by_model
+    assert session.parent_session_id == "conv_parent"
+    assert session.root_conversation_id == "conv_root"
+    assert session.kind == "sub_agent"
+    assert session.sub_agent_name == "summarizer"
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected_usage_included"),
+    [
+        # An older server omits the metadata keys entirely.
+        pytest.param({}, True, id="keys-omitted"),
+        # include_usage=false: usage is unknown rather than zero.
+        pytest.param(
+            {"usage_included": False, "total_cost_usd": None, "usage_by_model": None},
+            False,
+            id="usage-not-included",
+        ),
+    ],
+)
+def test_session_from_dict_metadata_compatibility(
+    extra: dict[str, Any], expected_usage_included: bool
+) -> None:
+    session = Session.from_dict(_session_response_body() | extra)
+
+    assert session.total_cost_usd is None
+    assert session.usage_included is expected_usage_included
+    assert session.usage_by_model is None
+    assert session.parent_session_id is None
+    assert session.root_conversation_id is None
+    assert session.kind == "default"
+    assert session.sub_agent_name is None
+
+
+# ── set_labels() ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_set_labels_patches_labels_and_returns_snapshot() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content.decode())
+        # The server upserts: a key the patch omits survives and an
+        # empty value is stored rather than deleting its key.
+        return httpx.Response(
+            200,
+            json=_session_response_body(status="idle")
+            | {"labels": {"env": "test", "team": "platform", "note": ""}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.set_labels("conv_abc", {"team": "platform", "note": ""})
+    finally:
+        await client.aclose()
+
+    assert captured == {
+        "url": "http://srv/v1/sessions/conv_abc",
+        "method": "PATCH",
+        "body": {"labels": {"team": "platform", "note": ""}},
+    }
+    assert session.labels == {"env": "test", "team": "platform", "note": ""}
+
+
+# ── delete() ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delete_branch", "expected_url"),
+    [
+        (False, "http://srv/v1/sessions/conv_abc"),
+        (True, "http://srv/v1/sessions/conv_abc?delete_branch=true"),
+    ],
+)
+async def test_delete_sends_delete_request(delete_branch: bool, expected_url: str) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url}")
+        return httpx.Response(
+            200,
+            json={"id": "conv_abc", "object": "conversation.deleted", "deleted": True},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_abc", delete_branch=delete_branch)
+    finally:
+        await client.aclose()
+
+    assert calls == [f"DELETE {expected_url}"]
+
+
+@pytest.mark.asyncio
+async def test_delete_404_raises_omnigent_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            404,
+            json={"error": {"code": "not_found", "message": "Session not found"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await ns.delete("conv_missing")
+    finally:
+        await client.aclose()
+
+    assert "Session not found" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_set_labels_forbidden_raises_omnigent_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            403,
+            json={
+                "error": {"code": "forbidden", "message": "cost_control labels are runner-owned"}
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(OmnigentError) as exc_info:
+            await ns.set_labels("conv_abc", {"cost_control.mode": "on"})
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 403
+    assert "runner-owned" in str(exc_info.value)
+
+
+# ── caller-supplied ids stay inside the session path ─────────────────
+
+
+async def _drain(events: AsyncIterator[Any]) -> None:
+    async for _ in events:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_delete_keeps_reserved_characters_inside_the_session_id() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # raw_path keeps the wire encoding and would carry any query string.
+        captured["raw_path"] = request.url.raw_path
+        return httpx.Response(
+            200,
+            json={"id": "conv_x", "object": "conversation.deleted", "deleted": True},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.delete("conv_x?delete_branch=true")
+    finally:
+        await client.aclose()
+
+    assert captured == {"raw_path": b"/v1/sessions/conv_x%3Fdelete_branch%3Dtrue"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda ns, sid: ns.get(sid), id="get"),
+        pytest.param(lambda ns, sid: ns.set_labels(sid, {"team": "platform"}), id="set_labels"),
+        pytest.param(lambda ns, sid: ns.delete(sid), id="delete"),
+        pytest.param(lambda ns, sid: ns.set_archived(sid, archived=True), id="set_archived"),
+        pytest.param(
+            lambda ns, sid: ns.post_event(sid, {"type": "interrupt", "data": {}}),
+            id="post_event",
+        ),
+        pytest.param(
+            lambda ns, sid: ns.resolve_elicitation("conv_abc", sid, {"action": "accept"}),
+            id="elicitation_id",
+        ),
+        pytest.param(lambda ns, sid: _drain(ns.stream(sid)), id="stream"),
+    ],
+)
+async def test_session_routes_reject_ids_that_escape_the_session_path(
+    call: Callable[[SessionsNamespace, str], Awaitable[Any]],
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(f"{request.method} {request.url.path}")
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(ValueError):
+            await call(ns, "conv_abc/permissions/alice")
+    finally:
+        await client.aclose()
+
+    assert calls == []

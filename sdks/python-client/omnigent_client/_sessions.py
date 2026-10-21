@@ -35,6 +35,7 @@ from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._http import session_url
 from ._timeouts import _SSE_TIMEOUT
 from ._types import PaginatedList
 
@@ -181,6 +182,30 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param sub_agent_name: For sub-agent sessions, the sub-agent type
+        name within the parent's spec tree, e.g. ``"summarizer"``.
+        ``None`` for top-level sessions.
+    :param kind: ``"default"`` for a top-level session or ``"sub_agent"``
+        for a child spawned by another session. ``"default"`` when an
+        older server omits the field.
+    :param parent_session_id: For sub-agent sessions, the parent
+        conversation's id, e.g. ``"conv_parent987"``. ``None`` for
+        top-level sessions.
+    :param root_conversation_id: Id of this session's spawn-tree root.
+        Equals ``id`` for top-level sessions; for sub-agents it points
+        at the top-level ancestor. ``None`` when the server omits it.
+    :param total_cost_usd: Cumulative LLM spend for this session in USD,
+        e.g. ``0.42``. ``None`` while the session is unpriced (no turn
+        has been priced yet) or when ``usage_included`` is ``False``.
+    :param usage_by_model: Per-model breakdown of the same usage, keyed
+        by the raw harness model id. Each value is the server's
+        ``ModelUsage`` object as a dict (``input_tokens``,
+        ``output_tokens``, ``total_tokens``, cache buckets,
+        ``total_cost_usd``). ``None`` when nothing has been recorded or
+        when ``usage_included`` is ``False``.
+    :param usage_included: ``False`` when the snapshot was fetched with
+        ``include_usage=false``, so ``total_cost_usd`` and
+        ``usage_by_model`` are unknown rather than zero.
     """
 
     id: str
@@ -202,6 +227,13 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    sub_agent_name: str | None = None
+    kind: str = "default"
+    parent_session_id: str | None = None
+    root_conversation_id: str | None = None
+    total_cost_usd: float | None = None
+    usage_by_model: dict[str, dict[str, Any]] | None = None
+    usage_included: bool = True
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -218,6 +250,8 @@ class Session:
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
+        raw_cost = raw.get("total_cost_usd")
+        usage_raw = raw.get("usage_by_model")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
@@ -238,6 +272,13 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            sub_agent_name=raw.get("sub_agent_name"),
+            kind=str(raw.get("kind") or "default"),
+            parent_session_id=raw.get("parent_session_id"),
+            root_conversation_id=raw.get("root_conversation_id"),
+            total_cost_usd=float(raw_cost) if raw_cost is not None else None,
+            usage_by_model=usage_raw if isinstance(usage_raw, dict) else None,
+            usage_included=bool(raw.get("usage_included", True)),
         )
 
 
@@ -352,6 +393,10 @@ class SessionsNamespace:
     interrupt that bypasses it), and live-tail the SSE stream. There
     is no replay; see the module docstring for the snapshot +
     live-tail reconnect contract.
+
+    Session and elicitation ids are opaque single path segments: a
+    method raises ``ValueError`` before sending anything when a
+    caller-supplied id is empty, a dot segment, or contains ``/``.
 
     :param http: Pre-built ``httpx.AsyncClient`` shared with the
         parent :class:`OmnigentClient`. Owned by the parent;
@@ -720,7 +765,7 @@ class SessionsNamespace:
             registered).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -743,7 +788,7 @@ class SessionsNamespace:
             session does not exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -774,7 +819,7 @@ class SessionsNamespace:
         """
         wire_effort = reasoning_effort if reasoning_effort is not None else "default"
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -819,7 +864,7 @@ class SessionsNamespace:
         if silent:
             body["silent"] = True
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -853,7 +898,7 @@ class SessionsNamespace:
             access, 404 when the session does not exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -888,8 +933,45 @@ class SessionsNamespace:
             exist).
         """
         resp = await self._http.patch(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
             json={"external_session_id": external_session_id},
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return Session.from_dict(
+            require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
+        )
+
+    async def set_labels(
+        self,
+        session_id: str,
+        labels: dict[str, str],
+    ) -> Session:
+        """
+        Upsert guardrails labels on an existing session.
+
+        Calls ``PATCH /v1/sessions/{session_id}`` with
+        ``{"labels": {...}}``. The server merges rather than replaces:
+        every key in *labels* is written with its value and keys not
+        mentioned keep their current value, so a partial update never
+        drops other labels. Values are sent verbatim: an empty string is
+        stored as ``""`` rather than removing the key (the server clears
+        only its own project and pin keys on an empty value). An empty
+        mapping leaves the session unchanged.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param labels: Label key/value pairs to write, e.g.
+            ``{"team": "platform"}``.
+        :returns: The updated :class:`Session` snapshot; its ``labels``
+            carry the merged result.
+        :raises OmnigentError: On non-2xx status (400 for a
+            server-reserved key, 403 for an advisor-owned
+            ``cost_control.*`` key without the bound runner's authority
+            on a multi-user server, 404 when the session does not exist).
+        """
+        resp = await self._http.patch(
+            session_url(self._base, session_id),
+            json={"labels": labels},
         )
         raise_for_status(resp.status_code, response_body(resp))
         return Session.from_dict(
@@ -930,7 +1012,7 @@ class SessionsNamespace:
         if after is not None:
             params["after"] = after
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}/items",
+            session_url(self._base, session_id, "items"),
             params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -969,7 +1051,7 @@ class SessionsNamespace:
         if after is not None:
             params["after"] = after
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}/child_sessions",
+            session_url(self._base, session_id, "child_sessions"),
             params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1068,10 +1150,42 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}",
+            session_url(self._base, session_id),
         )
         raise_for_status(resp.status_code, response_body(resp))
         return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+
+    async def delete(
+        self,
+        session_id: str,
+        *,
+        delete_branch: bool = False,
+    ) -> None:
+        """
+        Delete a session and the resources the server holds for it.
+
+        Calls ``DELETE /v1/sessions/{session_id}``. The server stops any
+        running turn, tears down runner-side resources, removes the
+        session's files and drops the conversation row, so a later
+        :meth:`get` raises a 404 :class:`OmnigentError`. Owner-only.
+
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param delete_branch: When ``True`` and the session has a
+            server-created git worktree, also remove that worktree and
+            delete its branch on the host (sent as
+            ``?delete_branch=true``). Ignored for sessions without a
+            worktree.
+        :raises OmnigentError: On non-2xx status (403 when the caller is
+            not the owner, 404 when the session does not exist, 409 when
+            ``delete_branch=True`` and the host is offline so worktree
+            cleanup cannot run).
+        """
+        resp = await self._http.delete(
+            session_url(self._base, session_id),
+            params={"delete_branch": "true"} if delete_branch else None,
+        )
+        raise_for_status(resp.status_code, response_body(resp))
 
     async def post_event(
         self,
@@ -1098,7 +1212,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{session_id}/events",
+            session_url(self._base, session_id, "events"),
             json=event,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1137,7 +1251,7 @@ class SessionsNamespace:
             status (404 when the session does not exist).
         """
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            session_url(self._base, session_id, "elicitations", elicitation_id, "resolve"),
             json=result,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1182,7 +1296,7 @@ class SessionsNamespace:
         if up_to_response_id is not None:
             body["up_to_response_id"] = up_to_response_id
         resp = await self._http.post(
-            f"{self._base}/v1/sessions/{source_session_id}/fork",
+            session_url(self._base, source_session_id, "fork"),
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
@@ -1295,7 +1409,7 @@ async def _stream_session_events(
     """
     async with http.stream(
         "GET",
-        f"{base_url}/v1/sessions/{session_id}/stream",
+        session_url(base_url, session_id, "stream"),
         timeout=_SSE_TIMEOUT,
     ) as resp:
         if resp.status_code >= 400:
