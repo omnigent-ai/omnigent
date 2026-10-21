@@ -172,17 +172,6 @@ the extra fields. Resolver and raw-tunnel checks:
 `tests/host/test_harness_startup.py`,
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
-**Pi rebuilt history:** converter pairing/name cases in
-`tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
-and orphan results. The existing
-`tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
-checks real server/runner serialization with a stub Pi process. For a real
-Google-provider check, fork a session containing tool calls onto native Pi
-with Gemini, then send a follow-up; repeat a cold resume after removing its
-local session file. Expect preserved results and a reply without the empty
-`function_response.name` error. Orphan results and thought signatures remain
-separate compatibility gaps; these automated checks do not prove live Gemini.
-
 Cross-harness journeys:
 
 - **`working-status`, Claude (component and real-process checks):** run with
@@ -519,6 +508,17 @@ Cross-harness journeys:
   remain visible. For an older host (501) or server (404), verify that the
   derived skill/MCP plugin listing still works; a 502 shows an inventory error.
   Codex and Cursor keep their existing derived listings.
+
+**Pi rebuilt history:** converter pairing/name cases in
+`tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
+and orphan results. The existing
+`tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
+checks real server/runner serialization with a stub Pi process. For a real
+Google-provider check, fork a session containing tool calls onto native Pi
+with Gemini, then send a follow-up; repeat a cold resume after removing its
+local session file. Expect preserved results and a reply without the empty
+`function_response.name` error. Orphan results and thought signatures remain
+separate compatibility gaps; these automated checks do not prove live Gemini.
 
 ## Gotchas
 
