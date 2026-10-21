@@ -23,6 +23,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import httpx
@@ -30,6 +31,7 @@ import psutil
 import pytest
 
 from dev.benchmarks.omnigent import journeys as bench_journeys
+from dev.benchmarks.omnigent import preferences as bench_preferences
 from dev.benchmarks.omnigent import run as bench_run
 from dev.benchmarks.omnigent.environment import (
     BenchEnvironment,
@@ -95,18 +97,19 @@ def _smoke_args(**overrides: object) -> argparse.Namespace:
 @pytest.mark.parametrize(
     ("journey", "arguments", "valid"),
     [
+        ("read", ["--preference-history", "100001"], False),
         ("sync_same_user", ["--concurrency", "25"], False),
         ("sync_many_users", ["--preference-clients", "32"], False),
         ("sync_same_user", ["--preference-clients", "1", "--preference-keys", "1"], False),
         (
             "sync_same_user",
-            ["--preference-history", "9000", "--preference-keys", "512", "--concurrency", "16"],
-            False,
+            ["--preference-history", "10001", "--preference-keys", "512", "--concurrency", "16"],
+            True,
         ),
         (
             "write",
-            ["--preference-history", "9000", "--preference-keys", "512", "--iterations", "500"],
-            False,
+            ["--preference-history", "10001", "--preference-keys", "512", "--iterations", "500"],
+            True,
         ),
         (
             "write",
@@ -137,6 +140,52 @@ def test_preference_benchmark_workload_bounds(journey, arguments, valid):
         with pytest.raises(SystemExit) as exc:
             bench_run._parse_args(arguments)
         assert exc.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_preference_setup_paces_requests_but_timed_posts_do_not_retry(monkeypatch):
+    elapsed = 0.0
+    delays = []
+
+    async def advance(seconds):
+        nonlocal elapsed
+        delays.append(seconds)
+        elapsed += seconds
+
+    monkeypatch.setattr(bench_preferences, "time", SimpleNamespace(monotonic=lambda: elapsed))
+    monkeypatch.setattr(bench_preferences, "asyncio", SimpleNamespace(sleep=advance))
+    monkeypatch.setattr(bench_preferences, "MAX_PREFERENCE_REQUESTS_PER_MINUTE", 34)
+    pacer = bench_preferences._SetupPacer()
+    request = httpx.Request("GET", "http://test")
+    for _ in range(3):
+        await pacer.before_request(request)
+    assert delays == [60.1]
+
+    requests = []
+
+    def busy(request):
+        requests.append(request)
+        return httpx.Response(429, headers={"Retry-After": "5"})
+
+    from omnigent.preference_sync import PreferenceMutation, PreferenceNamespace
+
+    operation = PreferenceMutation(
+        protocol_version=2,
+        observed_revision=0,
+        identity=PreferenceNamespace(authority_id="bench", user_id="user", workspace_id="0"),
+        operation_id="00000000-0000-0000-0000-000000000001",
+        installation_id="bench",
+        key=bench_preferences._MODEL,
+        expected_version=0,
+        value="saved",
+    )
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(busy)
+    ) as http:
+        with pytest.raises(httpx.HTTPStatusError) as exc:
+            await bench_preferences._post(http, operation)
+    assert exc.value.response.status_code == 429 and len(requests) == 1
+    assert delays == [60.1]
 
 
 def test_default_benchmarks_preserve_disabled_preference_control():
@@ -1439,6 +1488,7 @@ def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
 _SWALLOWING_RUN = """
 import argparse, asyncio, os, signal, sys
 from dev.benchmarks.omnigent import run as bench_run
+from dev.benchmarks.omnigent import preferences as bench_preferences
 
 async def fake_run_benchmark(args, *, teardown_started=None):
     os.kill(os.getpid(), signal.SIGTERM)

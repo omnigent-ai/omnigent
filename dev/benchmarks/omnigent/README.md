@@ -295,14 +295,16 @@ The sync journeys also use the production client's private SQLite cache/outbox.
 | `sync_many_users` | Same, with each client in a separate user namespace |
 
 Each setup uses fresh benchmark-owned identities. `--preference-keys` (default
-32) controls current records; `--preference-history` (default 0, maximum 9000)
-adds real consumed operations/receipts before timing. `--preference-clients`
+32) controls current records; `--preference-history` (default 0, maximum 100000)
+adds real v2 operations before timing; only the latest 10,000 receipts remain. `--preference-clients`
 (default 16) controls independent disk caches. Concurrent sync uses a different
 plugin key per client so contention measurements are not conflict rejection
 measurements. Use at least clients + 1 keys and concurrency no higher than the
 client count. The correctness tests separately exercise conflicting same-key edits.
-The CLI rejects sync workloads that exceed the client pool or the per-namespace
-operation budget before starting a server; the budget is conservative for separate users.
+The CLI rejects sync workloads that exceed the client pool before starting a server.
+Setup paces requests below the production account limit and lets large seed bursts
+age out before timing. Large histories therefore take minutes per namespace.
+Timed samples never retry 429s: admission failures remain visible in the report.
 
 ```sh
 # Sequential latency, including client disk persistence.
@@ -310,10 +312,10 @@ uv run --no-sync dev/benchmarks/omnigent/run.py \
   --journeys shared_preferences_read,shared_preferences_write,shared_preferences_retry,shared_preferences_refresh \
   --iterations 100 --runs 3 --output /tmp/preference-latency.json
 
-# Near-capacity history; 9000 history operations plus 512 keys leaves room for samples.
+# Beyond retention: exercise reads and slot replacement after receipt compaction.
 uv run --no-sync dev/benchmarks/omnigent/run.py \
   --journeys shared_preferences_read,shared_preferences_retry,shared_preferences_write,shared_preferences_refresh \
-  --preference-keys 512 --preference-history 9000 \
+  --preference-keys 512 --preference-history 10001 \
   --iterations 100 --runs 3 --output /tmp/preference-history.json
 
 # Compare same-namespace locking with independent-user traffic.
@@ -325,8 +327,9 @@ uv run --no-sync dev/benchmarks/omnigent/run.py \
 Repeat on an isolated Postgres/MySQL/CockroachDB database via `--database-uri`.
 Never point history seeding at a production database. Setup persists benchmark
 rows in an external database; its owner cleans up that isolated database.
-Keep total keys + history + warmup + measured writes below the server's 10,000
-operation cap; exceeding it is a failed run, not a performance result.
+V2 has no lifetime operation ceiling. Reads and exact retries use the negotiated
+protocol; the retry journey keeps a recent retained receipt after setup. Writes
+advance their observed revision while preserving per-key version checks.
 
 Use `--shared-preferences` to enable the API for existing control journeys such
 as `get_session`, `list_sessions`, and `project_order_save_1000`; omit it for the

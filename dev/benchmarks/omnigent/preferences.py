@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -18,6 +20,7 @@ from omnigent.preference_sync import (
     PreferenceSnapshot,
     SharedPreferenceKey,
 )
+from omnigent.server.preference_requests import MAX_PREFERENCE_REQUESTS_PER_MINUTE
 
 from .environment import BenchEnvironment
 
@@ -43,6 +46,26 @@ async def _post(http: httpx.AsyncClient, operation: PreferenceMutation) -> Prefe
     response = await http.post(_PATH + "/operations", json=operation.model_dump(mode="json"))
     response.raise_for_status()
     return PreferenceResult.model_validate_json(response.content)
+
+
+@dataclass
+class _SetupPacer:
+    starts: deque[float] = field(default_factory=deque)
+
+    async def before_request(self, _request: httpx.Request) -> None:
+        now = time.monotonic()
+        while self.starts and now - self.starts[0] >= 60:
+            self.starts.popleft()
+        if len(self.starts) >= MAX_PREFERENCE_REQUESTS_PER_MINUTE - 32:
+            await asyncio.sleep(max(0, self.starts[0] + 60.1 - now))
+            await self.before_request(_request)
+            return
+        self.starts.append(time.monotonic())
+
+    async def finish(self) -> None:
+        # Large seeds must not consume the measured workload's initial rate budget.
+        if len(self.starts) >= MAX_PREFERENCE_REQUESTS_PER_MINUTE // 2:
+            await asyncio.sleep(max(0, self.starts[-1] + 60.1 - time.monotonic()))
 
 
 @dataclass
@@ -77,22 +100,31 @@ async def _setup(
 ) -> _Context:
     ctx = _Context()
     run_id = uuid4().hex
+    shared_pacer = _SetupPacer()
+    pacers: list[_SetupPacer] = []
     if env.preference_keys <= clients:
         raise ValueError("Concurrent sync needs at least preference_clients + 1 keys")
     try:
         for index in range(clients):
             user = f"benchmark-preferences-{run_id}-{index if separate_users else 0}"
+            pacer = _SetupPacer() if separate_users else shared_pacer
+            if index == 0 or separate_users:
+                pacers.append(pacer)
             http = httpx.AsyncClient(
                 base_url=env.base_url,
                 headers={"X-Forwarded-Email": user},
                 timeout=30,
                 trust_env=False,
-                event_hooks=env.client.event_hooks,
+                event_hooks={
+                    **env.client.event_hooks,
+                    "request": [*env.client.event_hooks.get("request", []), pacer.before_request],
+                },
             )
             try:
                 snapshot = await _read(http)
                 original = PreferenceMutation(
-                    protocol_version=1,
+                    protocol_version=snapshot.protocol_version,
+                    observed_revision=snapshot.revision,
                     identity=snapshot.identity,
                     operation_id=uuid4(),
                     installation_id="seed",
@@ -102,23 +134,36 @@ async def _setup(
                 )
                 if index == 0 or separate_users:
                     receipt = await _post(http, original)
+                    if receipt.protocol_version != 2 or receipt.status != "applied":
+                        raise RuntimeError("Preference benchmark requires protocol v2")
+                    revision = receipt.revision
                     for key_index in range(env.preference_keys - 1):
                         operation = original.model_copy(
                             update={
                                 "operation_id": uuid4(),
                                 "key": _plugin(key_index),
                                 "value": False,
+                                "observed_revision": revision,
                             }
                         )
-                        if (await _post(http, operation)).status != "applied":
+                        seeded = await _post(http, operation)
+                        if seeded.status != "applied":
                             raise RuntimeError("Preference seeding did not apply")
+                        revision = seeded.revision
                     # Consume real operations so history has the production receipt format.
                     for _ in range(env.preference_history):
                         operation = original.model_copy(
-                            update={"operation_id": uuid4(), "expected_version": 1}
+                            update={
+                                "operation_id": uuid4(),
+                                "expected_version": 1,
+                                "observed_revision": revision,
+                            }
                         )
-                        if (await _post(http, operation)).status != "unchanged":
+                        receipt = await _post(http, operation)
+                        if receipt.status != "unchanged":
                             raise RuntimeError("Receipt seeding changed the value")
+                        revision = receipt.revision
+                        original = operation
                 else:
                     original, receipt = ctx.workers[0].original, ctx.workers[0].receipt
                 local = PreferenceClient(
@@ -135,6 +180,9 @@ async def _setup(
             except BaseException:
                 await http.aclose()
                 raise
+        await asyncio.gather(*(pacer.finish() for pacer in pacers))
+        for worker in ctx.workers:
+            worker.http.event_hooks["request"] = list(env.client.event_hooks.get("request", []))
         return ctx
     except BaseException:
         await _teardown(env, ctx)
@@ -159,6 +207,7 @@ async def _write(_env: BenchEnvironment, context: object) -> None:
         update={
             "operation_id": uuid4(),
             "expected_version": worker.receipt.entry.version,
+            "observed_revision": worker.snapshot.revision,
             "value": f"model-{uuid4().hex}",
         }
     )
@@ -171,6 +220,7 @@ async def _write(_env: BenchEnvironment, context: object) -> None:
     ):
         raise RuntimeError("Preference edit was not applied")
     worker.receipt = result
+    worker.snapshot = worker.snapshot.model_copy(update={"revision": result.revision})
 
 
 async def _verify_write(_env: BenchEnvironment, context: object) -> None:

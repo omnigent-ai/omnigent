@@ -418,6 +418,11 @@ reduced legacy file cap without blocking prepared launches and use a real child
 process to verify live files survive while a dead owner's file is reclaimed.
 Legacy unprepared handoffs stay frozen and are never evicted automatically.
 
+The performance recipe uses v2 operations and accepts histories beyond receipt
+retention. Setup is paced below the production account rate limit, outside timing;
+measured samples expose overload without retries. A local SQLite burst does not
+establish managed capacity or the load implied by a weekly active-user count.
+
 Cache schema v4 records the negotiated protocol alongside namespace-bound host
 adoption without creating a CLI login profile. Existing v1–v3 snapshots, receipts
 and queued edits survive upgrade; older clients reject the newer cache version

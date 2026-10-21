@@ -54,7 +54,6 @@ from dev.benchmarks.omnigent.measure import (
     print_results,
 )
 from dev.benchmarks.omnigent.schema import build_report
-from omnigent.preference_sync import MAX_OPERATIONS
 
 # Harness label stamped in the report: HTTP/DB journeys drive no agent turn;
 # runner journeys drive turns through the in-process openai-agents SDK harness.
@@ -354,7 +353,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--preference-history",
         type=int,
         default=DEFAULT_PREFERENCE_HISTORY,
-        help="Extra receipt rows seeded per preference namespace, outside timing (0..9000).",
+        help="Extra v2 operations seeded per namespace outside timing, paced (0..100000).",
     )
     parser.add_argument(
         "--preference-keys",
@@ -369,8 +368,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Independent disk caches for concurrent sync journeys.",
     )
     args = parser.parse_args(argv)
-    if not 0 <= args.preference_history <= 9000 or not 1 <= args.preference_keys <= 512:
-        parser.error("preference history must be 0..9000 and keys must be 1..512")
+    if not 0 <= args.preference_history <= 100000 or not 1 <= args.preference_keys <= 512:
+        parser.error("preference history must be 0..100000 and keys must be 1..512")
     if not 1 <= args.preference_clients <= 64:
         parser.error("preference clients must be 1..64")
     selected = {
@@ -383,21 +382,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         and args.preference_keys < 2
     ):
         parser.error("preference journeys need at least two seeded keys")
-    writes = 0
     if sync:
         if args.concurrency > args.preference_clients:
             parser.error("preference sync concurrency cannot exceed --preference-clients")
         if args.preference_keys <= args.preference_clients:
             parser.error("preference sync needs at least --preference-clients + 1 keys")
-        # Budget conservatively even when clients use separate user namespaces.
-        writes = args.requests if args.concurrency > 1 else args.iterations
-    if "shared_preferences_write" in selected:
-        writes = max(writes, args.iterations)
-    if (
-        writes
-        and args.preference_history + args.preference_keys + args.warmup + writes > MAX_OPERATIONS
-    ):
-        parser.error("preference keys + history + warmup + writes cannot exceed 10000 operations")
     return args
 
 
