@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import errno
+import itertools
 import json
 import os
 import stat
@@ -46,6 +47,9 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
@@ -2970,6 +2974,78 @@ async def test_run_turn_still_adopts_non_terminal_first_event() -> None:
     assert len(turn_completes) == 1
     # The adopted id's deltas + final answer flow through normally.
     assert turn_completes[0].response == "Hello"
+
+
+async def test_run_turn_ignores_unregistered_child_turn_id_in_adopt() -> None:
+    """A helper event arriving before its spawn item registers the child must
+    not let the helper's turn id be adopted as the parent's active turn, which
+    would strand the parent's own final answer.
+    """
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+    async def _inject_child_then_parent() -> None:
+        await asyncio.sleep(0.01)
+        # An unregistered helper's first event carries the helper's own turn id.
+        session._events.put_nowait(
+            {
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-child",
+                    "turnId": "turn-child",
+                    "item": {"type": "agentMessage", "id": "msg-child"},
+                },
+            }
+        )
+        # The parent's real final answer on its own turn.
+        session._events.put_nowait(
+            {
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-1",
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg-parent",
+                        "text": "Parent still answers.",
+                        "phase": "final_answer",
+                    },
+                },
+            }
+        )
+
+    inject_task = asyncio.create_task(_inject_child_then_parent())
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    await inject_task
+
+    turn_completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_completes) == 1, (
+        f"Expected exactly one TurnComplete, got {len(turn_completes)}: {events}"
+    )
+    # If the helper's ``turn-child`` were adopted, the parent's ``turn-1``
+    # final answer would be dropped and this response would be empty.
+    assert turn_completes[0].response == "Parent still answers.", (
+        f"Expected the parent's own final answer; got "
+        f"{turn_completes[0].response!r}. An unregistered helper's turn id "
+        f"was adopted as the parent turn."
+    )
 
 
 def test_format_codex_error_params_extracts_provider_error_from_nested_error() -> None:
@@ -5964,5 +6040,697 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
 
         assert not any(isinstance(event, ExecutorError) for event in events), events
         assert session._certificate_failure is None
+
+    _run(_t())
+
+
+# ── Helpers spawned with Codex's built-in spawn_agent ───────────────────────────
+
+_HELPER_PROMPT = "Run `sleep 6; echo helper-done` and then say you are done."
+_CHILD_COMMAND = {
+    "id": "cmd-child",
+    "type": "commandExecution",
+    "command": "sleep 6; echo helper-done",
+    "cwd": "/tmp/workspace",
+}
+_CHILD_SHELL_ARGS = {"command": "sleep 6; echo helper-done", "cwd": "/tmp/workspace"}
+_SUBAGENT_EVENT_TYPES = (SubAgentStarted, SubAgentToolCall, SubAgentCompleted)
+
+
+def _spawn_helper_session(nickname: str | None = "Volta") -> _CodexAppServerSession:
+    """A session on an existing parent thread; ``thread/read`` names helpers *nickname*."""
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-parent"
+    turn_numbers = itertools.count(1)
+
+    async def _respond(method: str, params: dict) -> dict:
+        if method == "turn/start":
+            return {"result": {"turn": {"id": f"turn-{next(turn_numbers)}"}}}
+        if method == "thread/read":
+            if nickname is None:
+                raise RuntimeError("thread not loaded")
+            return {"result": {"thread": {"id": params["threadId"], "agentNickname": nickname}}}
+        return {"result": {}}
+
+    session._request = AsyncMock(side_effect=_respond)
+    return session
+
+
+def _collab_event(method: str, *, turn_id: str = "turn-1", **item_fields: object) -> dict:
+    """A parent-turn ``collabAgentToolCall`` notification shaped like Codex 0.158."""
+
+    item = {
+        "type": "collabAgentToolCall",
+        "id": "call_spawn_1",
+        "tool": "spawnAgent",
+        "status": "inProgress",
+        "senderThreadId": "thread-parent",
+        "receiverThreadIds": [],
+        "prompt": _HELPER_PROMPT,
+        "model": "",
+        "agentsStates": {},
+        **item_fields,
+    }
+    return {
+        "method": method,
+        "params": {"threadId": "thread-parent", "turnId": turn_id, "item": item},
+    }
+
+
+def _spawn_completed_event(**item_fields: object) -> dict:
+    return _collab_event(
+        "item/completed",
+        status="completed",
+        receiverThreadIds=["thread-child"],
+        agentsStates={"thread-child": {"status": "pendingInit", "message": None}},
+        **item_fields,
+    )
+
+
+def _child_event(method: str, params: dict) -> dict:
+    return {"method": method, "params": {"threadId": "thread-child", **params}}
+
+
+def _usage_event(thread_id: str, turn_id: str, total_tokens: int) -> dict:
+    counts = {
+        "totalTokens": total_tokens,
+        "inputTokens": total_tokens - 5,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 5,
+        "reasoningOutputTokens": 0,
+    }
+    return {
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "tokenUsage": {"total": counts, "last": counts},
+        },
+    }
+
+
+def _parent_final_answer(
+    text: str, *, turn_id: str = "turn-1", item_id: str = "msg-parent"
+) -> dict:
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread-parent",
+            "turnId": turn_id,
+            "item": {"id": item_id, "type": "agentMessage", "phase": "final_answer", "text": text},
+        },
+    }
+
+
+# The helper's whole turn, as Codex emits it on the parent's app-server connection.
+_CHILD_TURN_EVENTS = [
+    _child_event("turn/started", {"turn": {"id": "turn-child", "status": "inProgress"}}),
+    _child_event("item/started", {"turnId": "turn-child", "item": _CHILD_COMMAND}),
+    _child_event(
+        "item/completed",
+        {
+            "turnId": "turn-child",
+            "item": {**_CHILD_COMMAND, "aggregatedOutput": "helper-done\n", "exitCode": 0},
+        },
+    ),
+    _usage_event("thread-child", "turn-child", 1000),
+    _child_event(
+        "item/completed",
+        {
+            "turnId": "turn-child",
+            "item": {
+                "id": "msg-child",
+                "type": "agentMessage",
+                "phase": None,
+                "text": "Helper task finished.",
+            },
+        },
+    ),
+    _child_event("turn/completed", {"turn": {"id": "turn-child", "status": "completed"}}),
+]
+
+
+def test_run_turn_surfaces_spawned_helper_as_child_session() -> None:
+    """A helper started with spawn_agent is announced, its work mirrored, and closed out."""
+
+    async def _t():
+        session = _spawn_helper_session()
+
+        events = await _run_turn_with_events(
+            session,
+            [
+                _collab_event("item/started"),
+                # Codex reports the new thread before the spawn item completes.
+                _child_event("thread/status/changed", {"status": {"type": "idle"}}),
+                _spawn_completed_event(model="gpt-5"),
+                *_CHILD_TURN_EVENTS,
+                _usage_event("thread-parent", "turn-1", 40),
+                _parent_final_answer("The helper reported that it finished."),
+            ],
+        )
+
+        assert [e for e in events if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=_HELPER_PROMPT),
+            SubAgentToolCall(
+                child_key="thread-child", call_id="cmd-child", name="shell", args=_CHILD_SHELL_ARGS
+            ),
+            SubAgentCompleted(child_key="thread-child", ok=True, summary="Helper task finished."),
+        ]
+        session._request.assert_any_await(
+            "thread/read", {"threadId": "thread-child", "includeTurns": False}
+        )
+        # The spawn shows in the parent transcript like Codex's other built-in tools.
+        parent_tools = [e for e in events if isinstance(e, (ToolCallRequest, ToolCallComplete))]
+        assert [(type(e), e.name) for e in parent_tools] == [
+            (ToolCallRequest, "spawn_agent"),
+            (ToolCallRequest, "spawn_agent"),
+            (ToolCallComplete, "spawn_agent"),
+        ]
+        assert parent_tools[0].args == {"prompt": _HELPER_PROMPT}
+        assert parent_tools[1].args == {
+            "prompt": _HELPER_PROMPT,
+            "model": "gpt-5",
+            "agent_thread_ids": ["thread-child"],
+        }
+        assert parent_tools[2].result == "thread-child: pendingInit"
+        assert parent_tools[2].metadata["internally_executed"] is True
+        # The helper's text and token usage stay out of the parent's turn.
+        assert [e.text for e in events if isinstance(e, TextChunk)] == [
+            "The helper reported that it finished."
+        ]
+        assert isinstance(events[-1], TurnComplete)
+        assert events[-1].response == "The helper reported that it finished."
+        assert events[-1].usage is not None
+        assert events[-1].usage["total_tokens"] == 40
+
+    _run(_t())
+
+
+def test_run_turn_keeps_queued_helper_events_across_turns() -> None:
+    """A helper that finishes between parent turns is closed out by the next turn."""
+
+    async def _t():
+        session = _spawn_helper_session()
+
+        first = await _run_turn_with_events(
+            session, [_spawn_completed_event(), _parent_final_answer("Helper started.")]
+        )
+        assert [e for e in first if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=_HELPER_PROMPT)
+        ]
+
+        # Between turns the queue holds a stale tail of turn-1 and the helper's turn.
+        session._events.put_nowait(_parent_final_answer("stale tail", item_id="msg-stale"))
+        for event in _CHILD_TURN_EVENTS:
+            session._events.put_nowait(event)
+
+        second = await _run_turn_with_events(
+            session, [_parent_final_answer("All done.", turn_id="turn-2", item_id="msg-parent-2")]
+        )
+
+        # Re-announced without the task so the child's transcript is not re-seeded.
+        assert [e for e in second if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=""),
+            SubAgentToolCall(
+                child_key="thread-child", call_id="cmd-child", name="shell", args=_CHILD_SHELL_ARGS
+            ),
+            SubAgentCompleted(child_key="thread-child", ok=True, summary="Helper task finished."),
+        ]
+        assert isinstance(second[-1], TurnComplete)
+        assert second[-1].response == "All done."
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    ("agent_status", "ok"),
+    [("completed", True), ("errored", False)],
+    ids=["completed", "errored"],
+)
+def test_run_turn_closes_helper_from_wait_snapshot(agent_status: str, ok: bool) -> None:
+    """Without the helper's own turn end, the parent's ``wait`` snapshot closes it out."""
+
+    async def _t():
+        session = _spawn_helper_session(nickname=None)
+
+        events = await _run_turn_with_events(
+            session,
+            [
+                _spawn_completed_event(),
+                _collab_event(
+                    "item/completed",
+                    id="call_wait_1",
+                    tool="wait",
+                    status="completed",
+                    receiverThreadIds=["thread-child"],
+                    agentsStates={
+                        "thread-child": {"status": agent_status, "message": "Report written."}
+                    },
+                ),
+                _parent_final_answer("Done."),
+            ],
+        )
+
+        assert [e for e in events if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Codex helper", task=_HELPER_PROMPT),
+            SubAgentCompleted(child_key="thread-child", ok=ok, summary="Report written."),
+        ]
+        wait_cards = [e for e in events if isinstance(e, ToolCallComplete) and e.name == "wait"]
+        assert [card.result for card in wait_cards] == [
+            f"thread-child: {agent_status}\nReport written."
+        ]
+
+    _run(_t())
+
+
+def test_codex_collab_completion_marks_failed_calls() -> None:
+    completion = _codex_builtin_tool_completion(
+        {
+            "id": "call_spawn_2",
+            "type": "collabAgentToolCall",
+            "tool": "spawnAgent",
+            "status": "failed",
+            "receiverThreadIds": [],
+            "agentsStates": {},
+        }
+    )
+
+    assert completion is not None
+    assert completion.name == "spawn_agent"
+    assert completion.status is ToolCallStatus.ERROR
+    assert completion.error == "spawn_agent failed."
+    assert completion.result == ""
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"result": None},
+        {"result": {}},
+        {"result": {"thread": None}},
+        {"result": {"thread": {}}},
+        {"result": {"thread": {"agentNickname": ""}}},
+        {},
+    ],
+    ids=["null-result", "no-thread", "null-thread", "no-nickname", "empty-nickname", "no-result"],
+)
+def test_child_thread_title_falls_back_on_missing_nickname(response: dict) -> None:
+    """A malformed ``thread/read`` reply yields the fallback label instead of raising."""
+
+    async def _t():
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session._request = AsyncMock(return_value=response)
+
+        title = await session._child_thread_title("thread-child")
+
+        assert title == "Codex helper"
+        session._request.assert_awaited_once_with(
+            "thread/read", {"threadId": "thread-child", "includeTurns": False}
+        )
+
+    _run(_t())
+
+
+def test_run_turn_closes_helper_once_despite_snapshot_and_turn_end() -> None:
+    """A terminal ``wait`` snapshot and the helper's own ``turn/completed`` close it only once."""
+
+    async def _t():
+        session = _spawn_helper_session()
+
+        events = await _run_turn_with_events(
+            session,
+            [
+                _spawn_completed_event(),
+                _child_event(
+                    "turn/started", {"turn": {"id": "turn-child", "status": "inProgress"}}
+                ),
+                _child_event(
+                    "item/completed",
+                    {
+                        "turnId": "turn-child",
+                        "item": {
+                            "id": "msg-child",
+                            "type": "agentMessage",
+                            "phase": None,
+                            "text": "Helper task finished.",
+                        },
+                    },
+                ),
+                # The parent's ``wait`` snapshot reports the helper done first ...
+                _collab_event(
+                    "item/completed",
+                    id="call_wait_1",
+                    tool="wait",
+                    status="completed",
+                    receiverThreadIds=["thread-child"],
+                    agentsStates={
+                        "thread-child": {"status": "completed", "message": "Report written."}
+                    },
+                ),
+                # ... then the helper's own turn end arrives for the same turn.
+                _child_event(
+                    "turn/completed", {"turn": {"id": "turn-child", "status": "completed"}}
+                ),
+                _parent_final_answer("Done."),
+            ],
+        )
+
+        completions = [e for e in events if isinstance(e, SubAgentCompleted)]
+        assert len(completions) == 1, events
+        assert completions[0] == SubAgentCompleted(
+            child_key="thread-child", ok=True, summary="Report written."
+        )
+        assert [e for e in events if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=_HELPER_PROMPT),
+            SubAgentCompleted(child_key="thread-child", ok=True, summary="Report written."),
+        ]
+
+    _run(_t())
+
+
+def test_run_turn_answers_helper_dynamic_tool_call() -> None:
+    """A helper's blocking ``item/tool/call`` runs the tool, is answered, and shows a card."""
+
+    async def _t():
+        session = _spawn_helper_session()
+        tool_calls: list[tuple[str, dict]] = []
+
+        def _executor(name: str, args: dict):
+            tool_calls.append((name, dict(args)))
+            return {"result": "72F and sunny"}
+
+        session._tool_executor = _executor
+
+        events = await _run_turn_with_events(
+            session,
+            [
+                _spawn_completed_event(),
+                _child_event(
+                    "turn/started", {"turn": {"id": "turn-child", "status": "inProgress"}}
+                ),
+                # Codex asks the parent (us) to run a dynamic tool on the helper's behalf.
+                {
+                    "id": 777,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-child",
+                        "callId": "call_dyn_1",
+                        "tool": "search_web",
+                        "arguments": {"query": "weather in SF"},
+                    },
+                },
+                _child_event(
+                    "turn/completed", {"turn": {"id": "turn-child", "status": "completed"}}
+                ),
+                _parent_final_answer("The helper looked it up."),
+            ],
+        )
+
+        # The helper's tool call surfaces as a child card with the real arguments.
+        assert [e for e in events if isinstance(e, SubAgentToolCall)] == [
+            SubAgentToolCall(
+                child_key="thread-child",
+                call_id="call_dyn_1",
+                name="search_web",
+                args={"query": "weather in SF"},
+            )
+        ]
+        # The Omnigent tool actually ran with the helper's arguments.
+        assert tool_calls == [("search_web", {"query": "weather in SF"})]
+        # The helper's blocking request was answered, so it does not hang forever.
+        responses = [json.loads(write.decode("utf-8")) for write in session._proc.stdin.writes]
+        answers = [r for r in responses if r.get("id") == 777 and "result" in r]
+        assert len(answers) == 1, responses
+        payload = answers[0]["result"]
+        assert payload["success"] is True
+        assert "72F and sunny" in payload["contentItems"][0]["text"]
+
+    _run(_t())
+
+
+def test_run_turn_defers_helper_events_during_completed_tail_drain() -> None:
+    """Helper events landing in the post-``turn/completed`` drain survive to the next turn.
+
+    The parent ends its turn with no final message, so the executor drains a
+    short tail window looking for a trailing final answer. A helper's blocking
+    tool request and its completion that arrive during that window must not be
+    consumed there: dropping the request would leave the helper waiting on a
+    response that never comes. They are delivered on the next parent turn.
+    """
+
+    async def _t():
+        session = _spawn_helper_session()
+        tool_calls: list[tuple[str, dict]] = []
+
+        def _executor(name: str, args: dict):
+            tool_calls.append((name, dict(args)))
+            return {"result": "72F and sunny"}
+
+        session._tool_executor = _executor
+
+        first = await _run_turn_with_events(
+            session,
+            [
+                _spawn_completed_event(),
+                # Turn/completed with no final answer opens the drain window; the
+                # helper's blocking tool call and completion then land inside it.
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-parent",
+                        "turnId": "turn-1",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
+                },
+                {
+                    "id": 778,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-child",
+                        "callId": "call_dyn_1",
+                        "tool": "search_web",
+                        "arguments": {"query": "weather in SF"},
+                    },
+                },
+                _child_event(
+                    "item/completed",
+                    {
+                        "turnId": "turn-child",
+                        "item": {
+                            "id": "msg-child",
+                            "type": "agentMessage",
+                            "phase": None,
+                            "text": "Helper task finished.",
+                        },
+                    },
+                ),
+                _child_event(
+                    "turn/completed", {"turn": {"id": "turn-child", "status": "completed"}}
+                ),
+            ],
+        )
+
+        # Turn one closes with only the helper's start; the drained events are
+        # neither lost nor delivered yet, so the tool has not run.
+        assert [e for e in first if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=_HELPER_PROMPT)
+        ]
+        assert tool_calls == []
+        assert isinstance(first[-1], TurnComplete)
+
+        second = await _run_turn_with_events(
+            session,
+            [_parent_final_answer("All done.", turn_id="turn-2", item_id="msg-parent-2")],
+        )
+
+        # The next turn delivers the deferred request and completion in order.
+        assert [e for e in second if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=""),
+            SubAgentToolCall(
+                child_key="thread-child",
+                call_id="call_dyn_1",
+                name="search_web",
+                args={"query": "weather in SF"},
+            ),
+            SubAgentCompleted(child_key="thread-child", ok=True, summary="Helper task finished."),
+        ]
+        # The deferred request was answered, so the helper never hangs waiting.
+        assert tool_calls == [("search_web", {"query": "weather in SF"})]
+        responses = [json.loads(write.decode("utf-8")) for write in session._proc.stdin.writes]
+        answers = [r for r in responses if r.get("id") == 778 and "result" in r]
+        assert len(answers) == 1, responses
+        assert "72F and sunny" in answers[0]["result"]["contentItems"][0]["text"]
+
+    _run(_t())
+
+
+def test_run_turn_refuses_unsupported_helper_request() -> None:
+    """A helper request the executor cannot serve is refused with a JSON-RPC error."""
+
+    async def _t():
+        session = _spawn_helper_session()
+
+        events = await _run_turn_with_events(
+            session,
+            [
+                _spawn_completed_event(),
+                _child_event(
+                    "turn/started", {"turn": {"id": "turn-child", "status": "inProgress"}}
+                ),
+                # A blocking request with no handler must still be answered so the
+                # helper (and any parent wait on it) fails fast instead of hanging.
+                {
+                    "id": 779,
+                    "method": "fs/readFile",
+                    "params": {"threadId": "thread-child", "path": "/etc/passwd"},
+                },
+                _child_event(
+                    "turn/completed", {"turn": {"id": "turn-child", "status": "completed"}}
+                ),
+                _parent_final_answer("The helper could not proceed."),
+            ],
+        )
+
+        # An unsupported request runs no tool and shows no child card.
+        assert [e for e in events if isinstance(e, SubAgentToolCall)] == []
+        responses = [json.loads(write.decode("utf-8")) for write in session._proc.stdin.writes]
+        for_request = [r for r in responses if r.get("id") == 779]
+        assert for_request and all("result" not in r for r in for_request), responses
+        errors = [r["error"] for r in for_request if "error" in r]
+        assert len(errors) == 1, responses
+        # -32601 is the JSON-RPC "method not found" code.
+        assert errors[0]["code"] == -32601
+        assert "fs/readFile" in errors[0]["message"]
+
+    _run(_t())
+
+
+def test_run_turn_closes_failed_helper_on_turn_failed() -> None:
+    """A helper's ``turn/failed`` closes its row as failed, carrying the error text."""
+
+    async def _t():
+        session = _spawn_helper_session()
+
+        events = await _run_turn_with_events(
+            session,
+            [
+                _spawn_completed_event(),
+                _child_event(
+                    "turn/started", {"turn": {"id": "turn-child", "status": "inProgress"}}
+                ),
+                _child_event(
+                    "turn/failed",
+                    {"turn": {"id": "turn-child"}, "message": "helper model overloaded"},
+                ),
+                _parent_final_answer("The helper could not finish."),
+            ],
+        )
+
+        assert [e for e in events if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=_HELPER_PROMPT),
+            SubAgentCompleted(
+                child_key="thread-child", ok=False, summary="helper model overloaded"
+            ),
+        ]
+
+    _run(_t())
+
+
+def test_run_turn_registers_helper_spawned_during_completed_tail_drain() -> None:
+    """A helper whose spawn item lands in the drain is registered, not dropped.
+
+    The parent ends its turn with no final message, so the drain window opens. If
+    the ``spawnAgent`` item itself arrives during that window, the helper is not
+    yet known; its blocking tool call must still be deferred and answered on the
+    next turn rather than consumed by the drain's turn-id filter.
+    """
+
+    async def _t():
+        session = _spawn_helper_session()
+        tool_calls: list[tuple[str, dict]] = []
+
+        def _executor(name: str, args: dict):
+            tool_calls.append((name, dict(args)))
+            return {"result": "72F and sunny"}
+
+        session._tool_executor = _executor
+
+        first = await _run_turn_with_events(
+            session,
+            [
+                # Turn/completed with no final answer opens the drain; the spawn
+                # item and the new helper's blocking call then land inside it.
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread-parent",
+                        "turnId": "turn-1",
+                        "turn": {"id": "turn-1", "status": "completed"},
+                    },
+                },
+                _spawn_completed_event(),
+                {
+                    "id": 781,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": "thread-child",
+                        "callId": "call_dyn_1",
+                        "tool": "search_web",
+                        "arguments": {"query": "weather in SF"},
+                    },
+                },
+                _child_event(
+                    "item/completed",
+                    {
+                        "turnId": "turn-child",
+                        "item": {
+                            "id": "msg-child",
+                            "type": "agentMessage",
+                            "phase": None,
+                            "text": "Helper task finished.",
+                        },
+                    },
+                ),
+                _child_event(
+                    "turn/completed", {"turn": {"id": "turn-child", "status": "completed"}}
+                ),
+            ],
+        )
+
+        # Nothing is announced or run on turn one, but the request is not consumed.
+        assert [e for e in first if isinstance(e, _SUBAGENT_EVENT_TYPES)] == []
+        assert tool_calls == []
+        assert isinstance(first[-1], TurnComplete)
+
+        second = await _run_turn_with_events(
+            session,
+            [_parent_final_answer("All done.", turn_id="turn-2", item_id="msg-parent-2")],
+        )
+
+        # The next turn registers the deferred helper, surfaces its card and
+        # completion, and answers its blocking request.
+        assert [e for e in second if isinstance(e, _SUBAGENT_EVENT_TYPES)] == [
+            SubAgentStarted(child_key="thread-child", title="Volta", task=_HELPER_PROMPT),
+            SubAgentToolCall(
+                child_key="thread-child",
+                call_id="call_dyn_1",
+                name="search_web",
+                args={"query": "weather in SF"},
+            ),
+            SubAgentCompleted(child_key="thread-child", ok=True, summary="Helper task finished."),
+        ]
+        assert tool_calls == [("search_web", {"query": "weather in SF"})]
+        responses = [json.loads(write.decode("utf-8")) for write in session._proc.stdin.writes]
+        answers = [r for r in responses if r.get("id") == 781 and "result" in r]
+        assert len(answers) == 1, responses
+        assert "72F and sunny" in answers[0]["result"]["contentItems"][0]["text"]
 
     _run(_t())
