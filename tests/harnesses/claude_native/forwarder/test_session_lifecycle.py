@@ -97,7 +97,6 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             return httpx.Response(200, json={"id": "terminal_claude_main"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_old":
             assert body == {
-                "runner_id": "",
                 "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
             }
             return httpx.Response(200, json={"id": "conv_old"})
@@ -155,7 +154,7 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
         (
             "PATCH",
             "/v1/sessions/conv_old",
-            {"runner_id": "", "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
+            {"labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
         ),
     ]
 
@@ -223,7 +222,6 @@ async def test_clear_hook_rotation_survives_old_runner_clear_failure(
             return httpx.Response(200, json={"id": "terminal_claude_main"})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_old":
             assert body == {
-                "runner_id": "",
                 "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"},
             }
             return httpx.Response(503, json={"error": {"message": "temporary failure"}})
@@ -346,7 +344,8 @@ async def test_clear_hook_transfer_failure_does_not_loop(
 
 
 @pytest.mark.asyncio
-async def test_post_clear_supersession_notifies_old_session() -> None:
+@pytest.mark.parametrize("detach_failure", [False, True])
+async def test_post_clear_supersession_notifies_old_session(detach_failure, caplog) -> None:
     """
     A /clear rotation notifies the superseded (old) conversation.
 
@@ -363,6 +362,8 @@ async def test_post_clear_supersession_notifies_old_session() -> None:
         """Record each POST and return a benign success."""
         body = json.loads(request.content.decode("utf-8")) if request.content else None
         calls.append((request.method, request.url.path, body))
+        if detach_failure and request.method == "PATCH":
+            return httpx.Response(503, json={"error": {"message": "temporarily unavailable"}})
         return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
 
     transport = httpx.MockTransport(handler)
@@ -374,10 +375,12 @@ async def test_post_clear_supersession_notifies_old_session() -> None:
             agent_name="claude-native-ui",
         )
 
-    assert len(calls) == 3
+    assert ("Failed to detach superseded session after /clear" in caplog.text) is detach_failure
+    assert len(calls) == 4
+    assert calls[-1] == ("PATCH", "/v1/sessions/conv_old", {"runner_id": ""})
     # Every post is addressed to the OLD conversation.
     assert all(
-        (method, path) == ("POST", "/v1/sessions/conv_old/events") for method, path, _ in calls
+        (method, path) == ("POST", "/v1/sessions/conv_old/events") for method, path, _ in calls[:3]
     )
 
     _, _, status_body = calls[0]

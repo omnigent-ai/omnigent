@@ -4654,7 +4654,12 @@ def create_runner_app(
             post_tools_changed,
             start_tool_relay,
         )
+        from omnigent.runner.tool_dispatch import (
+            build_native_relay_tool_schemas,
+            runner_uses_confined_bearer,
+        )
 
+        runner_confined = runner_uses_confined_bearer(server_client)
         try:
             spec_entry = await _resolve_session_spec_entry(session_id)
         except OmnigentError:
@@ -4689,7 +4694,12 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.runner_confined == runner_confined
+            and known_bridge_dir is None
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -4709,14 +4719,15 @@ def create_runner_app(
         if (
             current is not None
             and current.spec_entry is spec_entry
+            and current.runner_confined == runner_confined
             and current.bridge_dir == bridge_dir
         ):
             return
 
-        from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
-
         relay_spec = _unwrap_spec_entry(spec_entry)
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
+            relay_spec, runner_confined=runner_confined
+        )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
@@ -4732,6 +4743,7 @@ def create_runner_app(
             if (
                 current is not None
                 and current.spec_entry is spec_entry
+                and current.runner_confined == runner_confined
                 and current.bridge_dir == bridge_dir
             ):
                 return
@@ -4826,6 +4838,7 @@ def create_runner_app(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
+            runner_confined=runner_confined,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -5259,6 +5272,13 @@ def create_runner_app(
             from omnigent.runner.tool_dispatch import strip_browser_tool_schemas
 
             _spec_tools = strip_browser_tool_schemas(_spec_tools)
+        from omnigent.runner.tool_dispatch import (
+            runner_uses_confined_bearer,
+            strip_account_tool_schemas,
+        )
+
+        if runner_uses_confined_bearer(server_client):
+            _spec_tools = strip_account_tool_schemas(_spec_tools)
         _client_tools = cast(list[_JsonObject], msg_body.get("tools") or [])
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:

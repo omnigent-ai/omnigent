@@ -557,7 +557,7 @@ def _create_clear_replacement_session(
     clear_resp = client.patch(
         f"{ap_server_url}/v1/sessions/{url_component(old_session_id)}",
         json={
-            "runner_id": "",
+            # Detach is owned by the forwarder.
             # Re-key the superseded session onto a DISTINCT "-cleared" bridge id
             # so its later resume gets its own isolated dir instead of the new
             # session's live one (which would double-mirror the transcript and
@@ -569,7 +569,7 @@ def _create_clear_replacement_session(
     if clear_resp.status_code >= 400:
         print(
             (
-                "omnigent claude clear hook: failed to clear old runner binding: "
+                "omnigent claude clear hook: failed to re-key old bridge: "
                 f"{clear_resp.status_code} {clear_resp.text}"
             ),
             file=sys.stderr,

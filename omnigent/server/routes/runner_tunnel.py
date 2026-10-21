@@ -24,12 +24,17 @@ from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
 from typing import cast
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Header, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.identity import (
+    RUNNER_CREDENTIAL_PROTOCOL,
+    RUNNER_CREDENTIAL_PROTOCOL_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
     TunnelDiagnosticAttrs,
     silence_source,
@@ -49,7 +54,13 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import (
+    LEGACY_RUNNER_TOKENS_ENV,
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    UnifiedAuthProvider,
+    env_var_is_truthy,
+)
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
@@ -197,6 +208,7 @@ def create_runner_tunnel_router(
     runner_exit_reports: RunnerExitReports | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
     mint_managed_runner_token: Callable[[str, int], str | None] | None = None,
+    mint_scoped_managed_runner_token: Callable[[str, int], str | None] | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/runners/{id}/tunnel`` WS endpoint.
 
@@ -236,10 +248,13 @@ def create_runner_tunnel_router(
         ``None`` disables the lookup (an unauthenticated non-loopback
         peer is then rejected, the prior behavior).
     :param mint_managed_runner_token: Accounts-mode issuer that validates the
-        saved runner authority and mints under the account lock.
+        saved runner authority and mints legacy tokens under the account lock.
+    :param mint_scoped_managed_runner_token: Companion issuer enforcing runner
+        confinement under the same lock; absent for legacy custom issuers.
     :returns: A FastAPI router with the tunnel endpoint.
     """
     router = APIRouter()
+    legacy_warning_logged = False
 
     def _get_user_id_from_request(request: Request) -> str | None:
         """Extract user identity from an HTTP request, 401 if rejected.
@@ -322,23 +337,17 @@ def create_runner_tunnel_router(
         return result
 
     @router.post("/runners/{runner_id}/token")
-    async def mint_runner_owner_token(request: Request, runner_id: str) -> dict[str, str | int]:
-        """Mint a short-lived owner bearer for a delegated runner.
+    async def mint_runner_owner_token(
+        request: Request,
+        runner_id: str,
+        credential_protocol: str | None = Header(
+            default=None, alias=RUNNER_CREDENTIAL_PROTOCOL_HEADER
+        ),
+    ) -> dict[str, str | int]:
+        """Mint a short-lived runner bearer, confined when scoped-v1 is requested.
 
-        A host-launched or managed-sandbox runner does not inherit the host
-        user's credential; it presents its server-minted tunnel binding token
-        (``X-Omnigent-Runner-Tunnel-Token``) and the server returns a
-        short-lived owner JWT the runner then uses on its HTTP callbacks
-        (which gate on ``require_user``). This is the HTTP analog of the
-        runner tunnel's binding-token handshake: the same SHA-256 gate
-        (``token_bound_runner_id(token) == runner_id``) and the same
-        owner resolution (``resolve_managed_runner_owner``), minting a
-        bearer instead of registering a tunnel.
-
-        The binding-token match is required unconditionally — the
-        allow-list shortcut honored on some other runner-token checks is
-        deliberately NOT accepted here, because this endpoint issues a
-        full owner credential and delegated runners are token-bound.
+        Legacy owner-wide issuance remains until 0.21.0 unless
+        ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0``. A scoped request never downgrades.
 
         :param request: The incoming FastAPI request (carries the binding
             token header).
@@ -348,7 +357,11 @@ def create_runner_tunnel_router(
             doesn't match ``runner_id``, or resolves to no managed-launch
             owner; 400 when the active auth mode can't mint server-side
             (header/proxy, or no auth provider).
+        :param credential_protocol: ``scoped-v1`` for confined credentials;
+            absent for legacy issuance during the 0.20.x compatibility window.
+        :raises OmnigentError: 426 for unsupported protocols/providers or disabled legacy issuance.
         """
+        nonlocal legacy_warning_logged
         if auth_provider is None:
             # No auth configured: the runner authenticates by binding
             # token alone and needs no bearer — minting is meaningless.
@@ -359,10 +372,32 @@ def create_runner_tunnel_router(
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token or token_bound_runner_id(token) != runner_id:
             raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-        if mint_managed_runner_token is not None:
-            bearer = await asyncio.to_thread(
-                mint_managed_runner_token, runner_id, _MANAGED_RUNNER_TOKEN_TTL_S
+        if credential_protocol not in (None, RUNNER_CREDENTIAL_PROTOCOL):
+            raise OmnigentError(
+                "upgrade the runner to a supported credential protocol (scoped-v1)",
+                code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
             )
+        confined = credential_protocol == RUNNER_CREDENTIAL_PROTOCOL
+        if confined and not (
+            isinstance(auth_provider, UnifiedAuthProvider)
+            and auth_provider.runner_confinement_ready
+            and (mint_managed_runner_token is None or mint_scoped_managed_runner_token is not None)
+        ):
+            raise OmnigentError(
+                "upgrade the auth provider and managed issuer to a wired scoped-v1 "
+                "implementation; "
+                "a scoped request cannot use legacy credentials",
+                code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
+            )
+        if not confined and not env_var_is_truthy(LEGACY_RUNNER_TOKENS_ENV, default=True):
+            raise OmnigentError(
+                "upgrade the runner and auth provider to scoped-v1; "
+                "legacy runner credential issuance is disabled",
+                code=ErrorCode.RUNNER_UPGRADE_REQUIRED,
+            )
+        issuer = mint_scoped_managed_runner_token if confined else mint_managed_runner_token
+        if issuer is not None:
+            bearer = await asyncio.to_thread(issuer, runner_id, _MANAGED_RUNNER_TOKEN_TTL_S)
             if bearer is None:
                 raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
         else:
@@ -371,13 +406,26 @@ def create_runner_tunnel_router(
                 owner = await asyncio.to_thread(resolve_managed_runner_owner, runner_id)
             if owner is None:
                 raise OmnigentError("unauthenticated", code=ErrorCode.UNAUTHORIZED)
-            bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
+            if confined:
+                bearer = auth_provider.mint_runner_token(
+                    owner, _MANAGED_RUNNER_TOKEN_TTL_S, runner_id=runner_id
+                )
+            else:
+                # Remove the old two-argument provider contract in 0.21.0.
+                bearer = auth_provider.mint_runner_token(owner, _MANAGED_RUNNER_TOKEN_TTL_S)
         if bearer is None:
             # oidc/accounts mint; header/proxy mode can't (identity is
             # asserted upstream). Signal clearly rather than 401.
             raise OmnigentError(
                 "runner token minting is unsupported in this auth mode",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        if not confined and not legacy_warning_logged:
+            legacy_warning_logged = True
+            _logger.warning(
+                "Legacy owner-wide runner credentials are deprecated until removal in "
+                "0.21.0; upgrade runners/providers and set %s=0 to enforce confinement",
+                LEGACY_RUNNER_TOKENS_ENV,
             )
         return {
             "token": bearer,

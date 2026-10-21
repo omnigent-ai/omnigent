@@ -59,12 +59,13 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    extra_claims: dict[str, str] | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
 
     The seconds-based core behind :func:`mint_session_cookie`. A managed
-    runner needs a short-lived (sub-hour) owner token, which the hours-only
+    runner needs a short-lived (sub-hour) token, which the hours-only
     cookie helper cannot express; both share this HS256 claim shape so the
     same validator (:meth:`UnifiedAuthProvider._check_cookie`) accepts
     either.
@@ -77,10 +78,14 @@ def mint_session_token(
         ``"accounts"``. Stored as an informational claim.
     :param cli_login_ticket: Ticket authenticated by the browser callback,
         never included in runner, refresh, or CLI-issued credentials.
+    :param extra_claims: Additional claims, e.g. a runner token's
+        ``{"scope": "runner", "runner_id": "runner_abc"}``. They cannot
+        replace the standard claims above.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
     payload = {
+        **(extra_claims or {}),
         "sub": user_id,
         "iat": now,
         "exp": now + ttl_seconds,

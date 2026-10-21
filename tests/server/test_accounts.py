@@ -27,10 +27,13 @@ import secrets
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.accounts_bootstrap import (
     bootstrap_admin,
     resolve_admin_username,
@@ -38,10 +41,14 @@ from omnigent.server.accounts_bootstrap import (
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import (
+    LEGACY_RUNNER_TOKENS_ENV,
+    RUNNER_CREATOR_LABEL_KEY,
+    RUNNER_TOKEN_SCOPE,
     AuthProvider,
     UnifiedAuthProvider,
     create_auth_provider,
     resolve_auth_source,
+    runner_session_in_scope,
 )
 from omnigent.server.passwords import (
     InvalidPasswordError,
@@ -366,30 +373,107 @@ def test_accounts_source_login_url_points_at_spa() -> None:
     assert provider.login_url == "/login"
 
 
-def test_mint_runner_token_round_trips_to_owner() -> None:
-    """A managed runner's minted owner token resolves back to the owner.
+_RUNNER = "runner_0123456789abcdef"
 
-    The sandbox runner has no login of its own, so the server mints an
-    owner JWT it presents as ``Authorization: Bearer`` on its HTTP
-    callbacks — ``get_user_id`` (the same check ``require_user`` applies)
-    must resolve it to the owner, else every callback 401s.
+
+def _bearer_request(
+    token: str,
+    path: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+) -> Request:
+    """Build a real Starlette request carrying *token* as a bearer."""
+    raw = [(b"authorization", f"Bearer {token}".encode())]
+    raw += [(key.lower().encode(), value.encode()) for key, value in (headers or {}).items()]
+    request_path, _, query = path.partition("?")
+    return Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": request_path,
+            "headers": raw,
+            "query_string": query.encode(),
+        }
+    )
+
+
+def _runner_provider(
+    in_scope: frozenset[str] = frozenset(), *, source: Literal["accounts", "oidc"] = "accounts"
+) -> UnifiedAuthProvider:
+    """Provider whose runner-scope lookup admits *in_scope* for ``_RUNNER``."""
+    from tests.server.integration.oidc_fixtures import make_oidc_config
+
+    provider = UnifiedAuthProvider(
+        source=source, accounts_config=_make_accounts_config(), oidc_config=make_oidc_config()
+    )
+    provider.set_runner_session_check(
+        lambda runner_id, session_id: runner_id == _RUNNER and session_id in in_scope
+    )
+    return provider
+
+
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+@pytest.mark.parametrize("confined", [False, True])
+def test_mint_runner_token_round_trips_to_owner(
+    source: Literal["accounts", "oidc"], confined: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delegated runner's minted token resolves to the owner on its own routes.
+
+    The sandbox runner has no login of its own, so the server mints a JWT
+    it presents as ``Authorization: Bearer`` on its HTTP callbacks —
+    ``get_user_id`` must resolve it to the owner, else every callback 401s.
     """
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    import jwt
 
-    token = provider.mint_runner_token("alice@example.com", 1800)
+    from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY
+
+    provider = _runner_provider(frozenset({"conv_bound"}), source=source)
+    monkeypatch.delenv(LEGACY_RUNNER_TOKENS_ENV, raising=False)
+
+    token = provider.mint_runner_token(
+        "alice@example.com", 1800, **({"runner_id": _RUNNER} if confined else {})
+    )
     assert token is not None
+    claims = jwt.decode(
+        token,
+        _TEST_COOKIE_SECRET if source == "accounts" else TEST_SIGNING_KEY,
+        algorithms=["HS256"],
+    )
+    if confined:
+        assert (claims["scope"], claims["runner_id"]) == (RUNNER_TOKEN_SCOPE, _RUNNER)
+    else:
+        assert "scope" not in claims and "runner_id" not in claims
 
-    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    request = _bearer_request(token, f"/v1/runners/{_RUNNER}/status")
     assert provider.get_user_id(request) == "alice@example.com"
+    assert (
+        provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))
+        == "alice@example.com"
+    )
+    if confined:
+        with pytest.raises(OmnigentError) as denied:
+            provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_other"))
+        assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+    else:
+        assert provider.get_user_id(_bearer_request(token, "/v1/me")) == "alice@example.com"
+
+
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_strict_runner_issuance_disables_only_legacy_tokens(source, monkeypatch):
+    monkeypatch.setenv(LEGACY_RUNNER_TOKENS_ENV, "0")
+    provider = _runner_provider(source=source)
+    assert provider.mint_runner_token("alice", 1800) is None
+    assert provider.mint_runner_token("alice", 1800, runner_id=_RUNNER) is not None
 
 
 def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
-    """No token for an empty or reserved owner — never mint reserved-identity creds."""
+    """No token for an empty/reserved owner or without a runner to confine it to."""
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
-    assert provider.mint_runner_token("", 1800) is None
-    assert provider.mint_runner_token("local", 1800) is None
+    assert provider.mint_runner_token("", 1800, runner_id=_RUNNER) is None
+    assert provider.mint_runner_token("local", 1800, runner_id=_RUNNER) is None
+    assert provider.mint_runner_token("alice@example.com", 1800, runner_id="") is None
 
 
 def test_mint_runner_token_returns_none_for_header_source() -> None:
@@ -399,13 +483,14 @@ def test_mint_runner_token_returns_none_for_header_source() -> None:
     can't synthesize it. The base ``AuthProvider`` default is also None.
     """
     header_provider = UnifiedAuthProvider(source="header")
-    assert header_provider.mint_runner_token("alice@example.com", 1800) is None
+    assert header_provider.runner_token_scope is None
+    assert header_provider.mint_runner_token("alice@example.com", 1800, runner_id=_RUNNER) is None
 
     class _Base(AuthProvider):
         def get_user_id(self, request: object) -> str | None:  # type: ignore[override]
             return None
 
-    assert _Base().mint_runner_token("alice@example.com", 1800) is None
+    assert _Base().mint_runner_token("alice@example.com", 1800, runner_id=_RUNNER) is None
 
 
 def test_mint_runner_token_expired_resolves_to_none() -> None:
@@ -415,14 +500,191 @@ def test_mint_runner_token_expired_resolves_to_none() -> None:
     fixed cap — the token expires and the runner re-mints, so there is no
     static long-lived credential.
     """
-    cfg = _make_accounts_config()
-    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    provider = _runner_provider()
 
-    token = provider.mint_runner_token("alice@example.com", -1)
+    token = provider.mint_runner_token("alice@example.com", -1, runner_id=_RUNNER)
     assert token is not None
 
-    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    request = _bearer_request(token, f"/v1/runners/{_RUNNER}/status")
     assert provider.get_user_id(request) is None
+
+
+_SESSION_HEADER = {"X-Omnigent-Session-Id": "conv_bound"}
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers"),
+    [
+        ("GET", "/v1/sessions/conv_bound", None),
+        ("POST", "/v1/sessions/conv_bound/events", None),
+        ("GET", "/v1/sessions/conv_bound/agent/contents", None),
+        ("POST", "/v1/sessions", None),
+        ("GET", f"/v1/runners/{_RUNNER}/status", None),
+        ("GET", "/v1/sessions/conv_bound/owner", None),
+        ("GET", "/v1/policy-registry", None),
+        ("GET", "/api/version", None),
+        ("POST", "/v1/mcp/tracker", _SESSION_HEADER),
+    ],
+)
+def test_runner_token_accepted_on_runner_routes(
+    method: str, path: str, headers: dict[str, str] | None
+) -> None:
+    """The routes a runner calls for its own sessions keep authenticating."""
+    provider = _runner_provider(frozenset({"conv_bound"}))
+    token = provider.mint_runner_token("admin", 1800, runner_id=_RUNNER)
+    assert token is not None
+
+    request = _bearer_request(token, path, method=method, headers=headers)
+
+    assert provider.get_user_id(request) == "admin"
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "headers"),
+    [
+        ("GET", "/v1/me", None),
+        ("GET", "/auth/users", None),
+        ("POST", "/auth/invite", None),
+        ("GET", "/v1/sessions", None),
+        ("GET", "/v1/sessions/conv_bound/stream", None),
+        ("GET", "/v1/sessions/conv_other", None),
+        ("POST", "/v1/sessions/conv_other/resources/environments/env/shell", None),
+        ("GET", "/v1/hosts", None),
+        ("GET", "/v1/hosts/host_1/filesystem", None),
+        ("POST", "/v1/scheduled-tasks", None),
+        ("POST", "/v1/agents", None),
+        ("GET", "/v1/agents", None),
+        ("GET", "/v1/agents?scope=user", None),
+        ("GET", "/v1/agents/agent_other", None),
+        ("GET", "/v1/agents/agent_other/config", None),
+        ("GET", "/v1/agents/agent_other/contents", None),
+        ("GET", "/v1/sessions/conv_bound/permissions", None),
+        ("PUT", "/v1/sessions/conv_bound/permissions", None),
+        ("DELETE", "/v1/sessions/conv_bound/permissions/bob", None),
+        ("GET", "/v1/runners/runner_other/status", None),
+        ("POST", "/v1/mcp/tracker", None),
+        ("POST", "/v1/mcp/tracker", {"X-Omnigent-Session-Id": "conv_other"}),
+        ("POST", "/oauth/token", None),
+    ],
+)
+def test_runner_token_rejected_outside_runner_scope(
+    method: str, path: str, headers: dict[str, str] | None
+) -> None:
+    """A runner bearer reaches nothing beyond its own sessions, even for an admin owner.
+
+    Code in the runner's sandbox can read the bearer, so admin, account,
+    host, scheduling, listing, and other-session routes must all refuse it.
+    """
+    provider = _runner_provider(frozenset({"conv_bound"}))
+    token = provider.mint_runner_token("admin", 1800, runner_id=_RUNNER)
+    assert token is not None
+
+    request = _bearer_request(token, path, method=method, headers=headers)
+
+    with pytest.raises(OmnigentError) as denied:
+        provider.get_user_id(request)
+    assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+    assert denied.value.http_status == 403
+
+
+def test_runner_token_reaches_no_session_without_scope_lookup() -> None:
+    """Fail closed: until the app wires the scope lookup, no session is reachable."""
+    provider = _runner_provider()
+    token = provider.mint_runner_token("alice", 1800, runner_id=_RUNNER)
+    assert token is not None
+    provider._runner_session_check = None
+    assert provider.mint_runner_token("alice", 1800, runner_id=_RUNNER) is None
+
+    with pytest.raises(OmnigentError, match="not authorized"):
+        provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))
+    assert provider.get_user_id(_bearer_request(token, f"/v1/runners/{_RUNNER}/status")) == "alice"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+async def test_runner_scope_denial_closes_websocket_before_dispatch(source):
+    from asgiref.testing import ApplicationCommunicator
+
+    from omnigent.server.auth import AccountAuthenticationMiddleware
+
+    provider = _runner_provider(source=source)
+    token = provider.mint_runner_token("alice", 1800, runner_id=_RUNNER)
+    assert token is not None
+
+    async def unexpected_dispatch(scope, receive, send):
+        pytest.fail("a denied WebSocket must not reach the application")
+
+    connection = ApplicationCommunicator(
+        AccountAuthenticationMiddleware(unexpected_dispatch, provider),
+        {
+            "type": "websocket",
+            "path": "/v1/sessions/conv_other/stream",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+            "query_string": b"",
+        },
+    )
+    await connection.send_input({"type": "websocket.connect"})
+    closed = await connection.receive_output(timeout=5)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 1008
+    await connection.wait(timeout=5)
+
+
+def test_runner_session_scope_follows_nearest_runner_binding() -> None:
+    """Only sessions bound to (or created and not yet bound by) the runner are in scope."""
+    from types import SimpleNamespace
+
+    def conv(runner_id: str | None, parent: str | None = None, creator: str | None = None):
+        labels = {RUNNER_CREATOR_LABEL_KEY: creator} if creator else {}
+        return SimpleNamespace(runner_id=runner_id, labels=labels, parent_conversation_id=parent)
+
+    conversations = {
+        "bound": conv(_RUNNER),
+        "elsewhere": conv("runner_other"),
+        "child": conv(None, parent="bound"),
+        "rebound_child": conv("runner_other", parent="bound"),
+        "created": conv(None, creator=_RUNNER),
+        "created_elsewhere": conv(None, creator="runner_other"),
+        "unbound": conv(None),
+        "loop_a": conv(None, parent="loop_b"),
+        "loop_b": conv(None, parent="loop_a"),
+    }
+
+    def in_scope(session_id: str) -> bool:
+        return runner_session_in_scope(_RUNNER, session_id, conversations.get)
+
+    assert [in_scope(sid) for sid in ("bound", "child", "created")] == [True] * 3
+    assert not any(
+        in_scope(sid)
+        for sid in (
+            "elsewhere",
+            "rebound_child",
+            "created_elsewhere",
+            "unbound",
+            "missing",
+            "loop_a",
+        )
+    )
+    parent = "bound"
+    for depth in range(1, 34):
+        session_id = f"depth_{depth}"
+        conversations[session_id] = conv(None, parent=parent)
+        parent = session_id
+
+    reads = []
+
+    def lookup(session_id: str):
+        reads.append(session_id)
+        return conversations.get(session_id)
+
+    for depth in (31, 32, 33):
+        reads.clear()
+        assert runner_session_in_scope(_RUNNER, f"depth_{depth}", lookup) is (depth <= 32)
+        assert len(reads) == min(depth + 1, 33)
+    conversations["depth_33"].runner_id = _RUNNER
+    assert in_scope("depth_33")
+    conversations["depth_31"].runner_id = "runner_other"
+    assert not in_scope("depth_32")
 
 
 # ── resolve_auth_source (shared resolver used by every spawn path) ──

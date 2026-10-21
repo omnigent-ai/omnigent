@@ -1542,3 +1542,54 @@ async def test_failed_launch_rolls_back_only_new_relay(
                 await c.delete(f"/v1/sessions/{session_id}")
         shutil.rmtree(bridge_dir, ignore_errors=True)
         shutil.rmtree(next_bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_relay_refreshes_tools_when_bearer_becomes_confined(
+    tmp_path, terminal_registry_singleton
+):
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.server.oidc import mint_session_token
+
+    token = None
+    server_client = _SwitchableServerClient("agent")
+    server_client.auth = _RunnerDatabricksAuth(lambda: token)
+    app = _switch_app(tmp_path, server_client, {"agent": _spec_with_terminals()})
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                prior_url = None
+                for confined in (False, True, True):
+                    token = mint_session_token(
+                        "alice",
+                        b"test-only-secret" * 3,
+                        1800,
+                        "accounts",
+                        extra_claims={"scope": "runner", "runner_id": "runner_test"}
+                        if confined
+                        else None,
+                    )
+                    auth_flow = server_client.auth.auth_flow(
+                        httpx.Request("GET", "http://server/health")
+                    )
+                    next(auth_flow)
+                    auth_flow.close()
+                    await _launch_bridged(client, session_id)
+                    names = _relay_tool_names(relay_file)
+                    assert ("sys_agent_list" in names) is not confined
+                    assert ("sys_scheduled_task_list" in names) is not confined
+                    assert {"sys_session_list", "list_comments"} <= names
+                    current_url = json.loads(relay_file.read_text())["url"]
+                    if prior_url is not None:
+                        assert current_url == prior_url
+                    if confined:
+                        prior_url = current_url
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)

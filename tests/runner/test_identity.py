@@ -13,6 +13,7 @@ from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+    runner_bearer_is_confined,
     strip_runner_auth_secrets,
     token_bound_runner_id,
     touch_connect_marker,
@@ -209,3 +210,23 @@ def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypat
     assert runner_sign_in_is_pending(connected, "runner-owned") is (state == "valid")
     mark_sign_in_pending("runner-owned", None)
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "token", [None, "opaque-proxy-bearer", "a.!.c", "a.bm90LWpzb24.c", "a.W10.c"]
+)
+def test_runner_bearer_hint_ignores_opaque_or_malformed_tokens(token):
+    assert not runner_bearer_is_confined(token)
+
+
+def test_runner_bearer_hint_recognizes_scoped_jwt():
+    from omnigent.server.oidc import mint_session_token
+
+    token = mint_session_token(
+        "alice",
+        b"test-only-secret" * 3,
+        1800,
+        "accounts",
+        extra_claims={"scope": "runner", "runner_id": "runner_hint"},
+    )
+    assert runner_bearer_is_confined(token)

@@ -29,7 +29,11 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import (
+    RUNNER_CREATOR_LABEL_KEY,
+    ConversationStore,
+    DailyCostState,
+)
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -526,8 +530,9 @@ class PolicyEngine:
 
         - The key has a declared ``LabelDef.values`` list and
           the new value is not in it.
+        - The key holds server-owned runner bootstrap permission.
 
-        Keys with no ``LabelDef`` are set freely (omnigent
+        Other keys with no ``LabelDef`` are set freely (omnigent
         parity — "unschema'd labels set freely"). The engine
         applies the filtered dict in a single UPSERT through
         the store so either every surviving write lands or
@@ -971,6 +976,8 @@ class PolicyEngine:
         """
         result: dict[str, str] = {}
         for key, value in set_labels.items():
+            if key == RUNNER_CREATOR_LABEL_KEY:
+                continue
             ldef = self.label_defs.get(key)
             if ldef is None:
                 result[key] = value

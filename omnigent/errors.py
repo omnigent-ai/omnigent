@@ -192,6 +192,8 @@ class ErrorCode:
         default route. Distinct from ``RUNNER_UNAVAILABLE`` (no runner
         bound anywhere), which no re-addressing can fix.
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
+    :cvar RUNNER_SCOPE_DENIED: A runner credential cannot authorize this request (HTTP 403).
+    :cvar RUNNER_UPGRADE_REQUIRED: The runner credential protocol is unsupported (HTTP 426).
     :cvar FORBIDDEN: Authenticated but insufficient permissions (HTTP 403).
     :cvar RUNNER_CAPABILITY_MISMATCH: The selected runner cannot
         spawn the requested harness kind (HTTP 503).
@@ -240,6 +242,8 @@ class ErrorCode:
 
     UNAUTHORIZED = "unauthorized"
     FORBIDDEN = "forbidden"
+    RUNNER_SCOPE_DENIED = "runner_scope_denied"
+    RUNNER_UPGRADE_REQUIRED = "runner_upgrade_required"
     NOT_FOUND = "not_found"
     INVALID_INPUT = "invalid_input"
     ALREADY_EXISTS = "already_exists"
@@ -273,10 +277,15 @@ SESSION_AGENT_BUNDLE_MISSING_MESSAGE = (
 )
 
 
+ERROR_CODE_HEADER = "X-Omnigent-Error-Code"
+
+
 # Single source of truth for error code → HTTP status.
 _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.UNAUTHORIZED: 401,
     ErrorCode.FORBIDDEN: 403,
+    ErrorCode.RUNNER_SCOPE_DENIED: 403,
+    ErrorCode.RUNNER_UPGRADE_REQUIRED: 426,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.INVALID_INPUT: 400,
     ErrorCode.ALREADY_EXISTS: 409,
@@ -330,6 +339,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # rejection of a well-formed request and a schema-invalid request body.
     ErrorCode.UNAUTHORIZED: ErrorCategory.USER,
     ErrorCode.FORBIDDEN: ErrorCategory.USER,
+    ErrorCode.RUNNER_SCOPE_DENIED: ErrorCategory.USER,
+    ErrorCode.RUNNER_UPGRADE_REQUIRED: ErrorCategory.CONFIG,
     ErrorCode.NOT_FOUND: ErrorCategory.USER,
     ErrorCode.INVALID_INPUT: ErrorCategory.USER,
     ErrorCode.ALREADY_EXISTS: ErrorCategory.USER,
@@ -399,6 +410,8 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
     ErrorCode.FORBIDDEN: ErrorImpact.BENIGN,
+    ErrorCode.RUNNER_SCOPE_DENIED: ErrorImpact.BENIGN,
+    ErrorCode.RUNNER_UPGRADE_REQUIRED: ErrorImpact.BLOCKING,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorImpact.BENIGN,
     ErrorCode.NOT_FOUND: ErrorImpact.BENIGN,
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
@@ -428,6 +441,8 @@ def impact_for_code(code: str) -> ErrorImpact:
 _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UNAUTHORIZED: ErrorPhase.REQUEST,
     ErrorCode.FORBIDDEN: ErrorPhase.REQUEST,
+    ErrorCode.RUNNER_SCOPE_DENIED: ErrorPhase.REQUEST,
+    ErrorCode.RUNNER_UPGRADE_REQUIRED: ErrorPhase.REQUEST,
     ErrorCode.NOT_FOUND: ErrorPhase.REQUEST,
     ErrorCode.INVALID_INPUT: ErrorPhase.REQUEST,
     ErrorCode.ALREADY_EXISTS: ErrorPhase.REQUEST,

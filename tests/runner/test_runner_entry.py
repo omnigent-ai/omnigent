@@ -49,6 +49,8 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
+    RUNNER_CREDENTIAL_PROTOCOL,
+    RUNNER_CREDENTIAL_PROTOCOL_HEADER,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -1430,6 +1432,9 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
         captured["url"] = str(request.url)
         captured["method"] = request.method
         captured["binding_token"] = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER, "")
+        captured["credential_protocol"] = request.headers.get(
+            RUNNER_CREDENTIAL_PROTOCOL_HEADER, ""
+        )
         return httpx.Response(200, json={"token": "owner-jwt", "expires_at": 1234567890})
 
     real_client = httpx.Client
@@ -1450,6 +1455,7 @@ def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     assert expires_at == 1234567890.0
     assert captured["method"] == "POST"
     assert captured["binding_token"] == "the-binding-token"
+    assert captured["credential_protocol"] == RUNNER_CREDENTIAL_PROTOCOL
     assert captured["url"].endswith("/v1/runners/runner_token_abc/token")
 
 
@@ -1721,11 +1727,9 @@ def test_runner_databricks_auth_does_not_remint_on_unrelated_redirect(
     assert factory_calls == 1
 
 
-def test_runner_databricks_auth_remints_on_401() -> None:
-    """The classic 401 path still re-mints (regression guard).
-
-    The login-redirect fix added a parallel branch alongside the 401
-    check; this test pins that the 401 path didn't regress.
+@pytest.mark.parametrize("denied", [False, True])
+def test_runner_databricks_auth_renews_only_authentication_failures(denied: bool) -> None:
+    """Authentication failures renew; explicit scope denials keep the current token.
 
     :returns: None.
     """
@@ -1742,12 +1746,21 @@ def test_runner_databricks_auth_remints_on_401() -> None:
 
     auth = _RunnerDatabricksAuth(_factory)
     request = httpx.Request("GET", "http://server/v1/agents")
-    unauthorized = httpx.Response(401)
+    from omnigent.errors import ERROR_CODE_HEADER, ErrorCode
+
+    assert not auth.runner_confined
+    assert minted_tokens == []
+    unauthorized = (
+        httpx.Response(403, headers={ERROR_CODE_HEADER: ErrorCode.RUNNER_SCOPE_DENIED})
+        if denied
+        else httpx.Response(401)
+    )
 
     captured = _drive_auth_flow(auth, request, unauthorized)
 
-    assert len(captured) == 2
-    assert captured[1] == "Bearer tok-2"
+    assert len(captured) == (1 if denied else 2)
+    assert len(minted_tokens) == len(captured)
+    assert captured[-1] == ("Bearer tok-1" if denied else "Bearer tok-2")
 
 
 @pytest.mark.asyncio
@@ -3388,3 +3401,35 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
     ]
     assert len({result.workdir for result in results}) == 1
     assert "registry" not in (results[0].workdir / "config.yaml").read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("caller", ["factory", "http", "tunnel"])
+async def test_managed_mint_protocol_failure_never_falls_back(monkeypatch, cached, caller):
+    def refuse(mint_url, *args, **kwargs):
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "upgrade required", request=request, response=httpx.Response(426, request=request)
+        )
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", refuse)
+    factory = _ManagedMintTokenFactory("http://server/token", "http://server", "binding")
+    if cached:
+        factory._cached_token = "previous-bearer"
+        factory._cached_expires_at = time.time() + 1
+    with pytest.raises(httpx.HTTPStatusError, match="upgrade the runner"):
+        if caller == "http":
+            async with httpx.AsyncClient(
+                auth=_RunnerDatabricksAuth(factory),
+                transport=httpx.MockTransport(lambda _: pytest.fail("no callback after 426")),
+            ) as client:
+                await client.get("http://server/v1/runners/runner/status")
+        elif caller == "tunnel":
+            from omnigent.runner.transports.ws_tunnel.serve import _refresh_auth_token
+
+            await _refresh_auth_token("previous-bearer", factory)
+        else:
+            factory()
+    assert not factory.declined
+    assert not factory.proxy_auth_failed

@@ -393,14 +393,22 @@ def test_managed_runner_callback_authenticates_end_to_end(
         "managed-mint factory should install for a managed sandbox "
         "(binding token + server URL present, no user credential)"
     )
-    authed = asyncio.run(
-        _get_agent_contents(base_url, contents_path, _RunnerDatabricksAuth(factory))
-    )
+    auth = _RunnerDatabricksAuth(factory)
+    authed = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
     assert authed.status_code == 200, (authed.status_code, authed.text)
     # The minted owner token resolved to Alice, who owns the session, so the
     # real agent bundle comes back.
     assert authed.headers.get("X-Agent-Name")
     assert authed.content[:2] == b"\x1f\x8b", "expected a gzip agent bundle body"
+
+    # The same minted bearer is confined to this runner's sessions: account
+    # and host routes refuse it even after the client's re-mint retry.
+    for path in ("/v1/me", "/v1/hosts"):
+        refused = asyncio.run(_get_agent_contents(base_url, path, auth))
+        assert refused.status_code == 403, (path, refused.status_code, refused.text)
+    recovered = asyncio.run(_get_agent_contents(base_url, contents_path, auth))
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.content == authed.content
 
 
 def test_managed_runner_survives_mint_403_after_token_expiry(

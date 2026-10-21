@@ -3477,7 +3477,7 @@ async def _create_clear_replacement_session(
     :param bridge_dir: Native Claude bridge directory.
     :returns: New Omnigent session id, e.g. ``"conv_new"``.
     :raises httpx.HTTPError: If Omnigent rejects session creation, new-session
-        binding, or terminal transfer. Clearing the old runner binding is
+        binding, or terminal transfer. Re-keying the old bridge is
         best-effort after the bridge has rotated.
     :raises RuntimeError: If the old session snapshot is malformed.
     """
@@ -3528,7 +3528,7 @@ async def _create_clear_replacement_session(
     clear_resp = await client.patch(
         f"/v1/sessions/{url_component(old_session_id)}",
         json={
-            "runner_id": "",
+            # The forwarder detaches after posting the old session's final events.
             # Re-key the superseded session onto a DISTINCT "-cleared" bridge id.
             # The new session keeps the original bridge id (set above) and owns
             # the live terminal/pane in D(original); the old session must NOT
@@ -3544,7 +3544,7 @@ async def _create_clear_replacement_session(
     )
     if clear_resp.status_code >= 400:
         _logger.warning(
-            "Failed to clear old claude-native runner binding after /clear; "
+            "Failed to re-key old claude-native bridge after /clear; "
             "old_session=%s new_session=%s status=%s body=%s",
             old_session_id,
             new_session_id,
@@ -5611,6 +5611,7 @@ async def _post_clear_supersession(
        republishes as ``session.superseded``, so a client *actively*
        viewing the old conversation auto-redirects to the new one.
 
+    Detach only after these events: detaching revokes the runner credential.
     Each failure is logged and swallowed: the rotation has already
     completed and reset forwarder state, and a notification error must
     not disrupt the poll loop or stop the new session from forwarding.
@@ -5688,6 +5689,20 @@ async def _post_clear_supersession(
             "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
             old_session_id,
             new_session_id,
+            exc_info=True,
+            extra={"session_id": old_session_id},
+        )
+
+    try:
+        detach_resp = await client.patch(
+            f"/v1/sessions/{url_component(old_session_id)}",
+            json={"runner_id": ""},
+        )
+        detach_resp.raise_for_status()
+    except httpx.HTTPError:
+        _logger.warning(
+            "Failed to detach superseded session after /clear; old_session=%s",
+            old_session_id,
             exc_info=True,
             extra={"session_id": old_session_id},
         )

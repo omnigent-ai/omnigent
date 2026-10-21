@@ -2596,7 +2596,7 @@ async def _auto_create_pi_terminal(
     # refresh runs env-scrubbed and can only preserve this header, so bake it in
     # here at launch (harmless additive header on bearer-authenticated servers).
     from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
-    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, runner_bearer_is_confined
 
     binding_token = _runner_tunnel_binding_token_from_env()
     if binding_token:
@@ -2613,7 +2613,9 @@ async def _auto_create_pi_terminal(
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = build_native_relay_tool_schemas(spec_for_tools)
+        pi_tools = build_native_relay_tool_schemas(
+            spec_for_tools, runner_confined=runner_bearer_is_confined(auth_token)
+        )
     except Exception:  # noqa: BLE001 — tool registration is additive
         _logger.warning(
             "Failed to build pi-native tool schemas for session %s; "

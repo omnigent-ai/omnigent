@@ -435,6 +435,20 @@ _SCHEDULED_TASK_TOOLS = frozenset(
     }
 )
 
+_ACCOUNT_WIDE_TOOLS = _SCHEDULED_TASK_TOOLS | {"sys_agent_list", "sys_session_share"}
+
+
+def runner_uses_confined_bearer(server_client: httpx.AsyncClient | None) -> bool:
+    """Read the last authenticated bearer's capability without refreshing it."""
+    auth = getattr(server_client, "auth", None)
+    return getattr(auth, "runner_confined", False) is True
+
+
+def strip_account_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
+    """Hide tools requiring account-wide authority from confined runners."""
+    return _strip_tool_schemas(schemas, _ACCOUNT_WIDE_TOOLS)
+
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -518,19 +532,25 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     :param schemas: Tool schemas in either supported shape.
     :returns: The same list minus any ``browser_*`` entries.
     """
+    return _strip_tool_schemas(schemas, _BROWSER_TOOLS)
+
+
+def _strip_tool_schemas(schemas: list[_JsonObject], names: frozenset[str]) -> list[_JsonObject]:
     kept: list[_JsonObject] = []
     for schema in schemas:
         name: object = schema.get("name")
         if not isinstance(name, str):
             function = _string_object_dict(schema.get("function"))
             name = function.get("name") if function is not None else None
-        if isinstance(name, str) and name in _BROWSER_TOOLS:
+        if isinstance(name, str) and name in names:
             continue
         kept.append(schema)
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None, *, runner_confined: bool = False
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -547,6 +567,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     :param spec: The session's resolved agent spec. ``None`` falls back to the
         always-on read/discovery surface (never the opt-in spawn writes, whose
         gate can't be evaluated without the spec), mirroring the relay.
+    :param runner_confined: Hide tools requiring account-wide credentials.
     :returns: Flat tool schemas for native bridges.
     """
     from omnigent.tools.builtins.agents import (
@@ -619,7 +640,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         if function is not None:
             _append(function)
 
-    return schemas
+    return strip_account_tool_schemas(schemas) if runner_confined else schemas
 
 
 # sys_agent_list: locally-authored agent config YAMLs live under this
@@ -4990,7 +5011,7 @@ async def _host_harnesses_or_none(
     server_client: httpx.AsyncClient,
 ) -> _JsonObject | None:
     """Return the bound host's reported harness readiness, best-effort."""
-    if not host_id:
+    if not host_id or runner_uses_confined_bearer(server_client):
         return None
     try:
         resp = await server_client.get(f"/v1/hosts/{host_id}", timeout=30.0)
@@ -5899,6 +5920,7 @@ async def _session_list_via_rest(
     sessions_page = (
         _DiscoveryPage([], False)
         if cursor_state["sessions"][0] == _DISCOVERY_END
+        or runner_uses_confined_bearer(server_client)
         else await _collect_global_sessions(
             server_client,
             agent_name,
@@ -6577,6 +6599,13 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
+    if tool_name in _ACCOUNT_WIDE_TOOLS and runner_uses_confined_bearer(server_client):
+        return json.dumps(
+            {
+                "error": f"{tool_name} requires interactive user credentials; "
+                "it is unavailable to a runner-confined bearer"
+            }
+        )
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
     if mcp_manager is None:

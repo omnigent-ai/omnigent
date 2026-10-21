@@ -171,11 +171,13 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
         ),
     ],
 )
+@pytest.mark.parametrize("confined", [False, True])
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     env_denylist: str | None,
     expected_env_unset: list[str],
+    confined: bool,
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -197,7 +199,16 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
+    from omnigent.server.oidc import mint_session_token
 
+    token = mint_session_token(
+        "alice",
+        b"test-only-secret" * 3,
+        1800,
+        "accounts",
+        extra_claims={"scope": "runner", "runner_id": "runner_test"} if confined else None,
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: lambda: token)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     if env_denylist is None:
         monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
@@ -283,6 +294,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     )
     tool_names = {tool["name"] for tool in config["tools"]}
     assert {"list_comments", "sys_session_list"} <= tool_names
+    assert ("sys_agent_list" in tool_names) is not confined
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
 

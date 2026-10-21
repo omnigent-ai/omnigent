@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -50,6 +51,9 @@ RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
+RUNNER_CREDENTIAL_PROTOCOL_HEADER = "X-Omnigent-Runner-Credential-Protocol"
+RUNNER_CREDENTIAL_PROTOCOL = "scoped-v1"
+
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
 # terminal-attach) set on their handshakes so the server's CSWSH origin
@@ -238,3 +242,19 @@ def _default_runner_id_path() -> Path:
     :returns: ``~/.omnigent/runners/runner_id``.
     """
     return Path.home() / ".omnigent" / "runners" / "runner_id"
+
+
+def runner_bearer_is_confined(token: str | None) -> bool:
+    """Read a tool-discovery hint, never an authorization decision, from a bearer.
+
+    Opaque proxy credentials and legacy owner JWTs retain their tool surface.
+    The server independently verifies the signature and enforces the scope.
+    """
+    if not token:
+        return False
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(claims, dict) and claims.get("scope") == "runner"
