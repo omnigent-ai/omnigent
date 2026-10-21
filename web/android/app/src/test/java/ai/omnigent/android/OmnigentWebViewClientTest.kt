@@ -68,6 +68,55 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `transport error canonicalizes host and rejects other origins or paths`() {
+        val savedUrl = "https://Omnigent.example.com/route"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reported = mutableListOf<Int>()
+        val client =
+            client(
+                pinnedOrigin = originOf(savedUrl)!!,
+                onMainFrameUnreachable = { _, code, _ -> reported += code },
+            )
+        client.beginShellLoad(savedUrl)
+
+        client.onReceivedError(
+            webView,
+            request("https://foreign.example.com/route"),
+            transportError(-6),
+        )
+        client.onReceivedError(
+            webView,
+            request("https://omnigent.example.com/other"),
+            transportError(-6),
+        )
+        assertTrue(reported.isEmpty())
+        client.onReceivedError(
+            webView,
+            request("https://omnigent.example.com/route"),
+            transportError(-6),
+        )
+
+        assertEquals(listOf(-6), reported)
+    }
+
+    @Test
+    fun `transport error matches a saved explicit default port before page start`() {
+        val savedUrl = "https://example.com:443/route%2Fone?next=%2F"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reported = mutableListOf<Int>()
+        val client = client(onMainFrameUnreachable = { _, code, _ -> reported += code })
+        client.beginShellLoad(savedUrl)
+
+        client.onReceivedError(
+            webView,
+            request("https://example.com/route%2Fone?next=%2F"),
+            transportError(-6),
+        )
+
+        assertEquals(listOf(-6), reported)
+    }
+
+    @Test
     fun `certificate failure is cancelled and reported as TLS`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var tls = 0
