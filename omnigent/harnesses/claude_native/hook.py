@@ -176,6 +176,13 @@ _SESSION_ROTATION_TIMEOUT_S = 70.0
 # the permission long-poll. Held at one day; the server caps the real
 # wait via the deciding policy's ``ask_timeout``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
+# A question Omnigent can't show on the web is otherwise left in Claude's
+# terminal picker, where a web-only user never sees it. Asking in chat text
+# reaches both the web transcript and the terminal.
+_ASK_USER_QUESTION_UNAVAILABLE_MESSAGE = (
+    "Omnigent could not show this question in its web UI. Ask the same question, "
+    "with its options, in a normal chat message instead, then wait for the user's reply."
+)
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _FORK_TRANSCRIPT_WAIT_S = 1.0
 _FORK_TRANSCRIPT_POLL_S = 0.05
@@ -932,7 +939,8 @@ def _main_permission_request(argv: list[str]) -> int:
         e.g. ``["--bridge-dir", "/tmp/x", "--omnigent-server-url",
         "http://127.0.0.1:8787"]``.
     :returns: Process exit code. Returns ``0`` on transport failures so
-        Claude Code falls back to its terminal prompt.
+        Claude Code falls back to its terminal prompt; an ``AskUserQuestion``
+        is denied instead so Claude asks it in chat text.
     """
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
@@ -981,6 +989,18 @@ def _main_permission_request(argv: list[str]) -> int:
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
     )
     if resp is None:
+        if payload.get("tool_name") == "AskUserQuestion":
+            decision = {"behavior": "deny", "message": _ASK_USER_QUESTION_UNAVAILABLE_MESSAGE}
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": decision,
+                        }
+                    }
+                )
+            )
         return 0
     if resp.content:
         sys.stdout.write(resp.text)

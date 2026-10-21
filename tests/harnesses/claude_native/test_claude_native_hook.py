@@ -1062,6 +1062,62 @@ def test_permission_request_hook_does_not_retry_rejections(
     assert "rejected" in captured.err
 
 
+def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An AskUserQuestion the hook can't forward is denied with a chat-text hint.
+
+    Without a decision, Claude leaves the question in its terminal picker
+    and the web UI shows only a spinning tool call nobody can answer.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", lambda *_a, **_k: None)
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_ask_lost")
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"questions": [{"question": "Which fix?", "options": []}]},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+    decision = output["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "deny"
+    assert "normal chat message" in decision["message"]
+
+
+def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    Other tools the hook can't forward still fall back to Claude's own prompt.
+
+    Denying them would block an edit or command the terminal user could
+    still approve.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", lambda *_a, **_k: None)
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_bash_lost")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+
+
 def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
