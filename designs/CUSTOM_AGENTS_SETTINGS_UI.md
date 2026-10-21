@@ -62,7 +62,9 @@ without a stale-draft check. Neither revision header must survive the proxy.
 Keep the existing `custom_agents_settings_ui` flag off until both backend and UI
 support this behavior.
 Either can deploy first while the flag is off. With the flag enabled, a newer UI
-against an older backend can receive 428 without a tag; its draft is retained.
+against an older backend can receive 428 without a tag. The editor retains the
+draft and explains that the server needs an update, without offering reload as a
+fix. Saving can be retried after the update without discarding the draft.
 
 ```json
 {

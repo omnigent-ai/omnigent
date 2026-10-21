@@ -102,10 +102,14 @@ export function CustomAgentConfigForm({
       setDraft(agentConfigDraft(result.config));
       save.reset();
     } catch (err) {
-      if (err instanceof ApiError && [412, 428].includes(err.status)) {
+      if (err instanceof ApiError && err.status === 412) {
         setConflict(true);
         setError(
-          "This agent changed or its revision is unavailable. Reload the latest configuration before saving. Your draft is still here.",
+          "This agent changed. Reload the latest configuration before saving. Your draft is still here.",
+        );
+      } else if (err instanceof ApiError && err.status === 428) {
+        setError(
+          "This server needs an update before it can save these changes. Your draft is still here. Try saving again after the update.",
         );
       } else setError(err instanceof Error ? err.message : "Could not save the agent.");
       // Mutation variables can contain replacement credentials; only the local draft retains them.
