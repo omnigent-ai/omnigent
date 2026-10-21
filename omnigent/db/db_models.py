@@ -701,6 +701,9 @@ class SqlConversationMetadata(OmnigentBase):
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        # Cross-workspace interrupted-session recovery scan, keyset-paged by
+        # (live_status, workspace_id, id) over the mid-turn and failed codes.
+        Index("ix_conversation_metadata_live_status", "live_status", "workspace_id", "id"),
     )
 
 
@@ -1374,6 +1377,33 @@ class SqlHost(OmnigentBase):
             "terminating_sandbox_id",
             "workspace_id",
             "host_id",
+        ),
+    )
+
+
+class SqlSessionRecovery(OmnigentBase):
+    """Durable interruption budget per session, independent of its current host."""
+
+    __tablename__ = "session_recovery"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    host_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    episode_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_attempt_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_until: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    claim_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    outcome_json: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    terminal_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_session_recovery_host_lease",
+            "workspace_id",
+            "host_id",
+            "lease_until",
+            "session_id",
         ),
     )
 
