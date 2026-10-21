@@ -41,6 +41,7 @@ from omnigent.server.accounts_bootstrap import (
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import (
+    LEGACY_RUNNER_TOKENS_ENV,
     RUNNER_CREATOR_LABEL_KEY,
     RUNNER_TOKEN_SCOPE,
     AuthProvider,
@@ -385,8 +386,15 @@ def _bearer_request(
     """Build a real Starlette request carrying *token* as a bearer."""
     raw = [(b"authorization", f"Bearer {token}".encode())]
     raw += [(key.lower().encode(), value.encode()) for key, value in (headers or {}).items()]
+    request_path, _, query = path.partition("?")
     return Request(
-        {"type": "http", "method": method, "path": path, "headers": raw, "query_string": b""}
+        {
+            "type": "http",
+            "method": method,
+            "path": request_path,
+            "headers": raw,
+            "query_string": query.encode(),
+        }
     )
 
 
@@ -406,7 +414,10 @@ def _runner_provider(
 
 
 @pytest.mark.parametrize("source", ["accounts", "oidc"])
-def test_mint_runner_token_round_trips_to_owner(source: Literal["accounts", "oidc"]) -> None:
+@pytest.mark.parametrize("confined", [False, True])
+def test_mint_runner_token_round_trips_to_owner(
+    source: Literal["accounts", "oidc"], confined: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A delegated runner's minted token resolves to the owner on its own routes.
 
     The sandbox runner has no login of its own, so the server mints a JWT
@@ -418,15 +429,21 @@ def test_mint_runner_token_round_trips_to_owner(source: Literal["accounts", "oid
     from tests.server.integration.oidc_fixtures import TEST_SIGNING_KEY
 
     provider = _runner_provider(frozenset({"conv_bound"}), source=source)
+    monkeypatch.delenv(LEGACY_RUNNER_TOKENS_ENV, raising=False)
 
-    token = provider.mint_runner_token("alice@example.com", 1800, runner_id=_RUNNER)
+    token = provider.mint_runner_token(
+        "alice@example.com", 1800, **({"runner_id": _RUNNER} if confined else {})
+    )
     assert token is not None
     claims = jwt.decode(
         token,
         _TEST_COOKIE_SECRET if source == "accounts" else TEST_SIGNING_KEY,
         algorithms=["HS256"],
     )
-    assert (claims["scope"], claims["runner_id"]) == (RUNNER_TOKEN_SCOPE, _RUNNER)
+    if confined:
+        assert (claims["scope"], claims["runner_id"]) == (RUNNER_TOKEN_SCOPE, _RUNNER)
+    else:
+        assert "scope" not in claims and "runner_id" not in claims
 
     request = _bearer_request(token, f"/v1/runners/{_RUNNER}/status")
     assert provider.get_user_id(request) == "alice@example.com"
@@ -434,9 +451,20 @@ def test_mint_runner_token_round_trips_to_owner(source: Literal["accounts", "oid
         provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))
         == "alice@example.com"
     )
-    with pytest.raises(OmnigentError) as denied:
-        provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_other"))
-    assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+    if confined:
+        with pytest.raises(OmnigentError) as denied:
+            provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_other"))
+        assert denied.value.code == ErrorCode.RUNNER_SCOPE_DENIED
+    else:
+        assert provider.get_user_id(_bearer_request(token, "/v1/me")) == "alice@example.com"
+
+
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_strict_runner_issuance_disables_only_legacy_tokens(source, monkeypatch):
+    monkeypatch.setenv(LEGACY_RUNNER_TOKENS_ENV, "0")
+    provider = _runner_provider(source=source)
+    assert provider.mint_runner_token("alice", 1800) is None
+    assert provider.mint_runner_token("alice", 1800, runner_id=_RUNNER) is not None
 
 
 def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
@@ -492,7 +520,7 @@ _SESSION_HEADER = {"X-Omnigent-Session-Id": "conv_bound"}
         ("GET", "/v1/sessions/conv_bound/agent/contents", None),
         ("POST", "/v1/sessions", None),
         ("GET", f"/v1/runners/{_RUNNER}/status", None),
-        ("GET", "/v1/agents", None),
+        ("GET", "/v1/sessions/conv_bound/owner", None),
         ("GET", "/v1/policy-registry", None),
         ("GET", "/api/version", None),
         ("POST", "/v1/mcp/tracker", _SESSION_HEADER),
@@ -525,6 +553,14 @@ def test_runner_token_accepted_on_runner_routes(
         ("GET", "/v1/hosts/host_1/filesystem", None),
         ("POST", "/v1/scheduled-tasks", None),
         ("POST", "/v1/agents", None),
+        ("GET", "/v1/agents", None),
+        ("GET", "/v1/agents?scope=user", None),
+        ("GET", "/v1/agents/agent_other", None),
+        ("GET", "/v1/agents/agent_other/config", None),
+        ("GET", "/v1/agents/agent_other/contents", None),
+        ("GET", "/v1/sessions/conv_bound/permissions", None),
+        ("PUT", "/v1/sessions/conv_bound/permissions", None),
+        ("DELETE", "/v1/sessions/conv_bound/permissions/bob", None),
         ("GET", "/v1/runners/runner_other/status", None),
         ("POST", "/v1/mcp/tracker", None),
         ("POST", "/v1/mcp/tracker", {"X-Omnigent-Session-Id": "conv_other"}),
@@ -560,6 +596,36 @@ def test_runner_token_reaches_no_session_without_scope_lookup() -> None:
     with pytest.raises(OmnigentError, match="not authorized"):
         provider.get_user_id(_bearer_request(token, "/v1/sessions/conv_bound"))
     assert provider.get_user_id(_bearer_request(token, f"/v1/runners/{_RUNNER}/status")) == "alice"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+async def test_runner_scope_denial_closes_websocket_before_dispatch(source):
+    from asgiref.testing import ApplicationCommunicator
+
+    from omnigent.server.auth import AccountAuthenticationMiddleware
+
+    provider = _runner_provider(source=source)
+    token = provider.mint_runner_token("alice", 1800, runner_id=_RUNNER)
+    assert token is not None
+
+    async def unexpected_dispatch(scope, receive, send):
+        pytest.fail("a denied WebSocket must not reach the application")
+
+    connection = ApplicationCommunicator(
+        AccountAuthenticationMiddleware(unexpected_dispatch, provider),
+        {
+            "type": "websocket",
+            "path": "/v1/sessions/conv_other/stream",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+            "query_string": b"",
+        },
+    )
+    await connection.send_input({"type": "websocket.connect"})
+    closed = await connection.receive_output(timeout=5)
+    assert closed["type"] == "websocket.close"
+    assert closed["code"] == 1008
+    await connection.wait(timeout=5)
 
 
 def test_runner_session_scope_follows_nearest_runner_binding() -> None:

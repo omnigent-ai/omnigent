@@ -1728,11 +1728,8 @@ def test_runner_databricks_auth_does_not_remint_on_unrelated_redirect(
 
 
 @pytest.mark.parametrize("denied", [False, True])
-def test_runner_databricks_auth_remints_on_401(denied: bool) -> None:
-    """The classic 401 path still re-mints (regression guard).
-
-    The login-redirect fix added a parallel branch alongside the 401
-    check; this test pins that the 401 path didn't regress.
+def test_runner_databricks_auth_renews_only_authentication_failures(denied: bool) -> None:
+    """Authentication failures renew; explicit scope denials keep the current token.
 
     :returns: None.
     """

@@ -276,7 +276,7 @@ def _require_runner_confined_placement(
     if host_id is not None or host_type != "external" or sandbox_provider or project_id:
         raise OmnigentError(
             "runner credential cannot place a session on a host",
-            code=ErrorCode.FORBIDDEN,
+            code=ErrorCode.RUNNER_SCOPE_DENIED,
         )
 
 
@@ -2714,7 +2714,7 @@ def register_core_routes(
             # Rebinding to another runner would execute this session's turns there.
             raise OmnigentError(
                 "runner credential can only bind its own runner",
-                code=ErrorCode.FORBIDDEN,
+                code=ErrorCode.RUNNER_SCOPE_DENIED,
             )
         if body.labels and RUNNER_CREATOR_LABEL_KEY in body.labels:
             raise OmnigentError(

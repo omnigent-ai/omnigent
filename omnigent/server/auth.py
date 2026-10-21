@@ -99,10 +99,12 @@ def delegated_path_allowed(path: str) -> bool:
 
 # Sandbox-readable bearer confined to its runner's sessions.
 RUNNER_TOKEN_SCOPE = "runner"
+# Remove legacy owner-wide issuance in 0.21.0, after the 0.20.x upgrade window.
+LEGACY_RUNNER_TOKENS_ENV = "OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS"
 
 _RUNNER_CONFINEMENT_KEY = "omnigent.runner_confinement"
 _RUNNER_OPEN_PATHS = frozenset({"/health", "/api/version"})
-_RUNNER_READ_ONLY_PREFIXES = ("/v1/agents", "/v1/policy-registry")
+_RUNNER_READ_ONLY_PREFIXES = ("/v1/policy-registry",)
 _SESSION_ID_HEADER = "X-Omnigent-Session-Id"
 # Inspect the target plus at most 32 parent edges; deeper unbound sessions
 # need an explicit runner binding before a confined bearer can access them.
@@ -187,8 +189,8 @@ class RunnerTokenConfinement:
             if not rest:
                 # Creation is further confined by the create route itself.
                 return method == "POST"
-            # Browser streams mirror events from children on other runners.
-            if len(rest) == 2 and rest[1] == "stream":
+            # Browser streams mirror other runners; sharing is an owner operation.
+            if len(rest) >= 2 and rest[1] in ("stream", "permissions"):
                 return False
             return bool(rest[0]) and self.allows_session(rest[0])
         if family == "runners":
@@ -531,7 +533,7 @@ class AuthProvider(ABC):
         user_id: str,  # noqa: ARG002
         ttl_seconds: int,  # noqa: ARG002
         *,
-        runner_id: str,  # noqa: ARG002
+        runner_id: str | None = None,  # noqa: ARG002
     ) -> str | None:
         """
         Mint a short-lived bearer a delegated runner presents as *user_id*.
@@ -540,8 +542,10 @@ class AuthProvider(ABC):
         credential of its own, so the server mints one for its HTTP
         callbacks when auth is enabled (see the
         ``POST /v1/runners/{id}/token`` endpoint). Code in that sandbox can
-        read the bearer, so implementations must confine it to
-        *runner_id*'s sessions rather than mint a plain owner session.
+        read the bearer, so providers opting into ``runner_token_scope``
+        must confine it to *runner_id*'s sessions. Until 0.21.0, calls
+        without *runner_id* retain the legacy owner-wide contract when
+        ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS`` is enabled (default).
         Default: ``None`` — no minting (single-user / no-auth, or a
         provider whose identity is asserted externally and can't be minted
         server-side, e.g. header/proxy auth). The runner then authenticates
@@ -551,7 +555,7 @@ class AuthProvider(ABC):
             ``"alice@example.com"``.
         :param ttl_seconds: Token lifetime in seconds.
         :param runner_id: Runner the bearer is confined to, e.g.
-            ``"runner_0123456789abcdef"``.
+            ``"runner_0123456789abcdef"``; omitted for legacy issuance.
         :returns: A bearer token string, or ``None`` when this provider
             cannot mint one.
         """
@@ -742,9 +746,11 @@ class UnifiedAuthProvider(AuthProvider):
             return self._check_cookie(request)
         return self._check_header(request)
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int, *, runner_id: str) -> str | None:
+    def mint_runner_token(
+        self, user_id: str, ttl_seconds: int, *, runner_id: str | None = None
+    ) -> str | None:
         """
-        Mint a short-lived runner-confined JWT for a delegated runner.
+        Mint a short-lived delegated runner JWT, scoped when *runner_id* is supplied.
 
         Accounts / OIDC modes sign a JWT in the same HS256 format
         :meth:`_check_cookie` validates, so the runner can present it as
@@ -755,14 +761,19 @@ class UnifiedAuthProvider(AuthProvider):
         returns ``None`` — identity there is asserted by the upstream proxy
         and can't be minted server-side.
 
+        Omitting *runner_id* preserves owner-wide issuance through 0.20.x,
+        unless ``OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0``. Remove in 0.21.0.
+
         :param user_id: The session owner the runner acts as, e.g.
             ``"alice@example.com"``.
         :param ttl_seconds: Token lifetime in seconds.
-        :param runner_id: Runner the bearer is confined to.
+        :param runner_id: Runner the bearer is confined to, or ``None`` for legacy issuance.
         :returns: An HS256-signed JWT, or ``None`` for header mode, an
             empty/reserved user or runner id, or a missing cookie config.
         """
-        if not user_id or user_id in _RESERVED_USERS or not runner_id:
+        if not user_id or user_id in _RESERVED_USERS or runner_id == "":
+            return None
+        if runner_id is None and not env_var_is_truthy(LEGACY_RUNNER_TOKENS_ENV, default=True):
             return None
         if self._source not in ("oidc", "accounts"):
             return None
@@ -778,7 +789,11 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
-            extra_claims={"scope": RUNNER_TOKEN_SCOPE, "runner_id": runner_id},
+            extra_claims=(
+                {"scope": RUNNER_TOKEN_SCOPE, "runner_id": runner_id}
+                if runner_id is not None
+                else None
+            ),
         )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:

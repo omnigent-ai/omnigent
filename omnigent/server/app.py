@@ -4133,11 +4133,17 @@ def create_app(
             for conv, client in roots:
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
 
-    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+    def _mint_managed_runner_token(
+        runner_id: str, ttl_seconds: int, *, confined: bool = False
+    ) -> str | None:
         assert runner_account_store is not None and auth_provider is not None
         return runner_account_store.with_runner_authority(
             runner_id,
-            lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds, runner_id=runner_id),
+            lambda owner: (
+                auth_provider.mint_runner_token(owner, ttl_seconds, runner_id=runner_id)
+                if confined
+                else auth_provider.mint_runner_token(owner, ttl_seconds)
+            ),
         )
 
     if isinstance(auth_provider, UnifiedAuthProvider):
@@ -4185,6 +4191,11 @@ def create_app(
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),
+            mint_scoped_managed_runner_token=(
+                lambda runner_id, ttl: _mint_managed_runner_token(runner_id, ttl, confined=True)
+            )
+            if runner_account_store is not None
+            else None,
         ),
         prefix="/v1",
         tags=["runners"],

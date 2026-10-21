@@ -687,44 +687,37 @@ Update this top-level README with a row in the table above.
 
 ### Delegated runner credentials
 
-For the planned 0.20.0 accounts/OIDC server rollout, upgrade and restart runners
-first. They announce `X-Omnigent-Runner-Credential-Protocol: scoped-v1`, which
-supports confined tool discovery and finalization before detach. Older servers
-ignore this header. The new server refuses missing or unknown protocols with
-HTTP 426 (`runner_upgrade_required`); upgrading it first interrupts older
-runners at their next mint. Ending legacy runner issuance in 0.20.0 requires
-maintainer approval of this compatibility break before release. Custom managed
-token issuers keep their existing protocol and authorization.
+During the 0.20.x compatibility window, accounts/OIDC runners announcing
+`X-Omnigent-Runner-Credential-Protocol: scoped-v1` receive credentials confined
+to their runner's sessions and callbacks. Older runners keep receiving legacy
+owner-wide credentials by default. **Legacy issuance retains the original
+cross-runner/account exposure**; protocol negotiation is not proof that a
+sandbox is trustworthy. Upgrade/restart runners, then set
+`OMNIGENT_ALLOW_LEGACY_RUNNER_TOKENS=0` on the server to require confinement.
+Legacy issuance is deprecated and scheduled for removal in **0.21.0**.
 
-New accounts/OIDC runner bearers are bound to their runner's sessions. They
-cannot administer accounts, manage hosts, or access sessions bound to another
-runner. A scope denial returns HTTP 403 (`runner_scope_denied`) without renewing
-the token. Previously issued unscoped bearers retain their original authority
-until expiry; restart runners to obtain scoped tokens, or rotate the account
-password to revoke older credentials immediately. Password rotation and account
-deletion also revoke scoped tokens.
+Unknown protocols receive HTTP 426 (`runner_upgrade_required`). With legacy
+issuance disabled, missing protocols and providers without confinement support
+also receive 426. Existing legacy bearers retain their authority until expiry;
+password rotation or account deletion revokes both legacy and scoped bearers.
+Scoped denials return HTTP 403 (`runner_scope_denied`) without token renewal.
+Confined runners hide scheduling and account-wide agent discovery, skip global
+session/host discovery, and cannot change session sharing or use browser SSE.
+Their session-scoped agent routes and local child discovery remain available.
 
-Confined runners hide `sys_agent_list` and
-`sys_scheduled_task_create/list/update/delete` in request harnesses, native
-relays, and Pi. Global session listing is empty; session-local discovery remains
-available. Host readiness is omitted, and browser SSE streams are unavailable
-because they mirror descendants from other runners. Interactive user clients
-retain account-wide operations.
+Custom `AuthProvider`s retain their two-argument `mint_runner_token` contract
+during this window (including for updated runners). To opt into confinement,
+accept `runner_id` as an optional keyword, enforce it when supplied, and declare
+`runner_token_scope = "runner"`. The server passes that keyword only when both
+runner and provider opt in; legacy calls omit it. Strict mode refuses the legacy
+path before calling the provider. Custom managed-token issuers retain their
+two-argument legacy callback; pair it with `mint_scoped_managed_runner_token`
+to opt into scoped issuance under the same saved-authority lock.
 
-Session creation and native rotation stay on the creating runner. Temporary
-bootstrap scope ends before the first binding, transfer, or detach attempt;
-policy writes cannot restore it. Across separate databases, revocation commits
-first. If binding then fails, the owner must retry with interactive credentials.
-Claude-native `/clear` posts final events and transfers its terminal before
-detaching the old session.
-
-Inherited scope stops after 32 parent edges (33 indexed lookups). Before rollout,
-bind deeper active sessions explicitly with `PATCH /v1/sessions/{id}` and
-`{"runner_id": "<runner-id>"}` using owner credentials. A nearer conflicting
-runner binding still denies access. Direct bindings and active bootstrap scope
-are independent of total nesting depth.
-
-Custom `AuthProvider` implementations must accept `runner_id` in
-`mint_runner_token`, enforce that binding, and declare `runner_token_scope =
-"runner"`. Older providers receive an actionable configuration error; their
-unscoped mint method is never used as a fallback.
+Session creation and native rotation stay on the creating runner; bootstrap
+scope is consumed before binding, transfer, or detach. Claude-native `/clear`
+finalizes before detach. Inherited scope stops after 32 parent edges (33 indexed
+lookups). For deeper unbound sessions, or a failed initial binding, use owner
+credentials to bind explicitly with `PATCH /v1/sessions/{id}` and
+`{"runner_id": "<runner-id>"}`. A nearer conflicting binding still denies access;
+direct bindings and active bootstrap grants have no total nesting-depth limit.

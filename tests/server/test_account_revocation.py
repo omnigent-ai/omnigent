@@ -155,10 +155,16 @@ def _redeem_path(redeem_url: str) -> str:
 
 
 @pytest.mark.parametrize("revocation", ["change", "reset"])
-def test_password_rotation_revokes_issued_credentials_and_keeps_work(setup_app, revocation):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_password_rotation_revokes_issued_credentials_and_keeps_work(
+    setup_app, revocation, legacy, monkeypatch
+):
     import uuid
 
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.auth import LEGACY_RUNNER_TOKENS_ENV
+
+    monkeypatch.delenv(LEGACY_RUNNER_TOKENS_ENV, raising=False)
 
     admin, alice, stores, _ = setup_app
     accounts, tasks, hosts = (
@@ -190,12 +196,20 @@ def test_password_rotation_revokes_issued_credentials_and_keeps_work(setup_app, 
             f"/v1/runners/{token_bound_runner_id(binding)}/token",
             headers={
                 RUNNER_TUNNEL_TOKEN_HEADER: binding,
-                RUNNER_CREDENTIAL_PROTOCOL_HEADER: RUNNER_CREDENTIAL_PROTOCOL,
+                **(
+                    {RUNNER_CREDENTIAL_PROTOCOL_HEADER: RUNNER_CREDENTIAL_PROTOCOL}
+                    if not legacy
+                    else {}
+                ),
             },
         )
 
     issued = mint_runner_token()
     assert issued.status_code == 200, issued.text
+    import jwt
+
+    claims = jwt.decode(issued.json()["token"], options={"verify_signature": False})
+    assert (claims.get("scope") == "runner") is not legacy
     stale_runner = TestClient(alice.app)
     stale_runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
     runner_status = f"/v1/runners/{token_bound_runner_id(binding)}/status"
@@ -1040,29 +1054,15 @@ def _runner_for_session(owner_client, stores, owner, *, legacy=False):
         f"/v1/runners/{runner_id}/token",
         headers={
             RUNNER_TUNNEL_TOKEN_HEADER: binding,
-            RUNNER_CREDENTIAL_PROTOCOL_HEADER: RUNNER_CREDENTIAL_PROTOCOL,
+            **(
+                {RUNNER_CREDENTIAL_PROTOCOL_HEADER: RUNNER_CREDENTIAL_PROTOCOL}
+                if not legacy
+                else {}
+            ),
         },
     )
     assert issued.status_code == 200, issued.text
-    if legacy:
-        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
-        from omnigent.server.oidc import mint_session_token
-
-        refused = runner.post(
-            f"/v1/runners/{runner_id}/token", headers={RUNNER_TUNNEL_TOKEN_HEADER: binding}
-        )
-        assert refused.status_code == 426, refused.text
-        assert refused.json()["error"]["code"] == "runner_upgrade_required"
-        # Reproduce the token shape issued before scoped credentials existed.
-        token = mint_session_token(
-            owner,
-            stores["auth_provider"]._accounts_config.cookie_secret,
-            1800,
-            "accounts",
-            account_generation=stores["account_store"].get_user(owner).account_generation,
-        )
-    else:
-        token = issued.json()["token"]
+    token = issued.json()["token"]
     runner.headers["Authorization"] = f"Bearer {token}"
     return runner, bound, runner_id
 
@@ -1367,11 +1367,19 @@ def test_runner_resource_copy_checks_ancestor_scope(setup_app):
     assert transfer.status_code == 403, transfer.text
 
 
-def test_runner_binding_lifecycle_consumes_bootstrap_scope(setup_app):
-    from omnigent.server.auth import RUNNER_CREATOR_LABEL_KEY
+def test_runner_binding_lifecycle_consumes_bootstrap_scope(setup_app, monkeypatch):
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.auth import LEGACY_RUNNER_TOKENS_ENV, RUNNER_CREATOR_LABEL_KEY
 
+    monkeypatch.setenv(LEGACY_RUNNER_TOKENS_ENV, "0")
     _, alice, stores, _ = setup_app
     runner, bound, runner_id = _runner_for_session(alice, stores, "alice")
+    legacy_mint = runner.post(
+        f"/v1/runners/{runner_id}/token",
+        headers={RUNNER_TUNNEL_TOKEN_HEADER: "confined-runner-binding"},
+    )
+    assert legacy_mint.status_code == 426, legacy_mint.text
+    assert legacy_mint.json()["error"]["code"] == "runner_upgrade_required"
     conversations = stores["conversation_store"]
     agent_id = conversations.get_conversation(bound).agent_id
     owner_client = alice
@@ -1398,9 +1406,11 @@ def test_runner_binding_lifecycle_consumes_bootstrap_scope(setup_app):
     assert runner.patch(f"/v1/sessions/{rotated_id}", json={"title": "next"}).status_code == 200
     rebind = runner.patch(f"/v1/sessions/{bound}", json={"runner_id": other_runner_id})
     assert rebind.status_code == 403
+    assert rebind.json()["error"]["code"] == "runner_scope_denied"
     assert conversations.get_conversation(bound).runner_id == runner_id
     managed_fork = runner.post(f"/v1/sessions/{bound}/fork", json={"host_type": "managed"})
     assert managed_fork.status_code == 403, managed_fork.text
+    assert managed_fork.json()["error"]["code"] == "runner_scope_denied"
     forked = runner.post(f"/v1/sessions/{bound}/fork", json={})
     assert forked.status_code == 201, forked.text
     fork_labels = conversations.get_conversation(forked.json()["id"]).labels
