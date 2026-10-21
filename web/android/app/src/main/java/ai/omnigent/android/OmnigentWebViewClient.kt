@@ -63,6 +63,24 @@ internal class OmnigentWebViewClient(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    fun beginShellLoad(url: String?) {
+        activeMainFrameUrl =
+            url?.let { requested ->
+                val parsed = Uri.parse(requested)
+                if (isHttpScheme(parsed.scheme) && parsed.path.isNullOrEmpty()) {
+                    parsed
+                        .buildUpon()
+                        .path("/")
+                        .build()
+                        .toString()
+                } else {
+                    requested
+                }
+            }
+        shellStoppedUrl = null
+        failedNavigation = false
+    }
+
     override fun onPageStarted(
         view: WebView,
         url: String?,
@@ -74,9 +92,7 @@ internal class OmnigentWebViewClient(
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
         val pinned = pinnedOrigin()
         val session = workspaceSession()
-        activeMainFrameUrl = url
-        shellStoppedUrl = null
-        failedNavigation = false
+        beginShellLoad(url)
         if (session != null && isHttpScheme(scheme)) {
             val parsed = runCatching { url?.let(::URI) }.getOrNull()
             if (parsed != null && session.isSignOutUri(parsed)) {
@@ -395,7 +411,10 @@ internal class OmnigentWebViewClient(
         view: WebView,
         target: String,
     ) {
-        mainHandler.post { view.loadUrl(target) }
+        mainHandler.post {
+            beginShellLoad(target)
+            view.loadUrl(target)
+        }
     }
 
     private companion object {
