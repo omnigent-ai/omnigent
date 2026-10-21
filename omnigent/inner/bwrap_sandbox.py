@@ -186,9 +186,7 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Nested-sandbox /proc handling
 # ---------------------------------------------------------------------------
 
-# Binding outer procfs exposes process metadata, so only vetted backends opt in.
-# Phoenix requires a single-tenant PID namespace with hostPID and process sharing
-# disabled. Other environments keep fresh procfs; see _should_bind_host_proc.
+# Vetted outer sandboxes; see _should_bind_host_proc for isolation requirements.
 _PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
 # Marker directory the Databricks Lakebox runtime seeds inside every
@@ -237,7 +235,8 @@ def _should_bind_host_proc() -> bool:
     Binding outer ``/proc`` exposes its world-readable process metadata.
     The user namespace still blocks ptrace-gated files, and ``--unshare-pid``
     contains signalling, but callers must still provide an isolated,
-    single-tenant outer PID namespace.
+    single-tenant outer PID namespace. Phoenix must disable ``hostPID`` and
+    ``shareProcessNamespace``.
 
     :returns: ``True`` to emit ``--bind /proc /proc``; ``False`` to emit
         ``--proc /proc``.

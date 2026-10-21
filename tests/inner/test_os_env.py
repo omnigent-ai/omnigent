@@ -82,7 +82,7 @@ def test_build_helper_env_inactive_strips_binding_token() -> None:
     env = build_helper_env(parent, _inactive_policy())
 
     assert RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR not in env
-    assert HOST_SANDBOX_BACKEND_ENV not in env
+    assert env[HOST_SANDBOX_BACKEND_ENV] == "phoenix-kubernetes"
     assert "bug-binding-token-secret" not in env.values()
     assert env["PATH"] == "/usr/bin"
 

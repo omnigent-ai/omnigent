@@ -572,7 +572,7 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     child_env = json.loads(out_file.read_text())
     # Opt-in contract: no allowlist, no prune.
     assert child_env.get("DELIBERATE_EXTRA") == "kept"
-    assert HOST_SANDBOX_BACKEND_ENV not in child_env
+    assert child_env[HOST_SANDBOX_BACKEND_ENV] == "phoenix-kubernetes"
 
 
 def _read_launcher(target: str) -> tuple[str, str]:

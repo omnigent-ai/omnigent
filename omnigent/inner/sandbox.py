@@ -52,7 +52,7 @@ _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 
 # Trusted outer-launcher hint consumed before sandbox environment filtering.
-# It is never forwarded to agent targets.
+# Active sandbox helpers and launcher targets strip it; unsandboxed children keep it.
 HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 
 # Backends that need a spawn-time wrap (parent-side ``bwrap`` /
@@ -189,7 +189,6 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
-    # Resolved only at the final direct wrap or exec-launcher construction.
     bind_host_proc: bool | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
@@ -1130,8 +1129,9 @@ def run_launcher(
     ):
         sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
 
-    # The host marker is launcher-only and must never reach the target.
-    os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
+    # Unsandboxed children may launch their own runner and still need the hint.
+    if sandbox.active:
+        os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
 
     # Before any wrap / exec so neither the re-exec'd launcher nor the target
     # can see env vars the spawner didn't deliberately pass.

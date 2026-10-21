@@ -1138,16 +1138,27 @@ def test_wrap_launcher_argv_fresh_proc_by_default(
     assert not _has_pair(argv, "--bind", "/proc", "/proc")
 
 
-@pytest.mark.parametrize(("frozen", "expected_bind"), [(None, True), (False, False)])
-def test_wrap_launcher_argv_respects_proc_choice_on_phoenix(
+@pytest.mark.parametrize(
+    ("frozen", "declared", "expected_bind"),
+    [
+        (None, "phoenix-kubernetes", True),
+        (None, "lakebox", True),
+        (False, "phoenix-kubernetes", False),
+        (False, "lakebox", False),
+        (True, None, True),
+    ],
+)
+def test_wrap_launcher_argv_respects_proc_choice(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     frozen: bool | None,
+    declared: str | None,
     expected_bind: bool,
 ) -> None:
-    """A frozen choice wins over Phoenix detection."""
+    """A frozen choice wins over host detection, even without a host signal."""
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
+    if declared is not None:
+        monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, declared)
     backend = _make_backend()
     policy = _make_policy(tmp_path)
     policy.bind_host_proc = frozen

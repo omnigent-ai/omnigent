@@ -238,7 +238,6 @@ def build_helper_env(
         # sandbox must not also hand the agent the binding token.
         env = strip_runner_auth_secrets(parent_env)
         env.pop(SHARED_ENVIRONMENT_VAR, None)
-        env.pop(HOST_SANDBOX_BACKEND_ENV, None)
         return env
 
     allowed = set(_DEFAULT_ENV_PASSTHROUGH)
