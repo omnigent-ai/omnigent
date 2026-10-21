@@ -1,10 +1,8 @@
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
-// PullRequestPanel — the right-rail "Pull Requests" tab. A view of the session
-// branch's relationship to its git provider: the associated PR (number, title,
-// state, CI summary, link out) and the branch-vs-base diff. Labels are its only
-// edit to the PR itself (see PullRequestLabels).
+// PullRequestPanel — the right-rail "Pull Requests" tab: the session branch's PR
+// (number, title, state, CI summary, labels, link out) and the branch-vs-base diff.
 // Provider-visible text comes from lib/gitProviders.ts.
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll

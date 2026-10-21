@@ -1,7 +1,5 @@
-// Tests for the pure helpers in usePullRequests — the 404 → reason classifier that
-// steers an outdated host to the "update your host" panel state, the payload
-// normalizer (and that the info fetch applies it), the panel's
-// poll-interval decision, and the label edit applied before the host answers.
+// Tests for usePullRequests' pure helpers: the 404 → "update your host" classifier, the
+// payload normalizer (and that the info fetch applies it), the poll interval, and label edits.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {

@@ -558,12 +558,18 @@ def _label_target(
 
 
 def _label_names(value: object, field: str) -> list[str]:
-    """Return the unique label names in a request field, in order."""
+    """Return a request field's label names, without case-insensitive repeats, in order.
+
+    GitHub label names ignore case, so the first spelling sent is kept.
+    """
     if not isinstance(value, (list, tuple)) or not all(
         isinstance(name, str) and name.strip() for name in value
     ):
         raise ValueError(f"Expected {field} to be a list of label names")
-    return list(dict.fromkeys(value))
+    unique: dict[str, str] = {}
+    for name in value:
+        unique.setdefault(name.casefold(), name)
+    return list(unique.values())
 
 
 def pr_labels(
@@ -591,15 +597,19 @@ def update_pr_labels(
     :param add: Names of existing repository labels to add.
     :param remove: Names of labels to remove; one the PR lacks is ignored.
     :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
-    :raises ValueError: On an empty, overlapping, or oversized edit, without a
-        selected tracked PR, or when the provider refuses the change.
+    :raises ValueError: On an empty, overlapping, or oversized edit, a removal
+        named ``.`` or ``..``, without a selected tracked PR, or when the
+        provider refuses the change.
     """
     add_names = _label_names(add, "add")
     remove_names = _label_names(remove, "remove")
     if not add_names and not remove_names:
         raise ValueError("Expected labels to add or remove")
-    if set(add_names) & set(remove_names):
+    if {name.casefold() for name in add_names} & {name.casefold() for name in remove_names}:
         raise ValueError("A label cannot be both added and removed")
+    # A removal names the label in the URL path, where these are dot segments.
+    if {".", ".."} & set(remove_names):
+        raise ValueError("Remove labels named . or .. on GitHub")
     if len(add_names) + len(remove_names) > _MAX_LABEL_EDIT:
         raise ValueError(f"Edit at most {_MAX_LABEL_EDIT} labels at once")
     facet, reference = _label_target(session_id, pr_url)

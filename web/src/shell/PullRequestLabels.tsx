@@ -1,7 +1,5 @@
-// The Summary tab's Labels section: the selected PR's labels as color chips and,
-// for editors on a provider with `label_editing`, a picker over the repository's
-// labels. Edits show at once from the pending mutations and settle to the labels
-// the provider reports back; a failed edit drops out and the info is refetched.
+// The Summary tab's Labels section: PR label chips and, for editors, a picker over
+// the repository's labels. Pending edits show at once and settle to what the provider reports.
 
 import { useMemo, useState } from "react";
 import { useMutationState } from "@tanstack/react-query";
@@ -215,7 +213,7 @@ export function PullRequestLabels({
           ))}
         </ul>
       )}
-      {update.isError && (
+      {update.isError && update.variables?.prUrl === prUrl && (
         <p role="alert" className="text-ui text-destructive">
           {update.error.message}
         </p>

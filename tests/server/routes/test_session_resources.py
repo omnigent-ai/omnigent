@@ -3189,26 +3189,31 @@ async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncCl
     fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     timeouts: list[float | None] = []
-    proxy_post = fake_runner.post
+    proxy_get, proxy_post = fake_runner.get, fake_runner.post
+
+    async def get(url: str, *, params: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_get(url, params=params, timeout=timeout)
 
     async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
         timeouts.append(timeout)
         return await proxy_post(url, json=json, timeout=timeout)
 
-    fake_runner.post = post  # type: ignore[method-assign]
+    fake_runner.get, fake_runner.post = get, post  # type: ignore[method-assign]
 
     resp = await client.post(
         path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"]}
     )
     malformed = await client.post(path, json={"add": ["bug"]})
+    await client.get(path, params={"pr_url": "https://github.com/acme/widgets/pull/17"})
 
     assert resp.status_code == 400
     assert resp.json()["detail"] == detail
     assert malformed.status_code == 400
-    # The server and the host tunnel both outwait the runner's whole label edit.
-    assert timeouts == [routes_resources._LABEL_EDIT_PROXY_TIMEOUT_S]
-    assert github_resource._LABEL_EDIT_SECONDS < routes_resources._LABEL_EDIT_PROXY_TIMEOUT_S
-    assert github_resource._LABEL_EDIT_SECONDS < _host_filesystem._FS_TIMEOUT_S
+    # The server and the host tunnel both outwait the runner's label request budget.
+    assert timeouts == [routes_resources._LABEL_PROXY_TIMEOUT_S] * 2
+    assert github_resource._LABEL_REQUEST_SECONDS < routes_resources._LABEL_PROXY_TIMEOUT_S
+    assert github_resource._LABEL_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
     assert fake_runner.post_json_calls == [
         (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"], "remove": []})
     ]

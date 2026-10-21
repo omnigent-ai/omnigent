@@ -28,22 +28,13 @@ def _label(name: str, color: str = "ededed", description: str = "") -> dict[str,
 
 
 def _fake_gh(
-    calls: list[GhCall],
-    responses: list[tuple[int | None, str, str]],
-    budgets: list[float | None] | None = None,
+    calls: list[GhCall], responses: list[tuple[int | None, str, str]]
 ) -> Callable[..., tuple[int | None, str, str]]:
-    """A ``_gh`` stand-in that records ``(argv, token)`` and answers in order.
+    """A ``_gh`` stand-in that records ``(argv, token)`` and answers in order."""
 
-    :param budgets: Receives each call's ``max_seconds``, when given.
-    """
-
-    def gh(
-        argv: list[str], *, cwd: str, token: str | None = None, max_seconds: float | None = None
-    ) -> tuple[int | None, str, str]:
+    def gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
         assert cwd == "/workspace"
         calls.append((argv, token))
-        if budgets is not None:
-            budgets.append(max_seconds)
         return responses.pop(0)
 
     return gh
@@ -107,23 +98,24 @@ def test_repo_labels_lists_as_the_pr_account_sorted_by_name(
                 "--json",
                 "name,color,description",
                 "--limit",
-                "1000",
+                "1001",
             ],
             "selected-token",
         )
     ]
 
 
-def test_repo_labels_reports_a_truncated_list(
-    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef
+@pytest.mark.parametrize("extra, has_more", [(0, False), (1, True)])
+def test_repo_labels_report_only_a_truncated_list(
+    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef, extra: int, has_more: bool
 ) -> None:
-    raw = [_label(f"label-{index:04}") for index in range(github._MAX_REPO_LABELS)]
+    raw = [_label(f"label-{index:04}") for index in range(github._MAX_REPO_LABELS + extra)]
     monkeypatch.setattr(github, "_gh", _fake_gh([], [(0, json.dumps(raw), "")]))
 
     result = github._repo_labels("/workspace", reference)
 
     assert len(result["data"]) == github._MAX_REPO_LABELS
-    assert result["has_more"] is True
+    assert result["has_more"] is has_more
 
 
 @pytest.mark.parametrize(
@@ -252,7 +244,6 @@ def test_an_absent_label_keeps_an_earlier_removal_result(
             "GitHub rejected the label change: Validation Failed",
         ),
         ((1, "", "gh: Server Error (HTTP 502)"), "could not update the labels"),
-        ((None, "", "timed out"), "took too long to update the labels"),
         ((None, "", "No such file or directory: 'gh'"), "could not update the labels"),
         ((0, json.dumps({"unexpected": True}), ""), "could not update the labels"),
     ],
@@ -269,55 +260,59 @@ def test_edit_label_failures_are_user_facing(
         github._edit_labels("/workspace", reference, add=["ready"], remove=[])
 
 
-def _clock(monkeypatch: pytest.MonkeyPatch, *readings: float) -> None:
-    """Make ``github_resource`` read ``time.monotonic()`` as ``readings``, in order."""
-    values = iter(readings)
-    monkeypatch.setattr(github, "time", SimpleNamespace(monotonic=lambda: next(values)))
-
-
-def test_label_edit_requests_share_one_time_budget(
-    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef
+def test_every_gh_call_of_a_label_edit_shares_one_deadline(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[GhCall] = []
-    budgets: list[float | None] = []
-    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(0, "[]", ""), (0, "[]", "")], budgets))
-    _clock(monkeypatch, 100.0, 101.0, 110.0)
+    monkeypatch.setattr(github._config, "github_account_preference", lambda _repo: "work")
+    monkeypatch.setattr(github, "time", SimpleNamespace(monotonic=lambda: 100.0))
+    deadlines: list[tuple[str, float | None]] = []
 
-    github._edit_labels("/workspace", reference, add=["ready"], remove=["bug"])
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        deadlines.append((argv[1], github._gh_deadline.get()))
+        return 0, "selected-token" if argv[:2] == ["auth", "token"] else "[]", ""
 
-    assert budgets == [github._LABEL_EDIT_SECONDS - 1, github._LABEL_EDIT_SECONDS - 10]
+    monkeypatch.setattr(github, "_gh", gh)
+
+    github._edit_labels(
+        "/workspace", PullRequestRef.from_url(PR_URL), add=["ready"], remove=["bug"]
+    )
+
+    deadline = 100.0 + github._LABEL_REQUEST_SECONDS
+    assert deadlines == [("token", deadline), ("--hostname", deadline), ("--hostname", deadline)]
+    assert github._gh_deadline.get() is None
 
 
-def test_label_edit_stops_once_its_budget_is_spent(
-    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef
+@pytest.mark.parametrize("slow", ["account lookup", "removal"])
+def test_a_label_edit_past_its_deadline_reports_an_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch, slow: str
 ) -> None:
-    calls: list[GhCall] = []
-    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(0, "[]", "")]))
-    _clock(monkeypatch, 100.0, 101.0, 100.0 + github._LABEL_EDIT_SECONDS)
-
-    with pytest.raises(ValueError, match="took too long to update the labels"):
-        github._edit_labels("/workspace", reference, add=[], remove=["bug", "ready"])
-
-    assert len(calls) == 1
-
-
-@pytest.mark.parametrize("max_seconds, expected", [(3.0, 3.0), (99.0, 15.0), (None, 15.0)])
-def test_gh_never_waits_past_its_callers_budget(
-    monkeypatch: pytest.MonkeyPatch, max_seconds: float | None, expected: float
-) -> None:
-    monkeypatch.delenv("OMNIGENT_GH_TIMEOUT_SECONDS", raising=False)
-    timeouts: list[float] = []
+    """The deadline cuts the slow call; nothing runs after it, least of all as another account."""
+    monkeypatch.setattr(
+        github._config,
+        "github_account_preference",
+        lambda _repo: "work" if slow == "account lookup" else None,
+    )
+    clock = [100.0]
+    monkeypatch.setattr(github, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    commands: list[list[str]] = []
 
     def run(argv: list[str], *, cwd: str, timeout: float, env: object = None):
-        del argv, cwd, env
-        timeouts.append(timeout)
-        return 0, "", ""
+        del cwd, env
+        commands.append(argv)
+        assert timeout <= github._LABEL_REQUEST_SECONDS
+        clock[0] += timeout
+        return None, "", "timed out"
 
     monkeypatch.setattr(github, "_run", run)
 
-    github._gh(["api", "user"], cwd="/workspace", max_seconds=max_seconds)
+    with pytest.raises(ValueError, match="took too long to update the labels"):
+        github._edit_labels(
+            "/workspace", PullRequestRef.from_url(PR_URL), add=["ready"], remove=["bug"]
+        )
 
-    assert timeouts == [expected]
+    first = ["gh", "auth", "token"] if slow == "account lookup" else ["gh", "api", "--hostname"]
+    assert [command[:3] for command in commands] == [first]
+    assert github._gh_timed_out.get() is False
 
 
 @pytest.fixture
@@ -340,6 +335,9 @@ def tracked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
         ({"remove": ["bug", 7]}, "Expected remove to be a list of label names"),
         ({"add": ["  "]}, "Expected add to be a list of label names"),
         ({"add": ["bug"], "remove": ["bug"]}, "both added and removed"),
+        ({"add": ["Bug"], "remove": ["bug"]}, "both added and removed"),
+        ({"remove": [".."]}, "Remove labels named . or .. on GitHub"),
+        ({"remove": ["."]}, "Remove labels named . or .. on GitHub"),
         ({"add": [f"label-{index}" for index in range(101)]}, "at most 100 labels"),
         ({"pr_url": None, "add": ["bug"]}, "Select a pull request"),
         ({"pr_url": PR_URL.replace("17", "18"), "add": ["bug"]}, "not associated"),
@@ -356,7 +354,9 @@ def test_invalid_label_edits_never_reach_github(
         pr_resource.update_pr_labels(tracked, session_id="session", **request)  # type: ignore[arg-type]
 
 
-def test_label_edit_names_are_deduplicated(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_label_edit_names_are_deduplicated_ignoring_case(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     seen: dict[str, object] = {}
 
     def edit(_root: str, _reference: PullRequestRef, *, add: list[str], remove: list[str]):
@@ -366,7 +366,11 @@ def test_label_edit_names_are_deduplicated(tracked: str, monkeypatch: pytest.Mon
     monkeypatch.setattr(github, "_edit_labels", edit)
 
     pr_resource.update_pr_labels(
-        tracked, session_id="session", pr_url=PR_URL, add=["bug", "bug"], remove=["x", "x"]
+        tracked,
+        session_id="session",
+        pr_url=PR_URL,
+        add=["bug", "Bug", "bug"],
+        remove=["x", "X"],
     )
 
     assert seen == {"add": ["bug"], "remove": ["x"]}

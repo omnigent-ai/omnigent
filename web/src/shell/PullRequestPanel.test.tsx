@@ -362,7 +362,6 @@ describe("PullRequestPanel", () => {
     const prUrl = "https://github.com/acme/app/pull/6000";
     const bug = { name: "bug", color: "d73a4a", description: "Something isn't working" };
     const docs = { name: "Docs", color: "0075ca", description: null };
-    const ready = { name: "ready", color: null, description: null };
 
     beforeEach(() => {
       state.info!.data!.selected_pr_url = prUrl;
@@ -401,13 +400,7 @@ describe("PullRequestPanel", () => {
       ).toBeTruthy();
     });
 
-    it("removes a label from its chip and toggles labels from the picker", async () => {
-      state.repoLabels = {
-        data: { object: "list", data: [bug, docs, ready], has_more: false },
-        isPending: false,
-        isError: false,
-        error: null,
-      };
+    it("wires editing to the selected PR: chips remove, and the picker loads on open", () => {
       renderPanel();
 
       fireEvent.click(screen.getByRole("button", { name: "Remove label bug" }));
@@ -416,31 +409,10 @@ describe("PullRequestPanel", () => {
         add: [],
         remove: [bug],
       });
-
       expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, false);
       fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
       expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, true);
       expect(screen.getByRole("combobox", { name: "Filter labels" })).toBeInTheDocument();
-      expect(await screen.findByRole("option", { name: /^bug/ })).toHaveAttribute(
-        "data-checked",
-        "true",
-      );
-      expect(screen.getByRole("option", { name: "ready" })).toHaveAttribute(
-        "data-checked",
-        "false",
-      );
-      fireEvent.click(screen.getByRole("option", { name: "ready" }));
-      expect(state.updateLabels.mutate).toHaveBeenLastCalledWith({
-        prUrl,
-        add: [ready],
-        remove: [],
-      });
-      fireEvent.click(screen.getByRole("option", { name: "Docs" }));
-      expect(state.updateLabels.mutate).toHaveBeenLastCalledWith({
-        prUrl,
-        add: [],
-        remove: [docs],
-      });
     });
 
     it.each([
@@ -483,22 +455,6 @@ describe("PullRequestPanel", () => {
       renderPanel();
 
       expect(screen.queryByRole("heading", { name: "Labels" })).toBeNull();
-    });
-
-    it("says when the PR has no labels and shows why an edit failed", () => {
-      state.info!.data!.pr!.labels = [];
-      state.updateLabels = {
-        mutate: vi.fn(),
-        isError: true,
-        error: new Error("The GitHub account on the host cannot edit this pull request's labels."),
-      };
-      renderPanel();
-
-      const labels = screen.getByRole("heading", { name: "Labels" }).closest("section")!;
-      expect(within(labels).getByText("No labels.")).toBeInTheDocument();
-      expect(within(labels).getByRole("alert")).toHaveTextContent(
-        "cannot edit this pull request's labels",
-      );
     });
   });
 

@@ -133,9 +133,9 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
-# Runner wait for a PR label edit, above the runner's 15-second label edit budget so a
-# slow edit that GitHub applied is not reported as failed.
-_LABEL_EDIT_PROXY_TIMEOUT_S = 20.0
+# Runner wait for a PR label request, above the runner's 15-second budget for all of
+# its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
+_LABEL_PROXY_TIMEOUT_S = 20.0
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -538,6 +538,7 @@ def register_resources_routes(
         runner_path: str,
         runner_params: dict[str, str] | None = None,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+        runner_timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -568,6 +569,7 @@ def register_resources_routes(
             has nothing for this to resolve against. Resolving it eagerly
             would refuse absolute browsing on exactly those sessions even
             though the online runner can serve them.
+        :param runner_timeout: Seconds to wait for the runner's response.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -579,6 +581,7 @@ def register_resources_routes(
                 runner_path,
                 conversation,
                 params=runner_params,
+                timeout=runner_timeout,
             )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
@@ -3220,6 +3223,7 @@ def register_resources_routes(
             host_params={"pr_url": pr_url},
             runner_params={"pr_url": pr_url},
             runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            runner_timeout=_LABEL_PROXY_TIMEOUT_S,
         )
 
     @router.post(
@@ -3252,7 +3256,7 @@ def register_resources_routes(
                 f"/v1/sessions/{session_id}/resources/github/labels",
                 params,
                 conv,
-                timeout=_LABEL_EDIT_PROXY_TIMEOUT_S,
+                timeout=_LABEL_PROXY_TIMEOUT_S,
             )
         except OmnigentError as exc:
             if exc.code != ErrorCode.RUNNER_UNAVAILABLE:

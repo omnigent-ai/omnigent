@@ -100,7 +100,12 @@ it("shows an edit at once and keeps the labels the host reports", async () => {
   const client = renderLabels([bug]);
 
   fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
-  fireEvent.click(await screen.findByRole("option", { name: /^ready/ }));
+  expect(await screen.findByRole("option", { name: /^bug/ })).toHaveAttribute(
+    "data-checked",
+    "true",
+  );
+  expect(screen.getByRole("option", { name: /^ready/ })).toHaveAttribute("data-checked", "false");
+  fireEvent.click(screen.getByRole("option", { name: /^ready/ }));
 
   await waitFor(() => expect(shownLabels()).toEqual(["bug", "ready"]));
   await waitFor(() => expect(posts).toHaveLength(1));
@@ -162,6 +167,26 @@ it("sends edits one at a time in click order, so a quick add then remove ends re
     expect(client.getQueryData<PullRequestInfo>(INFO_KEY)?.pr?.labels).toEqual([bug]),
   );
   expect(shownLabels()).toEqual(["bug"]);
+});
+
+it("does not show one PR's failed edit under the next PR's labels", async () => {
+  const { posts } = stubFetch(() => json({ object: "list", data: [], has_more: false }));
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const section = (prUrl: string, labels: PullRequestLabel[]) => (
+    <QueryClientProvider client={client}>
+      <PullRequestLabels conversationId="conv_1" prUrl={prUrl} labels={labels} editable />
+    </QueryClientProvider>
+  );
+  const { rerender } = render(section(PR_URL, [bug]));
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove label bug" }));
+  await waitFor(() => expect(posts).toHaveLength(1));
+  await act(async () => posts[0].respond(json({ detail: "Refused by GitHub" }, 400)));
+  expect(await screen.findByRole("alert")).toHaveTextContent("Refused by GitHub");
+
+  rerender(section("https://github.com/acme/app/pull/8", []));
+  expect(screen.getByText("No labels.")).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).toBeNull();
 });
 
 it.each([

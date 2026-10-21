@@ -62,7 +62,8 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote
@@ -79,15 +80,14 @@ _logger = logging.getLogger(__name__)
 # slightly more generous timeout than the local ``git`` reads. Overridable via
 # ``OMNIGENT_GH_TIMEOUT_SECONDS`` so operators can tune it without a restart.
 _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
-# A title lookup bounds every ``gh`` call it makes by this monotonic deadline.
-_pr_title_deadline: ContextVar[float | None] = ContextVar("pr_title_deadline", default=None)
-_pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default=False)
+# A request with its own time budget bounds every ``gh`` call by this monotonic
+# deadline (see :func:`_gh_deadline_scope`); ``_gh_timed_out`` records a cut-off call.
+_gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
+_gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 
-# Fields requested from ``gh pr view``. Always pass ``--json`` — bare
-# ``gh pr view`` opens an interactive/pager view and misbehaves in a
-# non-interactive subprocess. ``body``, ``comments``, and ``labels`` feed the
-# Summary tab; all are accepted by ``gh pr list`` too, so the fork-fallback path
-# shares them.
+# Fields for ``gh pr view``; always pass ``--json``, as a bare call opens a pager.
+# ``body``, ``comments``, and ``labels`` feed the Summary tab, and the fork
+# fallback's ``gh pr list`` accepts them too.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
     ",reviewRequests,latestReviews,labels"
@@ -166,18 +166,13 @@ def _in_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
-def _gh(
-    argv: list[str], *, cwd: str, token: str | None = None, max_seconds: float | None = None
-) -> tuple[int | None, str, str]:
-    """Run ``gh`` in ``cwd``; ``max_seconds`` caps the timeout for a caller with a budget."""
+def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
     timeout = _gh_timeout_seconds()
-    if max_seconds is not None:
-        timeout = min(timeout, max_seconds)
-    if (deadline := _pr_title_deadline.get()) is not None:
+    if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
-            _pr_title_timed_out.set(True)
-            return None, "", "title lookup deadline exceeded"
+            _gh_timed_out.set(True)
+            return None, "", "gh deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -209,8 +204,23 @@ def _gh(
         and result[2] == "timed out"
         and time.monotonic() >= deadline
     ):
-        _pr_title_timed_out.set(True)
+        _gh_timed_out.set(True)
     return result
+
+
+@contextmanager
+def _gh_deadline_scope(deadline: float) -> Iterator[None]:
+    """End every ``gh`` call in the block by ``deadline``, a ``time.monotonic()`` value.
+
+    ``_gh_timed_out`` starts false and turns true once the deadline cuts a call short.
+    """
+    deadline_token = _gh_deadline.set(deadline)
+    timed_out_token = _gh_timed_out.set(False)
+    try:
+        yield
+    finally:
+        _gh_timed_out.reset(timed_out_token)
+        _gh_deadline.reset(deadline_token)
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -485,10 +495,11 @@ def _shape_comments(raw: Any) -> list[dict[str, Any]]:
 
 # GitHub label colors are six hex digits; the panel puts them in inline styles.
 _LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
-# ``gh label list`` pages through the repository's labels up to this many.
+# The label picker lists at most this many of the repository's labels.
 _MAX_REPO_LABELS = 1000
-# One label edit's ``gh`` calls share this budget, under the host tunnel's 20-second wait.
-_LABEL_EDIT_SECONDS = 15.0
+# Every ``gh`` call of one label request shares this budget, under the 20-second
+# waits of the server and the host tunnel.
+_LABEL_REQUEST_SECONDS = 15.0
 _LABEL_EDIT_TIMED_OUT = "GitHub took too long to update the labels. Refresh to see which applied."
 
 
@@ -903,14 +914,9 @@ def _pr_title_before(
     :returns: ``(title, timed_out)``; ``timed_out`` is true only when the
         deadline ended the lookup.
     """
-    token = _pr_title_deadline.set(deadline)
-    timeout_token = _pr_title_timed_out.set(False)
-    try:
+    with _gh_deadline_scope(deadline):
         data = _pr_json(root, reference, "title")
-        return _pr_title(data), data is None and _pr_title_timed_out.get()
-    finally:
-        _pr_title_timed_out.reset(timeout_token)
-        _pr_title_deadline.reset(token)
+        return _pr_title(data), data is None and _gh_timed_out.get()
 
 
 def _verify_pr_access(root: str, reference: PullRequestRef) -> None:
@@ -1334,60 +1340,48 @@ def _pr_file_contents(
 def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """List the PR repository's labels by name for the label picker.
 
-    :raises ValueError: When ``gh`` cannot list them.
+    :raises ValueError: When ``gh`` cannot list them within :data:`_LABEL_REQUEST_SECONDS`.
     """
-    _host_args(root, reference)
-    rc, out, _ = _gh(
-        [
-            "label",
-            "list",
-            "-R",
-            _repo_argument(reference),
-            "--json",
-            "name,color,description",
-            "--limit",
-            str(_MAX_REPO_LABELS),
-        ],
-        cwd=root,
-        token=_pr_token(root, reference),
-    )
+    with _gh_deadline_scope(time.monotonic() + _LABEL_REQUEST_SECONDS):
+        _host_args(root, reference)
+        rc, out, _ = _gh(
+            [
+                "label",
+                "list",
+                "-R",
+                _repo_argument(reference),
+                "--json",
+                "name,color,description",
+                "--limit",
+                # One past the cap tells a full list from a truncated one.
+                str(_MAX_REPO_LABELS + 1),
+            ],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
     if rc != 0:
         raise ValueError("GitHub could not list this repository's labels. Refresh to retry.")
     try:
         raw = json.loads(out)
     except ValueError as exc:
         raise ValueError("GitHub returned an unexpected label list") from exc
-    labels = sorted(_shape_labels(raw), key=lambda label: str(label["name"]).casefold())
-    return {
-        "object": "list",
-        "data": labels,
-        "has_more": isinstance(raw, list) and len(raw) >= _MAX_REPO_LABELS,
-    }
+    raw = raw if isinstance(raw, list) else []
+    labels = sorted(
+        _shape_labels(raw[:_MAX_REPO_LABELS]), key=lambda label: str(label["name"]).casefold()
+    )
+    return {"object": "list", "data": labels, "has_more": len(raw) > _MAX_REPO_LABELS}
 
 
 def _labels_api(
-    root: str,
-    host: list[str],
-    token: str | None,
-    args: list[str],
-    *,
-    deadline: float,
-    missing_ok: bool = False,
+    root: str, host: list[str], token: str | None, args: list[str], *, missing_ok: bool = False
 ) -> list[Any] | None:
     """Run one ``gh api`` issue-labels request and return the PR's labels after it.
 
-    :param deadline: ``time.monotonic()`` value the request must finish by.
     :param missing_ok: Return ``None`` when GitHub reports that the PR lacks the
         label being removed.
-    :raises ValueError: With a user-facing message when GitHub refuses the
-        request or the deadline passes.
+    :raises ValueError: With a user-facing message when GitHub refuses the request.
     """
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise ValueError(_LABEL_EDIT_TIMED_OUT)
-    rc, out, err = _gh(["api", *host, *args], cwd=root, token=token, max_seconds=remaining)
-    if rc is None and err == "timed out":
-        raise ValueError(_LABEL_EDIT_TIMED_OUT)
+    rc, out, err = _gh(["api", *host, *args], cwd=root, token=token)
     try:
         body = json.loads(out) if out.strip() else None
     except ValueError:
@@ -1409,13 +1403,30 @@ def _edit_labels(
 ) -> dict[str, Any]:
     """Remove, then add, the PR's labels through GitHub's issue labels API.
 
-    Each request returns the PR's labels afterwards, so the last one is the
-    result; a final read supplies it when every removed label was already absent.
-    The requests share :data:`_LABEL_EDIT_SECONDS`.
+    Every ``gh`` call, including the account and host lookups, shares
+    :data:`_LABEL_REQUEST_SECONDS`; running out reports that the outcome is unknown.
+    """
+    with _gh_deadline_scope(time.monotonic() + _LABEL_REQUEST_SECONDS):
+        try:
+            return _apply_label_edit(root, reference, add=add, remove=remove)
+        except ValueError:
+            if _gh_timed_out.get():
+                raise ValueError(_LABEL_EDIT_TIMED_OUT) from None
+            raise
+
+
+def _apply_label_edit(
+    root: str, reference: PullRequestRef, *, add: Sequence[str], remove: Sequence[str]
+) -> dict[str, Any]:
+    """Make the edit's requests; each returns the PR's labels, so the last one is the result.
+
+    A final read supplies the labels when every removed label was already absent.
     """
     host = _host_args(root, reference)
     token = _pr_token(root, reference)
-    deadline = time.monotonic() + _LABEL_EDIT_SECONDS
+    if _gh_timed_out.get():
+        # The selected account's token is unknown, so the edit must not run as another.
+        raise ValueError(_LABEL_EDIT_TIMED_OUT)
     endpoint = f"repos/{reference.repository}/issues/{reference.number}/labels"
     labels: list[Any] | None = None
     for name in remove:
@@ -1424,15 +1435,12 @@ def _edit_labels(
             host,
             token,
             ["-X", "DELETE", f"{endpoint}/{quote(name, safe='')}"],
-            deadline=deadline,
             missing_ok=True,
         )
         labels = removed if removed is not None else labels
     if add:
         fields = [arg for name in add for arg in ("-f", f"labels[]={name}")]
-        labels = _labels_api(
-            root, host, token, ["-X", "POST", endpoint, *fields], deadline=deadline
-        )
+        labels = _labels_api(root, host, token, ["-X", "POST", endpoint, *fields])
     if labels is None:
-        labels = _labels_api(root, host, token, [f"{endpoint}?per_page=100"], deadline=deadline)
+        labels = _labels_api(root, host, token, [f"{endpoint}?per_page=100"])
     return {"object": PR_LABELS_OBJECT, "labels": _shape_labels(labels)}
