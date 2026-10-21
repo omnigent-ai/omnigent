@@ -5125,7 +5125,8 @@ async def _auto_create_codex_terminal(
                     # `omnigent codex --model` pins the same id in the spec, so
                     # falling back to it would relaunch the unlisted model.
                     fallback_model = None
-                _codex_launch = resolve_native_codex_launch(
+                _codex_launch = await asyncio.to_thread(
+                    resolve_native_codex_launch,
                     model=fallback_model,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
