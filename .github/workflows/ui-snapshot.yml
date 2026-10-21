@@ -71,6 +71,9 @@ env:
 jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Cheap pre-flight (no container/build): does this PR touch anything that can
   # change the render? The heavy job below is `if`-gated on it, so non-UI PRs

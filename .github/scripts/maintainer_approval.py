@@ -255,7 +255,7 @@ def main() -> int:
         os.environ.get("DEPENDABOT_AUTOMERGE_MODE") == "merge"
         and (pull.get("user") or {}).get("login") == "dependabot[bot]"
     ):
-        from dependabot_automerge import evaluate
+        from dependabot_automerge import evaluate, require_current_candidate, require_reports
 
         try:
             candidate = evaluate(
@@ -263,6 +263,10 @@ def main() -> int:
                 args.pr_number,
                 os.environ.get("EXPECTED_HEAD") or pull["head"]["sha"],
             )
+            # Native auto-merge also consumes this required check. Grant the
+            # bot exception only after the worker's CI and advisory checks pass.
+            require_reports(args.repository, candidate)
+            require_current_candidate(args.repository, args.pr_number, candidate)
         except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError) as exc:
             print(f"Dependabot update requires human review: {exc}")
         else:

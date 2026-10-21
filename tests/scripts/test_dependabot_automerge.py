@@ -62,6 +62,7 @@ def api():
     }
     routes = {
         f"{PREFIX}/pulls/123": pull,
+        f"{PREFIX}/git/ref/heads/main": {"object": {"sha": BASE}},
         f"{PREFIX}/compare/{BASE}...{HEAD}": {"merge_base_commit": {"sha": BASE}},
         f"{PREFIX}/commits/{HEAD}/statuses?per_page=100&page=1": [
             {"id": 1, "context": "Merge Ready", "state": "success"}
@@ -122,12 +123,16 @@ def api():
             "web-tests.yml",
             "e2e-ui.yml",
             "docker-build.yml",
+            "windows.yml",
         ),
         start=11,
     ):
         routes[f"{PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1"] = {
             "jobs": [
-                {"name": name.replace("*", "1/1"), "conclusion": "success"}
+                {
+                    "name": name.replace("*", "runtime-core" if name == "Pytest (*)" else "1/1"),
+                    "conclusion": "success",
+                }
                 for name in workflow_jobs[workflow]
             ]
         }
@@ -135,7 +140,15 @@ def api():
             f"{PREFIX}/actions/workflows/{workflow}/runs?head_sha={HEAD}&event=pull_request&per_page=100"
         ] = {
             "workflow_runs": [
-                {"id": run_id, "head_sha": HEAD, "status": "completed", "conclusion": "success"}
+                {
+                    "id": run_id,
+                    "head_sha": HEAD,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "pull_requests": [
+                        {"number": 123, "head": {"sha": HEAD}, "base": {"sha": BASE}}
+                    ],
+                }
             ]
         }
     routes[f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"].extend(
@@ -215,7 +228,7 @@ elif args[:3] == ['api', '--method', 'POST']:
 elif args[0] == 'api':
     assert os.environ['GH_TOKEN'] == 'test-only'
     endpoint = args[1]
-    if endpoint.endswith('/artifacts/12/zip'):
+    if '/artifacts/' in endpoint and endpoint.endswith('/zip'):
         count = sum(json.loads(line) == args
                     for line in (root / 'calls.jsonl').read_text().splitlines())
         if count == 1 and 'first_artifact' in data:
@@ -223,7 +236,10 @@ elif args[0] == 'api':
             sys.exit(0)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w') as archive:
-            archive.writestr('trivy-results.json', json.dumps(data['report']))
+            artifact_id = endpoint.rsplit('/', 2)[1]
+            report = (data['report'] if artifact_id == '12'
+                      else data['artifact_reports'][artifact_id])
+            archive.writestr('trivy-results.json', json.dumps(report))
         sys.stdout.buffer.write(buf.getvalue())
     else:
         if '/check-runs?' in endpoint:
@@ -232,8 +248,13 @@ elif args[0] == 'api':
         if endpoint.endswith('/pulls/123') and 'pull_after' in data:
             count = sum(json.loads(line) == args
                         for line in (root / 'calls.jsonl').read_text().splitlines())
-            if count > 1:
+            if count > data.get('pull_after_reads', 1):
                 value = data['pull_after']
+        if endpoint.endswith('/git/ref/heads/main') and 'main_after' in data:
+            count = sum(json.loads(line) == args
+                        for line in (root / 'calls.jsonl').read_text().splitlines())
+            if count > 1:
+                value = data['main_after']
         print(json.dumps(value))
 else:
     raise AssertionError(args)
@@ -375,16 +396,26 @@ def test_merge_mode_never_falls_back_to_workflow_token(tmp_path, api):
     assert calls == []
 
 
-@pytest.mark.parametrize("change", ["head", "hold"])
-def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change):
+@pytest.mark.parametrize("change", ["head", "main", "target", "hold"])
+@pytest.mark.parametrize("entry", ["merge", "approval"])
+def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change, entry):
     api["pull_after"] = copy.deepcopy(api["routes"][f"{PREFIX}/pulls/123"])
+    api["pull_after_reads"] = 2 if entry == "approval" else 1
     if change == "head":
         api["pull_after"]["head"]["sha"] = "c" * 40
+    elif change == "main":
+        api["main_after"] = {"object": {"sha": "c" * 40}}
+    elif change == "target":
+        api["pull_after"]["base"]["ref"] = "release"
     else:
         api["pull_after"]["labels"] = [{"name": "hold-automerge"}]
-    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert process.returncode == 0, process.stderr
-    assert "human review or retry required" in process.stdout
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", sweep=entry == "merge", approval=entry == "approval"
+    )
+    assert process.returncode == (1 if entry == "approval" else 0), process.stderr
+    assert (
+        "requires human review" if entry == "approval" else "human review or retry required"
+    ) in process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
 
@@ -402,6 +433,8 @@ def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change):
 def test_real_approval_entry_point_preserves_review_unless_pilot_enabled(
     tmp_path, api, mode, fault, expected
 ):
+    # The approval gate must validate reports without waiting on itself.
+    api["routes"]["Maintainer Approval"]["check_runs"][0]["conclusion"] = "failure"
     if fault == "hold":
         api["routes"][f"{PREFIX}/pulls/123"]["labels"] = [{"name": "hold-automerge"}]
     elif fault == "ghost":
@@ -489,20 +522,25 @@ def test_ineligible_changes_keep_human_review(tmp_path, api, fault):
 
 
 @pytest.mark.parametrize(
-    "fault",
+    "entry,fault",
     [
-        "failed_scan",
-        "pending_scan",
-        "missing_scan",
-        "newer_scan",
-        "missing_inventory",
-        "wrong_inventory",
-        "severe",
-        "pending_ci",
-        "merge_blocked",
-    ],
+        (entry, fault)
+        for entry in ("merge", "approval")
+        for fault in (
+            "failed_scan",
+            "pending_scan",
+            "missing_scan",
+            "newer_scan",
+            "missing_inventory",
+            "wrong_inventory",
+            "severe",
+            "pending_ci",
+            "old_coverage",
+        )
+    ]
+    + [("merge", "merge_blocked")],
 )
-def test_no_merge_without_reports_and_required_checks(tmp_path, api, fault):
+def test_no_merge_without_reports_and_required_checks(tmp_path, api, entry, fault):
     scan = api["routes"]["Trivy CVE Scan (repository)"]
     if fault == "failed_scan":
         scan["check_runs"][0]["conclusion"] = "failure"
@@ -533,10 +571,17 @@ def test_no_merge_without_reports_and_required_checks(tmp_path, api, fault):
         api["routes"][
             f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
         ]["workflow_runs"][0]["status"] = "in_progress"
-    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert process.returncode == 0, process.stderr
+    elif fault == "old_coverage":
+        jobs = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"]
+        jobs[:] = [job for job in jobs if job["name"] != "CI coverage scope"]
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", sweep=entry == "merge", approval=entry == "approval"
+    )
+    assert process.returncode == (1 if entry == "approval" else 0), process.stderr
     assert "Merged after policy" not in process.stdout
-    assert "human review or retry required" in process.stdout
+    assert (
+        "requires human review" if entry == "approval" else "human review or retry required"
+    ) in process.stdout
     if fault != "merge_blocked":
         assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
@@ -561,6 +606,11 @@ def test_bad_candidate_does_not_stop_later_merges(tmp_path, api, fault):
     for endpoint, value in list(api["routes"].items()):
         if "/pulls/123" in endpoint:
             api["routes"][endpoint.replace("/pulls/123", "/pulls/122")] = copy.deepcopy(value)
+        if isinstance(value, dict):
+            for run in value.get("workflow_runs", []):
+                run["pull_requests"].append(
+                    {"number": 122, "head": {"sha": HEAD}, "base": {"sha": BASE}}
+                )
     if fault == "null_files":
         api["routes"][f"{PREFIX}/pulls/122/files?per_page=100&page=1"] = None
     else:
@@ -897,10 +947,14 @@ def test_scoped_dependency_ci_requires_executed_consumer_jobs(tmp_path, expanded
         ]
         api["routes"][f"{PREFIX}/actions/runs/17/jobs?per_page=100&page=1"]["jobs"] = jobs
         api["routes"]["Browser Contract UI"]["check_runs"][0]["conclusion"] = "skipped"
+        jobs.extend(
+            {"name": name, "conclusion": "success"}
+            for name in ("UI coverage scope", "E2E UI result")
+        )
         required = jobs[0]
     else:
         jobs = ci_jobs
-        required = next(job for job in jobs if job["name"] == "CI scope")
+        required = next(job for job in jobs if job["name"] == "CI coverage scope")
     if result == "missing":
         jobs.remove(required)
         if ecosystem == "cargo":
@@ -915,13 +969,13 @@ def test_scoped_dependency_ci_requires_executed_consumer_jobs(tmp_path, expanded
 
 
 @pytest.mark.parametrize("expanded_update", ["npm", "pre-commit"], indirect=True)
-def test_pre_selection_heads_can_finish_their_full_ci(tmp_path, expanded_update):
+def test_pre_selection_heads_cannot_use_old_smoke_ci(tmp_path, expanded_update):
     _ecosystem, api = expanded_update
     route = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]
-    route["jobs"] = [job for job in route["jobs"] if job["name"] != "CI scope"]
+    route["jobs"] = [job for job in route["jobs"] if job["name"] != "CI coverage scope"]
     process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
     assert process.returncode == 0, process.stderr
-    assert any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
 
 
 def test_lockfile_guards_are_in_the_required_lint_job():
@@ -966,6 +1020,10 @@ def evaluate_fixture(policy_module, expanded_update, monkeypatch):
         ("1.2.3", "2.0.0", True, False),
         ("1.2.3", "1.2.4rc1", True, False),
         ("1.2.3", "1.2.2", True, False),
+        ("1.2.3", "1.2.3.0", True, False),
+        ("1.2.3", "1.2.3.1", True, True),
+        ("1!2.0", "1!2.1", True, False),
+        ("1.2.3", "1.2.4+local", True, False),
     ],
 )
 def test_update_policy_respects_version_boundaries(policy_module, old, new, minor, allowed):
@@ -974,6 +1032,49 @@ def test_update_policy_respects_version_boundaries(policy_module, old, new, mino
     else:
         with pytest.raises(policy_module.NeedsReview):
             policy_module.upgrade(old, new, minor)
+
+
+@pytest.mark.parametrize("expanded_update", ["npm", "cargo"], indirect=True)
+@pytest.mark.parametrize("fault", [None, "mismatch", "high"])
+def test_exact_manifest_pins_use_production_worker(tmp_path, expanded_update, fault):
+    ecosystem, api = expanded_update
+    if ecosystem == "npm":
+        for path in ("web/package.json", "pnpm-lock.yaml"):
+            api["files"][path] = tuple(
+                text.replace("^2.1.", "2.1.") for text in api["files"][path]
+            )
+        if fault == "mismatch":
+            for path in ("web/package.json", "pnpm-lock.yaml"):
+                old, new = api["files"][path]
+                api["files"][path] = (
+                    old,
+                    new.replace("2.1.1", "2.1.2")
+                    if path.endswith("json")
+                    else new.replace("specifier: 2.1.1", "specifier: 2.1.2"),
+                )
+        set_changed_files(api, dict(api["files"]))
+    else:
+        manifest = '[dependencies]\nanyhow = "=1.0.0"\n'
+        files = dict(api["files"])
+        files["tests/codex_parity/sidecar/Cargo.toml"] = (
+            manifest,
+            manifest.replace("1.0.0", "1.0.2" if fault == "mismatch" else "1.0.1"),
+        )
+        set_changed_files(api, files)
+    if fault == "high":
+        report = api["report"]["Results"][0]
+        package = report["Packages"][0]
+        report["Vulnerabilities"].append(
+            {
+                "PkgName": package["Name"],
+                "InstalledVersion": package["Version"],
+                "Severity": "HIGH",
+                "VulnerabilityID": "pin-advisory",
+            }
+        )
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) is (fault is None), process.stdout
 
 
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
@@ -1000,7 +1101,8 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
         files["web/package.json"] = (old, new.replace("vitest", "curl attacker"))
     elif fault == "pin":
         for path in ("web/package.json", "pnpm-lock.yaml"):
-            files[path] = tuple(text.replace("^2.1.", "2.1.") for text in files[path])
+            old, new = files[path]
+            files[path] = (old, new.replace("^2.1.", "2.1."))
     elif fault in {"integrity", "source", "young"}:
         metadata = api["registry"]["https://registry.npmjs.org/clsx"]
         if fault == "young":
@@ -1101,15 +1203,58 @@ def test_action_and_hook_advisories_block_unattended_merge(tmp_path, expanded_up
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
 
-def test_policy_reads_merge_base_while_preserving_tip_race_check(tmp_path, api):
+@pytest.mark.parametrize("entry", ["merge", "approval"])
+@pytest.mark.parametrize("fresh_ci", [True, False])
+def test_live_main_ref_controls_ci_freshness_despite_stale_pr_base(tmp_path, api, entry, fresh_ci):
     tip = "c" * 40
-    api["routes"][f"{PREFIX}/pulls/123"]["base"]["sha"] = tip
+    api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
     api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
-    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert process.returncode == 0, process.stderr
-    assert calls[-1][:2] == ["pr", "merge"], process.stdout
+    if fresh_ci:
+        for response in api["routes"].values():
+            for run in response.get("workflow_runs", []) if isinstance(response, dict) else []:
+                run["pull_requests"][0]["base"]["sha"] = tip
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", sweep=entry == "merge", approval=entry == "approval"
+    )
+    assert process.returncode == (1 if entry == "approval" and not fresh_ci else 0), process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (entry == "merge" and fresh_ci)
+    if not fresh_ci:
+        assert "CI did not test the current PR head and base" in process.stdout
+    assert ["api", f"{PREFIX}/compare/{tip}...{HEAD}"] in calls
     assert ["api", f"{PREFIX}/git/trees/{tip}"] not in calls
     assert ["api", f"{PREFIX}/git/trees/{BASE}"] in calls
+
+
+@pytest.mark.parametrize("entry", ["merge", "approval"])
+@pytest.mark.parametrize("fault", ["base", "head", "number", "missing"])
+def test_required_workflow_must_test_current_head_and_base(tmp_path, api, entry, fault):
+    run = api["routes"][
+        f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+    ]["workflow_runs"][0]
+    if fault == "missing":
+        del run["pull_requests"]
+    elif fault == "number":
+        run["pull_requests"][0]["number"] = 999
+    else:
+        run["pull_requests"][0][fault]["sha"] = "c" * 40
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", sweep=entry == "merge", approval=entry == "approval"
+    )
+    assert process.returncode == (1 if entry == "approval" else 0)
+    assert "CI did not test the current PR head and base" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+def test_tested_action_pin_does_not_authorize_unmapped_workflow(tmp_path, expanded_update):
+    _, api = expanded_update
+    pair = api["files"][".github/workflows/ci.yml"]
+    set_changed_files(
+        api, {".github/workflows/ci.yml": pair, ".github/workflows/release.yml": pair}
+    )
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert "release.yml: Action changes need mapped PR CI" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
 
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
@@ -1223,7 +1368,8 @@ def test_skipped_label_run_does_not_hide_real_e2e_result(tmp_path, api, newest):
 
 
 @pytest.mark.parametrize(
-    "condition", ["eligible", "report", "held", "pending", "limit", "wrong_workflow"]
+    "condition",
+    ["eligible", "report", "held", "pending", "limit", "wrong_workflow", "reports_pending"],
 )
 def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, condition):
     check = api["routes"]["Maintainer Approval"]["check_runs"][0]
@@ -1246,6 +1392,10 @@ def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, conditio
         run["run_attempt"] = 3
     elif condition == "wrong_workflow":
         run["path"] = ".github/workflows/release.yml"
+    elif condition == "reports_pending":
+        api["routes"][
+            f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        ]["workflow_runs"][0]["status"] = "in_progress"
     process, calls = run_cli(
         tmp_path, api, mode="report" if condition == "report" else "merge", sweep=True
     )
@@ -1265,10 +1415,11 @@ def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, conditio
         assert calls[-1][:2] == ["pr", "merge"], process.stdout
 
 
+@pytest.mark.parametrize("workflow", ["ci.yml", "windows.yml"])
 @pytest.mark.parametrize("condition", ["gate", "test", "scan_red", "report", "limit"])
-def test_worker_only_recovers_ci_blocked_by_a_now_green_scan(tmp_path, api, condition):
+def test_worker_only_recovers_ci_blocked_by_a_now_green_scan(tmp_path, api, condition, workflow):
     run = api["routes"][
-        f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        f"{PREFIX}/actions/workflows/{workflow}/runs?head_sha={HEAD}&event=pull_request&per_page=100"
     ]["workflow_runs"][0]
     run.update(conclusion="failure", run_attempt=3 if condition == "limit" else 1)
     jobs = api["routes"][f"{PREFIX}/actions/runs/{run['id']}/jobs?per_page=100&page=1"]["jobs"]
@@ -1317,3 +1468,47 @@ def test_report_mode_checks_advisories_without_automatic_approval(tmp_path, api)
     assert "CVE-changed-version requires human review" in process.stdout
     assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "expanded_update,run_id,marker",
+    [
+        (ecosystem, 12, "CI coverage scope")
+        for ecosystem in ("python", "npm", "cargo", "github-actions")
+    ]
+    + [
+        ("npm", 15, "E2E coverage scope"),
+        ("npm", 16, "Web coverage scope"),
+        ("python", 17, "UI coverage scope"),
+    ],
+    indirect=["expanded_update"],
+)
+@pytest.mark.parametrize("result", ["missing", "skipped", "failure"])
+def test_full_dependency_coverage_marker_blocks_older_runs(
+    tmp_path, expanded_update, result, run_id, marker
+):
+    _ecosystem, api = expanded_update
+    jobs = api["routes"][f"{PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1"]["jobs"]
+    for job in list(jobs):
+        if job["name"] == marker:
+            if result == "missing":
+                jobs.remove(job)
+            else:
+                job["conclusion"] = result
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert not any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+    assert f"waiting for successful {marker}" in process.stdout
+
+
+@pytest.mark.parametrize("expanded_update", ["python", "github-actions"], indirect=True)
+@pytest.mark.parametrize("result", ["success", "skipped", "failure"])
+def test_dependency_automerge_requires_windows_hard_checks(tmp_path, expanded_update, result):
+    _ecosystem, api = expanded_update
+    jobs = api["routes"][f"{PREFIX}/actions/runs/19/jobs?per_page=100&page=1"]["jobs"]
+    jobs[0]["conclusion"] = result
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (result == "success"), (
+        process.stdout
+    )
