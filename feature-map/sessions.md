@@ -252,12 +252,15 @@ including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
 status and live session updates, including when the app is embedded.
 
-**Reconnect:** in a session whose agent stopped, use the reconnect affordance
-in the chat; the dialog shows the command for this situation (for example
-`omnigent host` when the host is offline, or the harness's `--resume` command
-when a local session is stranded). In the desktop app, reconnect acts directly
-for this machine; an Arca-hosted session offers an explicit **Reconnect Arca**
-action in the same dialog.
+**Reconnect:** in a session whose agent stopped, the composer is disabled and
+says "reconnect below"; the red "Host is offline — click to reconnect" pill (or
+"Agent disconnected — click to reconnect" for a stranded local session) sits
+directly under it, and the composer's host menu also offers "Reconnect host".
+The dialog shows the command for this situation (for example `omnigent host`
+when the host is offline, or the harness's `--resume` command when a local
+session is stranded). In the desktop app, reconnect acts directly for this
+machine; an Arca-hosted session offers an explicit **Reconnect Arca** action in
+the same dialog.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -533,6 +536,9 @@ plain `uv run pytest`, which starts a private server for the test.
   It covers missing and stale runner bindings, reload persistence, and retry
   without duplicate transcript input. Repeat with `--device='iPhone 13'` for
   the mobile entry point; keep browser evidence outside the checkout.
+  `tests/e2e_ui/sessions/test_session_host_offline.py::test_offline_host_composer_offers_visible_reconnect_below`
+  stops the host under an open idle session and clicks the reconnect pill below
+  the composer.
 - **`reconnect`, stopped session (own environment):**
   `tests/e2e_ui/sessions/test_sidebar_stop.py::test_stopped_session_shows_reconnect_affordance`
 - **`reconnect`, completed turn after host handoff (own environment):**
@@ -557,6 +563,8 @@ plain `uv run pytest`, which starts a private server for the test.
   including after reload. Only model replies and stale persistence are staged.
   Requires Claude Code and tmux; machine-managed Claude credentials need an
   isolated container for the local model endpoint.
+- **`reconnect`, host offline:**
+  `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_offline_host_keeps_name_and_pill_offers_reconnect_below`
 - **`stop`, `archive`, active sub-agents (own environment):**
   `tests/e2e/test_parent_stop_subagents_e2e.py::test_native_parent_teardown_preserves_child_outcome`
   drives real Claude and Codex parents, native children, a host daemon, and its

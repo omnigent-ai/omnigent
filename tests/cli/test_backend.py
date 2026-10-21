@@ -1050,6 +1050,30 @@ def test_registration_target_display_preserves_ipv6_brackets() -> None:
     assert cli._registration_target_display(record) == "http://[::1]:59999"
 
 
+def test_daemon_web_ui_url_adds_local_base_path_without_userinfo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon's web UI URL keeps the local server's base path and drops userinfo."""
+    from omnigent.host import local_server
+
+    monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: (4242, 6767))
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
+    local_record = cli._HostDaemonRecord(
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=None,
+        started_at=1_000_000,
+        host_id="host_abc",
+        resolved_server_url="http://127.0.0.1:6767",
+    )
+    remote_record = _server_record("https://synthetic-user:synthetic-secret@server.example.com")
+
+    assert cli._daemon_web_ui_url(local_record) == "http://127.0.0.1:6767/proxy/6767"
+    assert cli._daemon_web_ui_url(remote_record) == "https://server.example.com"
+
+
 def test_registration_timeout_keeps_hint_when_server_answered_then_dropped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1298,6 +1322,8 @@ def test_foreground_connect_refuses_duplicate_live_daemon(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Foreground ``host`` refuses a second live daemon for one server."""
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
@@ -1323,11 +1349,15 @@ def test_foreground_connect_refuses_duplicate_live_daemon(
     result = CliRunner().invoke(
         cli_group,
         ["host", "--server", "https://server.example.com/"],
+        standalone_mode=False,
     )
 
-    assert result.exit_code != 0
-    assert "already running for this server" in result.output
-    assert "pid=4242" in result.output
+    assert isinstance(result.exception, click.ClickException)
+    message = result.exception.format_message()
+    assert "already running for this server" in message
+    assert "pid=4242" in message
+    assert "Open the Omnigent web UI: https://server.example.com\n" in message
+    assert suppresses_recovery_hint(result.exception)
 
 
 def _patch_foreground_host_local(
@@ -1357,6 +1387,35 @@ def _patch_foreground_host_local(
         lambda: LocalServerStartup(url="http://127.0.0.1:8000", spawned=spawned),
     )
     monkeypatch.setattr("omnigent.host.connect.run_host_process", run_host_process)
+
+
+def test_foreground_connect_local_duplicate_names_running_server_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Re-running local ``host`` while a daemon serves it names the server URL to reopen."""
+
+    def _unexpected_run_host_process(server_url: str, **_kw: object) -> None:
+        raise AssertionError(f"unexpected foreground connect: {server_url}")
+
+    _patch_foreground_host_local(
+        monkeypatch, tmp_path, run_host_process=_unexpected_run_host_process, spawned=False
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: pid == 4242)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        resolved_server_url="http://127.0.0.1:8000",
+    )
+
+    result = CliRunner().invoke(cli_group, ["host"])
+
+    assert result.exit_code != 0
+    assert "already running for this server" in result.output
+    assert "http://127.0.0.1:8000" in result.output
 
 
 def test_foreground_connect_local_prompts_and_stops_server_on_yes(

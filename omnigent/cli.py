@@ -3365,26 +3365,36 @@ def _claim_foreground_daemon_record(
     if conflict is not None:
         # server_url is None in local mode; "" makes the hint say --server "".
         stop_command = _host_stop_command(conflict.server_url or "")
+        from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
         detail = (
             "A host daemon is already running for this server "
-            f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
+            f"({_describe_pid(conflict.pid)}, target={conflict.target}).\n"
         )
+        web_url = _daemon_web_ui_url(conflict)
+        if web_url is not None:
+            detail += f"Open the Omnigent web UI: {web_url}\n"
         if _pid_is_foreign(conflict.pid):
             # Another user owns the daemon: `host stop` on this account can only
             # clear the shared registry record, not signal the process — and a
             # service-managed daemon respawns. Point at remedies that work
             # instead of a stop that cannot.
-            raise click.ClickException(
+            exc = click.ClickException(
                 detail + "It is owned by another user, so it cannot be stopped from this "
                 f"account: `{stop_command}` only clears the shared registry record "
                 "(and a service-managed daemon respawns). Ask that user to stop it, "
                 "or set OMNIGENT_DATA_DIR to a directory only you use to run your "
                 "own host."
             )
-        raise click.ClickException(
-            detail + f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
-            "to stop it first."
-        )
+        else:
+            exc = click.ClickException(
+                detail + f"Run `{cli_invocation()} host status` to inspect it or "
+                f"`{stop_command}` to stop it first."
+            )
+        # The stale-host hint suggests `omnigent stop`, which would stop the very
+        # host this error points the user to.
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
     previous = _find_daemon_record(record.target)
     if (
         previous is not None
@@ -8996,21 +9006,40 @@ def _registration_target_display(record: _HostDaemonRecord) -> str:
     kept: ``ServerUrl`` strips arbitrary queries from the API base, and the
     display form only re-adds the non-secret ``?o=<workspace>`` selector.
     """
-    from urllib.parse import urlsplit, urlunsplit
-
     from omnigent.util.server_url import display_server_url
 
     base_url = _daemon_base_url(record)
-    if not base_url:
-        return "the configured server"
-    display = display_server_url(base_url)
+    display = _credential_free_url(display_server_url(base_url)) if base_url else None
+    return display or "the configured server"
+
+
+def _daemon_web_ui_url(record: _HostDaemonRecord) -> str | None:
+    """Return the credential-free browser URL of the server a daemon serves.
+
+    :param record: Daemon registry record, e.g. a live duplicate daemon.
+    :returns: The web UI URL, e.g. ``"http://127.0.0.1:6767"``, or ``None``
+        when the daemon's server URL is unknown.
+    """
+    base_url = _daemon_base_url(record)
+    return _credential_free_url(_host_web_ui_url(base_url)) if base_url else None
+
+
+def _credential_free_url(url: str) -> str | None:
+    """Return *url* without basic-auth userinfo, or ``None`` if it is no URL.
+
+    :param url: Display URL, e.g. ``"https://user:token@example.com/omnigent"``.
+    :returns: e.g. ``"https://example.com/omnigent"``, or ``None`` when *url*
+        has no scheme or host.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
     try:
-        parts = urlsplit(display)
+        parts = urlsplit(url)
         host = parts.hostname
     except ValueError:
-        return "the configured server"
+        return None
     if not parts.scheme or not host:
-        return "the configured server"
+        return None
     # Drop only the userinfo, keeping the rest of the authority verbatim so
     # an IPv6 literal retains its brackets (``http://[::1]:6767``).
     netloc = parts.netloc.rpartition("@")[2]
@@ -9115,6 +9144,22 @@ def _maybe_open_host_web_ui(
     if _resolve_auto_open_conversation_setting(cfg) is False:
         return
     from omnigent.conversation_browser import open_conversation_url
+
+    web_url = _host_web_ui_url(server_url)
+    try:
+        opened = open_conversation_url(web_url)
+    except OSError:
+        opened = False
+    if not opened:
+        click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
+
+
+def _host_web_ui_url(server_url: str) -> str:
+    """Return the browser URL of the web UI served at *server_url*.
+
+    :param server_url: Server API base, e.g. ``"http://127.0.0.1:6767"``.
+    :returns: The display URL, e.g. ``"http://127.0.0.1:6767/proxy/6767"``.
+    """
     from omnigent.host.local_server import local_server_base_path
     from omnigent.util.server_url import display_server_url
 
@@ -9123,14 +9168,7 @@ def _maybe_open_host_web_ui(
     # opening the bare root renders blank (BrowserRouter basename mismatch).
     # No-op for a remote --server or an unconfigured/root local server.
     base_path = local_server_base_path(server_url)
-    if base_path:
-        web_url = web_url.rstrip("/") + base_path
-    try:
-        opened = open_conversation_url(web_url)
-    except OSError:
-        opened = False
-    if not opened:
-        click.echo(f"Open the Omnigent web UI: {web_url}", err=True)
+    return web_url.rstrip("/") + base_path if base_path else web_url
 
 
 def _run_background_host(

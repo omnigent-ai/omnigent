@@ -77,18 +77,18 @@ describe("ConnectionIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders nothing for a non-terminal-first host_offline session (badge owns the affordance)", () => {
-    // WHY: the reconnect prompt for host_offline moved up into the composer's
-    // host badge (ComposerStatusLine), where the host is already named — so
-    // this band suppresses itself for a non-terminal-first session. The badge
-    // renders the clickable "Host is offline — click to reconnect" instead.
-    const { container } = render(
+  it("renders the host-offline reconnect pill for a non-terminal-first session", () => {
+    // WHY: the disabled composer says "reconnect below"; with an icon-only
+    // composer host trigger, this pill is the legible affordance it points at.
+    render(
       <ConnectionIndicator
         liveness={{ kind: "host_offline", isOwner: true }}
         onShowReconnectHelp={onShowReconnectHelp}
       />,
     );
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.getByTestId("disconnected-indicator")).toHaveTextContent(
+      /Host is offline — click to reconnect/,
+    );
   });
 
   it("shows agent-disconnected copy for a local-stranded runner", () => {

@@ -14,7 +14,7 @@ from playwright.sync_api import Page, expect
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.native_session import NativeHarness, create_native_session
-from tests._helpers.server_runner import server_runner
+from tests._helpers.server_runner import ServerRunner, server_runner
 
 
 def _wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None:
@@ -24,6 +24,60 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None
             return
         time.sleep(0.2)
     raise AssertionError(f"condition was not met within {timeout}s")
+
+
+def _list_hosts(client: httpx.Client) -> list[dict]:
+    response = client.get("/v1/hosts")
+    response.raise_for_status()
+    return response.json()["hosts"]
+
+
+def _start_host_bound_session(
+    stack: ServerRunner, client: httpx.Client, mock_llm_server_url: str, harness: NativeHarness
+) -> tuple[str, str, str]:
+    stack.start_host(
+        env={
+            "OMNIGENT_RUNNER_ZYGOTE": "0",
+            "OPENAI_API_KEY": "mock-key",
+            "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+            "ANTHROPIC_API_KEY": "mock-key",
+            "ANTHROPIC_BASE_URL": mock_llm_server_url,
+            "CODEX_HOME": str(stack.runner_home / ".codex"),
+        }
+    )
+    _wait_until(lambda: any(host["status"] == "online" for host in _list_hosts(client)))
+    [host] = [host for host in _list_hosts(client) if host["status"] == "online"]
+    host_id = host["host_id"]
+    created = create_native_session(
+        client,
+        stack.base_url,
+        harness=harness,
+        metadata={"host_id": host_id, "workspace": str(stack.workspace)},
+    )
+    session_id = created["session_id"]
+    snapshot = client.get(f"/v1/sessions/{session_id}").json()
+    runner_id = snapshot["runner_id"]
+    assert runner_id is not None
+    assert snapshot["host_id"] == host_id
+    return host_id, session_id, runner_id
+
+
+def _stop_host_daemon(
+    stack: ServerRunner, client: httpx.Client, host_id: str, runner_id: str
+) -> None:
+    # Stop the daemon first so no runner-exit report overrides the host cause.
+    assert stack.host is not None
+    stack.host.kill()
+    stack.host.wait(timeout=10.0)
+    _, survivors = reap_leaked_omnigent_processes(stack.runner_home / ".omnigent", timeout=2.0)
+    assert not survivors
+    _wait_until(
+        lambda: any(
+            host["host_id"] == host_id and host["status"] == "offline"
+            for host in _list_hosts(client)
+        )
+    )
+    _wait_until(lambda: client.get(f"/v1/runners/{runner_id}/status").json()["online"] is False)
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
@@ -80,51 +134,10 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
         server_runner(tmp_path, server_bootstrap=server_bootstrap) as stack,
         httpx.Client(base_url=stack.base_url, timeout=100.0, trust_env=False) as client,
     ):
-        stack.start_host(
-            env={
-                "OMNIGENT_RUNNER_ZYGOTE": "0",
-                "OPENAI_API_KEY": "mock-key",
-                "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
-                "ANTHROPIC_API_KEY": "mock-key",
-                "ANTHROPIC_BASE_URL": mock_llm_server_url,
-                "CODEX_HOME": str(stack.runner_home / ".codex"),
-            }
+        host_id, session_id, runner_id = _start_host_bound_session(
+            stack, client, mock_llm_server_url, harness
         )
-
-        def hosts() -> list[dict]:
-            response = client.get("/v1/hosts")
-            response.raise_for_status()
-            return response.json()["hosts"]
-
-        _wait_until(lambda: any(host["status"] == "online" for host in hosts()))
-        [host] = [host for host in hosts() if host["status"] == "online"]
-        host_id = host["host_id"]
-        created = create_native_session(
-            client,
-            stack.base_url,
-            harness=harness,
-            metadata={"host_id": host_id, "workspace": str(stack.workspace)},
-        )
-        session_id = created["session_id"]
-        snapshot = client.get(f"/v1/sessions/{session_id}").json()
-        runner_id = snapshot["runner_id"]
-        assert runner_id is not None
-        assert snapshot["host_id"] == host_id
-
-        # Stop the daemon first so no runner-exit report overrides the host cause.
-        assert stack.host is not None
-        stack.host.kill()
-        stack.host.wait(timeout=10.0)
-        _, survivors = reap_leaked_omnigent_processes(stack.runner_home / ".omnigent", timeout=2.0)
-        assert not survivors
-        _wait_until(
-            lambda: any(
-                host["host_id"] == host_id and host["status"] == "offline" for host in hosts()
-            )
-        )
-        _wait_until(
-            lambda: client.get(f"/v1/runners/{runner_id}/status").json()["online"] is False
-        )
+        _stop_host_daemon(stack, client, host_id, runner_id)
         if not runner_bound:
             cleared = client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
             cleared.raise_for_status()
@@ -211,3 +224,42 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
         expect(pill).to_be_visible()
         after_retry = client.get(f"/v1/sessions/{session_id}/items").json()["data"]
         assert [item["id"] for item in after_retry] == [item["id"] for item in items]
+
+
+_OFFLINE_PLACEHOLDER = "Session offline — reconnect below to continue"
+
+
+def test_offline_host_composer_offers_visible_reconnect_below(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> None:
+    """When an open session's host drops, the composer's "reconnect below" has a control below."""
+    with (
+        server_runner(tmp_path) as stack,
+        httpx.Client(base_url=stack.base_url, timeout=100.0, trust_env=False) as client,
+    ):
+        host_id, session_id, runner_id = _start_host_bound_session(
+            stack, client, mock_llm_server_url, "claude"
+        )
+        page: Page = request.getfixturevalue("page")
+        page.goto(f"{stack.base_url}/c/{session_id}")
+        composer = page.get_by_label("Message the agent")
+        expect(composer).to_be_enabled(timeout=60_000)
+        expect(composer).not_to_have_attribute("placeholder", _OFFLINE_PLACEHOLDER)
+
+        _stop_host_daemon(stack, client, host_id, runner_id)
+        expect(composer).to_have_attribute("placeholder", _OFFLINE_PLACEHOLDER, timeout=60_000)
+        expect(composer).to_be_disabled()
+
+        pill = page.get_by_test_id("disconnected-indicator")
+        expect(pill).to_have_text("Host is offline — click to reconnect")
+        pill_box, composer_box = pill.bounding_box(), composer.bounding_box()
+        assert pill_box is not None and composer_box is not None, (pill_box, composer_box)
+        composer_bottom = composer_box["y"] + composer_box["height"]
+        assert pill_box["y"] >= composer_bottom, (pill_box, composer_box)
+
+        pill.click()
+        expect(page.get_by_test_id("reconnect-session-dialog")).to_be_visible()
+        expect(page.get_by_test_id("reconnect-session-command")).to_contain_text("omnigent host")
