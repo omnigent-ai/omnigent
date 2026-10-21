@@ -11,13 +11,16 @@ REQUIRED=(
   "Pre-commit checks"
   "Docker build"
   "Web scope"
+  "Web coverage scope"
   "Web result"
   "Docker scope"
   "Docker result"
   "Build unsigned AAB"
   "CI scope"
+  "CI coverage scope"
   "CI result"
   "UI scope"
+  "UI coverage scope"
   "E2E UI result"
   "Rust tests (omnidev)"
   "Pytest (codex-parity)"
@@ -65,13 +68,16 @@ REQUIRED=(
 ALLOW_SKIP=(
   "Docker build"
   "Web scope"
+  "Web coverage scope"
   "Web result"
   "Docker scope"
   "Docker result"
   "Build unsigned AAB"
   "CI scope"
+  "CI coverage scope"
   "CI result"
   "UI scope"
+  "UI coverage scope"
   "E2E UI result"
   "Rust tests (omnidev)"
   "Pytest (codex-parity)"
@@ -130,10 +136,10 @@ is_allow_skip() {
 # selection job is present. An explicit skipped result is never green.
 scope_for_result() {
   case "$1" in
-    "Web result") echo "Web scope" ;;
+    "Web result") echo "Web scope,Web coverage scope" ;;
     "Docker result") echo "Docker scope" ;;
-    "CI result") echo "CI scope" ;;
-    "E2E UI result") echo "UI scope" ;;
+    "CI result") echo "CI scope,CI coverage scope" ;;
+    "E2E UI result") echo "UI scope,UI coverage scope" ;;
     *) echo "" ;;
   esac
 }
@@ -144,11 +150,11 @@ scope_for_result() {
 # workflow is still queued or re-running.
 workflow_for() {
   case "$1" in
-    "Web scope"|"Web result") echo "web Tests" ;;
+    "Web scope"|"Web coverage scope"|"Web result") echo "web Tests" ;;
     "Build unsigned AAB") echo "Android Bundle" ;;
     "Docker scope"|"Docker result"|"Docker build")          echo "Docker build" ;;
-    "CI scope"|"CI result"|"Rust tests (omnidev)") echo "CI" ;;
-    "UI scope"|"E2E UI result") echo "E2E UI Tests" ;;
+    "CI scope"|"CI coverage scope"|"CI result"|"Rust tests (omnidev)") echo "CI" ;;
+    "UI scope"|"UI coverage scope"|"E2E UI result") echo "E2E UI Tests" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;

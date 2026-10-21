@@ -2051,6 +2051,18 @@ class SandboxStatus(BaseModel):
     provider: str | None = None
 
 
+class NativeUsageBaseline(BaseModel):
+    """Own-session cumulative tokens for resuming a native usage reporter.
+
+    Excludes spawned sessions. Input includes cache reads, matching the native
+    usage event contract rather than the display's separate token buckets.
+    """
+
+    cumulative_input_tokens: int = Field(default=0, ge=0)
+    cumulative_output_tokens: int = Field(default=0, ge=0)
+    cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
+
+
 class ModelUsage(BaseModel):
     """
     Cumulative token/cost usage attributed to a single LLM model.
@@ -2275,6 +2287,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
+    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
+        descendants. Available even when display usage aggregation is skipped;
+        ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2402,6 +2417,7 @@ class SessionResponse(BaseModel):
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
+    native_usage_baseline: NativeUsageBaseline | None = None
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None

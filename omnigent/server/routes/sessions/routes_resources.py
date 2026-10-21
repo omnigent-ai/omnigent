@@ -11,7 +11,7 @@ import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import httpx
 from fastapi import (
@@ -81,6 +81,7 @@ from omnigent.server.routes._sessions.helpers import (
     _await_settled_managed_launch,
     _enforce_filesystem_attachment_policy,
     _file_content_etag,
+    _filesystem_attachment_policy,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
     _load_agent_spec_for_session,
@@ -108,6 +109,9 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 
 class _RunnerStreamResponse(StreamingResponse):
@@ -171,6 +175,23 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachmentPolicy) -> str:
+    """Explain a refused upload in terms of the types this server accepts."""
+    from omnigent.inner.native_attachments import DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+
+    detail = (
+        f"Unsupported attachment type '{content_type}'. Attach images, PDF, or text/code files"
+    )
+    if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
+        return (
+            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+        )
+    if policy.extensions:
+        extensions = ", ".join(sorted(policy.extensions))
+        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+    return f"{detail}."
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -187,7 +208,7 @@ def register_resources_routes(
     """Register the resources routes on router."""
 
     async def _require_filesystem_attachment_support(
-        request: Request, conv: Conversation, filename: str
+        request: Request, conv: Conversation, filename: str, capability: str
     ) -> None:
         await _require_filesystem_attachment_harness(conv, filename)
         tracker = getattr(request.app.state, "managed_launches", None)
@@ -228,6 +249,7 @@ def register_resources_routes(
             host_registry=host_registry,
             tunnel_registry=tunnel_registry,
             runner_router=runner_router,
+            capability=capability,
         )
 
     @router.get(
@@ -1772,12 +1794,18 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            DELIVERY_KEY,
+            FILESYSTEM_DELIVERY,
+            filesystem_attachment_capability,
+            requires_filesystem,
+        )
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
             ImageCompressionError,
             _resolve_content_type,
+            attachment_delivery,
             attachment_text_type_for_extension,
             attachment_upload_limit,
             compress_image_attachment,
@@ -1790,17 +1818,26 @@ def register_resources_routes(
             file.content_type,
             file.filename,
         )
-        # Check the filename first so a misleading MIME cannot skip the
-        # harness requirement or the quotas for files that need local tools.
-        filesystem_required = requires_filesystem(file.filename)
-        if filesystem_required:
-            # Drop the declared type so the file is never stored as text.
+        # Listed extensions are checked by name first so a misleading MIME cannot
+        # skip the harness requirement or the quotas for files that need local tools.
+        policy = _filesystem_attachment_policy(request.app.state)
+        delivery = attachment_delivery(file.filename, file.content_type, policy)
+        filesystem_required = delivery == "filesystem"
+        if filesystem_required or requires_filesystem(file.filename):
+            # Drop the declared type so the file is never stored as text, even
+            # when the policy leaves its extension out.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
+        if filesystem_required:
             if initial_input:
                 # The host does not exist yet; dispatch validates its runtime after provisioning.
                 await _require_filesystem_attachment_harness(conv, file.filename)
             else:
-                await _require_filesystem_attachment_support(request, conv, file.filename)
+                await _require_filesystem_attachment_support(
+                    request,
+                    conv,
+                    file.filename,
+                    filesystem_attachment_capability([file.filename]),
+                )
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1829,17 +1866,14 @@ def register_resources_routes(
                 if type_limit is None:
                     raise HTTPException(
                         status_code=415,
-                        detail=(
-                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
-                            "or text/code files, or use Claude Code or Codex for archives, "
-                            "Office documents, and databases."
-                        ),
+                        detail=_unsupported_attachment_detail(content_type, policy),
                     )
                 read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
             filename = file.filename
             # Persist original dimensions only after a downscale.
             source_dims: tuple[int, int] | None = None
-            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+            # An image delivered as a file keeps its original bytes.
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES and not filesystem_required:
                 # Compressible images carry the large cap and the decode, so they are
                 # the server's peak upload memory. The body is already spooled to
                 # disk by the multipart parser, so gate the in-memory read + the
@@ -1868,14 +1902,18 @@ def register_resources_routes(
                 # PDF/text/SVG and other non-compressed types use their smaller
                 # per-type caps and aren't decoded, so they read outside the gate.
                 content = await _read_upload_capped(file, read_limit)
+            source_metadata: dict[str, Any] | None = (
+                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+            )
+            # Record the decision so delivery doesn't change if the policy does.
+            if filesystem_required:
+                source_metadata = {DELIVERY_KEY: FILESYSTEM_DELIVERY}
             stored = file_store.create(
                 session_id=session_id,
                 filename=filename,
                 bytes=len(content),
                 content_type=content_type,
-                source_metadata=(
-                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
-                ),
+                source_metadata=source_metadata,
             )
             try:
                 artifact_store.put(stored.id, content)
@@ -2177,16 +2215,23 @@ def register_resources_routes(
 
         # Files requiring filesystem tools entering a session pass the same checks as an upload,
         # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            filesystem_attachment_capability,
+            uses_filesystem_delivery,
+        )
 
         filesystem_sources = [
             stored
             for stored in sources
-            if stored.filename and requires_filesystem(stored.filename)
+            if stored.filename
+            and uses_filesystem_delivery(stored.filename, stored.source_metadata)
         ]
         if filesystem_sources:
             await _require_filesystem_attachment_support(
-                request, conv, filesystem_sources[0].filename or ""
+                request,
+                conv,
+                filesystem_sources[0].filename or "",
+                filesystem_attachment_capability(stored.filename for stored in filesystem_sources),
             )
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()

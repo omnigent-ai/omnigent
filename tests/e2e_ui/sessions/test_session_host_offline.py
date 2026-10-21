@@ -152,9 +152,15 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
         expected_waits.append(("host_reconnect", expected_host_grace_s))
         observed = [json.loads(line) for line in wait_trace.read_text().splitlines()]
         assert [(wait["name"], wait["timeout_s"]) for wait in observed] == expected_waits
-        assert all(wait["elapsed_s"] >= wait["timeout_s"] for wait in observed), observed
+        # Allow millisecond timer rounding when comparing expiry with monotonic time.
+        timer_tolerance_s = 0.01
+        assert all(
+            wait["elapsed_s"] >= wait["timeout_s"] - timer_tolerance_s for wait in observed
+        ), observed
         assert all(not wait["connected"] for wait in observed), observed
-        assert sum(timeout for _, timeout in expected_waits) <= elapsed < 90.0
+        minimum_elapsed = sum(timeout for _, timeout in expected_waits)
+        minimum_elapsed -= timer_tolerance_s * len(expected_waits)
+        assert minimum_elapsed <= elapsed < 90.0
 
         items = client.get(f"/v1/sessions/{session_id}/items").json()["data"]
         errors = [item for item in items if item["type"] == "error"]

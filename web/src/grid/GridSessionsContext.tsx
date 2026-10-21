@@ -9,6 +9,9 @@ import {
 } from "react";
 import { toast } from "sonner";
 import { useIdentityReady, useViewerId } from "@/hooks/useViewerId";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -28,6 +31,7 @@ import {
 
 interface GridSessionsContextValue {
   enabled: boolean;
+  desktop: boolean;
   identityReady: boolean;
   grids: SessionGrid[];
   activeGrid?: SessionGrid;
@@ -49,6 +53,9 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
 }
 
 function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
+  const mobileViewport = useIsMobileViewport();
+  const coarsePointer = useIsCoarsePointer();
+  const desktop = !mobileViewport && !coarsePointer && !isIOSShell() && !isAndroidShell();
   const viewerId = useViewerId();
   const identityReady = useIdentityReady();
   const { conversationId: routeConversationId, gridId } = useParams<{
@@ -58,7 +65,7 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   const conversationId = isTempConvId(routeConversationId) ? undefined : routeConversationId;
   const navigate = useNavigate();
   const storageKey =
-    viewerId === null
+    viewerId === null || !desktop
       ? null
       : `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:${viewerId}`;
   const read = useCallback(() => {
@@ -100,6 +107,7 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
     };
     return {
       enabled: storageKey !== null,
+      desktop,
       identityReady,
       grids,
       activeGrid,
@@ -141,7 +149,7 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
           save(grids.map((grid) => (grid.id === id ? { ...grid, name: trimmed } : grid)));
       },
     };
-  }, [grids, activeGrid, conversationId, gridId, navigate, storageKey, identityReady]);
+  }, [grids, activeGrid, conversationId, gridId, navigate, storageKey, identityReady, desktop]);
   return <GridSessionsContext.Provider value={value}>{children}</GridSessionsContext.Provider>;
 }
 

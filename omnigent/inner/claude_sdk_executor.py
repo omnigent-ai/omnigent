@@ -1608,6 +1608,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        system_prompt_preset: str | None = None,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1620,6 +1621,8 @@ class ClaudeSDKExecutor(Executor):
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
+            system_prompt_preset: Set to ``claude_code`` to append agent
+                instructions to Claude Code's prompt. Unset preserves the custom prompt.
             permission_mode: SDK permission mode (default: auto
                 so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
@@ -1691,6 +1694,9 @@ class ClaudeSDKExecutor(Executor):
                 f"Databricks provider with `{cli_invocation()} setup`, to route through "
                 "the Databricks Anthropic gateway."
             )
+        if system_prompt_preset not in (None, "claude_code"):
+            raise ValueError("system_prompt_preset must be 'claude_code' or unset")
+        self._system_prompt_preset = system_prompt_preset
         self._cwd = cwd
         self._os_env_spec = os_env
         self._os_env = os_env is not None
@@ -2705,6 +2711,12 @@ class ClaudeSDKExecutor(Executor):
             "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
+        if self._system_prompt_preset == "claude_code":
+            options_kwargs["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": system_prompt,
+            }
         # Only forward ``setting_sources`` when explicitly set.
         # ``None`` lets the SDK apply its default
         # (``["user", "project"]`` when ``skills`` is non-None).
@@ -2768,12 +2780,14 @@ class ClaudeSDKExecutor(Executor):
 
         # Log the full configuration for debugging
         logger.info(
-            "ClaudeSDKExecutor: model=%s, gateway=%s, base_url=%s, tools=%d, thinking=%r",
+            "ClaudeSDKExecutor: model=%s, gateway=%s, base_url=%s, tools=%d, thinking=%r, "
+            "system_prompt_preset=%s",
             model or "(default)",
             self._gateway,
             env.get("ANTHROPIC_BASE_URL", "(not set)"),
             len(tools),
             options_kwargs.get("thinking"),
+            self._system_prompt_preset or "custom",
         )
 
         # Run the query, streaming events as they arrive.

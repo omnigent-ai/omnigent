@@ -11,7 +11,7 @@ description: >
 
 inputs:
   dependency_smoke:
-    description: Run the existing cross-component compatibility smoke suite.
+    description: Deprecated; removal in 0.21.0. Run compatibility smoke only.
     required: false
     default: "false"
   shard_id:
@@ -87,7 +87,7 @@ runs:
 
     - name: Install project and test dependencies
       shell: bash
-      run: uv sync --locked --extra all --extra openshell --group test
+      run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
     - name: Install system dependencies
       # bubblewrap backs the linux_bwrap sandbox. Ubuntu 24.04 restricts

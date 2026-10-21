@@ -19,8 +19,8 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
-- `rename`: from the row, the header menu, or the header title; long titles are
-  limited.
+- `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
+  on desktop; long titles are limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -133,15 +133,26 @@ the header menu), and each place is a separate entry point.
 
 ## How to get to it (user POV)
 
-**Session grids:** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+**Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript and composer; one shared Workspace panel follows the active cell. Open the session full screen
+transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
+each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
+only the active cell. Choices survive reloads and follow the session into full
+screen; drafts and terminal connections survive view changes. Shared-session
+terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
-their `/grid/<id>` URL on the same browser. Double-click a grid title or use
+their `/grid/<id>` URL on the same desktop browser. All sessions in the open grid
+are highlighted in the sidebar. Mobile-width viewports, touch-primary devices, and
+the iOS/Android apps hide grid menus and saved entries; grid URLs show a desktop-only
+message without changing saved grids. Narrowing an open grid unmounts its cells
+and disconnects terminal views; widening it restores the saved layout and reconnects.
+The coarse-primary-pointer check also blocks tablets with attached keyboards;
+touch-capable desktops whose primary pointer is fine remain eligible.
+Double-click a grid title or use
 its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
@@ -182,6 +193,12 @@ pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions.
+
+**Rename shortcut:** in an owner-managed top-level session on desktop, press
+Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
+The header title becomes an input with its text selected. Enter or blur saves;
+Escape cancels. The shortcut leaves terminals, code editors, and open menus or
+dialogs alone. It is listed in Keyboard shortcuts and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -338,17 +355,17 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
+  per-cell terminal input, switching without reattaching, active-cell shortcuts,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar
-  reopening/deletion, titlebar rearrangement and cancellation, narrow-view
-  workspaces, identity recovery, and missing/disabled grid routes. With the flag absent or false,
+  reopening/deletion, highlighting all grid members, titlebar rearrangement and cancellation,
+  mobile and tablet entry-point gating (including resize and reload), identity recovery, and missing/disabled grid routes. With the flag absent or false,
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
   `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
-  `grid_sessions_display_ui` on the isolated server. Also check a collapsed
-  sidebar and narrow viewport manually.
+  `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
@@ -363,6 +380,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
+  The desktop shortcut, including draft preservation, cancellation, and reload:
+  `tests/e2e_ui/sessions/test_header_session_menu.py::test_rename_hotkey_from_composer_persists_and_cancels`.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`

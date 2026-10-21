@@ -374,11 +374,19 @@ export function GridWorkspace({
         className="relative flex min-h-0 min-w-0 flex-1"
         onDragOver={preventLinkDrop}
         onDropCapture={preventLinkDrop}
-        data-grid-session={grids.conversationId}
+        data-grid-session={grids.enabled ? grids.conversationId : undefined}
       >
         {content}
       </div>
     );
+  const loading = grids.desktop && !grids.enabled && !grids.identityReady;
+  const canReload = grids.desktop && !grids.enabled && grids.identityReady;
+  let message = "Grids are available on desktop only. Open a session from the sidebar.";
+  if (loading) message = "Waiting for your account identity.";
+  else if (canReload) message = "Your account identity is unavailable. Reload to retry.";
+  else if (grids.desktop)
+    message =
+      "This grid isn’t saved on this device. Open a session and drag another session into it to create a grid.";
   return (
     <section
       className="flex min-h-0 min-w-0 flex-1 flex-col pt-[var(--mac-titlebar-height,0px)]"
@@ -397,17 +405,9 @@ export function GridWorkspace({
               componentId="grid.open_sidebar"
             />
           )}
-          <h1>{!grids.enabled && !grids.identityReady ? "Loading grid…" : "Grid unavailable"}</h1>
-          <p>
-            {grids.enabled
-              ? "This grid isn’t saved on this device. Open a session and drag another session into it to create a grid."
-              : grids.identityReady
-                ? "Your account identity is unavailable. Reload to retry."
-                : "Waiting for your account identity."}
-          </p>
-          {!grids.enabled && grids.identityReady && (
-            <Button onClick={() => window.location.reload()}>Reload</Button>
-          )}
+          <h1>{loading ? "Loading grid…" : "Grid unavailable"}</h1>
+          <p>{message}</p>
+          {canReload && <Button onClick={() => window.location.reload()}>Reload</Button>}
           <Button asChild variant="outline">
             <Link to="/">Back to sessions</Link>
           </Button>

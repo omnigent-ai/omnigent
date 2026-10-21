@@ -27,6 +27,8 @@ import {
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import {
@@ -4528,6 +4530,26 @@ describe("Composer file-attachment focus", () => {
     if (!el) throw new Error("file input not found");
     return el;
   }
+
+  it("offers and accepts any file when the server delivers all types as files", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachments: { extensions: [".zip"], all_types: true },
+        }}
+      >
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    expect(fileInput().hasAttribute("accept")).toBe(false);
+
+    const trace = new File([new Uint8Array(4)], "trace.gz", { type: "application/gzip" });
+    fireEvent.change(fileInput(), { target: { files: [trace] } });
+
+    expect(screen.getByText("trace.gz")).toBeTruthy();
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
 
   it("focuses the textarea after a file is attached", () => {
     render(<Composer {...composerProps()} />);
