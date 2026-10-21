@@ -1462,6 +1462,23 @@ def register_resource_routes(
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
         return await _github_call(session_id, "disable_pr_auto_merge", pr_url=body["pr_url"])
 
+    @app.get("/v1/sessions/{session_id}/resources/github/reviewers")
+    async def read_github_reviewers(session_id: str, pr_url: str | None = None) -> JSONResponse:
+        return await _github_call(session_id, "pr_review_candidates", pr_url=pr_url)
+
+    @app.post("/v1/sessions/{session_id}/resources/github/reviewers")
+    async def update_github_reviewers_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "update_pr_reviewers",
+            pr_url=body["pr_url"],
+            add=body.get("add", []),
+            remove=body.get("remove", []),
+        )
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"

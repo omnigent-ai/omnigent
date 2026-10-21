@@ -652,3 +652,16 @@ class WorkspaceReader:
                 pr_url=pr_url,
             ),
         )
+
+    def github_reviewers(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The users and teams a review of the selected PR can be requested from."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_candidates(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )

@@ -9357,6 +9357,75 @@ def test_github_merge_ops_are_served_on_host(
     assert calls[1][-3:] == ["--rebase", "--match-head-commit", "a" * 40]
 
 
+def test_github_reviewer_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host lists review candidates and requests reviews when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    calls: list[list[str]] = []
+    users = {"nodes": [{"login": "octocat", "name": ""}], "pageInfo": {"hasNextPage": False}}
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        if argv[:2] == ["api", "graphql"]:
+            return 0, json.dumps({"data": {"repository": {"assignableUsers": users}}}), ""
+        if argv[:2] == ["pr", "view"]:
+            requests = [{"__typename": "User", "login": "octocat"}]
+            return 0, json.dumps({"reviewRequests": requests, "latestReviews": []}), ""
+        return 0, "[]", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    octocat = {"login": "octocat", "kind": "user"}
+    try:
+        listed = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="reviewers",
+                op="github_reviewers",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url},
+            )
+        )
+        edited = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="reviewers-update",
+                op="github_reviewers_update",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "add": [octocat], "session_id": "untrusted"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert listed.status == "ok", listed
+    assert listed.payload == {
+        "object": "list",
+        "data": [{**octocat, "name": None}],
+        "has_more": False,
+    }
+    assert edited.status == "ok", edited
+    assert edited.payload == {
+        "object": "session.github.pr_reviewers",
+        "reviewers": [{**octocat, "state": "PENDING"}],
+    }
+    assert calls[2][-3:] == [
+        "repos/example/one/pulls/42/requested_reviewers",
+        "-f",
+        "reviewers[]=octocat",
+    ]
+
+
 def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

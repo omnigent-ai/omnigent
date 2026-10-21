@@ -2,7 +2,7 @@
 // the `github` prefix because they are stable wire ids.
 //
 // PullRequestPanel — the right-rail "Pull Requests" tab: the session branch's PR
-// (number, title, state, CI summary, labels, link out) and the branch-vs-base diff.
+// (number, title, state, CI summary, reviewers, labels, link out) and the branch-vs-base diff.
 // Provider-visible text comes from lib/gitProviders.ts.
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll
@@ -44,7 +44,6 @@ import {
   GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
-  MessageCircleIcon,
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
@@ -97,10 +96,10 @@ import {
   type PullRequestChecks,
   type PullRequestComment,
   type PullRequestInfo,
-  type PullRequestReviewer,
 } from "@/hooks/usePullRequests";
 import { PullRequestLabels } from "./PullRequestLabels";
 import { PullRequestMerge } from "./PullRequestMerge";
+import { PullRequestReviewers } from "./PullRequestReviewers";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -614,37 +613,6 @@ function CheckPill({
 // ── Summary and Comments tabs ────────────────────────────────────────────
 // Reviewer assignments, CI checks, the PR description, and conversation comments.
 
-const REVIEWER_STATE_META: Record<
-  PullRequestReviewer["state"],
-  { label: string; className: string; Icon: LucideIcon }
-> = {
-  PENDING: {
-    label: "Pending",
-    className: "text-amber-700 dark:text-amber-400",
-    Icon: CircleDotIcon,
-  },
-  APPROVED: {
-    label: "Approved",
-    className: "text-green-700 dark:text-green-400",
-    Icon: CircleCheckIcon,
-  },
-  COMMENTED: {
-    label: "Commented",
-    className: "text-blue-700 dark:text-blue-400",
-    Icon: MessageCircleIcon,
-  },
-  CHANGES_REQUESTED: {
-    label: "Changes requested",
-    className: "text-red-700 dark:text-red-400",
-    Icon: CircleXIcon,
-  },
-  DISMISSED: {
-    label: "Dismissed",
-    className: "text-muted-foreground",
-    Icon: AlertCircleIcon,
-  },
-};
-
 /**
  * Space colors evenly and group shared suffixes without provider-specific rules.
  * The same author set keeps its colors; adding or removing authors can shift them.
@@ -682,52 +650,6 @@ function PullRequestAuthorAvatar({
     >
       {author?.[0]?.toUpperCase() ?? "?"}
     </span>
-  );
-}
-
-/** Keep reviewer colors for review state; author colors belong in comments. */
-function PullRequestReviewerRow({ reviewer }: { reviewer: PullRequestReviewer }) {
-  const state = REVIEWER_STATE_META[reviewer.state];
-  const StateIcon = state.Icon;
-  const subject = reviewer.kind === "team" ? `Team ${reviewer.login}` : reviewer.login;
-
-  return (
-    <li
-      aria-label={`${subject}: ${state.label}`}
-      className="inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs"
-    >
-      <span className="min-w-0 truncate font-medium text-foreground">{reviewer.login}</span>
-      {reviewer.kind === "team" && <span className="shrink-0 text-muted-foreground">(team)</span>}
-      <span className={cn("inline-flex shrink-0 items-center gap-1", state.className)}>
-        <StateIcon aria-hidden className="size-3" />
-        <span>{state.label}</span>
-      </span>
-    </li>
-  );
-}
-
-/** Compact reviewer rows that keep the assignment and current review state together. */
-function PullRequestReviewers({ reviewers }: { reviewers: PullRequestReviewer[] }) {
-  const reviewerKeys = listKeys(reviewers, (reviewer) => [reviewer.login, reviewer.kind]);
-
-  return (
-    <section className="space-y-1.5" aria-labelledby="pull-request-reviewers-heading">
-      <h3
-        id="pull-request-reviewers-heading"
-        className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
-      >
-        Reviewers
-      </h3>
-      {reviewers.length === 0 ? (
-        <p className="text-ui text-muted-foreground">No reviewers assigned.</p>
-      ) : (
-        <ul className="flex flex-wrap gap-1.5">
-          {reviewers.map((reviewer, index) => (
-            <PullRequestReviewerRow key={reviewerKeys[index]} reviewer={reviewer} />
-          ))}
-        </ul>
-      )}
-    </section>
   );
 }
 
@@ -788,7 +710,7 @@ function PullRequestSummaryTab({
   checksUnavailableHint,
   body,
 }: {
-  reviewers: PullRequestReviewer[] | undefined;
+  reviewers: React.ReactNode;
   labels: React.ReactNode;
   merge: React.ReactNode;
   checks: PullRequestChecks;
@@ -797,7 +719,7 @@ function PullRequestSummaryTab({
   body: string | null | undefined;
 }) {
   const showChecks = checks.total > 0 || checks.partial || !checksSupported;
-  const showReviewers = reviewers !== undefined;
+  const showReviewers = !!reviewers;
   const showPeople = showReviewers || !!labels;
   const showStatus = showChecks || !!merge;
   return (
@@ -805,11 +727,7 @@ function PullRequestSummaryTab({
     <div>
       {showPeople && (
         <div className="flex">
-          {showReviewers && (
-            <div className="min-w-0 flex-1 p-3">
-              <PullRequestReviewers reviewers={reviewers} />
-            </div>
-          )}
+          {showReviewers && <div className="min-w-0 flex-1 p-3">{reviewers}</div>}
           {showReviewers && labels && <Separator orientation="vertical" />}
           {labels && <div className="min-w-0 flex-1 p-3">{labels}</div>}
         </div>
@@ -1781,7 +1699,17 @@ function PullRequestPanelDetails({
         {/* Summary: reviewers, CI checks, and the PR description. */}
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
           <PullRequestSummaryTab
-            reviewers={pr.reviewers}
+            reviewers={
+              pr.reviewers !== undefined && (
+                <PullRequestReviewers
+                  conversationId={conversationId}
+                  prUrl={data.selected_pr_url ?? null}
+                  reviewers={pr.reviewers}
+                  author={pr.author}
+                  editable={canEdit && !!data.capabilities.reviewer_editing}
+                />
+              )
+            }
             labels={
               pr.labels !== undefined &&
               data.selected_pr_url && (

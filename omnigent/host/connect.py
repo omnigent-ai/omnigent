@@ -3746,6 +3746,8 @@ class HostProcess:
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
             return r.github_merge_options(session_id, cast("str | None", params.get("pr_url")))
+        if op == "github_reviewers":
+            return r.github_reviewers(session_id, cast("str | None", params.get("pr_url")))
         raise ValueError(f"unknown fs op: {op!r}")
 
     def _handle_fs_write(self, frame: HostFsWriteFrame) -> HostFsResultFrame:
@@ -3853,6 +3855,14 @@ class HostProcess:
                 workspace,
                 session_id=cast("str | None", params.get("session_id")),
                 pr_url=cast("str | None", params.get("pr_url")),
+            )
+        if op == "github_reviewers_update":
+            return pr_resource.update_pr_reviewers(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                add=params.get("add", []),
+                remove=params.get("remove", []),
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 

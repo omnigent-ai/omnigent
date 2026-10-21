@@ -21,6 +21,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
+    ReviewerRef,
     gitlab_observer,
     local_git,
 )
@@ -587,6 +588,21 @@ class GitLabPullRequests:
     def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
         del root, reference
         raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
+    def review_candidates(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Editing GitLab merge request reviewers is not supported yet.")
+
+    def edit_reviewers(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[ReviewerRef],
+        remove: Sequence[ReviewerRef],
+    ) -> dict[str, Any]:
+        del root, reference, add, remove
+        raise ValueError("Editing GitLab merge request reviewers is not supported yet.")
 
 
 PULL_REQUESTS: PullRequestFacet = GitLabPullRequests()

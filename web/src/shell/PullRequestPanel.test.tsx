@@ -18,6 +18,7 @@ import type {
   PullRequestDiffResponse,
   PullRequestInfo,
   PullRequestRepoLabels,
+  PullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
@@ -57,6 +58,13 @@ const state = vi.hoisted(() => ({
     error: null as Error | null,
   },
   updateLabels: { mutate: vi.fn(), isError: false, error: null as Error | null },
+  reviewCandidates: {
+    data: undefined as PullRequestReviewCandidates | undefined,
+    isPending: true,
+    isError: false,
+    error: null as Error | null,
+  },
+  updateReviewers: { mutate: vi.fn(), isError: false, error: null as Error | null },
 }));
 
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
@@ -71,6 +79,11 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     usePullRequestMergeOptions: () => ({ data: undefined, isPending: true, isError: false }),
     useMergePullRequest: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useDisablePullRequestAutoMerge: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    applyPullRequestReviewerChange: original.applyPullRequestReviewerChange,
+    pullRequestReviewerKey: original.pullRequestReviewerKey,
+    pullRequestReviewersMutationKey: original.pullRequestReviewersMutationKey,
+    usePullRequestReviewCandidates: vi.fn(() => state.reviewCandidates),
+    useUpdatePullRequestReviewers: () => state.updateReviewers,
     usePullRequestInfo: vi.fn(() => state.info),
     usePullRequestChangedFiles: vi.fn(() => state.changes),
     usePullRequestDiff: () => ({
@@ -121,6 +134,7 @@ import {
   usePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestRepoLabels,
+  usePullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 import {
@@ -359,6 +373,73 @@ describe("PullRequestPanel", () => {
     expect(
       screen.getByRole("listitem", { name: "Team platform-team: Approved" }),
     ).toBeInTheDocument();
+  });
+
+  describe("reviewer editing", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.pr!.reviewers = [
+        { login: "alice", kind: "user", state: "PENDING" },
+        { login: "bob", kind: "user", state: "APPROVED" },
+      ];
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        reviewer_editing: true,
+      };
+    });
+
+    it("wires the rows and the picker to the selected PR", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Withdraw review request from alice" }));
+      expect(state.updateReviewers.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [],
+        remove: [{ login: "alice", kind: "user", state: "PENDING" }],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Re-request review from bob" }));
+      expect(state.updateReviewers.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [{ login: "bob", kind: "user", state: "APPROVED" }],
+        remove: [],
+      });
+      expect(usePullRequestReviewCandidates).toHaveBeenLastCalledWith("conv_1", prUrl, false);
+      fireEvent.click(screen.getByRole("button", { name: "Request reviewers" }));
+      expect(usePullRequestReviewCandidates).toHaveBeenLastCalledWith("conv_1", prUrl, true);
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without reviewer editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a host that names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("shows reviewers read-only for %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.getByRole("listitem", { name: "alice: Pending" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Request reviewers" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /review request from|review from/ })).toBeNull();
+    });
   });
 
   describe("labels", () => {
