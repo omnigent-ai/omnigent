@@ -226,7 +226,8 @@ internal class OmnigentWebViewClient(
     ) {
         super.onReceivedError(view, request, error)
         val url = request.url.toString()
-        if (!request.isForMainFrame || url != activeMainFrameUrl || url == shellStoppedUrl ||
+        if (!request.isForMainFrame || !sameMainFrameUrl(url, activeMainFrameUrl) ||
+            sameMainFrameUrl(url, shellStoppedUrl) ||
             failedNavigation || !acceptedMainFrame(url) ||
             !isConnectionError(error.errorCode, error.description.toString())
         ) {
