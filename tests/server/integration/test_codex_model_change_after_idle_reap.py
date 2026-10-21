@@ -733,6 +733,121 @@ async def test_model_change_waits_for_codex_startup(
     session.assert_applied(response)
 
 
+async def test_model_change_allows_cold_launch_before_waiting_for_bridge(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = native_session
+    await session.reap(clear_bridge=True)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_LAUNCH_TIMEOUT_S", budget(10))
+    launch = native_runtime._auto_create_codex_terminal
+    launch_started = asyncio.Event()
+    release_launch = asyncio.Event()
+    launch_cancelled = asyncio.Event()
+
+    async def delayed_launch(*args: Any, **kwargs: Any) -> SessionResourceView:
+        launch_started.set()
+        try:
+            await release_launch.wait()
+            return await launch(*args, **kwargs)
+        except asyncio.CancelledError:
+            launch_cancelled.set()
+            raise
+
+    monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", delayed_launch)
+    change = asyncio.create_task(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        )
+    )
+    try:
+        await asyncio.wait_for(launch_started.wait(), timeout=budget(2))
+        await asyncio.sleep(0.1)
+        assert not change.done(), "Bridge readiness must not cancel an in-progress cold launch"
+        assert not launch_cancelled.is_set()
+        release_launch.set()
+        response = await asyncio.wait_for(change, timeout=budget(2))
+    finally:
+        release_launch.set()
+        change.cancel()
+        await asyncio.gather(change, return_exceptions=True)
+
+    session.assert_applied(response)
+    assert session.codex.launches == 2
+
+
+@pytest.mark.parametrize("stop", ["launch-timeout", "legacy-timeout", "caller-cancel"])
+async def test_stopping_cold_settings_launch_cancels_it_and_allows_retry(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    stop: str,
+) -> None:
+    session = native_session
+    await session.reap(clear_bridge=True)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(
+        native_controls,
+        "_CODEX_SETTINGS_LAUNCH_TIMEOUT_S",
+        0.05 if stop == "launch-timeout" else budget(10),
+    )
+    launch = native_runtime._auto_create_codex_terminal
+    launch_started = asyncio.Event()
+    launch_cancelled = asyncio.Event()
+
+    async def stalled_launch(*_args: Any, **_kwargs: Any) -> SessionResourceView:
+        launch_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            launch_cancelled.set()
+        raise AssertionError("A cancelled launch cannot register a terminal")
+
+    monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", stalled_launch)
+    change = asyncio.create_task(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        )
+        if stop == "launch-timeout"
+        else session.runner.post(
+            f"/v1/sessions/{session.session_id}/events",
+            json={"type": "model_change", "model": _REQUESTED_MODEL},
+        )
+    )
+    try:
+        await asyncio.wait_for(launch_started.wait(), timeout=budget(2))
+        if stop != "caller-cancel":
+            response = await asyncio.wait_for(change, timeout=budget(2))
+            if stop == "launch-timeout":
+                _assert_codex_refusal(session, response)
+            else:
+                assert response.status_code == 503, response.text
+                assert response.json()["error"] == "codex_native_settings_update_failed"
+        else:
+            change.cancel()
+            await asyncio.gather(change, return_exceptions=True)
+            assert change.cancelled()
+        await asyncio.wait_for(launch_cancelled.wait(), timeout=budget(2))
+        assert session.terminals.get(session.session_id, "codex", "main") is None
+        assert session.session_id not in native_runtime._AUTO_CODEX_APP_SERVERS
+        assert session.codex.launches == 1
+        assert session.codex.requests == []
+    finally:
+        change.cancel()
+        await asyncio.gather(change, return_exceptions=True)
+
+    monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    assert response.status_code == 200, response.text
+    session.assert_settings(_REQUESTED_MODEL)
+    assert len(session.codex.applied_updates) == 1
+    assert session.codex.launches == 2
+
+
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
 async def test_model_change_succeeds_after_delayed_codex_startup(
     client: httpx.AsyncClient, native_session: _NativeSession

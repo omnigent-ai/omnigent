@@ -41,6 +41,9 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.harnesses.codex_native.timeouts import (
+    SETTINGS_FORWARD_TIMEOUT_SECONDS as _CODEX_SETTINGS_FORWARD_TIMEOUT_S,
+)
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -321,10 +324,6 @@ async def _wake_runner_for_model_change(
     )
     return conv
 
-
-# Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
-# mirroring/cleanup (6s) to finish before the server restores a selection.
-_CODEX_SETTINGS_FORWARD_TIMEOUT_S = 40.0
 
 _CODEX_SETTINGS_RESTORED_MESSAGE = (
     "The terminal did not apply the model and reasoning effort changes. "

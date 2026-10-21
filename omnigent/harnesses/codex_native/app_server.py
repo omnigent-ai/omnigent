@@ -78,6 +78,9 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
     codex_app_server_diagnostic_env,
     report_capture_start_failure,
 )
+from omnigent.harnesses.codex_native.timeouts import (
+    APP_SERVER_READY_TIMEOUT_SECONDS as _APP_SERVER_READY_TIMEOUT_SECONDS,
+)
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
@@ -134,10 +137,6 @@ _EFFORT_CLOSE_TIMEOUT_SECONDS = 2.0
 # Model discovery is a best-effort side process whose callers fall back to a
 # cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
-# The session app-server has no fallback, and a loaded host can take well over
-# 10 s to start codex. Match the 60 s native-terminal readiness budget; a child
-# that exits early still fails at once.
-_APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0

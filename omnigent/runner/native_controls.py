@@ -29,6 +29,12 @@ from fastapi.responses import JSONResponse, Response
 from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.harnesses.codex_native.timeouts import (
+    APP_SERVER_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
+)
+from omnigent.harnesses.codex_native.timeouts import (
+    SETTINGS_BRIDGE_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_READY_TIMEOUT_S,
+)
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
@@ -148,9 +154,6 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
-# Runtime recovery and bridge publication precede any settings RPC. Keep this
-# below the server's Codex settings forward budget, including confirmation.
-_CODEX_SETTINGS_READY_TIMEOUT_S = 15.0
 _CODEX_SETTINGS_READY_POLL_S = 0.1
 _CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
@@ -364,15 +367,13 @@ def build_native_controls(
                 _logger.warning("Could not mirror pending Codex %s in %s", key, bridge_dir)
         return pending
 
-    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
-        """Recover a reaped pane and wait for startup to publish its owned bridge."""
+    async def _wait_for_codex_bridge_for_settings(
+        conv_id: str,
+    ) -> CodexNativeBridgeState | None:
+        """Wait for a created terminal to publish its owned bridge."""
         from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         terminal_registry = resource_registry.terminal_registry
-        if terminal_registry is not None:
-            await _ensure_native_terminal_for_turn(conv_id, "codex-native")
-            if terminal_registry.get(conv_id, "codex", "main") is None:
-                return None
         state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
             conv_id, action="settings update", missing_state_log_level=logging.DEBUG
         )
@@ -386,6 +387,21 @@ def build_native_controls(
                 return state if state.session_id == conv_id else None
             await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
         return None
+
+    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
+        """Bound cold terminal creation separately from its thread-discovery wait."""
+        terminal_registry = resource_registry.terminal_registry
+        if terminal_registry is not None:
+            await asyncio.wait_for(
+                _ensure_native_terminal_for_turn(conv_id, "codex-native"),
+                timeout=_CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
+            )
+            if terminal_registry.get(conv_id, "codex", "main") is None:
+                return None
+        return await asyncio.wait_for(
+            _wait_for_codex_bridge_for_settings(conv_id),
+            timeout=_CODEX_SETTINGS_READY_TIMEOUT_S,
+        )
 
     async def _close_unreachable_owned_codex(
         conv_id: str,
@@ -455,7 +471,13 @@ def build_native_controls(
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
         if ready_deadline is None:
-            ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+            # A refused listener may recover once, sharing these phase budgets.
+            # An older server still stops waiting after its 20-second forward.
+            ready_deadline = (
+                asyncio.get_running_loop().time()
+                + _CODEX_SETTINGS_READY_TIMEOUT_S
+                + (0 if legacy_server else _CODEX_SETTINGS_LAUNCH_TIMEOUT_S)
+            )
         backend_before_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         process_before_ready = getattr(backend_before_ready, "proc", None)
         try:
