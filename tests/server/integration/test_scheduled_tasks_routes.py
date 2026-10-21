@@ -943,18 +943,57 @@ async def test_update_rejects_invalid_reasoning_effort(
     assert bad.status_code == 400, bad.text
 
 
-async def test_delete_removes_task(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_delete_removes_task(
+    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool
+) -> None:
     _make_user(db_uri)
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
     ).json()
     task_id = created["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    if claimed:
+        task = store.get(task_id)
+        from omnigent.server.scheduled.schedule import next_scheduled_time
+
+        assert store.initialize_next_run_at(task, next_scheduled_time(task, task.created_at))
+        task = store.get(task_id)
+        assert task is not None and task.next_run_at is not None
+        assert (
+            store.claim_scheduled_run(
+                task,
+                now=task.next_run_at,
+                next_run_at=task.next_run_at + 3600,
+                host_id=task.host_id,
+                lease_seconds=120,
+            )
+            is not None
+        )
 
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 404
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.json()["scheduled_tasks"] == []
+    if claimed:
+        assert store.get(task_id).state == "deleted"
+        assert len(store.list_runs(task_id)[0]) == 1
+        for method, suffix, body in [
+            ("get", "/runs", None),
+            ("post", "/run", None),
+            ("patch", "", {"state": "active"}),
+            ("delete", "", None),
+        ]:
+            response = await auth_client.request(
+                method,
+                f"/v1/scheduled-tasks/{task_id}{suffix}",
+                headers=_headers(),
+                json=body,
+            )
+            assert response.status_code == 404
 
 
 async def test_other_users_task_is_not_visible(

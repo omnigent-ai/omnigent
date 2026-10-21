@@ -347,9 +347,13 @@ def create_scheduled_tasks_router(
         )
 
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
-        return task.user_id == owner and (
-            current_account_user() is None
-            or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+        return (
+            task.state != "deleted"
+            and task.user_id == owner
+            and (
+                current_account_user() is None
+                or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+            )
         )
 
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:

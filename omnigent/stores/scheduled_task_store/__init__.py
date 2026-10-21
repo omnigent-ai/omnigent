@@ -181,6 +181,9 @@ class ScheduledTaskStore(ABC):
         """
         Delete a scheduled task. Idempotent.
 
+        Unfinished claimed runs may retain the task in the deleted state until
+        cleanup or completion finishes. Such tasks cannot be edited or fired.
+
         :param scheduled_task_id: Opaque task identifier.
         :returns: ``True`` if removed; ``False`` if not found.
         """

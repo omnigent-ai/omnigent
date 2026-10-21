@@ -1292,3 +1292,320 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
     with workspace_scope(11):
         found = store.get_running_run_by_conversation(_uid("conv_ws"))
         assert found is not None and found.id == _uid("run_ws")
+
+
+def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):
+    store.configure_dispatch(True)
+    task = store.create(
+        _uid(seed),
+        seed,
+        "prompt",
+        "FREQ=HOURLY",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+    )
+    # Discovery and claiming consume DB snapshots (Uuid16 normalizes UUIDs on read).
+    return store.get(task.id)
+
+
+def test_dispatch_claim_is_atomic_across_replicas(store: SqlAlchemyScheduledTaskStore) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    task = _due_task(store)
+    assert task is not None and task.next_run_at is not None
+    barrier = Barrier(2)
+
+    def claim():
+        replica = SqlAlchemyScheduledTaskStore(store.storage_location)
+        barrier.wait(timeout=10)
+        return replica.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id=task.host_id,
+            lease_seconds=120,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: claim(), range(2)))
+    runs = [run for run in results if run is not None]
+    assert len(runs) == 1
+    run = runs[0]
+    assert run.status == "starting"
+    assert run.trigger_key == f"schedule:{task.next_run_at}"
+    assert run.host_id == task.host_id
+    assert run.lease_expires_at == task.next_run_at + 120
+    assert store.get(task.id).next_run_at == task.next_run_at + 3600
+    assert store.list_runs(task.id)[0] == [run]
+    assert store.list_latest_run_status_for_tasks([task.id]) == {task.id: "starting"}
+
+
+@pytest.mark.parametrize(
+    "edit", [{"prompt": "new"}, {"host_id": _uid("new-host")}, {"state": "paused"}]
+)
+def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, edit: dict) -> None:
+    task = _due_task(store)
+    updated = store.update(task.id, **edit)
+    assert (
+        store.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id=task.host_id,
+            lease_seconds=120,
+        )
+        is None
+    )
+    assert store.get(task.id) == updated
+    assert store.list_runs(task.id)[0] == []
+
+
+def test_dispatch_insert_failure_rolls_back_schedule(store: SqlAlchemyScheduledTaskStore) -> None:
+    from sqlalchemy.exc import StatementError
+
+    task = _due_task(store)
+    with pytest.raises(StatementError):
+        store.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id="not-a-uuid",
+            lease_seconds=120,
+        )
+    assert store.get(task.id) == task
+    assert store.list_runs(task.id)[0] == []
+
+
+def test_dispatch_pagination_and_workspace_isolation(store: SqlAlchemyScheduledTaskStore) -> None:
+    tasks = []
+    for workspace in (31, 32, 33):
+        with workspace_scope(workspace):
+            tasks.append(_due_task(store))
+    cutoff = max(task.next_run_at for task in tasks)
+    first = store.list_due_tasks(cutoff, limit=1)[0]
+    remaining = store.list_due_tasks(
+        cutoff, after=(first.next_run_at, first.workspace_id, first.id)
+    )
+    assert {task.workspace_id for task in [first, *remaining]} == {31, 32, 33}
+    assert (
+        store.claim_scheduled_run(
+            first, now=cutoff, next_run_at=cutoff + 3600, host_id=first.host_id, lease_seconds=120
+        )
+        is None
+    )
+    with workspace_scope(first.workspace_id):
+        run = store.claim_scheduled_run(
+            first, now=cutoff, next_run_at=cutoff + 3600, host_id=first.host_id, lease_seconds=120
+        )
+    assert store.renew_starting_run(run.id, now=lambda: cutoff + 30, lease_seconds=120) is None
+    assert store.transition_starting_run(run, now=lambda: cutoff + 30, status="failed") is None
+
+
+def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    renewed = store.renew_starting_run(run.id, now=lambda: now + 30, lease_seconds=120)
+    assert renewed.lease_expires_at == now + 150
+    assert store.transition_starting_run(run, now=lambda: now + 31, status="failed") is None
+    assert store.list_expired_starting_runs(now + 120) == []
+    assert store.list_expired_starting_runs(now + 150) == [renewed]
+    assert store.renew_starting_run(run.id, now=lambda: now + 150, lease_seconds=120) == renewed
+    assert store.transition_starting_run(renewed, now=lambda: now + 150, status="running") is None
+    # A reconciler that established prompt delivery preserves the running session.
+    running = store.transition_starting_run(
+        renewed,
+        now=lambda: now + 150,
+        status="running",
+        expired=True,
+        conversation_id=_uid("session"),
+    )
+    assert running.status == "running"
+    assert running.lease_expires_at is None
+    assert store.list_expired_starting_runs(now + 300) == []
+    assert store.renew_starting_run(run.id, now=lambda: now + 300, lease_seconds=120) == running
+    assert (
+        store.transition_starting_run(
+            renewed, now=lambda: now + 300, status="failed", expired=True
+        )
+        is None
+    )
+
+
+def test_schedule_edits_and_run_now_metadata(store: SqlAlchemyScheduledTaskStore) -> None:
+    task = _due_task(store)
+    assert task.next_run_at > task.created_at
+    metadata_update = store.update(task.id, last_run_at=task.created_at + 1)
+    assert metadata_update.next_run_at == task.next_run_at
+    assert store.update(task.id, state="paused").next_run_at is None
+    assert store.update(task.id, state="active").next_run_at is not None
+    assert store.update(task.id, state="deleted").next_run_at is None
+
+
+@pytest.mark.parametrize("dispatch_enabled", [False, True])
+def test_metadata_update_does_not_calculate_null_cursor(store, monkeypatch, dispatch_enabled):
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    task = _due_task(store)
+    # A paused task has no next occurrence; neither metadata nor prompt edits
+    # should invoke recurrence search, even if the rule would exhaust its budget.
+    store.update(task.id, state="paused")
+    store.configure_dispatch(dispatch_enabled)
+
+    def unexpected_calculation(*args):
+        pytest.fail("Metadata-only writes must not calculate a schedule")
+
+    monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", unexpected_calculation)
+    updated = store.update(task.id, last_run_at=task.created_at + 1, prompt="edited")
+    assert updated.next_run_at is None
+    assert updated.last_run_at == task.created_at + 1
+    assert updated.prompt == "edited"
+
+
+def test_duplicate_occurrence_advances_cursor_without_another_run(store):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    task = _due_task(store)
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    # A clock correction followed by a schedule edit can revisit an occurrence.
+    with store._session_immediate("test_revisited_occurrence") as session:
+        session.execute(
+            update(SqlScheduledTask).where(SqlScheduledTask.id == task.id).values(next_run_at=now)
+        )
+    assert (
+        store.claim_scheduled_run(
+            store.get(task.id),
+            now=now,
+            next_run_at=now + 3600,
+            host_id=task.host_id,
+            lease_seconds=120,
+        )
+        is None
+    )
+    assert store.list_due_tasks(now) == []
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == [run]
+
+
+def test_invalid_schedule_pause_does_not_overwrite_edits_or_other_workspace(store):
+    task = _due_task(store)
+    with workspace_scope(42):
+        assert not store.pause_invalid_schedule(task)
+    store.update(task.id, rrule="FREQ=DAILY")
+    assert not store.pause_invalid_schedule(task)
+    assert store.get(task.id).state == "active"
+    assert store.get(task.id).rrule == "FREQ=DAILY"
+
+
+def test_legacy_schedule_initialization_does_not_overwrite_edit(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    task = _due_task(store)
+    with store._session_immediate("test_legacy_task") as session:
+        session.execute(
+            update(SqlScheduledTask).where(SqlScheduledTask.id == task.id).values(next_run_at=None)
+        )
+    legacy = store.get(task.id)
+    store.update(task.id, prompt="edited")
+    assert not store.initialize_next_run_at(legacy, task.next_run_at)
+    assert store.get(task.id).next_run_at is None
+    assert store.initialize_next_run_at(store.get(task.id), task.next_run_at)
+    assert not store.initialize_next_run_at(store.get(task.id), task.next_run_at)
+
+
+@pytest.mark.parametrize("finish_running_first", [False, True])
+def test_deleted_task_keeps_claims_until_last_completion(
+    store: SqlAlchemyScheduledTaskStore, finish_running_first: bool
+) -> None:
+    task = _due_task(store, "delete_claims")
+    now = task.next_run_at
+    first = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    running = store.transition_starting_run(first, now=lambda: now, status="running")
+    second = store.claim_scheduled_run(
+        store.get(task.id),
+        now=now + 3600,
+        next_run_at=now + 7200,
+        host_id=task.host_id,
+        lease_seconds=120,
+    )
+    assert store.delete(task.id)
+    assert not store.delete(task.id)
+    assert store.get(task.id).state == "deleted"
+    assert store.get(task.id).next_run_at is None
+    assert store.update(task.id, state="active") is None
+    assert store.list_due_tasks(now + 7200) == []
+    assert len(store.list_runs(task.id)[0]) == 2
+
+    def complete():
+        result = store.update_run(running.id, status="succeeded", finished_at=now + 3720)
+        assert result.status == "succeeded"
+
+    def recover():
+        result = store.transition_starting_run(
+            second, now=lambda: now + 3720, status="failed", expired=True
+        )
+        assert result.status == "failed"
+
+    first_finish, last_finish = (
+        (complete, recover) if finish_running_first else (recover, complete)
+    )
+    first_finish()
+    assert store.get(task.id).state == "deleted"
+    assert len(store.list_runs(task.id)[0]) == 1
+    last_finish()
+    assert store.get(task.id) is None
+    assert store.list_runs(task.id)[0] == []
+
+
+def test_delete_racing_claim_preserves_any_claim_that_won(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    task = _due_task(store, "delete_race")
+    barrier = Barrier(2)
+
+    def claim():
+        barrier.wait(timeout=10)
+        return store.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id=task.host_id,
+            lease_seconds=120,
+        )
+
+    def delete_task():
+        barrier.wait(timeout=10)
+        return store.delete(task.id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claiming = pool.submit(claim)
+        deleting = pool.submit(delete_task)
+        run = claiming.result(timeout=10)
+        assert deleting.result(timeout=10)
+    if run is None:
+        assert store.get(task.id) is None
+        assert store.list_runs(task.id)[0] == []
+    else:
+        assert store.get(task.id).state == "deleted"
+        assert store.list_expired_starting_runs(task.next_run_at + 120) == [run]
