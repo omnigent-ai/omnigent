@@ -1702,8 +1702,8 @@ module.exports = function (pi) {
     if (changed) await publishTaskList();
   }
 
-  // Sum usage once per assistant message; repeated events must not double-count.
-  // Restored totals cover pre-relaunch messages, and the POST key skips unchanged totals.
+  // Sum each assistant message once; restored totals cover pre-relaunch messages.
+  // The POST key skips unchanged totals.
   const countedUsageMessages = new Set();
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
@@ -1778,7 +1778,7 @@ module.exports = function (pi) {
     await postEvent(config, { type: "external_session_usage", data });
   }
 
-  // Restore the baseline after relaunch so new usage exceeds the server's prior peak.
+  // Restore cumulative totals before recording new usage after a relaunch.
   function usageStatePath() {
     if (!config || !config.bridgeDir) return null;
     return path.join(config.bridgeDir, "cumulative_usage.json");
@@ -1802,22 +1802,14 @@ module.exports = function (pi) {
       );
       fs.renameSync(tmp, statePath);
     } catch (_err) {
-      // Persistence is best-effort; remove a temp file left by a failed rename.
+      // Remove temporary state after a failed best-effort checkpoint.
       try {
         fs.unlinkSync(tmp);
       } catch (_cleanupErr) {}
     }
   }
 
-  function restoreCumulativeUsage() {
-    const statePath = usageStatePath();
-    if (!statePath) return;
-    let saved;
-    try {
-      saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    } catch (_err) {
-      return; // Fresh session or unreadable state: start the counters at 0.
-    }
+  function raiseUsageTotals(saved) {
     if (!saved || typeof saved !== "object") return;
     const input = toInt(saved.cumulative_input_tokens);
     const output = toInt(saved.cumulative_output_tokens);
@@ -1828,8 +1820,26 @@ module.exports = function (pi) {
     if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
     if (!usageModel && typeof saved.model === "string" && saved.model)
       usageModel = saved.model;
-    // Repost the baseline on session_start in case the last flush failed.
-    // The server's grow-only clamp makes duplicate reports harmless.
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens)
+    ) {
+      lastPostedUsageKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    }
   }
 
   function rememberContext(ctx) {

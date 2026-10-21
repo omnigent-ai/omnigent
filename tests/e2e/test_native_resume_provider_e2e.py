@@ -203,21 +203,27 @@ def test_connected_native_resume_routes_to_configured_provider(
 
         history: list[str] = []
         expected_input_tokens = 0
+        expected_cache_tokens = 0
 
         def round_trip(expected: str, terminal: dict[str, Any] | None = None) -> None:
-            nonlocal expected_input_tokens
+            nonlocal expected_input_tokens, expected_cache_tokens
             prompt = f"provider-probe-{uuid.uuid4().hex}"
             replies = {name: f"{name}-reply-{uuid.uuid4().hex}" for name in providers}
+            input_tokens = 1000 if not history else 100
+            cache_tokens = 50 if not history else 5
             for name, url in providers.items():
                 configure_mock_llm(
                     url,
                     [
                         {
                             "text": replies[name],
-                            "usage": {"input_tokens": 1000 if not history else 100},
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "cache_read_input_tokens": cache_tokens,
+                            },
                         }
                     ]
-                    if restart_scope == "process"
+                    if harness == "pi"
                     else [],
                     match=prompt,
                 )
@@ -273,23 +279,31 @@ def test_connected_native_resume_routes_to_configured_provider(
                     f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
                 )
                 response.raise_for_status()
-                return any(
-                    item.get("role") == "assistant" and replies[expected] in json.dumps(item)
-                    for item in response.json()["data"]
+                items = response.json()["data"]
+                return all(
+                    sum(item.get("role") == role and text in json.dumps(item) for item in items)
+                    == 1
+                    for role, text in (("user", prompt), ("assistant", replies[expected]))
                 )
 
             _wait(mirrored_reply, f"{harness} assistant reply mirrored into Omnigent")
-            if restart_scope == "process":
-                expected_input_tokens += 1000 if not history else 100
+            if harness == "pi":
+                expected_input_tokens += input_tokens
+                expected_cache_tokens += cache_tokens
+
+                def usage_advanced() -> bool:
+                    usage = snapshot().get("usage_by_model") or {}
+                    return usage.get(_MODEL, {}).get("input_tokens") == expected_input_tokens
+
                 _wait(
-                    lambda: (
-                        (snapshot().get("usage_by_model") or {})
-                        .get(_MODEL, {})
-                        .get("input_tokens")
-                        == expected_input_tokens
-                    ),
-                    f"usage advances to {expected_input_tokens} after Pi relaunch",
+                    usage_advanced,
+                    f"Pi cumulative input usage reaching {expected_input_tokens}",
+                    timeout=15,
                 )
+                observed = snapshot()
+                usage = observed["usage_by_model"][_MODEL]
+                assert usage["cache_read_input_tokens"] == expected_cache_tokens
+                assert usage["output_tokens"] == 5 * (len(history) // 2 + 1)
             history.extend((prompt, replies[expected]))
             print(f"{harness} {selection}: expected={expected}, requests={counts}", flush=True)
 
