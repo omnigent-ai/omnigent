@@ -1,9 +1,15 @@
 package ai.omnigent.android
 
+import android.content.Context
+import android.graphics.Color
+import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
+import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -17,6 +23,39 @@ import org.robolectric.shadows.ShadowAlertDialog
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class UserConnectRequestsTest {
+    @Test
+    @Config(qualifiers = "night")
+    fun `first launch in dark mode shows a light wordmark on Connect`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        assertFalse(ServerStore(context).hasServer())
+        val mainActivity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val connectIntent = shadowOf(mainActivity).nextStartedActivity
+        assertEquals(ConnectActivity::class.java.name, connectIntent.component!!.className)
+
+        val connectActivity =
+            Robolectric.buildActivity(ConnectActivity::class.java, connectIntent).setup().get()
+        assertEquals(Color.WHITE, connectActivity.getColor(R.color.omnigents_wordmark))
+        val content = connectActivity.findViewById<ViewGroup>(android.R.id.content)
+        val scrollView = content.getChildAt(0) as ViewGroup
+        val column = scrollView.getChildAt(0) as ViewGroup
+        val logo = column.getChildAt(0) as ImageView
+        assertNotNull(logo.drawable)
+        connectActivity.resources.getXml(R.drawable.omnigents_logo).use { parser ->
+            parser.next()
+            parser.nextTag()
+            parser.nextTag()
+            assertEquals("path", parser.name)
+            assertEquals(
+                R.color.omnigents_wordmark,
+                parser.getAttributeResourceValue(
+                    "http://schemas.android.com/apk/res/android",
+                    "fillColor",
+                    0,
+                ),
+            )
+        }
+    }
+
     @Test
     fun `connect screen starts the shell with a request that counts once`() {
         val activity = Robolectric.buildActivity(ConnectActivity::class.java).setup().get()
