@@ -522,11 +522,14 @@ class HookForwardState:
     :param cursor_fingerprint: Hash of bytes immediately before
         ``byte_offset``. Used to detect truncation/replacement before
         seeking into a stale offset.
+    :param posted_compaction_status_key: Identity of a successfully posted
+        compaction status whose hook cursor is still held for snapshot retries.
     """
 
     event_cursor: int
     byte_offset: int | None = None
     cursor_fingerprint: str | None = None
+    posted_compaction_status_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -4173,22 +4176,31 @@ async def _forward_available_status_events(
             # the rest of the hook stream.
             compaction_status = _compaction_status_for_record(record)
             if compaction_status is not None:
-                try:
-                    await _post_external_compaction_status(
-                        client,
-                        session_id=session_id,
-                        status=compaction_status,
-                    )
-                except httpx.HTTPError:
-                    _logger.warning(
-                        "Failed to forward Claude compaction status; "
-                        "session=%s event_cursor=%s status=%s",
-                        session_id,
-                        record.event_cursor,
-                        compaction_status,
-                        exc_info=True,
-                        extra={"session_id": session_id},
-                    )
+                status_key = (
+                    f"{record.event_cursor}:{record.recorded_at}:{next_durable.cursor_fingerprint}"
+                )
+                if durable.posted_compaction_status_key != status_key:
+                    try:
+                        await _post_external_compaction_status(
+                            client,
+                            session_id=session_id,
+                            status=compaction_status,
+                        )
+                    except httpx.HTTPError:
+                        _logger.warning(
+                            "Failed to forward Claude compaction status; "
+                            "session=%s event_cursor=%s status=%s",
+                            session_id,
+                            record.event_cursor,
+                            compaction_status,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                    else:
+                        # Snapshot retries hold the cursor, but must not replay
+                        # an acknowledged UI notification, even after restart.
+                        durable = replace(durable, posted_compaction_status_key=status_key)
+                        await _write_hook_state_async(bridge_dir, durable)
                 if compaction_status == "in_progress":
                     # ``PreCompact`` mints a durable pending token that the
                     # completion signal (transcript ``isCompactSummary`` or
@@ -4273,6 +4285,7 @@ async def _forward_available_status_events(
                                 seq,
                                 decision.attempts,
                                 decision.delay_s,
+                                exc_info=True,
                                 extra={"session_id": session_id},
                             )
                             return durable
@@ -4802,6 +4815,7 @@ async def _handle_compact_summary_item(
             seq,
             decision.attempts,
             decision.delay_s,
+            exc_info=True,
             extra={"session_id": session_id},
         )
         return False
@@ -6402,6 +6416,25 @@ async def _post_external_compaction_status(
     resp.raise_for_status()
 
 
+def _compaction_summary_boundary(
+    records: Mapping[str, dict[str, object]], summary: Mapping[str, object]
+) -> dict[str, object] | None:
+    """Find the summary's boundary through optional Claude attachment records."""
+    parent_uuid = summary.get("parentUuid")
+    seen: set[str] = set()
+    while isinstance(parent_uuid, str) and parent_uuid not in seen:
+        seen.add(parent_uuid)
+        parent = records.get(parent_uuid)
+        if parent is None:
+            return None
+        if parent.get("type") == "system" and parent.get("subtype") == "compact_boundary":
+            return parent
+        if parent.get("type") != "attachment":
+            return None
+        parent_uuid = parent.get("parentUuid")
+    return None
+
+
 def _restore_preserved_compaction_messages(
     transcript_path: Path,
     messages: list[tuple[str, dict[str, object]]],
@@ -6431,18 +6464,14 @@ def _restore_preserved_compaction_messages(
     boundary: dict[str, object] | None
     if expected_summary_uuid is not None:
         summary = records.get(expected_summary_uuid)
-        parent_uuid = summary.get("parentUuid") if summary is not None else None
         if (
             summary is None
             or summary.get("type") != "user"
             or summary.get("isCompactSummary") is not True
-            or not isinstance(parent_uuid, str)
+            or not isinstance(summary.get("parentUuid"), str)
         ):
             raise ValueError("Claude compaction summary identity is not available")
-        boundary = next(
-            (candidate for candidate in boundaries if candidate.get("uuid") == parent_uuid),
-            None,
-        )
+        boundary = _compaction_summary_boundary(records, summary)
         if boundary is None:
             raise ValueError("Claude compaction summary boundary is not available")
     else:
@@ -6504,7 +6533,7 @@ def _restore_preserved_compaction_messages(
         summary is None
         or summary.get("type") != "user"
         or summary.get("isCompactSummary") is not True
-        or summary.get("parentUuid") != boundary.get("uuid")
+        or _compaction_summary_boundary(records, summary) != boundary
     ):
         raise ValueError("Claude compaction summary is not available yet")
     if expected_summary_uuid is not None and anchor != expected_summary_uuid:
@@ -6666,6 +6695,7 @@ async def _persist_native_compaction_item(
             session_id,
             native_messages is not None,
             type(exc).__name__,
+            exc_info=True,
             extra={"session_id": session_id},
         )
     compacted_messages: list[dict[str, object]] | None = None
@@ -7004,16 +7034,22 @@ def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
     event_cursor = raw.get("event_cursor")
     byte_offset = raw.get("byte_offset")
     cursor_fingerprint = raw.get("cursor_fingerprint")
+    posted_compaction_status_key = raw.get("posted_compaction_status_key")
     if not isinstance(event_cursor, int) or event_cursor < 0:
         return None
     if byte_offset is not None and (not isinstance(byte_offset, int) or byte_offset < 0):
         return None
     if cursor_fingerprint is not None and not isinstance(cursor_fingerprint, str):
         return None
+    if posted_compaction_status_key is not None and not isinstance(
+        posted_compaction_status_key, str
+    ):
+        return None
     return HookForwardState(
         event_cursor=event_cursor,
         byte_offset=byte_offset,
         cursor_fingerprint=cursor_fingerprint,
+        posted_compaction_status_key=posted_compaction_status_key,
     )
 
 
@@ -7034,6 +7070,8 @@ def _write_hook_state(bridge_dir: Path, state: HookForwardState) -> None:
         payload["byte_offset"] = state.byte_offset
     if state.cursor_fingerprint is not None:
         payload["cursor_fingerprint"] = state.cursor_fingerprint
+    if state.posted_compaction_status_key is not None:
+        payload["posted_compaction_status_key"] = state.posted_compaction_status_key
     _write_json_atomic(bridge_dir / _HOOK_STATE_FILE, payload)
 
 
