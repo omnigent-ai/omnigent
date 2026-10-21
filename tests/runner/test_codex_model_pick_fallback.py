@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -238,6 +239,29 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     assert harness.builds[0]["session_id"] == _SESSION_ID
     assert harness.resets == []
     harness.probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_policy_hook_token_refresh_keeps_runner_responsive(
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = codex_launch_harness
+    harness.snapshot["model_override"] = None
+    loop = asyncio.get_running_loop()
+    loop_progressed: list[bool] = []
+
+    def token_factory() -> str:
+        released = threading.Event()
+        loop.call_soon_threadsafe(released.set)
+        loop_progressed.append(released.wait(timeout=1.0))
+        return "test-hook-token"
+
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: token_factory)
+    await harness.launch()
+
+    assert harness.builds[0]["ap_auth_headers"]["Authorization"] == "Bearer test-hook-token"
+    assert loop_progressed == [True], "Codex hook token refresh blocked the runner event loop"
 
 
 @pytest.mark.asyncio
