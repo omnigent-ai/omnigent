@@ -20,6 +20,24 @@ SIDECAR = "tests/codex_parity/sidecar/Cargo.lock"
 HOOKS = ".pre-commit-config.yaml"
 
 
+def test_merge_gate_skip_membership_with_a_large_check_list():
+    """A matching check stays skippable when the list exceeds the pipe buffer."""
+    subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            'source "$1"; printf -v padding "%100000s" ""; ALLOW_SKIP+=("$padding"); '
+            'is_allow_skip "Pytest (inner-rest)"; ! is_allow_skip "unknown check"',
+            "bash",
+            str(ROOT / ".github/scripts/merge-ready/required.sh"),
+        ],
+        check=True,
+    )
+
+
 @pytest.fixture
 def scope_module():
     spec = importlib.util.spec_from_file_location("dependency_scope", CI / "dependency_scope.py")

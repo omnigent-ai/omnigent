@@ -53,6 +53,7 @@ from omnigent.cli_config import (
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
 )
+from omnigent.cli_diagnostics import printable as _printable
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
@@ -7367,6 +7368,10 @@ _FROM_OPENCLAW_HELP = (
 )
 _MODEL_HELP = "Model to use for the agent."
 _PROMPT_HELP = "Send this as the first message when the REPL starts."
+_AGENT_HELP = (
+    "Agent registered on the --server to start the session with. With -p and "
+    "several registered agents, this picks the one to run."
+)
 _SYSTEM_PROMPT_HELP = "Instructions to use for the agent."
 _RESUME_HELP = (
     "Resume a prior conversation. With no value, opens an interactive "
@@ -7630,6 +7635,9 @@ _RESUME_SKIP_PARAMS: frozenset[str] = frozenset(
         # ephemeral is session-scoped infrastructure flag, not
         # meaningful across invocations.
         "ephemeral",
+        # The resumed session already has its agent, and --agent is
+        # rejected alongside --resume.
+        "agent",
     }
 )
 
@@ -8037,6 +8045,7 @@ def _dispatch_run(
     server_from_cli: bool = False,
     model_from_cli: bool = False,
     acp_agent: AcpAgentEntry | None = None,
+    agent: str | None = None,
 ) -> None:
     """
     Route ``omnigent run`` to the right impl.
@@ -8083,12 +8092,24 @@ def _dispatch_run(
         on the command line rather than loaded from config.
     :param acp_agent: Optional one-shot ACP agent carried in the generated
         temporary spec instead of loaded from global config.
+    :param agent: ``--agent`` value: the registered agent a direct ``--server``
+        session starts with, e.g. ``"scribe"``. ``None`` discovers one.
     """
     if target is not None and _is_server_url(target):
         raise click.ClickException(
             "Server URLs are no longer accepted as the AGENT argument. "
             f"Use `{cli_invocation()} run --server {target}` instead."
         )
+
+    if fork_session_id is not None:
+        if resume_conversation_id or resume_latest or resume_picker:
+            raise click.ClickException(
+                "--fork is mutually exclusive with --resume and --continue."
+            )
+        if prompt is not None:
+            raise click.ClickException(
+                "--fork requires interactive REPL mode; remove -p/--prompt."
+            )
 
     if target is None:
         # Truthiness, not ``is not None``: an empty ``--server ""`` selects local
@@ -8167,6 +8188,7 @@ def _dispatch_run(
                 debug_events=debug_events,
                 resume_parts=resume_parts,
                 auto_open_conversation=auto_open_conversation,
+                agent_name=agent,
             )
             return
         if harness is None:
@@ -8222,16 +8244,6 @@ def _dispatch_run(
             raise click.ClickException(
                 "--server is for binding a LOCAL agent YAML to a remote "
                 "server. Pass a YAML path as the target (got a URL)."
-            )
-
-    if fork_session_id is not None:
-        if resume_conversation_id or resume_latest or resume_picker:
-            raise click.ClickException(
-                "--fork is mutually exclusive with --resume and --continue."
-            )
-        if prompt is not None:
-            raise click.ClickException(
-                "--fork requires interactive REPL mode; remove -p/--prompt."
             )
 
     harness = canonicalize_harness(harness)
@@ -8536,6 +8548,7 @@ def attach(
         'configured server default (--server "" does the same).'
     ),
 )
+@click.option("--agent", "agent", default=None, metavar="NAME", help=_AGENT_HELP)
 @click.option(
     "--profile",
     "databricks_profile",
@@ -8585,6 +8598,7 @@ def run(
     ephemeral: bool,
     log: bool,
     server: str | None,
+    agent: str | None,
     databricks_profile: str | None,
     debug_events: bool,
     register_host: bool,
@@ -8609,6 +8623,7 @@ def run(
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
+      omnigent run --server http://localhost:6767 --agent scribe -p "hi"
       omnigent run --server local  # local server, ignoring any configured default
       omnigent run examples/databricks_coding_agent.yaml --server https://<app>.databricksapps.com
       omnigent run --server https://<app>.databricksapps.com --profile my-sp -p "hi"
@@ -8682,6 +8697,20 @@ def run(
         and not harness_from_cli
         and acp_agent is None
     )
+    if agent is not None:
+        agent = agent.strip()
+        if not agent:
+            raise click.ClickException("--agent requires a non-empty agent name.")
+        if not direct_server_cli:
+            raise click.ClickException(
+                "--agent names an agent registered on a server. Use it with "
+                "`--server <url>` and no AGENT path or --harness."
+            )
+        if resume is not None or resume_latest or fork_session_id is not None:
+            raise click.ClickException(
+                "--agent starts a new session; it cannot be combined with "
+                "--resume, --continue, or --fork."
+            )
 
     _global_cfg = _load_effective_config()
     if target is None and not direct_server_cli and acp_agent is None:
@@ -8752,6 +8781,7 @@ def run(
         server_from_cli=server_from_cli,
         model_from_cli=model_from_cli,
         acp_agent=acp_agent,
+        agent=agent,
     )
 
 
@@ -11715,11 +11745,6 @@ def _agent_dir_name(agent_dir: Path) -> str:
     return name if isinstance(name, str) and name else agent_dir.name
 
 
-def _printable(text: str) -> str:
-    """Escape control characters so repo-supplied text can't rewrite the terminal."""
-    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
-
-
 _LFS_POINTER = b"version https://git-lfs.github.com/spec/"
 
 
@@ -12471,7 +12496,7 @@ def _workspace_api_server_url(server: str) -> str:
         return server
     try:
         probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
-    except _httpx.HTTPError:
+    except (_httpx.HTTPError, _httpx.InvalidURL):
         return server
     # Already something we understand at the root: an omnigent server
     # (200 / 401-with-login_url JSON) or a Databricks Apps edge /

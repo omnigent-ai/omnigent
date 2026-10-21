@@ -5054,7 +5054,125 @@ def test_run_server_without_agent_dispatches_direct_server(
         # Interactive ``run --server`` (no -p) defaults the browser-open ON,
         # including for remote servers.
         auto_open_conversation=True,
+        agent_name=None,
     )
+
+
+def test_run_server_agent_forwards_agent_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run --server URL --agent NAME -p`` hands the requested agent to ``run_chat``."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "scribe", "-p", "hi"]
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    assert run_chat.call_args.kwargs["target"] == "http://localhost:8000"
+    assert run_chat.call_args.kwargs["agent_name"] == "scribe"
+    assert run_chat.call_args.kwargs["prompt"] == "hi"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["run", "--agent", "scribe"],
+        [
+            "run",
+            "tests/resources/examples/hello_world.yaml",
+            "--server",
+            "http://localhost:8000",
+            "--agent",
+            "scribe",
+        ],
+        ["run", "--server", "http://localhost:8000", "--harness", "codex", "--agent", "scribe"],
+    ],
+)
+def test_run_agent_requires_direct_server(
+    args: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--agent`` names a server-registered agent, so it needs a direct ``--server`` run."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code != 0
+    assert "--agent" in result.output and "--server <url>" in result.output
+    run_chat.assert_not_called()
+
+
+@pytest.mark.parametrize("flags", [["--resume", "conv_1"], ["--continue"], ["--fork", "conv_1"]])
+def test_run_agent_rejects_resume_flags(flags: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--agent`` starts a new session; resuming or forking one contradicts it."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "scribe", *flags]
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be combined with --resume, --continue, or --fork" in result.output
+    run_chat.assert_not_called()
+
+
+def test_run_agent_name_is_trimmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Surrounding whitespace in ``--agent`` is dropped before the name is checked."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "  scribe ", "-p", "hi"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["agent_name"] == "scribe"
+
+
+def test_run_direct_server_fork_prompt_fails_before_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    discovery = Mock(side_effect=AssertionError("fork prompts must fail before discovery"))
+    monkeypatch.setattr("omnigent.chat._pick_agent", discovery)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--fork", "conv_x", "-p", "hi"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "--fork requires interactive REPL mode" in result.output
+    assert "--agent" not in result.output
+    discovery.assert_not_called()
+
+
+def test_run_agent_rejects_a_blank_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--agent ""`` must not silently fall back to agent discovery."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "", "-p", "hi"]
+    )
+
+    assert result.exit_code != 0
+    assert "non-empty agent name" in result.output
+    run_chat.assert_not_called()
+
+
+def test_run_help_lists_agent_option() -> None:
+    """The ``--agent`` selector the agent-discovery errors point at exists on ``run``."""
+    result = CliRunner().invoke(cli, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--agent NAME" in result.output
 
 
 @pytest.mark.parametrize("alias", ["", "local", "LOCAL", " local "])
