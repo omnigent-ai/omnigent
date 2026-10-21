@@ -458,6 +458,7 @@ class MainActivity : AppCompatActivity() {
             historyCleared = false
             val destination = retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: url
             retryRoute = null
+            showStatus(ConnectionStatus.Connecting(statusHost()))
             webView.loadUrl(destination)
         }
 

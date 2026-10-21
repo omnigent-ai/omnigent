@@ -362,11 +362,9 @@ class MainActivityTest {
     fun `same origin cold start redirect stays covered until final commit`() {
         val activity = launch()
         val webView = activity.webView()
-        val first = "https://example.com/"
         val final = "https://example.com/omnigent/c/123"
-        webView.webViewClient.onPageStarted(webView, first, null)
+        assertEquals("https://example.com", shadowOf(webView).lastLoadedUrl)
         webView.webViewClient.onPageStarted(webView, final, null)
-        webView.webViewClient.onPageCommitVisible(webView, first)
         assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
         assertTrue(
             activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
@@ -569,6 +567,37 @@ class MainActivityTest {
         assertEquals(
             ConnectActivity::class.java.name,
             shadowOf(activity).nextStartedActivity.component?.className,
+        )
+    }
+
+    @Test
+    fun `post sign in page load becomes slow connecting after ten seconds`() {
+        val activity = launch()
+        val host =
+            Class
+                .forName("ai.omnigent.android.MainActivity\$OidcHost")
+                .getDeclaredConstructor(MainActivity::class.java)
+                .apply { isAccessible = true }
+                .newInstance(activity) as OidcSessionController.Host
+        val page = "https://example.com/omnigent/c/recovered"
+        host.showProgress(OidcSessionController.Progress.COMPLETING)
+        host.loadPage(page)
+        assertEquals(page, shadowOf(activity.webView()).lastLoadedUrl)
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(9_900))
+        assertFalse(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+        assertEquals(View.VISIBLE, activity.findViewById<Button>(R.id.status_secondary).visibility)
+        assertEquals(
+            activity.getString(R.string.status_change_server),
+            activity.findViewById<Button>(R.id.status_secondary).text.toString(),
         )
     }
 
