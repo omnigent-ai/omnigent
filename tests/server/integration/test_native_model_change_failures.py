@@ -253,6 +253,9 @@ async def native_session(
         monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", lambda _config: None)
         monkeypatch.setattr(claude_native, "claude_launch_catalog", AsyncMock(return_value=[]))
         monkeypatch.setattr(claude_bridge, "confirm_dialog_if_open", lambda *_a, **_k: False)
+        # No pane behind this bridge dir: the prompt wait ahead of the injection
+        # would only time out, so it passes at once as in the runner suite.
+        monkeypatch.setattr(claude_bridge, "wait_for_input_ready", lambda *_a, **_k: None)
         monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.05)
         monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.005)
     else:
@@ -432,3 +435,23 @@ async def test_credential_failure_mirroring_applied_codex_effort_keeps_model_cha
     assert session.tunnel.dispatch_errors == []
     health = await asyncio.wait_for(session.runner.get("/health"), timeout=5)
     assert health.status_code == 200
+
+
+async def test_claude_model_the_picker_cannot_spell_is_rejected_as_invalid_input(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = native_session
+    assert session.claude is not None
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    session.requested_model = "gpt-6-sol"
+
+    response = await _pick_model(client, session)
+
+    assert response.status_code == 400, response.text
+    assert "cannot switch to gpt-6-sol" in response.json()["error"]["message"]
+    assert session.runner_replies[0].json()["error"] == "claude_native_model_unsupported"
+    assert session.claude.commands == []
+    assert session.errors == []
+    session.assert_model(session.previous_model)

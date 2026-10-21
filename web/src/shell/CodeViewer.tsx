@@ -87,10 +87,10 @@ import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import { isVideoFile } from "@/lib/video";
 
-// Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
-// actually viewed, so the initial bundle and markdown/preview paths don't pay
-// for it.
+// Lazy-load Monaco so small Markdown and preview surfaces avoid its bundle.
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
@@ -492,6 +492,8 @@ export interface CodeViewerProps {
     sel: { start_index: number; end_index: number; anchor_content: string } | null,
   ) => void;
   panelOpen: boolean;
+  /** Stop media in a hidden rail without unmounting unsaved editor state. */
+  mediaActive?: boolean;
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
   /**
@@ -501,6 +503,8 @@ export interface CodeViewerProps {
   searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
+  /** FileViewer keeps this choice stable across autosaves for the current file. */
+  markdownSourceFallback: boolean;
   onDirtyChange?: (isDirty: boolean) => void;
   /**
    * Forwarded to the Monaco editor only — it reports its auto-save lifecycle so
@@ -532,11 +536,13 @@ export function CodeViewer({
   activeSelection,
   onSetActiveSelection,
   panelOpen,
+  mediaActive = panelOpen,
   searchOpen,
   setSearchOpen,
   searchFocusNonce,
   searchInputRef,
   viewMode,
+  markdownSourceFallback,
   onDirtyChange,
   onSaveStatusChange,
   pendingBodyRef,
@@ -592,14 +598,14 @@ export function CodeViewer({
   // must drop to read-only when this is set.
   const truncated = fileQuery.data?.truncated ?? false;
   const lang = detectLang(path);
-  // Non-markdown files render in Monaco (read-only or editable by permission);
-  // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
-  const showMonaco = lang !== "markdown" && viewMode !== "preview";
+  // Large Markdown shares the virtualized code editor and its save/permission rules.
+  const showMonaco = markdownSourceFallback || (lang !== "markdown" && viewMode !== "preview");
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isHtmlPreview = viewMode === "preview" && lang === "html";
   const isMarkdownOrNotebookPreview =
-    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+    viewMode === "preview" &&
+    ((lang === "markdown" && !markdownSourceFallback) || isNotebookPath(path));
   const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
@@ -683,7 +689,7 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+  const isMarkdownEditor = viewMode === "editor" && lang === "markdown" && !markdownSourceFallback;
 
   // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
   // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
@@ -857,6 +863,18 @@ export function CodeViewer({
     };
   }, [content]);
 
+  if (isVideoFile(path, fileQuery.data?.content_type)) {
+    if (!mediaActive) return null;
+    return (
+      <div className="flex h-full items-center justify-center overflow-auto p-4">
+        <VideoPlayer
+          conversationId={conversationId}
+          path={path}
+          title={path.split("/").pop() ?? path}
+        />
+      </div>
+    );
+  }
   if (fileQuery.isLoading) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
@@ -915,7 +933,7 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "editor" && lang === "markdown") {
+  if (isMarkdownEditor) {
     return (
       <MarkdownRichTextViewer
         content={content}
@@ -991,6 +1009,7 @@ export function CodeViewer({
           path={path}
           isSettled={fileQuery.isSuccess}
           truncated={truncated}
+          largeMarkdown={markdownSourceFallback}
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}

@@ -51,7 +51,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -64,6 +63,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.native_session import create_native_session
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -99,12 +99,6 @@ _ERROR_PILL = '[data-testid="error-pill"]'
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
 # that must not intercept loopback requests to the spawned server.
 _client = httpx.Client(trust_env=False)
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 #: Ambient variables that would otherwise leak into the rig: provider
@@ -189,7 +183,7 @@ class _SnapshotDelayProxy:
 
     def __init__(self, backend_port: int) -> None:
         self._backend_port = backend_port
-        self.port = _free_port()
+        self.port = find_free_port()
         self._pattern: bytes | None = None
         # Let the first ``_stall_after`` matching GETs pass through untouched
         # (the bind/init snapshot reads), and only degrade the match after that
@@ -379,7 +373,7 @@ def cursor_launch_rig(
     for path in (config_home, home_dir, artifacts):
         path.mkdir(parents=True, exist_ok=True)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     proxy = _SnapshotDelayProxy(backend_port=port)
     runner_server_url = f"http://127.0.0.1:{proxy.port}"

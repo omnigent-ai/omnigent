@@ -167,7 +167,8 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
     assert failure.get("response_id") == response_id
     assert context["failure_source"] == "claude_hook"
     assert context["native_error_category"] == "authentication_failed"
-    if scenario in {"current_error", "multiple_error_blocks", "failed_error_item"}:
+    # A later prompt without output leaves the hook to end the failed turn.
+    if scenario in {"current_error", "multiple_error_blocks", "failed_error_item", "later_turn"}:
         assert failure["failure_detail"].startswith(error_text + "\n\n")
         assert "omni setup" in failure["failure_detail"]
         assert context["detail_source"] == "explicit_api_error"
@@ -183,6 +184,246 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         )
         assert context["detail_source"] == "hook_error_category"
         assert "native_api_error_message" not in context
+
+
+_SPEND_LIMIT_ERROR = (
+    'API Error: 403 {"error":{"type":"permission_error",'
+    '"message":"Synthetic spend limit reached"}}'
+)
+_MAIN_API_ERROR: dict[str, object] = {
+    "type": "assistant",
+    "uuid": "main-error",
+    "isApiErrorMessage": True,
+    "error": "authentication_failed",
+    "message": {
+        "role": "assistant",
+        "model": "<synthetic>",
+        "content": [{"type": "text", "text": _SPEND_LIMIT_ERROR}],
+    },
+}
+_MAIN_STOP_FAILURE = {
+    "hook_event_name": "StopFailure",
+    "session_id": "native-session",
+    "error": "authentication_failed",
+}
+_NEXT_TURN_RECORDS: dict[str, dict[str, object]] = {
+    # Claude delivers a background agent's result right after the turn ends.
+    "task_notification": {
+        "type": "user",
+        "uuid": "next-turn",
+        "origin": {"kind": "task-notification"},
+        "message": {
+            "role": "user",
+            "content": "<task-notification>\n<task-id>bg-agent</task-id>\n"
+            "<status>failed</status>\n</task-notification>",
+        },
+    },
+    # A prompt typed while the turn was running is submitted when it ends.
+    "queued_prompt": {
+        "type": "user",
+        "uuid": "next-turn",
+        "message": {"role": "user", "content": "Also update the docs"},
+    },
+}
+
+
+def _append_transcript(path: Path, *records: dict[str, object]) -> None:
+    with path.open("a") as transcript:
+        for record in records:
+            native = {"sessionId": "native-session", "isSidechain": False}
+            transcript.write(json.dumps({**native, **record}) + "\n")
+
+
+async def _poll_transcript(
+    client: httpx.AsyncClient,
+    bridge_dir: Path,
+    state: forwarder.TranscriptForwardState,
+    dedupe: forwarder._ForwardDedupeState,
+) -> forwarder.TranscriptForwardState:
+    return await forwarder._forward_available_items(
+        client=client,
+        session_id="conv_synthetic",
+        bridge_dir=bridge_dir,
+        agent_name="test-agent",
+        state=state,
+        retry_tracker=forwarder._PostRetryTracker(),
+        dedupe=dedupe,
+    )
+
+
+async def _poll_hooks(
+    client: httpx.AsyncClient,
+    bridge_dir: Path,
+    state: forwarder.HookForwardState,
+    dedupe: forwarder._ForwardDedupeState,
+    response_id: str | None,
+) -> forwarder.HookForwardState:
+    return await forwarder._forward_available_status_events(
+        client=client,
+        session_id="conv_synthetic",
+        bridge_dir=bridge_dir,
+        state=state,
+        retry_tracker=forwarder._PostRetryTracker(),
+        dedupe=dedupe,
+        task_subjects={},
+        task_statuses={},
+        task_order=[],
+        response_id=response_id,
+    )
+
+
+def _record_events(
+    failures: list[dict[str, object]], error_posts: list[object] | None = None
+) -> httpx.MockTransport:
+    def handle(request: httpx.Request) -> httpx.Response:
+        event = json.loads(request.content)
+        if event["type"] == "external_session_status":
+            failures.append(event["data"])
+            return httpx.Response(204)
+        if error_posts is not None and "main-error" in event["data"]["source_id"]:
+            error_posts.append(event["data"]["response_id"])
+            # The first delivery of the API error fails and is retried.
+            return httpx.Response(503 if len(error_posts) == 1 else 202, json={})
+        return httpx.Response(202, json={})
+
+    return httpx.MockTransport(handle)
+
+
+@pytest.mark.parametrize("next_turn", ["task_notification", "queued_prompt"])
+@pytest.mark.parametrize("next_turn_poll", ["same_poll", "next_poll"])
+@pytest.mark.asyncio
+async def test_api_error_survives_next_turn_opening_before_stop_failure(
+    tmp_path: Path, next_turn: str, next_turn_poll: str
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _append_transcript(
+        transcript_path,
+        {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "Run checks"}},
+        {
+            "type": "assistant",
+            "uuid": "launch",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_bg", "name": "Agent", "input": {}}],
+            },
+        },
+    )
+    turn_end = {"type": "system", "subtype": "turn_duration", "uuid": "turn-duration"}
+    failures: list[dict[str, object]] = []
+    # One dedupe and transcript-derived response IDs, as in the forwarder loop.
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=_record_events(failures), base_url="http://test"
+    ) as client:
+        state = await _poll_transcript(
+            client, bridge_dir, forwarder.TranscriptForwardState(transcript_path, 0), dedupe
+        )
+        failed_response_id = state.current_response_id
+        bridge.record_hook_event(bridge_dir, {**_MAIN_STOP_FAILURE, "agent_id": "bg-agent"})
+        hooks = await _poll_hooks(
+            client,
+            bridge_dir,
+            forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            dedupe,
+            state.current_response_id,
+        )
+        assert failures == []
+        if next_turn_poll == "same_poll":
+            _append_transcript(
+                transcript_path, _MAIN_API_ERROR, turn_end, _NEXT_TURN_RECORDS[next_turn]
+            )
+        else:
+            _append_transcript(transcript_path, _MAIN_API_ERROR, turn_end)
+            state = await _poll_transcript(client, bridge_dir, state, dedupe)
+            _append_transcript(transcript_path, _NEXT_TURN_RECORDS[next_turn])
+        state = await _poll_transcript(client, bridge_dir, state, dedupe)
+        # The next turn has opened, so the transcript no longer names the failed one.
+        assert state.current_response_id != failed_response_id
+        bridge.record_hook_event(bridge_dir, _MAIN_STOP_FAILURE)
+        await _poll_hooks(client, bridge_dir, hooks, dedupe, state.current_response_id)
+
+    (failure,) = failures
+    assert failure["failure_detail"] == "Synthetic spend limit reached"
+    context = failure["failure_context"]
+    assert context["detail_source"] == "explicit_api_error"
+    assert context["native_record_id"] == "main-error"
+    assert context["native_agent_role"] == "session_agent"
+
+
+@pytest.mark.asyncio
+async def test_retried_api_error_keeps_its_turn_after_the_next_turn_opens(
+    tmp_path: Path,
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _append_transcript(
+        transcript_path,
+        {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "Run checks"}},
+        {
+            "type": "assistant",
+            "uuid": "progress",
+            "message": {"role": "assistant", "content": "On it"},
+        },
+    )
+    failures: list[dict[str, object]] = []
+    error_posts: list[object] = []
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=_record_events(failures, error_posts), base_url="http://test"
+    ) as client:
+        state = await _poll_transcript(
+            client, bridge_dir, forwarder.TranscriptForwardState(transcript_path, 0), dedupe
+        )
+        failed_response_id = state.current_response_id
+        _append_transcript(transcript_path, _MAIN_API_ERROR, _NEXT_TURN_RECORDS["queued_prompt"])
+        state = await _poll_transcript(client, bridge_dir, state, dedupe)
+        bridge.record_hook_event(bridge_dir, _MAIN_STOP_FAILURE)
+        await _poll_hooks(
+            client,
+            bridge_dir,
+            forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            dedupe,
+            state.current_response_id,
+        )
+        await _poll_transcript(client, bridge_dir, state, dedupe)
+
+    # The retried error stays in the failed turn instead of starting a new one.
+    assert error_posts == [failed_response_id, failed_response_id]
+    (failure,) = failures
+    assert failure["response_id"] == failed_response_id
+    assert failure["failure_detail"] == "Synthetic spend limit reached"
+
+
+@pytest.mark.asyncio
+async def test_api_error_is_not_reused_once_its_turn_ended(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    _append_transcript(
+        transcript_path,
+        {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "Run checks"}},
+        _MAIN_API_ERROR,
+    )
+    failures: list[dict[str, object]] = []
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=_record_events(failures), base_url="http://test"
+    ) as client:
+        state = forwarder.TranscriptForwardState(transcript_path, 0)
+        hooks = forwarder.HookForwardState(event_cursor=0, byte_offset=0)
+        # The second turn fails before Claude writes anything for it.
+        for next_turn in ((), (_NEXT_TURN_RECORDS["queued_prompt"],)):
+            _append_transcript(transcript_path, *next_turn)
+            bridge.record_hook_event(bridge_dir, _MAIN_STOP_FAILURE)
+            state = await _poll_transcript(client, bridge_dir, state, dedupe)
+            hooks = await _poll_hooks(client, bridge_dir, hooks, dedupe, state.current_response_id)
+
+    first, second = failures
+    assert first["failure_detail"] == "Synthetic spend limit reached"
+    assert second["failure_detail"] == (
+        "Claude Code ended the turn with an API error (authentication_failed)."
+    )
+    assert second["failure_context"]["detail_source"] == "hook_error_category"
 
 
 @pytest.mark.asyncio

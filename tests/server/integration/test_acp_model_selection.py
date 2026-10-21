@@ -15,6 +15,7 @@ from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+from tests._helpers.providers import isolate_provider_resolution
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -29,9 +30,7 @@ _UNLISTED = "another-model"
 @pytest.fixture(autouse=True)
 def _isolated_provider_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Use synthetic provider configuration without ambient credentials or network discovery."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     providers: dict[str, Any] = {}
     for name, default, alternate in (
         ("curated", _DEFAULT, _ALTERNATE),

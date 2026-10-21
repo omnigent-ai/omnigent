@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 import respx
+from omnigent_slack.omnigent import ClientAuth
 
 # The placeholder text the bot posts as its "Working on it…" ack. Kept in sync
 # with the service module so a recorded ack is recognizable.
@@ -575,3 +576,12 @@ class FakeOmnigentServer:
         )
         if token is not None:
             assert auth == f"Bearer {token}", f"{method} {path} bearer={auth!r} != Bearer {token}"
+
+
+async def resolve_test_auth(_server_url: str, user_id: str) -> ClientAuth:
+    """Give HTTP integration fixtures a distinct delegated credential per user."""
+
+    async def refresh() -> str | None:
+        return None
+
+    return ClientAuth(f"test-{user_id}", refresh)

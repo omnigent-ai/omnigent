@@ -147,6 +147,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
+  /**
+   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
+   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   */
+  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
+  /** Check the laptop's dbcert without starting sign-in. */
+  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host

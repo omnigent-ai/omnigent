@@ -30,9 +30,12 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_REFRESH_HARNESSES,
     HostHelloFrame,
     HostInstallHarnessFrame,
     HostInstallHarnessResultFrame,
+    HostRefreshHarnessesFrame,
+    HostRefreshHarnessesResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
@@ -79,6 +82,7 @@ def _hello_text(name: str = _HOST_NAME) -> str:
             version="0.1.0-test",
             frame_protocol_version=1,
             name=name,
+            capabilities=[CAP_REFRESH_HARNESSES],
         )
     )
 
@@ -180,6 +184,27 @@ async def install_setup(
             if not isinstance(text, str):
                 continue
             frame = decode_host_frame(text)
+            if isinstance(frame, HostRefreshHarnessesFrame):
+                reply = replies.get("__refresh__", {})
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostRefreshHarnessesResultFrame(
+                                request_id=frame.request_id,
+                                status=reply.get("status", "ok"),
+                                configured_harnesses=reply.get(
+                                    "configured_harnesses", {"codex-native": True}
+                                ),
+                                gateway_inference=reply.get(
+                                    "gateway_inference", {"codex-native": False}
+                                ),
+                                error=reply.get("error"),
+                            )
+                        ),
+                    }
+                )
+                continue
             if not isinstance(frame, HostInstallHarnessFrame):
                 continue
             reply = replies.get(frame.harness)
@@ -196,6 +221,7 @@ async def install_setup(
                     request_id=frame.request_id,
                     status=reply.get("status", "ok"),
                     configured_harnesses=reply.get("configured_harnesses"),
+                    version=reply.get("version"),
                     error=reply.get("error"),
                 )
             await comm.send_input(
@@ -262,6 +288,7 @@ async def test_install_harness_returns_refreshed_readiness(
     replies["claude"] = {
         "status": "ok",
         "configured_harnesses": {"claude": True, "claude-native": True},
+        "version": "2.1.295",
     }
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -272,6 +299,7 @@ async def test_install_harness_returns_refreshed_readiness(
     assert body["object"] == "harness_install"
     assert body["harness"] == "claude"
     assert body["configured_harnesses"]["claude"] is True
+    assert body["version"] == "2.1.295"
 
 
 async def test_install_harness_tolerates_a_garbled_gateway_inference(
@@ -455,6 +483,155 @@ async def test_install_coalesces_concurrent_same_family(
 
 
 # ── Feature flag ────────────────────────────────────────
+
+
+async def test_refresh_harnesses_returns_fresh_host_maps(
+    install_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    app, _registry, _comm, replies, _drain = install_setup
+    replies["__refresh__"] = {
+        "configured_harnesses": {
+            "claude-native": "needs-auth",
+            "codex-native": True,
+        },
+        "gateway_inference": {
+            "claude-native": True,
+            "codex-native": False,
+        },
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "configured_harnesses": {
+            "claude-native": "needs-auth",
+            "codex-native": True,
+        },
+        "gateway_inference": {
+            "claude-native": True,
+            "codex-native": False,
+        },
+    }
+
+
+async def test_refresh_harnesses_failed_host_result_returns_502(
+    install_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    app, _registry, _comm, replies, _drain = install_setup
+    replies["__refresh__"] = {
+        "status": "failed",
+        "error": "readiness refresh failed: probe exited",
+    }
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+
+    assert resp.status_code == 502
+    assert (
+        resp.json()["detail"]
+        == "host readiness refresh failed: readiness refresh failed: probe exited"
+    )
+
+
+async def test_refresh_harnesses_route_hidden_when_flag_off(
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    _app, registry, host_store, conv_store = install_app
+    off_app = FastAPI()
+    off_app.include_router(
+        create_hosts_router(
+            registry,
+            host_store,
+            conv_store,
+            feature_flags=FeatureFlags(),
+        ),
+        prefix="/v1",
+    )
+    async with AsyncClient(transport=ASGITransport(app=off_app), base_url="http://test") as client:
+        resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+
+    assert resp.status_code == 404
+
+
+async def test_refresh_harnesses_old_host_returns_unsupported_without_waiting(
+    install_setup: tuple[
+        FastAPI,
+        HostRegistry,
+        ApplicationCommunicator,
+        dict[str, dict[str, Any]],
+        asyncio.Task[None],
+    ],
+) -> None:
+    app, registry, _comm, _replies, _drain = install_setup
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    conn.hello.capabilities = []
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "refresh_unsupported"
+
+
+async def test_refresh_harnesses_offline_host_returns_409(
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    app, _registry, host_store, _conv_store = install_app
+    host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="local")
+    host_store.set_offline(_HOST_ID)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/v1/hosts/{_HOST_ID}/harnesses/refresh")
+
+    assert resp.status_code == 409
+
+
+async def test_refresh_harnesses_non_owner_returns_403(
+    install_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    from omnigent.server.auth import AuthProvider
+
+    _app, _registry, host_store, conv_store = install_app
+
+    class _Stub(AuthProvider):
+        def get_user_id(self, request: Any) -> str | None:
+            return request.headers.get("X-Test-User")
+
+    auth = _Stub()
+    auth_app = FastAPI()
+    registry = HostRegistry()
+    auth_app.include_router(
+        create_host_tunnel_router(registry, host_store, auth_provider=auth), prefix="/v1"
+    )
+    auth_app.include_router(
+        create_hosts_router(registry, host_store, conv_store, auth_provider=auth), prefix="/v1"
+    )
+    host_store.upsert_on_connect(host_id=_HOST_ID, name=_HOST_NAME, user_id="alice@example.com")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=auth_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/v1/hosts/{_HOST_ID}/harnesses/refresh",
+            headers={"X-Test-User": "bob@example.com"},
+        )
+
+    assert resp.status_code == 403
 
 
 async def test_install_harness_route_hidden_when_flag_off(

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import threading
 import time
 import urllib.parse
 import weakref
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 import httpx
 from fastapi.responses import JSONResponse, Response
 
+from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.inner.databricks_executor import DatabricksAuthError
@@ -69,6 +71,48 @@ _CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
 
 
 _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
+
+
+# A session woken for a control may still be booting its TUI, so typing waits for
+# the prompt, capped so the rest fits the server's ~20s wait for the control.
+_CLAUDE_CONTROL_PROMPT_WAIT_S = 9.0
+
+
+# Whole-request budget for a control, under the server's ~20s forward timeout.
+_CLAUDE_CONTROL_BUDGET_S = 18.0
+
+
+class _ClaudeControlDeadline(threading.Event):
+    """A ``cancellable_injection`` flag that sets itself once the control's budget is spent.
+
+    The bridge checks the flag before every tmux key, pane capture and lock
+    wait, so no key reaches the terminal after the server has rolled the
+    control back.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.at = time.monotonic() + _CLAUDE_CONTROL_BUDGET_S
+
+    def remaining_s(self) -> float:
+        return max(0.0, self.at - time.monotonic())
+
+    def is_set(self) -> bool:
+        return super().is_set() or time.monotonic() >= self.at
+
+    def wait(self, timeout: float | None = None) -> bool:
+        budget = self.remaining_s()
+        return super().wait(budget if timeout is None else min(timeout, budget)) or self.is_set()
+
+
+async def _drive_claude_pane(
+    deadline: _ClaudeControlDeadline, function: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    """Run a pane-driving bridge call that stops sending keys at *deadline*."""
+    from omnigent.harnesses.claude_native.bridge import cancellable_injection
+
+    with cancellable_injection(deadline):
+        return await asyncio.to_thread(function, *args, **kwargs)
 
 
 # How long the detached watcher keeps answering a /model confirm dialog that
@@ -1078,6 +1122,8 @@ def build_native_controls(
         has no way to clear: ``inject_slash_command`` reclaims the composer
         itself in ``_restore_occupied_input``. Waiting here would stall the
         case inject already handles for the whole budget, then inject anyway.
+        A live pane that is still booting (a session woken just before the
+        change) is likewise left to the prompt wait inside the injection.
 
         No terminal registry means there is nothing to heal, and a recreate that
         produced no pane is not waited on either (inject keeps its own short
@@ -1132,6 +1178,7 @@ def build_native_controls(
 
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
+        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1143,15 +1190,17 @@ def build_native_controls(
             # An effort switch invalidates the prompt cache on a session with
             # history, so Claude Code asks to confirm; the chat UI cannot render
             # that TUI dialog, so answer it by its own title.
-            await asyncio.to_thread(
+            await _drive_claude_pane(
+                deadline,
                 inject_slash_command,
                 bridge_dir,
                 command=command,
                 timeout_s=1.0,
+                ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
                 auto_confirm=True,
                 confirm_hint=EFFORT_DIALOG_HINT,
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1215,12 +1264,15 @@ def build_native_controls(
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
+            ClaudeInjectionCancelled,
+            ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
+            wait_for_input_ready,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
@@ -1239,6 +1291,9 @@ def build_native_controls(
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        # The server rolls the pick back after its forward timeout, so no key may
+        # reach the terminal past this deadline.
+        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1293,21 +1348,8 @@ def build_native_controls(
                 },
             )
         command = f"/model {model_arg}"
-        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
-            await asyncio.to_thread(
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-            )
-        except (RuntimeError, ValueError) as exc:
+
+        def _model_failed(exc: BaseException) -> JSONResponse:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1315,6 +1357,41 @@ def build_native_controls(
                     "detail": _client_safe_error_detail(exc, context="claude-native model change"),
                 },
             )
+
+        # A session woken for this change may still be booting its TUI, which drops
+        # typed keys. Wait for the prompt first, so the baseline below is the booted
+        # pane's model rather than an empty or leftover snapshot.
+        prompt_budget_s = min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s())
+        wait_started = time.monotonic()
+        wait_error: Exception | None = None
+        try:
+            await _drive_claude_pane(
+                deadline,
+                wait_for_input_ready,
+                bridge_dir,
+                ready_timeout_s=prompt_budget_s,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, OSError) as exc:
+            wait_error = exc
+        waited_s = time.monotonic() - wait_started
+        _logger.info(
+            "claude-native model change for session=%s waited %.1fs for the Claude prompt: %s",
+            conv_id,
+            waited_s,
+            "ready" if wait_error is None else type(wait_error).__name__,
+            extra=debug_event(
+                "claude_native_model_change_prompt_wait",
+                session_id=conv_id,
+                waited_ms=round(waited_s * 1000),
+                budget_ms=round(prompt_budget_s * 1000),
+                timed_out=isinstance(wait_error, ClaudePromptTimeout),
+                error_type=None if wait_error is None else type(wait_error).__name__,
+            ),
+        )
+        if wait_error is not None:
+            return _model_failed(wait_error)
+        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
         # Expected spellings come from this session's own catalog rows (every
@@ -1332,12 +1409,44 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+
+        def _switched(current: str | None) -> bool:
+            return bool(current and (current in expected or (baseline and current != baseline)))
+
+        try:
+            # Accepted trade-off: ``/model <id>`` also saves the pick as the
+            # person's global default in ``~/.claude/settings.json``. Driving
+            # the interactive picker instead avoided that write but needed
+            # ~35s of fragile tmux automation, so the write stands.
+            await _drive_claude_pane(
+                deadline,
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                # A boot that used the prompt budget still leaves the injection a
+                # short wait for a torn capture right after the prompt rendered.
+                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
+                auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            )
+        except ClaudeInjectionCancelled as exc:
+            # The budget can lapse in the dialog watch after ``/model`` was submitted;
+            # a pane that already switched must not be rolled back. Read only, no keys.
+            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
+                return Response(status_code=204)
+            return _model_failed(exc)
+        except (RuntimeError, ValueError, OSError) as exc:
+            return _model_failed(exc)
+        # The prompt wait comes out of this window, keeping the whole request
+        # inside the server's forward timeout.
+        confirm_window_s = min(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S, deadline.remaining_s())
+        confirm_deadline = time.monotonic() + confirm_window_s
         # A switch typed into a busy pane is queued; its turn may settle before the deadline.
         was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
-        deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-            if current and (current in expected or (baseline and current != baseline)):
+            if _switched(current):
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
@@ -1355,15 +1464,16 @@ def build_native_controls(
                     extra={"session_id": conv_id},
                 )
                 return Response(status_code=204)
-            # The confirm dialog can render well after the injection's own
-            # short watch (a warm repaint, or a queued command surfacing) —
-            # answer it whenever it shows inside the window.
-            await asyncio.to_thread(
-                confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+            # The dialog can render after the injection's short watch; answer it
+            # inside the window. A lapsed budget ends the window like a timeout.
+            if deadline.is_set():
+                break
+            await _drive_claude_pane(
+                deadline, confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
             )
             if _native_pane_status.get(conv_id) in ("running", "waiting"):
                 was_busy = True
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= confirm_deadline:
                 break
             await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
         if was_busy:
@@ -1391,7 +1501,7 @@ def build_native_controls(
                 "error": "claude_native_model_unconfirmed",
                 "detail": (
                     f"the terminal did not confirm the switch to {model_arg} within "
-                    f"{_CLAUDE_MODEL_CONFIRM_TIMEOUT_S:.0f}s — a dialog may be open in the pane"
+                    f"{confirm_window_s:.0f}s — a dialog may be open in the pane"
                 ),
             },
         )
@@ -1597,6 +1707,7 @@ def build_native_controls(
             inject_slash_command,
         )
 
+        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1604,13 +1715,15 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
-            await asyncio.to_thread(
+            await _drive_claude_pane(
+                deadline,
                 inject_slash_command,
                 bridge_dir,
                 command="/compact",
                 timeout_s=1.0,
+                ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={

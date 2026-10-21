@@ -1301,29 +1301,41 @@ describe("PullRequestPanel", () => {
         expect(keyWarnings()).toEqual([]);
       });
 
-      it("lists every check in the hover card when checks share a build URL or a name", async () => {
+      it("lists every check in the hover card and links only http(s) run URLs, even when checks share a URL or a name", async () => {
         const user = userEvent.setup();
         const keyWarnings = watchKeyWarnings();
         const buildUrl = "https://forge.example.test/contoso/web/_build/results?buildId=41";
         state.info!.data = withPr({
           checks: {
-            passing: 4,
+            passing: 5,
             failing: 0,
             pending: 0,
-            total: 4,
+            total: 5,
             runs: [
               { name: "Build", bucket: "passing", url: buildUrl },
               { name: "Lint", bucket: "passing", url: buildUrl },
               { name: "Deploy", bucket: "passing", url: null },
               { name: "Deploy", bucket: "passing", url: null },
+              // A status poster controls its target URL, so a script URL must not render.
+              { name: "Status", bucket: "passing", url: "javascript:alert(1)" },
             ],
           },
         });
         renderPanel();
 
-        await user.hover(screen.getByRole("button", { name: /4\s*passed/ }));
+        await user.hover(screen.getByRole("button", { name: /5\s*passed/ }));
         const rows = await screen.findAllByRole("listitem");
-        expect(rows.map((row) => row.textContent)).toEqual(["Build", "Lint", "Deploy", "Deploy"]);
+        expect(rows.map((row) => row.textContent)).toEqual([
+          "Build",
+          "Lint",
+          "Deploy",
+          "Deploy",
+          "Status",
+        ]);
+        expect(
+          rows.map((row) => within(row).queryByRole("link")?.getAttribute("href") ?? null),
+        ).toEqual([buildUrl, buildUrl, null, null, null]);
+        expect(within(rows[0]).getByRole("link")).toHaveAttribute("target", "_blank");
         expect(keyWarnings()).toEqual([]);
       });
     });
@@ -1366,6 +1378,36 @@ describe("PullRequestPanel", () => {
 
     expect(await screen.findByText("Diff request timed out.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("reports a failed file list without claiming there are no changes", async () => {
+    state.changes!.data = undefined;
+    state.changes!.error = new Error("Could not load changed files.");
+    renderChanges();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load changed files.");
+    expect(screen.queryByText("No changes vs base.")).toBeNull();
+  });
+
+  it("reports a malformed patch", async () => {
+    vi.mocked(parsePatchFiles).mockImplementationOnce(() => {
+      throw new Error("bad patch");
+    });
+    renderChanges();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t read the PR diff.");
+    expect(screen.queryByText("No text diff available for this file.")).toBeNull();
+  });
+
+  it("refreshes info, files and diff even from an error state", async () => {
+    state.info!.error = new Error("Request timed out.");
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries").mockResolvedValue();
+    onTestFinished(() => invalidate.mockRestore());
+    renderPanel();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
+      "github-info",
+      "github-changed-files",
+      "github-pr-diff",
+    ]);
   });
 
   it("marks an incomplete changed-file list while retaining loaded file diffs", async () => {
@@ -1534,6 +1576,13 @@ describe("derivePullRequestPanelState", () => {
       "runner-offline",
     );
     expect(derivePullRequestPanelState(q({ error: new Error("boom") })).kind).toBe("error");
+  });
+
+  it("reads an offline sandbox as sandbox-offline unless info was cached before it stopped", () => {
+    const asleep = (over: Parameters<typeof q>[0]) => ({ ...q(over), sandboxAsleep: true });
+    expect(derivePullRequestPanelState(asleep({ isLoading: true })).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({})).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({ data: ready })).kind).toBe("ready");
   });
 
   it("maps each unavailable reason to its own state", () => {
@@ -1711,6 +1760,7 @@ describe("session PR selection", () => {
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveTextContent(/^$/);
     expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
