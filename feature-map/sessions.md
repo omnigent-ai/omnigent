@@ -314,7 +314,10 @@ does not send a message; enter a question and send when ready.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
-create or select a closable Browser soft tab automatically.
+create or select a closable Browser soft tab automatically. A chat link to a
+session on the connected server instead opens that session in the current
+window, whether or not in-app opening is enabled. The iOS app does the same for
+a plain tap.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
@@ -657,6 +660,12 @@ plain `uv run pytest`, which starts a private server for the test.
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
+- **Desktop session links (real Electron, own environment):**
+  `web/electron/e2e/desktop_session_link.e2e.js` plain-clicks a chat link to
+  another session on the connected server and checks it opens in the same
+  window with no system browser. Cmd-click opening it externally has component
+  coverage in `web/src/components/blocks/ChatMarkdown.inAppLinkRouting.test.tsx`;
+  check it and an iOS tap of the same link manually.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide

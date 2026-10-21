@@ -1,5 +1,6 @@
-// Desktop chat links: an opted-in plain click routes to the embedded browser;
-// everything else keeps the shell's external default.
+// Desktop chat links: a same-origin session link opens in place, an opted-in
+// plain click routes to the embedded browser, and everything else keeps the
+// shell's external default.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -15,6 +16,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 }));
 
 const LINK = "https://example.com/page";
+const SESSION_LINK = `${window.location.origin}/c/conv-2`;
 let openOrNavigate: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
@@ -27,6 +29,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, "", "/");
   delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
   window.localStorage.clear();
 });
@@ -63,13 +66,44 @@ it.each([
   ["ctrl-click", LINK, { ctrlKey: true }],
   ["middle-click", LINK, { button: 1 }],
   ["a mailto: link", "mailto:a@example.com", {}],
+  ["cmd-click on a session link", SESSION_LINK, { metaKey: true }],
 ])("keeps %s on the external path", (_label, href, init) => {
   expect(clickLink(href, init).defaultPrevented).toBe(false);
   expect(openOrNavigate).not.toHaveBeenCalled();
 });
 
-it("keeps the external default when the preference is off", () => {
-  writeOpenLinksInApp(false);
-  expect(clickLink().defaultPrevented).toBe(false);
-  expect(openOrNavigate).not.toHaveBeenCalled();
-});
+it.each([LINK, "https://other.example.com/c/conv-2"])(
+  "keeps %s on the external path when the preference is off",
+  (href) => {
+    writeOpenLinksInApp(false);
+    window.history.replaceState(null, "", "/c/conv-1");
+    expect(clickLink(href).defaultPrevented).toBe(false);
+    expect(window.location.pathname).toBe("/c/conv-1");
+    expect(openOrNavigate).not.toHaveBeenCalled();
+  },
+);
+
+it.each([true, false])(
+  "opens a same-origin session link in place (in-app browser preference %s)",
+  (preference) => {
+    writeOpenLinksInApp(preference);
+    window.history.replaceState(null, "", "/c/conv-1");
+    expect(clickLink(SESSION_LINK).defaultPrevented).toBe(true);
+    expect(window.location.pathname).toBe("/c/conv-2");
+    expect(openOrNavigate).not.toHaveBeenCalled();
+  },
+);
+
+it.each([true, false])(
+  "keeps a same-origin non-session link off the session path (in-app browser preference %s)",
+  (preference) => {
+    writeOpenLinksInApp(preference);
+    window.history.replaceState(null, "", "/c/conv-1");
+    const settingsLink = `${window.location.origin}/settings/c/session`;
+    expect(clickLink(settingsLink).defaultPrevented).toBe(preference);
+    expect(window.location.pathname).toBe("/c/conv-1");
+    expect(openOrNavigate.mock.calls).toEqual(
+      preference ? [["conv-1", settingsLink, undefined, { agent: true }]] : [],
+    );
+  },
+);

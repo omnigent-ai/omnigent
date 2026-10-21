@@ -7,6 +7,7 @@ import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
 import { isNativeShell, supportsBrowser } from "./nativeBridge";
+import { openSameOriginSessionLink } from "./sessionNavigation";
 
 type OpenOrNavigate = (
   conversationId: string,
@@ -79,8 +80,9 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
  * open-in-new-tab / menu semantics. In a native shell the default path is the
  * shell's window-open policy (external browser / system handlers) — except
- * when the user opted in to the in-app browser, where a plain click on a web
- * link routes to the conversation's embedded browser pane instead. The web
+ * that a plain click on a same-origin session link navigates the app in place,
+ * and, when the user opted in to the in-app browser, a plain click on another
+ * web link routes to the conversation's embedded browser pane instead. The web
  * popup fallback never runs natively: the shell's policy reports `null` from
  * window.open regardless, so it would navigate twice.
  */
@@ -92,7 +94,9 @@ export function followLinkWithPopupFallback(
   if (event.defaultPrevented || event.button !== 0) return;
   if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   if (isNativeShell()) {
-    if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
+    if (openSameOriginSessionLink(href) || maybeOpenLinkInApp(conversationId, href)) {
+      event.preventDefault();
+    }
     return;
   }
   if (!/^(?:https?:)?\/\//i.test(href)) return;
