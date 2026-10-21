@@ -431,7 +431,9 @@ def test_managed_databricks_connection_native_gemini_support(native_gemini: bool
         entry = load_providers(config)["dbx"]
         assert entry.connection == "databricks"
         assert entry.profile is None
-        assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+        assert provider_families(entry) == frozenset(
+            {ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE}
+        )
 
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])

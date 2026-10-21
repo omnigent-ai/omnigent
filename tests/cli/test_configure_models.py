@@ -12,9 +12,10 @@ add/set-default/remove write paths surfaces here rather than silently.
 harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
-``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
-``15=Quit``. There is no "More" folding — every harness is visible at once —
+``7=Omp``, ``8=Antigravity``, ``9=Qwen Code``, ``10=Goose``, ``11=Devin``,
+``12=Grok Build``, ``13=Jcode``, ``14=Copilot``, ``15=Kiro``,
+``16=Kimi Code``, ``17=Import from OpenClaw``, ``18=Custom ACP agent``,
+``19=Quit``. There is no "More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -981,7 +982,7 @@ def test_remove_databricks_gemini_preserves_other_harness_wiring(isolated_config
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "3", "1", "2", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "3", "1", "2", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     assert "agy-db" not in _config_yaml(isolated_config).get("providers", {})
@@ -3027,8 +3028,8 @@ def test_cursor_install_now_invokes_runner_without_index(
 
 
 # ── Antigravity auth flow ───────────────────────────────────────────────────
-# Antigravity (Gemini-native, no provider family) is row 7 on the overview (it
-# follows Pi) and stores its key in the secret store + the ``antigravity:``
+# Antigravity (Gemini-native, no provider family) is row 8 on the overview (it
+# follows Omp) and stores its key in the secret store + the ``antigravity:``
 # config block. The same drill-in also exposes native ``agy`` sign-in;
 # ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
 
@@ -3759,7 +3760,7 @@ def test_antigravity_gateway_setup_persists_native_provider(isolated_config, mon
     stdin = (
         "\n".join(
             [
-                "7",
+                "8",
                 "3",
                 "1",
                 "2",
@@ -3792,7 +3793,7 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
     from omnigent.harnesses.antigravity_native.credentials import resolve_antigravity_credentials
     from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL
 
-    stdin = "\n".join(["7", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     credentials = resolve_antigravity_credentials()
@@ -3804,7 +3805,7 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
 
 @pytest.mark.parametrize("correct_url", [True, False], ids=["correct", "go-back"])
 def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct_url) -> None:
-    inputs = ["7", "3", "1", "2", "demo-gemini", "https://gateway.example/v1/responses"]
+    inputs = ["8", "3", "1", "2", "demo-gemini", "https://gateway.example/v1/responses"]
     if correct_url:
         inputs += ["https://gateway.example/gemini", "gateway-fake-key", ""]
     else:
@@ -3849,7 +3850,7 @@ def test_gemini_databricks_setup_recovers_from_auth_failure(
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     source.assert_called_once_with("work")
@@ -3897,7 +3898,7 @@ def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, 
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     assert "OpenAI Responses" in result.output, result.output
@@ -3970,7 +3971,7 @@ def test_databricks_setup_recovers_from_malformed_profile(
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     assert "profile configuration" in " ".join(result.output.split())
