@@ -24,7 +24,9 @@ parsing can fail before native logging initializes. Neither path reads Codex's
 private log files. Claude's debug channel does
 not capture arbitrary child-process stderr, terminal screen contents, or errors
 that occur before Claude initializes its logger. The terminal's file descriptors
-remain unchanged.
+remain unchanged. Both harnesses also export a bounded excerpt of a live pane that
+has not become interactive; see
+[Native startup stall records](#native-startup-stall-records).
 
 ## Content and destinations
 
@@ -289,6 +291,33 @@ error or the CLI's startup error. Cancellation emits no event. If the collector
 fails, the row carries `diagnostics_error_type` instead of the snapshot; a
 logging failure cannot replace the startup error or skip teardown.
 
+## Native startup stall records
+
+A native TUI that stays on screen without becoming interactive leaves records of
+what its pane shows, so a session start held by a launcher step (a login
+refresh, an update prompt, a wrapper waiting on the network) can be attributed.
+The runner's readiness observer logs `terminal_interactive_slow` once at INFO,
+20 s after the terminal is registered (never later than a third of the 180 s
+readiness deadline), and `terminal_interactive_unobserved` at WARNING when the
+deadline passes with the pane still running. Most slow starts still succeed,
+which is why the early record stays below WARNING. Codex's `agent_startup_pending` record is written when
+the thread-start budget expires behind a live pane.
+
+Records of a running pane carry `sign_in_prompt_detected`. With capture enabled
+and no sign-in prompt on screen they also carry `terminal_last_output`: the live
+pane read with wrapped rows joined, sanitized and trimmed like the startup-exit
+excerpt (the last 40 lines and 4,000 characters). The excerpt is also appended
+to the log message, so the runner's local log under `~/.omnigent/logs/runner/`
+carries it without a structured exporter. An actionable sign-in prompt is
+reported only as the flag, and the tail is withheld whenever any sign-in
+material is on screen: a sign-in address, or a line mentioning a code beside
+sign-in wording, even from a prompt the launcher has moved past. One-time codes
+therefore stay out of logs. The early
+record exists so a runner lost before the deadline, for example by a host
+restart, still leaves the pane on record. A pane that has already stopped is
+described by its exit records instead; with capture disabled these records stay
+content-free.
+
 ## Native turn failure evidence
 
 Failed `external_session_status` events accept optional `failure_context`
@@ -478,7 +507,7 @@ uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_diagno
 uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_continuous_diagnostics.py tests/harnesses/codex_native/test_codex_native_app_server_stderr.py
 uv run --no-sync pytest -q tests/harnesses/codex_native/app_server/test_startup.py
 uv run --no-sync pytest -q tests/harnesses/codex_native/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
-uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py
+uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py tests/runner/test_native_terminal_interactive.py
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py

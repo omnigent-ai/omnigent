@@ -362,7 +362,12 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # references keep the tasks alive after session creation returns.
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
+# First record of a pane that is not interactive yet, early enough that a runner
+# lost before the deadline (a host restart) still leaves what it showed on record.
+_TERMINAL_INTERACTIVE_SLOW_S = 20.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
+# A startup dialog still up after this long is waiting on the person, not a repaint.
+_STARTUP_DIALOG_NOTICE_AFTER_S = 3.0
 # Sign-in may stay open indefinitely; limit its liveness subprocess rate.
 _CODEX_LOGIN_EXIT_POLL_INTERVAL_S = 1.0
 # How often a starting pane is read for a launcher sign-in prompt.
@@ -400,6 +405,72 @@ _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
 _terminal_lookup_miss_log_state: dict[tuple[str, str, str], float] = {}
 
 
+@dataclasses.dataclass(frozen=True)
+class _StartupDialogWatch:
+    """
+    How a harness spots a dialog holding its starting pane and tells the person.
+
+    :param headline: Names the dialog on a pane capture, e.g. ``"Settings Error"``,
+        or returns ``None`` when no dialog is up.
+    :param notify: Posts the session notice for a dialog headline.
+    :param category: Fault attribution for a dialog headline, e.g.
+        :attr:`ErrorCategory.CONFIG` for a settings file the agent cannot read,
+        or ``None`` when the dialog says nothing about fault.
+    """
+
+    headline: Callable[[str], str | None]
+    notify: Callable[[str], Awaitable[None]]
+    category: Callable[[str], ErrorCategory | None]
+
+
+async def _report_startup_dialog(
+    watch: _StartupDialogWatch,
+    headline: str,
+    *,
+    session_id: str,
+    harness: str,
+    terminal_id: str,
+    instance: TerminalInstance,
+    waited_s: float,
+) -> None:
+    """Log the dialog holding a starting pane, then tell the person to answer it."""
+    from omnigent.process_logging import redact_log_text
+
+    category = watch.category(headline)
+    attribution = (
+        {
+            "error_category": category.value,
+            "error_impact": ErrorImpact.BLOCKING.value,
+            "error_phase": ErrorPhase.HARNESS_STARTUP.value,
+        }
+        if category is not None
+        else {}
+    )
+    _logger.warning(
+        "Native terminal startup is waiting on a dialog: session=%s harness=%s "
+        "terminal_id=%s waited_s=%.0f",
+        session_id,
+        harness,
+        terminal_id,
+        waited_s,
+        extra=debug_event(
+            "native_startup_dialog",
+            session_id=session_id,
+            harness=harness,
+            terminal_id=terminal_id,
+            terminal_instance_id=instance.diagnostic_id,
+            dialog_headline=redact_log_text(headline),
+            **attribution,
+        ),
+    )
+    try:
+        await watch.notify(headline)
+    except Exception:  # noqa: BLE001 — a lost notice must not end the readiness watch
+        _logger.warning(
+            "Failed to post the startup dialog notice for %s", session_id, exc_info=True
+        )
+
+
 async def _observe_terminal_interactive(
     *,
     session_id: str,
@@ -409,11 +480,30 @@ async def _observe_terminal_interactive(
     instance: TerminalInstance,
     is_interactive: Callable[[str], bool],
     timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
+    slow_after_s: float | None = None,
     poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
+    startup_dialog: _StartupDialogWatch | None = None,
 ) -> None:
-    """Emit one semantic event when a native TUI can accept a message."""
+    """Emit one semantic event when a native TUI can accept a message.
+
+    A pane still not interactive at the slow mark is described once with its
+    redacted tail, so a runner lost before the deadline still leaves a record.
+    By default the mark is ``_TERMINAL_INTERACTIVE_SLOW_S`` or a third of
+    *timeout_s*, whichever is shorter; an explicit *slow_after_s* is used as given.
+
+    With ``startup_dialog``, a dialog that holds the pane for
+    :data:`_STARTUP_DIALOG_NOTICE_AFTER_S` is reported once, so the person
+    learns the session is waiting on them rather than starting slowly.
+    """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
+    started_at = loop.time()
+    deadline = started_at + timeout_s
+    if slow_after_s is None:
+        slow_after_s = min(_TERMINAL_INTERACTIVE_SLOW_S, timeout_s / 3)
+    slow_logged = False
+    dialog_headline: str | None = None
+    dialog_since = started_at
+    dialog_reported = False
     try:
         while True:
             result = await instance.read()
@@ -438,26 +528,73 @@ async def _observe_terminal_interactive(
                 raise RuntimeError("terminal stopped before becoming interactive")
             if loop.time() >= deadline:
                 raise TimeoutError(f"terminal did not become interactive within {timeout_s:g}s")
+            if startup_dialog is not None and not dialog_reported and isinstance(screen, str):
+                headline = startup_dialog.headline(screen)
+                if headline != dialog_headline:
+                    dialog_headline, dialog_since = headline, loop.time()
+                elif headline is not None and (
+                    loop.time() - dialog_since >= _STARTUP_DIALOG_NOTICE_AFTER_S
+                ):
+                    dialog_reported = True
+                    await _report_startup_dialog(
+                        startup_dialog,
+                        headline,
+                        session_id=session_id,
+                        harness=harness,
+                        terminal_id=terminal_id,
+                        instance=instance,
+                        waited_s=loop.time() - started_at,
+                    )
+            if not slow_logged and loop.time() >= started_at + slow_after_s:
+                slow_logged = True
+                tail, sign_in_prompt = await _stalled_pane_diagnostics(instance)
+                slow_event = debug_event("terminal_interactive_slow", session_id=session_id)
+                slow_event["attributes"] = {
+                    "harness": harness,
+                    "terminal_id": terminal_id,
+                    "terminal_instance_id": instance.diagnostic_id,
+                    "readiness_signal": readiness_signal,
+                    **_pane_attributes(tail, sign_in_prompt),
+                }
+                # Most slow starts still succeed, so this stays below the deadline's WARNING.
+                _logger.info(
+                    "Native terminal is not interactive yet: session=%s harness=%s "
+                    "terminal_id=%s waited_s=%.0f%s",
+                    session_id,
+                    harness,
+                    terminal_id,
+                    loop.time() - started_at,
+                    _pane_tail_message(tail),
+                    extra=slow_event,
+                )
             await asyncio.sleep(poll_interval_s)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
+        # A stopped pane reports its final screen with the exit; a live one is read here.
+        tail, sign_in_prompt = (
+            await _stalled_pane_diagnostics(instance)
+            if isinstance(exc, TimeoutError)
+            else (None, None)
+        )
+        unobserved_event = debug_event("terminal_interactive_unobserved", session_id=session_id)
+        unobserved_event["attributes"] = {
+            "harness": harness,
+            "terminal_id": terminal_id,
+            "terminal_instance_id": instance.diagnostic_id,
+            "readiness_signal": readiness_signal,
+            "reason": type(exc).__name__,
+            **_pane_attributes(tail, sign_in_prompt),
+        }
         _logger.warning(
             "Native terminal interactivity was not observed: session=%s harness=%s "
-            "terminal_id=%s reason=%s",
+            "terminal_id=%s reason=%s%s",
             session_id,
             harness,
             terminal_id,
             str(exc),
-            extra=debug_event(
-                "terminal_interactive_unobserved",
-                session_id=session_id,
-                harness=harness,
-                terminal_id=terminal_id,
-                terminal_instance_id=instance.diagnostic_id,
-                readiness_signal=readiness_signal,
-                reason=type(exc).__name__,
-            ),
+            _pane_tail_message(tail),
+            extra=unobserved_event,
         )
 
 
@@ -470,6 +607,7 @@ def _schedule_terminal_interactive_observer(
     harness: str,
     readiness_signal: str,
     is_interactive: Callable[[str], bool],
+    startup_dialog: _StartupDialogWatch | None = None,
 ) -> None:
     """Start a non-blocking readiness observer for a registered terminal."""
     terminal_registry = getattr(resource_registry, "terminal_registry", None)
@@ -496,6 +634,7 @@ def _schedule_terminal_interactive_observer(
             readiness_signal=readiness_signal,
             instance=instance,
             is_interactive=is_interactive,
+            startup_dialog=startup_dialog,
         ),
         name=f"terminal-interactive-{session_id}-{terminal_name}",
     )
@@ -2920,6 +3059,47 @@ _CODEX_THREAD_RESET_NOTICE = (
     "Codex thread instead of failing the turn. The chat history here is intact, but "
     "Codex's own memory of the earlier turns is not restored."
 )
+
+
+async def _post_claude_startup_dialog_notice(
+    headline: str,
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+) -> None:
+    """Tell the person that Claude Code's startup is waiting on a terminal dialog.
+
+    Posts an ``error`` item with ``level: "info"``, so the web UI renders a
+    neutral notice that persists across reload and stays out of the model's
+    context. A session started from the web has no other sign that its agent
+    is waiting on the person rather than still starting.
+
+    :param headline: The dialog's first line, e.g. ``"Settings Error"``.
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client.
+    :raises httpx.HTTPError: If the notice could not be posted.
+    """
+    resp = await server_client.post(
+        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "native_startup_dialog",
+                    "title": "Claude Code is waiting for an answer",
+                    "message": (
+                        f"Claude Code is showing “{headline}” in its terminal and won't "
+                        "start until it is answered. Open the terminal to continue."
+                    ),
+                    "level": "info",
+                },
+            },
+        },
+        timeout=10.0,
+    )
+    resp.raise_for_status()
 
 
 async def _post_codex_thread_reset_notice(
@@ -5816,15 +5996,62 @@ def _terminal_exit_summary(
     return f"{runtime_name} terminal exited{status_text} {stage}."
 
 
-def _startup_terminal_output(instance: TerminalInstance) -> str | None:
-    """Apply the same capture gate and bounds to both startup-error paths."""
+def _redacted_terminal_text(text: str) -> str | None:
+    """Redact and bound pane text for a diagnostic, or ``None`` when capture is off."""
     from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
     from omnigent.process_logging import harness_stderr_capture_enabled
     from omnigent.runner.resource_registry import trim_terminal_output
 
     if not harness_stderr_capture_enabled():
         return None
-    return trim_terminal_output(sanitize_diagnostic_text(instance.last_exit_text() or ""))
+    return trim_terminal_output(sanitize_diagnostic_text(text))
+
+
+def _pane_tail_message(tail: str | None) -> str:
+    """Append a captured pane to a log message; the local runner log renders only messages."""
+    return f"\nTerminal output:\n{tail}" if tail else ""
+
+
+def _pane_attributes(tail: str | None, sign_in_prompt: bool | None) -> dict[str, object]:
+    """Pane attributes for a startup record: only what a live pane read established."""
+    attributes: dict[str, object] = {}
+    if sign_in_prompt is not None:
+        attributes["sign_in_prompt_detected"] = sign_in_prompt
+    if tail:
+        attributes["terminal_last_output"] = tail
+    return attributes
+
+
+def _startup_terminal_output(instance: TerminalInstance) -> str | None:
+    """Apply the same capture gate and bounds to both startup-error paths."""
+    from omnigent.process_logging import harness_stderr_capture_enabled
+
+    # Read the exit text only when it may be exported.
+    if not harness_stderr_capture_enabled():
+        return None
+    return _redacted_terminal_text(instance.last_exit_text() or "")
+
+
+async def _stalled_pane_diagnostics(instance: TerminalInstance) -> tuple[str | None, bool]:
+    """Return a live pane's redacted tail and whether it shows a sign-in prompt.
+
+    The flag reports an actionable prompt. The tail is withheld whenever any
+    sign-in material is on screen, including a prompt the launcher has already
+    moved past, so a one-time code or address never reaches a log.
+    """
+    from omnigent.harnesses.diagnostics import contains_sign_in_material, detect_sign_in_prompt
+
+    try:
+        screen = await _read_pane_screen(instance)
+        prompt = detect_sign_in_prompt(screen) is not None
+        if contains_sign_in_material(screen):
+            return None, prompt
+        return _redacted_terminal_text(screen), False
+    except Exception:  # noqa: BLE001 — a diagnostics failure costs the tail, not the observation
+        _logger.debug(
+            "Stalled pane diagnostics failed for %s", instance.diagnostic_id, exc_info=True
+        )
+        return None, False
 
 
 class _CodexTerminalExited(RuntimeError):
@@ -5843,16 +6070,14 @@ class _CodexSignInPromptSeen(RuntimeError):
         super().__init__("Codex pane is parked on a sign-in prompt")
 
 
-async def _codex_pane_screen(instance: TerminalInstance) -> str:
+async def _read_pane_screen(instance: TerminalInstance) -> str:
     """Return the pane's screen with wrapped rows joined, or ``""`` when it cannot be read."""
     try:
         # A sign-in address is far wider than the 80-column pane the runner
         # creates, so read wrapped rows joined back into their original lines.
         result = await instance.read(join_wrapped=True)
     except Exception:  # noqa: BLE001 — an unreadable pane simply shows nothing yet
-        _logger.debug(
-            "Codex startup pane read failed for %s", instance.diagnostic_id, exc_info=True
-        )
+        _logger.debug("Startup pane read failed for %s", instance.diagnostic_id, exc_info=True)
         return ""
     raw_screen = result.get("screen") if isinstance(result, dict) else None
     return raw_screen if isinstance(raw_screen, str) else ""
@@ -5883,7 +6108,7 @@ async def _wait_for_codex_thread_or_terminal_exit(
         previous_url: str | None = None
         while True:
             await asyncio.sleep(_CODEX_SIGN_IN_POLL_INTERVAL_S)
-            prompt = detect_sign_in_prompt(await _codex_pane_screen(instance))
+            prompt = detect_sign_in_prompt(await _read_pane_screen(instance))
             if prompt is not None and prompt.url == previous_url:
                 return
             previous_url = prompt.url if prompt is not None else None
@@ -5941,9 +6166,14 @@ async def _record_agent_startup_pending(
     :param waited_seconds: How long discovery has waited for the thread so far.
     """
     from omnigent.harnesses.codex_native.bridge import write_bridge_startup_error
-    from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+    from omnigent.harnesses.diagnostics import (
+        contains_sign_in_material,
+        detect_sign_in_prompt,
+        sign_in_next_step,
+    )
 
-    prompt = detect_sign_in_prompt(await _codex_pane_screen(terminal_instance))
+    screen = await _read_pane_screen(terminal_instance)
+    prompt = detect_sign_in_prompt(screen)
     if prompt is not None:
         code = "databricks_sign_in_pending"
         title = "Codex can't start until you sign in to Databricks"
@@ -5967,20 +6197,26 @@ async def _record_agent_startup_pending(
         remediation=remediation,
     )
     pending_event = debug_event("agent_startup_pending", session_id=session_id)
-    pending_event["attributes"] = {
+    attributes: dict[str, object] = {
         "harness": "codex-native",
         "phase": "thread_discovery",
         "waited_s": round(waited_seconds, 1),
         "sign_in_prompt_detected": prompt is not None,
         "code": code,
     }
+    # The pane is the only record of what holds startup, unless sign-in material is on it.
+    tail = None if contains_sign_in_material(screen) else _redacted_terminal_text(screen)
+    if tail:
+        attributes["terminal_last_output"] = tail
+    pending_event["attributes"] = attributes
     _logger.warning(
         "Codex TUI for %s has not started a thread after %.0fs but its pane is alive; "
-        "recorded %s and waiting without a deadline%s",
+        "recorded %s and waiting without a deadline%s%s",
         session_id,
         waited_seconds,
         code,
         " (a sign-in prompt is on screen)" if prompt is not None else "",
+        _pane_tail_message(tail),
         extra=pending_event,
     )
 
@@ -9430,7 +9666,16 @@ async def _auto_create_claude_terminal(
         terminal_name="claude",
         session_key="main",
     )
-    from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+    from omnigent.harnesses.claude_native.bridge import (
+        _claude_prompt_rendered,
+        _terminal_dialog_headline,
+        claude_startup_dialog_category,
+    )
+
+    async def notify_startup_dialog(headline: str) -> None:
+        await _post_claude_startup_dialog_notice(
+            headline, session_id=session_id, server_client=server_client
+        )
 
     _schedule_terminal_interactive_observer(
         session_id=session_id,
@@ -9440,6 +9685,11 @@ async def _auto_create_claude_terminal(
         harness="claude-native",
         readiness_signal="claude_composer",
         is_interactive=_claude_prompt_rendered,
+        startup_dialog=_StartupDialogWatch(
+            headline=_terminal_dialog_headline,
+            notify=notify_startup_dialog,
+            category=claude_startup_dialog_category,
+        ),
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",

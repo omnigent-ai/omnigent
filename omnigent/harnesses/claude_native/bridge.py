@@ -68,6 +68,7 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+from omnigent.errors import ErrorCategory
 from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -6437,6 +6438,22 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     if not has_selector and "press enter" not in footer.lower():
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
+
+
+# Claude Code's dialog for a settings file it cannot parse.
+_SETTINGS_ERROR_DIALOG_HEADLINE = "Settings Error"
+
+
+def claude_startup_dialog_category(headline: str) -> ErrorCategory | None:
+    """
+    Attribute a dialog holding Claude Code's startup, or ``None`` when it says nothing.
+
+    :param headline: The dialog's first line from :func:`_terminal_dialog_headline`,
+        e.g. ``"Settings Error"``.
+    :returns: :attr:`ErrorCategory.CONFIG` for the invalid-settings dialog, whose fix
+        is in the person's own settings file; ``None`` for any other dialog.
+    """
+    return ErrorCategory.CONFIG if headline == _SETTINGS_ERROR_DIALOG_HEADLINE else None
 
 
 def _wait_for_claude_prompt_ready(
