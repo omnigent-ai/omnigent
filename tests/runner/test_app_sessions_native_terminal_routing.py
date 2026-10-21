@@ -1072,6 +1072,8 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     [
         ("missing", True),
         ("failed_startup", True),
+        ("dead_backend", True),
+        ("unowned_dead_backend", False),
         ("starting", False),
         ("ready", False),
         ("detached", False),
@@ -1089,7 +1091,7 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
     session_id = uuid.uuid4().hex
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
-    if backend_state in ("ready", "detached"):
+    if backend_state in ("ready", "detached", "dead_backend", "unowned_dead_backend"):
         codex_native_bridge.write_bridge_state(
             bridge_dir,
             codex_native_bridge.CodexNativeBridgeState(
@@ -1101,11 +1103,17 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
         )
     if backend_state == "failed_startup":
         codex_native_bridge.record_app_server_stopped(bridge_dir)
-    if backend_state in ("starting", "ready"):
+    backend = None
+    if backend_state in ("starting", "ready", "dead_backend", "unowned_dead_backend"):
+        backend = SimpleNamespace(
+            proc=SimpleNamespace(returncode=1 if "dead_backend" in backend_state else None),
+            bridge_dir=bridge_dir,
+            close=AsyncMock(),
+        )
         monkeypatch.setitem(
             orchestration._AUTO_CODEX_APP_SERVERS,
             session_id,
-            SimpleNamespace(proc=SimpleNamespace(returncode=None)),
+            backend,
         )
 
     registry = TerminalRegistry()
@@ -1119,7 +1127,8 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
         _harness_spec("codex-native"), terminal_registry=registry
     )
     resources = app.state.session_resource_registry
-    resources._terminal_roles[(session_id, "terminal_codex_main")] = CODEX_NATIVE_TERMINAL_ROLE
+    if backend_state != "unowned_dead_backend":
+        resources._terminal_roles[(session_id, "terminal_codex_main")] = CODEX_NATIVE_TERMINAL_ROLE
     launches: list[str] = []
 
     async def launch(
@@ -1147,6 +1156,8 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
 
     assert launches == ([session_id] if recreated else [])
     assert close.await_count == int(recreated)
+    if backend is not None:
+        assert backend.close.await_count == int(recreated)
 
 
 @pytest.mark.asyncio

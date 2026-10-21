@@ -143,7 +143,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
-from omnigent.runner.native_controls import build_native_controls
+from omnigent.runner.native_controls import build_native_controls, retire_stopped_codex_backend
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -5276,6 +5276,21 @@ def create_runner_app(
             and name not in _spec_names
         )
 
+        if harness_name == "codex-native":
+            backend = _native_runtime._AUTO_CODEX_APP_SERVERS.get(conv)
+            if backend is not None and (
+                backend.proc is None or backend.proc.returncode is not None
+            ):
+                from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+                await retire_stopped_codex_backend(
+                    conv,
+                    read_bridge_state(backend.bridge_dir),
+                    backend.bridge_dir,
+                    backend,
+                    resource_registry=resource_registry,
+                    ensure_locks=_codex_terminal_ensure_locks,
+                )
         await _ensure_native_terminal_for_turn(conv, harness_name)
 
         startup_envelope = _fresh_session_init_envelope(conv)
