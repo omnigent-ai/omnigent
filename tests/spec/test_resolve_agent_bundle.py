@@ -3,6 +3,8 @@ import re
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
+from markdown_it.tree import SyntaxTreeNode
 
 from omnigent.cli import _bundle
 from omnigent.inner.bundle_skills import claude_native_skill_args
@@ -13,6 +15,30 @@ from omnigent.spec import load, materialize_bundle
 from omnigent.tools.builtins.load_skill import LoadSkillTool, list_skill_resources
 
 _AGENT = Path(__file__).resolve().parents[2] / "dev" / "resolve-agent"
+
+
+def _markdown_link_targets(source: str) -> list[str]:
+    tree = SyntaxTreeNode(MarkdownIt().parse(source))
+    return [
+        node.attrs["href" if node.type == "link" else "src"]
+        for node in tree.walk()
+        if node.type in {"link", "image"}
+    ]
+
+
+def test_markdown_link_targets_exclude_code_examples() -> None:
+    source = """`![demo](recordings/example.mp4)`
+
+```markdown
+[example](missing.md)
+```
+
+[Guide](guide.md) and ![Image](image.png)
+[Reference][ref]
+
+[ref]: reference.md
+"""
+    assert _markdown_link_targets(source) == ["guide.md", "image.png", "reference.md"]
 
 
 @pytest.mark.parametrize("target_repo", ["omnigent", "omnigent-internal"])
@@ -90,7 +116,7 @@ def test_otto_agent_markdown_links_resolve_from_their_own_directory(agent: str) 
     assert all(skill.is_dir() for skill in shared)
     documents = {*root.rglob("*.md"), *(doc for skill in shared for doc in skill.rglob("*.md"))}
     for document in sorted(documents):
-        for target in re.findall(r"\]\(([^)\s]+)\)", document.read_text()):
+        for target in _markdown_link_targets(document.read_text()):
             if re.match(r"[a-z][a-z0-9+.-]*:|#|/", target):
                 continue
             if not (document.parent / target.split("#")[0]).exists():

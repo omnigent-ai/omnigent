@@ -20,16 +20,21 @@ hook changed tested files, rerun their checks. If the checkout has
   `pushed_branch` and leave `pr_url` empty; do not prepare a PR or drive one.
   The outcome is `partially_implemented`, with publishing and the PR loop in
   `remaining_work`.
-- **Workflow-owned (a CI publisher contract is appended to your instructions):**
-  do not push or make any `gh` write. Write and validate `.omnigent/pr-body.md`
+- **Workflow-owned (CI says the workflow publishes after your handoff):**
+  do not push or make any PR write, including through `pr.py`.
+  Write and validate `.omnigent/pr-body.md`
   (below), write the final handoff, and stop. The workflow publishes the PR and
   runs the PR loop.
+- **Agent-owned (CI explicitly says this session owns publication):** follow
+  that contract to push, create the PR with the checked helper, then upload
+  demos and drive the PR. This overrides the workflow-owned handoff procedure.
 - **Direct (no publisher contract):** push the branch, open the PR, then drive it
   (below).
 
-When `.omnigent/pr-gate.json` exists, make every PR write (create, edit, comment,
-review, ready) with the `pr.py` helper CI supplies, at the path given in the
-publisher contract. Keep Git pushes on the supplied credential. Never decode,
+The gate file selects the transport; it does not grant publication authority.
+When PR writes are authorized and `.omnigent/pr-gate.json` exists, make every
+PR write (create, edit, comment, review, ready) with the `pr.py` helper CI supplies,
+at the path given in the publisher contract. Keep Git pushes on the supplied credential. Never decode,
 search for, or export another token, and never change credential configuration.
 
 The PR is always **ready for review, never a draft**, including when a
@@ -56,10 +61,15 @@ in, keeping every heading and checkbox row:
 
 Aim for fewer than 800 visible words. If the checkout has
 `.github/scripts/pr-template/validate.py`, run it with
-`PR_BODY="$(cat .omnigent/pr-body.md)"` and fix every error. Then publish with
+`PR_BODY="$(cat .omnigent/pr-body.md)"` and fix every error. In workflow-owned
+mode, hand off and stop here. Otherwise publish with
 `gh pr create --body-file .omnigent/pr-body.md`, or the helper in checked mode.
 
 ## Upload the demo
+
+This step requires an existing PR and authorization to write to it: an
+agent-owned/direct publication run, or an authorized PR-loop/remediation run.
+Workflow-owned author runs leave uploading and description edits to the publisher.
 
 Wait for recording and rendering to finish before uploading. Upload the clips
 in a PR comment, then copy their returned URLs into the description:
@@ -78,6 +88,8 @@ in a PR comment, then copy their returned URLs into the description:
    use `gh pr comment <pr> --body-file <file> --attach <clip> …` with the supplied
    credential. If uploading is unavailable, report the recording blocker and
    manual test steps; do not change credentials.
+   Read the uploaded asset URLs from the posted comment using
+   `gh pr view <pr> --comments` or the comment URL printed by `gh`.
 3. Put those URLs under the matching `### CUJ-n` headings in the Demo section,
    each on its own line so videos play inline. Update the description with
    the helper in checked mode or `gh pr edit --body-file` in direct mode.
@@ -86,7 +98,11 @@ Only these uploaded URLs count as recordings: they must be
 `https://github.com/user-attachments/assets/…` URLs. Local `recordings/` paths
 and CI artifact links do not.
 
-## Drive the PR (direct publication)
+The checked helper's CLI and upload contract live in `omnigent-internal`:
+`.github/scripts/resolve_pr_client.py` and `.github/scripts/resolve_pr_gate.py`;
+regressions are covered by `agents/repro-agent/tests/unit/test_pr_attachments.py`.
+
+## Drive the PR (agent-owned or direct publication)
 
 Stay on the PR until CI is green and both reviews are settled:
 
