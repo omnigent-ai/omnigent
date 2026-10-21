@@ -39,6 +39,7 @@ import {
   ChevronRightIcon,
   ClockIcon,
   CircleAlertIcon,
+  MoonIcon,
   CircleStopIcon,
   FolderGit2Icon,
   FolderIcon,
@@ -190,14 +191,17 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { SessionStateBadge } from "@/components/SessionStateBadge";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { SessionStateBadge, asleepTooltipText } from "@/components/SessionStateBadge";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
+import { isEditorLevel } from "@/lib/permissionsApi";
 import { SidebarEditRow } from "./SidebarEditRow";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
+import { useRunnerAsleepConfirmed, useTurnEndedAt } from "@/hooks/runnerHealthFreshness";
+import { IMPORT_SOURCE_LABEL_KEY, STARTING_GRACE_S } from "@/hooks/useSessionLiveness";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useSessionErrorStates } from "@/hooks/useSessionErrors";
 import type { LatestSessionError } from "@/lib/sessionError";
@@ -4289,6 +4293,19 @@ function SessionErrorHint() {
   );
 }
 
+/** Muted tooltip line for a stopped runner; the badge itself is covered by row actions on hover. */
+function SessionAsleepNote({ text }: { text: string }) {
+  return (
+    <p
+      data-testid="session-tooltip-asleep"
+      className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+    >
+      <MoonIcon aria-hidden className="size-3.5 shrink-0" />
+      <span>{text}</span>
+    </p>
+  );
+}
+
 /** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */
 function sessionLocationLabel(
   conversation: Conversation,
@@ -4478,10 +4495,12 @@ function LegacySessionTooltipContent({
   conversation,
   hostsById,
   hasError,
+  asleepNote,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
+  asleepNote: string | null;
 }) {
   return (
     <TooltipContent
@@ -4517,6 +4536,7 @@ function LegacySessionTooltipContent({
         </p>
       )}
       {hasError && <SessionErrorHint />}
+      {asleepNote !== null && <SessionAsleepNote text={asleepNote} />}
     </TooltipContent>
   );
 }
@@ -4525,10 +4545,12 @@ function SessionTooltipContent({
   conversation,
   hostsById,
   hasError,
+  asleepNote,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
+  asleepNote: string | null;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -4537,6 +4559,7 @@ function SessionTooltipContent({
         conversation={conversation}
         hostsById={hostsById}
         hasError={hasError}
+        asleepNote={asleepNote}
       />
     );
   }
@@ -4585,6 +4608,7 @@ function SessionTooltipContent({
       </p>
       <SessionTooltipDetails conversation={conversation} />
       {hasError && <SessionErrorHint />}
+      {asleepNote !== null && <SessionAsleepNote text={asleepNote} />}
     </TooltipContent>
   );
 }
@@ -4592,6 +4616,14 @@ function SessionTooltipContent({
 // Max gap between the first click and the dblclick of one double-click.
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
+
+/** Epoch ms when a fresh session's startup grace ends, or null when none applies. */
+function startupGraceEndMs(conversation: Conversation): number | null {
+  const createdAt = conversation.created_at;
+  if (!(typeof createdAt === "number" && createdAt > 0)) return null;
+  if (conversation.labels?.[IMPORT_SOURCE_LABEL_KEY] !== undefined) return null;
+  return (createdAt + STARTING_GRACE_S) * 1000;
+}
 
 function ConversationRowImpl({
   conversation,
@@ -4778,7 +4810,17 @@ function ConversationRowImpl({
   // Approvals and failures outrank the unread dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
   const [latestError] = useSessionErrorStates(errorConversations);
-  const derivedState = getSessionState(conversation, latestError);
+  // Stopped-runner liveness (stream-fed). Suppressed during the startup grace
+  // (a fresh session's runner has not registered yet), like the chat view.
+  const hostOnline = useSessionHostOnline(conversation.id);
+  // Like the chat view, the grace only covers the initial cold boot: once the
+  // runner has been seen online, a later offline reading is real.
+  const everOnlineRef = useRef<{ id: string; seen: boolean }>({ id: conversation.id, seen: false });
+  if (everOnlineRef.current.id !== conversation.id) {
+    everOnlineRef.current = { id: conversation.id, seen: false };
+  }
+  if (runnerOnline === true) everOnlineRef.current.seen = true;
+  const startupGraceEndsAtMs = everOnlineRef.current.seen ? null : startupGraceEndMs(conversation);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
@@ -4789,20 +4831,62 @@ function ConversationRowImpl({
   const isStartingUp = useChatStore(
     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
   );
-  const sessionState =
+  // The open row sees its own turn end in the same render as the chat view
+  // (both read the chat store), so the gate below never trusts a stale moon
+  // for that commit.
+  const localTurnEndedAt = useTurnEndedAt(conversation.id, isStartingUp);
+  // The open session's own poll can lag a just-finished turn; other rows are
+  // stream-fed and unaffected.
+  const asleepConfirmed = useRunnerAsleepConfirmed(isActive ? conversation.id : undefined, {
+    turnEndedAt: localTurnEndedAt,
+  });
+  const [, setGraceTick] = useState(0);
+  useEffect(() => {
+    if (startupGraceEndsAtMs === null) return;
+    const remainingMs = startupGraceEndsAtMs - Date.now();
+    if (remainingMs <= 0) return;
+    const timer = setTimeout(() => setGraceTick((tick) => tick + 1), remainingMs + 50);
+    return () => clearTimeout(timer);
+  }, [startupGraceEndsAtMs]);
+  const inStartupGrace = startupGraceEndsAtMs !== null && Date.now() < startupGraceEndsAtMs;
+  const derivedState = getSessionState(
+    conversation,
+    latestError,
+    inStartupGrace || !asleepConfirmed
+      ? undefined
+      : {
+          runnerOnline,
+          hostOnline,
+          // null = full access (unshared / single-user); only a numeric level
+          // below edit cannot send.
+          readOnly: !isEditorLevel(conversation.permission_level ?? null),
+        },
+  );
+  const rankedState =
     derivedState?.kind === "awaiting" || derivedState?.kind === "running"
       ? derivedState
       : isStartingUp
         ? { kind: "starting" as const }
-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
+        : derivedState && derivedState.kind !== "asleep"
+          ? derivedState
+          : hasUnseenMessages
+            ? { kind: "unseen" as const }
+            : derivedState;
   // Drafts share the row's trailing indicator slot, but the active session's
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
+  // Asleep is the lowest priority: a draft marker takes the slot instead.
+  const sessionState = rankedState?.kind === "asleep" && showDraftIndicator ? null : rankedState;
+  const asleepNote =
+    sessionState?.kind === "asleep" ? asleepTooltipText(sessionState.readOnly) : null;
   const showSharedIndicator = !isOwner;
-  const hasSessionIndicator = sessionState !== null || showDraftIndicator;
-  // The "Show → Updated" timestamp takes the indicator slot only when it's free.
+  // The "Show → Updated" timestamp takes the indicator slot only when it's
+  // free. The asleep moon is the exception: it sits beside the label instead
+  // of replacing it, so the timestamp stays readable.
   const show = useContext(SidebarShowContext);
+  const asleepBesideUpdated = sessionState?.kind === "asleep" && show.includes("updated");
+  const hasSessionIndicator = (sessionState !== null && !asleepBesideUpdated) || showDraftIndicator;
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
   const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
@@ -5045,8 +5129,12 @@ function ConversationRowImpl({
               : "pr-29"
             : showUpdated
               ? showSharedIndicator
-                ? "pr-18"
-                : "pr-11"
+                ? asleepBesideUpdated
+                  ? "pr-23"
+                  : "pr-18"
+                : asleepBesideUpdated
+                  ? "pr-16"
+                  : "pr-11"
               : hasSessionIndicator && showSharedIndicator
                 ? "pr-14"
                 : hasTrailingIndicator
@@ -5186,6 +5274,7 @@ function ConversationRowImpl({
               conversation={conversation}
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
+              asleepNote={asleepNote}
             />
           </Tooltip>
         )
@@ -5242,6 +5331,7 @@ function ConversationRowImpl({
             conversation={conversation}
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
+            asleepNote={asleepNote}
           />
         </Tooltip>
       )}
@@ -5289,9 +5379,12 @@ function ConversationRowImpl({
           className={cn(
             SESSION_STATE_SLOT_CLASS,
             overlayTop,
-            "right-2 text-sm text-muted-foreground",
+            "right-2 gap-1 text-sm text-muted-foreground",
           )}
         >
+          {asleepBesideUpdated && sessionState !== null && (
+            <SessionStateBadge state={sessionState} />
+          )}
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
@@ -5303,7 +5396,13 @@ function ConversationRowImpl({
           className={cn(
             "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
             overlayTop,
-            hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
+            hasSessionIndicator
+              ? "right-8"
+              : showUpdated
+                ? asleepBesideUpdated
+                  ? "right-16"
+                  : "right-11"
+                : "right-1",
           )}
         >
           <UsersIcon className="size-3.5" aria-hidden="true" />
@@ -5658,6 +5757,8 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "archived",
   "status",
   "updated_at",
+  "created_at",
+  "permission_level",
   "git_branch",
   "host_id",
   "runner_id",

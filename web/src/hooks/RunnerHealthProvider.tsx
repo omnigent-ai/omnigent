@@ -34,6 +34,11 @@ import {
 } from "react";
 import { useActiveConversationId } from "@/hooks/useActiveConversationId";
 import { isTempConvId } from "@/store/chatStore";
+import {
+  RunnerHealthRefreshContext,
+  RunnerSampleTimeContext,
+  runnerHealthSampleStartedAt,
+} from "@/hooks/runnerHealthFreshness";
 import { type RunnerHealthInput, useRunnerHealth } from "@/hooks/useRunnerHealth";
 import { useSession } from "@/hooks/useSession";
 
@@ -138,7 +143,15 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
   // user-visible (the reconnect/fork banner), so we keep a direct `/health`
   // poll on it. This is a single session, not the old fleet-wide poll — the
   // sidebar's many rows still get their liveness purely from the stream.
-  const polledHealth = useRunnerHealth(fallbackSet);
+  const [refreshRevision, setRefreshRevision] = useState(0);
+  const requestRefresh = useCallback(() => setRefreshRevision((revision) => revision + 1), []);
+  const polledHealth = useRunnerHealth(fallbackSet, refreshRevision);
+  const sampleTimes = useMemo(() => {
+    const startedAt = runnerHealthSampleStartedAt(polledHealth);
+    const map = new Map<string, number>();
+    if (startedAt !== undefined) for (const id of polledHealth.keys()) map.set(id, startedAt);
+    return map;
+  }, [polledHealth]);
 
   // Merge stream + poll, with the POLL winning for the rows it covers (the
   // open + registered sessions): `/health` is the freshest, tunnel-accurate
@@ -172,7 +185,13 @@ export function RunnerHealthProvider({ children }: { children: ReactNode }) {
     <RunnerHealthRegistryContext.Provider value={register}>
       <RunnerHealthContext.Provider value={runnerHealth}>
         <HostHealthContext.Provider value={hostHealth}>
-          <HostVersionContext.Provider value={hostVersion}>{children}</HostVersionContext.Provider>
+          <HostVersionContext.Provider value={hostVersion}>
+            <RunnerSampleTimeContext.Provider value={sampleTimes}>
+              <RunnerHealthRefreshContext.Provider value={requestRefresh}>
+                {children}
+              </RunnerHealthRefreshContext.Provider>
+            </RunnerSampleTimeContext.Provider>
+          </HostVersionContext.Provider>
         </HostHealthContext.Provider>
       </RunnerHealthContext.Provider>
     </RunnerHealthRegistryContext.Provider>

@@ -8,6 +8,7 @@
 
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { runnerHealthSampleStartedAt } from "./runnerHealthFreshness";
 import { type RunnerHealthInput, useRunnerHealth } from "./useRunnerHealth";
 
 import * as nativeBridge from "@/lib/nativeBridge";
@@ -175,5 +176,30 @@ describe("useRunnerHealth", () => {
     // Empty fallback set (nothing open) → no /health request, empty map.
     expect(fetchMock).not.toHaveBeenCalled();
     expect(result.current.size).toBe(0);
+  });
+});
+
+describe("useRunnerHealth refresh trigger", () => {
+  it("re-polls immediately when refreshRevision bumps and stamps the request time", async () => {
+    fetchMock.mockResolvedValue(
+      mockHealth({ conv_a: { runner_online: false, host_online: true } }),
+    );
+    const sessions = [input("conv_a")];
+    const before = Date.now();
+    const { result, rerender } = renderHook(
+      ({ revision }: { revision: number }) => useRunnerHealth(sessions, revision),
+      { initialProps: { revision: 0 } },
+    );
+    await waitFor(() => expect(result.current.size).toBe(1));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const firstStamp = runnerHealthSampleStartedAt(result.current);
+    expect(firstStamp).toBeGreaterThanOrEqual(before);
+
+    rerender({ revision: 1 });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current).not.toBe(undefined));
+    await waitFor(() =>
+      expect(runnerHealthSampleStartedAt(result.current)).toBeGreaterThanOrEqual(firstStamp ?? 0),
+    );
   });
 });

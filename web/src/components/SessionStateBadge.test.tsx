@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SessionStateBadge } from "./SessionStateBadge";
@@ -55,6 +55,34 @@ describe("SessionStateBadge — per-state rendering", () => {
     const spinner = container.querySelector('[data-testid="running-dot"]');
     expect(spinner).not.toBeNull();
     expect(spinner?.getAttribute("class")).toContain("animate-spin");
+  });
+
+  it("renders asleep as a muted moon icon with the exact restart tooltip", async () => {
+    const { container } = renderBadge({ kind: "asleep" });
+    const badge = screen.getByTestId("session-state-badge");
+    const text = "Agent asleep — your next message restarts it";
+    expect(badge).toHaveAttribute("data-state", "asleep");
+    expect(badge).toHaveAttribute("aria-label", text);
+    const icon = container.querySelector("svg.lucide-moon");
+    expect(icon).not.toBeNull();
+    expect(icon?.getAttribute("class")).toContain("text-muted-foreground");
+    expect(icon?.getAttribute("class")).toContain("size-3.5");
+    fireEvent.focus(badge);
+    expect((await screen.findAllByText(text)).length).toBeGreaterThan(0);
+  });
+
+  it("drops the restart promise for a read-only viewer's asleep badge", () => {
+    renderBadge({ kind: "asleep", readOnly: true });
+    expect(screen.getByTestId("session-state-badge")).toHaveAttribute("aria-label", "Agent asleep");
+  });
+
+  it("keeps the 'Host disconnected' wording for the disconnected state", () => {
+    const { container } = renderBadge({ kind: "disconnected" });
+    expect(screen.getByTestId("session-state-badge")).toHaveAttribute(
+      "aria-label",
+      "Host disconnected",
+    );
+    expect(container.querySelector(".border-muted-foreground")).not.toBeNull();
   });
 
   it("renders unseen messages as a solid (non-pulsing) brand-pink dot", () => {

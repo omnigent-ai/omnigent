@@ -72,6 +72,7 @@ import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
+import { useRunnerAsleepConfirmed, useTurnEndedAt } from "@/hooks/runnerHealthFreshness";
 import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -80,6 +81,7 @@ import {
   derivePermissionLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
+  isEditorLevel,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
@@ -1443,6 +1445,32 @@ export function updateWarmTerminalSurfaces(
 }
 
 /**
+ * True when a send from this composer cannot restart a stopped runner, so the
+ * "your next message will restart it" notice would mislead: the composer is
+ * read-only (structurally or by grant), disabled (no agent / agents failed to
+ * load), or the numeric permission level is below edit. A null level is
+ * single-user / still loading and counts as full access.
+ */
+export function composerCannotRestartSession({
+  readOnlyReason,
+  permissionLevel,
+  sendDisabledReason,
+  disabled,
+}: {
+  readOnlyReason: string | null;
+  permissionLevel: number | null;
+  sendDisabledReason: string | null;
+  disabled: boolean;
+}): boolean {
+  return (
+    disabled ||
+    readOnlyReason !== null ||
+    sendDisabledReason !== null ||
+    !isEditorLevel(permissionLevel)
+  );
+}
+
+/**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
@@ -1451,7 +1479,7 @@ export function updateWarmTerminalSurfaces(
  * `MainTerminalView`. The switcher itself stays visible (in the header,
  * see ViewModeToggle) so the user can flip back to Chat.
  */
-const MainAgentSurface = memo(function MainAgentSurfaceImpl({
+export const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   conversationId,
   hostId,
   status,
@@ -1493,6 +1521,10 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   wrapperLabel,
 }: MainAgentSurfaceProps) {
   const terminalFirst = useTerminalFirst();
+  const localTurnEndedAt = useTurnEndedAt(conversationId ?? undefined, status === "streaming");
+  const asleepConfirmed = useRunnerAsleepConfirmed(conversationId ?? undefined, {
+    turnEndedAt: localTurnEndedAt,
+  });
   // Streaming-hot subscriptions and the bubble pipeline live in <Transcript>.
   // The turn rail is a hover minimap with no mobile affordance (CSS-hidden
   // under `md`). Gate its MOUNT — not just its visibility — on the viewport so
@@ -1820,7 +1852,17 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           {/* Reconnect-or-fork banner when unreachable, nothing otherwise.
           Sits below the composer so its position is consistent with the
           terminal view. */}
-          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+          <ConnectionIndicator
+            liveness={liveness}
+            onShowReconnectHelp={onShowReconnectHelp}
+            asleepConfirmed={asleepConfirmed}
+            composerReadOnly={composerCannotRestartSession({
+              readOnlyReason,
+              permissionLevel,
+              sendDisabledReason,
+              disabled,
+            })}
+          />
         </>
       )}
     </>

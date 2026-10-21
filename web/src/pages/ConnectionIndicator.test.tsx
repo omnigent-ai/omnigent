@@ -111,22 +111,41 @@ describe("ConnectionIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders NOTHING for a runner_asleep NON-terminal-first session — composer stays open", () => {
+  it("shows the quiet asleep notice (no banner) for a runner_asleep NON-terminal-first session", () => {
     // Core UX goal: when the host is alive the chat box stays open and
-    // the runner relaunches on the next message, so the band shows no
-    // disconnect banner.
-    const { container } = renderWithContext({ kind: "runner_asleep" }, null);
+    // the runner relaunches on the next message, so the band shows a muted
+    // pre-send notice rather than a disconnect banner.
+    renderWithContext({ kind: "runner_asleep" }, null);
     expect(screen.queryByTestId("disconnected-indicator")).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.getByTestId("asleep-indicator")).toHaveTextContent(
+      "Agent is asleep — your next message will restart it.",
+    );
   });
 
-  it("renders nothing (no banner) for a runner_asleep terminal-first session", () => {
-    // Stopping a runner keeps the chat open (host alive); the header toggle
-    // stays available and the next send relaunches the runner. This band
-    // shows no disconnect banner.
-    const { container } = renderWithContext({ kind: "runner_asleep" }, makeCtx());
+  it("shows the asleep notice for a terminal-first session on the CHAT tab (no banner)", () => {
+    // Host-launched sessions carry the terminal label; the composer is still on
+    // screen in the chat view, so the pre-send notice applies.
+    renderWithContext({ kind: "runner_asleep" }, makeCtx({ view: "chat" }));
     expect(screen.queryByTestId("disconnected-indicator")).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+    expect(screen.getByTestId("asleep-indicator")).toHaveTextContent(
+      "Agent is asleep — your next message will restart it.",
+    );
+  });
+
+  it("shows the sandbox-asleep notice for a terminal-first session on the chat tab", () => {
+    renderWithContext({ kind: "host_asleep" }, makeCtx({ view: "chat" }));
+    expect(screen.getByTestId("asleep-indicator")).toHaveTextContent(
+      "Sandbox is asleep — your next message will start it.",
+    );
+  });
+
+  it("renders no asleep notice on the terminal-first TERMINAL tab (MainTerminalView owns it)", () => {
+    for (const kind of ["runner_asleep", "host_asleep"] as const) {
+      const { container } = renderWithContext({ kind }, makeCtx({ view: "terminal" }));
+      expect(screen.queryByTestId("asleep-indicator")).toBeNull();
+      expect(container).toBeEmptyDOMElement();
+      cleanup();
+    }
   });
 
   it("renders nothing while liveness is unknown (pre-poll)", () => {
