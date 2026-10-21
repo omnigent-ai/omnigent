@@ -80,15 +80,13 @@ internal data class ConnectionFailureDetails(
 
 internal enum class StatusAction { NONE, CANCEL, SIGN_IN, RETRY, CHANGE_SERVER, HOW_TO_UPDATE }
 
-internal enum class StatusIcon { NONE, UNREACHABLE, ALERT, CRASH, LOCK }
-
 internal data class ConnectionPresentation(
     val headline: Int,
     val body: Int? = null,
     val dynamicBody: String? = null,
     val progress: Boolean = false,
     val hostChip: Boolean = true,
-    val icon: StatusIcon = StatusIcon.NONE,
+    val icon: Int? = null,
     val primary: StatusAction = StatusAction.NONE,
     val secondary: StatusAction = StatusAction.NONE,
     val cancel: Boolean = false,
@@ -134,7 +132,7 @@ internal fun ConnectionStatus.presentation(): ConnectionPresentation =
                 R.string.status_sign_in_required,
                 if (workspace && message == null) R.string.status_workspace_session_ended else null,
                 message,
-                icon = StatusIcon.LOCK,
+                icon = R.drawable.ic_status_lock,
                 primary = StatusAction.SIGN_IN,
                 secondary = StatusAction.CHANGE_SERVER,
             )
@@ -148,7 +146,7 @@ internal fun ConnectionStatus.presentation(): ConnectionPresentation =
                     UnreachableKind.OFFLINE -> R.string.status_unreachable_offline
                     UnreachableKind.TLS -> R.string.status_unreachable_tls
                 },
-                icon = StatusIcon.UNREACHABLE,
+                icon = R.drawable.ic_status_unreachable,
                 primary = StatusAction.RETRY,
                 secondary = StatusAction.CHANGE_SERVER,
             )
@@ -158,7 +156,7 @@ internal fun ConnectionStatus.presentation(): ConnectionPresentation =
             ConnectionPresentation(
                 R.string.status_workspace_failure,
                 dynamicBody = message,
-                icon = StatusIcon.ALERT,
+                icon = R.drawable.ic_status_alert,
                 primary = StatusAction.RETRY,
                 secondary = StatusAction.CHANGE_SERVER,
             )
@@ -168,7 +166,7 @@ internal fun ConnectionStatus.presentation(): ConnectionPresentation =
             ConnectionPresentation(
                 R.string.status_crash_recovery,
                 R.string.status_crash_recovery_body,
-                icon = StatusIcon.CRASH,
+                icon = R.drawable.ic_status_crash,
                 primary = StatusAction.RETRY,
                 secondary = StatusAction.CHANGE_SERVER,
             )
@@ -188,7 +186,7 @@ internal fun ConnectionStatus.presentation(): ConnectionPresentation =
             ConnectionPresentation(
                 R.string.status_update_required,
                 R.string.status_update_required_body,
-                icon = StatusIcon.ALERT,
+                icon = R.drawable.ic_status_alert,
                 primary = StatusAction.HOW_TO_UPDATE,
                 secondary = StatusAction.CHANGE_SERVER,
             )
