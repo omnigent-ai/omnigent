@@ -50,6 +50,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
+from omnigent.server.preference_broker import PreferenceBrokerGrant
 
 _logger = logging.getLogger(__name__)
 
@@ -122,6 +123,9 @@ def _fail_pending_imports(conn: HostConnection) -> None:
 
 
 def _fail_pending_preferences(conn: HostConnection) -> None:
+    conn.preference_brokers.clear()
+    for task in tuple(conn.preference_broker_tasks):
+        task.cancel()
     while conn.pending_preferences:
         _, future = conn.pending_preferences.popitem()
         if not future.done():
@@ -500,6 +504,8 @@ class HostConnection:
     pending_preferences: dict[str, asyncio.Future[HostPreferencesResultFrame]] = field(
         default_factory=dict
     )
+    preference_brokers: dict[str, PreferenceBrokerGrant] = field(default_factory=dict)
+    preference_broker_tasks: set[asyncio.Task[None]] = field(default_factory=set)
     pending_plugins: dict[str, asyncio.Future[HostPluginsResultFrame]] = field(
         default_factory=dict
     )

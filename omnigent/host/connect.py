@@ -101,6 +101,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostPreferenceReplyFrame,
+    HostPreferenceRequestFrame,
     HostPreferencesFrame,
     HostPreferencesResultFrame,
     HostRefreshHarnessesFrame,
@@ -1338,6 +1340,9 @@ class HostProcess:
         # Strong refs to in-flight frame tasks (create_task results are
         # otherwise GC-able); each discards itself on completion.
         self._frame_tasks: set[asyncio.Task[None]] = set()
+        from omnigent.preference_broker import PreferenceBrokerTransport
+
+        self._preference_brokers: dict[str, PreferenceBrokerTransport] = {}
         # Background watcher that force-drops a stale tunnel on wake from system
         # suspend (laptop sleep) so the reconnect loop reattaches at once
         # instead of waiting out the ~90s keepalive timeout. See run() /
@@ -5155,14 +5160,37 @@ class HostProcess:
         elif isinstance(frame, HostSkillsFrame):
             skills_result = await asyncio.to_thread(self._handle_skills, frame)
             await self._send_text(ws, encode_host_frame(skills_result))
+        elif isinstance(frame, HostPreferenceReplyFrame):
+            broker = self._preference_brokers.get(frame.parent_id)
+            if broker is not None:
+                broker.deliver(frame.request_id, frame.reply)
         elif isinstance(frame, HostPreferencesFrame):
             from omnigent.host.preferences import control_preferences
+            from omnigent.preference_broker import PreferenceBrokerTransport, PreferenceRequest
+
+            async def send_preference(request_id: str, request: PreferenceRequest) -> None:
+                await self._send_text(
+                    ws,
+                    encode_host_frame(
+                        HostPreferenceRequestFrame(frame.request_id, request_id, request)
+                    ),
+                )
 
             try:
                 async with asyncio.timeout(12):
-                    result = await control_preferences(
-                        self._server_url, frame.identity, frame.control, shared=frame.shared
-                    )
+                    if frame.broker:
+                        transport = PreferenceBrokerTransport(send_preference)
+                        self._preference_brokers[frame.request_id] = transport
+                        async with httpx.AsyncClient(
+                            base_url="http://preferences", transport=transport
+                        ) as http:
+                            result = await control_preferences(
+                                self._server_url, frame.identity, frame.control, http=http
+                            )
+                    else:
+                        result = await control_preferences(
+                            self._server_url, frame.identity, frame.control, shared=frame.shared
+                        )
                 reply = HostPreferencesResultFrame(frame.request_id, result=result)
             except Exception:  # noqa: BLE001 — do not disclose host files or credentials
                 reply = HostPreferencesResultFrame(
@@ -5172,6 +5200,8 @@ class HostProcess:
                         "Check this host's login, pending edits and connection, then retry."
                     ),
                 )
+            finally:
+                self._preference_brokers.pop(frame.request_id, None)
             await self._send_text(ws, encode_host_frame(reply))
         elif isinstance(frame, HostPluginsFrame):
             plugins_result = await asyncio.to_thread(self._handle_plugins, frame)

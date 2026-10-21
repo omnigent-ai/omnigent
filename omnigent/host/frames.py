@@ -31,6 +31,7 @@ from pydantic import ValidationError
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.preference_broker import PREFERENCE_REQUEST, PreferenceReply, PreferenceRequest
 from omnigent.preference_controls import (
     PREFERENCE_CONTROL,
     PreferenceControl,
@@ -68,6 +69,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_PREFERENCES = "preferences"
 CAP_PREFERENCE_PREPARE = "preference_prepare"
+CAP_PREFERENCE_BROKER = "preference_broker"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
@@ -80,6 +82,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_PREFERENCES,
     CAP_PREFERENCE_PREPARE,
+    CAP_PREFERENCE_BROKER,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
     CAP_MCP_REGISTRY,
@@ -175,6 +178,8 @@ class HostFrameKind(str, Enum):
     SKILLS_RESULT = "host.skills_result"
     PREFERENCES = "host.preferences"
     PREFERENCES_RESULT = "host.preferences_result"
+    PREFERENCE_REQUEST = "host.preference_request"
+    PREFERENCE_REPLY = "host.preference_reply"
     PLUGINS = "host.plugins"
     PLUGINS_RESULT = "host.plugins_result"
     SKILL_CONTENT = "host.skill_content"
@@ -1139,6 +1144,21 @@ class HostPreferencesFrame:
     identity: PreferenceNamespace
     control: PreferenceControl
     shared: PreferenceSnapshot | None = None
+    broker: bool = False
+
+
+@dataclass
+class HostPreferenceRequestFrame:
+    parent_id: str
+    request_id: str
+    request: PreferenceRequest
+
+
+@dataclass
+class HostPreferenceReplyFrame:
+    parent_id: str
+    request_id: str
+    reply: PreferenceReply
 
 
 @dataclass
@@ -1372,6 +1392,8 @@ HostFrame = (
     | HostSkillsResultFrame
     | HostPreferencesFrame
     | HostPreferencesResultFrame
+    | HostPreferenceRequestFrame
+    | HostPreferenceReplyFrame
     | HostPluginsFrame
     | HostPluginsResultFrame
     | HostSkillContentFrame
@@ -1827,6 +1849,25 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "identity": frame.identity.model_dump(mode="json"),
                 "control": frame.control.model_dump(mode="json"),
                 "shared": frame.shared.model_dump(mode="json") if frame.shared else None,
+                "broker": frame.broker,
+            }
+        )
+    if isinstance(frame, HostPreferenceRequestFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PREFERENCE_REQUEST.value,
+                "parent_id": frame.parent_id,
+                "request_id": frame.request_id,
+                "request": frame.request.model_dump(mode="json"),
+            }
+        )
+    if isinstance(frame, HostPreferenceReplyFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PREFERENCE_REPLY.value,
+                "parent_id": frame.parent_id,
+                "request_id": frame.request_id,
+                "reply": frame.reply.model_dump(mode="json"),
             }
         )
     if isinstance(frame, HostPreferencesResultFrame):
@@ -2325,6 +2366,19 @@ def _decode_known_host_frame(
                 shared=PreferenceSnapshot.model_validate(msg["shared"])
                 if msg.get("shared") is not None
                 else None,
+                broker=_required_bool(msg, "broker") if "broker" in msg else False,
+            )
+        case HostFrameKind.PREFERENCE_REQUEST:
+            return HostPreferenceRequestFrame(
+                parent_id=_required_str(msg, "parent_id"),
+                request_id=_required_str(msg, "request_id"),
+                request=PREFERENCE_REQUEST.validate_python(msg.get("request")),
+            )
+        case HostFrameKind.PREFERENCE_REPLY:
+            return HostPreferenceReplyFrame(
+                parent_id=_required_str(msg, "parent_id"),
+                request_id=_required_str(msg, "request_id"),
+                reply=PreferenceReply.model_validate(msg.get("reply")),
             )
         case HostFrameKind.PREFERENCES_RESULT:
             try:

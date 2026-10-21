@@ -117,6 +117,17 @@ class PreferenceWorkspace:
             installation_id=self.installation_id,
         )
 
+    def host_adopted(self) -> bool:
+        """Owner-tunnel adoption never authorizes offline use under a CLI login."""
+        with self.client._transaction(write=False) as connection:
+            return bool(
+                connection.execute("SELECT host_adopted FROM state WHERE id = 1").fetchone()[0]
+            )
+
+    def adopt_host(self) -> None:
+        with self.client._transaction() as connection:
+            connection.execute("UPDATE state SET host_adopted = 1 WHERE id = 1")
+
     def set_machine(self, key: SharedPreferenceKey, value: Value) -> None:
         """None removes the override; False and [] remain explicit local choices."""
         validated = PreferenceMutation(

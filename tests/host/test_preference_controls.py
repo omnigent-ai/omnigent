@@ -1,5 +1,7 @@
 """Host controls keep account binding and reviewed import bases intact."""
 
+import json
+
 import httpx
 import pytest
 
@@ -11,10 +13,21 @@ from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferen
 from tests.test_preference_client import transport
 
 
-async def test_host_checks_authenticated_identity_before_adopting(tmp_path, monkeypatch, db_uri):
+@pytest.mark.parametrize("broker,count", [(False, 1), (True, 101)])
+async def test_host_checks_authenticated_identity_before_adopting(
+    tmp_path, monkeypatch, db_uri, broker, count
+):
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="controls")
+    native = tmp_path / "claude"
+    native.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(native))
+    (native / "settings.json").write_text(
+        json.dumps(
+            {"enabledPlugins": {f"plugin-{index}@test": False for index in range(count - 1)}}
+        )
+    )
 
     async def open_http(_):
         return httpx.AsyncClient(base_url="http://test", transport=transport(store))
@@ -23,6 +36,11 @@ async def test_host_checks_authenticated_identity_before_adopting(tmp_path, monk
     monkeypatch.setattr("omnigent.host.preferences.open_preference_http", open_http)
 
     async def control(identity, **payload):
+        if broker:
+            async with await open_http("http://test") as http:
+                return await control_preferences(
+                    "http://test", identity, PREFERENCE_CONTROL.validate_python(payload), http=http
+                )
         return await control_preferences(
             "http://test", identity, PREFERENCE_CONTROL.validate_python(payload)
         )
@@ -30,15 +48,17 @@ async def test_host_checks_authenticated_identity_before_adopting(tmp_path, monk
     alice, bob = store.identity("alice"), store.identity("bob")
     save_global_config({"model": "portable", "server": "http://test"})
     assert not (await control(alice, action="status")).connected
-    with pytest.raises(ValueError, match="login does not match"):
+    with pytest.raises(ValueError, match="another identity" if broker else "login does not match"):
         await control(bob, action="connect")
     assert "shared_preferences" not in load_global_config()
-    preview = await control(alice, action="preview_import")
+    preview = await control(alice, action="preview_import", plugins=["claude"])
     assert preview.preview.changes[0].operation.value == "portable"
     assert "shared_preferences" not in load_global_config()
     await control(alice, action="connect")
     before = load_global_config()
-    with pytest.raises(ValueError, match="another account or workspace"):
+    with pytest.raises(
+        ValueError, match="Connect this machine" if broker else "another account or workspace"
+    ):
         await control(
             bob, action="set_machine", key={"kind": "model", "name": "model"}, value="wrong"
         )
@@ -49,15 +69,34 @@ async def test_host_checks_authenticated_identity_before_adopting(tmp_path, monk
     async def unavailable(_):
         raise httpx.ConnectError("offline")
 
-    monkeypatch.setattr("omnigent.host.preferences.open_preference_http", unavailable)
+    if broker:
+        original_http = open_http
+
+        async def offline_write(_):
+            def fail_write(request):
+                if request.method == "POST":
+                    raise httpx.ConnectError("offline")
+                return transport(store).handle_request(request)
+
+            return httpx.AsyncClient(
+                base_url="http://test", transport=httpx.MockTransport(fail_write)
+            )
+
+        open_http = offline_write
+    else:
+        monkeypatch.setattr("omnigent.host.preferences.open_preference_http", unavailable)
     queued = await control(
         alice, action="apply_import", preview=preview.preview.model_dump(mode="json")
     )
-    assert queued.warning and len(queued.pending) == 1
+    assert queued.warning and len(queued.pending) == count
     assert queued.pending[0] == preview.preview.changes[0].operation
-    monkeypatch.setattr("omnigent.host.preferences.open_preference_http", open_http)
+    if broker:
+        open_http = original_http
+    else:
+        monkeypatch.setattr("omnigent.host.preferences.open_preference_http", open_http)
     synced = await control(alice, action="sync")
     assert not synced.pending
+    assert len(synced.shared.entries) == count
     assert (
         next(
             entry.value
@@ -67,8 +106,12 @@ async def test_host_checks_authenticated_identity_before_adopting(tmp_path, monk
         == "portable"
     )
     monkeypatch.setenv("OMNIGENT_API_KEY", "changed-test-login")
-    with pytest.raises(ValueError, match="login changed"):
-        await control(alice, action="status")
+    if broker:
+        assert (await control(alice, action="status")).connected
+        assert "shared_preferences" not in load_global_config()
+    else:
+        with pytest.raises(ValueError, match="login changed"):
+            await control(alice, action="status")
     assert (await control(alice, action="connect")).connected
 
 

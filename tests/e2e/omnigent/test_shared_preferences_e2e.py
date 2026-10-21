@@ -269,7 +269,7 @@ def test_durable_preference_clients_offline_reconnect_and_restart(tmp_path, db_u
         assert drive("remote", restarted)["snapshot"] == cleared
 
 
-@pytest.mark.parametrize("surface", ["cli", "host"])
+@pytest.mark.parametrize("surface", ["cli", "host", "managed-host"])
 def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, surface):
     config = tmp_path / "cli-server.yaml"
     config.write_text("shared_preferences_authority_id: cli-preference-test\n")
@@ -296,8 +296,41 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, su
     from tests._helpers.host import isolated_host
 
     with ExitStack() as stack:
+        dropped_reply = tmp_path / "drop-broker-reply"
+        bootstrap = "from omnigent.cli import main\nmain()\n"
+        if surface == "managed-host":
+            bootstrap = """
+import asyncio
+import os
+from pathlib import Path
+from omnigent.host.frames import HostPreferenceReplyFrame, decode_host_frame
+from omnigent.server.host_registry import HostRegistry
+from omnigent.cli import main
+original = HostRegistry.send_text
+def send(self, conn, payload, **kwargs):
+    frame = decode_host_frame(payload)
+    marker = Path(os.environ["TEST_DROP_BROKER_REPLY"])
+    if (isinstance(frame, HostPreferenceReplyFrame)
+            and frame.reply.result is not None and marker.exists()):
+        marker.unlink()
+        asyncio.create_task(conn.ws.close(code=1012))
+        return
+    return original(self, conn, payload, **kwargs)
+HostRegistry.send_text = send
+main()
+"""
         server = stack.enter_context(
-            isolated_local_server(tmp_path / "cli-server", extra_args=arguments)
+            isolated_local_server(
+                tmp_path / "cli-server",
+                extra_args=arguments,
+                bootstrap=bootstrap,
+                env={
+                    "OMNIGENT_LOCAL_SINGLE_USER": "0",
+                    "TEST_DROP_BROKER_REPLY": str(dropped_reply),
+                }
+                if surface == "managed-host"
+                else {},
+            )
         )
 
         def cli(*args):
@@ -311,23 +344,80 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, su
             assert result.returncode == 0, result.stdout + result.stderr
             return result.stdout
 
-        if surface == "host":
+        if surface in ("host", "managed-host"):
+            host_id = uuid4().hex
+            host_env = {"CLAUDE_CONFIG_DIR": str(native)}
+            headers = {}
+            if surface == "managed-host":
+                from omnigent.db.utils import now_epoch
+                from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+                from omnigent.stores.host_store import HostStore
+
+                token = "isolated-preference-host-token"
+                HostStore(db_uri).register_managed_host(
+                    host_id=host_id,
+                    name=f"e2e-host-{host_id[:12]}",
+                    user_id="alice@example.test",
+                    token=token,
+                    provider="test",
+                    sandbox_id="isolated-host",
+                    token_expires_at=now_epoch() + 3600,
+                )
+                host_env[HOST_TOKEN_ENV_VAR] = token
+                headers = {"X-Forwarded-Email": "alice@example.test"}
+                assert (
+                    httpx.get(
+                        server + "/v1/preferences/shared",
+                        headers={MANAGED_HOST_TOKEN_HEADER: token},
+                    ).status_code
+                    == 401
+                )
             host = stack.enter_context(
                 isolated_host(
                     tmp_path / "host",
                     server,
                     config=yaml.safe_load(source.read_text()),
-                    env={"CLAUDE_CONFIG_DIR": str(native)},
+                    env=host_env,
+                    host_id=host_id,
                     base_env={"PATH": os.environ["PATH"]},
                 )
             )
             client = stack.enter_context(
-                httpx.Client(base_url=server, timeout=20, trust_env=False)
+                httpx.Client(base_url=server, timeout=20, trust_env=False, headers=headers)
             )
             host.wait_online(client)
 
+            drop_once = surface == "managed-host"
+
             def action(payload):
+                nonlocal drop_once
+                drop = drop_once and payload["action"] == "apply_import"
+                if drop:
+                    dropped_reply.touch()
+                    drop_once = False
                 response = client.post(f"/v1/hosts/{host.host_id}/preferences", json=payload)
+                if drop:
+                    from tests._helpers.polling import poll_until
+
+                    assert response.status_code == 503, response.text
+                    assert not dropped_reply.exists()
+                    # Only observe: reconnect must replay the receipt and finish the import.
+                    state = {}
+
+                    def delivered():
+                        nonlocal state
+                        snapshot = client.get("/v1/preferences/shared").json()
+                        if len(snapshot.get("entries", [])) != 4:
+                            return False
+                        current = client.post(
+                            f"/v1/hosts/{host.host_id}/preferences", json={"action": "status"}
+                        )
+                        state = current.json()
+                        return current.status_code == 200 and state.get("pending") == []
+
+                    poll_until(delivered, timeout_s=45, interval_s=0.2)
+                    assert state["shared"]["revision"] == 4
+                    return state
                 assert response.status_code == 200, (
                     response.text + host.log_path.read_text()[-2000:]
                 )

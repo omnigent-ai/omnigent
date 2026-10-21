@@ -1,0 +1,56 @@
+"""Short-lived grants for preference RPCs inside an authenticated owner action."""
+
+from __future__ import annotations
+
+import asyncio
+from contextvars import Context, copy_context
+from dataclasses import dataclass, field
+
+from omnigent.errors import OmnigentError
+from omnigent.preference_broker import PreferenceRead, PreferenceReply, PreferenceRequest
+from omnigent.preference_client import MAX_PENDING_OPERATIONS
+from omnigent.preference_controls import PreferenceApply, PreferenceControl
+from omnigent.stores.preference_store import PreferenceStore
+
+
+@dataclass
+class PreferenceBrokerGrant:
+    store: PreferenceStore
+    user_id: str | None
+    installation_id: str
+    control: PreferenceControl
+    context: Context = field(default_factory=copy_context)
+    remaining: int = 2 * MAX_PENDING_OPERATIONS
+    busy: bool = False
+
+    async def execute(self, request: PreferenceRequest) -> PreferenceReply:
+        """Only an explicit sync or reviewed import can publish this host's edits."""
+        if self.remaining <= 0:
+            return PreferenceReply(status=429)
+        self.remaining -= 1
+        try:
+            if isinstance(request, PreferenceRead):
+                page = await asyncio.to_thread(
+                    self.store.read,
+                    user_id=self.user_id,
+                    limit=request.limit,
+                    cursor=request.cursor,
+                )
+                return PreferenceReply(status=200, page=page)
+            operation = request.operation
+            if (
+                self.control.action not in ("apply_import", "sync")
+                or operation.identity != self.store.identity(self.user_id)
+                or operation.installation_id != self.installation_id
+            ):
+                return PreferenceReply(status=403)
+            if isinstance(self.control, PreferenceApply) and operation not in [
+                change.operation for change in self.control.preview.changes
+            ]:
+                return PreferenceReply(status=403)
+            result = await asyncio.to_thread(self.store.apply, operation, user_id=self.user_id)
+            return PreferenceReply(status=200, result=result)
+        except OmnigentError as exc:
+            return PreferenceReply(status=exc.http_status)
+        except Exception:  # noqa: BLE001 — do not expose database errors to the host
+            return PreferenceReply(status=503)

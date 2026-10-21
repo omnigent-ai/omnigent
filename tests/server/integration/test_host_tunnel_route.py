@@ -1603,6 +1603,71 @@ def _register_managed(
     )
 
 
+async def test_preference_broker_grant_expires_with_its_owner_action(host_app, db_uri):
+    from omnigent.host.frames import (
+        CAP_PREFERENCE_BROKER,
+        HostPreferenceReplyFrame,
+        HostPreferenceRequestFrame,
+        HostPreferencesFrame,
+        HostPreferencesResultFrame,
+    )
+    from omnigent.preference_broker import PreferenceRead
+    from omnigent.preference_controls import PreferenceControlResult, PreferenceInspect
+    from omnigent.server.routes.preference_controls import run_preference_control
+    from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
+
+    app, registry, _ = host_app
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="broker")
+    peer = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(peer, registry)
+    conn = registry.get(_HOST_ID)
+    conn.hello.capabilities.append(CAP_PREFERENCE_BROKER)
+    task = asyncio.create_task(
+        run_preference_control(registry, conn, store, None, PreferenceInspect(action="status"))
+    )
+    try:
+        outgoing = await peer.receive_output(timeout=budget(2))
+        action = decode_host_frame(outgoing["text"])
+        assert isinstance(action, HostPreferencesFrame) and action.broker
+        for parent_id, status in [("unknown", 403), (action.request_id, 200)]:
+            await peer.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_host_frame(
+                        HostPreferenceRequestFrame(parent_id, "read", PreferenceRead())
+                    ),
+                }
+            )
+            reply = decode_host_frame((await peer.receive_output(timeout=budget(2)))["text"])
+            assert isinstance(reply, HostPreferenceReplyFrame) and reply.reply.status == status
+        await peer.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostPreferencesResultFrame(
+                        action.request_id, PreferenceControlResult(connected=False)
+                    )
+                ),
+            }
+        )
+        await task
+        await peer.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostPreferenceRequestFrame(action.request_id, "late", PreferenceRead())
+                ),
+            }
+        )
+        reply = decode_host_frame((await peer.receive_output(timeout=budget(2)))["text"])
+        assert reply.reply.status == 403
+        assert not conn.preference_brokers
+    finally:
+        task.cancel()
+        await peer.send_input({"type": "websocket.disconnect", "code": 1000})
+        await peer.wait(timeout=budget(2))
+
+
 async def test_managed_token_authenticates_as_record_owner(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:

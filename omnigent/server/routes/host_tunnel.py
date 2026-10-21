@@ -54,6 +54,8 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
+    HostPreferenceReplyFrame,
+    HostPreferenceRequestFrame,
     HostPreferencesResultFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
@@ -1042,7 +1044,44 @@ async def _receive_loop(
             if mcp_future is not None and not mcp_future.done():
                 mcp_future.set_result(frame)
             continue
+        if isinstance(frame, HostPreferenceRequestFrame):
+            from omnigent.preference_broker import PreferenceReply
+
+            grant = conn.preference_brokers.get(frame.parent_id)
+            if grant is None or grant.busy or len(conn.preference_broker_tasks) >= 5:
+                host_registry.send_text(
+                    conn,
+                    encode_host_frame(
+                        HostPreferenceReplyFrame(
+                            frame.parent_id,
+                            frame.request_id,
+                            PreferenceReply(status=403 if grant is None else 429),
+                        )
+                    ),
+                )
+                continue
+            grant.busy = True
+
+            async def reply_preference(request_frame=frame, request_grant=grant):
+                try:
+                    reply = await request_grant.execute(request_frame.request)
+                    host_registry.send_text(
+                        conn,
+                        encode_host_frame(
+                            HostPreferenceReplyFrame(
+                                request_frame.parent_id, request_frame.request_id, reply
+                            )
+                        ),
+                    )
+                finally:
+                    request_grant.busy = False
+
+            task = asyncio.create_task(reply_preference(), context=grant.context.copy())
+            conn.preference_broker_tasks.add(task)
+            task.add_done_callback(conn.preference_broker_tasks.discard)
+            continue
         if isinstance(frame, HostPreferencesResultFrame):
+            conn.preference_brokers.pop(frame.request_id, None)
             preferences_future = conn.pending_preferences.pop(frame.request_id, None)
             if preferences_future is not None and not preferences_future.done():
                 preferences_future.set_result(frame)

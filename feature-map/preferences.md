@@ -7,7 +7,8 @@ and an opt-in server API for durable edits and conflicts. Explicit shared/machin
 the CLI and Settings → Shared preferences. Connected CLI launches and user-owned
 hosts consume saved choices at startup. New-session composers prepare the selected
 host’s defaults once, preserve unavailable choices, and offer explicit recovery.
-Managed deployment wiring remains separate integration work. Pending edits
+Settings controls also use the owner tunnel on managed-token hosts without a
+user login. Managed deployment wiring remains separate integration work. Pending edits
 retry on host reconnect without polling between messages.
 Claude/Codex native and SDK sessions also apply plugin toggles in private settings.
 Native and SDK startup apply adopted model defaults and retain requested choices.
@@ -270,9 +271,13 @@ managed-startup and per-harness availability journeys for each user entry point.
 uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reruns 0 -q -rs
 ```
 
-The CLI/host scenario has two variants: separate CLI processes, and real HTTP
-through the server and host tunnel into a daemon with isolated config/cache.
-Both drive the same import/override/restore assertions. The host variant also
+The CLI/host scenario has three variants: separate CLI processes, a user host,
+and a managed-token host without user credentials. All drive the same
+import/override/restore assertions through real HTTP and isolated config/cache.
+The managed-token case drops a committed edit's reply and disconnects the tunnel;
+reconnect must finish the import without another write from the test or duplicate
+revision increments. The token itself cannot access the shared HTTP API.
+These are local processes, not a deployed managed sandbox. The host variants also
 checks status and preview leave adoption off and omit local commands.
 These scenarios cover: connect, preview/apply
 a portable YAML/native-plugin import, set/remove a machine override, and restore
@@ -322,9 +327,11 @@ uv run --no-sync pytest tests/server/routes/test_preference_controls.py \
 
 These checks cover ownership, authenticated identity, typed frame round trips,
 old hosts, disconnect/timeout cleanup, bounded requests and concurrent actions,
-invalid replies, and durable retry after an outage. The shared operations recipe
-above exercises the real server/host process boundary; no browser or managed
-credential broker is involved.
+invalid replies, and durable retry after an outage. The broker protocol tests
+also cover request-scoped read/write grants, account and installation boundaries,
+reviewed-import matching and uncertain delivery with a dependent queued edit.
+The shared operations recipe above exercises real managed-token broker transport;
+the browser recipe drives the same Settings controls through a user-owned host.
 
 **Shared plugins (own environment):**
 
@@ -400,6 +407,9 @@ fresh retry can converge. These cases extend the same `shared-client` recipe.
 The component matrix also covers causal offline edits, malformed or stale replies,
 identity changes, cancellation, local writers, sync locking, and outbox limits.
 Its HTTP transport is simulated; the mapped process test covers real transport.
+Cache schema v3 adds namespace-bound host adoption without creating a CLI login
+profile. Existing v2 snapshots, receipts and queued edits survive upgrade; older
+clients reject the newer cache version instead of resetting it.
 
 For latency and contention use the existing
 [benchmark runner](../dev/benchmarks/omnigent/README.md#shared-preferences).

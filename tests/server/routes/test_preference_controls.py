@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
 from omnigent.host.frames import (
+    CAP_PREFERENCE_BROKER,
     CAP_PREFERENCE_PREPARE,
     CAP_PREFERENCES,
     HostHelloFrame,
@@ -64,9 +65,12 @@ def controls(db_uri):
     return app, registry, connection, store
 
 
+@pytest.mark.parametrize("broker", [False, True])
 @pytest.mark.parametrize("user,status", [(None, 401), ("stranger", 403), ("owner", 200)])
-async def test_owner_controls_cross_typed_wire(controls, user, status):
+async def test_owner_controls_cross_typed_wire(controls, user, status, broker):
     app, _, connection, store = controls
+    if broker:
+        connection.hello.capabilities.append(CAP_PREFERENCE_BROKER)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app), base_url="http://test"
     ) as client:
@@ -82,6 +86,8 @@ async def test_owner_controls_cross_typed_wire(controls, user, status):
             assert isinstance(frame, HostPreferencesFrame)
             assert frame.identity == store.identity("owner")
             assert frame.control.action == "status"
+            assert frame.broker is broker
+            assert (frame.request_id in connection.preference_brokers) is broker
             result = decode_host_frame(
                 encode_host_frame(
                     HostPreferencesResultFrame(
@@ -93,6 +99,7 @@ async def test_owner_controls_cross_typed_wire(controls, user, status):
         response = await task
     assert response.status_code == status
     assert not connection.pending_preferences
+    assert not connection.preference_brokers
     assert connection.outbound_queue.empty()
 
 

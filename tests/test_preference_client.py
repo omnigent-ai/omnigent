@@ -443,7 +443,7 @@ async def test_cache_schema_permissions_bounds_and_incomplete_refresh(peers):
     # An ack isn't a complete snapshot; offline startup retains the last complete read.
     assert local.cached() == before
     with local._transaction() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE entries SET payload = ?", (b"x" * 16001,))
         connection.execute("PRAGMA user_version = 999")

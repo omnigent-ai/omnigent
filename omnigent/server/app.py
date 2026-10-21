@@ -4200,6 +4200,21 @@ def create_app(
             if startup_inputs is not None:
                 startup_inputs.host_changed(app, _host_id)
 
+        async def _on_host_connected(host_id: str, owner: str | None) -> None:
+            await _on_hosts_changed(host_id, owner)
+            if preference_store is None:
+                return
+            from omnigent.host.frames import CAP_PREFERENCE_BROKER
+            from omnigent.server.routes.preference_controls import retry_host_preferences
+
+            conn = host_registry.get(host_id)
+            if conn is not None and CAP_PREFERENCE_BROKER in conn.hello.capabilities:
+                task = asyncio.create_task(
+                    retry_host_preferences(host_registry, conn, preference_store, owner)
+                )
+                conn.preference_broker_tasks.add(task)
+                task.add_done_callback(conn.preference_broker_tasks.discard)
+
         app.include_router(
             create_host_tunnel_router(
                 host_registry,
@@ -4207,7 +4222,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_host_connect=_on_hosts_changed,
+                on_host_connect=_on_host_connected,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
             ),

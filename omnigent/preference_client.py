@@ -36,7 +36,7 @@ from omnigent.preference_sync import (
 )
 
 _PATH = "/v1/preferences/shared"
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 MAX_PENDING_OPERATIONS = 512
 _Result = TypeVar("_Result")
 
@@ -197,6 +197,13 @@ class PreferenceClient:
                     "result BLOB CHECK(length(result) <= 16000)) WITHOUT ROWID"
                 )
                 connection.execute("PRAGMA user_version = 2")
+                version = 2
+            if version == 2:
+                connection.execute(
+                    "ALTER TABLE state ADD COLUMN host_adopted INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK(host_adopted IN (0, 1))"
+                )
+                connection.execute("PRAGMA user_version = 3")
             elif version != _CACHE_VERSION:
                 raise ValueError(f"Unsupported preference cache version: {version}")
             binding = connection.execute("SELECT binding FROM state WHERE id = 1").fetchone()[0]
