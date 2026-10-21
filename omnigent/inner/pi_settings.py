@@ -1,11 +1,11 @@
 """Helpers for seeding a managed Pi agent dir (``PI_CODING_AGENT_DIR``).
 
 When the pi harness runs in gateway mode it relocates Pi's agent root to a
-per-session temp directory (for ``models.json``). That hides the user's global
-``~/.pi/agent/settings.json`` and installed package trees. This module copies
-the global settings metadata into the managed dir and symlinks install
-directories so Pi's native loader still sees extensions and ``pi install``
-packages — without mutating the user's home directory.
+per-session temp directory (for ``models.json``). That hides everything else in
+the user's global ``~/.pi/agent`` — settings, MCP servers, skills, extensions,
+packages. This module copies the global settings into the managed dir and
+symlinks the rest of the user's agent-dir entries, so a managed session sees
+the same Pi setup as a plain ``pi`` run.
 """
 
 from __future__ import annotations
@@ -23,9 +23,26 @@ _Settings: TypeAlias = dict[str, object]
 # Default global Pi agent root (``PI_CODING_AGENT_DIR`` when unset).
 DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 
-# Install / checkout trees Pi places under the agent dir. Symlinked into the
-# managed dir so ``packages`` entries in settings keep resolving.
-_PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git")
+# Global agent-dir entries NOT linked into the managed dir; every other entry is
+# (``mcp.json``, ``skills/``, ``extensions/``, ``npm/``, ...), including ones newer
+# Pi versions add.
+_UNSHARED_AGENT_DIR_ENTRIES: frozenset[str] = frozenset(
+    {
+        # Written per session by Omnigent; Pi keeps models-store.json beside models.json.
+        "models.json",
+        "models-store.json",
+        "settings.json",
+        # Model-provider logins: managed sessions use the provider Omnigent configures.
+        "auth.json",
+        "oauth.json",
+        # Per-run state and logs.
+        "sessions",
+        "tmp",
+        "crashes.json",
+        "mcp.log",
+        "pi-debug.log",
+    }
+)
 
 
 def _read_settings_file(path: Path) -> _Settings:
@@ -56,16 +73,17 @@ def _symlink_agent_resource_dirs(
     managed_dir: Path,
     global_agent_dir: Path,
 ) -> None:
-    """Symlink package install trees from *global_agent_dir* into *managed_dir*."""
-    for name in _PI_AGENT_RESOURCE_DIRS:
-        source = global_agent_dir / name
-        if not source.is_dir():
+    """Symlink shareable entries of *global_agent_dir* into *managed_dir*."""
+    if not global_agent_dir.is_dir():
+        return
+    for source in sorted(global_agent_dir.iterdir()):
+        if source.name in _UNSHARED_AGENT_DIR_ENTRIES:
             continue
-        target = managed_dir / name
+        target = managed_dir / source.name
         if target.exists():
             continue
         try:
-            target.symlink_to(source, target_is_directory=True)
+            target.symlink_to(source, target_is_directory=source.is_dir())
         except OSError as exc:
             _logger.warning(
                 "Could not symlink Pi agent resource %s -> %s: %s",
@@ -86,8 +104,11 @@ def prepare_managed_pi_agent_dir(
 
     Copies (merges) ``settings.json`` from the user's global agent dir into
     *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
-    symlinks install trees (``npm/``, ``git/``) so ``packages`` entries keep
-    working. The user's ``~/.pi/agent`` is never modified.
+    symlinks the other global entries — ``mcp.json``, ``skills/``,
+    ``extensions/``, ``npm/``, etc. — except those in
+    :data:`_UNSHARED_AGENT_DIR_ENTRIES`. Omnigent never writes to the user's
+    ``~/.pi/agent``; Pi may update linked files (e.g. refreshed MCP OAuth
+    tokens) as it would in a plain ``pi`` run.
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.
