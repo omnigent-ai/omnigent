@@ -4,6 +4,8 @@ This opt-in API stores model choice (`model` and `opencode_model`), the default
 harness, ordered arguments per harness, and plugin enable/disable choices. It
 provides durable values, versions, conflict alternatives, and retry receipts.
 It does not import settings, enable automatic client sync, or change launches.
+The explicit [durable client](shared-preferences-client.md) adds local queues
+and reconnect synchronization; application adoption remains separate.
 
 ## Enable an isolated server
 

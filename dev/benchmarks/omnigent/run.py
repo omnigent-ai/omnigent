@@ -33,7 +33,12 @@ from pathlib import Path
 # Allow ``uv run <path>`` (no package context) to import the sibling modules.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from dev.benchmarks.omnigent.environment import BenchEnvironment
+from dev.benchmarks.omnigent.environment import (
+    DEFAULT_PREFERENCE_CLIENTS,
+    DEFAULT_PREFERENCE_HISTORY,
+    DEFAULT_PREFERENCE_KEYS,
+    BenchEnvironment,
+)
 from dev.benchmarks.omnigent.journeys import (
     ALL_JOURNEYS,
     Journey,
@@ -49,6 +54,7 @@ from dev.benchmarks.omnigent.measure import (
     print_results,
 )
 from dev.benchmarks.omnigent.schema import build_report
+from omnigent.preference_sync import MAX_OPERATIONS
 
 # Harness label stamped in the report: HTTP/DB journeys drive no agent turn;
 # runner journeys drive turns through the in-process openai-agents SDK harness.
@@ -148,7 +154,9 @@ async def run_benchmark(
     :returns: ``(report, passed)`` where *passed* is ``False`` if any journey
         breached a supplied threshold.
     """
-    journeys = resolve_journeys(args.journeys)
+    journeys = resolve_journeys(
+        args.journeys, shared_preferences=getattr(args, "shared_preferences", False)
+    )
     journey_results: dict[str, dict[str, object]] = {}
     passed = True
     backend = _backend_of(args.database_uri)
@@ -161,6 +169,9 @@ async def run_benchmark(
     # mixed selection that includes it boots the host too.
     with_runner = any(j.needs_runner for j in journeys)
     with_host = any(j.needs_host for j in journeys)
+    shared_preferences = getattr(args, "shared_preferences", False) or any(
+        j.needs_shared_preferences for j in journeys
+    )
     harness = _RUNNER_HARNESS if with_runner else _HTTP_HARNESS
 
     async with BenchEnvironment(
@@ -168,6 +179,10 @@ async def run_benchmark(
         with_host=with_host,
         database_uri=args.database_uri,
         network_delay_ms=args.network_delay_ms,
+        shared_preferences=shared_preferences,
+        preference_history=getattr(args, "preference_history", DEFAULT_PREFERENCE_HISTORY),
+        preference_keys=getattr(args, "preference_keys", DEFAULT_PREFERENCE_KEYS),
+        preference_clients=getattr(args, "preference_clients", DEFAULT_PREFERENCE_CLIENTS),
         teardown_started=teardown_started,
     ) as env:
         for journey in journeys:
@@ -218,6 +233,10 @@ async def run_benchmark(
         "with_runner": with_runner,
         "backend": backend,
         "network_delay_ms": args.network_delay_ms,
+        "shared_preferences": shared_preferences,
+        "preference_history": getattr(args, "preference_history", DEFAULT_PREFERENCE_HISTORY),
+        "preference_keys": getattr(args, "preference_keys", DEFAULT_PREFERENCE_KEYS),
+        "preference_clients": getattr(args, "preference_clients", DEFAULT_PREFERENCE_CLIENTS),
     }
     generated_at = datetime.datetime.now(datetime.UTC).isoformat()
     report = build_report(
@@ -326,7 +345,60 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="N",
         help="Exit 1 if any journey's avg P99 latency exceeds N ms.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--shared-preferences",
+        action="store_true",
+        help="Enable the API for control journeys too.",
+    )
+    parser.add_argument(
+        "--preference-history",
+        type=int,
+        default=DEFAULT_PREFERENCE_HISTORY,
+        help="Extra receipt rows seeded per preference namespace, outside timing (0..9000).",
+    )
+    parser.add_argument(
+        "--preference-keys",
+        type=int,
+        default=DEFAULT_PREFERENCE_KEYS,
+        help="Current preference keys per namespace (1..512).",
+    )
+    parser.add_argument(
+        "--preference-clients",
+        type=int,
+        default=DEFAULT_PREFERENCE_CLIENTS,
+        help="Independent disk caches for concurrent sync journeys.",
+    )
+    args = parser.parse_args(argv)
+    if not 0 <= args.preference_history <= 9000 or not 1 <= args.preference_keys <= 512:
+        parser.error("preference history must be 0..9000 and keys must be 1..512")
+    if not 1 <= args.preference_clients <= 64:
+        parser.error("preference clients must be 1..64")
+    selected = {
+        journey.name
+        for journey in resolve_journeys(args.journeys, shared_preferences=args.shared_preferences)
+    }
+    sync = selected & {"shared_preferences_sync_same_user", "shared_preferences_sync_many_users"}
+    if (
+        any(name.startswith("shared_preferences_") for name in selected)
+        and args.preference_keys < 2
+    ):
+        parser.error("preference journeys need at least two seeded keys")
+    writes = 0
+    if sync:
+        if args.concurrency > args.preference_clients:
+            parser.error("preference sync concurrency cannot exceed --preference-clients")
+        if args.preference_keys <= args.preference_clients:
+            parser.error("preference sync needs at least --preference-clients + 1 keys")
+        # Budget conservatively even when clients use separate user namespaces.
+        writes = args.requests if args.concurrency > 1 else args.iterations
+    if "shared_preferences_write" in selected:
+        writes = max(writes, args.iterations)
+    if (
+        writes
+        and args.preference_history + args.preference_keys + args.warmup + writes > MAX_OPERATIONS
+    ):
+        parser.error("preference keys + history + warmup + writes cannot exceed 10000 operations")
+    return args
 
 
 async def _run_until_terminated(args: argparse.Namespace) -> tuple[dict[str, object], bool]:

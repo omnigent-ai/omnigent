@@ -4,12 +4,15 @@ Own environment; no provider calls, mock services, browser, or native harness.
 The CLI config explicitly enables the API on these isolated local servers.
 """
 
+import json
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import httpx
 
-from tests._helpers.live_server import isolated_local_server
+from tests._helpers.live_server import isolated_local_server, isolated_process_env
 
 
 def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
@@ -103,3 +106,161 @@ def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
                 if item["key"] == {"kind": "model", "name": "model"}
             )
             assert model["value"] is None and model["version"] == 3
+
+
+_CLIENT_PROCESS = """
+import asyncio, json, sys
+from pathlib import Path
+from uuid import UUID
+import httpx
+from omnigent.preference_client import PreferenceClient
+from omnigent.preference_sync import PreferenceNamespace, SharedPreferenceKey
+
+root, installation, url, action, payload = sys.argv[1:]
+local = PreferenceClient(Path(root) / 'cache.db', installation_id=installation,
+    identity=PreferenceNamespace(authority_id='live-preference-client',
+                                 user_id='alice@example.test', workspace_id='0'))
+error = None
+async def drive():
+    async def lose_reply(response):
+        if response.request.method == 'POST' and response.status_code == 200:
+            raise httpx.ReadError('injected lost acknowledgment', request=response.request)
+    async with httpx.AsyncClient(base_url=url, trust_env=False, timeout=10,
+        headers={'X-Forwarded-Email': 'alice@example.test'},
+        event_hooks={'response': [lose_reply]} if action == 'lose-ack' else {}) as http:
+        await local.sync(http, page_size=2)
+try:
+    if action == 'enqueue':
+        for edit in json.loads(payload):
+            local.enqueue(SharedPreferenceKey.model_validate(edit['key']), edit['value'],
+                resolves=tuple(UUID(item) for item in edit.get('resolves', [])))
+    elif action == 'discard':
+        local.discard(UUID(payload))
+    else:
+        asyncio.run(drive())
+except httpx.HTTPError as exc:
+    error = type(exc).__name__
+snapshot = local.cached()
+print(json.dumps({'snapshot': snapshot.model_dump(mode='json') if snapshot else None,
+                  'pending': [item.model_dump(mode='json') for item in local.pending()],
+                  'error': error}))
+sys.exit(2 if error else 0)
+"""
+
+
+def test_durable_preference_clients_offline_reconnect_and_restart(tmp_path, db_uri):
+    config = tmp_path / "server.yaml"
+    config.write_text("shared_preferences_authority_id: live-preference-client\n")
+    arguments = ("--config", str(config), "--database-uri", db_uri)
+    server_env = {"OMNIGENT_LOCAL_SINGLE_USER": "0"}
+    model_key = {"kind": "model", "name": "model"}
+
+    def drive(installation, url, action="sync", edits=(), *, failure=False):
+        root = tmp_path / installation
+        root.mkdir(exist_ok=True)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _CLIENT_PROCESS,
+                str(root),
+                installation,
+                url,
+                action,
+                edits if action == "discard" else json.dumps(edits),
+            ],
+            env=isolated_process_env(root / "home", {}, None),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == (2 if failure else 0), result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    def edit(key, value, **extra):
+        return {"key": key, "value": value, **extra}
+
+    with isolated_local_server(tmp_path / "first", extra_args=arguments, env=server_env) as first:
+        with isolated_local_server(
+            tmp_path / "replica", extra_args=arguments, env=server_env
+        ) as replica:
+            drive("laptop", first)
+            drive("remote", replica)
+            edits = [
+                edit(model_key, "model-a"),
+                edit(model_key, "model-b"),
+                edit({"kind": "model", "name": "opencode_model"}, "opencode-default"),
+                edit({"kind": "harness", "name": "default"}, "pi-native"),
+                edit({"kind": "harness_args", "name": "claude"}, []),
+                edit(
+                    {
+                        "kind": "plugin",
+                        "name": {"ecosystem": "claude", "source": "catalog", "name": "tools"},
+                    },
+                    False,
+                ),
+            ]
+            queued = drive("laptop", "http://127.0.0.1:1", "enqueue", edits)
+            assert len(queued["pending"]) == len(edits)
+            saved = drive("laptop", first)["snapshot"]
+            assert len(saved["entries"]) == 5 and saved["conflicts"] == []
+            drive("remote", replica, "enqueue", [edit(model_key, "remote-choice")])
+            conflict = drive("remote", replica)["snapshot"]["conflicts"][0]
+            drive("laptop", first)
+            blocked = drive(
+                "laptop",
+                first,
+                "enqueue",
+                [
+                    edit(model_key, "laptop-choice", resolves=[conflict["operation_id"]]),
+                    edit({"kind": "harness", "name": "default"}, "codex-native"),
+                ],
+            )["pending"][0]
+            drive(
+                "remote",
+                replica,
+                "enqueue",
+                [edit(model_key, "remote-choice", resolves=[conflict["operation_id"]])],
+            )
+            drive("remote", replica)
+            rejected = drive("laptop", first, failure=True)
+            assert rejected["error"] == "HTTPStatusError"
+            assert len(rejected["pending"]) == 2
+            drive("laptop", first, "discard", blocked["operation_id"])
+            recovered = drive("laptop", first)
+            assert recovered["pending"] == [] and recovered["snapshot"]["conflicts"] == []
+            assert any(
+                entry["key"] == {"kind": "harness", "name": "default"}
+                and entry["value"] == "codex-native"
+                for entry in recovered["snapshot"]["entries"]
+            )
+            assert (
+                next(
+                    entry
+                    for entry in recovered["snapshot"]["entries"]
+                    if entry["key"] == model_key
+                )["value"]
+                == "remote-choice"
+            )
+            drive("laptop", first)
+            drive("laptop", first, "enqueue", [edit(model_key, "lost-ack-choice")])
+            uncertain = drive("laptop", first, "lose-ack", failure=True)
+            assert len(uncertain["pending"]) == 1
+            drive("remote", replica)
+            drive("remote", replica, "enqueue", [edit(model_key, "newer-choice")])
+            newer = drive("remote", replica)["snapshot"]
+    # Both the client process and server processes have stopped; disk state remains.
+    offline = drive("laptop", "http://127.0.0.1:1", failure=True)
+    assert offline["pending"] == uncertain["pending"]
+    with isolated_local_server(
+        tmp_path / "restart", extra_args=arguments, env=server_env
+    ) as restarted:
+        retried = drive("laptop", restarted)
+        assert retried["snapshot"] == newer and retried["pending"] == []
+        drive("laptop", restarted, "enqueue", [edit(model_key, None)])
+        cleared = drive("laptop", restarted)["snapshot"]
+        assert (
+            next(entry for entry in cleared["entries"] if entry["key"] == model_key)["value"]
+            is None
+        )
+        assert drive("remote", restarted)["snapshot"] == cleared

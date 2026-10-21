@@ -5,6 +5,7 @@ and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
 and an opt-in server API for durable edits and conflicts. Automatic client sync
 and shared/machine scope controls are not available through the CLI or UI yet.
+An explicit Python client can persist offline edits and synchronize them on reconnect.
 
 ## Sub-features
 
@@ -24,6 +25,9 @@ and shared/machine scope controls are not available through the CLI or UI yet.
   distinct across shared, machine, project, and session scopes.
 - `shared-operations`: opt-in server API; read/save all four groups, retry an
   edit, remove a preference, inspect competing edits, and resolve them explicitly.
+- `shared-client`: explicit Python client; preserve offline edits across process
+  restarts, retry uncertain deliveries, refresh the cache, and surface conflicts. Cache records are versioned and bounded; lock contention
+  and unsupported cache versions remain visible.
 
 ## How to get to it (user POV)
 
@@ -52,6 +56,12 @@ The [API guide](../docs/shared-preferences-api.md) covers requests, conflict
 resolution, identity, and limits. These endpoints do not adopt preferences into
 launchers or turn on sync. Embedded apps opt in with `create_app(preference_store=...)`;
 omitting an auth provider uses the reserved `local` user namespace.
+
+**Embedded client:** use the [client API](../docs/shared-preferences-client.md)
+with a private cache file, an expected account/workspace/deployment identity,
+and the caller's authenticated HTTP client. Queue explicit edits locally, then
+synchronize on reconnect. The caller schedules synchronization; launchers, the
+host daemon, and the settings UI do not call this API automatically yet.
 
 **Shared scope controls:** the CLI and UI do not yet offer importing/reimporting
 preferences, saving shared or machine defaults, removing a machine override,
@@ -146,6 +156,38 @@ Use the process recipe above for replica and restart transport.
 For later slices, continue live verification of each newly connected path on an
 isolated deployment. Record the candidate/runtime versions, configuration,
 observed results, any mocked services, and remaining entry-point gaps.
+
+**Durable client (own environment):** the same server test file also runs
+`test_durable_preference_clients_offline_reconnect_and_restart`. It launches
+separate client processes with private caches, queues all four groups offline,
+resolves competing edits through two server replicas, injects a lost response
+after a real commit, stops both servers, and starts a fresh replica to verify
+retry/deletion convergence. It also rejects a duplicate conflict resolution,
+explicitly discards that blocked edit, and delivers the remaining queued work.
+The lost-response fault is injected; HTTP and SQL are real. This is local OSS
+client/API evidence, not automatic host sync, launcher adoption, or Arclet proof.
+
+```sh
+uv run --no-sync pytest tests/test_preference_client.py --reruns 0 -q -rs
+```
+
+The process client requests two-row pages to exercise full traversal before
+adopting a snapshot, including after server restart. The component matrix covers
+later-page disconnects, changed revisions/identities, duplicate entries, repeated
+cursors, and malformed pages: the prior cache and outbox remain intact, and a
+fresh retry can converge. These cases extend the same `shared-client` recipe.
+
+The component matrix also covers causal offline edits, malformed or stale replies,
+identity changes, cancellation, local writers, sync locking, and outbox limits.
+Its HTTP transport is simulated; the mapped process test covers real transport.
+
+For latency and contention use the existing
+[benchmark runner](../dev/benchmarks/omnigent/README.md#shared-preferences).
+Record key/history/client counts, backend/driver, feature gate, revision,
+latency percentiles, errors, and HTTP requests per operation. Compare receipt
+history sizes and existing server journeys with the API off/on; label injected
+network delay separately from a real WAN. Performance numbers do not replace
+the correctness scenarios above.
 
 ## Gotchas
 

@@ -306,6 +306,11 @@ def _stop_process_group(proc: subprocess.Popen[bytes]) -> None:
         psutil.wait_procs(current, timeout=0.2)
 
 
+DEFAULT_PREFERENCE_HISTORY = 0
+DEFAULT_PREFERENCE_KEYS = 32
+DEFAULT_PREFERENCE_CLIENTS = 16
+
+
 class BenchEnvironment:
     """Async context manager owning the benchmark's server (± runner + mock).
 
@@ -332,6 +337,10 @@ class BenchEnvironment:
         real client↔server network hop that loopback lacks. ``0`` (default)
         adds no delay. Combined with per-op request counts, it turns each
         journey's round-trip count into wall-clock cost.
+    :param shared_preferences: Enable the preference API only on this owned server.
+    :param preference_history: Prior operations seeded per benchmark namespace.
+    :param preference_keys: Number of current keys in each preference namespace.
+    :param preference_clients: Independent caches used by concurrent sync journeys.
     """
 
     def __init__(
@@ -343,6 +352,10 @@ class BenchEnvironment:
         harness: str = _DEFAULT_HARNESS,
         model: str = _DEFAULT_MODEL,
         network_delay_ms: float = 0.0,
+        shared_preferences: bool = False,
+        preference_history: int = DEFAULT_PREFERENCE_HISTORY,
+        preference_keys: int = DEFAULT_PREFERENCE_KEYS,
+        preference_clients: int = DEFAULT_PREFERENCE_CLIENTS,
         teardown_started: asyncio.Event | None = None,
     ) -> None:
         # with_host is additive over with_runner: the boot runner still serves
@@ -354,6 +367,10 @@ class BenchEnvironment:
         self.harness = harness
         self.model = model
         self.network_delay_ms = network_delay_ms
+        self.shared_preferences = shared_preferences
+        self.preference_history = preference_history
+        self.preference_keys = preference_keys
+        self.preference_clients = preference_clients
         self.base_url = ""
         self.mock_url = ""
         self.runner_id = ""
@@ -682,6 +699,8 @@ class BenchEnvironment:
             "debug_router_modules": [_DEBUG_ROUTER_MODULE],
             "policy_modules": ["dev.benchmarks.omnigent.journeys"],
         }
+        if self.shared_preferences:
+            server_config["shared_preferences_authority_id"] = "benchmark-preferences"
         if self.with_runner:
             server_config["llm"] = {
                 "model": _POLICY_LLM_KEY,

@@ -34,7 +34,7 @@ uv run --no-sync dev/benchmarks/omnigent/run.py \
 
 # Throughput mode: >1 concurrency drives concurrency-safe journeys as load.
 uv run --no-sync dev/benchmarks/omnigent/run.py \
-    --requests 500 --concurrency 25 --runs 3
+    --requests 500 --concurrency 25 --preference-clients 25 --runs 3
 
 # CI gating: exit 1 if a threshold is breached.
 uv run --no-sync dev/benchmarks/omnigent/run.py --max-p50-ms 25 --max-p99-ms 100
@@ -275,6 +275,76 @@ backend.
   system library) — it is not in any extra. A supported backend, though prod
   runs on Postgres. Stand up a local one with
   `docker run -e MYSQL_ROOT_PASSWORD=… -e MYSQL_DATABASE=benchdb -p 3306:3306 mysql:8.0`.
+
+## Shared preferences
+
+Default runs omit preference journeys and leave the API off. Name a preference
+journey explicitly or pass `--shared-preferences` to include them.
+
+The `shared_preferences_*` journeys enable the API on the benchmark-owned
+server. They use real HTTP/SQL and local header authentication, with no model.
+The sync journeys also use the production client's private SQLite cache/outbox.
+
+| Journey suffix | Timed work |
+| --- | --- |
+| `read` | Collect every snapshot page, validated against seeded state |
+| `write` | Changed-value POST; a separate untimed GET verifies persistence |
+| `retry` | Repeat a known operation; require its exact original receipt |
+| `refresh` | Fetch and persist the authoritative snapshot in a local cache |
+| `sync_same_user` | Queue an edit durably and sync it; clients share one user/workspace |
+| `sync_many_users` | Same, with each client in a separate user namespace |
+
+Each setup uses fresh benchmark-owned identities. `--preference-keys` (default
+32) controls current records; `--preference-history` (default 0, maximum 9000)
+adds real consumed operations/receipts before timing. `--preference-clients`
+(default 16) controls independent disk caches. Concurrent sync uses a different
+plugin key per client so contention measurements are not conflict rejection
+measurements. Use at least clients + 1 keys and concurrency no higher than the
+client count. The correctness tests separately exercise conflicting same-key edits.
+The CLI rejects sync workloads that exceed the client pool or the per-namespace
+operation budget before starting a server; the budget is conservative for separate users.
+
+```sh
+# Sequential latency, including client disk persistence.
+uv run --no-sync dev/benchmarks/omnigent/run.py \
+  --journeys shared_preferences_read,shared_preferences_write,shared_preferences_retry,shared_preferences_refresh \
+  --iterations 100 --runs 3 --output /tmp/preference-latency.json
+
+# Near-capacity history; 9000 history operations plus 512 keys leaves room for samples.
+uv run --no-sync dev/benchmarks/omnigent/run.py \
+  --journeys shared_preferences_read,shared_preferences_retry,shared_preferences_write,shared_preferences_refresh \
+  --preference-keys 512 --preference-history 9000 \
+  --iterations 100 --runs 3 --output /tmp/preference-history.json
+
+# Compare same-namespace locking with independent-user traffic.
+uv run --no-sync dev/benchmarks/omnigent/run.py \
+  --journeys shared_preferences_sync_same_user,shared_preferences_sync_many_users \
+  --requests 300 --concurrency 16 --runs 3 --output /tmp/preference-contention.json
+```
+
+Repeat on an isolated Postgres/MySQL/CockroachDB database via `--database-uri`.
+Never point history seeding at a production database. Setup persists benchmark
+rows in an external database; its owner cleans up that isolated database.
+Keep total keys + history + warmup + measured writes below the server's 10,000
+operation cap; exceeding it is a failed run, not a performance result.
+
+Use `--shared-preferences` to enable the API for existing control journeys such
+as `get_session`, `list_sessions`, and `project_order_save_1000`; omit it for the
+disabled control. Compare identical workloads on the same host. The JSON config
+records the gate and corpus sizes. Server CPU/RSS is process-wide; it does not
+measure the database container's memory.
+
+Reads use the production client's revision-bound page collector. Each page holds
+at most 100 values and conflicts combined. With the default 32 keys, a one-edit
+sync uses three HTTP requests and a refresh uses one. With 512 keys and no
+conflicts, refresh uses six GETs and a one-edit sync uses thirteen requests.
+Receipt history does not add pages; retry always uses one POST. A changed
+revision between pages fails the sample rather than silently retrying it.
+The write journey's request count includes its untimed verification GETs, as with
+project ordering. `--network-delay-ms 50` injects delay per HTTP request,
+including setup: label these samples simulated network latency, not a WAN test.
+The feature-map client/server process tests remain the correctness evidence;
+benchmark numbers alone do not establish recovery or managed-deployment readiness.
 
 ## Output → Databricks → dashboard
 

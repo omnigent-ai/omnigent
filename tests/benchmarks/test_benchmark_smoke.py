@@ -56,6 +56,7 @@ _SMOKE_JOURNEYS = [
     "policy_evaluate",
     "native_hook_spawn",
     *(name for name in ALL_JOURNEYS if name.startswith("project_order_")),
+    *(name for name in ALL_JOURNEYS if name.startswith("shared_preferences_")),
 ]
 
 
@@ -80,12 +81,80 @@ def _smoke_args(**overrides: object) -> argparse.Namespace:
         "min_rps": None,
         "max_p50_ms": None,
         "max_p99_ms": None,
+        "preference_clients": 2,
+        "preference_keys": 4,
+        "preference_history": 2,
     }
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
 # ── pure-layer unit checks (no server) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("journey", "arguments", "valid"),
+    [
+        ("sync_same_user", ["--concurrency", "25"], False),
+        ("sync_many_users", ["--preference-clients", "32"], False),
+        ("sync_same_user", ["--preference-clients", "1", "--preference-keys", "1"], False),
+        (
+            "sync_same_user",
+            ["--preference-history", "9000", "--preference-keys", "512", "--concurrency", "16"],
+            False,
+        ),
+        (
+            "write",
+            ["--preference-history", "9000", "--preference-keys", "512", "--iterations", "500"],
+            False,
+        ),
+        (
+            "write",
+            ["--preference-history", "9000", "--preference-keys", "512", "--iterations", "478"],
+            True,
+        ),
+        (
+            "read",
+            [
+                "--preference-history",
+                "9000",
+                "--preference-keys",
+                "512",
+                "--iterations",
+                "10000",
+                "--concurrency",
+                "25",
+            ],
+            True,
+        ),
+    ],
+)
+def test_preference_benchmark_workload_bounds(journey, arguments, valid):
+    arguments = ["--journeys", "shared_preferences_" + journey, *arguments]
+    if valid:
+        bench_run._parse_args(arguments)
+    else:
+        with pytest.raises(SystemExit) as exc:
+            bench_run._parse_args(arguments)
+        assert exc.value.code == 2
+
+
+def test_default_benchmarks_preserve_disabled_preference_control():
+    args = bench_run._parse_args(["--concurrency", "25"])
+    assert not args.shared_preferences
+    assert not any(j.needs_shared_preferences for j in bench_journeys.resolve_journeys(None))
+    assert any(
+        j.needs_shared_preferences
+        for j in bench_journeys.resolve_journeys(None, shared_preferences=True)
+    )
+    assert bench_journeys.resolve_journeys(["shared_preferences_read"])[0].needs_shared_preferences
+
+
+@pytest.mark.asyncio
+async def test_benchmark_control_records_disabled_api():
+    report, passed = await bench_run.run_benchmark(_smoke_args(journeys=["list_sessions"]))
+    assert passed
+    assert _d(report["config"])["shared_preferences"] is False
 
 
 def test_backend_of_classifies_uri_schemes() -> None:
@@ -751,6 +820,7 @@ async def test_benchmark_smoke_end_to_end() -> None:
 
     assert passed  # no thresholds supplied → vacuously passes
     assert report["schema_version"] == SCHEMA_VERSION
+    assert _d(report["config"])["shared_preferences"] is True
     assert _d(report["config"])["with_runner"] is False
     # No --database-uri → the throwaway-SQLite path, labelled "sqlite".
     assert _d(report["config"])["backend"] == "sqlite"
@@ -782,6 +852,8 @@ async def test_benchmark_smoke_end_to_end() -> None:
             assert cast(float, per_op) == 0.0, f"{name}: {per_op} requests/op"
             assert not _d(block["summary"]).get("network_routes")
             continue
+        if name.startswith("shared_preferences_"):
+            assert per_op == (3 if "sync_" in name else 2 if name.endswith("write") else 1)
         assert cast(float, per_op) >= 1.0, f"{name}: {per_op} requests/op"
         # Per-route appendix: at least one endpoint attributed, and its
         # per-op figures sum to roughly the aggregate per-op count.
