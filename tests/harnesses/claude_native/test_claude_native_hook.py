@@ -1075,7 +1075,12 @@ def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", lambda *_a, **_k: None)
+    holds: list[object] = []
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_post_hook_with_reattach",
+        lambda *_a, **kwargs: holds.append(kwargs.get("hold_through_outages")),
+    )
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_ask_lost")
     payload = {
         "hook_event_name": "PermissionRequest",
@@ -1092,6 +1097,7 @@ def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
     decision = output["hookSpecificOutput"]["decision"]
     assert decision["behavior"] == "deny"
     assert "normal chat message" in decision["message"]
+    assert holds == [True], "a question must be held through outages before it is denied"
 
 
 def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
@@ -1107,7 +1113,12 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", lambda *_a, **_k: None)
+    holds: list[object] = []
+    monkeypatch.setattr(
+        claude_native_hook,
+        "_post_hook_with_reattach",
+        lambda *_a, **kwargs: holds.append(kwargs.get("hold_through_outages")),
+    )
     bridge_dir = _prepare_permission_bridge(tmp_path, "conv_bash_lost")
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
@@ -1116,6 +1127,7 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
 
     assert exit_code == 0
     assert capsys.readouterr().out == ""
+    assert holds == [False], "other tools keep the bounded retry and terminal fallback"
 
 
 def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set(
@@ -2212,6 +2224,87 @@ def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPat
     assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
         "reattach must stop after the consecutive-hard-failure cap, not spin"
     )
+
+
+@pytest.mark.parametrize("kind", ["connect", "5xx"])
+def test_reattach_held_question_outlasts_the_hard_failure_cap(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """A held question keeps retrying a down server until it answers again.
+
+    Giving up would drop the web card and leave the question in a terminal
+    picker a web-only user never sees.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    client = _scripted_client(
+        script=[(kind, 0.0)] * (cap * 3) + [("ok", 0.0)], monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PermissionRequest"},
+        hook_label="permission",
+        hold_through_outages=True,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert len(client.calls) == cap * 3 + 1
+
+
+def test_reattach_held_question_retries_auth_before_its_first_held_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held question waits out a login that can't be renewed yet, even unparked."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            auth = self._headers.get("Authorization", "")
+            seen_auth.append(auth)
+            req = httpx.Request("POST", url)
+            if auth == "Bearer fresh":
+                return httpx.Response(200, json={"ok": True}, request=req)
+            return httpx.Response(403, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    failed_mints = {"left": 2}
+
+    def _reauth() -> dict[str, str] | None:
+        """
+        Fail to mint until the user has signed in again.
+
+        :returns: Fresh headers once signed in, else ``None``.
+        """
+        failed_mints["left"] -= 1
+        return None if failed_mints["left"] >= 0 else {"Authorization": "Bearer fresh"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PermissionRequest"},
+        hook_label="permission",
+        reauth=_reauth,
+        hold_through_outages=True,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert seen_auth == ["Bearer stale"] * 3 + ["Bearer fresh"], seen_auth
 
 
 def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) -> None:
