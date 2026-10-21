@@ -136,3 +136,27 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
 
 async def test_preferences_not_mounted_by_default(client):
     assert (await client.get("/v1/preferences/shared")).status_code == 404
+
+
+async def test_preference_body_is_bounded_before_json_parse(db_uri):
+    from fastapi import FastAPI
+
+    from omnigent.server.preference_requests import MAX_PREFERENCE_REQUEST_BYTES
+    from omnigent.server.routes.preferences import create_preferences_router
+
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="body-test")
+    app = FastAPI()
+    app.include_router(create_preferences_router(store), prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+
+        async def chunks():
+            yield b" " * MAX_PREFERENCE_REQUEST_BYTES
+            yield b"x"
+
+        response = await client.post("/v1/preferences/shared/operations", content=chunks())
+        assert response.status_code == 413
+        response = await client.post("/v1/preferences/shared/operations", content=b"not json")
+        assert response.status_code == 422
+        assert (await client.get("/v1/preferences/shared")).json()["revision"] == 0

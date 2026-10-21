@@ -375,7 +375,10 @@ uv run --no-sync pytest tests/stores/test_preference_store.py \
 
 The [store matrix](../tests/stores/test_preference_store.py) covers bounded
 pages, concurrent edits, limits, atomic rejection, and stable retry receipts.
-The [route matrix](../tests/server/routes/test_preferences.py) covers authenticated
+The [admission matrix](../tests/server/test_preference_requests.py) covers shared
+HTTP/tunnel capacity, cancellation retaining worker slots, and account/workspace
+rate isolation. Account deletion tests inject a mid-batch failure and verify
+atomic rollback before retry. The [route matrix](../tests/server/routes/test_preferences.py) covers authenticated
 and no-auth embedding, identity validation, and HTTP status mapping. The
 [protocol tests](../tests/test_preference_sync.py) own key/value validation.
 Use the process recipe above for replica and restart transport.
@@ -429,9 +432,11 @@ the correctness scenarios above.
   rejected visibly; review the current value, discard the pending edit, then
   explicitly save again if still needed. V1 clients require upgrade after 10,000
   total revisions. All server replicas must support v2 before enabling writers.
-  Bounded account cleanup remains an activation prerequisite.
-- Request parsing currently has no route-specific body-size or rate limit.
-  Add these before broad activation; the value cap applies after JSON parsing.
+  Account cleanup uses 256-key statements within the atomic revocation transaction.
+- Shared API writes are capped at 64 KiB before parsing (host import controls:
+  8 MiB), with a five-second upload deadline. HTTP/tunnel/preparation share a
+  16-worker admission limit and a per-process account/workspace rate limit.
+  A busy response leaves queued edits intact; retry after congestion clears.
 - Managed deployment, Universe wiring, Arclet startup,
   and live per-harness model availability remain unverified follow-ups. Startup adoption
   carries portable intent; each adapter must still apply and report its capabilities.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from functools import partial
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import ValidationError
@@ -24,6 +25,7 @@ from omnigent.preference_controls import (
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.preference_broker import PreferenceBrokerGrant
+from omnigent.server.preference_requests import read_preference_payload, run_preference_work
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.stores.host_store import HostStore
@@ -83,11 +85,7 @@ def create_preference_controls_router(
             raise HTTPException(501, "Update this host to manage shared preferences")
         if len(conn.pending_preferences) >= 4:
             raise HTTPException(429, "Preference actions are busy; retry shortly")
-        payload = bytearray()
-        async for chunk in request.stream():
-            if len(payload) + len(chunk) > MAX_CONTROL_BYTES:
-                raise HTTPException(413, "Preference action exceeds the request limit")
-            payload.extend(chunk)
+        payload = await read_preference_payload(request, MAX_CONTROL_BYTES)
         try:
             action = PREFERENCE_CONTROL.validate_json(payload)
         except ValidationError as exc:
@@ -110,7 +108,9 @@ async def run_preference_control(
     if action.action == "prepare":
         if CAP_PREFERENCE_PREPARE not in conn.hello.capabilities:
             raise HTTPException(501, "Update this host to prepare shared preferences")
-        shared = await asyncio.to_thread(read_store_snapshot, preference_store, user_id)
+        shared = await run_preference_work(
+            user_id, partial(read_store_snapshot, preference_store, user_id)
+        )
         if shared.revision == 0:
             raise HTTPException(
                 409, "Choose shared defaults once in Settings, or use temporary defaults"

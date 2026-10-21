@@ -137,8 +137,23 @@ server is downgraded. Upgraded metadata is not readable by older server binaries
 roll out matching server code to every replica before enabling v2 writers.
 
 There are at most 30,641 rows per namespace: 512 keys, 128 conflicts, metadata,
-10,000 legacy receipts, 10,000 v2 receipts and 10,000 ring slots. Account cleanup
-and route-specific request bounds remain separate activation prerequisites.
+10,000 legacy receipts, 10,000 v2 receipts and 10,000 ring slots. Account deletion removes preferences in batches of at most 256 keys in its
+existing revocation transaction. A failed batch rolls everything back; no
+partially deleted account or surviving preferences are exposed on re-registration.
+Batching bounds each statement, not the duration of the complete transaction.
+
+The HTTP write route accepts at most 64 KiB before JSON parsing, including chunked
+uploads. Host-control requests retain their 8 MiB cap for reviewed imports.
+Uploads have a five-second deadline. HTTP reads/writes, host preparation, and
+owner-tunnel operations share at most 16 active SQL workers per server event loop.
+Excess work returns 429 without joining an unbounded queue. Cancelling a request
+does not release its slot until the SQL worker finishes.
+
+The existing bounded sliding-window limiter allows 2,048 operations per minute
+per account/workspace per process. It tracks at most 4,096 keys and fails open
+for new keys at capacity; the worker cap still applies. These are local admission
+bounds, not a fleet-wide quota. Large benchmark history seeds must pace requests;
+an overload response is a failed sample, not a latency measurement.
 
 The version-1 key encoding is explicit and pinned by digest tests. Changing its
 encoding, harness aliases, or stored-record validation requires a migration or a

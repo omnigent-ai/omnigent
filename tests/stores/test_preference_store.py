@@ -362,17 +362,43 @@ def test_key_and_conflict_limits_preserve_existing_values(store, monkeypatch):
     assert store.apply(mutation(store, value="model-d"), user_id="alice").status == "conflict"
 
 
-def test_account_deletion_cleans_preferences_and_revokes_stale_write(store, db_uri):
+@pytest.mark.parametrize("fail_batch", [False, True])
+def test_account_deletion_cleans_preferences_and_revokes_stale_write(
+    store, db_uri, monkeypatch, fail_batch
+):
     from omnigent.db.account_authority import account_authority_scope
     from omnigent.server.accounts_store import SqlAlchemyAccountStore
 
+    monkeypatch.setattr("omnigent.server.accounts_store.PREFERENCE_DELETE_BATCH_SIZE", 2)
     accounts = SqlAlchemyAccountStore(db_uri)
     accounts.create_user_with_password("alice", "test-hash", is_admin=False)
     operation = mutation(store)
     store.apply(operation, user_id="alice")
     generation = accounts.login_snapshot("alice")[1]
     assert generation is not None
-    assert accounts.delete_user("alice") is True
+    deleted_batches = []
+
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        if statement.startswith("DELETE FROM preferences"):
+            deleted_batches.append(parameters)
+            if fail_batch and len(deleted_batches) == 2:
+                raise RuntimeError("cleanup interrupted")
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        if fail_batch:
+            with pytest.raises(RuntimeError, match="cleanup interrupted"):
+                accounts.delete_user("alice")
+            assert accounts.get_user("alice") is not None
+            assert store.read(user_id="alice").entries[0].value == operation.value
+        else:
+            assert accounts.delete_user("alice") is True
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(deleted_batches) == 2
+    assert all(len(parameters) <= 4 for parameters in deleted_batches)
+    if fail_batch:
+        assert accounts.delete_user("alice") is True
     assert store.read(user_id="alice").entries == []
     with account_authority_scope("alice", generation):
         with pytest.raises(OmnigentError, match="revoked"):

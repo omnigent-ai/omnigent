@@ -52,6 +52,8 @@ from omnigent.db.utils import (
 from omnigent.entities import Account, AccountToken
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 
+PREFERENCE_DELETE_BATCH_SIZE = 256
+
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
 
@@ -504,12 +506,21 @@ class SqlAlchemyAccountStore:
                 )
             )
             _revoke_durable_authority(session, user_id, now=int(time.time()))
-            session.execute(
-                delete(SqlPreference).where(
-                    SqlPreference.workspace_id == current_workspace_id(),
-                    SqlPreference.user_id == user_id,
-                )
+            preference_scope = (
+                SqlPreference.workspace_id == current_workspace_id(),
+                SqlPreference.user_id == user_id,
             )
+            while keys := list(
+                session.scalars(
+                    select(SqlPreference.key)
+                    .where(*preference_scope)
+                    .order_by(SqlPreference.key)
+                    .limit(PREFERENCE_DELETE_BATCH_SIZE)
+                )
+            ):
+                session.execute(
+                    delete(SqlPreference).where(*preference_scope, SqlPreference.key.in_(keys))
+                )
             target.deleted_at = int(time.time())
             target.password_hash = None
             target.is_admin = False
