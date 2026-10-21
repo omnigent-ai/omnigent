@@ -206,6 +206,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.memory_mb: int | None = None
         self.disk_gb: int | None = None
         self.idle_pause_after_s: int | None = None
+        self.on_timeout: str | None = None
         self.cluster: str | None = None
         # Microsandbox ctor wiring (captured by
         # install_fake_microsandbox_launcher).
@@ -540,8 +541,9 @@ def install_fake_e2b_launcher(
     """
     Substitute the fake for ``E2BSandboxLauncher`` at its public seam.
 
-    The managed flow constructs ``E2BSandboxLauncher(template=…, env=…)``;
-    the shim records the template name and env names on the fake and
+    The managed flow constructs
+    ``E2BSandboxLauncher(template=…, env=…, on_timeout=…)``; the shim
+    records the template name, env names and timeout action on the fake and
     hands the fake back, so production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
@@ -549,10 +551,13 @@ def install_fake_e2b_launcher(
     """
     import omnigent.onboarding.sandboxes.e2b as e2b_mod
 
-    def _ctor(*, template: str | None = None, env: list[str] | None = None) -> FakeSandboxLauncher:
+    def _ctor(
+        *, template: str | None = None, env: list[str] | None = None, on_timeout: str = "kill"
+    ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.template = template
         fake.env = env
+        fake.on_timeout = on_timeout
         # Report the e2b provider so managed-host teardown's provider match
         # (launcher.provider vs host.sandbox_provider) exercises the real path
         # instead of the FakeSandboxLauncher default ("modal").
