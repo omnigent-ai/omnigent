@@ -11,7 +11,8 @@ import {
   startHostDbcertRefresh,
 } from "@/lib/hostDbcert";
 import type { SandboxStatus } from "@/lib/types";
-import { useChatStore } from "@/store/chatStore";
+import { bindConversationForTest, handleSessionEvent } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 const NOW = Date.UTC(2026, 9, 18, 21);
 const EXPIRED = Date.UTC(2026, 9, 18, 20, 8, 15);
@@ -401,12 +402,30 @@ describe("LaptopDbcertBanner", () => {
 describe("ArcletDbcertBanner", () => {
   const MISSING: SandboxStatus = { stage: "dbcert_missing", error: null, provider: "arclet" };
 
-  function showSession(conversationId: string, sandboxStatus: SandboxStatus | null) {
-    act(() => useChatStore.setState({ conversationId, sandboxStatus }));
+  /** Put *conversationId* on screen, seeded with *sandboxStatus* when given. */
+  function showSession(conversationId: string, sandboxStatus?: SandboxStatus | null) {
+    act(() => {
+      bindConversationForTest(
+        conversationId,
+        sandboxStatus === undefined ? undefined : { sandboxStatus },
+      );
+    });
+  }
+
+  /** Deliver a launch report on the session's own stream, as the server does. */
+  function report(conversationId: string, stage: "dbcert_missing" | "provisioning") {
+    act(() =>
+      handleSessionEvent(
+        { type: "session_sandbox_status", conversationId, stage, error: null, provider: "arclet" },
+        conversationId,
+      ),
+    );
   }
 
   afterEach(() => {
-    useChatStore.setState({ conversationId: null, sandboxStatus: null });
+    cleanup();
+    conversationRegistry.clear();
+    bindConversationForTest(null);
   });
 
   it("says how to refresh a dbcert the Arclet hasn't received", () => {
@@ -431,16 +450,31 @@ describe("ArcletDbcertBanner", () => {
   it("goes away once the launch moves on", () => {
     showSession("conv_a", MISSING);
     render(<ArcletDbcertBanner />);
-    showSession("conv_a", { stage: "provisioning", error: null, provider: "arclet" });
+    report("conv_a", "provisioning");
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("stays dismissed only in the session it was dismissed in", () => {
-    showSession("conv_a", MISSING);
+  it("keeps each session's dismissal", () => {
+    showSession("conv_a");
+    report("conv_a", "dbcert_missing");
     render(<ArcletDbcertBanner />);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByRole("status")).toBeNull();
-    showSession("conv_b", MISSING);
+    showSession("conv_b");
+    report("conv_b", "dbcert_missing");
+    expect(screen.getByRole("status")).toHaveTextContent(/hasn't received your dbcert/i);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    showSession("conv_a");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("shows a later warning in the same session after a dismissal", () => {
+    showSession("conv_a");
+    report("conv_a", "dbcert_missing");
+    render(<ArcletDbcertBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    report("conv_a", "provisioning");
+    report("conv_a", "dbcert_missing");
     expect(screen.getByRole("status")).toHaveTextContent(/hasn't received your dbcert/i);
   });
 });

@@ -8,6 +8,7 @@ import {
   hasDbcertRefreshBridge,
   refreshDbcert,
 } from "@/lib/nativeBridge";
+import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chatStore";
 
@@ -120,11 +121,11 @@ export function LaptopDbcertBanner({
  * copies it from.
  */
 export function ArcletDbcertBanner() {
-  const conversationId = useChatStore((s) => s.conversationId);
-  const missing = useChatStore((s) => s.sandboxStatus?.stage === "dbcert_missing");
-  // ChatPage stays mounted across sessions, so a dismissal holds only in its own session.
-  const [dismissedIn, setDismissedIn] = useState<string | null>(null);
-  if (!missing || dismissedIn === conversationId) return null;
+  const status = useChatStore((s) => s.sandboxStatus);
+  // Each launch report is a new object, so a dismissal hides only the report it was shown for:
+  // a later warning shows again, and so does one in another session.
+  const [dismissed, setDismissed] = useState<ReadonlySet<SandboxStatus>>(() => new Set());
+  if (status?.stage !== "dbcert_missing" || dismissed.has(status)) return null;
   return (
     <DbcertRefreshBanner
       message="Your Arclet hasn't received your dbcert yet, so its host may not connect."
@@ -135,7 +136,7 @@ export function ArcletDbcertBanner() {
           Arclet.
         </>
       }
-      onDismiss={() => setDismissedIn(conversationId)}
+      onDismiss={() => setDismissed((current) => new Set(current).add(status))}
     />
   );
 }
