@@ -1087,12 +1087,8 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
 ) -> None:
     """
     A launch that needs the user to act reports ``action_required`` with
-    what to do: the live stream carries those details, and so does the
-    snapshot a reloading client cold-loads.
-
-    The stand-in launch reports through the real stage observer the
-    session route hands it, and waits for the stream subscription first
-    because the stream has no replay.
+    what to do: the live stream and the snapshot carry those details until
+    the launch moves on.
     """
     from fastapi import HTTPException
 
@@ -1158,6 +1154,8 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
         await asyncio.sleep(0.05)
     else:
         raise AssertionError("the stand-in launch never settled as failed")
+    # Each report replaces the last, so the failure no longer carries the details.
+    assert settled.json()["sandbox_status"]["details"] is None
 
 
 async def test_subagent_session_reuses_managed_sandbox_runner(

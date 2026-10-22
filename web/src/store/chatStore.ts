@@ -1050,6 +1050,12 @@ export interface ConversationState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  /**
+   * The `action_required` details the user dismissed for this session's launch, or `null`.
+   * Keeps the launch's banner hidden while it keeps asking for the same thing; a
+   * `session.sandbox_status` event for any other stage clears it.
+   */
+  sandboxActionDismissed: string | null;
   /** Managed startup accepts sends durably before its first harness dispatch. */
   startupPending: boolean;
   /**
@@ -1380,6 +1386,8 @@ export interface ChatActions {
   refreshSessionState: (conversationId?: string) => Promise<void>;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
+  /** Hide the launch's `action_required` banner while the launch keeps asking for *details*. */
+  dismissSandboxAction: (details: string) => void;
   /**
    * Dismiss the /btw sidechat overlay.
    * TODO: reconcile with terminal Escape on native sessions.
@@ -2079,6 +2087,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
+  sandboxActionDismissed: null,
   startupPending: false,
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
@@ -3367,6 +3376,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
+
+  dismissSandboxAction: (details) => setActive({ sandboxActionDismissed: details }),
 
   dismissBtwSidechat: () => {
     const { conversationId } = get();
@@ -7647,9 +7658,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // `ready` clears the launch indicator and starts the launch grace (the runner is
       // up, its terminal not yet); `failed` keeps the reason so the page can explain
       // why the sandbox never came up.
-      applyToConversation(
+      applyToConversation((s) =>
         event.stage === "ready"
-          ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
+          ? { sandboxStatus: null, sandboxActionDismissed: null, runnerLaunchedAt: Date.now() }
           : {
               sandboxStatus: {
                 stage: event.stage,
@@ -7657,6 +7668,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 provider: event.provider,
                 details: event.details,
               },
+              // A dismissal lasts while the launch keeps asking; any other stage ends it.
+              sandboxActionDismissed:
+                event.stage === "action_required" ? s.sandboxActionDismissed : null,
             },
       );
       // The sandbox host is bound before its runner starts; refetch the binding and a

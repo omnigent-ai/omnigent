@@ -182,6 +182,29 @@ describe("SandboxActionBanner", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
+  it("keeps a dismissal when the banner remounts", () => {
+    showSession("conv_a");
+    report("conv_a", "action_required");
+    render(<SandboxActionBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    // The transcript unmounts while the terminal is open, and mounts again after.
+    cleanup();
+    render(<SandboxActionBanner />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("clears a background session's dismissal once its launch moves on", () => {
+    showSession("conv_a");
+    report("conv_a", "action_required");
+    render(<SandboxActionBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    showSession("conv_b");
+    report("conv_a", "provisioning");
+    report("conv_a", "action_required");
+    showSession("conv_a");
+    expect(screen.getByRole("status")).toHaveTextContent(DETAILS);
+  });
+
   it("shows a later warning in the same session after a dismissal", () => {
     showSession("conv_a");
     report("conv_a", "action_required");
