@@ -21,12 +21,18 @@ from zipfile import BadZipFile, ZipFile
 REVIEWERS = {"polly": "polly-review.yml", "ocr": "open-code-review.yml"}
 REVIEW_BOTS = {"github-actions[bot]", "omnigent-ci[bot]"}
 RESOLVE_BOT = "omni-resolve-agent[bot]"
-PERMISSIONS = {"admin", "maintain", "write", "push"}
+# The permission endpoint reports legacy roles only; maintain is reported as write.
+PERMISSIONS = {"admin", "write"}
+# Success outcomes per agent: Resolve and the feature agent.
+SUCCESS_OUTCOMES = {"fixed", "implemented"}
 
 
 class GitHubError(RuntimeError):
     def __init__(self, error: subprocess.CalledProcessError):
-        detail = (error.stderr or "").strip() or str(error)
+        stderr = error.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        detail = stderr.strip() or str(error)
         status = re.search(r"\(HTTP (\d{3})\)", detail)
         self.status = int(status[1]) if status else None
         super().__init__(detail)
@@ -108,9 +114,10 @@ def completed_review_runs(repository, number, head, default_branch, reviewer, re
     return markers
 
 
-def review_attempts(repository, number, head, reviewer, request):
+def review_attempts(repository, number, head, reviewer, request, default_branch=None):
     """Find trusted attempts and active, unpinned review requests for this PR."""
-    repo = api_object(f"repos/{repository}", request)
+    if default_branch is None:
+        default_branch = api_object(f"repos/{repository}", request)["default_branch"]
     runs = api_object(
         f"repos/{repository}/actions/workflows/{REVIEWERS[reviewer]}/runs?per_page=100",
         request,
@@ -126,6 +133,20 @@ def review_attempts(repository, number, head, reviewer, request):
                     "workflow_runs",
                 )
             )
+        # Active runs on the first page are returned again by the status pages,
+        # which are read later, so the later copy (e.g. a rerun) is current.
+        # Runs without an id are kept rather than risk dropping an active one.
+        latest, unique = {}, []
+        for run in runs:
+            run_id = run.get("id")
+            if run_id is None:
+                unique.append(run)
+            elif run_id in latest:
+                unique[latest[run_id]] = run
+            else:
+                latest[run_id] = len(unique)
+                unique.append(run)
+        runs = unique
     label = {"polly": "Polly", "ocr": "OCR"}[reviewer]
     return [
         run
@@ -134,7 +155,7 @@ def review_attempts(repository, number, head, reviewer, request):
             run.get("event") == "pull_request_target"
             or (
                 run.get("event") in {"workflow_dispatch", "issue_comment"}
-                and run.get("head_branch") == repo["default_branch"]
+                and run.get("head_branch") == default_branch
             )
         )
         and (
@@ -146,7 +167,7 @@ def review_attempts(repository, number, head, reviewer, request):
                     or (
                         run.get("event") == "pull_request_target"
                         and any(
-                            pull.get("number") == number for pull in run.get("pull_requests", [])
+                            pull.get("number") == number for pull in run.get("pull_requests") or []
                         )
                     )
                 )
@@ -155,22 +176,25 @@ def review_attempts(repository, number, head, reviewer, request):
     ]
 
 
-def active_review_runs(repository, number, head, reviewer, request):
+def active_review_runs(repository, number, head, reviewer, request, default_branch=None):
     return [
         run
-        for run in review_attempts(repository, number, head, reviewer, request)
+        for run in review_attempts(repository, number, head, reviewer, request, default_branch)
         if run.get("status") != "completed"
     ]
 
 
 def artifact_zip(repository, artifact_id):
     """Download through the caller's GitHub transport, replaceable by the CI host."""
-    return subprocess.run(
-        ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
-        check=True,
-        capture_output=True,
-        timeout=120,
-    ).stdout
+    try:
+        return subprocess.run(
+            ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        raise GitHubError(exc) from exc
 
 
 def ocr_receipt(repository, artifact_id):
@@ -202,10 +226,15 @@ def completed_zero_findings(repository, number, head, comments, artifacts):
     }
     if not summary_urls:
         return False
+    errors = []
     for artifact_id in artifacts.values():
         if not artifact_id:
             continue
-        receipt = ocr_receipt(repository, artifact_id)
+        try:
+            receipt = ocr_receipt(repository, artifact_id)
+        except (RuntimeError, ValueError) as exc:
+            errors.append(exc)
+            continue
         if (
             receipt.get("pr") == number
             and receipt.get("head") == head
@@ -213,6 +242,10 @@ def completed_zero_findings(repository, number, head, comments, artifacts):
             and receipt["summary_url"] in summary_urls
         ):
             return True
+    # An unreadable artifact may hold the matching receipt, so report why instead
+    # of quietly treating the review as incomplete.
+    if errors:
+        raise RuntimeError("; ".join(str(exc) for exc in errors)) from errors[-1]
     return False
 
 
@@ -326,9 +359,10 @@ def snapshot(repository: str, number: int, request=gh_json):
 def validate(state, handoff):
     if not isinstance(handoff, dict):
         raise RuntimeError("Handoff must be an object")
-    if handoff.get("outcome") != "fixed":
+    if handoff.get("outcome") not in SUCCESS_OUTCOMES:
         raise RuntimeError(
-            "Review cycle is incomplete: outcome must be fixed, not partially_fixed"
+            "Review cycle is incomplete: outcome must be fixed or implemented, "
+            f"not {handoff.get('outcome')!r}"
         )
     missing = [name for name, complete in state["completed"].items() if not complete]
     if missing:
@@ -374,7 +408,7 @@ def request_reviews(repository, number, state, request=gh_json):
     repo = api_object(f"repos/{repository}", request)
     for name, workflow in REVIEWERS.items():
         if not state["completed"][name] and not active_review_runs(
-            repository, number, state["head_sha"], name, request
+            repository, number, state["head_sha"], name, request, repo["default_branch"]
         ):
             request(
                 [
@@ -412,6 +446,8 @@ def main():
         print(json.dumps(state, indent=2))
     except (
         OSError,
+        LookupError,
+        TypeError,
         ValueError,
         RuntimeError,
         subprocess.CalledProcessError,

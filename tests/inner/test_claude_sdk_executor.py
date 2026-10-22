@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
@@ -1734,6 +1735,14 @@ class TestResolveGatewayEnv(unittest.TestCase):
             env = _resolve_gateway_env()
         self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
+            [
+                "x-databricks-use-coding-agent-mode: true",
+                "Databricks-Custom-Coding-Agent: claude-code",
+                "Databricks-Custom-Client-Surfaces: omnigent",
+            ],
+        )
 
     def test_non_databricks_gateway_keeps_beta_disable(self):
         """A gateway host outside the trusted Databricks domains keeps the workaround.
@@ -2336,6 +2345,220 @@ class TestSkillsFilterTranslation(unittest.TestCase):
         self.assertIsNone(_resolve_skills_option("bogus"))
 
 
+async def _turn_options(executor, config=None):
+    """Return the ``ClaudeAgentOptions`` one turn builds, stopping before the CLI starts."""
+    captured = {}
+
+    async def capture_options(sdk, *, session_key, options, model):
+        captured["options"] = options
+        raise RuntimeError("stop after options built")
+
+    with patch.object(executor, "_get_or_create_client", side_effect=capture_options):
+        with pytest.raises(RuntimeError, match="stop after options built"):
+            async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], "", config):
+                pass
+    return captured["options"]
+
+
+def _default_executor(**kwargs):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    return ClaudeSDKExecutor(**kwargs)
+
+
+def _databricks_gateway_executor(**kwargs):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.databricks_executor import DatabricksCredentials
+
+    with patch(
+        "omnigent.inner.databricks_executor._read_databrickscfg",
+        return_value=DatabricksCredentials(
+            host="https://example.cloud.databricks.com", token="dapi_test_token"
+        ),
+    ):
+        return ClaudeSDKExecutor(gateway=True, **kwargs)
+
+
+def _databricks_opus_executor():
+    return _databricks_gateway_executor(model="databricks-claude-opus-4-7")
+
+
+@pytest.mark.parametrize(
+    ("settings_text", "expected"),
+    [
+        (
+            '{"env": {"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example", "RETRIES": 3}}',
+            {"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"},
+        ),
+        ("{not json", {}),
+        ('{"env": ["ANTHROPIC_BEDROCK_BASE_URL"]}', {}),
+        (None, {}),
+    ],
+    ids=["string-entries", "malformed-json", "env-not-object", "missing-file"],
+)
+def test_claude_user_settings_env_reads_home_settings(
+    settings_text: str | None,
+    expected: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner.claude_sdk_executor import _claude_user_settings_env
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if settings_text is not None:
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.json").write_text(settings_text)
+
+    assert _claude_user_settings_env() == expected
+
+
+@pytest.mark.parametrize(
+    ("make_executor", "skills_filter", "expected_base_url"),
+    [
+        (_default_executor, "none", "https://gateway.example"),
+        (_default_executor, "all", None),
+        (_databricks_gateway_executor, "none", None),
+    ],
+    ids=["no-setting-sources", "cli-loads-user-settings", "omnigent-gateway"],
+)
+async def test_hermetic_turn_carries_user_settings_env_under_omnigent_env(
+    make_executor,
+    skills_filter: str,
+    expected_base_url: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without setting sources the CLI skips user settings, so the executor passes their env."""
+    config_dir = tmp_path / "claude-config"
+    config_dir.mkdir()
+    user_env = {
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example",
+        "CLAUDE_CODE_ENTRYPOINT": "user-settings-entrypoint",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+    }
+    (config_dir / "settings.json").write_text(json.dumps({"env": user_env}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    monkeypatch.setenv("OMNIGENT_CLAUDE_CODE_ENTRYPOINT", "omnigent-entrypoint")
+    executor = make_executor(skills_filter=skills_filter)
+
+    options = await _turn_options(executor, ExecutorConfig(extra={"max_tokens": 32}))
+
+    assert options.env.get("ANTHROPIC_BEDROCK_BASE_URL") == expected_base_url
+    assert options.env["CLAUDE_CODE_ENTRYPOINT"] == "omnigent-entrypoint"
+    assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "32"
+
+
+async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "claude-config").mkdir(parents=True)
+    (workspace / "claude-config" / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}})
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "claude-config")
+    executor = _default_executor(skills_filter="none", cwd=str(workspace))
+
+    options = await _turn_options(executor)
+
+    assert options.env.get("ANTHROPIC_BEDROCK_BASE_URL") == "https://gateway.example"
+
+
+@pytest.mark.parametrize(
+    ("make_executor", "max_tokens", "expected_thinking"),
+    [
+        (_default_executor, 32, {"type": "disabled"}),
+        (_databricks_opus_executor, 32, {"type": "disabled"}),
+        (_default_executor, 1024, {"type": "disabled"}),
+        (_default_executor, 1025, None),
+        (_databricks_opus_executor, 32000, {"type": "adaptive", "display": "summarized"}),
+    ],
+    ids=[
+        "title-cap",
+        "title-cap-adaptive-model",
+        "largest-cap-without-room",
+        "smallest-cap-with-room",
+        "large-cap-adaptive-model",
+    ],
+)
+async def test_output_token_cap_reaches_cli_and_keeps_thinking_when_a_budget_fits(
+    make_executor, max_tokens: int, expected_thinking: dict[str, str] | None
+) -> None:
+    options = await _turn_options(
+        make_executor(), ExecutorConfig(extra={"max_tokens": max_tokens})
+    )
+
+    assert options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == str(max_tokens)
+    assert options.thinking == expected_thinking
+
+
+async def test_turn_without_output_cap_keeps_cli_defaults() -> None:
+    options = await _turn_options(_default_executor())
+
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in options.env
+    assert options.thinking is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: Bundle plugin gating (skill-less bundles emit no --plugin-dir)
+# ---------------------------------------------------------------------------
+
+
+class TestBundlePluginGating(unittest.TestCase):
+    def _plugins_for_bundle(self, bundle_dir):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor(
+            gateway=True,
+            gateway_host="https://gateway.example.com",
+            base_url_override="https://gateway.example.com/v1",
+            gateway_auth_command="printf token",
+            bundle_dir=bundle_dir,
+            agent_name="my-agent",
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_get_or_create_client(sdk, *, session_key, options, model):
+            captured["plugins"] = getattr(options, "plugins", None)
+            raise RuntimeError("stop after options built")
+
+        async def _t():
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+        _run(_t())
+        return captured["plugins"]
+
+    def test_skill_less_bundle_emits_no_plugin(self):
+        # No `skills/` directory -> empty `plugins` and no manifest written
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            self.assertEqual(self._plugins_for_bundle(bundle), [])
+            self.assertFalse((bundle / ".claude-plugin" / "plugin.json").exists())
+
+    def test_bundle_with_skills_registers_plugin(self):
+        # `skills/` directory -> local plugin for bundle and manifest written
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            skill_dir = bundle / "skills" / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# demo\n")
+            self.assertEqual(
+                self._plugins_for_bundle(bundle),
+                [{"type": "local", "path": str(bundle)}],
+            )
+            self.assertTrue((bundle / ".claude-plugin" / "plugin.json").exists())
+
+
 # ---------------------------------------------------------------------------
 # Tests: StreamEvent-based streaming
 # ---------------------------------------------------------------------------
@@ -2418,7 +2641,7 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
-    def test_os_env_spec_exposes_only_explicit_native_tools(self):
+    def test_prompt_preset_preserves_instructions_and_tool_restrictions(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
@@ -2437,6 +2660,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                 def __init__(self, options):
                     captured_options["tools"] = getattr(options, "tools", None)
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
+                    captured_options["system_prompt"] = options.system_prompt
 
                 async def query(self, prompt, session_id="default"):
                     _FakeSDK.messages = [_ResultMessage(session_id, "done")]
@@ -2445,7 +2669,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                     for message in _FakeSDK.messages:
                         yield message
 
-        async def _t():
+        async def _t(preset):
             # Explicit ``sandbox=none`` so the test runs on any
             # platform. The default ``OSEnvSandboxSpec.type`` is
             # ``"linux_bwrap"``; without this override,
@@ -2453,6 +2677,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             # raises on macOS even though the test isn't exercising
             # sandbox behavior.
             executor = ClaudeSDKExecutor(
+                system_prompt_preset=preset,
                 os_env=OSEnvSpec(
                     type="caller_process",
                     sandbox=OSEnvSandboxSpec(type="none"),
@@ -2470,7 +2695,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                                 "parameters": {"type": "object"},
                             }
                         ],
-                        "",
+                        "Resolve this bug.",
                     )
                 ]
             # OS operations route through sys_os_* MCP tools, not SDK
@@ -2479,8 +2704,20 @@ class TestStreamEventStreaming(unittest.TestCase):
             self.assertIn("mcp__omnigent__sleep", captured_options["allowed_tools"])
             self.assertNotIn("Bash", captured_options["allowed_tools"])
             self.assertIsInstance(events[-1], TurnComplete)
+            prompt = captured_options["system_prompt"]
+            if preset:
+                self.assertEqual(prompt["type"], "preset")
+                self.assertEqual(prompt["preset"], "claude_code")
+                prompt = prompt["append"]
+            self.assertTrue(prompt.startswith("Resolve this bug."))
+            self.assertIn("mcp__omnigent__<tool_name>", prompt)
 
-        _run(_t())
+        for preset in (None, "claude_code"):
+            with self.subTest(preset=preset):
+                _run(_t(preset))
+
+        with self.assertRaisesRegex(ValueError, "system_prompt_preset"):
+            ClaudeSDKExecutor(system_prompt_preset="unknown")
 
     def test_mcp_only_session_keeps_discovery_tools_without_native_os_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
@@ -5612,3 +5849,84 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
     assert fake_sdk.created_clients == []
     assert executor._clients["sess-1"].client is live_client
     assert live_client.prompts == ["second question"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_effort", [None, "low"])
+@pytest.mark.parametrize(
+    "compact_content",
+    [
+        None,
+        "/compact",
+        [{"type": "text", "text": "/compact"}],
+        [{"type": "input_text", "text": "/compact"}],
+    ],
+)
+async def test_effort_changes_rebuild_client_with_history(initial_effort, compact_content) -> None:
+    """Changing or clearing effort reaches the next query without losing history."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorConfig
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    messages = []
+    efforts = [initial_effort, "max", "max", None]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock) as close,
+    ):
+        for index, effort in enumerate(efforts):
+            if index == 1:
+                initial_client = executor._clients["effort"].client
+                if compact_content is not None:
+                    messages.append({"role": "user", "content": compact_content})
+                    compact_events = [
+                        event
+                        async for event in executor.run_turn(
+                            messages, [], "", ExecutorConfig(extra={"reasoning_effort": effort})
+                        )
+                    ]
+                    assert not [
+                        event for event in compact_events if isinstance(event, ExecutorError)
+                    ]
+                    assert executor._clients["effort"].client is initial_client
+                    assert executor._clients["effort"].effort == initial_effort
+                    assert initial_client.prompts[-1] == "/compact"
+                    messages.append({"role": "assistant", "content": "compacted summary"})
+                # No pending input must not replay an already-completed turn.
+                query_count = len(initial_client.prompts)
+                empty_events = [
+                    event
+                    async for event in executor.run_turn(
+                        messages, [], "", ExecutorConfig(extra={"reasoning_effort": effort})
+                    )
+                ]
+                assert empty_events == [TurnComplete(response=None)]
+                assert executor._clients["effort"].client is initial_client
+                assert len(initial_client.prompts) == query_count
+                assert len(fake_sdk.created_clients) == 1
+                close.assert_not_awaited()
+            messages.append(
+                {"role": "user", "content": f"question {index}", "session_id": "effort"}
+            )
+            events = [
+                event
+                async for event in executor.run_turn(
+                    messages, [], "", ExecutorConfig(extra={"reasoning_effort": effort})
+                )
+            ]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            assert any(isinstance(event, TurnComplete) for event in events)
+            client = executor._clients["effort"].client
+            assert client.options.effort == effort
+            prompt = client.prompts[-1]
+            if index == 2:
+                assert prompt == "question 2"
+            else:
+                for previous in range(index):
+                    assert f"question {previous}" in prompt
+                    assert f"answer {previous}" in prompt
+            messages.append({"role": "assistant", "content": f"answer {index}"})
+
+    assert len(fake_sdk.created_clients) == 3
+    assert [call.args[0] for call in close.await_args_list] == fake_sdk.created_clients[:2]

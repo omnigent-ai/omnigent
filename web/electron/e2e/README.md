@@ -124,6 +124,42 @@ into the nearby floating editor, and confirm the field remains `W41`. Escape
 should close only the editor. Reopen it and use Send or Enter to submit an
 instruction to chat. No instruction bar should appear below the browser URL.
 
+## Arclet laptop credentials
+
+`desktop_dbcert_preflight.e2e.js` drives New Session → Arclet Sandbox through
+the real SPA, preload, main process, CLI subprocess, and local server. It checks
+that missing or expired credentials block launch with a refresh banner, renewal
+only starts on click, and the preserved task launches only on a later submit.
+It also checks that prelaunch renewal skips kubeconfig updates and existing-Arca
+sync, verifies the local credentials before clearing the banner, and skips
+renewal for valid credentials. Choosing Skip during a pending check starts one
+session without waiting; the component suite covers late-result UI state.
+The dbcert executable and machine policy
+are fixtures; cloud allocation remains gated. This test does not cover macOS
+SSO or Companion's credential transfer.
+
+```sh
+OMNIGENT_PYTHON=/path/to/venv/bin/python \
+  OMNIGENT_PW_NO_SANDBOX=1 \
+  OMNIGENT_DESKTOP_RECORD_DIR=/absolute/path/outside/repo \
+  xvfb-run -a node --test e2e/desktop_dbcert_preflight.e2e.js
+```
+
+Human check: use the updated desktop shell and web bundle on a managed server,
+with Arca Companion running. With an expired or missing laptop dbcert, submit
+a task to Arclet Sandbox. Confirm a yellow banner appears, the draft stays, and
+no browser or sandbox opens. Click Refresh dbcert, finish browser sign-in, and
+confirm the banner clears without launching anything. Submit again to launch
+the original task. Prelaunch refresh waits for local renewal and validation, not
+sync to an existing Arca; Companion transfers credentials separately. Repeat
+with a valid dbcert and confirm no sign-in opens.
+Dismiss the warning while the cert is invalid and submit again: the warning
+must return without creating an Arclet. A canceled or failed refresh should
+leave the draft and offer a retry.
+While the credential-check spinner is visible, click Skip to continue without
+verification. Confirm this starts one session without sign-in; later launches
+must check credentials again. Skipping does not guarantee sandbox authentication.
+
 ## Authoring a desktop reproduction
 
 For macOS titlebar clearance, build the SPA and run
@@ -149,3 +185,35 @@ Actual Size, then collapse/reopen the sidebar and open Settings.
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or
    `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
    the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).
+
+## Navigation policy runtime boundary
+
+`desktop_navigation_policy.e2e.js` uses the production partition hooks in a real
+Electron process. It checks public HTTPS navigation twice, an HSTS HTTP-to-HTTPS
+upgrade after learning a real server policy, a refused loopback
+alias, and a trusted localhost preview twice. The public and preview response
+assertions check connected addresses and view IDs; the HSTS assertions check
+Chromium’s HTTP-to-HTTPS redirect metadata and final URL. Internal-resolving
+iframe and object destinations must be classified as `subFrame` and `object`,
+attributed to the preview view, and cancelled through production request hooks.
+A main-frame redirect and page-created `window.open` to that alias must also
+retain the owning view ID and be cancelled. A main-only
+fixture bypasses preflight for one local request to isolate response cancellation;
+its real network metadata must trigger the production response guard. Preview
+eligibility is supplied by the main-only fixture rather than live Arca enrollment.
+The test requires outbound HTTPS access to `example.com` and `hsts.badssl.com`,
+and public DNS resolution of `lvh.me` to loopback. Repeated local-fixture loads must report HTTP 200 because
+the document guard skips cache reads.
+
+Run with the prerequisites above:
+
+```sh
+OMNIGENT_DESKTOP_RECORD_DIR=/absolute/path/outside/repo \
+  OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_navigation_policy.e2e.js
+```
+
+The recording and `network-evidence.json` are retained together, including partial
+network evidence when an assertion fails. Temporary server fixtures and the desktop
+profile are removed separately from the recording directory. Renderer
+URL-bar navigation also passes through the policy; it has no local-network
+opt-out.

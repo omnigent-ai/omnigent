@@ -40,15 +40,24 @@ def _builtin_agent_id(base_url: str, name: str) -> str:
     :param name: Built-in agent name, e.g. ``"hello_world"``.
     :returns: The agent id.
     """
-    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
-    resp.raise_for_status()
-    agents = resp.json()["data"]
-    matches = [a["id"] for a in agents if a["name"] == name]
-    assert matches, (
+    names: list[str] = []
+    after: str | None = None
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        while True:
+            resp = client.get("/v1/agents", params={"after": after} if after else {})
+            resp.raise_for_status()
+            result = resp.json()
+            for agent in result["data"]:
+                if agent["name"] == name:
+                    return agent["id"]
+                names.append(agent["name"])
+            if not result["has_more"]:
+                break
+            after = result["last_id"]
+    pytest.fail(
         f"built-in agent {name!r} not listed in /v1/agents "
-        f"(got {[a['name'] for a in agents]}) — nothing to seed a task against."
+        f"(got {names}) — nothing to seed a task against."
     )
-    return matches[0]
 
 
 def _create_task(
@@ -192,7 +201,9 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     agent_id = _builtin_agent_id(live_server, "hello_world")
 
     # Daily at 9:00 AM → "Every day at 9:00 AM".
-    _create_task(live_server, agent_id, "Daily digest", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+    daily_id = _create_task(
+        live_server, agent_id, "Daily digest", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+    )
     # Mon–Fri at 8:00 AM → "Weekdays at 8:00 AM".
     _create_task(
         live_server,
@@ -203,6 +214,12 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     # Hourly at :30 → "Hourly at :30" (the interval-1 non-zero-BYMINUTE fix).
     _create_task(live_server, agent_id, "Half-past sweep", "FREQ=HOURLY;BYMINUTE=30")
 
+    created = httpx.get(f"{live_server}/v1/scheduled-tasks/{daily_id}", timeout=10.0)
+    created.raise_for_status()
+    next_run_at = created.json()["next_run_at"]
+    assert next_run_at, "seeded active task should have an armed next_run_at"
+    # Keep the label away from the valid "soon" state near the scheduled instant.
+    page.clock.install(time=_parse_iso(next_run_at) - timedelta(hours=1))
     page.goto(f"{live_server}/tasks")
 
     # All three rows render (the list query resolves against the seeded tasks).
@@ -225,11 +242,7 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     hourly = _row_by_name(page, "Half-past sweep")
     expect(hourly.get_by_test_id("task-schedule-line")).to_contain_text("Hourly at :30")
 
-    # The next-run label IS shown now — but as a DELTA from the server's
-    # next_run_at ("Next run in Xh/Xd"), not a client-recomputed instant. An
-    # armed daily task is always <24h out, so its label is "Next run in …".
-    # (The forbidden thing was a client recompute of WHICH instant is next; a
-    # delta off the server value is fine.)
+    # The label is relative to the server's timestamp and the controlled clock.
     expect(daily.get_by_test_id("task-next-run")).to_contain_text("Next run in", timeout=30_000)
 
 
@@ -317,9 +330,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Daily")
 
     time_input = page.get_by_test_id("schedule-time")
-    time_input.fill("")
     time_input.click()
-    page.keyboard.type("9:37")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    expect(time_input).to_be_focused()
+    time_input.press("ControlOrMeta+A")
+    time_input.press_sequentially("9:37")
     assert time_input.input_value() == "9:37"
     # force=True: focusing the time input opened the picker popover, so a normal
     # click here can resolve to the dialog overlay (see _pick_minute's note). A
@@ -361,9 +376,13 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     assert submit_box is not None
     assert submit_box["y"] + submit_box["height"] <= dialog_box["y"] + dialog_box["height"] + 1
 
-    time_input.fill("")
+    expect(time_input).to_have_value("09:00 AM")
     time_input.click()
-    page.keyboard.type("10:37")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    expect(time_input).to_be_focused()
+    time_input.press("ControlOrMeta+A")
+    time_input.press_sequentially("10:37")
+    assert time_input.input_value() == "10:37"
     # force=True: the time input's focus reopened the picker popover, so blur it
     # with a forced click that can't be swallowed by the dialog overlay.
     page.get_by_test_id("task-name-input").click(force=True)

@@ -118,6 +118,24 @@ describe("RunnerStartingIndicator", () => {
     },
   );
 
+  it.each(["hero", "row"] as const)(
+    "%s: still says provisioning while the launch needs the user to act",
+    (variant) => {
+      // SandboxActionBanner says what to do; the indicator's copy doesn't change.
+      useChatStore.setState({
+        sandboxStatus: {
+          stage: "action_required",
+          error: null,
+          provider: "arclet",
+          details: "Refresh your dbcert on your laptop.",
+        },
+      });
+      renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
+      const indicator = screen.getByTestId("runner-starting-indicator");
+      expect(indicator).toHaveTextContent(/provisioning sandbox/i);
+    },
+  );
+
   it("row: sandbox stage still renders during terminal startup", () => {
     useChatStore.setState({ sandboxStatus: { stage: "cloning", error: null } });
     renderWithContext("row", makeCtx({ terminalStartingUp: true }));

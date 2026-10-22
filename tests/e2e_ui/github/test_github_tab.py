@@ -54,18 +54,26 @@ _INFO = {
         "url": "https://example.com/pr/4242",
         "is_draft": False,
         "author": "octocat",
+        "reviewers": [
+            {"login": "alice", "kind": "user", "state": "APPROVED"},
+            {"login": "platform", "kind": "team", "state": "PENDING"},
+        ],
         "base_ref": "main",
         "head_ref": "feature/github-tab",
         "checks": {
             "passing": 3,
             "failing": 1,
             "pending": 0,
-            "total": 4,
+            "cancelled": 1,
+            "skipped": 1,
+            "total": 6,
             "runs": [
                 {"name": "unit", "bucket": "passing", "url": None},
                 {"name": "lint", "bucket": "passing", "url": None},
                 {"name": "types", "bucket": "passing", "url": None},
                 {"name": "e2e", "bucket": "failing", "url": None},
+                {"name": "superseded build", "bucket": "cancelled", "url": None},
+                {"name": "optional deploy", "bucket": "skipped", "url": None},
             ],
         },
         # The Summary tab renders the description (markdown); comments get their own tab.
@@ -180,6 +188,8 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="Team platform: Pending")).to_be_visible()
 
     # A host without tracking controls puts the provider beside the repo.
     icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
@@ -191,6 +201,16 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text("Checks")).to_be_visible()
     expect(rail.get_by_text(re.compile(r"3\s*passed"))).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*failed"))).to_be_visible()
+    for label, job in [("cancelled", "superseded build"), ("skipped", "optional deploy")]:
+        pill = rail.get_by_role("button", name=f"1 {label}", exact=True)
+        expect(pill).to_be_visible()
+        expect(pill).to_have_class(re.compile(r"\bbg-muted\b"))
+        expect(pill).to_have_class(re.compile(r"\btext-muted-foreground\b"))
+        pill.hover()
+        expect(page.get_by_text(job, exact=True)).to_be_visible()
+        expect(page.get_by_text("e2e", exact=True)).not_to_be_visible()
+        rail.get_by_text("Checks", exact=True).hover()
+        expect(page.get_by_text(job, exact=True)).not_to_be_visible()
 
     # Summary is the default tab: the PR description renders there.
     expect(rail.get_by_text(re.compile(r"Adds the GitHub tab"))).to_be_visible()
@@ -208,6 +228,54 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     pr_tabs.get_by_role("tab", name="Changes").click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
+
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Summary").click()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+def test_pr_diff_retry_keeps_associations(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    failed = True
+
+    def diff(route: Route) -> None:
+        if failed:
+            route.fulfill(
+                status=400, json={"error": {"message": "GitHub could not load the PR diff."}}
+            )
+        else:
+            route.fulfill(json=_PR_DIFF)
+
+    page.route(re.compile(r"/resources/github/diff(?:\?|$)"), diff)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
+        "tab", name="Changes", exact=True
+    ).click()
+    expect(panel.get_by_role("alert")).to_have_text("GitHub could not load the PR diff.")
+    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    expect(panel.get_by_text("No changes vs base.")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-error.png"))
+    failed = False
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(panel.get_by_role("alert")).to_have_count(0)
+    expect(panel.locator("diffs-container")).to_have_count(1)
+    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-recovered.png"))
 
 
 @pytest.mark.parametrize(

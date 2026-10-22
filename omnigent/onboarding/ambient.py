@@ -538,6 +538,27 @@ def claude_managed_gateway(
     return None, False
 
 
+def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:
+    """Return the non-Anthropic gateway Claude Code's managed settings pin, if any.
+
+    Claude Code applies managed settings over the environment omnigent passes,
+    so when this returns a URL it — not omnigent's provider config — decides
+    where native Claude inference goes.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The managed ``ANTHROPIC_BASE_URL``, or ``None`` when no credentialed
+        managed gateway is configured or it points at Anthropic itself.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if not base_url or not has_credential:
+        return None
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return None
+    return base_url
+
+
 def claude_managed_model_picker(
     paths: tuple[Path, ...] | None = None,
 ) -> tuple[tuple[str, str], ...]:

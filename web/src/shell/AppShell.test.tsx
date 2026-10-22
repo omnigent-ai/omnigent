@@ -24,6 +24,8 @@ import {
   useNavigate,
   useSearchParams,
 } from "react-router-dom";
+import { setEmbedRoot } from "@/lib/host";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -33,6 +35,7 @@ import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -181,9 +184,7 @@ vi.mock("./FilesPanel", () => ({
   ),
 }));
 vi.mock("./FileViewer", () => ({
-  // frameless=true → the inline desktop viewer (always open when rendered).
-  // frameless=false/absent → the mobile push-panel (open prop controls visibility).
-  // Use different testids so tests can target the one they care about.
+  // One frameless viewer moves between desktop and mobile layouts.
   FileViewer: ({
     open,
     path,
@@ -560,7 +561,7 @@ function renderShell(
               Settings button and the sidebar's Back row, both of which live in
               components mocked out here. */}
       <Route
-        path="settings"
+        path="settings/*"
         element={
           <>
             <div>settings</div>
@@ -725,6 +726,7 @@ beforeEach(() => {
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
+    sandboxStatus: null,
   });
 });
 
@@ -1186,6 +1188,44 @@ describe("AppShell header", () => {
     fireEvent.click(screen.getByTestId("nav-session"));
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("holds startup while the session's managed sandbox is still launching", () => {
+    // Provisioning outlasts the cold-boot grace, and the server reports a
+    // session with no runner yet as reachable, so only the launch status
+    // keeps the terminal from offering Resume.
+    runnerHealthState.runnerOnline = true;
+    mockConversations([
+      {
+        id: "conv_sandbox",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000) - 600,
+      },
+    ]);
+    useChatStore.setState({ sandboxStatus: { stage: "provisioning" } });
+
+    renderShell("/c/conv_sandbox");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("releases startup once the managed sandbox launch fails", () => {
+    // A failed launch never brings a terminal; its failure band owns the view.
+    runnerHealthState.runnerOnline = true;
+    mockConversations([
+      {
+        id: "conv_sandbox_failed",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000) - 600,
+      },
+    ]);
+    useChatStore.setState({ sandboxStatus: { stage: "failed", error: "quota exceeded" } });
+
+    renderShell("/c/conv_sandbox_failed");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
 
   it("does not hold startup for a fresh chat-first session with an online runner", () => {
@@ -1931,15 +1971,23 @@ describe("Workspace rail maximize", () => {
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
   });
 
-  it("pins the sidebar open on /settings so the Back row is reachable", () => {
-    // The settings nav replaces the session list INSIDE the sidebar, and its
-    // Back row is the only way off the page. Collapsed, that row is clipped and
-    // inert — the user is stranded with no visible exit. Entering /settings must
-    // therefore force the sidebar open.
+  it.each([
+    ["desktop", "/settings", true],
+    ["desktop", "/settings/import", true],
+    ["mobile", "/settings", true],
+    ["mobile", "/settings/import", false],
+    ["mobile", "/settings/harnesses/codex", false],
+  ] as const)("opens the appropriate settings surface on %s at %s", (viewport, path, open) => {
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query === "(min-width: 768px)" ? viewport === "desktop" : false,
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
-    renderShell("/settings");
+    renderShell(path);
 
-    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", String(open));
   });
 
   it("refuses to collapse the sidebar while on /settings", () => {
@@ -2666,6 +2714,75 @@ describe("Extension pages own the header", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it.each([true, false])(
+    "waits for capabilities before validating restored search (enabled=%s)",
+    async (enabled) => {
+      mockConversations([{ id: "conv_restore_search", permission_level: null }]);
+      writeSessionWorkspaceState("conv_restore_search", {
+        open: true,
+        rightRailTab: "content-search",
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = (info: ServerInfo | "loading") => (
+        <CapabilitiesProvider info={info}>
+          {sessionShellTree(client, "/c/conv_restore_search")}
+        </CapabilitiesProvider>
+      );
+      const { rerender } = render(tree("loading"));
+      expect(readSessionWorkspaceState("conv_restore_search").rightRailTab).toBe("content-search");
+      rerender(tree(serverInfo({ features: { workspace_content_search: enabled } })));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("tab", { name: enabled ? "Content search" : "Files" }),
+        ).toHaveAttribute("aria-selected", "true"),
+      );
+      expect(readSessionWorkspaceState("conv_restore_search").rightRailTab).toBe(
+        enabled ? "content-search" : "files",
+      );
+    },
+  );
+
+  it.each(["MacIntel", "Win32"])(
+    "opens content search, focuses its input and preserves the query on %s",
+    async (platform) => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+      writeWorkspacePanelDefault("collapsed");
+      mockConversations([{ id: "conv_search_hotkey", permission_level: null }]);
+      renderShell(
+        "/c/conv_search_hotkey",
+        serverInfo({ features: { workspace_content_search: true } }),
+      );
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      const chord = {
+        code: "KeyF",
+        shiftKey: true,
+        metaKey: platform === "MacIntel",
+        ctrlKey: platform !== "MacIntel",
+      };
+      fireEvent.keyDown(document, chord);
+      const input = await screen.findByRole("searchbox", { name: "Search file contents" });
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(screen.getByRole("tab", { name: "Content search" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      fireEvent.change(input, { target: { value: "keep my query" } });
+      screen.getByRole("button", { name: "Search" }).focus();
+      fireEvent.keyDown(document.activeElement!, chord);
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(input).toHaveValue("keep my query");
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+      fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+      expect(screen.getByTestId("file-viewer-inline")).toBeInTheDocument();
+      fireEvent.keyDown(document, chord);
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+      expect(input).toHaveValue("keep my query");
+    },
+  );
+
   it("restores each Canvas card's saved Workspace choice", async () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3083,6 +3200,132 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
 
+  it("opens and closes unpinned pages through + when every page is unpinned", () => {
+    writePinnedWorkspaceTabs([]);
+    mockConversations([{ id: "conv_unpinned", permission_level: null }]);
+    renderShell("/c/conv_unpinned");
+
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
+    expect(readSessionWorkspaceState("conv_unpinned").openPanels).toEqual(["changes"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_unpinned").rightRailTab).toBeNull();
+  });
+
+  it("selects a pinned page when its workspace becomes available", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_waiting_workspace", permission_level: null }]);
+    renderShell("/c/conv_waiting_workspace", undefined, { rerenderable: true });
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("selects an available open page when the active workspace page becomes unavailable", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_workspace_unavailable", {
+      rightRailTab: "changes",
+      openPanels: ["changes", "subagents"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_workspace_unavailable", permission_level: null }]);
+    renderShell("/c/conv_workspace_unavailable", undefined, { rerenderable: true });
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+    expect(readSessionWorkspaceState("conv_workspace_unavailable").rightRailTab).toBe("subagents");
+  });
+
+  it("restores unpinned page tabs across session switches and reloads", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_to", {
+      rightRailTab: "changes",
+      openPanels: ["changes", "subagents"],
+    });
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const first = render(
+      sessionShellTree(queryClient, "/c/conv_from", <SessionNavButton to="/c/conv_to" />),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: "Close Agents" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_from").openPanels ?? []).toEqual([]);
+    expect(readSessionWorkspaceState("conv_to").rightRailTab).toBe("changes");
+
+    first.unmount();
+    renderShell("/c/conv_to");
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("opens an unpinned Agents page from an explicit panel link", () => {
+    writePinnedWorkspaceTabs([]);
+    mockConversations([{ id: "conv_agents_link", permission_level: null }]);
+    renderShell("/c/conv_agents_link?panel=agents");
+
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: "Close Agents" })).toBeInTheDocument();
+  });
+
+  it.each([false, true])(
+    "closes a linked file with all pages unpinned (existing page: %s)",
+    (hasOpenPage) => {
+      writePinnedWorkspaceTabs([]);
+      if (hasOpenPage)
+        writeSessionWorkspaceState("conv_file_link", {
+          rightRailTab: "subagents",
+          openPanels: ["subagents"],
+        });
+      mockConversations([{ id: "conv_file_link", permission_level: null }]);
+      renderShell("/c/conv_file_link?file=README.md");
+
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.queryByRole("tab", { name: "Files" })).toBeNull();
+      fireEvent.click(
+        within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+          name: /file-viewer: close/i,
+        }),
+      );
+      if (hasOpenPage) {
+        expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      } else {
+        expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+      }
+    },
+  );
+
   it("preserves a remembered Browser soft tab when the outgoing Files tab becomes unavailable", () => {
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
@@ -3461,11 +3704,8 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md");
 
-    // Viewer must be open and pointing at the file from the URL.
-    // file-viewer = mobile push-panel (md:hidden); file-viewer-inline = desktop inline.
-    // Failure: the conversationId effect did not read searchParams.get("file")
-    // and call setSelectedFilePath with it.
-    const pushPanel = screen.getByTestId("file-viewer");
+    const pushPanel = screen.getByTestId("file-viewer-inline");
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
   });
@@ -3552,8 +3792,7 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1");
 
-    // Scope to mobile push-panel to avoid ambiguity with the inline frameless viewer.
-    const pushPanel = screen.getByTestId("file-viewer");
+    const pushPanel = screen.getByTestId("file-viewer-inline");
     expect(pushPanel).toHaveAttribute("data-state", "open");
 
     fireEvent.click(within(pushPanel).getByRole("button", { name: /file-viewer: close/i }));
@@ -5261,6 +5500,28 @@ describe("AppShell design-mode submission", () => {
     );
   });
 
+  it("queues behind a first message still held for startup, even with always-steer", () => {
+    // The status can read idle during startup while the first message waits locally.
+    localStorage.setItem("omnigent:always-steer", "true");
+    Object.assign(chat, {
+      status: "idle",
+      sessionStatus: "idle",
+      pendingUserMessages: [
+        {
+          tempId: "pend_held",
+          content: [{ type: "input_text", text: "first" }],
+          initialDraft: { text: "first", files: [] },
+          createdAtS: 0,
+        },
+      ],
+    });
+    renderShell("/c/conv_design");
+    submitInstruction();
+
+    expect(enqueueMessage).toHaveBeenCalledTimes(1);
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it("reads a changed always-steer preference at submission without remounting", () => {
     localStorage.setItem("omnigent:always-steer", "true");
     renderShell("/c/conv_design");
@@ -5352,5 +5613,38 @@ describe("AppShell design-mode submission", () => {
       expect.stringContaining("A later instruction without a new screenshot"),
       undefined,
     );
+  });
+});
+
+describe("new-session browser shortcut", () => {
+  it.each([false, true])("works from the composer with embedded=%s", (embedded) => {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const app = embedded ? (
+      <EmbeddedProvider>
+        <AppShell />
+      </EmbeddedProvider>
+    ) : (
+      <AppShell />
+    );
+    const view = render(
+      shellTree(
+        client,
+        "/c/conv_abc",
+        <>
+          <Route index element={<p>New session route</p>} />
+          <Route path="c/:conversationId" element={<textarea aria-label="Message" />} />
+        </>,
+        app,
+      ),
+    );
+    if (embedded) setEmbedRoot(view.container);
+    const composer = screen.getByRole("textbox", { name: "Message" });
+    composer.focus();
+    fireEvent.keyDown(composer, { code: "KeyN", ctrlKey: true, altKey: true });
+    expect(screen.queryByText("New session route")).toBeNull();
+    fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+    expect(screen.getByText("New session route")).toBeInTheDocument();
+    setEmbedRoot(null);
   });
 });

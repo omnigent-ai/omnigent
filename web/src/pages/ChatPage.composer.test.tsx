@@ -27,6 +27,8 @@ import {
   setSessionDraft,
 } from "@/lib/sessionDrafts";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
 import {
@@ -2720,6 +2722,39 @@ describe("Composer shared visible controls", () => {
     await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
   });
 
+  it.each([
+    { permissionLevel: 2, enabled: false },
+    { permissionLevel: 3, enabled: false },
+    { permissionLevel: 4, enabled: true },
+  ])(
+    "lets only the owner change the permission mode (level $permissionLevel)",
+    ({ permissionLevel, enabled }) => {
+      useChatStore.setState({
+        conversationId: "owner-only-permissions",
+        codexApprovalMode: "ask-for-approval",
+      });
+      const setApproval = vi
+        .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+        .mockResolvedValue(undefined);
+      renderWithTooltips(
+        <Composer {...composerProps({ showCodexApprovalMode: true, permissionLevel })} />,
+      );
+      const chip = screen.getByTestId("composer-permission-chip");
+      if (enabled) {
+        expect(chip).toBeEnabled();
+        return;
+      }
+      expect(chip).toBeDisabled();
+      expect(chip).toHaveAttribute(
+        "title",
+        "Only the session owner can change the permission mode",
+      );
+      fireEvent.keyDown(chip, { key: "ArrowDown" });
+      expect(screen.queryByTestId("composer-permission-option-full-access")).toBeNull();
+      expect(setApproval).not.toHaveBeenCalled();
+    },
+  );
+
   it("doesn't offer Read Only as a codex runtime switch", () => {
     useChatStore.setState({
       conversationId: "codex-no-read-only",
@@ -4050,7 +4085,7 @@ describe("Composer reply quotes", () => {
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
   });
 
-  it("empties the composer when a restored failed send turns out delivered", () => {
+  it.each(["none", "failed", "delivered"])("retracts after a second send: %s", (secondSend) => {
     const stableId = "c".repeat(32);
     render(<Composer {...composerProps()} />);
     act(() =>
@@ -4064,19 +4099,49 @@ describe("Composer reply quotes", () => {
       }),
     );
     expect(textarea()).toHaveValue("resend me");
-    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+      stableId,
+      delivered: false,
+    });
 
-    // The send's committed item arrived (see retractDeliveredSendDraft):
-    // the message was delivered, so the untouched restore must go away.
+    if (secondSend !== "none") {
+      const secondId = "second-send";
+      if (secondSend === "delivered")
+        act(() =>
+          handleSessionEvent({
+            type: "session_input_consumed",
+            itemId: secondId,
+            itemType: "message",
+            data: { role: "user", content: [{ type: "input_text", text: "second message" }] },
+          }),
+        );
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: "second message",
+            files: [],
+            stableId: secondId,
+          },
+        }),
+      );
+      expect(textarea()).toHaveValue("resend me");
+      expect(useChatStore.getState().restoredSendDraft).toMatchObject({
+        stableId,
+        delivered: false,
+      });
+      expect(useChatStore.getState().pendingRetryStableId).toBe(
+        secondSend === "delivered" ? stableId : null,
+      );
+    }
+
+    // Delivery of the first send still retracts its unchanged draft.
     act(() =>
-      useChatStore.setState({
-        restoredSendDraft: {
-          conversationId: "conv_test",
-          stableId,
-          text: "resend me",
-          files: [],
-          delivered: true,
-        },
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: stableId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
       }),
     );
     expect(textarea()).toHaveValue("");
@@ -4465,6 +4530,26 @@ describe("Composer file-attachment focus", () => {
     if (!el) throw new Error("file input not found");
     return el;
   }
+
+  it("offers and accepts any file when the server delivers all types as files", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachments: { extensions: [".zip"], all_types: true },
+        }}
+      >
+        <Composer {...composerProps()} />
+      </CapabilitiesProvider>,
+    );
+    expect(fileInput().hasAttribute("accept")).toBe(false);
+
+    const trace = new File([new Uint8Array(4)], "trace.gz", { type: "application/gzip" });
+    fireEvent.change(fileInput(), { target: { files: [trace] } });
+
+    expect(screen.getByText("trace.gz")).toBeTruthy();
+    expect(screen.queryByText(/can't be attached/)).toBeNull();
+  });
 
   it("focuses the textarea after a file is attached", () => {
     render(<Composer {...composerProps()} />);

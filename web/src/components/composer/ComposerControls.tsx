@@ -110,7 +110,7 @@ export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status: "online" | "offline" | "unknown";
+    status?: "online" | "offline" | "unknown";
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -131,16 +131,18 @@ export const ComposerHostTrigger = forwardRef<
       {...props}
     >
       <span className="flex items-center">
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          <span
-            aria-hidden
-            className={cn(
-              "size-2 rounded-full",
-              status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-            )}
-            data-testid={`${testIdPrefix}-host-status`}
-          />
-        </span>
+        {status && (
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 rounded-full",
+                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
+              )}
+              data-testid={`${testIdPrefix}-host-status`}
+            />
+          </span>
+        )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
       </span>
     </button>
@@ -154,6 +156,7 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  disabledReason,
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
@@ -166,6 +169,8 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hover text explaining why the picker is disabled. */
+  disabledReason?: string;
   /** Hide the visible value; it stays in the accessible name. */
   iconOnly?: boolean;
   loading?: boolean;
@@ -185,7 +190,7 @@ export function ComposerPermissionPicker({
             loading && "disabled:opacity-100",
           )}
           aria-label={`${label}: ${value}`}
-          title={`${label}: ${value}`}
+          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >

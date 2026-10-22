@@ -36,7 +36,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -200,10 +200,10 @@ def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
     }
 
 
-def _validate_rrule_or_400(rrule: str) -> None:
+async def _validate_rrule_or_400(rrule: str) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        validate_rrule(rrule)
+        await asyncio.to_thread(validate_rrule, rrule)
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -347,9 +347,13 @@ def create_scheduled_tasks_router(
         )
 
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
-        return task.user_id == owner and (
-            current_account_user() is None
-            or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+        return (
+            task.state != "deleted"
+            and task.user_id == owner
+            and (
+                current_account_user() is None
+                or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+            )
         )
 
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
@@ -370,7 +374,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        _validate_rrule_or_400(body.rrule)
+        await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -403,9 +407,15 @@ def create_scheduled_tasks_router(
                 host_id=body.host_id,
                 execution_target=body.execution_target,
             )
-        except Exception:
+        except Exception as exc:
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+            if isinstance(exc, RRuleSearchError):
+                raise OmnigentError(
+                    "Could not calculate the next run time for this schedule. "
+                    "The task was not created.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -562,7 +572,7 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:
-            _validate_rrule_or_400(body.rrule)
+            await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
@@ -654,10 +664,16 @@ def create_scheduled_tasks_router(
             updated = store.update(scheduled_task_id, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-        except Exception:
+        except Exception as exc:
             # The task never bound the copy, so nothing else uses it.
             if new_copy is not None:
                 agent_store.delete(new_copy.id)
+            if isinstance(exc, RRuleSearchError):
+                raise OmnigentError(
+                    "Could not calculate the next run time for this schedule. "
+                    "Your changes were not saved.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -678,7 +694,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
-        store.delete(scheduled_task_id)
+        await asyncio.to_thread(store.delete, scheduled_task_id)
         scheduler = _scheduler(request)
         if scheduler is not None:
             scheduler.remove(scheduled_task_id)

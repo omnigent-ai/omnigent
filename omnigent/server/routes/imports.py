@@ -51,13 +51,14 @@ _LOCAL_IMPORT_STREAM_ERROR_MESSAGE = (
 )
 
 
-def _record_local_import_failure() -> tuple[str, str]:
-    """Log the active import exception and return its safe client correlation data."""
+def _record_local_import_failure(error: OmnigentError) -> tuple[str, str]:
+    """Log the import exception and return its safe client correlation data."""
     error_id = f"err_{secrets.token_hex(16)}"
-    _logger.exception(
+    _logger.error(
         "Local session import failed; error_id=%s",
         error_id,
         extra={"error_id": error_id},
+        exc_info=error,
     )
     return error_id, f"{_LOCAL_IMPORT_STREAM_ERROR_MESSAGE} Error ID: {error_id}."
 
@@ -295,7 +296,7 @@ async def _stream_local_sessions_from_host(
         while True:
             try:
                 kind, data = await asyncio.wait_for(queue.get(), timeout=_HOST_IMPORT_TIMEOUT_S)
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise OmnigentError(
                     f"host '{host_conn.host_id}' stalled mid-import "
                     f"(no session within {_HOST_IMPORT_TIMEOUT_S:.0f}s)",
@@ -695,7 +696,7 @@ def create_imports_router(
             async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
                 sessions.append(ref)
         except OmnigentError as exc:
-            error_id, message = _record_local_import_failure()
+            error_id, message = _record_local_import_failure(exc)
             return JSONResponse(
                 status_code=exc.http_status,
                 content={
@@ -750,10 +751,10 @@ def create_imports_router(
                     yield _import_event_line(
                         {"event": "session", "session_id": ref.session_id, "title": ref.title}
                     )
-            except OmnigentError:
+            except OmnigentError as exc:
                 # The read dropped/stalled mid-stream. The 200 + partial body is
                 # already sent, so report the failure inline rather than raising.
-                error = _record_local_import_failure()
+                error = _record_local_import_failure(exc)
             # Per-session failures (with reasons) after the successes so the
             # caller can name each one, not just count them.
             for failure in failures:

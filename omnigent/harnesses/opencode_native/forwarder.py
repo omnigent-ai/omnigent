@@ -230,7 +230,7 @@ class OpenCodeNativeForwarder:
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
-        except Exception:  # noqa: BLE001 - seeding is best effort.
+        except Exception:  # seeding is best effort.
             _logger.debug("OpenCode forwarder could not seed dedupe from history", exc_info=True)
             return
         for message in messages:
@@ -263,7 +263,7 @@ class OpenCodeNativeForwarder:
                 self.state.mark(self._key("message", message_id))
         try:
             await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+        except Exception:  # usage re-post is best effort.
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after seeding", exc_info=True
             )
@@ -279,7 +279,7 @@ class OpenCodeNativeForwarder:
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
-        except Exception:  # noqa: BLE001 - catch-up is best effort.
+        except Exception:  # catch-up is best effort.
             _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
             return
         for message in messages:
@@ -316,7 +316,7 @@ class OpenCodeNativeForwarder:
                 await self._flush_pending_text()
         try:
             await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+        except Exception:  # usage re-post is best effort.
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
             )
@@ -350,7 +350,7 @@ class OpenCodeNativeForwarder:
                     # Clean stream end (server closed): reconnect.
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 - reconnect on any transient SSE failure.
+                except Exception:  # reconnect on any transient SSE failure.
                     _logger.warning(
                         "OpenCode forwarder SSE error for session=%s; reconnecting",
                         self._session_id,
@@ -1004,7 +1004,7 @@ class OpenCodeNativeForwarder:
             await self._opencode.reply_permission(
                 request.request_id, reply_body(reply, message="omnigent-policy")
             )
-        except Exception:  # noqa: BLE001 - reply is best effort; log and move on.
+        except Exception:  # reply is best effort; log and move on.
             _logger.warning(
                 "OpenCode permission reply failed for request=%s",
                 request.request_id,
@@ -1031,7 +1031,7 @@ class OpenCodeNativeForwarder:
         )
         try:
             verdict = await self._policy_evaluator(normalized)
-        except Exception:  # noqa: BLE001 - policy errors fail closed.
+        except Exception:  # policy errors fail closed.
             _logger.warning("OpenCode policy evaluation failed", exc_info=True)
             return "ask"
         if verdict is None:

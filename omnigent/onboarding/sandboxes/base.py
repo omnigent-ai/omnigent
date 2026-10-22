@@ -38,7 +38,7 @@ from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKE
 from omnigent.onboarding.sandboxes import types as _sandbox_types
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from omnigent.onboarding.sandboxes.types import RepoWorkspace
@@ -398,6 +398,18 @@ class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
     Resumable providers use this only for a definitive absence, never for a
     timeout, connectivity failure, or unknown state. The managed-host wake path
     catches it and provisions a fresh sandbox generation instead.
+    """
+
+
+class OwnerCredentialMissingError(click.ClickException, _sandbox_types.SandboxError):
+    """Raised when an owner-identity launcher has no credential for the host's owner.
+
+    An owner-identity launcher (:attr:`SandboxHostLauncher.owner_credential_provider`)
+    acts on the provider *as the user who owns the host*, never as the server.
+    When that user has not connected the provider (or the server has no
+    connection flow for it), the launcher refuses with this error rather than
+    falling back to a shared server identity. The message tells the user what
+    to connect.
     """
 
 
@@ -927,6 +939,33 @@ class SandboxHostLauncher(SandboxLifecycle):
         """Bind credentials needed for background cleanup in one workspace."""
         return nullcontext()
 
+    @property
+    def owner_credential_provider(self) -> str | None:
+        """
+        Per-user connection provider this launcher acts as, or ``None``.
+
+        ``None`` (the default) means the launcher uses one deployment-wide
+        identity. A name such as ``"databricks"`` means every provider call is
+        made *as the host's owner* with the credential that user connected
+        under that provider; the server then binds a resolver with
+        :meth:`bind_owner_credential` before using the launcher.
+        """
+        return None
+
+    def bind_owner_credential(self, resolve: Callable[[], Mapping[str, object] | None]) -> None:
+        """
+        Bind the resolver for the host owner's credential.
+
+        Called once per launcher, right after the factory builds it, only when
+        :attr:`owner_credential_provider` is set. *resolve* returns the
+        owner's current credential payload (``{"token": ..., ...}``), refreshed
+        server-side, or ``None`` when the owner has not connected; it may block
+        (store read, token refresh) and is only called from worker threads.
+
+        :param resolve: Zero-argument resolver for this host's owner.
+        """
+        del resolve
+
     @abstractmethod
     def start_host(
         self,
@@ -945,7 +984,10 @@ class SandboxHostLauncher(SandboxLifecycle):
 
         :param sandbox_id: The sandbox from :meth:`provision`.
         :param token: The raw launch token the host authenticates with.
-        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_id: Host identity, e.g. ``"host_a1b2c3d4..."``, minted by the
+            server or chosen by a managed create's ``host_id``. The host must
+            register under exactly this id: *token* resolves only for it, and the
+            session's caller may already route by it.
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.
@@ -1006,6 +1048,45 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
 
         :returns: The absolute in-sandbox workspace path.
         """
+        workspace = self.prepare_workspace(sandbox_id, repos=repos, on_stage=on_stage)
+        if on_stage is not None:
+            on_stage("starting")
+        if host_config is not None or self.capabilities.resume_stopped:
+            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
+        env_prefix = " ".join(
+            f"{key}={shlex.quote(value)}"
+            for key, value in (
+                (HOST_TOKEN_ENV_VAR, token),
+                (HOST_ID_ENV_VAR, host_id),
+                (HOST_NAME_ENV_VAR, host_name),
+            )
+        )
+        try:
+            self.run_background(
+                sandbox_id,
+                f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+            )
+        except click.ClickException as exc:
+            # Provider errors echo the failed command, and this one carries the token.
+            # Redact in place so subclasses such as SandboxGoneError keep their type.
+            exc.message = exc.message.replace(token, "[redacted]")  # type: ignore[read-only]
+            exc.args = (exc.message,)
+            raise exc from None
+        return workspace
+
+    def prepare_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        repos: Sequence[RepoWorkspace] = (),
+        on_stage: Callable[[str], None] | None = None,
+    ) -> str:
+        """
+        Create ``<HOME>/workspace``, clone *repos* into it, and return the agent cwd.
+
+        The cwd is the single clone directory when exactly one repo is cloned,
+        else the workspace root parenting them all.
+        """
         if any(repo.git_clone != _sandbox_types.GitCloneOptions() for repo in repos):
             if not self.capabilities.git_clone_options:
                 raise click.ClickException(
@@ -1043,22 +1124,6 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             # One repo → drop the agent straight into it; several → the
             # workspace root that parents them all.
             workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
-        if on_stage is not None:
-            on_stage("starting")
-        if host_config is not None or self.capabilities.resume_stopped:
-            self.run(sandbox_id, render_host_config_write_command(host_config or {}))
-        env_prefix = " ".join(
-            f"{key}={shlex.quote(value)}"
-            for key, value in (
-                (HOST_TOKEN_ENV_VAR, token),
-                (HOST_ID_ENV_VAR, host_id),
-                (HOST_NAME_ENV_VAR, host_name),
-            )
-        )
-        self.run_background(
-            sandbox_id,
-            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-        )
         return workspace
 
     def materialize_workspace(

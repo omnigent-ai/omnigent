@@ -21,7 +21,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -32,6 +31,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e_ui.conftest import _create_native_codex_session
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view, _send
 
@@ -52,12 +52,6 @@ _NO_THREAD_MARKER = "never started a thread"
 _client = httpx.Client(trust_env=False)
 for _var in ("NO_PROXY", "no_proxy"):
     os.environ[_var] = ",".join(filter(None, [os.environ.get(_var, ""), "127.0.0.1,localhost"]))
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _no_proxy_env() -> dict[str, str]:
@@ -114,7 +108,7 @@ def bad_flag_codex_session(
         f'      - "{_BAD_FLAG}"\n'
     )
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 

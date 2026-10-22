@@ -562,7 +562,7 @@ def workdirs_for_kimi_sessions(kimi_home: Path) -> dict[str, str]:
 _workdirs_for_sessions = workdirs_for_kimi_sessions
 
 
-def _wire_created_at_ms(wire: Path) -> int | None | object:
+def _wire_created_at_ms(wire: Path) -> int | object | None:
     """``created_at`` (ms epoch) of the wire's first row — kimi's metadata header.
 
     Returns ``None`` only for a COMPLETE first line that carries no timestamp;

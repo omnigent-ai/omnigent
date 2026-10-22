@@ -152,7 +152,7 @@ def _enable_faulthandler() -> None:
         # from its signal handler, after Python can no longer open files.
         _faulthandler_file = open(log_dir / FAULTHANDLER_LOG_NAME, "ab", buffering=0)  # noqa: SIM115
         faulthandler.enable(file=_faulthandler_file, all_threads=True)
-    except Exception:  # noqa: BLE001 — crash capture must never block startup
+    except Exception:  # crash capture must never block startup
         _logger.debug("Could not enable faulthandler for the host", exc_info=True)
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -163,47 +164,53 @@ def _run_extension_script(node: str, extension_path: Path, script: str) -> None:
 
 
 def _usage_test_preamble() -> str:
-    """Shared Node harness: load the extension with a mocked fetch + Pi.
-
-    Exposes ``postedEvents`` (parsed request bodies), ``handlers`` (the
-    registered Pi event handlers), and a ``ctx`` stub.
-    """
+    """Load the extension with a real checkpoint directory and mocked Pi/HTTP edges."""
     return r"""
 const assert = require("assert").strict;
+const fs = require("fs");
 const path = require("path");
-
 const extensionPath = process.argv[1];
-const configPath = path.join(require("os").tmpdir(), `pi-usage-${process.pid}.json`);
-require("fs").writeFileSync(
-  configPath,
-  JSON.stringify({
-    serverUrl: "http://omnigent.test",
-    sessionId: "session-1",
-    authHeaders: { authorization: "Bearer test" },
-  }),
-);
+const root = fs.mkdtempSync(path.join(require("os").tmpdir(), "pi-usage-"));
+process.on("exit", () => fs.rmSync(root, { recursive: true, force: true }));
+const bridgeDir = path.join(root, "bridge");
+const inboxDir = path.join(root, "inbox");
+fs.mkdirSync(bridgeDir);
+fs.mkdirSync(inboxDir);
+const statePath = path.join(bridgeDir, "cumulative_usage.json");
+const configPath = path.join(root, "config.json");
+fs.writeFileSync(configPath, JSON.stringify({
+  serverUrl: "http://omnigent.test", sessionId: "session-1", bridgeDir, inboxDir,
+  authHeaders: { authorization: "Bearer test" },
+}));
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
-
 const postedEvents = [];
 global.fetch = async (_url, request) => {
   postedEvents.push(JSON.parse(request.body));
   return { ok: true };
 };
 global.setInterval = () => ({ fakeInterval: true });
-
-const handlers = {};
-const pi = {
-  registerCommand() {},
-  on(eventName, handler) {
-    handlers[eventName] = handler;
-  },
+function launchExtension() {
+  delete require.cache[require.resolve(extensionPath)];
+  const handlers = {};
+  require(extensionPath)({
+    registerCommand() {},
+    on(name, handler) { handlers[name] = handler; },
+  });
+  return handlers;
+}
+const handlers = launchExtension();
+const ctx = {
+  sessionManager: { getSessionId: () => "native-session-1" },
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
 };
-require(extensionPath)(pi);
-
-const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
-
 function usageEvents() {
   return postedEvents.filter((e) => e.type === "external_session_usage");
+}
+async function recordUsage(handlers, timestamp, input, output) {
+  await handlers.message_end({ message: {
+    role: "assistant", model: "databricks-claude-sonnet-4-6", timestamp,
+    usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output },
+  }}, ctx);
 }
 """
 
@@ -433,6 +440,91 @@ def test_distinct_messages_with_identical_usage_are_not_collapsed(
     _run_extension_script(node, extension_path, script)
 
 
+@pytest.mark.parametrize(
+    "baseline_source",
+    ["local", "server", "matching-local", "stale-local", "corrupt-local", "unreported-local"],
+)
+def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
+    """A fresh extension restores its checkpoint before accumulating the next turn."""
+    script = (
+        _usage_test_preamble()
+        + "\nconst baselineSource = "
+        + json.dumps(baseline_source)
+        + ";\n"
+        + r"""
+(async () => {
+
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 1000, 150000, 30000);
+  const saved = JSON.parse(fs.readFileSync(statePath));
+  assert.equal(saved.cumulative_input_tokens, 150000);
+  assert.equal(saved.cumulative_output_tokens, 30000);
+  if (baselineSource !== "local") {
+    const cfg = JSON.parse(fs.readFileSync(configPath));
+    cfg.usageBaseline = { ...saved };
+    delete cfg.usageBaseline.model;
+    if (baselineSource === "unreported-local") {
+      cfg.usageBaseline.cumulative_input_tokens = 100000;
+      cfg.usageBaseline.cumulative_output_tokens = 20000;
+    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg));
+    if (baselineSource === "server") fs.unlinkSync(statePath);
+    if (baselineSource === "corrupt-local") fs.writeFileSync(statePath, "{bad-json");
+    if (baselineSource === "stale-local") {
+      fs.writeFileSync(statePath, JSON.stringify({cumulative_input_tokens: 100000}));
+    }
+  }
+  postedEvents.length = 0;
+  const resumed = launchExtension();
+  await resumed.session_start({}, ctx);
+  await recordUsage(resumed, 2000, 900, 250);
+  const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
+  assert.deepEqual(usageEvents().map(({data}) => [
+    data.cumulative_input_tokens, data.cumulative_output_tokens, data.model,
+  ]), [
+    ...(reasserts ? [[150000, 30000, "databricks-claude-sonnet-4-6"]] : []),
+    [150900, 30250, "databricks-claude-sonnet-4-6"],
+  ]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_session_start_readiness_not_blocked_by_hung_usage_post() -> None:
+    """Readiness and inbox polling precede a stalled checkpoint POST."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  fs.writeFileSync(statePath, JSON.stringify({
+    cumulative_input_tokens: 150000, cumulative_output_tokens: 30000,
+    cumulative_cache_read_input_tokens: 0, model: "databricks-claude-sonnet-4-6",
+  }));
+  let usagePostAttempted = false;
+  let polling = false;
+  global.setInterval = () => { polling = true; return {}; };
+  global.fetch = async (_url, request) => {
+    if (JSON.parse(request.body).type === "external_session_usage") {
+      usagePostAttempted = true;
+      return new Promise(() => {});
+    }
+    return { ok: true };
+  };
+  handlers.session_start({}, ctx).catch(error => { console.error(error); process.exit(1); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(usagePostAttempted);
+  assert.ok(fs.existsSync(path.join(bridgeDir, "input_ready")));
+  assert.ok(polling);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
     tmp_path: Path,
 ) -> None:
@@ -485,6 +577,52 @@ def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
 """
     )
     _run_extension_script(node, extension_path, script)
+
+
+def test_restore_ignores_malformed_persisted_state() -> None:
+    """A truncated checkpoint does not contaminate the next usage report."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  fs.writeFileSync(statePath, "{not-json");
+  await handlers.session_start({}, ctx);
+  assert.equal(usageEvents().length, 0);
+  await recordUsage(handlers, 1000, 500, 100);
+  assert.deepEqual(usageEvents().map(({data}) => [
+    data.cumulative_input_tokens, data.cumulative_output_tokens,
+  ]), [[500, 100]]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_restore_never_lowers_a_higher_live_total() -> None:
+    """A stale checkpoint cannot lower the live cumulative total."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 1000, 150000, 30000);
+  fs.writeFileSync(statePath, JSON.stringify({
+    cumulative_input_tokens: 100000, cumulative_output_tokens: 20000,
+    cumulative_cache_read_input_tokens: 0, model: "databricks-claude-sonnet-4-6",
+  }));
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 2000, 500, 100);
+  const data = usageEvents().at(-1).data;
+  assert.equal(data.cumulative_input_tokens, 150500);
+  assert.equal(data.cumulative_output_tokens, 30100);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _extension_path() -> Path:
@@ -3213,6 +3351,154 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+    """A routed web turn runs on the routed model, not the old one.
+
+    The executor queues ``model_change`` then ``user_message``; the poller
+    fires the switch without awaiting it, and Pi's ``setModel`` only commits
+    after an async auth check. The ``input`` handler must hold the message's
+    turn until that switch settles.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let committed = null;
+  pi.setModel = async (model) => {
+    setModelCalls.push(model);
+    await sleep(150); // Pi's checkAuth before agent.state.model is set
+    committed = model.id;
+    return true;
+  };
+  await handlers.session_start({}, ctx);
+  const file = path.join(inboxDir, "000-model.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+  );
+  while (fs.existsSync(file)) await sleep(10);
+  assert.equal(committed, null); // still in flight
+  await handlers.input({ text: "routed turn", source: "extension" }, ctx);
+  assert.equal(committed, "databricks-claude-opus-4-1");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_routes_once_via_route_turn(tmp_path: Path) -> None:
+    """A prompt typed in the Pi TUI asks route-turn once and applies the pick.
+
+    Web messages (``source: "extension"``) were routed server-side and must
+    not be routed again; slash commands are not prompts; and once the server
+    answered, later prompts skip the round trip.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const routeCalls = [];
+  global.fetch = async (url, request) => {
+    const body = JSON.parse(request.body);
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls.push({ url, body });
+      return {
+        ok: true,
+        json: async () => ({
+          action: "route",
+          model: "omnigent/databricks-claude-opus-4-1",
+          terminal: false,
+        }),
+      };
+    }
+    posted.push(body);
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "from the web", source: "extension" }, ctx);
+  await handlers.input({ text: "/model", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 0);
+
+  await handlers.input({ text: "fix the bug", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  assert.equal(
+    routeCalls[0].url,
+    "http://omnigent.test/v1/sessions/session-1/hooks/route-turn",
+  );
+  assert.deepEqual(routeCalls[0].body, {
+    harness: "pi-native",
+    prompt: "fix the bug",
+    model: "omnigent/databricks-claude-sonnet-4-6",
+  });
+  assert.deepEqual(setModelCalls.map((m) => m.id), ["databricks-claude-opus-4-1"]);
+
+  await handlers.input({ text: "next prompt", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
+    """An unreachable route-turn leaves the model alone and is not retried."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let routeCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls += 1;
+      throw new Error("ECONNREFUSED");
+    }
+    posted.push(JSON.parse(request.body));
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "one", source: "interactive" }, ctx);
+  await handlers.input({ text: "two", source: "interactive" }, ctx);
+  assert.equal(routeCalls, 1);
+  assert.equal(setModelCalls.length, 0);
+  // The user's prompt is still mirrored to Omnigent.
+  assert.ok(
+    posted.some(
+      (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
+    ),
+  );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
     """A raw gateway selection cannot switch to an ambient vendor provider."""
     node = shutil.which("node")
@@ -3346,6 +3632,87 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   const changes = posted.filter((e) => e.type === "external_model_change");
   assert.equal(changes.length, 1, JSON.stringify(posted));
   assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_session_start_scoped_models_curate_model_options(tmp_path: Path) -> None:
+    """
+    A session with a resolved model scope posts THAT scope, not the registry.
+
+    Pi resolves ``--models`` / settings ``enabledModels`` into
+    ``ctx.scopedModels`` — the exact set its own Ctrl+P picker cycles. When
+    the scope is non-empty the extension must post it as the picker catalog
+    (keeping the launch model listed even when the scope excludes it) instead
+    of dumping ``registry.getAvailable()`` — the union of every logged-in
+    provider's full catalog. An empty scope still falls back to the registry.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  // Scope excludes the launch model: the posted catalog is the launch model
+  // plus the scope, and the registry is never consulted (it throws if read).
+  const throwingRegistry = {
+    getAvailable: () => { throw new Error("scoped session must not list the registry"); },
+    getAll: () => { throw new Error("scoped session must not list the registry"); },
+  };
+  const scopedCtx = {
+    ...ctx,
+    scopedModels: [
+      { model: { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus" } },
+    ],
+    modelRegistry: throwingRegistry,
+  };
+  await handlers.session_start({}, scopedCtx);
+  let opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 1, JSON.stringify(posted));
+  assert.deepEqual(
+    opts[0].data.models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+    JSON.stringify(opts[0].data.models),
+  );
+  assert.equal(opts[0].data.models[1].displayName, "Opus");
+
+  // Scope includes the launch model: exactly the scope, no duplicate row.
+  const inScopeCtx = {
+    ...scopedCtx,
+    scopedModels: [
+      { model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" } },
+    ],
+  };
+  await handlers.session_start({}, inScopeCtx);
+  opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 2, JSON.stringify(posted));
+  assert.deepEqual(opts[1].data.models.map((m) => m.id), [
+    "omnigent/databricks-claude-sonnet-4-6",
+  ]);
+
+  // An empty scope means "no curation": fall back to getAvailable().
+  await handlers.session_start({}, { ...ctx, scopedModels: [] });
+  opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 3, JSON.stringify(posted));
+  assert.deepEqual(
+    opts[2].data.models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+  );
   finish();
 })().catch((error) => {
   finish();
@@ -3675,6 +4042,78 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
   assert.deepEqual(sends.map(s => s.content), ["first", "second"]);
   assert.deepEqual(fs.readdirSync(inboxDir), []);
   fs.rmSync(tmpDir, { recursive: true, force: true });
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_native_auth_errors_are_correlated_and_redacted(tmp_path: Path) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the Pi extension")
+    script = (
+        _usage_test_preamble()
+        + "\nconst authDir = "
+        + json.dumps(str(tmp_path))
+        + r""";
+const crypto = require("crypto");
+process.env.OMNIGENT_PI_NATIVE_AUTH_DIR = authDir;
+const id = crypto.createHash("sha256").update("omnigent").digest("hex").slice(0, 16);
+const file = `auth-${id}.json`;
+const notifications = [];
+ctx.ui.notify = (message) => notifications.push(message);
+const originalError = "API key auth failed for provider omnigent: " +
+  `Failed to resolve API key for provider "omnigent" from shell command: node ${file}`;
+(async () => {
+  for (const [patch, classified] of [
+    [{}, true],
+    [{piPid: process.pid + 1}, false],
+    [{at: Date.now() - 60_000}, false],
+    [{kind: "ok"}, false],
+    [{kind: "private-error"}, false],
+  ]) {
+    postedEvents.length = 0;
+    notifications.length = 0;
+    fs.writeFileSync(path.join(authDir, `${file}.result.json`), JSON.stringify({
+      kind: "failed_exit", piPid: process.pid, at: Date.now(), secret: "DO-NOT-SHOW", ...patch,
+    }));
+    const bodies = [];
+    global.fetch = async (_url, request) => {
+      const body = JSON.parse(request.body);
+      postedEvents.push(body);
+      if (body.data && body.data.item_type === "error") {
+        bodies.push(body);
+        if (bodies.length === 1) throw new Error("socket closed during token resolution");
+      }
+      return {ok: true};
+    };
+    await handlers.message_end({message: {
+      role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
+      content: [],
+    }}, ctx);
+    const error = postedEvents.find(e => e.data && e.data.item_type === "error");
+    assert.ok(error);
+    assert.equal(bodies.length, 2);
+    assert.ok(bodies[0].data.source_id);
+    assert.deepEqual(bodies[0], bodies[1]);
+    assert.equal(error.data.item_data.code, classified ? "pi_auth_failed_exit" : "RuntimeError");
+    assert.equal(notifications.length, classified ? 1 : 0);
+    if (classified) {
+      assert.match(error.data.item_data.message, /exited unsuccessfully/);
+      assert.match(notifications[0], /send another message/);
+      assert.ok(!JSON.stringify(postedEvents).includes(file));
+      assert.ok(!fs.existsSync(path.join(authDir, `${file}.result.json`)));
+      postedEvents.length = 0;
+      await handlers.message_end({message: {
+        role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
+        content: [], timestamp: Date.now(),
+      }}, ctx);
+      const nextError = postedEvents.find(e => e.data && e.data.item_type === "error");
+      assert.equal(nextError.data.item_data.code, "RuntimeError");
+    }
+    assert.ok(!JSON.stringify(postedEvents).includes("DO-NOT-SHOW"));
+  }
 })().catch(error => { console.error(error); process.exit(1); });
 """
     )

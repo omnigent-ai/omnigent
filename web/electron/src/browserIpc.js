@@ -8,11 +8,95 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+const chromeCookieStoreModule = require("./chromeCookieStore");
+const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
+
+// Chrome's cookie jar is OS-encrypted through the macOS Keychain; the other
+// platforms' schemes aren't wired up yet (the shell's feature flag mirrors this).
+const CHROME_COOKIE_IMPORT_PLATFORM_ERROR = "Importing Chrome cookies is only supported on macOS.";
+
+/**
+ * Profile names come from Chrome's `Local State`, which is just a file on disk.
+ * Keep them one short line so a crafted name can't add its own paragraphs to
+ * the consent dialog.
+ *
+ * @param {unknown} value
+ * @param {string} fallback
+ * @returns {string}
+ */
+function flattenProfileLabel(value, fallback) {
+  let flattened = "";
+  for (const char of String(value || fallback || "")) {
+    const code = char.codePointAt(0);
+    if (code < 0x20 || code === 0x7f) flattened += " ";
+    // Quotes would close the prompt's own quoting around the name.
+    else flattened += char === '"' ? "'" : char;
+  }
+  flattened = flattened.replace(/\s+/g, " ").trim();
+  if (!flattened) return "Unknown";
+  return flattened.length > 40 ? `${flattened.slice(0, 39)}…` : flattened;
+}
+
+/**
+ * Consent text for the native prompt. Pure, so the wording and the flattening
+ * of Chrome-supplied names are testable without Electron.
+ *
+ * @param {{ host: string, scope: string, profileName: string, cookieCount: number }} request
+ * @returns {{ message: string, detail: string }}
+ */
+function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
+  const count = Number.isFinite(cookieCount) && cookieCount > 0 ? cookieCount : 0;
+  const what = count > 0 ? `${count} cookie${count === 1 ? "" : "s"}` : "Chrome's cookies";
+  // The scope is usually the tab's own host; name the tab too when an ancestor
+  // was picked, so the prompt says which page the copy lands in.
+  const where =
+    host && host !== scope
+      ? `${scope} and its subdomains (this tab is on ${host})`
+      : `${scope} and its subdomains`;
+  return {
+    message: `Import ${what} into Omnigent?`,
+    detail:
+      `From Chrome profile "${flattenProfileLabel(profileName, scope)}" for ${where}.\n\n` +
+      "They stay available to this conversation's embedded browser tabs, including any the " +
+      "agent controls, until you quit Omnigent.",
+  };
+}
+
+/**
+ * Ask the user, from the main process, before Chrome's key is touched: the pane's
+ * dialog is not proof a human asked, since the connected page holds the bridge.
+ *
+ * @param {{ host: string, scope: string, profileName: string, cookieCount: number,
+ *           parentWindow?: object | null }} request
+ * @returns {Promise<boolean>}
+ */
+async function askToImportChromeCookies({ host, scope, profileName, cookieCount, parentWindow }) {
+  const { dialog } = require("electron");
+  if (!dialog || typeof dialog.showMessageBox !== "function") return false;
+  const options = {
+    type: "warning",
+    buttons: ["Cancel", "Import"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    ...buildCookieImportPrompt({ host, scope, profileName, cookieCount }),
+  };
+  // Parented like the shell's other consent dialogs: an unparented alert can be
+  // approved while the window it describes is behind another app or on another
+  // desktop.
+  let parent = null;
+  if (parentWindow && !parentWindow.isDestroyed?.()) parent = parentWindow;
+  const { response } = parent
+    ? await dialog.showMessageBox(parent, options)
+    : await dialog.showMessageBox(options);
+  return response === 1;
+}
 
 /**
  * Detach design-mode listeners (console-message + input-event) off an entry and
@@ -255,6 +339,8 @@ function makeDesignModeInputHandler(gestureState) {
  * @param {(event: Electron.IpcMainInvokeEvent) =>
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
+ * @param {(event: Electron.IpcMainInvokeEvent) => (object | null)} [deps.getWindowForEvent]
+ *        The shell window that owns the sender, used to parent native dialogs.
  */
 function registerBrowserIpc({
   ipcMain,
@@ -263,6 +349,13 @@ function registerBrowserIpc({
   getAgentContextForEvent = () => null,
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
+  // Injected so native dialogs can be parented to the sender's window.
+  getWindowForEvent = () => null,
+  chromeCookieStore = chromeCookieStoreModule,
+  // Injected so the macOS-only guard is testable on any CI platform.
+  platform = process.platform,
+  // Injected so the native confirmation is testable without Electron dialogs.
+  confirmCookieImport = askToImportChromeCookies,
 }) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
@@ -298,15 +391,27 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const navigate = (registry) =>
-      registry.openOrNavigate(conversationId, url, bounds, {
+    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
+    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
+    const navigate = async (registry) => {
+      // The first-party renderer supplies the source-session host; main owns
+      // the target and eligibility. Caller exception flags never establish identity.
+      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+      if (url) {
+        const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
+        if (!isCurrent()) return cancelled;
+        if (!verdict.ok) return verdict;
+      }
+      return registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
-        agent: !!opts?.agent,
-        // The first-party renderer supplies the source-session host; main owns
-        // the target and eligibility. Caller exception flags never establish identity.
-        agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+        // Renderer flags do not establish user intent.
+        agent: true,
+        agentContext,
       });
-    let r = navigate(g.registry);
+    };
+    let r = await navigate(g.registry);
+    if (!isCurrent()) return cancelled;
     let recovered = false;
     if (!r.ok && opts?.agent) {
       try {
@@ -321,11 +426,14 @@ function registerBrowserIpc({
         recovered = false;
       }
     }
+    if (!isCurrent()) return cancelled;
     if (recovered) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.
       const refreshed = gateRegistry(event);
-      if (!refreshed.error) r = navigate(refreshed.registry);
+      if (refreshed.error || refreshed.registry !== g.registry) return cancelled;
+      r = await navigate(refreshed.registry);
+      if (!isCurrent()) return cancelled;
     }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
@@ -419,25 +527,28 @@ function registerBrowserIpc({
     }
   });
 
-  // Run relay-template JS in the conversation's view. PRIVATE to the relay's
-  // fixed templates (snapshot / click / type) — NOT an agent-facing generic
-  // `evaluate` (trust boundary; see README).
-  ipcMain.handle("omnigent:browser-execute", async (event, args) => {
+  // Both transports converge on main-owned scripts and the same sender gate.
+  async function performBrowserAction(event, args, legacy = false) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, js } = args ?? {};
-    if (typeof js !== "string") return { ok: false, error: "js must be a string" };
+    const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
-      // `true` = user gesture, so the page can call gesture-gated APIs.
-      const result = await entry.view.webContents.executeJavaScript(js, true);
-      // Normalize to a string — the relay JSON.parses snapshot/upload results.
+      const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
+      const js = buildBrowserActionScript(action, params);
+      const result = await entry.view.webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
-  });
+  }
+  ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
+    performBrowserAction(event, args),
+  );
+  ipcMain.handle("omnigent:browser-execute", (event, args) =>
+    performBrowserAction(event, args, true),
+  );
 
   // Whether a view currently exists for a conversation. Lets a (re)mounting
   // pane re-attach an already-created view without waiting for a create event.
@@ -577,6 +688,125 @@ function registerBrowserIpc({
     return { ok: true };
   });
 
+  // ── Import cookies from Google Chrome (macOS) ────────────────────────────
+  // Copies only the current site's cookies into this conversation's in-memory
+  // partition: a metadata-only preview (no Keychain), then the import. The site
+  // comes from the view's real URL in main and is re-checked before writing.
+
+  const siteForEntry = (entry) => {
+    let parsed;
+    try {
+      parsed = new URL(entry.view.webContents.getURL());
+    } catch {
+      return { error: "No website is loaded in this tab yet." };
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return { error: "Importing cookies works on http(s) pages only." };
+    }
+    if (!parsed.hostname) return { error: "This page has no site to import cookies for." };
+    return { host: parsed.hostname };
+  };
+
+  ipcMain.handle("omnigent:browser-chrome-cookie-preview", async (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    if (platform !== "darwin") {
+      return { ok: false, error: CHROME_COOKIE_IMPORT_PLATFORM_ERROR };
+    }
+    const entry = g.registry.get(args?.conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    const site = siteForEntry(entry);
+    if (site.error) return { ok: false, error: site.error };
+    try {
+      return await chromeCookieStore.previewSiteCookies({ host: site.host });
+    } catch (e) {
+      return { ok: false, error: e && e.message ? e.message : String(e) };
+    }
+  });
+
+  ipcMain.handle("omnigent:browser-chrome-cookie-import", async (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    if (platform !== "darwin") {
+      return { ok: false, error: CHROME_COOKIE_IMPORT_PLATFORM_ERROR };
+    }
+    const { conversationId, profileId, expectedHost, scope } = args ?? {};
+    const entry = g.registry.get(conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    const site = siteForEntry(entry);
+    if (site.error) return { ok: false, error: site.error };
+    // Fall back to the real module only for stores that are pure stubs.
+    const normalizeHost = chromeCookieStore.normalizeHost ?? chromeCookieStoreModule.normalizeHost;
+    const safeNormalize = (value) => {
+      try {
+        return normalizeHost(value);
+      } catch {
+        return null;
+      }
+    };
+    const hostMatches = (value) => {
+      const normalized = safeNormalize(value);
+      return normalized !== null && normalized === safeNormalize(site.host);
+    };
+    if (typeof expectedHost !== "string" || !hostMatches(expectedHost)) {
+      return {
+        ok: false,
+        error: "This tab is no longer on that site. Reopen the import dialog to retry.",
+      };
+    }
+    if (typeof profileId !== "string" || !profileId) {
+      return { ok: false, error: "Pick a Chrome profile to import from." };
+    }
+    try {
+      // Counts and scope for the confirmation come from main's own preview, so
+      // a renderer string can't understate what the user approves.
+      const preview = await chromeCookieStore.previewSiteCookies({ host: site.host });
+      // Counts, name and scope for the confirmation all come from main's own
+      // preview, so refuse before the prompt whenever it can't supply them.
+      if (!preview?.ok) {
+        return {
+          ok: false,
+          error: preview?.error || "This page's address isn't a site we can import cookies for.",
+        };
+      }
+      const profile = (preview.profiles ?? []).find((candidate) => candidate.id === profileId);
+      if (!profile) {
+        return { ok: false, error: "That Chrome profile has no cookies for this site." };
+      }
+      const requestedScope = safeNormalize(scope) ?? site.host;
+      const offered = (profile.scopes ?? []).find((candidate) => candidate.host === requestedScope);
+      if (!offered) {
+        return { ok: false, error: "That site scope isn't available for this tab." };
+      }
+      const approved = await confirmCookieImport({
+        host: site.host,
+        scope: offered.host,
+        profileName: profile.name,
+        cookieCount: offered.cookieCount,
+        parentWindow: getWindowForEvent(event) ?? null,
+      });
+      if (!approved) return { ok: false, cancelled: true };
+      return await chromeCookieStore.importSiteCookies({
+        host: site.host,
+        // Normalized and taken from the preview above; the store re-validates
+        // it against the page host's own ancestors.
+        scope: offered.host,
+        profileId,
+        cookiesApi: entry.view.webContents.session.cookies,
+        // The tab can navigate while the Keychain prompt is up; bail before any
+        // cookie is written so the import can't land on the new site.
+        beforeWrite: () => {
+          const current = siteForEntry(entry);
+          return !current.error && hostMatches(current.host);
+        },
+      });
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };
+      return { ok: false, error: msg };
+    }
+  });
+
   // Forward a submit's result envelope into the page for green/red feedback.
   // `id` matches the page's submitId so a late callback can't paint over a fresh
   // popup. Fields are defensively coerced before crossing back into the page.
@@ -606,6 +836,9 @@ function registerBrowserIpc({
 
 module.exports = {
   registerBrowserIpc,
+  // Exported for unit tests (prompt wording + dialog parenting without Electron).
+  buildCookieImportPrompt,
+  askToImportChromeCookies,
   // Exported for unit tests (drive nav-state / listener logic without Electron).
   attachNavListeners,
   readNavState,

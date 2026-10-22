@@ -66,6 +66,7 @@ from omnigent.runner.app import (
     _publish_terminal_pending,
     _terminal_lookup_miss_log_state,
 )
+from omnigent.runner.native.orchestration import _build_pi_native_args
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -75,12 +76,16 @@ from omnigent.runner.resource_registry import (
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.pi_native import seed_pi_own_login_catalog
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+_PI_SESSION_ID = "47f049b9d13df4db397c7f46859b825f"
 
 
 async def _no_op_forwarder(**kwargs: Any) -> None:
@@ -160,13 +165,18 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset"),
     [
-        (None, []),
+        ("missing", None, []),
         (
+            "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
         ),
+        ("empty", None, []),
+        ("raw", None, []),
+        ("resolved", None, []),
+        ("resolved-replace", None, []),
     ],
 )
 async def test_auto_create_pi_terminal_launches_required_terminal(
@@ -174,23 +184,12 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     monkeypatch: pytest.MonkeyPatch,
     env_denylist: str | None,
     expected_env_unset: list[str],
+    instruction_spec: str,
 ) -> None:
-    """
-    Pi-native auto-create must launch a *required* terminal.
+    """Launch a required terminal with session-local authored instructions.
 
-    Regression guard for a missed call site. The pi-native runtime *is* the
-    terminal process (parity with claude-native), so when the lifecycle-aware
-    launch API replaced ``launch_terminal`` with ``launch_required_terminal`` /
-    ``launch_auxiliary_terminal``, ``_auto_create_pi_terminal`` had to move to
-    ``launch_required_terminal``. The fake registry below exposes *only*
-    ``launch_required_terminal`` (no ``launch_terminal``), so a stale call site
-    raises ``AttributeError`` here in CI instead of crashing in production the
-    moment a real pi-native session boots.
-
-    :param tmp_path: Pytest-provided temporary directory.
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param env_denylist: Optional operator-supplied credential variable names.
-    :param expected_env_unset: Variables the terminal must remove before launch.
+    The registry exposes only the required-terminal API; provider discovery
+    must leave the event loop responsive and preserve the operator denylist.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
@@ -222,7 +221,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         return _PiNativeLaunchConfig(
             workspace=tmp_path,
             server_url="http://127.0.0.1:8000",
-            terminal_launch_args=None,
+            terminal_launch_args=["--append-system-prompt", "User addition"],
             external_session_id=None,
         )
 
@@ -231,7 +230,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     captured: dict[str, Any] = {}
 
     class _FakeResourceRegistry:
-        """Records the launch; exposes ONLY the required-terminal launch API."""
+        """Omit launch_terminal so regressions to the optional-terminal API fail."""
 
         terminal_registry = None
 
@@ -260,11 +259,30 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     published: list[dict[str, Any]] = []
 
+    instructions = "  Follow the authored role. π\nKeep this whitespace.  "
+    agent_spec = None
+    if instruction_spec != "missing":
+        agent_spec = AgentSpec(
+            spec_version=1,
+            name="pi",
+            executor=ExecutorSpec(),
+            instructions=instructions if instruction_spec != "empty" else "   ",
+        )
+        if instruction_spec == "resolved-replace":
+            agent_spec.executor.config.update(context_files=False, system_prompt_mode="replace")
+        if instruction_spec.startswith("resolved"):
+            agent_spec = ResolvedSpec(spec=agent_spec, workdir=tmp_path)
+
+    bridge_dir = pi_native_bridge.prepare_bridge_dir(_PI_SESSION_ID)
+    instructions_path = bridge_dir / "agent_instructions.md"
+    instructions_path.write_text("Stale role")
+
     await _auto_create_pi_terminal(
-        "47f049b9d13df4db397c7f46859b825f",
+        _PI_SESSION_ID,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, evt: published.append(evt),
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
     )
 
     # Required lifecycle (parity with claude-native), correct terminal identity.
@@ -283,6 +301,29 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert {"list_comments", "sys_session_list"} <= tool_names
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+
+    args = captured["spec"].args
+    assert args[-2:] == ["--append-system-prompt", "User addition"]
+    if instruction_spec in {"raw", "resolved", "resolved-replace"}:
+        assert args.count("--append-system-prompt") == 2
+        prompt_flag = (
+            "--system-prompt"
+            if instruction_spec == "resolved-replace"
+            else "--append-system-prompt"
+        )
+        path = Path(args[args.index(prompt_flag) + 1])
+        assert ("--no-context-files" in args) is (instruction_spec == "resolved-replace")
+        if instruction_spec == "resolved-replace":
+            assert args[args.index("--append-system-prompt") + 1] == ""
+        assert (
+            path.parent
+            == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
+        )
+        assert path.read_text() == instructions
+        assert instructions not in args
+    else:
+        assert args.count("--append-system-prompt") == 1
+        assert not instructions_path.exists()
 
 
 @pytest.mark.asyncio
@@ -360,7 +401,7 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
             return self._Response()
 
     await _auto_create_pi_terminal(
-        "47f049b9d13df4db397c7f46859b825f",
+        _PI_SESSION_ID,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
         server_client=_RecordingServerClient(),  # type: ignore[arg-type]
@@ -379,16 +420,37 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
+@pytest.mark.parametrize(
+    ("effort_warning", "model_notice", "expected_code"),
+    [
+        (
+            "effort ignored for gateway-routed model system.ai.placeholder-model-xyz: "
+            "thinking disabled to keep text surfacing",
+            None,
+            "pi_native_effort_ignored",
+        ),
+        (
+            None,
+            "The model override 'other-gw/system.ai.placeholder-model-xyz' names provider "
+            "'other-gw', but this Pi session is served by provider 'gw'; the model "
+            "'system.ai.placeholder-model-xyz' was requested from 'gw' instead.",
+            "pi_native_model_rerouted",
+        ),
+    ],
+)
+async def test_auto_create_pi_terminal_informational_notice_posts_info_level(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    effort_warning: str | None,
+    model_notice: str | None,
+    expected_code: str,
 ) -> None:
-    """An ignored effort setting posts a neutral info-level notice, not an error.
+    """An informational launch notice posts at info level, not as an error.
 
-    When a gateway-routed model disables thinking to keep text surfacing, the
-    effort setting is silently dropped. This is informational (the session still
-    works), so it must arrive as level=info with its own code, not as the
-    destructive pi_credentials_unresolved banner.
+    An effort setting dropped for a gateway-routed model, or a pick qualified by
+    another configured provider that is requested from the serving one, leaves
+    the session working. Each must arrive as level=info with its own code, not
+    as the destructive pi_credentials_unresolved banner that counts as a failure.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
@@ -405,6 +467,7 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
         model="system.ai.placeholder-model-xyz",
         api_key="managed-token",
         auth_header=True,
+        model_notice=model_notice,
     )
     monkeypatch.setattr(
         pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
@@ -413,14 +476,7 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
         pi_native_credentials,
         "pi_native_provider_launch",
         lambda _agent_dir, _provider, _effort=None, **_kwargs: (
-            pi_native_credentials.PiNativeLaunch(
-                env={},
-                args=[],
-                effort_warning=(
-                    "effort ignored for gateway-routed model system.ai.placeholder-model-xyz: "
-                    "thinking disabled to keep text surfacing"
-                ),
-            )
+            pi_native_credentials.PiNativeLaunch(env={}, args=[], effort_warning=effort_warning)
         ),
     )
 
@@ -471,10 +527,9 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
     assert len(notice_posts) == 1
     data = notice_posts[0]["data"]
     assert data["item_type"] == "error"
-    assert data["item_data"]["code"] == "pi_native_effort_ignored"
+    assert data["item_data"]["code"] == expected_code
+    assert data["item_data"]["message"] == (effort_warning or model_notice)
     assert data["item_data"]["level"] == "info"
-    # The credential error code must not appear on a notice-only post.
-    assert data["item_data"]["code"] != "pi_credentials_unresolved"
 
 
 @pytest.mark.asyncio
@@ -529,7 +584,7 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
             )
 
     await _auto_create_pi_terminal(
-        "47f049b9d13df4db397c7f46859b825f",
+        _PI_SESSION_ID,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -594,7 +649,7 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
             )
 
     await _auto_create_pi_terminal(
-        "47f049b9d13df4db397c7f46859b825f",
+        _PI_SESSION_ID,
         _FakeResourceRegistry(),  # type: ignore[arg-type]
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -682,7 +737,7 @@ async def test_auto_create_pi_terminal_outdated_cli_fails_with_upgrade_message(
 
     with pytest.raises(PiNativeCliOutdatedError) as excinfo:
         await _auto_create_pi_terminal(
-            "47f049b9d13df4db397c7f46859b825f",
+            _PI_SESSION_ID,
             captured["registry"],  # type: ignore[arg-type]
             lambda _sid, _evt: None,
             server_client=NullServerClient(),  # type: ignore[arg-type]
@@ -721,13 +776,252 @@ async def test_auto_create_pi_terminal_cli_version_at_floor_or_unknown_proceeds(
     captured = _pi_launch_test_stubs(tmp_path, monkeypatch, probed)
 
     await _auto_create_pi_terminal(
-        "47f049b9d13df4db397c7f46859b825f",
+        _PI_SESSION_ID,
         captured["registry"],  # type: ignore[arg-type]
         lambda _sid, _evt: None,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
     assert captured["spec"].command == "pi"
+
+
+@pytest.mark.parametrize(
+    (
+        "project",
+        "global_file",
+        "user_args",
+        "mode",
+        "approve",
+        "authored",
+        "unreadable",
+        "expected",
+    ),
+    [
+        (True, True, [], "append", True, True, None, ["project", "authored"]),
+        (False, True, [], "append", True, True, None, ["global", "authored"]),
+        (False, False, [], "append", True, True, None, ["authored"]),
+        (True, True, [], "append", False, True, None, ["global", "authored"]),
+        (True, True, ["--no-approve"], "append", True, True, None, ["global", "authored"]),
+        (True, True, ["-na", "-a"], "append", True, True, None, ["project", "authored"]),
+        (
+            True,
+            True,
+            ["--append-system-prompt", "custom"],
+            "append",
+            True,
+            True,
+            None,
+            ["authored", "custom"],
+        ),
+        (True, True, ["--append-system-prompt", ""], "append", True, True, None, ["authored", ""]),
+        (True, True, ["--system-prompt", "User base"], "replace", True, True, None, [""]),
+        (True, True, [], "append", True, False, None, []),
+        (True, True, [], "append", True, True, "project", ["global", "authored"]),
+        (False, True, [], "append", True, True, "global", ["authored"]),
+    ],
+    ids=[
+        "project",
+        "global-fallback",
+        "missing",
+        "no-trust-override",
+        "no-approve",
+        "trust-last-wins",
+        "user-append",
+        "user-empty-append",
+        "replace-user-base",
+        "no-authored",
+        "project-unreadable",
+        "global-unreadable",
+    ],
+)
+def test_native_pi_preserves_append_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    project: bool,
+    global_file: bool,
+    user_args: list[str],
+    mode: str,
+    approve: bool,
+    authored: bool,
+    unreadable: str | None,
+    expected: list[str],
+) -> None:
+    workspace = tmp_path / "workspace with spaces"
+    project_config = workspace / ".pi"
+    agent_dir = tmp_path / "active-agent"
+    project_config.mkdir(parents=True)
+    agent_dir.mkdir()
+    paths = {
+        "project": project_config / "APPEND_SYSTEM.md",
+        "global": agent_dir / "APPEND_SYSTEM.md",
+        "authored": tmp_path / "authored.md",
+    }
+    for name, present in (("project", project), ("global", global_file), ("authored", authored)):
+        if present:
+            paths[name].write_text(name)
+    if unreadable is not None:
+        original_stat = Path.stat
+
+        def stat(path: Path, *args: Any, **kwargs: Any) -> Any:
+            if path == paths[unreadable]:
+                raise PermissionError("Parent directory is not searchable")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    args = _build_pi_native_args(
+        terminal_launch_args=user_args,
+        extension_path=tmp_path / "extension.js",
+        session_dir=tmp_path,
+        external_session_id=None,
+        instructions_path=paths["authored"] if authored else None,
+        context_files=False,
+        system_prompt_mode=mode,
+        workspace=workspace,
+        agent_dir=agent_dir,
+        approve=approve,
+    )
+    assert [
+        args[index + 1] for index, arg in enumerate(args) if arg == "--append-system-prompt"
+    ] == [str(paths[value].resolve()) if value in paths else value for value in expected]
+    if user_args:
+        assert args[-len(user_args) :] == user_args
+    if mode == "replace":
+        assert args[args.index("--system-prompt") + 1] == str(paths["authored"])
+        assert args[-2:] == ["--system-prompt", "User base"]
+
+
+async def _launch_pi_terminal_args(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_override: str | None,
+    agent_spec: AgentSpec | None = None,
+) -> list[str]:
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+    import omnigent.harnesses.pi_native.main as pi_native
+
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    own_login_dir = tmp_path / "pi-own-login"
+    own_login_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(own_login_dir))
+
+    config = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or-testkey",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+    real_resolve = pi_native_credentials.resolve_pi_native_provider
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "resolve_pi_native_provider",
+        lambda **kwargs: real_resolve(config_loader=lambda: config, **kwargs),
+    )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+            model_override=model_override,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self, *, session_id: str, spec: Any, **_kwargs: Any
+        ) -> SessionResourceView:
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_pi_terminal(
+        _PI_SESSION_ID,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        agent_spec=agent_spec,
+    )
+    args = captured["spec"].args
+    assert isinstance(args, list)
+    return args
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_spec_pinned_own_login_reference_passes_through(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_pi_own_login_catalog(tmp_path / "pi-own-login", "openai-codex", ["gpt-5.6-sol"])
+
+    args = await _launch_pi_terminal_args(
+        tmp_path,
+        monkeypatch,
+        model_override=None,
+        agent_spec=AgentSpec(
+            spec_version=1,
+            name="pi",
+            executor=ExecutorSpec(model="openai-codex/gpt-5.6-sol"),
+        ),
+    )
+
+    assert "omnigent/openai-codex/gpt-5.6-sol" not in args
+    assert "--provider" not in args
+    assert "--model" in args
+    assert args[args.index("--model") + 1] == "openai-codex/gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_keeps_gateway_routing_for_slash_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    agent_dir = pi_native_bridge.prepare_bridge_dir(_PI_SESSION_ID) / "pi-agent"
+    agent_dir.mkdir()
+    append_file = agent_dir / "APPEND_SYSTEM.md"
+    append_file.write_text("Active global prompt")
+    own_login = tmp_path / "pi-own-login"
+    own_login.mkdir()
+    (own_login / "APPEND_SYSTEM.md").write_text("Inactive global prompt")
+    args = await _launch_pi_terminal_args(
+        tmp_path,
+        monkeypatch,
+        model_override="openai/gpt-4o-mini",
+        agent_spec=AgentSpec(
+            spec_version=1, name="pi", executor=ExecutorSpec(), instructions="Authored role"
+        ),
+    )
+    assert args[args.index("--append-system-prompt") + 1] == str(append_file)
+    assert str(own_login / "APPEND_SYSTEM.md") not in args
+
+    assert "--provider" in args
+    assert "--model" in args
+    assert args[args.index("--provider") + 1] == "omnigent"
+    assert args[args.index("--model") + 1] == "omnigent/openai/gpt-4o-mini"
 
 
 @pytest.mark.asyncio
@@ -1066,6 +1360,272 @@ async def test_auto_create_pi_terminal_inherits_agent_sandbox(
     assert captured["parent_os_env"] is agent_os_env
 
 
+class _TerminalLaunchCaptured(Exception):
+    """Raised by the fake registry once the terminal launch is recorded."""
+
+
+def _stub_goose_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.goose_native.bridge as bridge
+    import omnigent.harnesses.goose_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "goose-bridge")
+    monkeypatch.setattr(main, "resolve_goose_executable", lambda: "goose")
+
+
+def _stub_hermes_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.hermes_native.bridge as bridge
+    import omnigent.harnesses.hermes_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "hermes-bridge")
+    monkeypatch.setattr(main, "resolve_hermes_executable", lambda: "hermes")
+
+
+def _stub_kiro_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.kiro_native.main as main
+
+    monkeypatch.setattr(kiro_native_bridge, "_BRIDGE_ROOT", tmp_path / "kiro-bridge")
+    monkeypatch.setattr(main, "resolve_kiro_executable", lambda **_kwargs: "kiro-cli")
+
+    async def _fake_launch_config(**_kwargs: Any) -> _KiroNativeLaunchConfig:
+        return _KiroNativeLaunchConfig(
+            workspace=tmp_path / "workspace",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._kiro_native_launch_config", _fake_launch_config)
+
+
+def _stub_devin_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.devin_native.bridge as bridge
+    import omnigent.harnesses.devin_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "devin-bridge")
+    monkeypatch.setattr(main, "resolve_devin_executable", lambda **_kwargs: "devin")
+    monkeypatch.setattr(main, "resolve_devin_launch_model", lambda _model, _effort: None)
+
+
+def _stub_qwen_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.qwen_native.bridge as bridge
+    import omnigent.harnesses.qwen_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "qwen-bridge")
+    monkeypatch.setattr(main, "resolve_qwen_executable", lambda: "qwen")
+
+
+def _stub_kimi_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import omnigent.harnesses.kimi_native.bridge as bridge
+    import omnigent.harnesses.kimi_native.credentials as credentials
+    import omnigent.harnesses.kimi_native.main as main
+
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "kimi-bridge")
+    monkeypatch.setattr(main, "resolve_kimi_executable", lambda: "kimi")
+    monkeypatch.setattr(
+        credentials,
+        "build_kimi_session_home",
+        lambda session_home, **_kwargs: {"KIMI_CODE_HOME": str(session_home)},
+    )
+
+
+@pytest.mark.parametrize(
+    ("terminal_name", "builder_name", "stub_launch"),
+    [
+        ("goose", "_auto_create_goose_terminal", _stub_goose_launch),
+        ("hermes", "_auto_create_hermes_terminal", _stub_hermes_launch),
+        ("kiro", "_auto_create_kiro_terminal", _stub_kiro_launch),
+        ("devin", "_auto_create_devin_terminal", _stub_devin_launch),
+        ("qwen", "_auto_create_qwen_terminal", _stub_qwen_launch),
+        ("kimi", "_auto_create_kimi_terminal", _stub_kimi_launch),
+    ],
+    ids=["goose", "hermes", "kiro", "devin", "qwen", "kimi"],
+)
+@pytest.mark.asyncio
+async def test_auto_create_native_terminal_inherits_agent_sandbox(
+    terminal_name: str,
+    builder_name: str,
+    stub_launch: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Goose/hermes/kiro/devin/qwen/kimi auto-create honour the agent's ``os_env.sandbox``.
+
+    Same regression as the pi test above (#10262): these builders built the
+    terminal ``OSEnvSpec`` with no ``sandbox`` and passed no ``parent_os_env``,
+    so ``launch_required_terminal`` fell back to
+    ``_default_sandbox_for_platform`` (``linux_bwrap`` on Linux) and an agent
+    declaring ``os_env.sandbox.type: none`` failed to start on a host without
+    ``bwrap``.
+
+    The fake registry raises once it has recorded the launch, so the builders'
+    post-launch forwarder/relay startup never runs; only the launch spec is
+    under test.
+
+    :param terminal_name: Native terminal name, e.g. ``"hermes"``.
+    :param builder_name: ``omnigent.runner.app`` auto-create builder to call.
+    :param stub_launch: Stubs the builder's pre-launch dependencies.
+    :param tmp_path: Pytest-provided temporary directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runner import app as runner_app
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda **_kwargs: None)
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=workspace,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    stub_launch(tmp_path, monkeypatch)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        """Captures the launched terminal spec and parent os_env, then stops."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the spec + parent_os_env and end the builder here."""
+            del session_id, session_key, resource_role
+            captured["terminal_name"] = terminal_name
+            captured["spec"] = spec
+            captured["parent_os_env"] = parent_os_env
+            raise _TerminalLaunchCaptured
+
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name=f"{terminal_name}_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": f"{terminal_name}-native"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    builder = getattr(runner_app, builder_name)
+    with pytest.raises(_TerminalLaunchCaptured):
+        await builder(
+            "5f0c2d7e9a8b4c6d8e1f2a3b4c5d6e7f",
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=None,
+            agent_spec=agent_spec,
+        )
+
+    assert captured["terminal_name"] == terminal_name
+    launched_sandbox = captured["spec"].os_env.sandbox
+    assert launched_sandbox is not None, (
+        "auto-create dropped the agent's sandbox; launch_required_terminal will "
+        "fall back to _default_sandbox_for_platform (bwrap), overriding sandbox: none"
+    )
+    assert launched_sandbox.type == "none"
+    assert captured["parent_os_env"] is agent_os_env
+
+
+@pytest.mark.parametrize("terminal_name", ["goose", "hermes", "kiro", "qwen"])
+@pytest.mark.asyncio
+async def test_native_launch_arms_resolve_agent_spec_for_terminal(
+    terminal_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The create-session and ensure arms hand goose/hermes/kiro/qwen the agent spec.
+
+    The builders can only inherit ``os_env.sandbox`` (#10262) if the launch
+    context carries ``agent_spec``. Before the fix these four harnesses were
+    missing from the create-session ``_launch_resolve_spec`` arm in
+    ``omnigent.runner.app`` and from the ensure ``build_context`` arm in
+    ``omnigent.runner.resource_routes``, so ``ctx.agent_spec`` stayed ``None``
+    on both paths and the terminal fell back to the platform-default sandbox.
+
+    :param terminal_name: Native terminal name, e.g. ``"hermes"``.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    agent_os_env = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(type="none"),
+    )
+    native_spec = AgentSpec(
+        spec_version=1,
+        name=f"{terminal_name}_code",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": f"{terminal_name}-native"},
+        ),
+        os_env=agent_os_env,
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    launched_specs: list[Any] = []
+
+    async def _fake_launch(ctx: Any) -> SessionResourceView:
+        launched_specs.append(ctx.agent_spec)
+        return SessionResourceView(
+            id=f"terminal_{terminal_name}_main",
+            type="terminal",
+            session_id=ctx.session_id,
+            name=f"{terminal_name}:main",
+        )
+
+    monkeypatch.setattr(f"omnigent.runner.native._launch_{terminal_name}", _fake_launch)
+
+    session_id = "c4b1e6f2a9d84e0b8f3a7c5d2e1b9a60"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "9a3f0c1e7b2d4e6f8a0b1c2d3e4f5a6b"},
+        )
+        assert created.status_code == 201, created.text
+        # The fake launch registers no terminal, so the ensure arm builds again.
+        ensured = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={
+                "terminal": terminal_name,
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
+        )
+        assert ensured.status_code == 200, ensured.text
+
+    assert len(launched_specs) == 2, launched_specs
+    for launched_spec in launched_specs:
+        assert launched_spec is not None, "launch context carried no agent spec"
+        assert _agent_os_env_from_spec(launched_spec) is agent_os_env
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_envelope", [False, True], ids=["legacy", "envelope"])
 async def test_auto_create_claude_terminal_passes_session_effort(
@@ -1092,9 +1652,14 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     workspace = tmp_path / "workspace"
     (workspace / ".omnigent").mkdir(parents=True)
     (workspace / ".omnigent" / "config.yaml").write_text(
-        "harness:\n  claude-native:\n    command: workspace-claude\n"
+        "harness:\n  default: claude-native\n  claude-native:\n    command: workspace-claude\n"
     )
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: user-claude\n"
+    )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
 
@@ -1156,7 +1721,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
     args = captured["spec"].args
     assert captured["spec"].os_env.cwd == str(workspace)
-    assert captured["spec"].command == "workspace-claude"
+    assert captured["spec"].command == "user-claude"
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
@@ -2738,6 +3303,11 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
             "type": "session.status",
             "status": "failed",
             "error": error,
+            "failure_context": {
+                "failure_source": "native_terminal_start",
+                "failure_id": error_id,
+                "exception_type": "ImportError",
+            },
         },
     ]
     assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
@@ -3066,6 +3636,260 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     assert (
         patch_body.get("labels", {}).get(BRIDGE_ID_LABEL_KEY)
         == "b3e788af0ecd4516439ee859b8c74536-cleared"
+    )
+
+
+_RELAUNCHED_SESSION_ID = "6fe4feaa4dc772577c234c9f48c30dda"
+_SOURCE_BRIDGE_ID = "971d4249f0c874d2718c0ea35ed53ef5"
+
+
+class _LiveClaudeInstance:
+    """Minimal live terminal instance for the tmux-target publish."""
+
+    running = True
+    socket_path = "/tmp/fake-claude.sock"
+    tmux_target = "main"
+
+
+class _LiveClaudeTerminalRegistry:
+    """Returns the live instance for any (session, terminal, key) lookup."""
+
+    def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+        """Return the fake live instance."""
+        del conversation_id, terminal_name, session_key
+        return _LiveClaudeInstance()
+
+
+class _LiveClaudeResourceRegistry:
+    """Resource registry whose launched Claude pane is live."""
+
+    terminal_registry = _LiveClaudeTerminalRegistry()
+
+    async def launch_required_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Return a running terminal view."""
+        del spec, resource_role, parent_os_env
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name=f"{terminal_name}:{session_key}",
+            metadata={"terminal_name": terminal_name, "session_key": session_key, "running": True},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bridge_id_label", "moves"),
+    [(_SOURCE_BRIDGE_ID, True), (_RELAUNCHED_SESSION_ID, False)],
+    ids=["inherited_label", "own_label"],
+)
+async def test_auto_create_claude_terminal_rebinds_a_moved_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bridge_id_label: str,
+    moves: bool,
+) -> None:
+    """
+    A fresh pane for a session with an inherited bridge id moves it to its own dir.
+
+    A /clear or /fork replacement carries its source's bridge id label. A new
+    runner spawns the session's harness from that label, then launches the pane
+    in ``D(session_id)``. The launch must persist the label, since turns after the
+    init envelope expires read it from the server, and pass the move to
+    ``rebind_bridge`` so the harness is respawned in the new dir. A session
+    already on its own bridge id makes neither call.
+    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=_RELAUNCHED_SESSION_ID,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            workspace=str(workspace),
+            labels={BRIDGE_ID_LABEL_KEY: bridge_id_label},
+        ),
+    )
+    requests: list[httpx.Request] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    rebinds: list[tuple[str, str]] = []
+
+    async def _rebind(session_id: str, bridge_id: str) -> None:
+        rebinds.append((session_id, bridge_id))
+
+    async with httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle)
+    ) as client:
+        await _auto_create_claude_terminal(
+            _RELAUNCHED_SESSION_ID,
+            _LiveClaudeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=client,
+            session_init=envelope,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+            rebind_bridge=_rebind,
+        )
+
+    # The pane is advertised in the session's own dir either way.
+    assert (bridge_dir_for_bridge_id(_RELAUNCHED_SESSION_ID) / "tmux.json").exists()
+    assert envelope.snapshot.labels[BRIDGE_ID_LABEL_KEY] == _RELAUNCHED_SESSION_ID
+    label_patches = [
+        body["labels"]
+        for request in requests
+        if request.method == "PATCH"
+        and BRIDGE_ID_LABEL_KEY in (body := json.loads(request.content)).get("labels", {})
+    ]
+    if moves:
+        assert label_patches == [{BRIDGE_ID_LABEL_KEY: _RELAUNCHED_SESSION_ID}]
+        assert rebinds == [(_RELAUNCHED_SESSION_ID, _RELAUNCHED_SESSION_ID)]
+    else:
+        assert label_patches == []
+        assert rebinds == []
+
+
+@pytest.mark.asyncio
+async def test_relaunch_that_moves_the_bridge_respawns_the_harness_there(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The turn after a relaunch moved the Claude bridge spawns its harness in the new dir.
+
+    Session init spawns the harness from the inherited bridge id label before the
+    terminal launch moves the bridge. The runner's ``rebind_bridge`` must release
+    that harness and update the cached init labels, so the next turn's spawn env
+    names the dir the pane advertises in. Before, every web message waited 30 s
+    in the old dir and failed with "tmux target is not advertised yet".
+    """
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_DIR_ENV_VAR
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    agent_id = "b1428afa05a7169b76a73ae805a6f71f"
+    launches: list[str] = []
+
+    async def _moving_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        # The real launch moves a session off an inherited bridge id this way.
+        del resource_registry, publish_event
+        launches.append(session_id)
+        if len(launches) == 1:
+            await kwargs["rebind_bridge"](session_id, session_id)
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+        _moving_auto_create,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _RELAUNCHED_SESSION_ID,
+                "agent_id": agent_id,
+                "session_init": {
+                    "protocol_version": 2,
+                    "server_version": "0.19.0.dev0",
+                    "session_id": _RELAUNCHED_SESSION_ID,
+                    "agent_id": agent_id,
+                    "snapshot": {
+                        "created_at": 10,
+                        "updated_at": 11,
+                        "workspace": str(tmp_path),
+                        "labels": {BRIDGE_ID_LABEL_KEY: _SOURCE_BRIDGE_ID},
+                    },
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        # Init spawned the harness from the inherited label, then the launch
+        # released it.
+        assert pm.get_client_calls[0][2][BRIDGE_DIR_ENV_VAR] == str(
+            bridge_dir_for_bridge_id(_SOURCE_BRIDGE_ID)
+        )
+        assert pm.released == [_RELAUNCHED_SESSION_ID]
+
+        sent = await client.post(
+            f"/v1/sessions/{_RELAUNCHED_SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": agent_id,
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert sent.status_code == 202, sent.text
+        for _ in range(100):
+            if len(pm.get_client_calls) > 1:
+                break
+            await asyncio.sleep(0.02)
+
+    turn_spawns = [
+        env for _conv, harness, env in pm.get_client_calls[1:] if harness == "claude-native"
+    ]
+    assert turn_spawns, f"the turn never acquired its harness: {pm.get_client_calls!r}"
+    assert turn_spawns[0][BRIDGE_DIR_ENV_VAR] == str(
+        bridge_dir_for_bridge_id(_RELAUNCHED_SESSION_ID)
     )
 
 
@@ -4295,11 +5119,11 @@ class _RecordingCodexRegistry:
 
 
 @pytest.mark.asyncio
-async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    """A Codex TUI relaunch retains user launch settings after the runner cwd is gone."""
     from omnigent.runner.native.orchestration import (
         _CodexNativeLaunchConfig,
         _launch_codex_native_tui,
@@ -4309,6 +5133,11 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
     (workspace / ".omnigent").mkdir(parents=True)
     (workspace / ".omnigent" / "config.yaml").write_text(
         "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: user-codex\n    args: [--user-arg]\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
 
@@ -4348,8 +5177,8 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
     )
 
     spec = captured["spec"]
-    assert spec.command == "workspace-codex"
-    assert spec.args[0] == "--workspace-arg"
+    assert spec.command == "user-codex"
+    assert spec.args[0] == "--user-arg"
     assert spec.os_env.cwd == str(workspace)
 
 
@@ -4376,10 +5205,16 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     token_calls: list[int] = []
+    loop = asyncio.get_running_loop()
+    loop_progressed: list[bool] = []
 
     def _shared_auth_factory() -> str:
         token_calls.append(1)
+        released = threading.Event()
+        loop.call_soon_threadsafe(released.set)
+        loop_progressed.append(released.wait(timeout=1.0))
         return "shared-runner-token"
 
     def _unexpected_auth_resolution(*args: Any, **kwargs: Any) -> None:
@@ -4466,6 +5301,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
     assert config["ap_auth_headers"]["Authorization"] == "Bearer shared-runner-token"
     assert token_calls == [1]
+    assert loop_progressed == [True], "Claude hook token refresh blocked the runner event loop"
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
     # one-shot Authorization header) so a long-running host-spawned

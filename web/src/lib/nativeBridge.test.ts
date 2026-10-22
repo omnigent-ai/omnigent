@@ -5,13 +5,18 @@ import {
   getNativeNotificationMode,
   getNativeNotificationSettings,
   setNativeNotificationSettings,
+  previewNativeNotificationSound,
+  openNativeNotificationSettings,
+  checkDbcert,
   getServerPicker,
+  hasDbcertPreflightBridge,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
   isNativeShell,
   nativeNotify,
   onNativeNotificationModeChanged,
+  refreshDbcert,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -154,6 +159,58 @@ afterEach(() => {
   setAndroid(false);
 });
 
+describe("dbcert preflight bridge", () => {
+  it("forwards local-only renewal options without changing ordinary refresh calls", async () => {
+    const nativeRefresh = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      refreshDbcert: nativeRefresh,
+    };
+    expect(await refreshDbcert({ skipArcaSync: true })).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith({ skipArcaSync: true });
+    expect(await refreshDbcert()).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith();
+  });
+
+  it("detects older shells and browsers without the new method", async () => {
+    setElectron(false);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
+    setElectron(true);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
+  });
+
+  it.each(["checkDbcert", "refreshDbcert", "ensureDbcert"])(
+    "requires both checking and refresh, not just %s",
+    (method) => {
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        [method]: vi.fn(),
+      };
+      expect(hasDbcertPreflightBridge()).toBe(false);
+    },
+  );
+
+  it("passes through the native result and turns an IPC failure into a retryable error", async () => {
+    const nativeCheck = vi.fn().mockResolvedValue({ ok: true, valid: false });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      checkDbcert: nativeCheck,
+      refreshDbcert: vi.fn(),
+    };
+    expect(hasDbcertPreflightBridge()).toBe(true);
+    expect(await checkDbcert()).toEqual({ ok: true, valid: false });
+    nativeCheck.mockResolvedValueOnce({ ok: true, valid: true });
+    expect(await checkDbcert()).toEqual({ ok: true, valid: true });
+    nativeCheck.mockRejectedValue(new Error("IPC channel closed"));
+    expect(await checkDbcert()).toEqual({
+      ok: false,
+      error: "Couldn't check your laptop's dbcert. Try again.",
+    });
+  });
+});
+
 describe("isNativeShell / isElectronShell", () => {
   it("are false in a plain browser (no preload bridge)", () => {
     setElectron(false);
@@ -242,6 +299,29 @@ describe("applyMacElectronShellAttribute", () => {
 });
 
 describe("native notification mode", () => {
+  it("forwards settings and actions on a current desktop app", async () => {
+    setElectron(true);
+    const saved = {
+      mode: "always" as const,
+      soundEnabled: true,
+      soundName: "Ping",
+      sounds: ["Ping"],
+    };
+    const desktop = (window as unknown as { omnigentDesktop: Record<string, unknown> })
+      .omnigentDesktop;
+    desktop.getNotificationSettings = vi.fn().mockResolvedValue(saved);
+    desktop.setNotificationSettings = vi.fn().mockResolvedValue(saved);
+    desktop.previewNotificationSound = vi.fn().mockResolvedValue(undefined);
+    desktop.openNotificationSettings = vi.fn().mockResolvedValue(undefined);
+    await expect(getNativeNotificationSettings()).resolves.toEqual(saved);
+    await expect(setNativeNotificationSettings({ mode: "always" })).resolves.toEqual(saved);
+    expect(desktop.setNotificationSettings).toHaveBeenCalledWith({ mode: "always" });
+    await previewNativeNotificationSound("Ping");
+    expect(desktop.previewNotificationSound).toHaveBeenCalledWith("Ping");
+    await openNativeNotificationSettings();
+    expect(desktop.openNotificationSettings).toHaveBeenCalledOnce();
+  });
+
   it("reports unavailable settings on old shells and preserves save failures", async () => {
     setElectron(true);
     await expect(getNativeNotificationSettings()).resolves.toBeNull();

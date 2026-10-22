@@ -44,11 +44,35 @@ export function setSessionHost(sessionId: string, hostId: string | null | undefi
   notifySessionHostChanges();
 }
 
+// A managed create that chose its sandbox host's id records it in this label;
+// the row's host_id stays null until the host binds.
+export const REQUESTED_HOST_ID_LABEL = "omnigent.sandbox.requested_host_id";
+
+/**
+ * The host id a session routes by: its bound host, else the id its managed
+ * create chose for a sandbox host that hasn't bound yet.
+ */
+export function sessionRoutingHostId(
+  hostId: string | null | undefined,
+  labels: Record<string, string> | null | undefined,
+): string | null {
+  return hostId || labels?.[REQUESTED_HOST_ID_LABEL] || null;
+}
+
 // A sub-agent or side chat runs on its parent's runner, whose tunnel lives on the
 // replica keyed by the PARENT's host — the child row carries no host_id of its
 // own. Recording the parent link lets a child key its traffic by the nearest
 // host-bound ancestor instead of going keyless to the default replica.
 const _sessionParents = new Map<string, string>();
+
+/** Routing parent a child's labels encode (side chat or fork), or null if independent. */
+export function parentIdFromLabels(labels: Record<string, string> | undefined): string | null {
+  return (
+    labels?.["omnigent.side_chat.source_id"] ??
+    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null) ??
+    null
+  );
+}
 
 /**
  * Record (or clear) a session's parent so a hostless child resolves its host
@@ -59,11 +83,7 @@ export function setSessionParent(
   parentId: string | null | undefined,
   labels?: Record<string, string>,
 ): void {
-  // The fork-source fallback supports side chats created by older servers.
-  const routingParent =
-    parentId ??
-    labels?.["omnigent.side_chat.source_id"] ??
-    (labels?.["omnigent.side_chat"] === "1" ? labels["omnigent.fork.source_id"] : null);
+  const routingParent = parentId ?? parentIdFromLabels(labels);
   const nextParent = routingParent && routingParent !== sessionId ? routingParent : null;
   if ((_sessionParents.get(sessionId) ?? null) === nextParent) return;
   if (nextParent) {

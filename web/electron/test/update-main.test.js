@@ -13,6 +13,8 @@ function loadMainHarness({
   sessionCookies = [],
   forceDevUpdateConfig = false,
   dialogResponses = [{ response: 1, checkboxChecked: false }],
+  saveDialogResult = { canceled: false, filePath: "/tmp/desktop-diagnostics.jsonl" },
+  exportError = null,
   serverShutdown = () => Promise.resolve(),
   isPackaged = false,
   platform = process.platform,
@@ -33,6 +35,8 @@ function loadMainHarness({
     quitAndInstall: [],
     sent: [],
     showMessageBox: [],
+    showSaveDialog: [],
+    exportedDiagnostics: [],
     setApplicationMenu: [],
     aboutOpens: [],
     expiredAccess: [],
@@ -120,6 +124,10 @@ function loadMainHarness({
     Notification: { isSupported: () => false },
     clipboard: {},
     dialog: {
+      showSaveDialog: (...args) => {
+        calls.showSaveDialog.push(args);
+        return Promise.resolve(saveDialogResult);
+      },
       showMessageBox: (dialogWin, options) => {
         calls.showMessageBox.push({ win: dialogWin, options });
         return Promise.resolve(dialogResponses.shift() ?? { response: 1, checkboxChecked: false });
@@ -155,6 +163,15 @@ function loadMainHarness({
   };
 
   const localRequires = {
+    "./diagnostics": {
+      diagnostics: {
+        record: () => {},
+        exportTo: (destination) => {
+          if (exportError) throw exportError;
+          calls.exportedDiagnostics.push(destination);
+        },
+      },
+    },
     "./about_window": {
       createAboutWindow: () => ({
         open: (parent) => calls.aboutOpens.push(parent),
@@ -327,6 +344,70 @@ function findTopLevelMenu(menu, label) {
 }
 
 describe("macOS notification settings", () => {
+  it("preserves Always and broadcasts when only sound preferences change", (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      settings: { notification_mode: "always", notification_sound_enabled: true },
+    });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const save = harness.ipcHandlers.get("omnigent:set-notification-settings");
+    for (const patch of [{ soundEnabled: false }, { soundName: "Ping" }]) {
+      const before = harness.calls.sent.length;
+      const saved = save(harness.events.pinned, patch);
+      assert.equal(saved.mode, "always");
+      assert.equal(saved.soundEnabled, false);
+      assert.equal(harness.readSettings().notification_mode, "always");
+      assert.equal(harness.readSettings().notification_sound_enabled, false);
+      if (patch.soundName) {
+        assert.equal(saved.soundName, "Ping");
+        assert.equal(harness.readSettings().notification_sound_name, "Ping");
+      }
+      assert.equal(harness.calls.sent.length, before + 1);
+      assert.deepEqual(harness.calls.sent.at(-1), {
+        channel: "omnigent:notification-mode-changed",
+        payload: "always",
+      });
+    }
+  });
+
+  for (const platform of ["linux", "win32"]) {
+    it(`rejects macOS notification settings on ${platform}`, (t) => {
+      const harness = loadMainHarness({ platform });
+      t.after(harness.cleanup);
+      harness.api.registerIpc();
+      assert.equal(
+        harness.ipcHandlers.get("omnigent:get-notification-settings")(harness.events.pinned),
+        null,
+      );
+      for (const [channel, input] of [
+        ["set-notification-settings", { mode: "always" }],
+        ["preview-notification-sound", "Ping"],
+        ["open-notification-settings", undefined],
+      ]) {
+        assert.throws(
+          () => harness.ipcHandlers.get(`omnigent:${channel}`)(harness.events.pinned, input),
+          /connected macOS window/,
+        );
+      }
+      assert.deepEqual(harness.readSettings(), {});
+    });
+  }
+
+  it("rejects an unknown sound before previewing it", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    assert.throws(
+      () =>
+        harness.ipcHandlers.get("omnigent:preview-notification-sound")(
+          harness.events.pinned,
+          "missing",
+        ),
+      /Unknown notification sound/,
+    );
+  });
+
   it("uses Settings instead of a top-level Notifications menu", (t) => {
     const harness = loadMainHarness({ isPackaged: true, platform: "darwin" });
     t.after(harness.cleanup);
@@ -451,6 +532,45 @@ describe("in-app navigation menu actions", () => {
       channel: "omnigent:open-path",
       payload: "/",
     });
+  });
+});
+
+describe("diagnostics export menu wiring", () => {
+  it("exports from the production Server menu without renderer IPC", async (t) => {
+    const harness = loadMainHarness({ isPackaged: true, platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+    assert.equal(hasDebugMenu(menu), false);
+    assert.ok(harness.ipcHandlers.size > 0);
+    const item = findMenuItem(menu, "export_diagnostics");
+    assert.equal(item.label, "Export Diagnostics…");
+    item.click();
+    await flushPromises();
+    assert.equal(harness.calls.showSaveDialog.length, 1);
+    assert.deepEqual(harness.calls.exportedDiagnostics, ["/tmp/desktop-diagnostics.jsonl"]);
+    assert.equal(harness.ipcHandlers.has("omnigent:export-diagnostics"), false);
+  });
+
+  it("does not export when the save dialog is cancelled", async (t) => {
+    const harness = loadMainHarness({ saveDialogResult: { canceled: true } });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "export_diagnostics").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.exportedDiagnostics, []);
+  });
+
+  it("shows an error if the chosen destination cannot be written", async (t) => {
+    const harness = loadMainHarness({ exportError: new Error("Destination is not writable") });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "export_diagnostics").click();
+    await flushPromises();
+    assert.deepEqual(harness.calls.exportedDiagnostics, []);
+    assert.equal(harness.calls.showMessageBox.length, 1);
+    assert.equal(harness.calls.showMessageBox[0].options.title, "Could not export diagnostics");
   });
 });
 

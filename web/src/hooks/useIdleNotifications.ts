@@ -193,7 +193,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
       setNotificationModeReady(true);
     });
     void getNativeNotificationMode().then((mode) => {
-      // A menu event is newer than the startup read, even if its callback wins
+      // A Settings save event is newer than the startup read, even if its callback wins
       // the race by only a few milliseconds.
       if (!mounted || receivedModeChange) return;
       notificationModeRef.current = mode;

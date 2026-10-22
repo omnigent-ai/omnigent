@@ -67,7 +67,6 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -114,7 +113,6 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
-    _managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -160,6 +158,7 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
+    _start_managed_launch_task,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -197,6 +196,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -386,6 +386,16 @@ def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
+def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None:
+    """Return the runner's reason when the terminal has no way to select the requested model."""
+    if result is None or _runner_reply_field(result.body, "error") != (
+        "claude_native_model_unsupported"
+    ):
+        return None
+    detail = _runner_reply_field(result.body, "detail")
+    return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -407,6 +417,85 @@ def register_core_routes(
 ) -> None:
     """Register the core session routes on router."""
 
+    async def _check_initial_input(request: Request, event: SessionEventInput | None) -> None:
+        """Refuse a malformed first input before the session exists."""
+        from starlette.datastructures import UploadFile as FormUploadFile
+
+        form = (
+            await request.form()
+            if request.headers.get("content-type", "").startswith("multipart/form-data")
+            else None
+        )
+        files = form.getlist("initial_files") if form is not None else []
+        if event is None:
+            if files:
+                raise OmnigentError(
+                    "initial_files requires initial_input", code=ErrorCode.INVALID_INPUT
+                )
+            return
+        if getattr(request.app.state, "startup_inputs", None) is None:
+            raise OmnigentError(
+                "durable initial input is not configured", code=ErrorCode.INVALID_INPUT
+            )
+        if files and (
+            file_store is None or not all(isinstance(file, FormUploadFile) for file in files)
+        ):
+            raise OmnigentError(
+                "initial_files must contain uploaded files", code=ErrorCode.INVALID_INPUT
+            )
+
+    async def _accept_initial_input(
+        request: Request, session_id: str, event: SessionEventInput | None, user_id: str | None
+    ) -> None:
+        """Save a checked first input, deleting the new session if that fails."""
+        if event is None:
+            return
+        startup = request.app.state.startup_inputs
+        try:
+            form = (
+                await request.form()
+                if request.headers.get("content-type", "").startswith("multipart/form-data")
+                else None
+            )
+            blocks = []
+            for file in form.getlist("initial_files") if form is not None else []:
+                assert file_store is not None  # _check_initial_input refused files without one
+                resource = await request.app.state.initial_file_upload(request, session_id, file)
+                stored = await asyncio.to_thread(
+                    file_store.get, resource["id"], session_id=session_id
+                )
+                assert stored is not None
+                blocks.append(
+                    {
+                        "type": "input_image"
+                        if (stored.content_type or "").startswith("image/")
+                        else "input_file",
+                        "file_id": stored.id,
+                        "filename": stored.filename,
+                    }
+                )
+            if blocks:
+                event = event.model_copy(
+                    update={
+                        "data": {
+                            **event.data,
+                            "content": [*blocks, *event.data.get("content", [])],
+                        }
+                    }
+                )
+            await startup.enqueue(session_id, event, user_id=user_id, headers=request.headers)
+        except Exception:
+            # The create fails, so leave no session (or uploaded file) for a retry
+            # to duplicate.
+            if file_store is not None:
+                blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+                if artifact_store is not None:
+                    for blob_key in blob_keys:
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(artifact_store.delete, blob_key)
+            await conversation_store.delete_conversation(session_id)
+            raise
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -415,6 +504,7 @@ def register_core_routes(
         user_id: str | None,
         sandbox_provider: str | None,
         workspaces: list[str],
+        requested_host_id: str | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -448,6 +538,9 @@ def register_core_routes(
             parallel; empty for an empty sandbox. One repo becomes the
             session's working directory; several are cloned as siblings
             and the working directory is the parent that holds them.
+        :param requested_host_id: Host id the caller chose for the sandbox
+            host (already checked against existing hosts),
+            or ``None`` to let the launch mint one.
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
@@ -462,6 +555,7 @@ def register_core_routes(
             )
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
+            REQUESTED_HOST_ID_LABEL_KEY,
             managed_repo_labels,
             parse_repo_workspace,
         )
@@ -491,43 +585,95 @@ def register_core_routes(
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
         repos = [parse_repo_workspace(w) for w in workspaces]
+        managed_labels: dict[str, str] = {}
+        if requested_host_id is not None:
+            managed_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
         if workspaces:
             # The session row's workspace is overwritten with the CLONED path at
             # bind time; record the raw request value(s) so a sandbox relaunch
             # can re-clone the same repositories. Stored one label per repo (not
             # a single joined value) so the 256-char label-value cap can't
             # silently truncate the list and drop repos on relaunch.
+            managed_labels.update(managed_repo_labels(workspaces))
+        if managed_labels:
             await asyncio.to_thread(
                 conversation_store.set_labels,
                 session_id,
-                managed_repo_labels(workspaces),
+                managed_labels,
+            )
+        if getattr(request.app.state, "startup_inputs", None) is not None:
+            from omnigent.server.startup_inputs import STARTUP_LABEL
+
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
             )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
         # session page immediately after this 201) already carries the
-        # "provisioning" stage.
-        _publish_sandbox_status(session_id, "provisioning")
-        launch_task = asyncio.create_task(
-            _run_managed_launch(
-                session_id=session_id,
-                # On auth-disabled servers user_id is None; the sandbox
-                # host registers under the reserved local owner.
-                owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                sandbox_config=sandbox_config,
-                repos=repos,
-                tracker=managed_launches,
-                conversation_store=conversation_store,
-                host_store=host_store_for_managed,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                provider=sandbox_provider,
-                agent_store=agent_store,
-                agent_id=agent_id,
-            )
+        # "provisioning" stage and the provider being launched.
+        _publish_sandbox_status(
+            session_id,
+            "provisioning",
+            provider=sandbox_provider or sandbox_config.default.provider,
         )
-        _managed_launch_tasks.add(launch_task)
-        launch_task.add_done_callback(_managed_launch_tasks.discard)
+        launch = _run_managed_launch(
+            session_id=session_id,
+            # On auth-disabled servers user_id is None; the sandbox
+            # host registers under the reserved local owner.
+            owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=managed_launches,
+            conversation_store=conversation_store,
+            host_store=host_store_for_managed,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            provider=sandbox_provider,
+            agent_store=agent_store,
+            agent_id=agent_id,
+            host_id=requested_host_id,
+        )
+        _start_managed_launch_task(
+            session_id,
+            launch,
+            conversation_store=conversation_store,
+            tracker=managed_launches,
+            startup=getattr(request.app.state, "startup_inputs", None),
+        )
+
+    async def _check_requested_host_id(
+        request: Request, requested_host_id: str, user_id: str | None
+    ) -> None:
+        """
+        Reject a caller-chosen managed host id the launch could not register.
+
+        Not an idempotency key: the host row is written by the background
+        launch, so a retry could not find the session it would replay.
+
+        :param request: The originating request (for ``app.state`` lookups).
+        :param requested_host_id: The create's ``requested_host_id``.
+        :param user_id: The caller, who will own the host.
+        :raises OmnigentError: ``ALREADY_EXISTS`` if a host already has the id,
+            or one of the caller's hosts already has its derived name.
+        """
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.server.managed_hosts import managed_host_name
+
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_store is None:
+            return
+        name = managed_host_name(requested_host_id)
+        if await asyncio.to_thread(
+            host_store.host_identity_taken,
+            host_id=requested_host_id,
+            user_id=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            name=name,
+        ):
+            raise OmnigentError(
+                f"host {requested_host_id} or its name {name} is already in use",
+                code=ErrorCode.ALREADY_EXISTS,
+            )
 
     async def _bind_and_launch_on_caller_host(
         request: Request,
@@ -659,6 +805,8 @@ def register_core_routes(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
@@ -667,7 +815,7 @@ def register_core_routes(
             launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             launch_result = {
                 "status": "failed",
                 "error": (
@@ -743,7 +891,8 @@ def register_core_routes(
         """
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-        if content_type == "multipart/form-data":
+        form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
+        if form is not None and (form.get("bundle") is not None or "initial_files" not in form):
             result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
@@ -751,8 +900,14 @@ def register_core_routes(
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             return result
 
+        if form is not None and not isinstance(form.get("metadata"), str):
+            raise HTTPException(status_code=422, detail=[_multipart_missing_detail("metadata")])
         try:
-            payload = await request.json()
+            payload = (
+                json.loads(str(form.get("metadata", "{}")))
+                if form is not None
+                else await request.json()
+            )
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -782,6 +937,11 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        # Checked before the session exists so a rejected create leaves nothing
+        # behind.
+        await _check_initial_input(request, body.initial_input)
+        if body.requested_host_id is not None:
+            await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -885,10 +1045,7 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
-        # Push the new session to this user's other open tabs (see the
-        # multipart path above for the rationale).
-        _announce_session_added(user_id, resp.id)
-
+        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The
@@ -899,15 +1056,24 @@ def register_core_routes(
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
         launch_host_id = body.host_id
-        if body.host_type == "managed" and resp.runner_id is None:
-            await _schedule_managed_launch(
-                request,
-                session_id=resp.id,
-                agent_id=conv.agent_id if conv is not None else None,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=body.managed_repo_workspaces(),
-            )
+        try:
+            if body.host_type == "managed" and resp.runner_id is None:
+                await _schedule_managed_launch(
+                    request,
+                    session_id=resp.id,
+                    agent_id=conv.agent_id if conv is not None else None,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=body.managed_repo_workspaces(),
+                    requested_host_id=body.requested_host_id,
+                )
+        finally:
+            # Push the new session to this user's other open tabs (see the
+            # multipart path above for the rationale) once its managed labels
+            # are written, so a tab that lists it on this push sees the row the
+            # create returns. Still pushed when the managed guard fails: the
+            # owned row stays visible either way (see the grant above).
+            _announce_session_added(user_id, resp.id)
 
         # Host launch: if a host is targeted (caller-supplied or
         # managed) and no runner is bound yet, authorize (caller must
@@ -1006,6 +1172,7 @@ def register_core_routes(
             project_store=project_store,
         )
         parsed_metadata = project_resolution.body
+        await _check_initial_input(request, parsed_metadata.initial_input)
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -1032,7 +1199,7 @@ def register_core_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
 
         if parsed_metadata.mcp_registry_services:
@@ -1146,6 +1313,9 @@ def register_core_routes(
                 await asyncio.to_thread(
                     permission_store.grant, user_id, result.session_id, LEVEL_OWNER
                 )
+        await _accept_initial_input(
+            request, result.session_id, parsed_metadata.initial_input, user_id
+        )
         _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as
@@ -2368,7 +2538,8 @@ def register_core_routes(
         #   session may pin it — including a read-only collaborator on a session
         #   shared with them. Only when the pinned label is the request's ONLY
         #   mutation.
-        # * OWNER — archiving/unarchiving or filing into a project. Both are
+        # * OWNER — launch arguments and permission mode control host execution.
+        #   Archiving/unarchiving and filing into a project are also
         #   owner-only: projects are owner-private (an editor must not move a
         #   session between them), and archive pairs with a client-driven,
         #   owner-gated stop (an editor must not hide/stop a session they can't
@@ -2385,13 +2556,19 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_launch_args = (
+            body.terminal_launch_args is not None
+            or body.permission_mode is not None
+            or body.approval_mode is not None
+            or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
+        )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project:
+        elif body.archived is not None or set_project or set_launch_args:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -3004,13 +3181,20 @@ def register_core_routes(
                 unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
                     _model_forward
                 )
-                forward_failed = not unconfirmed and _surface_model_change_forward_failure(
-                    session_id,
-                    updated.model_override,
-                    _model_forward,
+                # A model the terminal can't select is a bad request, not a failed session.
+                unsupported = _unsupported_model_detail(_model_forward)
+                forward_failed = (
+                    unsupported is None
+                    and not unconfirmed
+                    and _surface_model_change_forward_failure(
+                        session_id,
+                        updated.model_override,
+                        _model_forward,
+                    )
                 )
                 if conv is not None and (
-                    (wake_for_model_change and (_model_forward is None or forward_failed))
+                    unsupported is not None
+                    or (wake_for_model_change and (_model_forward is None or forward_failed))
                     or (forward_failed and configured_snapshot(conv.inference_snapshot))
                 ):
                     if combined_model_forward:
@@ -3034,6 +3218,8 @@ def register_core_routes(
                         model_override=conv.model_override,
                         _unset_model_override=conv.model_override is None,
                     )
+                    if unsupported is not None:
+                        raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
                         "The previous selection has been restored.",
@@ -3296,7 +3482,8 @@ def register_core_routes(
         exists — and the sandbox is registered to the FORKING caller, not
         to the source session's owner. The fork's workspace is the
         repository named by ``body.workspace``, or the one the source
-        recorded when that field is omitted.
+        recorded when that field is omitted. ``body.host_id`` names the
+        fork's new sandbox host, as on a managed create.
 
         :param request: The incoming FastAPI request (for auth).
         :param source_id: Session/conversation identifier of the
@@ -3310,7 +3497,8 @@ def register_core_routes(
             owns a session-scoped ``body.agent_id``; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
-            for a sandbox this server has not configured; 410 if the
+            for a sandbox this server has not configured; 409 if
+            ``body.host_id`` is already in use; 410 if the
             source's agent was removed or a required bundle copy finds
             its source missing.
         """
@@ -3557,6 +3745,14 @@ def register_core_routes(
             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
             extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
 
+        # A managed fork's chosen sandbox host id is born with the row, as on a
+        # create: the caller routes the fork by it until its host binds, so no
+        # read of the row may miss it. The source's own id was dropped above.
+        if body.host_type == "managed" and body.host_id is not None:
+            from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
+            extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.host_id
+
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
         # runner carries history into the native harness. Same-family: clone
@@ -3682,10 +3878,12 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.inner.native_attachments import uses_filesystem_delivery
 
             filesystem_sources = [
-                stored for stored in fork_source_files if requires_filesystem(stored.filename)
+                stored
+                for stored in fork_source_files
+                if uses_filesystem_delivery(stored.filename, stored.source_metadata)
             ]
             if filesystem_sources:
                 await asyncio.to_thread(
@@ -3695,6 +3893,9 @@ def register_core_routes(
                     file_store=file_store,
                     sizes=[stored.bytes for stored in filesystem_sources],
                 )
+
+        if body.host_id is not None:
+            await _check_requested_host_id(request, body.host_id, user_id)
 
         # Copied last, after every validation above; the copy row itself is
         # inserted inside fork_conversation's transaction.
@@ -3819,13 +4020,6 @@ def register_core_routes(
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
-        # Push the forked session to this user's other open tabs — but NOT a
-        # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
-        # row, so announcing it would leak it into every open sidebar (the
-        # real-time path bypasses the list-endpoint's side-chat filter).
-        if not body.side_chat:
-            _announce_session_added(user_id, new_conv.id)
-
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
         # Managed host: schedule the fork's own BACKGROUND sandbox provision
@@ -3835,20 +4029,30 @@ def register_core_routes(
         # ALL of the repositories the source recorded (read off the SOURCE,
         # since a fork never inherits the labels itself), so cloning a
         # multi-repo sandbox session lands the fork with every repo.
-        if body.host_type == "managed":
-            fork_workspaces = (
-                ([body.workspace] if body.workspace is not None else [])
-                if workspace_set
-                else read_managed_repo_workspaces(source.labels)
-            )
-            await _schedule_managed_launch(
-                request,
-                session_id=new_conv.id,
-                agent_id=new_conv.agent_id,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=fork_workspaces,
-            )
+        try:
+            if body.host_type == "managed":
+                fork_workspaces = (
+                    ([body.workspace] if body.workspace is not None else [])
+                    if workspace_set
+                    else read_managed_repo_workspaces(source.labels)
+                )
+                await _schedule_managed_launch(
+                    request,
+                    session_id=new_conv.id,
+                    agent_id=new_conv.agent_id,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=fork_workspaces,
+                    requested_host_id=body.host_id,
+                )
+        finally:
+            # Push the forked session to this user's other open tabs — but NOT a
+            # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
+            # row, so announcing it would leak it into every open sidebar (the
+            # real-time path bypasses the list-endpoint's side-chat filter).
+            # Pushed once its managed labels are written, as on a create.
+            if not body.side_chat:
+                _announce_session_added(user_id, new_conv.id)
         # Default-public grant only after the managed launch was accepted (see
         # the create paths). A side chat is a private scratch fork of the
         # caller's own view.

@@ -36,6 +36,10 @@ vi.mock("@tiptap/extension-list", () => ({
   TaskList: {},
   TaskItem: { configure: vi.fn().mockReturnValue({}) },
 }));
+vi.mock("./tiptapBoundedTokenizers", () => ({
+  BoundedTaskList: {},
+  BoundedTable: { configure: vi.fn().mockReturnValue({}) },
+}));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({

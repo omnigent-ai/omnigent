@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -477,6 +478,7 @@ def _build_branding_app(
     label: str,
     *,
     server_config: dict[str, object] | None = None,
+    **create_app_kwargs: Any,
 ) -> FastAPI:
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 
@@ -491,7 +493,86 @@ def _build_branding_app(
             cache_dir=tmp_path / f"cache-{label}",
         ),
         server_config=server_config,
+        **create_app_kwargs,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_config", "create_app_kwargs", "expected"),
+    [
+        (
+            {},
+            {},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": False,
+            },
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {},
+            {"extensions": [".gz"], "all_types": False},
+        ),
+        # A deployment-supplied value or callable takes precedence over the config file.
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": [".har"]},
+            {"extensions": [".har"], "all_types": False},
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": lambda: ["*"]},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": True,
+            },
+        ),
+    ],
+)
+async def test_info_reports_the_filesystem_attachment_policy(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    create_app_kwargs: dict[str, Any],
+    expected: dict[str, object],
+) -> None:
+    """Clients read which uploads become files from /v1/info."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        server_config=server_config,
+        **create_app_kwargs,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        info = (await client.get("/v1/info")).json()
+
+    assert info["filesystem_attachments"] == expected
+
+
+async def test_info_evaluates_a_callable_policy_per_request(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """A callable policy can change while the server runs, e.g. behind a feature flag."""
+    policies = iter([[".gz"], ["*"]])
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        filesystem_attachment_allowed_extensions=lambda: next(policies),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = (await client.get("/v1/info")).json()["filesystem_attachments"]
+        second = (await client.get("/v1/info")).json()["filesystem_attachments"]
+
+    assert first == {"extensions": [".gz"], "all_types": False}
+    assert second["all_types"] is True
 
 
 def test_session_title_instructions_are_wired_into_coordinator(
@@ -2403,6 +2484,237 @@ async def _reconnect_with_initialize(
     with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
         await captured["callback"](runner_id, connection)  # type: ignore[operator]
     return [r for r in caplog.records if r.name == "omnigent.server.app"]
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle trees attach on reconnect without starting runner runtimes."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions.orchestration import (
+        _ensure_runner_session_initialized,
+    )
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_idle_reconnect_test"
+    idle_id, archived_id, active_parent_id, orphan_parent_id = _bind_sessions(
+        db_uri, runner_id, count=4
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    idle = store.get_conversation(idle_id)
+    archived = store.get_conversation(archived_id)
+    active_parent = store.get_conversation(active_parent_id)
+    orphan_parent = store.get_conversation(orphan_parent_id)
+    assert idle is not None and archived is not None
+    assert active_parent is not None and orphan_parent is not None
+    store.set_session_live_status(idle.id, "idle")
+    store.set_session_live_status(archived.id, "running")
+    store.update_conversation(archived.id, archived=True)
+    store.set_session_live_status(active_parent.id, "idle")
+    active_child = store.create_conversation(
+        agent_id=active_parent.agent_id,
+        runner_id=runner_id,
+        kind="sub_agent",
+        parent_conversation_id=active_parent.id,
+    )
+    store.set_session_live_status(active_child.id, "running")
+    store.set_session_live_status(orphan_parent.id, "idle")
+    idle_child = store.create_conversation(
+        agent_id=orphan_parent.agent_id,
+        runner_id=runner_id,
+        kind="sub_agent",
+        parent_conversation_id=orphan_parent.id,
+    )
+    store.set_session_live_status(idle_child.id, "idle")
+    orphan = store.create_conversation(
+        agent_id=orphan_parent.agent_id,
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=idle_child.id,
+    )
+    store.set_session_live_status(orphan.id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    initialized: list[tuple[str, bool]] = []
+
+    async def _initialize(conv: Conversation, *_a: object, **kwargs: object) -> httpx.Response:
+        initialized.append((conv.id, bool(kwargs.get("suppress_recovery_turn"))))
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert set(initialized) == {
+        (active_parent.id, False),
+        (orphan_parent.id, False),
+        (active_child.id, False),
+        (idle_child.id, True),
+        (orphan.id, False),
+    }
+    initialized_ids = [session_id for session_id, _ in initialized]
+    assert initialized_ids.index(active_parent.id) < initialized_ids.index(active_child.id)
+    assert initialized_ids.index(orphan_parent.id) < initialized_ids.index(idle_child.id)
+    assert initialized_ids.index(idle_child.id) < initialized_ids.index(orphan.id)
+    assert store.get_conversation(orphan.id).runner_id == runner_id  # type: ignore[union-attr]
+
+    refreshed_idle = store.get_conversation(idle.id)
+    assert refreshed_idle is not None
+    initialized_on_demand = await _ensure_runner_session_initialized(
+        idle.id,
+        refreshed_idle,
+        routed.client,
+        store,
+        app.state.runner_session_initializer,
+        suppress_recovery_turn=True,
+        require_success=True,
+    )
+
+    assert initialized_on_demand is True
+    assert initialized[-1] == (idle.id, True)
+    assert all(session_id != archived.id for session_id, _ in initialized)
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reconnect logs runner_session_init_deferred event with reason for idle/archived sessions."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_deferred_event_test"
+    idle_id, archived_id, active_id = _bind_sessions(db_uri, runner_id, count=3)
+    store = SqlAlchemyConversationStore(db_uri)
+    idle = store.get_conversation(idle_id)
+    archived = store.get_conversation(archived_id)
+    active = store.get_conversation(active_id)
+    assert idle is not None and archived is not None and active is not None
+    store.set_session_live_status(idle.id, "idle")
+    store.set_session_live_status(archived.id, "running")
+    store.update_conversation(archived.id, archived=True)
+    store.set_session_live_status(active.id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    deferred_events = [
+        r
+        for r in caplog.records
+        if r.name == "omnigent.server.app"
+        and getattr(r, "event_name", "") == "runner_session_init_deferred"
+    ]
+    # Check we have events for idle and archived sessions, but not active
+    assert len(deferred_events) == 2
+    messages = {r.getMessage() for r in deferred_events}
+    # Verify both idle and archived session IDs appear in the logs with the right reason
+    assert any(f"session={idle.id}" in msg and "reason=idle" in msg for msg in messages)
+    assert any(f"session={archived.id}" in msg and "reason=archived" in msg for msg in messages)
+    # Verify active session does not have a deferred event
+    assert not any(f"session={active.id}" in msg for msg in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
+async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_read: str,
+) -> None:
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_scan_failure_test"
+    root_id, other_id = _bind_sessions(db_uri, runner_id, count=2)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(root_id, "idle")
+    store.set_session_live_status(other_id, "idle")
+    orphan = store.create_conversation(
+        agent_id=store.get_conversation(root_id).agent_id,  # type: ignore[union-attr]
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=root_id,
+    )
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    attached: list[str] = []
+    initialized: list[str] = []
+    monkeypatch.setattr(
+        sessions_routes,
+        "_ensure_runner_relay",
+        lambda session_id, *_a, **_k: attached.append(session_id),
+    )
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        initialized.append(conv.id)
+        return httpx.Response(201, request=httpx.Request("POST", "http://runner/v1/sessions"))
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    original = getattr(SqlAlchemyConversationStore, failed_read)
+    failed = False
+
+    def _fail_once(self: SqlAlchemyConversationStore, *args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if not failed and (
+            failed_read != "get_conversations"
+            or (isinstance(args[0], list) and orphan.id in args[0])
+        ):
+            failed = True
+            raise RuntimeError("child scan unavailable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, failed_read, _fail_once)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert failed
+    assert set(attached) == {root_id, other_id}
+    assert set(initialized) == {root_id, other_id}
 
 
 @pytest.mark.asyncio

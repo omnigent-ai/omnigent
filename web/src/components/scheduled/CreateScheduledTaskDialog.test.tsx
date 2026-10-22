@@ -267,6 +267,7 @@ describe("CreateScheduledTaskDialog validation", () => {
   it("keeps submit disabled until name + prompt are set (agent defaults to the first)", () => {
     renderDialog();
     const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(submit).toHaveTextContent("Create automation");
     // Agent is never blank — the picker resolves a default (first agent) — so
     // only name + prompt gate submit.
     expect(submit).toBeDisabled();
@@ -512,6 +513,9 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
 
   it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {
     renderWithSandboxes();
+    expect(
+      screen.getByText("Leave unset to run on your connected host when the automation fires."),
+    ).toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
     // Sandbox mode swaps the helper text to the fresh-sandbox copy (no separate
