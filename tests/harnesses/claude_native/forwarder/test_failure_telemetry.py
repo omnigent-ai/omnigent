@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge, forwarder
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.native.failure_telemetry import FailureContext
@@ -694,6 +695,31 @@ def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Pat
     _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
     assert items[0].data["content"][0]["text"].startswith("Context limit reached")
     assert items[0].failure_context["native_error_message"] == "Prompt is too long"
+
+
+def test_budget_refusal_has_an_informational_budget_observation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "session.jsonl"
+    detail = 'Please run /login · API Error: 403 Budget "example" has reached its limit.'
+    _append_transcript(
+        path,
+        {**_MAIN_API_ERROR, "message": {"role": "assistant", "content": detail}},
+    )
+    _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
+
+    with caplog.at_level(logging.INFO, logger=forwarder.__name__):
+        forwarder._log_transcript_failure("conv_synthetic", items[0])
+
+    (record,) = [r for r in caplog.records if r.name == forwarder.__name__]
+    row = record_to_row(record, source="runner")
+    assert row["event_name"] == "native_budget_exhausted"
+    assert row["level"] == "INFO"
+    assert row["attributes"]["code"] == "budget_exhausted"
+    assert row["attributes"]["error_category"] == "user"
+    assert row["attributes"]["error_impact"] == "blocking"
+    assert row["attributes"]["native_error_message"] == detail
+    assert row["attributes"]["native_error_category"] == "authentication_failed"
 
 
 @pytest.mark.parametrize(

@@ -43,6 +43,7 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.native.input_diagnostics import input_attributes
+from omnigent.runner.launch_failure import budget_exhaustion_log_attributes
 from omnigent.runtime import disconnect_outcome, inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -233,6 +234,7 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
             attrs["error_code"] = error["code"]
         if error.get("source") is not None:
             attrs["error_source"] = error["source"]
+        attrs.update(budget_exhaustion_log_attributes(error.get("code"), None))
     if event.get("type") == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
         attrs["error_source"] = event["source"]
     return attrs
@@ -252,9 +254,14 @@ def _log_sse_event(conversation_id: str, event: dict[str, Any]) -> None:
         event_type = event.get("type")
         if not isinstance(event_type, str) or event_type in _SSE_SKIP_TYPES:
             return
-        level = logging.WARNING if event_type in _SSE_WARN_TYPES else logging.INFO
         extra = debug_event(event_type, session_id=conversation_id)
-        extra["attributes"] = _sse_safe_attributes(event)
+        attributes = _sse_safe_attributes(event)
+        extra["attributes"] = attributes
+        level = (
+            logging.WARNING
+            if event_type in _SSE_WARN_TYPES and attributes.get("code") != "budget_exhausted"
+            else logging.INFO
+        )
         sse_event_logger().log(level, "sse %s", event_type, extra=extra)
         # Turn-outcome audit rows are table-only: emit them only when the ZeroBus
         # sink is on, not merely when the file sink is (the audit logger has no
@@ -285,6 +292,7 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
             error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+            attributes.update(budget_exhaustion_log_attributes(error["code"], None))
         if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
             attributes["error_source"] = event["source"]
         impact = _TURN_OUTCOME_IMPACT.get(outcome)
@@ -292,8 +300,17 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
             attributes["error_impact"] = impact.value
             # A terminal turn outcome is, by definition, in the turn phase.
             attributes["error_phase"] = ErrorPhase.TURN.value
-    level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
-    audit_event_logger().log(level, "turn %s", outcome, extra=extra)
+    budget_exhausted = (
+        isinstance(attributes, dict) and attributes.get("code") == "budget_exhausted"
+    )
+    level = (
+        logging.WARNING
+        if outcome in ("failed", "incomplete") and not budget_exhausted
+        else logging.INFO
+    )
+    audit_event_logger().log(
+        level, "turn %s", "blocked by budget" if budget_exhausted else outcome, extra=extra
+    )
 
 
 def publish(conversation_id: str, event: dict[str, Any]) -> int:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import threading
 import uuid
@@ -29,6 +30,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.datastructures import Headers
 
+from omnigent.debug_logging import record_to_row
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     MessageData,
@@ -5781,11 +5783,20 @@ _CODEX_LOGIN_EXPIRED_DETAIL = (
             False,
             _CODEX_COMPACTION_MODELS,
         ),
+        (
+            'Please run /login · API Error: 403 Budget "example-budget" has reached its limit.',
+            "budget_exhausted",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
     ],
 )
 async def test_native_failures_are_coded_live_and_after_reload(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     wire_output: bool,
     detail: str,
     expected_code: str | None,
@@ -5795,6 +5806,7 @@ async def test_native_failures_are_coded_live_and_after_reload(
     status_extra: dict[str, str],
 ) -> None:
     """Native failures keep their diagnosis and raw detail through status and persistence."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
     published: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
@@ -5837,6 +5849,26 @@ async def test_native_failures_are_coded_live_and_after_reload(
         json={"type": "external_session_status", "data": data},
     )
     assert status_resp.status_code == 202, status_resp.text
+    budget_exhausted = expected_code == "budget_exhausted" or (
+        expected_code == "codex_compaction_model_failed"
+        and detail == _CODEX_COMPACTION_BUDGET_DETAIL
+    )
+    (record,) = [
+        record
+        for record in caplog.records
+        if getattr(record, "session_id", None) == session_id
+        and getattr(record, "event_name", None)
+        in {"session_turn_failed", "session_turn_budget_exhausted"}
+    ]
+    row = record_to_row(record, source="server")
+    assert row["event_name"] == (
+        "session_turn_budget_exhausted" if budget_exhausted else "session_turn_failed"
+    )
+    assert row["level"] == ("INFO" if budget_exhausted else "ERROR")
+    if budget_exhausted:
+        assert row["attributes"]["code"] == "budget_exhausted"
+        assert row["attributes"]["error_category"] == "user"
+        assert row["attributes"]["error_impact"] == "blocking"
     failed_events = [event for event in published if event.get("status") == "failed"]
     assert len(failed_events) == 1
     error = failed_events[0]["error"]

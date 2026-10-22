@@ -20,11 +20,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
+from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
     "FailureDiagnosis",
+    "budget_exhaustion_log_attributes",
     "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
@@ -291,6 +292,21 @@ def classify_native_turn_error(code: str, message: str) -> str:
     ):
         return "transient_upstream_error"
     return code
+
+
+def budget_exhaustion_log_attributes(code: object, message: object) -> dict[str, str]:
+    """Attribute a recognized spending-limit refusal without treating it as a fault."""
+    if code != "budget_exhausted" and (
+        not isinstance(message, str)
+        or classify_native_turn_error("native_turn_error", message) != "budget_exhausted"
+    ):
+        return {}
+    return {
+        "code": "budget_exhausted",
+        "error_category": ErrorCategory.USER.value,
+        "error_impact": ErrorImpact.BLOCKING.value,
+        "error_phase": ErrorPhase.TURN.value,
+    }
 
 
 def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:

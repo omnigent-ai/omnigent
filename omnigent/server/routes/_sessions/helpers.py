@@ -96,7 +96,11 @@ from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
-from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
+from omnigent.runner.launch_failure import (
+    budget_exhaustion_log_attributes,
+    classify_native_turn_error,
+    diagnose_model_unavailable,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
@@ -4936,10 +4940,9 @@ def _publish_status(
     :param response_id: Optional response id for terminal-backed status
         edges, e.g. ``"codex_turn_abc123"``.
     :param failure_origin: Stable slug naming the publish path behind a
-        ``"failed"`` edge, e.g. ``"runner_disconnected_mid_turn"``. Every
-        server-side failure logs one ERROR from here, so without it the
-        dozen unrelated causes that reach this function are one
-        undifferentiated signature. Ignored for non-failed edges.
+        ``"failed"`` edge, e.g. ``"runner_disconnected_mid_turn"``. It
+        distinguishes the causes sharing this log boundary. Recognized budget
+        refusals log at INFO; other failures log at ERROR. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
         the failure-log boundary. Malformed values cannot reject the status edge.
     """
@@ -4990,34 +4993,32 @@ def _publish_status(
     elif status == "idle":
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
-        # Canonical server-side broken-turn signal: every server-originated
-        # failed turn (runner disconnect mid-turn, setup/dispatch failure,
-        # rejection) funnels through here, so log once at ERROR for the
-        # dashboard. Relayed runner failures arrive via session_stream and are
-        # already logged runner-side, so they don't reach this path.
-        #
-        # Because every cause shares this one line, the row has to carry which
-        # path published it: the origin slug, the failure code, and the status
-        # the session was leaving. The message keeps its "session turn failed
-        # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
-        _logger.error(
-            "session turn failed for %s (origin=%s code=%s prev=%s): %s",
+        budget_attributes = budget_exhaustion_log_attributes(
+            failure_code, error.message if error is not None else None
+        )
+        attributes = {**failure_log_attributes(failure_context), **budget_attributes}
+        logged_code = attributes.pop("code", failure_code)
+        # Keep budget refusals queryable without reporting an application fault.
+        log = _logger.info if budget_attributes else _logger.error
+        log(
+            "session turn %s for %s (origin=%s code=%s prev=%s): %s",
+            "blocked by budget" if budget_attributes else "failed",
             session_id,
             origin,
-            failure_code,
+            logged_code,
             previous_status or "unknown",
             _failure_log_detail(error),
             extra=debug_event(
-                "session_turn_failed",
+                "session_turn_budget_exhausted" if budget_attributes else "session_turn_failed",
                 session_id=session_id,
                 origin=origin,
-                code=failure_code,
+                code=logged_code,
                 previous_status=previous_status or "unknown",
                 response_id=response_id,
                 cached_background_task_count=_session_background_task_count_cache.get(session_id),
-                **failure_log_attributes(failure_context),
+                **attributes,
             ),
         )
         session_live_state.persist_scheduled_run_completion(
