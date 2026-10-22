@@ -162,7 +162,7 @@ import {
   isNativeTerminalSession as isNativeTerminalSessionFn,
   nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
-import type { StoredReplyDraft } from "@/lib/replyDraft";
+import type { ReplyQuote, StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
 export interface SendOptions {
@@ -1099,7 +1099,7 @@ export interface ConversationState {
 /** One side chat's unsent composer contents. */
 export interface SideChatComposerDraft {
   starting?: boolean;
-  quotes?: string[];
+  quotes?: ReplyQuote[];
   text: string;
   files: File[];
 }

@@ -131,6 +131,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  appendReplyQuote,
   restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -3243,7 +3244,7 @@ function ComposerImpl(
       if (target?.parentId === sourceId) {
         store.updateSideChatComposer(target.childId, (current) => ({
           ...current,
-          quotes: [...(current.quotes ?? []), selectedText],
+          ...appendReplyQuote(current, selectedText),
         }));
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);

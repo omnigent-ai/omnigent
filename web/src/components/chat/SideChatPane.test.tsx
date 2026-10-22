@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
+import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as filesApi from "@/lib/filesApi";
@@ -20,7 +21,13 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
-vi.mock("@/components/ComposerMicButton", () => ({ ComposerMicButton: () => null }));
+const mic = vi.hoisted(() => ({ current: null as ComposerMicButtonProps | null }));
+vi.mock("@/components/ComposerMicButton", () => ({
+  ComposerMicButton: (props: ComposerMicButtonProps) => {
+    mic.current = props;
+    return null;
+  },
+}));
 const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
@@ -234,11 +241,18 @@ describe("side chat opened from a text selection", () => {
     await waitFor(() => expect(useChatStore.getState().sideChatDrafts).toEqual({}));
   });
 
-  it("adds quotes to a live draft without sending until the user submits", () => {
+  it("preserves surrounding replies when quote cards are removed", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     useChatStore.setState({
       sideChatComposers: {
-        [childId]: { text: "why?", files: [], quotes: ["first selection", "second selection"] },
+        [childId]: {
+          text: "why?",
+          files: [],
+          quotes: [
+            { id: "first", before: "Introduction", text: "first selection" },
+            { id: "second", before: "First answer", text: "second selection" },
+          ],
+        },
       },
     });
     renderPane(<SideChatPane childId={childId} selectionParentId="conv_main" />);
@@ -251,10 +265,20 @@ describe("side chat opened from a text selection", () => {
     expect(screen.getByTestId("side-chat-input")).toHaveFocus();
     expect(send).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]);
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+      "Introduction\n\nFirst answer",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    expect(screen.getByTestId("side-chat-input")).toHaveValue(
+      "Introduction\n\nFirst answer\n\nwhy?",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
-    expect(send).toHaveBeenCalledWith("> second selection\n\nwhy?", "agent_side", undefined, {
-      pinnedConversationId: childId,
-    });
+    expect(send).toHaveBeenCalledWith(
+      "Introduction\n\nFirst answer\n\nwhy?",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
     expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
   });
 
@@ -294,11 +318,161 @@ describe("side-chat selection reply", () => {
 
   afterEach(() => window.getSelection()?.removeAllRanges());
 
+  it("restores all reply fields when dictation is cancelled after focus moves", () => {
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "Tail answer",
+          files: [],
+          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const earlier = screen.getByRole("textbox", {
+      name: "Reply text before quote 1",
+    }) as HTMLTextAreaElement;
+    const tail = screen.getByTestId("side-chat-input");
+    act(() => earlier.focus());
+    earlier.setSelectionRange(earlier.value.length, earlier.value.length);
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken addition"));
+    expect(earlier).toHaveValue("Earlier answer spoken addition");
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    fireEvent.change(document.querySelector('input[type="file"]')!, {
+      target: { files: [file] },
+    });
+    act(() => tail.focus());
+    act(() => mic.current!.onVoiceDiscard!());
+
+    expect(earlier).toHaveValue("Earlier answer");
+    expect(tail).toHaveValue("Tail answer");
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([file]);
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it.each([false, true])(
+    "keeps answers between selected quotes across a remount (full session: %s)",
+    (fullSession) => {
+      conversationRegistry.acquire(childId).setState({
+        sessionStatus: "idle",
+        blocks: itemsToBlocks(
+          ["First passage", "Second passage"].map((text, index) => ({
+            id: `passage-${index}`,
+            response_id: `turn-${index}`,
+            type: "message" as const,
+            role: "user" as const,
+            status: "completed" as const,
+            content: [{ type: "input_text" as const, text }],
+          })),
+        ),
+      });
+      const pane = <SideChatPane childId={childId} fullSession={fullSession} />;
+      const view = renderPane(pane);
+      selectText(screen.getByText("First passage"));
+      fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+      fireEvent.change(screen.getByTestId("side-chat-input"), {
+        target: { value: "First answer" },
+      });
+      selectText(screen.getByText("Second passage"));
+      fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+
+      const between = screen.getByRole("textbox", { name: "Reply text before quote 2" });
+      expect(between).toHaveValue("First answer");
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+      act(() => between.focus());
+      fireEvent.change(between, { target: { value: "Edited first answer" } });
+      expect(between).toHaveFocus();
+      fireEvent.change(screen.getByTestId("side-chat-input"), {
+        target: { value: "Second answer" },
+      });
+      view.unmount();
+      renderPane(pane);
+
+      expect(screen.getByRole("textbox", { name: "Reply text before quote 2" })).toHaveValue(
+        "Edited first answer",
+      );
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Second answer");
+      fireEvent.click(screen.getByTestId("side-chat-send"));
+      expect(send).toHaveBeenCalledExactlyOnceWith(
+        "> First passage\n\nEdited first answer\n\n> Second passage\n\nSecond answer",
+        "agent_side",
+        undefined,
+        { pinnedConversationId: childId },
+      );
+    },
+  );
+
+  it.each([
+    { fullSession: false, between: false },
+    { fullSession: false, between: true },
+    { fullSession: true, between: false },
+    { fullSession: true, between: true },
+  ])("attaches a clipboard image from either reply input: %o", ({ fullSession, between }) => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    if (between)
+      useChatStore.setState({
+        sideChatComposers: {
+          [childId]: {
+            text: "",
+            files: [],
+            quotes: [
+              { id: "first", before: "", text: "First passage" },
+              { id: "second", before: "Keep answer", text: "Second passage" },
+            ],
+          },
+        },
+      });
+    renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
+    const input = between
+      ? screen.getByRole("textbox", { name: "Reply text before quote 2" })
+      : screen.getByTestId("side-chat-input");
+    expect(fireEvent.paste(input, { clipboardData: { items: [] } })).toBe(true);
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(
+      fireEvent.paste(input, {
+        clipboardData: {
+          items: [{ kind: "file", type: file.type, getAsFile: () => file }],
+        },
+      }),
+    ).toBe(false);
+    expect(screen.getByAltText("shot.png")).toBeInTheDocument();
+    expect(input).toHaveValue(between ? "Keep answer" : "");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      between ? "> First passage\n\nKeep answer\n\n> Second passage" : "",
+      "agent_side",
+      [file],
+      { pinnedConversationId: childId },
+    );
+  });
+
+  it("explains that attachments need a started side chat and preserves its question", () => {
+    renderPane(<SideChatPane childId="pending:side" />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Keep this question" } });
+    const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
+    expect(
+      fireEvent.paste(input, {
+        clipboardData: { items: [{ kind: "file", type: file.type, getAsFile: () => file }] },
+      }),
+    ).toBe(false);
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+      "Send a text question to start the side chat before attaching files.",
+    );
+    expect(input).toHaveValue("Keep this question");
+    expect(screen.queryByAltText("shot.png")).toBeNull();
+  });
+
   it("quotes selected side-chat text in its own composer and preserves the draft", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     useChatStore.setState({
       sideChatComposers: {
-        [childId]: { text: "my follow-up", files: [], quotes: ["existing quote"] },
+        [childId]: {
+          text: "my follow-up",
+          files: [],
+          quotes: [{ id: "existing", before: "", text: "existing quote" }],
+        },
       },
     });
     renderPane(<SideChatPane childId={childId} />);
@@ -306,9 +480,16 @@ describe("side-chat selection reply", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
 
     expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
-      text: "my follow-up",
+      text: "",
       files: [],
-      quotes: ["existing quote", "Ask a question here without affecting the main conversation."],
+      quotes: [
+        { id: "existing", before: "", text: "existing quote" },
+        {
+          id: expect.any(String),
+          before: "my follow-up",
+          text: "Ask a question here without affecting the main conversation.",
+        },
+      ],
     });
     expect(screen.getByTestId("side-chat-input")).toHaveFocus();
     expect(screen.queryByRole("button", { name: "Reply ↵" })).toBeNull();
@@ -641,6 +822,17 @@ describe("side chat sealed by the server", () => {
 });
 
 describe("side-chat composer auto-grow", () => {
+  it("shows the full reply after a seeded pending quote", () => {
+    useChatStore.setState({ sideChatDrafts: { "pending:quoted": "Quoted passage" } });
+    renderPane(<SideChatPane childId="pending:quoted" />);
+    const input = screen.getByTestId("side-chat-input");
+    input.style.lineHeight = "20px";
+    input.style.padding = "0px";
+    Object.defineProperty(input, "scrollHeight", { value: 500 });
+    fireEvent.change(input, { target: { value: "Long answer\n".repeat(25) } });
+    expect(input).toHaveStyle({ height: "500px" });
+  });
+
   it("applies auto-grow to the text input so it grows with its content", () => {
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input") as HTMLTextAreaElement;
@@ -763,7 +955,11 @@ describe("side-chat slash commands", () => {
       .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
     useChatStore.setState({
       sideChatComposers: {
-        [childId]: { text: "", files: [], quotes: ["a selection"] },
+        [childId]: {
+          text: "",
+          files: [],
+          quotes: [{ id: "selection", before: "", text: "a selection" }],
+        },
       },
     });
     skillsFixture.current = { skills: [], skillsStatus: "loading" };
@@ -921,7 +1117,7 @@ it.each(["none", "text", "files", "quote", "rejected-file"] as const)(
           none: {},
           text: { text: "Edited" },
           files: { files: [] },
-          quote: { quotes: ["New quote"] },
+          quote: { quotes: [{ id: "new", before: "", text: "New quote" }] },
           "rejected-file": {},
         }[edit],
       })),
@@ -953,9 +1149,11 @@ it.each([false, true])(
     renderPane(<SideChatPane childId={childId} fullSession />);
     if (hasNewDraft)
       act(() =>
-        useChatStore
-          .getState()
-          .updateSideChatComposer(childId, () => ({ text: "", files: [], quotes: ["New quote"] })),
+        useChatStore.getState().updateSideChatComposer(childId, () => ({
+          text: "",
+          files: [],
+          quotes: [{ id: "new", before: "", text: "New quote" }],
+        })),
       );
     act(() =>
       entry.setState({
