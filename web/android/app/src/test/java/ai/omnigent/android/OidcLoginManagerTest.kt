@@ -70,6 +70,34 @@ class OidcLoginManagerTest {
         }
     }
 
+    @Test
+    fun `malformed successful ticket reports refusal without polling`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(200, """{"login_url":"/auth/login"}""")
+            } else {
+                LocalHttpServer.Response(202)
+            }
+        }.use { server ->
+            var failure: Throwable? = null
+            assertTrue(
+                manager.start(
+                    activity,
+                    server.origin,
+                    {},
+                    onTicketFailure = { failure = it },
+                ),
+            )
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (failure == null && System.nanoTime() < deadline) {
+                drainMainLooper()
+                Thread.sleep(5)
+            }
+            assertTrue(failure is LegacyTicketFailure.Refused)
+            assertFalse(server.requests.any { it.path == "/auth/cli-poll" })
+        }
+    }
+
     private val manager = OidcLoginManager()
     private val activity: Activity
         get() = Robolectric.buildActivity(Activity::class.java).setup().get()
