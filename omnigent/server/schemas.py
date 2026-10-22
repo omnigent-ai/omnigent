@@ -20,6 +20,7 @@ from pydantic import (
     Field,
     SerializerFunctionWrapHandler,
     Strict,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -32,6 +33,7 @@ from omnigent.entities import (
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
+from omnigent.server.client_capabilities import client_permission_level
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -2220,7 +2222,7 @@ class SessionResponse(BaseModel):
         ``root_conversation_id`` column (not expected post-migration).
     :param permission_level: The requesting user's numeric
         permission level on this session: ``1`` = read, ``2`` =
-        edit, ``3`` = manage. ``None`` when permissions are
+        edit, ``3`` = manage, ``4`` = owner, ``5`` = comment. ``None`` when permissions are
         disabled (single-user mode without a permission store).
     :param llm_model: The model this session is actually on. When the
         harness has reported one (``reported_model``, written by
@@ -2409,6 +2411,11 @@ class SessionResponse(BaseModel):
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
+
+    @field_serializer("permission_level")
+    def _serialize_permission_level(self, level: int | None) -> int | None:
+        return client_permission_level(level)
+
     sub_agent_name: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
@@ -2947,7 +2954,7 @@ class SessionListItem(BaseModel):
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param permission_level: The requesting user's numeric
         permission level on this session: ``1`` = read, ``2`` =
-        edit, ``3`` = manage. ``None`` when permissions are
+        edit, ``3`` = manage, ``4`` = owner, ``5`` = comment. ``None`` when permissions are
         disabled.
     :param owner: The user_id of the session owner, or ``None``
         when permissions are disabled. Included so the sidebar
@@ -3028,6 +3035,11 @@ class SessionListItem(BaseModel):
     host_online: bool | None = None
     reasoning_effort: str | None = None
     permission_level: int | None = None
+
+    @field_serializer("permission_level")
+    def _serialize_permission_level(self, level: int | None) -> int | None:
+        return client_permission_level(level)
+
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
@@ -3160,11 +3172,12 @@ class GrantPermissionRequest(BaseModel):
         ``"alice@example.com"`` or ``"__public__"`` for public
         access subject to the server's public permission ceiling.
     :param level: Numeric permission level: ``1`` = read,
-        ``2`` = edit, ``3`` = manage.
+        ``2`` = edit, ``3`` = manage, ``5`` = comment. ``4`` (owner) is
+        never granted through this endpoint.
     """
 
     user_id: str
-    level: int = Field(ge=1, le=3)
+    level: Literal[1, 2, 3, 5]
 
 
 class PermissionObject(BaseModel):
@@ -3175,12 +3188,17 @@ class PermissionObject(BaseModel):
     :param conversation_id: The session, e.g.
         ``"conv_abc123"``.
     :param level: Numeric permission level (1=read, 2=edit,
-        3=manage).
+        3=manage, 4=owner, 5=comment). A comment grant reads as 1 to
+        clients that don't advertise the comment level.
     """
 
     user_id: str
     conversation_id: str
     level: int
+
+    @field_serializer("level")
+    def _serialize_level(self, level: int) -> int:
+        return client_permission_level(level)
 
 
 # ─────────────────────────────────────────────────────────────────────

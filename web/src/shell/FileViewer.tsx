@@ -97,6 +97,7 @@ import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { isAbsoluteComposerPath } from "@/lib/composerContext";
+import { canCommentLevel, isEditorLevel } from "@/lib/permissionsApi";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -383,8 +384,9 @@ function FileViewerBody({
   sort = "recent",
 }: FileViewerProps) {
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
-  // LEVEL_EDIT = 2; levels below 2 are read-only.
-  const canEdit = permissionLevel == null || permissionLevel >= 2;
+  // Comment-only collaborators may write comments but not send them to the agent.
+  const canEdit = isEditorLevel(permissionLevel ?? null);
+  const canComment = canCommentLevel(permissionLevel ?? null);
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
@@ -1849,6 +1851,7 @@ function FileViewerBody({
                 setActiveSelection(null);
             }}
             addressPending={sender?.isPending ?? false}
+            canComment={canComment}
             canEdit={canEdit}
           />
         )}

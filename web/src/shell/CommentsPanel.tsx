@@ -42,7 +42,10 @@ export interface CommentsPanelProps {
   onEditComment: (id: string, body: string) => void;
   onDeleteComment: (id: string) => void;
   onClickComment: (comment: Comment) => void;
-  /** When false, "Address All" is disabled (no agent registered). */
+  /**
+   * When false, "Address All" is disabled: no agent is registered, or the
+   * viewer can comment but not message the agent (below edit access).
+   */
   canAddress: boolean;
   addressPending: boolean;
   /**
@@ -50,7 +53,13 @@ export interface CommentsPanelProps {
    * (read-only access). When true, the add-comment form is shown, but the
    * per-comment edit/delete buttons appear only on the current user's own
    * comments — see `canModify`. Defaults to true (single-user mode or
-   * owner/editor access).
+   * owner/editor/comment access).
+   */
+  canComment?: boolean;
+  /**
+   * Whether the viewer has edit access. Comments with no recorded author can
+   * be edited or deleted only by editors, not comment-only collaborators.
+   * Defaults to true (single-user mode or owner/editor access).
    */
   canEdit?: boolean;
   /**
@@ -82,6 +91,7 @@ export function CommentsPanel({
   onClickComment,
   canAddress,
   addressPending,
+  canComment = true,
   canEdit = true,
   pendingBodyRef,
   onCopyCommentLink,
@@ -99,10 +109,10 @@ export function CommentsPanel({
   // too; this just hides the affordances). A comment with no recorded author
   // (legacy comments, or single-user/local mode where currentAuthorId is null)
   // stays editable by any editor, matching the server's `created_by is None`
-  // fallback.
+  // fallback, which requires edit access.
   const currentAuthorId = getCurrentAuthorId();
   const canModify = (c: Comment): boolean =>
-    canEdit && (c.created_by == null || c.created_by === currentAuthorId);
+    canComment && (c.created_by == null ? canEdit : c.created_by === currentAuthorId);
   const activeSelectionStart = activeSelection?.start_index;
   const activeSelectionEnd = activeSelection?.end_index;
   const activeCommentId = activeSelection?.comment_id;
@@ -220,7 +230,7 @@ export function CommentsPanel({
         })}
       </div>
 
-      {!canEdit && (
+      {!canComment && (
         <div className="shrink-0 border-b border-border px-3 py-2 text-sm text-muted-foreground">
           You have read-only access to this session.
         </div>
@@ -236,7 +246,7 @@ export function CommentsPanel({
               c.start_index === activeSelection.start_index &&
               c.end_index === activeSelection.end_index,
           ) &&
-          (canEdit ? (
+          (canComment ? (
             <div className="space-y-2 border-b border-border px-3 py-2">
               {activeSelection.anchor_content && (
                 <div className="truncate rounded bg-muted/40 px-2 py-1 font-mono text-[10px] text-muted-foreground">

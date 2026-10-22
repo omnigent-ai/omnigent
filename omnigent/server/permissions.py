@@ -9,7 +9,7 @@ this single function.
 from __future__ import annotations
 
 from omnigent.entities import Conversation, ResolvedAccess
-from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_MANAGE, LEVEL_OWNER, level_rank, level_satisfies
 from omnigent.server.sharing_settings import effective_public_level
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
@@ -37,7 +37,7 @@ def check_session_access(
     :param conversation_id: The session to check, e.g.
         ``"conv_abc123"``.
     :param required_level: Minimum numeric level needed
-        (1=read, 2=edit, 3=manage).
+        (1=read, 2=edit, 3=manage, 5=comment).
     :param permission_store: Store for permission lookups.
     :param conversation_store: Store for conversation lookups
         (needed for sub-agent parent delegation).
@@ -80,15 +80,14 @@ def resolved_allows(access: ResolvedAccess, required_level: int) -> bool:
 
     :param access: The resolved-access snapshot for one ``(user, conv)``.
     :param required_level: Minimum numeric level needed (1=read, 2=edit,
-        3=manage, 4=owner).
+        3=manage, 4=owner, 5=comment), compared by :func:`level_satisfies`.
     :returns: ``True`` if access is allowed, ``False`` otherwise.
     """
     if access.is_admin:
         return True
-    if access.user_grant_level is not None and access.user_grant_level >= required_level:
+    if level_satisfies(access.user_grant_level, required_level):
         return True
-    public_level = effective_public_level(access.public_grant_level)
-    if public_level is not None and public_level >= required_level:
+    if level_satisfies(effective_public_level(access.public_grant_level), required_level):
         return True
     return False
 
@@ -101,7 +100,7 @@ def resolved_level(access: ResolvedAccess) -> int | None:
     the capped public grant, or ``None`` if neither grants access.
 
     :param access: The resolved-access snapshot for one ``(user, conv)``.
-    :returns: Numeric level (1/2/3/4), or ``None`` when the user has no
+    :returns: Numeric level (1/2/3/4/5), or ``None`` when the user has no
         access.
     """
     if access.is_admin:
@@ -111,7 +110,7 @@ def resolved_level(access: ResolvedAccess) -> int | None:
         for level in (access.user_grant_level, effective_public_level(access.public_grant_level))
         if level is not None
     ]
-    return max(levels) if levels else None
+    return max(levels, key=level_rank) if levels else None
 
 
 def check_is_manager(

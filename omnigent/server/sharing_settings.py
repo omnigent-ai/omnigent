@@ -37,7 +37,13 @@ from typing import Any
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.server.admin_list import resolve_data_dir
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode, workspace_sharing_blocked
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_READ,
+    SharingMode,
+    level_rank,
+    workspace_sharing_blocked,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +102,8 @@ def effective_public_level(level: int | None) -> int | None:
     """Apply the live ceiling outside the raw grant cache, including on open streams."""
     if level is None:
         return None
-    return min(level, _public_sharing_max_level.get()().level)
+    # By rank: comment (5) sits below edit (2) despite its larger value.
+    return min(level, _public_sharing_max_level.get()().level, key=level_rank)
 
 
 @contextlib.contextmanager

@@ -8,11 +8,21 @@ import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
 
 /**
- * Numeric permission level of the session owner. Mirrors
- * ``LEVEL_OWNER`` in ``omnigent/server/auth.py`` (READ=1, EDIT=2,
- * MANAGE=3, OWNER=4).
+ * Numeric permission levels. Mirror the ``LEVEL_*`` constants in
+ * ``omnigent/server/auth.py``. COMMENT ranks between READ and EDIT but is
+ * numerically 5 so the pre-existing 1–4 values keep their meaning, which is
+ * why levels are only ever tested by membership, never ordered with ``>=``.
  */
+export const LEVEL_READ = 1;
+export const LEVEL_EDIT = 2;
+/** Legacy; the web UI never grants it but still recognizes existing grants. */
+export const LEVEL_MANAGE = 3;
 export const LEVEL_OWNER = 4;
+export const LEVEL_COMMENT = 5;
+
+const EDITOR_LEVELS: ReadonlySet<number> = new Set([LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER]);
+const COMMENTER_LEVELS: ReadonlySet<number> = new Set([...EDITOR_LEVELS, LEVEL_COMMENT]);
+const GRANTED_LEVELS: ReadonlySet<number> = new Set([LEVEL_READ, ...COMMENTER_LEVELS]);
 
 export function workspaceSharingBlocked(workspace: string | null | undefined): boolean {
   if (!workspace?.startsWith("/")) return false;
@@ -38,17 +48,11 @@ export function workspaceSharingBlocked(workspace: string | null | undefined): b
  *
  * :param level: The effective permission level, e.g. ``2`` for edit
  *     access, or ``null`` when unresolved.
- * :returns: ``true`` for the owner (level ``null`` or ``>= 4``).
+ * :returns: ``true`` for the owner (level ``null`` or ``4``).
  */
 export function isOwnerLevel(level: number | null): boolean {
-  return level == null || level >= LEVEL_OWNER;
+  return level == null || level === LEVEL_OWNER;
 }
-
-/**
- * Numeric permission level required to mutate the session's shared
- * workspace. Mirrors ``LEVEL_EDIT`` in ``omnigent/server/auth.py``.
- */
-export const LEVEL_EDIT = 2;
 
 /**
  * Return whether a permission level grants edit access — mutating the
@@ -57,7 +61,26 @@ export const LEVEL_EDIT = 2;
  * (single-user / still loading), matching ``isOwnerLevel`` / ``useCanEdit``.
  */
 export function isEditorLevel(level: number | null): boolean {
-  return level == null || level >= LEVEL_EDIT;
+  return level == null || EDITOR_LEVELS.has(level);
+}
+
+/**
+ * Return whether a permission level may write review comments (server-gated
+ * on ``LEVEL_COMMENT``): every editor level plus COMMENT itself. Sending
+ * comments to the agent is an edit action — gate that on
+ * :func:`isEditorLevel`. ``null`` is treated permissively, like
+ * :func:`isEditorLevel`.
+ */
+export function canCommentLevel(level: number | null): boolean {
+  return level == null || COMMENTER_LEVELS.has(level);
+}
+
+/**
+ * Return whether a permission level is any recognized grant (read or
+ * higher). ``null`` is treated permissively, like :func:`isEditorLevel`.
+ */
+export function canReadLevel(level: number | null): boolean {
+  return level == null || GRANTED_LEVELS.has(level);
 }
 
 /**
@@ -82,7 +105,7 @@ export function isEditorLevel(level: number | null): boolean {
  * 3. ``null`` while the single fetch is still in flight (the UI
  *    treats ``null`` permissively, avoiding a read-only flicker
  *    during the snapshot's first round-trip on child sessions).
- * 4. Read-only (1) — final fallback when the URL points at a
+ * 4. Read-only (``LEVEL_READ``) — final fallback when the URL points at a
  *    conversation the sidebar didn't return AND the single fetch
  *    either errored or hasn't been initiated.
  */
@@ -96,7 +119,7 @@ export function derivePermissionLevel(
   if (session != null) return session.permissionLevel;
   if (activeConv != null && activeConv.permission_level != null) return activeConv.permission_level;
   if (sessionLoading) return null;
-  if (conversationId && conversationsLoaded) return 1;
+  if (conversationId && conversationsLoaded) return LEVEL_READ;
   return null;
 }
 

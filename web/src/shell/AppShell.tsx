@@ -34,7 +34,7 @@ import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { canReadLevel, derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isElectronShell,
@@ -784,9 +784,7 @@ function AppShellImpl() {
   // affordance doesn't flicker in before that resolves. Shared by the header
   // menus and ForkDialogContext's per-message "Fork from here" action.
   const canClone =
-    !!conversationId &&
-    (isKnownTopLevel || isChildSession) &&
-    (permissionLevel === null || permissionLevel >= 1);
+    !!conversationId && (isKnownTopLevel || isChildSession) && canReadLevel(permissionLevel);
   const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =

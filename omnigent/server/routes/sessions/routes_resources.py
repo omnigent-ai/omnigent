@@ -47,10 +47,12 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_COMMENT,
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    level_satisfies,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
@@ -764,7 +766,7 @@ def register_resources_routes(
         diffs, search, and the GitHub diff views) all serve the workspace's
         own bytes or paths. An ABSOLUTE ``client_path`` is the owner's own
         machine — owner-only, exactly as :func:`_browse_level` decides for a
-        mutation. A workspace-relative read needs ``LEVEL_EDIT`` *unless* the
+        mutation. A workspace-relative read needs ``LEVEL_COMMENT`` *unless* the
         session owner opted into ``share_workspace_files``, which lowers the
         bar to ``LEVEL_READ``.
 
@@ -830,12 +832,17 @@ def register_resources_routes(
                 raise _session_not_found()
         # ``level is None`` means permissions are disabled (single-user) or, on a
         # child session, access inherited from the parent chain with no direct
-        # grant. Edit collaborators keep the workspace unconditionally; a
-        # view-only grant reaches it only once the owner shares its files.
-        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+        # grant. Comment collaborators keep the workspace unconditionally, since
+        # commenting needs the files; a view-only grant reaches it only once the
+        # owner shares its files.
+        if (
+            access.level is None
+            or level_satisfies(access.level, LEVEL_COMMENT)
+            or conv.share_workspace_files
+        ):
             return conv, await _owns_session(user_id, conv, access.level)
         raise OmnigentError(
-            f"{user_id!r} needs edit access to browse the workspace of session "
+            f"{user_id!r} needs comment access to browse the workspace of session "
             f"{session_id!r}, or the owner must enable file sharing",
             code=ErrorCode.FORBIDDEN,
         )
@@ -865,7 +872,7 @@ def register_resources_routes(
                 permission_store,
                 conversation_store,
             )
-        return level is not None and level >= LEVEL_OWNER
+        return level == LEVEL_OWNER
 
     def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
         """Resolve a filesystem request path against its declared base.

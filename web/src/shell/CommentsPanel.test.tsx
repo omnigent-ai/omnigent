@@ -128,16 +128,16 @@ describe("CommentsPanel copy-comment-link", () => {
   });
 });
 
-// ── Read-only collaborator gating (canEdit) ────────────────────────────────
+// ── Read-only collaborator gating (canComment) ────────────────────────────────
 //
 // A shared session opened by a read-only collaborator (permission level 1)
-// renders the panel with canEdit=false. The panel must then suppress every
+// renders the panel with canComment=false. The panel must then suppress every
 // mutation affordance — add-comment form, per-comment Edit, per-comment
 // Delete — while still letting the viewer read comments and copy links.
-// Edit-or-higher collaborators (canEdit=true, the default) keep all of them.
+// Edit-or-higher collaborators (canComment=true, the default) keep all of them.
 
 // A fresh selection whose range matches no existing comment, so the panel's
-// "add a comment here" form becomes eligible to render (gated on canEdit).
+// "add a comment here" form becomes eligible to render (gated on canComment).
 const FRESH_SELECTION: ActiveSelection = {
   start_index: 10,
   end_index: 20,
@@ -145,7 +145,8 @@ const FRESH_SELECTION: ActiveSelection = {
 };
 
 function renderGated(opts: {
-  canEdit: boolean;
+  canComment: boolean;
+  canEdit?: boolean;
   comments?: Comment[];
   activeSelection?: ActiveSelection | null;
   handlers?: Partial<{
@@ -166,6 +167,7 @@ function renderGated(opts: {
       onClickComment={vi.fn()}
       canAddress={false}
       addressPending={false}
+      canComment={opts.canComment}
       canEdit={opts.canEdit}
       onCopyCommentLink={vi.fn()}
     />,
@@ -173,38 +175,38 @@ function renderGated(opts: {
 }
 
 describe("CommentsPanel read-only collaborator gating", () => {
-  it("shows the read-only banner when canEdit is false", () => {
-    renderGated({ canEdit: false });
+  it("shows the read-only banner when canComment is false", () => {
+    renderGated({ canComment: false });
     expect(screen.getByText("You have read-only access to this session.")).toBeInTheDocument();
   });
 
-  it("does not show the read-only banner for editors (canEdit true)", () => {
-    renderGated({ canEdit: true });
+  it("does not show the read-only banner for editors (canComment true)", () => {
+    renderGated({ canComment: true });
     expect(screen.queryByText("You have read-only access to this session.")).toBeNull();
   });
 
   it("hides the add-comment form for a fresh selection when read-only", () => {
     // With a fresh selection an editor would get the compose form; a
     // read-only viewer must not, so they cannot create comments at all.
-    renderGated({ canEdit: false, activeSelection: FRESH_SELECTION });
+    renderGated({ canComment: false, activeSelection: FRESH_SELECTION });
     expect(screen.queryByPlaceholderText("Add a comment…")).toBeNull();
     expect(screen.queryByRole("button", { name: "Add Comment" })).toBeNull();
   });
 
   it("shows the add-comment form for the same selection when editing is allowed", () => {
-    renderGated({ canEdit: true, activeSelection: FRESH_SELECTION });
+    renderGated({ canComment: true, activeSelection: FRESH_SELECTION });
     expect(screen.getByPlaceholderText("Add a comment…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add Comment" })).toBeInTheDocument();
   });
 
   it("hides per-comment Edit and Delete actions when read-only", () => {
-    renderGated({ canEdit: false, comments: [makeComment("c1")] });
+    renderGated({ canComment: false, comments: [makeComment("c1")] });
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
   it("shows per-comment Edit and Delete actions for editors", () => {
-    renderGated({ canEdit: true, comments: [makeComment("c1")] });
+    renderGated({ canComment: true, comments: [makeComment("c1")] });
     expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
   });
@@ -212,7 +214,7 @@ describe("CommentsPanel read-only collaborator gating", () => {
   it("still lets a read-only viewer read comments and copy links", () => {
     // Read-only gates *mutation*, not visibility — the comment body and
     // the copy-link affordance remain available.
-    renderGated({ canEdit: false, comments: [makeComment("c1")] });
+    renderGated({ canComment: false, comments: [makeComment("c1")] });
     expect(screen.getByText("Comment c1")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy link to comment" })).toBeInTheDocument();
   });
@@ -220,7 +222,7 @@ describe("CommentsPanel read-only collaborator gating", () => {
 
 // ── Author-only edit/delete gating (created_by vs current user) ─────────────
 //
-// Even with edit access (canEdit=true), a collaborator may only edit/delete
+// Even with edit access (canComment=true), a collaborator may only edit/delete
 // their OWN comments. The panel compares each comment's created_by against
 // getCurrentAuthorId and exposes Edit/Delete only on a match (the backend
 // enforces this independently; the UI just hides the affordances). Comments
@@ -242,7 +244,7 @@ describe("CommentsPanel author-only edit/delete gating", () => {
   it("shows Edit/Delete on the current user's own comment", () => {
     mockGetCurrentAuthorId.mockReturnValue("alice@example.com");
     renderGated({
-      canEdit: true,
+      canComment: true,
       comments: [makeAuthoredComment("c1", "alice@example.com")],
     });
     // Alice authored c1 → her own affordances appear. Failure means
@@ -254,7 +256,7 @@ describe("CommentsPanel author-only edit/delete gating", () => {
   it("hides Edit/Delete on another user's comment even with edit access", () => {
     mockGetCurrentAuthorId.mockReturnValue("bob@example.com");
     renderGated({
-      canEdit: true,
+      canComment: true,
       comments: [makeAuthoredComment("c1", "alice@example.com")],
     });
     // Bob is an editor but did NOT author c1 → no mutation affordances.
@@ -270,7 +272,7 @@ describe("CommentsPanel author-only edit/delete gating", () => {
   it("shows Edit/Delete on an authorless (legacy/single-user) comment", () => {
     mockGetCurrentAuthorId.mockReturnValue("bob@example.com");
     renderGated({
-      canEdit: true,
+      canComment: true,
       comments: [makeAuthoredComment("c1", null)],
     });
     // created_by null → no author to protect, so any editor may modify,
@@ -280,10 +282,23 @@ describe("CommentsPanel author-only edit/delete gating", () => {
     expect(screen.getByRole("button", { name: "Delete" })).toBeInTheDocument();
   });
 
+  it("hides Edit/Delete on an authorless comment for a comment-only collaborator", () => {
+    mockGetCurrentAuthorId.mockReturnValue("carol@example.com");
+    renderGated({
+      canComment: true,
+      canEdit: false,
+      comments: [makeAuthoredComment("c1", null), makeAuthoredComment("c2", "carol@example.com")],
+    });
+    // The server requires edit access to change an unattributed comment, so a
+    // commenter only gets affordances on their own comment (c2).
+    expect(screen.getAllByRole("button", { name: "Edit" })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: "Delete" })).toHaveLength(1);
+  });
+
   it("renders own-vs-others affordances correctly in a mixed-author list", () => {
     mockGetCurrentAuthorId.mockReturnValue("alice@example.com");
     renderGated({
-      canEdit: true,
+      canComment: true,
       comments: [
         makeAuthoredComment("c1", "alice@example.com"),
         makeAuthoredComment("c2", "bob@example.com"),

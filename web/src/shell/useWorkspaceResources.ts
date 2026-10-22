@@ -9,7 +9,7 @@ import {
   useWorkspaceChangedFiles,
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
-import { isEditorLevel } from "@/lib/permissionsApi";
+import { canCommentLevel } from "@/lib/permissionsApi";
 
 /** Shared discovery for the full-session shell and grid workspaces. */
 export function useWorkspaceResources({
@@ -25,8 +25,9 @@ export function useWorkspaceResources({
   terminalFirst?: boolean;
   terminalPending?: boolean;
 }) {
-  // View grants don't include files. Unknown levels stay permissive; the server enforces access.
-  const canBrowseWorkspace = isEditorLevel(permissionLevel) || shareWorkspaceFiles === true;
+  // Comment and up always browse files; Read only when the owner shares them.
+  // Unknown levels stay permissive; the server enforces access.
+  const canBrowseWorkspace = canCommentLevel(permissionLevel) || shareWorkspaceFiles === true;
   const environmentQuery = useWorkspaceEnvironment(sessionId, { enabled: canBrowseWorkspace });
   const changedFiles = useWorkspaceChangedFiles(sessionId, { enabled: canBrowseWorkspace });
   const changedPaths = useMemo(

@@ -48,6 +48,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
     AuthProvider,
+    level_satisfies,
 )
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -660,7 +661,7 @@ def register_hooks_routes(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
         is_read_only = permission_store is not None and (
-            access.level is None or access.level < LEVEL_EDIT
+            access.level is None or not level_satisfies(access.level, LEVEL_EDIT)
         )
         if (
             permission_store is not None

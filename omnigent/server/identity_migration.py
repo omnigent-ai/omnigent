@@ -51,7 +51,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.query_context import query_name_scope
-from omnigent.server.auth import _RESERVED_USERS
+from omnigent.server.auth import _RESERVED_USERS, level_rank
 
 
 def _lock_host_collisions_and_check_tombstones(
@@ -244,7 +244,7 @@ def remap_identities(
                     SqlSessionPermission, (current_workspace_id(), new_id, grant.conversation_id)
                 )
                 if existing is not None:
-                    if grant.level > existing.level:
+                    if level_rank(grant.level) > level_rank(existing.level):
                         existing.level = grant.level
                     session.delete(grant)
                 else:

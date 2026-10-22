@@ -135,8 +135,8 @@ def test_shared_session_still_visible_in_flat_list(db_uri: str) -> None:
     assert resp.status_code == 200
     items = {s["id"]: s for s in resp.json()["data"]}
     assert conv_id in items
-    # Below LEVEL_OWNER, so the frontend files it under "Shared with me".
-    assert items[conv_id]["permission_level"] < LEVEL_OWNER
+    # Not LEVEL_OWNER, so the frontend files it under "Shared with me".
+    assert items[conv_id]["permission_level"] != LEVEL_OWNER
 
 
 @pytest.mark.parametrize(

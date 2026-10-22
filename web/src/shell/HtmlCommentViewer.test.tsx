@@ -7,6 +7,7 @@ import { HtmlCommentViewer } from "./HtmlCommentViewer";
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({
   useCanEdit: vi.fn(() => true),
+  useCanComment: vi.fn(() => true),
 }));
 
 beforeEach(() => {

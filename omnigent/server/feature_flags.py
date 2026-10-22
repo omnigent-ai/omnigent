@@ -31,6 +31,7 @@ class Feature(StrEnum):
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
+    COMMENT_SHARING = "comment_sharing"
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.COMMENT_SHARING,
+        description="Comment-only session sharing level",
+        owner="sharing",
+        review_by_release="0.19.0",
+        # Surfaced as /v1/info comment_sharing_enabled instead, which also
+        # reflects a per-request override passed to create_app.
+        frontend_visible=False,
     ),
 )
 

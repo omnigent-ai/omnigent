@@ -52,7 +52,10 @@ vi.mock("./useMonacoCommentLayer", () => ({
   },
 }));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: vi.fn(() => true),
+  useCanComment: vi.fn(() => true),
+}));
 
 import { MonacoDiffViewer } from "./MonacoDiffViewer";
 import { codeFontFamilyForEditor, writeCodeFontSizePx } from "@/lib/codeFontPreferences";

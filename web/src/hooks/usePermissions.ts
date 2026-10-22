@@ -8,8 +8,10 @@ import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type Permission,
+  canCommentLevel,
   derivePermissionLevel,
   getSessionOwner,
+  isEditorLevel,
   grantPermission,
   listPermissions,
   revokePermission,
@@ -76,25 +78,38 @@ export function useRevokePermission(sessionId: string) {
   });
 }
 
-/**
- * Returns whether the current user has edit access (level >= 2) to a session.
- * `null` permission level (single-user mode) is treated as unrestricted.
- */
-export function useCanEdit(conversationId: string): boolean {
+/** The current user's effective permission level on a session (see ``derivePermissionLevel``). */
+function useEffectivePermissionLevel(conversationId: string): number | null {
   const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);
     const activeConv = conversations?.find((c) => c.id === conversationId) ?? null;
-    const permissionLevel = derivePermissionLevel(
+    return derivePermissionLevel(
       activeSession,
       sessionLoading,
       activeConv,
       conversationId,
       conversationsData !== undefined,
     );
-    return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/**
+ * Returns whether the current user has edit access to a session.
+ * `null` permission level (single-user mode) is treated as unrestricted.
+ */
+export function useCanEdit(conversationId: string): boolean {
+  return isEditorLevel(useEffectivePermissionLevel(conversationId));
+}
+
+/**
+ * Returns whether the current user may write review comments on a session —
+ * editors and comment-only collaborators. Sending comments to the agent is an
+ * edit action; gate that on {@link useCanEdit}.
+ */
+export function useCanComment(conversationId: string): boolean {
+  return canCommentLevel(useEffectivePermissionLevel(conversationId));
 }
 
 export type { Permission };

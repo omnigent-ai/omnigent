@@ -11,7 +11,11 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/usePermissions", () => {
+  const useCanEdit = vi.fn();
+  // A read-only viewer can't comment either; comment-only tests override this.
+  return { useCanEdit, useCanComment: vi.fn((id: string) => useCanEdit(id)) };
+});
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
   ...(await importOriginal<typeof fileContentModule>()),
   useFileContent: vi.fn(() => ({ data: undefined })),
@@ -49,6 +53,7 @@ vi.mock("./ModelViewer", () => ({
 }));
 
 import * as permissions from "@/hooks/usePermissions";
+import { useChatStore } from "@/store/chatStore";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -102,7 +107,7 @@ const MINIMAL_NB = JSON.stringify({
   cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
 });
 
-function renderViewer(
+function viewerElement(
   content: string,
   panelOpen = true,
   path = "notes.md",
@@ -119,7 +124,7 @@ function renderViewer(
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return (
     <CodeViewer
       markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
@@ -136,8 +141,12 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+    />
   );
+}
+
+function renderViewer(...args: Parameters<typeof viewerElement>) {
+  return render(viewerElement(...args));
 }
 
 describe("video previews", () => {
@@ -176,6 +185,7 @@ function fireCopyEvent(): ReturnType<typeof vi.fn> {
 
 beforeEach(() => {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
+  vi.mocked(permissions.useCanComment).mockImplementation((id) => permissions.useCanEdit(id));
 });
 
 afterEach(() => {
@@ -548,6 +558,13 @@ describe("CodeViewer markdown preview comment hint", () => {
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
   });
 
+  it("shows the hint to comment-only collaborators, who can comment but not edit", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(true);
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeInTheDocument();
+  });
+
   it("shows no hint when the editor isn't reachable (no callback)", () => {
     renderViewer("# doc", true, "notes.md", { viewMode: "preview" });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
@@ -565,6 +582,66 @@ describe("CodeViewer markdown preview comment hint", () => {
       onRequestEditMode: () => {},
     });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+});
+
+describe("CodeViewer selection actions", () => {
+  // jsdom has no layout, so Range rects are missing; the buttons position
+  // themselves from the selection's first client rect.
+  const rect = { left: 10, top: 10, right: 50, bottom: 20, width: 40, height: 10, x: 10, y: 10 };
+  const originalGetClientRects = Range.prototype.getClientRects;
+  const originalGetBoundingClientRect = Range.prototype.getBoundingClientRect;
+
+  beforeEach(() => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    Range.prototype.getClientRects = () => [rect] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => rect as DOMRect;
+  });
+
+  afterEach(() => {
+    useChatStore.setState({ sessionHarness: null });
+    window.getSelection()?.removeAllRanges();
+    Range.prototype.getClientRects = originalGetClientRects;
+    Range.prototype.getBoundingClientRect = originalGetBoundingClientRect;
+  });
+
+  function selectFirstLine(container: HTMLElement) {
+    const line = container.querySelector<HTMLElement>('[data-line="1"]');
+    if (!line) throw new Error("line 1 not rendered");
+    const range = document.createRange();
+    range.selectNodeContents(line);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    fireEvent.mouseUp(line);
+  }
+
+  it("offers editors Attach to agent beside Add comment", () => {
+    const { container } = renderViewer("hello world");
+    selectFirstLine(container);
+    expect(screen.getByRole("button", { name: /add comment/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /attach to agent/i })).toBeInTheDocument();
+  });
+
+  it("lets a comment-only collaborator comment without attaching to the agent", () => {
+    // WHY: comment access must never become a path to message the agent.
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(true);
+    const { container } = renderViewer("hello world");
+    selectFirstLine(container);
+    expect(screen.getByRole("button", { name: /add comment/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /attach to agent/i })).toBeNull();
+  });
+
+  it("drops an open Add comment button when comment access is revoked", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    vi.mocked(permissions.useCanComment).mockReturnValue(true);
+    const { container, rerender } = renderViewer("hello world");
+    selectFirstLine(container);
+    expect(screen.getByRole("button", { name: /add comment/i })).toBeInTheDocument();
+
+    vi.mocked(permissions.useCanComment).mockReturnValue(false);
+    rerender(viewerElement("hello world"));
+    expect(screen.queryByRole("button", { name: /add comment/i })).toBeNull();
   });
 });
 

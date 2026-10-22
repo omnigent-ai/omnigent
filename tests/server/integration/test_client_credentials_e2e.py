@@ -336,7 +336,7 @@ async def test_machine_client_owns_and_operates_its_own_session(env: SimpleNames
 
     # ensure_user + owner grant actually landed for the machine principal.
     grant = env.permission_store.get(_MACHINE_SUB, session_id)
-    assert grant is not None and grant.level >= LEVEL_OWNER
+    assert grant is not None and grant.level == LEVEL_OWNER
 
     # Owner can read its own session's agent.
     agent = await env.client.get(f"/v1/sessions/{session_id}/agent", headers=auth)
