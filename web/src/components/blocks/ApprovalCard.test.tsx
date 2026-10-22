@@ -4,10 +4,17 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import {
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 import { BlockStream } from "@/lib/blockStream";
+import type { ElicitationBlock } from "@/lib/blocks";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
-import { useChatStore } from "@/store/chatStore";
+import { bindConversationForTest, useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
 afterEach(() => {
@@ -1336,6 +1343,277 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     // ("wants to call AskUserQuestion") would read as if the prompt
     // were still outstanding.
     expect(screen.queryByText(/wants to call/)).toBeNull();
+  });
+
+  describe("unsent answers across a remount", () => {
+    const draftQuestions: ClaudeQuestion[] = [
+      {
+        question: "Pick a codename",
+        header: "",
+        options: [
+          { label: "Alpha", description: "" },
+          { label: "Bravo", description: "" },
+        ],
+        multiSelect: false,
+      },
+      {
+        question: "Describe the rollout",
+        header: "",
+        options: [{ label: "Staged", description: "" }],
+        multiSelect: false,
+      },
+    ];
+
+    function pendingQuestionsCard(
+      elicitationId: string,
+      questions: ClaudeQuestion[],
+      block?: ElicitationBlock,
+    ) {
+      return (
+        <ApprovalCard
+          elicitationId={elicitationId}
+          message="Claude wants to call AskUserQuestion"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status={block?.status ?? "pending"}
+          response={block?.response ?? null}
+          askUserQuestion={{ questions }}
+        />
+      );
+    }
+
+    function renderPendingQuestions(elicitationId: string, questions: ClaudeQuestion[]) {
+      return render(pendingQuestionsCard(elicitationId, questions));
+    }
+
+    function answerFirstAndTypeSecond() {
+      fireEvent.click(screen.getByLabelText("Alpha"));
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+        target: { value: "Keep this partial answer" },
+      });
+    }
+
+    function expectFreshCard() {
+      expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
+      expect((screen.getByLabelText("Alpha") as HTMLInputElement).checked).toBe(false);
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "",
+      );
+    }
+
+    it("restores the carousel position, selection and typed text", () => {
+      const first = renderPendingQuestions("elic_draft_restore", draftQuestions);
+      answerFirstAndTypeSecond();
+      first.unmount();
+
+      renderPendingQuestions("elic_draft_restore", structuredClone(draftQuestions));
+
+      expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 2 of 2:");
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "Keep this partial answer",
+      );
+      expect(
+        (screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement).checked,
+      ).toBe(true);
+      fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+      expect((screen.getByLabelText("Alpha") as HTMLInputElement).checked).toBe(true);
+    });
+
+    it("starts fresh when the same elicitation id carries different questions", () => {
+      const first = renderPendingQuestions("elic_draft_reused", draftQuestions);
+      answerFirstAndTypeSecond();
+      first.unmount();
+
+      const [firstQuestion, ...rest] = draftQuestions;
+      renderPendingQuestions("elic_draft_reused", [
+        { ...firstQuestion!, question: "Pick another codename" },
+        ...rest,
+      ]);
+
+      expectFreshCard();
+    });
+
+    it("starts fresh when a mounted card's questions change", () => {
+      const first = renderPendingQuestions("elic_draft_replaced", draftQuestions);
+      answerFirstAndTypeSecond();
+      const [firstQuestion, ...rest] = draftQuestions;
+      const replaced = [{ ...firstQuestion!, question: "Pick another codename" }, ...rest];
+
+      first.rerender(pendingQuestionsCard("elic_draft_replaced", replaced));
+      expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
+      expect((screen.getByLabelText("Alpha") as HTMLInputElement).checked).toBe(false);
+      first.unmount();
+
+      renderPendingQuestions("elic_draft_replaced", replaced);
+      expectFreshCard();
+    });
+
+    it("keeps no draft for a card nobody answered", () => {
+      const [firstQuestion, ...rest] = draftQuestions;
+      const otherQuestions = [{ ...firstQuestion!, question: "Pick another codename" }, ...rest];
+      const otherDraft = {
+        currentIndex: 1,
+        selections: {},
+        customSelected: {},
+        customInputs: { "Describe the rollout": "Saved for other questions" },
+      };
+      saveAskUserQuestionDraft("elic_draft_untouched", otherQuestions, otherDraft);
+
+      const first = renderPendingQuestions("elic_draft_untouched", draftQuestions);
+      expect(getAskUserQuestionDraft("elic_draft_untouched", draftQuestions)).toBeUndefined();
+      expect(getAskUserQuestionDraft("elic_draft_untouched", otherQuestions)).toEqual(otherDraft);
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+      first.unmount();
+
+      expect(getAskUserQuestionDraft("elic_draft_untouched", draftQuestions)).toBeUndefined();
+    });
+
+    it("does not save a cleared draft again when the card rerenders with equal questions", () => {
+      const card = renderPendingQuestions("elic_draft_rerender", draftQuestions);
+      answerFirstAndTypeSecond();
+      clearAskUserQuestionDraft("elic_draft_rerender");
+
+      card.rerender(pendingQuestionsCard("elic_draft_rerender", structuredClone(draftQuestions)));
+
+      expect(getAskUserQuestionDraft("elic_draft_rerender", draftQuestions)).toBeUndefined();
+    });
+
+    it("drops the draft once a restored card's answers are undone", () => {
+      const regionQuestions: ClaudeQuestion[] = [
+        {
+          question: "Pick regions",
+          header: "",
+          options: [{ label: "eu-west", description: "" }],
+          multiSelect: true,
+        },
+      ];
+      const first = renderPendingQuestions("elic_draft_undone", regionQuestions);
+      fireEvent.click(screen.getByLabelText("eu-west"));
+      first.unmount();
+      expect(getAskUserQuestionDraft("elic_draft_undone", regionQuestions)).toBeDefined();
+
+      renderPendingQuestions("elic_draft_undone", regionQuestions);
+      fireEvent.click(screen.getByLabelText("eu-west"));
+
+      expect(getAskUserQuestionDraft("elic_draft_undone", regionQuestions)).toBeUndefined();
+    });
+
+    it.each([
+      ["Submit", () => fireEvent.click(screen.getByTestId("ask-user-question-submit"))],
+      ["Cancel", () => fireEvent.click(screen.getByRole("button", { name: /cancel/i }))],
+    ])("restores the answers when a failed %s returns the card", async (action, respond) => {
+      const elicitationId = `elic_draft_rollback_${action}`;
+      bindConversationForTest(`conv_draft_rollback_${action}`, {
+        blocks: [
+          {
+            type: "elicitation",
+            ctx: {
+              agent: null,
+              depth: 0,
+              turn: 0,
+              timestamp: 0,
+              responseId: "resp_1",
+              itemId: null,
+            },
+            elicitationId,
+            message: "Claude wants to call AskUserQuestion",
+            phase: "pre_tool_use",
+            policyName: "claude_native_permission",
+            contentPreview: "",
+            requestedSchema: {},
+            status: "pending",
+            response: null,
+          },
+        ],
+      });
+      useChatStore.setState({ submitApproval: useChatStore.getInitialState().submitApproval });
+      let failResolve: ((response: Response) => void) | undefined;
+      const fetchMock = vi.fn((input: RequestInfo | URL) =>
+        String(input).endsWith("/resolve")
+          ? new Promise<Response>((resolve) => {
+              failResolve = resolve;
+            })
+          : Promise.resolve(new Response("{}")),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      function StoreBackedCard() {
+        const block = useChatStore((s) =>
+          s.blocks.find((b): b is ElicitationBlock => b.type === "elicitation"),
+        );
+        return block ? pendingQuestionsCard(elicitationId, draftQuestions, block) : null;
+      }
+      try {
+        render(<StoreBackedCard />);
+        answerFirstAndTypeSecond();
+        respond();
+        expect(screen.queryByTestId("ask-user-question-progress")).toBeNull();
+        await vi.waitFor(() => expect(failResolve).toBeDefined());
+        await act(async () => failResolve!(new Response("{}", { status: 500 })));
+
+        expect(screen.getByTestId("ask-user-question-progress").textContent).toBe(
+          "Question 2 of 2:",
+        );
+        expect(
+          (screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value,
+        ).toBe("Keep this partial answer");
+      } finally {
+        cleanup();
+        vi.unstubAllGlobals();
+        bindConversationForTest(null);
+      }
+    });
+
+    it.each([
+      [
+        "typed",
+        () =>
+          fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+            target: { value: "sk-not-for-storage" },
+          }),
+      ],
+      ["chosen", () => fireEvent.click(screen.getByLabelText("Use the saved token"))],
+    ])("does not keep a %s answer to a secret question", (how, answerSecret) => {
+      const secretQuestions: ClaudeQuestion[] = [
+        {
+          id: "token",
+          question: "Paste the API token",
+          options: [{ label: "Use the saved token", description: "" }],
+          multiSelect: false,
+          isSecret: true,
+        },
+        { id: "region", question: "Pick a region", options: [], multiSelect: false },
+      ];
+      const elicitationId = `elic_draft_secret_${how}`;
+      const first = renderPendingQuestions(elicitationId, secretQuestions);
+      answerSecret();
+      expect(getAskUserQuestionDraft(elicitationId, secretQuestions)).toBeUndefined();
+      fireEvent.click(screen.getByTestId("ask-user-question-next"));
+      fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+        target: { value: "eu-west" },
+      });
+      first.unmount();
+
+      renderPendingQuestions(elicitationId, secretQuestions);
+
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "eu-west",
+      );
+      fireEvent.click(screen.getByTestId("ask-user-question-prev"));
+      expect((screen.getByLabelText("Use the saved token") as HTMLInputElement).checked).toBe(
+        false,
+      );
+      expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
+        "",
+      );
+      expect(
+        (screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement).checked,
+      ).toBe(false);
+    });
   });
 });
 

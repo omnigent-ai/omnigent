@@ -62,7 +62,9 @@ def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     return resp.json().get("pending_elicitations") or []
 
 
-def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> threading.Thread:
+def _post_ask_user_question(
+    base_url: str, session_id: str, holder: dict, questions: list[dict] | None = None
+) -> threading.Thread:
     """Park an ``AskUserQuestion`` permission request on *session_id*.
 
     The call blocks server-side until the web verdict lands, so it runs on
@@ -71,8 +73,13 @@ def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> thr
     :param base_url: Server base URL.
     :param session_id: Session to raise the prompt on.
     :param holder: Dict the thread writes ``response`` / ``error`` into.
+    :param questions: The tool's ``questions``; defaults to one Alpha/Bravo question.
     :returns: The started thread.
     """
+    if questions is None:
+        questions = [
+            {"question": "Which option do you prefer?", "options": [_OPTION_ONE, _OPTION_TWO]}
+        ]
 
     def _post() -> None:
         try:
@@ -80,14 +87,7 @@ def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> thr
                 f"{base_url}/v1/sessions/{session_id}/hooks/permission-request",
                 json={
                     "tool_name": "AskUserQuestion",
-                    "tool_input": {
-                        "questions": [
-                            {
-                                "question": "Which option do you prefer?",
-                                "options": [_OPTION_ONE, _OPTION_TWO],
-                            }
-                        ]
-                    },
+                    "tool_input": {"questions": questions},
                 },
                 timeout=60.0,
             )
@@ -142,6 +142,76 @@ def test_ask_user_question_form_renders_and_submits(
             "error"
         ]
 
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("leave_via", ["inbox", "other_session"])
+def test_partial_answers_survive_leaving_the_session(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+    leave_via: str,
+) -> None:
+    """A pending question card keeps partial answers after the user leaves and returns."""
+    base_url, session_id, other_session_id = seeded_session_pair
+    draft = "Keep this partial answer"
+    questions = [
+        {
+            "question": f"Question {number}?",
+            "header": f"Q{number}",
+            "multiSelect": False,
+            "options": [
+                {"label": _OPTION_ONE, "description": "first"},
+                {"label": _OPTION_TWO, "description": "second"},
+            ],
+        }
+        for number in (1, 2, 3)
+    ]
+    result_holder: dict = {}
+    hook_thread = _post_ask_user_question(base_url, session_id, result_holder, questions)
+    poll_until(lambda: _pending_elicitations(base_url, session_id))
+    pending_ids = [
+        event["elicitation_id"] for event in _pending_elicitations(base_url, session_id)
+    ]
+
+    page.goto(f"{base_url}/c/{session_id}")
+    card = (
+        page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
+        .filter(has=page.locator(_FORM))
+        .first
+    )
+    progress = card.get_by_test_id("ask-user-question-progress")
+    custom_input = card.get_by_test_id("ask-user-question-custom-input")
+    expect(progress).to_have_text("Question 1 of 3:", timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    card.get_by_role("radio", name=_OPTION_ONE).check()
+    card.get_by_test_id("ask-user-question-next").click()
+    expect(progress).to_have_text("Question 2 of 3:")
+    custom_input.fill(draft)
+
+    if leave_via == "inbox":
+        page.get_by_test_id("inbox-button").click()
+        expect(page.get_by_test_id("inbox-item").first).to_be_visible(timeout=15_000)
+    else:
+        page.locator(f'li[data-sidebar-session-id="{other_session_id}"] a').first.click()
+        expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
+    page.locator(f'li[data-sidebar-session-id="{session_id}"] a').first.click()
+
+    expect(card).to_be_visible(timeout=_MOCK_ELICITATION_TIMEOUT_MS)
+    assert [
+        event["elicitation_id"] for event in _pending_elicitations(base_url, session_id)
+    ] == pending_ids
+    expect(progress).to_have_text("Question 2 of 3:")
+    expect(custom_input).to_have_value(draft)
+    card.get_by_test_id("ask-user-question-prev").click()
+    expect(card.get_by_role("radio", name=_OPTION_ONE)).to_be_checked()
+
+    card.get_by_role("button", name="Cancel").click()
+    hook_thread.join(timeout=30)
+    assert not hook_thread.is_alive(), "hook call still parked after Cancel"
+    if "error" in result_holder:
+        raise AssertionError(f"hook thread failed: {result_holder['error']}") from result_holder[
+            "error"
+        ]
     poll_until(lambda: not _pending_elicitations(base_url, session_id))
 
 

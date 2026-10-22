@@ -28,11 +28,18 @@
 // Selections are gathered into a flat ``{[question id or text]:
 // answer}`` map matching MCP's ``ElicitResult.content`` shape and
 // passed to ``onSubmit``.
+//
+// Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useState } from "react";
+import { type ChangeEvent, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import {
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 
 /**
  * Map from question id/text → either a single selected label
@@ -41,6 +48,8 @@ import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 export type AskUserQuestionAnswers = Record<string, string | string[]>;
 
 interface AskUserQuestionFormProps {
+  /** Pending elicitation the questions belong to; keys the unsent draft. */
+  elicitationId: string;
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
@@ -82,13 +91,23 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({
+  elicitationId,
+  questions,
+  onSubmit,
+  onReject,
+}: AskUserQuestionFormProps) {
+  const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, questions));
+  // Form state belongs to the first questions; ApprovalCard remounts the form for new ones.
+  const [draftQuestions] = useState(questions);
+
   // Currently-visible question (carousel index).
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(draft?.currentIndex ?? 0);
 
   // Per-question option selection. Single-select stores a string;
   // multi-select stores a deduped array.
   const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
+    if (draft) return draft.selections;
     const initial: Record<string, string | string[]> = {};
     for (const q of questions) {
       initial[questionKey(q)] = q.multiSelect ? [] : "";
@@ -101,15 +120,48 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
   // is checked (which determines whether the typed text is part of
   // the answer).
   const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
+    if (draft) return draft.customSelected;
     const initial: Record<string, boolean> = {};
     for (const q of questions) initial[questionKey(q)] = false;
     return initial;
   });
   const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
+    if (draft) return draft.customInputs;
     const initial: Record<string, string> = {};
     for (const q of questions) initial[questionKey(q)] = "";
     return initial;
   });
+
+  useEffect(() => {
+    const draftSelections = { ...selections };
+    const draftSelected = { ...customSelected };
+    const draftInputs = { ...customInputs };
+    // Answers to a secret question are never kept past this mount.
+    for (const q of draftQuestions) {
+      if (!q.isSecret) continue;
+      draftSelections[questionKey(q)] = q.multiSelect ? [] : "";
+      draftSelected[questionKey(q)] = false;
+      draftInputs[questionKey(q)] = "";
+    }
+    // Untouched cards keep no draft, so they cannot evict real ones.
+    const untouched =
+      currentIndex === 0 &&
+      Object.values(draftSelections).every((selection) => selection.length === 0) &&
+      !Object.values(draftSelected).some(Boolean) &&
+      Object.values(draftInputs).every((text) => text === "");
+    if (untouched) {
+      if (getAskUserQuestionDraft(elicitationId, draftQuestions)) {
+        clearAskUserQuestionDraft(elicitationId);
+      }
+      return;
+    }
+    saveAskUserQuestionDraft(elicitationId, draftQuestions, {
+      currentIndex,
+      selections: draftSelections,
+      customSelected: draftSelected,
+      customInputs: draftInputs,
+    });
+  }, [elicitationId, draftQuestions, currentIndex, selections, customSelected, customInputs]);
 
   const handleSingleSelect = (key: string, label: string) => {
     // Single-select mutex: clicking a real option clears the

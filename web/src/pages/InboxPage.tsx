@@ -84,6 +84,7 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { latestOutputPreview } from "@/lib/lastAssistantText";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
@@ -326,6 +327,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          clearAskUserQuestionDraft(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           if (item.elicitation.nativeDelivery) {
             const queryKey = ["inbox-elicitations", item.row.id];
