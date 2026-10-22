@@ -588,6 +588,23 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
+  vendor model):**
+  `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`
+  interrupts through the runner's real event route, and the next idle settles
+  a sub-agent dispatch as cancelled with its output.
+  `tests/runner/test_native_interrupt_runner.py::test_opencode_interrupt_fallbacks`
+  covers missing native session state and a failed abort. Neither runs
+  OpenCode. With the CLI on `PATH`,
+  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`
+  (opt-in `OMNIGENT_E2E_OPENCODE_NATIVE=1`) checks the abort call against a
+  real server, and the matrix test covers cancelling during startup. No test
+  interrupts a running OpenCode turn: configure an OpenAI-compatible loopback
+  provider that holds the reply open, interrupt once the request arrives, then
+  confirm the session goes idle without turning busy again, a reply released
+  afterwards never appears, and a follow-up in the same session completes. The
+  harness bench does not register opencode-native, so its interrupt probe does
+  not apply.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -713,3 +730,6 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
+- OpenCode accepts an abort even when nothing is running, so an accepted
+  interrupt does not prove a turn was stopped. Check the session state and the
+  model request instead.
