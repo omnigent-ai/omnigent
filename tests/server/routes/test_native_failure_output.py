@@ -213,3 +213,23 @@ async def test_idle_enrichment_retains_its_existing_behavior() -> None:
         ],
     )
     assert result["output"] == "Completed output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "items",
+    [
+        pytest.param([], id="empty-store"),
+        pytest.param(
+            [_message("assistant", "The previous task succeeded.", "resp_old")],
+            id="earlier-reply-in-store",
+        ),
+    ],
+)
+async def test_confirmed_idle_output_from_the_forwarder_is_kept(
+    items: list[ConversationItem],
+) -> None:
+    """A confirmed turn's own idle-edge text reaches the parent, even over an earlier reply."""
+    notice = "Omnigent could not read this turn's output: the transcript never appeared."
+    result = await _enrich({"status": "idle", "turn_completed": True, "output": notice}, items)
+    assert result["output"] == notice
