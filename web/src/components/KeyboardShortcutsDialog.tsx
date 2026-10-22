@@ -80,6 +80,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
+      { label: "Rename current session", keys: [MOD_KEY, ALT_KEY, "R"] },
       { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],

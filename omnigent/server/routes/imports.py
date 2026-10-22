@@ -295,7 +295,7 @@ async def _stream_local_sessions_from_host(
         while True:
             try:
                 kind, data = await asyncio.wait_for(queue.get(), timeout=_HOST_IMPORT_TIMEOUT_S)
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise OmnigentError(
                     f"host '{host_conn.host_id}' stalled mid-import "
                     f"(no session within {_HOST_IMPORT_TIMEOUT_S:.0f}s)",

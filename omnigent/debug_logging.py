@@ -35,7 +35,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -532,9 +532,12 @@ def debug_event(
     string-valued attributes map, and pass ``session_id`` (and ``turn_id`` once
     it is wired) explicitly so the row is correlated to its session, e.g.::
 
-        _logger.info("dispatching tool", extra=debug_event(
-            "tool_call_dispatched", session_id=session_id,
-            tool_call_id=tc.id, model=model))
+        _logger.info(
+            "dispatching tool",
+            extra=debug_event(
+                "tool_call_dispatched", session_id=session_id, tool_call_id=tc.id, model=model
+            ),
+        )
 
     Explicit fields win over ambient lifecycle context. The sink enriches
     ordinary logs too: session/request/runner scopes on the server and host,
@@ -1353,7 +1356,7 @@ class SseFileHandler(logging.Handler):
 
     def _format_line(self, item: _SseFileItem) -> bytes:
         row = {
-            "ts": datetime.fromtimestamp(item.created, tz=timezone.utc).isoformat(),
+            "ts": datetime.fromtimestamp(item.created, tz=UTC).isoformat(),
             "source": self._source,
             "level": item.level,
             "conversation_id": item.session_id,

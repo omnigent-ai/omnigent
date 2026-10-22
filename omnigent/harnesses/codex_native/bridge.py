@@ -13,13 +13,12 @@ import stat
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-
-import tomllib
 
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.native import native_bridge_common

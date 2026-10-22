@@ -4296,7 +4296,7 @@ async def _timer_loop(
                 # httpx does not raise on 4xx/5xx by default; treat those
                 # as delivery failures so they share the warning path below.
                 resp.raise_for_status()
-            except (httpx.HTTPError, ValueError, asyncio.TimeoutError):
+            except (TimeoutError, httpx.HTTPError, ValueError):
                 _logger.warning(
                     "Timer %s firing persist failed for %s",
                     timer_id,

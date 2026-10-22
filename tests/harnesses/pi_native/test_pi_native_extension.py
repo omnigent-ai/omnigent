@@ -164,47 +164,53 @@ def _run_extension_script(node: str, extension_path: Path, script: str) -> None:
 
 
 def _usage_test_preamble() -> str:
-    """Shared Node harness: load the extension with a mocked fetch + Pi.
-
-    Exposes ``postedEvents`` (parsed request bodies), ``handlers`` (the
-    registered Pi event handlers), and a ``ctx`` stub.
-    """
+    """Load the extension with a real checkpoint directory and mocked Pi/HTTP edges."""
     return r"""
 const assert = require("assert").strict;
+const fs = require("fs");
 const path = require("path");
-
 const extensionPath = process.argv[1];
-const configPath = path.join(require("os").tmpdir(), `pi-usage-${process.pid}.json`);
-require("fs").writeFileSync(
-  configPath,
-  JSON.stringify({
-    serverUrl: "http://omnigent.test",
-    sessionId: "session-1",
-    authHeaders: { authorization: "Bearer test" },
-  }),
-);
+const root = fs.mkdtempSync(path.join(require("os").tmpdir(), "pi-usage-"));
+process.on("exit", () => fs.rmSync(root, { recursive: true, force: true }));
+const bridgeDir = path.join(root, "bridge");
+const inboxDir = path.join(root, "inbox");
+fs.mkdirSync(bridgeDir);
+fs.mkdirSync(inboxDir);
+const statePath = path.join(bridgeDir, "cumulative_usage.json");
+const configPath = path.join(root, "config.json");
+fs.writeFileSync(configPath, JSON.stringify({
+  serverUrl: "http://omnigent.test", sessionId: "session-1", bridgeDir, inboxDir,
+  authHeaders: { authorization: "Bearer test" },
+}));
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
-
 const postedEvents = [];
 global.fetch = async (_url, request) => {
   postedEvents.push(JSON.parse(request.body));
   return { ok: true };
 };
 global.setInterval = () => ({ fakeInterval: true });
-
-const handlers = {};
-const pi = {
-  registerCommand() {},
-  on(eventName, handler) {
-    handlers[eventName] = handler;
-  },
+function launchExtension() {
+  delete require.cache[require.resolve(extensionPath)];
+  const handlers = {};
+  require(extensionPath)({
+    registerCommand() {},
+    on(name, handler) { handlers[name] = handler; },
+  });
+  return handlers;
+}
+const handlers = launchExtension();
+const ctx = {
+  sessionManager: { getSessionId: () => "native-session-1" },
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
 };
-require(extensionPath)(pi);
-
-const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
-
 function usageEvents() {
   return postedEvents.filter((e) => e.type === "external_session_usage");
+}
+async function recordUsage(handlers, timestamp, input, output) {
+  await handlers.message_end({ message: {
+    role: "assistant", model: "databricks-claude-sonnet-4-6", timestamp,
+    usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output },
+  }}, ctx);
 }
 """
 
@@ -434,6 +440,91 @@ def test_distinct_messages_with_identical_usage_are_not_collapsed(
     _run_extension_script(node, extension_path, script)
 
 
+@pytest.mark.parametrize(
+    "baseline_source",
+    ["local", "server", "matching-local", "stale-local", "corrupt-local", "unreported-local"],
+)
+def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
+    """A fresh extension restores its checkpoint before accumulating the next turn."""
+    script = (
+        _usage_test_preamble()
+        + "\nconst baselineSource = "
+        + json.dumps(baseline_source)
+        + ";\n"
+        + r"""
+(async () => {
+
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 1000, 150000, 30000);
+  const saved = JSON.parse(fs.readFileSync(statePath));
+  assert.equal(saved.cumulative_input_tokens, 150000);
+  assert.equal(saved.cumulative_output_tokens, 30000);
+  if (baselineSource !== "local") {
+    const cfg = JSON.parse(fs.readFileSync(configPath));
+    cfg.usageBaseline = { ...saved };
+    delete cfg.usageBaseline.model;
+    if (baselineSource === "unreported-local") {
+      cfg.usageBaseline.cumulative_input_tokens = 100000;
+      cfg.usageBaseline.cumulative_output_tokens = 20000;
+    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg));
+    if (baselineSource === "server") fs.unlinkSync(statePath);
+    if (baselineSource === "corrupt-local") fs.writeFileSync(statePath, "{bad-json");
+    if (baselineSource === "stale-local") {
+      fs.writeFileSync(statePath, JSON.stringify({cumulative_input_tokens: 100000}));
+    }
+  }
+  postedEvents.length = 0;
+  const resumed = launchExtension();
+  await resumed.session_start({}, ctx);
+  await recordUsage(resumed, 2000, 900, 250);
+  const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
+  assert.deepEqual(usageEvents().map(({data}) => [
+    data.cumulative_input_tokens, data.cumulative_output_tokens, data.model,
+  ]), [
+    ...(reasserts ? [[150000, 30000, "databricks-claude-sonnet-4-6"]] : []),
+    [150900, 30250, "databricks-claude-sonnet-4-6"],
+  ]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_session_start_readiness_not_blocked_by_hung_usage_post() -> None:
+    """Readiness and inbox polling precede a stalled checkpoint POST."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  fs.writeFileSync(statePath, JSON.stringify({
+    cumulative_input_tokens: 150000, cumulative_output_tokens: 30000,
+    cumulative_cache_read_input_tokens: 0, model: "databricks-claude-sonnet-4-6",
+  }));
+  let usagePostAttempted = false;
+  let polling = false;
+  global.setInterval = () => { polling = true; return {}; };
+  global.fetch = async (_url, request) => {
+    if (JSON.parse(request.body).type === "external_session_usage") {
+      usagePostAttempted = true;
+      return new Promise(() => {});
+    }
+    return { ok: true };
+  };
+  handlers.session_start({}, ctx).catch(error => { console.error(error); process.exit(1); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(usagePostAttempted);
+  assert.ok(fs.existsSync(path.join(bridgeDir, "input_ready")));
+  assert.ok(polling);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
     tmp_path: Path,
 ) -> None:
@@ -486,6 +577,52 @@ def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
 """
     )
     _run_extension_script(node, extension_path, script)
+
+
+def test_restore_ignores_malformed_persisted_state() -> None:
+    """A truncated checkpoint does not contaminate the next usage report."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  fs.writeFileSync(statePath, "{not-json");
+  await handlers.session_start({}, ctx);
+  assert.equal(usageEvents().length, 0);
+  await recordUsage(handlers, 1000, 500, 100);
+  assert.deepEqual(usageEvents().map(({data}) => [
+    data.cumulative_input_tokens, data.cumulative_output_tokens,
+  ]), [[500, 100]]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_restore_never_lowers_a_higher_live_total() -> None:
+    """A stale checkpoint cannot lower the live cumulative total."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 1000, 150000, 30000);
+  fs.writeFileSync(statePath, JSON.stringify({
+    cumulative_input_tokens: 100000, cumulative_output_tokens: 20000,
+    cumulative_cache_read_input_tokens: 0, model: "databricks-claude-sonnet-4-6",
+  }));
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 2000, 500, 100);
+  const data = usageEvents().at(-1).data;
+  assert.equal(data.cumulative_input_tokens, 150500);
+  assert.equal(data.cumulative_output_tokens, 30100);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _extension_path() -> Path:
@@ -3920,7 +4057,6 @@ def test_native_auth_errors_are_correlated_and_redacted(tmp_path: Path) -> None:
         + "\nconst authDir = "
         + json.dumps(str(tmp_path))
         + r""";
-const fs = require("fs");
 const crypto = require("crypto");
 process.env.OMNIGENT_PI_NATIVE_AUTH_DIR = authDir;
 const id = crypto.createHash("sha256").update("omnigent").digest("hex").slice(0, 16);

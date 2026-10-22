@@ -2164,7 +2164,9 @@ async def test_search_invalid_q_returns_422(
 def glob_workspace(tmp_path: Path) -> Path:
     """Workspace with assorted file types/depths for glob filter tests.
 
-    Layout::
+    Layout:
+
+    .. code-block:: text
 
         app.ts
         app.test.ts

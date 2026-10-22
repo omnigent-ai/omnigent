@@ -38,6 +38,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -4057,10 +4058,12 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "OMNIGENT_CLAUDE_CODE_ENTRYPOINT": "gateway-client",
         "KUBECONFIG": "/home/alice/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL": "sonnet",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
@@ -4111,6 +4114,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # The claude-sdk harness sends this as the Claude CLI entrypoint.
+    assert env["OMNIGENT_CLAUDE_CODE_ENTRYPOINT"] == "gateway-client"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
@@ -4124,6 +4129,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    # The runner's background-title service reads this model override.
+    assert env["OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL"] == "sonnet"
     # Opaque request-routing headers forward host→runner so the runner's tunnel
     # and server callbacks reach the same server instance the host registered on
     # (without the operator also listing it in OMNIGENT_RUNNER_ENV_PASSTHROUGH).
@@ -4386,12 +4393,13 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
 
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
-def test_forge_config_paths_survive_daemon_and_runner_hops(
+def test_host_settings_survive_daemon_and_runner_hops(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_url: str | None
 ) -> None:
     from omnigent.cli import _build_host_daemon_env
 
     selectors = {
+        "OMNIGENT_HOST_SANDBOX_BACKEND": "phoenix-kubernetes",
         "GLAB_CONFIG_DIR": str(tmp_path / "glab"),
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
@@ -7754,6 +7762,176 @@ async def test_runner_status_settles_after_unsuccessful_launch(
             await asyncio.gather(query, return_exceptions=True)
 
 
+async def test_launch_handler_failure_still_answers_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected fault owes the server a result before it propagates.
+
+    Silence is not read as a failure: the server waits out its launch-result
+    timeout, treats that as a slow host, and only fails the turn after the
+    runner-connect wait as a generically unavailable runner, with the real
+    reason left behind in the host log.
+    """
+    host = _make_host_process()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_handler_failed",
+        binding_token="token_handler_failed",
+        workspace="/w",
+        session_id="session_handler_failed",
+    )
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("unsearchable CLI fallback directory")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    # Propagating is intended: the frame task logs the traceback, which is the
+    # only diagnostic an unexpected fault leaves.
+    with pytest.raises(RuntimeError, match="unsearchable CLI fallback directory"):
+        await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+    results = [decode_host_frame(raw) for raw in ws.sent]
+    launch_results = [
+        result for result in results if isinstance(result, HostLaunchRunnerResultFrame)
+    ]
+    assert len(launch_results) == 1, f"expected exactly one launch result, sent: {ws.sent}"
+    assert launch_results[0].request_id == frame.request_id
+    assert launch_results[0].status == "failed"
+    assert launch_results[0].error_code == LAUNCH_HANDLER_FAILED_ERROR_CODE
+    assert "unsearchable CLI fallback directory" in (launch_results[0].error or "")
+    # Status queries park on this future, so it has to settle on the raising
+    # path too or they wait for a launch that already failed.
+    assert all(
+        pending.done() for futures in host._pending_runner_launches.values() for pending in futures
+    )
+
+
+async def test_launch_handler_failure_is_attributed_to_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A code with no mapping of its own must not unattribute a host fault."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_attribution",
+        binding_token="token_attribution",
+        workspace="/w",
+        session_id="session_attribution",
+    )
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        with pytest.raises(RuntimeError):
+            await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    assert failure.attributes["error_code"] == LAUNCH_HANDLER_FAILED_ERROR_CODE
+    assert failure.attributes["error_category"] == "host"
+    assert failure.attributes["error_phase"] == "runner_launch"
+    assert failure.attributes["error_impact"] == "blocking"
+
+
+async def test_launch_handler_fault_after_spawn_leaves_the_launch_unanswered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault after the spawn must not tell the server no runner is coming.
+
+    Servers may terminate the launch or revoke its binding on a failed result,
+    so answering "failed" here could fail a turn whose runner still connects.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_fault_after_spawn",
+        binding_token="token_fault_after_spawn",
+        workspace=str(workspace),
+        session_id="session_fault_after_spawn",
+    )
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _raise_after_spawn(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("fault after the runner was spawned")
+
+    # Raised once the runner is registered, i.e. a live runner may connect.
+    monkeypatch.setattr(host, "_watch_runner_connect", _raise_after_spawn)
+
+    try:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            with pytest.raises(RuntimeError, match="fault after the runner was spawned"):
+                await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+        assert token_bound_runner_id(frame.binding_token) in host._runners, (
+            "the test must fault after the runner was spawned"
+        )
+        launch_results = [
+            result
+            for result in (decode_host_frame(raw) for raw in ws.sent)
+            if isinstance(result, HostLaunchRunnerResultFrame)
+        ]
+        assert launch_results == [], (
+            f"a post-spawn fault must not be answered as a failed launch, sent: {ws.sent}"
+        )
+        assert not host._spawned_launch_requests
+        assert all(
+            pending.done()
+            for futures in host._pending_runner_launches.values()
+            for pending in futures
+        )
+    finally:
+        _cleanup_host(host)
+
+
+async def test_launch_handler_fault_survives_a_lost_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel that drops the answer must not also drop the fault's traceback."""
+    host = _make_host_process()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_lost_answer",
+        binding_token="token_lost_answer",
+        workspace="/w",
+        session_id="session_lost_answer",
+    )
+
+    class _ClosedWs:
+        async def send(self, data: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("the real launch fault") from PermissionError("denied")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    # ConnectionClosed would be logged only at debug level as a dropped frame;
+    # the launch fault has to reach the frame task's traceback logging instead.
+    with pytest.raises(RuntimeError, match="the real launch fault") as raised:
+        await host._dispatch_host_frame(_ClosedWs(), frame)  # type: ignore[arg-type]
+    # The underlying cause is often the actual diagnostic; it must survive.
+    assert isinstance(raised.value.__cause__, PermissionError)
+
+
 async def test_stop_frame_never_overtakes_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8083,6 +8261,14 @@ async def test_launch_harness_probe_runs_off_the_event_loop(
 
     monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _record_thread)
 
+    hint_thread_ids: list[int] = []
+
+    def hint(harness):
+        hint_thread_ids.append(threading.get_ident())
+        return "run omni setup"
+
+    monkeypatch.setattr("omnigent.host.connect.harness_setup_hint", hint)
+
     result = await host._handle_launch(
         HostLaunchRunnerFrame(
             request_id="req_probe_thread",
@@ -8093,6 +8279,7 @@ async def test_launch_harness_probe_runs_off_the_event_loop(
     )
 
     assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert hint_thread_ids and loop_thread_id not in hint_thread_ids
     assert probe_thread_ids, "the harness probe should still run"
     assert loop_thread_id not in probe_thread_ids, (
         "harness readiness probe ran on the event loop thread"

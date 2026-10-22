@@ -20,10 +20,10 @@ Run::
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 
 # Worktree root: tests/e2e/<this file> -> parents[2].
 _REPO_ROOT = Path(__file__).resolve().parents[2]

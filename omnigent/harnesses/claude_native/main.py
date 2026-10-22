@@ -41,7 +41,7 @@ if sys.platform != "win32":
     import tty
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -5682,7 +5682,7 @@ def _claude_transcript_records_from_session_items(
                         "subtype": "compact_boundary",
                         "content": "Conversation compacted",
                         "isMeta": False,
-                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                         "uuid": boundary_uuid,
                         "level": "info",
                         # Claude scans every compact_boundary and destructures
@@ -5885,7 +5885,7 @@ def _claude_transcript_record_from_session_item(
         "userType": "external",
         "sessionId": session_id,
         "cwd": str(cwd),
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "message": message,
         **extra,
     }

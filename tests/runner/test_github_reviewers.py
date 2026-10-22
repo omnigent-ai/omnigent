@@ -117,6 +117,7 @@ def _pr_data() -> dict[str, object]:
         "statusCheckRollup": [],
         "body": "description",
         "comments": [],
+        "reviews": [],
         "latestReviews": [_review("alice", "APPROVED")],
         "reviewRequests": [{"__typename": "Team", "slug": "platform"}],
         "labels": [

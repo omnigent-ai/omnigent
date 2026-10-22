@@ -68,12 +68,15 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Compute the shard matrix once. A skipped run (draft / fork pull_request)
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
-    name: UI scope
+    name: UI coverage scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -184,7 +187,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       # ci.yml skips UI-only changes, so check here that the verify-omnigent
       # feature map still names tests that exist after UI test renames.
@@ -277,7 +280,7 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose

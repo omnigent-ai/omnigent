@@ -43,6 +43,8 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
@@ -2573,12 +2575,14 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_type", [False, True], ids=["default-type", "recorded-gz"])
 async def test_copy_spends_the_child_workspace_quota(
     file_client: httpx.AsyncClient,
     file_conv_store: _ConversationStore,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
     monkeypatch: pytest.MonkeyPatch,
+    recorded_type: bool,
 ) -> None:
     """Copies count against the child's workspace quota, like uploads."""
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
@@ -2591,7 +2595,19 @@ async def test_copy_spends_the_child_workspace_quota(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
     )
     first = _seed_parent_zip(file_store, artifact_store, "first.zip")
-    second = _seed_parent_zip(file_store, artifact_store, "second.zip")
+    if recorded_type:
+        # Counted by its recorded delivery, since .gz isn't a default extension.
+        stored = file_store.create(
+            session_id="b460374fc8e697b296708f52dc9d8179",
+            filename="second.gz",
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata={"delivery": "filesystem"},
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        second = stored.id
+    else:
+        second = _seed_parent_zip(file_store, artifact_store, "second.zip")
     url = "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy"
     source = "b460374fc8e697b296708f52dc9d8179"
 
@@ -2633,6 +2649,43 @@ async def test_native_forward_leaves_a_workspace_file_for_the_runner(
     )
     assert forwarded["content"] == [zip_block]
     assert "File reference resolution failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_native_forward_drops_client_delivery_claims(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Only an upload's stored record can mark a file for filesystem delivery."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [
+        {"type": "input_file", "file_id": upload.json()["id"], "delivery": "filesystem"},
+        {
+            "type": "input_file",
+            "filename": "inline.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+            "delivery": "filesystem",
+        },
+    ]
+
+    resp = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert len(forwarded["content"]) == 2
+    assert all("delivery" not in block for block in forwarded["content"])
 
 
 @pytest.mark.asyncio
@@ -6261,7 +6314,7 @@ async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
 
     try:
         request = asyncio.create_task(persist())
-        await asyncio.to_thread(store.first_append_started.wait, 5)
+        assert await asyncio.to_thread(store.first_append_started.wait, budget(5))
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
             await request
@@ -6273,10 +6326,15 @@ async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
         assert pending_inputs.resolve_matching_text(sid, "still here?").matched is None
 
         store.release_first_append.set()
-        for _attempt in range(200):
-            if not pending_inputs.snapshot_for(sid):
-                break
-            await asyncio.sleep(0.01)
+        # Settlement precedes title seeding and publication of the final receipt.
+        await poll_until_async(
+            lambda: any(
+                event.get("type") == "session.input.consumed"
+                and event["data"]["cleared_pending_id"] == matched
+                for _conversation_id, event in published
+            ),
+            timeout_s=budget(5),
+        )
 
         assert pending_inputs.snapshot_for(sid) == []
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
@@ -9781,30 +9839,74 @@ async def test_pr_edit_reaches_offline_host(
 
 
 @pytest.mark.asyncio
-async def test_copy_new_type_refuses_old_runtime(
+@pytest.mark.parametrize(
+    ("filename", "host_tier", "status"),
+    [
+        ("archive.zip", "none", 409),
+        ("archive.zip", "attachments", 200),
+        ("trace.gz", "attachments", 409),
+        ("trace.gz", "current", 200),
+    ],
+    ids=[
+        "default-type-needs-attachments",
+        "default-type-on-attachments-host",
+        "recorded-type-needs-delivery",
+        "recorded-type-on-current-host",
+    ],
+)
+async def test_copy_requires_the_hosts_attachment_support(
     file_client: httpx.AsyncClient,
     file_app: FastAPI,
     file_conv_store: _ConversationStore,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
+    filename: str,
+    host_tier: str,
+    status: int,
 ) -> None:
-    """A capable harness on an old host cannot receive a copied binary file."""
+    """A copy into a capable harness still needs a host that can deliver the file."""
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     child = "405bfe154d5c0e795a2b87021bc897bf"
     parent = "b460374fc8e697b296708f52dc9d8179"
     file_conv_store._conversations[child].labels.update(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
     )
-    file_app.state.host_registry.get("host_files").hello.capabilities = []
-    file_id = _seed_parent_zip(file_store, artifact_store, "archive.zip")
+    file_app.state.host_registry.get("host_files").hello.capabilities = {
+        "none": [],
+        "attachments": [CAP_FILESYSTEM_ATTACHMENTS],
+        "current": HOST_CAPABILITIES,
+    }[host_tier]
+    if filename.endswith(".zip"):
+        file_id = _seed_parent_zip(file_store, artifact_store, filename)
+        source_metadata = None
+    else:
+        # Outside the default extensions, so only the record marks it for disk.
+        source_metadata = {"delivery": "filesystem"}
+        stored = file_store.create(
+            session_id=parent,
+            filename=filename,
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata=source_metadata,
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        file_id = stored.id
+
     response = await file_client.post(
         f"/v1/sessions/{child}/resources/files:copy",
         json={"source_session_id": parent, "file_ids": [file_id]},
     )
-    assert response.status_code == 409, response.text
-    assert file_store.list(child).data == []
+
+    assert response.status_code == status, response.text
     assert file_store.get(file_id, session_id=parent) is not None
+    if status == 200:
+        copied = file_store.get(response.json()["mapping"][file_id]["new_id"], session_id=child)
+        assert copied is not None
+        assert copied.source_metadata == source_metadata
+    else:
+        assert file_store.list(child).data == []
 
 
 @pytest.mark.asyncio
@@ -9850,6 +9952,70 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retained_history", "host_has_attachments", "status"),
+    [(False, True, 409), (True, True, 202), (True, False, 409)],
+)
+async def test_native_send_requires_delivery_support_for_new_types(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+    host_has_attachments: bool,
+    status: int,
+) -> None:
+    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+
+    A recorded file in retained history still needs filesystem attachment support.
+    """
+    from omnigent.entities import MessageData
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENTS,
+        FilesystemAttachmentPolicy,
+    )
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+        all_types=True
+    )
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [{"type": "input_file", "file_id": upload.json()["id"]}]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached trace again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = (
+        [CAP_FILESYSTEM_ATTACHMENTS] if host_has_attachments else []
+    )
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == status, response.text
+    if status == 202:
+        assert runner.post_json_calls
+    else:
+        assert runner.post_json_calls == []
+        if not retained_history:
+            assert "this file type" in response.text
 
 
 @pytest.mark.asyncio

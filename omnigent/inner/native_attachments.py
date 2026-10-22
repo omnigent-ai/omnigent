@@ -20,13 +20,14 @@ import contextlib
 import errno
 import hashlib
 import logging
+import mimetypes
 import os
 import re
 import shutil
 import stat
 import urllib.parse
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any, Literal
@@ -99,9 +100,10 @@ MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
 MAX_SESSION_FILESYSTEM_ATTACHMENTS: int = 20
 MAX_SESSION_FILESYSTEM_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
 
-# These formats require the harness's filesystem tools. Match by extension
-# because browsers can mislabel Office documents as ZIP or generic binary data.
-_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
+# These formats require the harness's filesystem tools by default. Match by
+# extension because browsers can mislabel Office documents as ZIP or generic
+# binary data.
+DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
     {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
 )
 
@@ -111,6 +113,38 @@ FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "c
 # Advertised by builds that can deliver and restore these attachments.
 CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
 
+# Advertised by builds that follow the delivery recorded for an upload, so a
+# type outside the default extensions also reaches the harness as a file.
+CAP_FILESYSTEM_ATTACHMENT_DELIVERY = "filesystem_attachment_delivery"
+
+# Key recording how an upload is delivered, in its ``source_metadata`` and on
+# the content block a runner rebuilds from it.
+DELIVERY_KEY = "delivery"
+FILESYSTEM_DELIVERY = "filesystem"
+INLINE_DELIVERY = "inline"
+
+
+@dataclass(frozen=True)
+class FilesystemAttachmentPolicy:
+    """
+    Which uploads a deployment delivers through the harness's filesystem tools.
+
+    :param extensions: Lowercase extensions always delivered as files,
+        matched by name before the MIME type, e.g. ``frozenset({".zip"})``.
+    :param all_types: Whether every other file that can't be inlined is
+        delivered as a file too, instead of being refused.
+    """
+
+    extensions: frozenset[str] = DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
+    all_types: bool = False
+
+    def matches(self, filename: str | None) -> bool:
+        """Whether *filename* has one of :attr:`extensions`."""
+        return bool(filename and PurePath(filename).suffix.lower() in self.extensions)
+
+
+DEFAULT_FILESYSTEM_ATTACHMENT_POLICY = FilesystemAttachmentPolicy()
+
 
 def requires_filesystem(filename: str | None) -> bool:
     """
@@ -119,12 +153,45 @@ def requires_filesystem(filename: str | None) -> bool:
     :param filename: The original filename, e.g. ``"report.docx"``.
     :returns: True for supported archives, Office documents, and databases.
     """
-    return bool(
-        filename and PurePath(filename).suffix.lower() in _FILESYSTEM_ATTACHMENT_EXTENSIONS
-    )
+    return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY.matches(filename)
 
 
-def inline_filesystem_attachment_name(content: object) -> str | None:
+def uses_filesystem_delivery(filename: str | None, metadata: object) -> bool:
+    """
+    Whether a stored upload is delivered as a file.
+
+    The upload route records its decision, so a later policy change does not
+    alter files a session already holds. Records without one predate it and
+    follow the default extensions.
+
+    :param filename: The stored filename, e.g. ``"trace.gz"``.
+    :param metadata: The file's ``source_metadata``, or a content block
+        rebuilt from it, e.g. ``{"delivery": "filesystem"}``.
+    :returns: True when the harness must open the file from disk.
+    """
+    delivery = metadata.get(DELIVERY_KEY) if isinstance(metadata, Mapping) else None
+    if delivery in (FILESYSTEM_DELIVERY, INLINE_DELIVERY):
+        return delivery == FILESYSTEM_DELIVERY
+    return requires_filesystem(filename)
+
+
+def filesystem_attachment_capability(filenames: Iterable[str | None]) -> str:
+    """
+    Runtime capability needed to deliver these filesystem attachments.
+
+    :param filenames: Names of files delivered as files, e.g. ``["a.zip"]``.
+    :returns: :data:`CAP_FILESYSTEM_ATTACHMENT_DELIVERY` when any name is
+        outside the default extensions, else :data:`CAP_FILESYSTEM_ATTACHMENTS`.
+    """
+    if all(requires_filesystem(filename) for filename in filenames):
+        return CAP_FILESYSTEM_ATTACHMENTS
+    return CAP_FILESYSTEM_ATTACHMENT_DELIVERY
+
+
+def inline_filesystem_attachment_name(
+    content: object,
+    requires: Callable[[str, str | None], bool] | None = None,
+) -> str | None:
     """
     Filename of the first attachment requiring filesystem tools with inline bytes.
 
@@ -133,19 +200,61 @@ def inline_filesystem_attachment_name(content: object) -> str | None:
     reach the sandbox.
 
     :param content: A message's content blocks.
-    :returns: The offending filename, e.g. ``"payload.zip"``, or ``None``.
+    :param requires: Deployment check given a filename and its data-URI MIME
+        type, applied in addition to the default extensions. An unnamed block
+        is checked as ``attachment`` plus its MIME type's extension, e.g.
+        ``"attachment.gz"``.
+    :returns: The offending filename, e.g. ``"payload.zip"``, the MIME type of
+        an unnamed one, e.g. ``"application/gzip"``, or ``None``.
     """
     if not isinstance(content, list):
         return None
     for block in content:
         if not isinstance(block, dict):
             continue
-        filename = block.get("filename")
-        if not isinstance(filename, str) or not requires_filesystem(filename):
+        data_uri = block.get("file_data") or block.get("image_url")
+        if not data_uri:
             continue
-        if block.get("file_data") or block.get("image_url"):
-            return filename
+        mime = _data_uri_mime(data_uri)
+        filename = block.get("filename")
+        if isinstance(filename, str):
+            name = filename
+        elif mime is not None:
+            # Extension-based policies need a name; only the MIME says what these bytes are.
+            name = f"attachment{_extension_for_mime(mime)}"
+        else:
+            continue
+        if requires_filesystem(name) or (requires is not None and requires(name, mime)):
+            return filename if isinstance(filename, str) else mime
     return None
+
+
+# Filesystem types that ``mimetypes.guess_extension`` can't name: it treats
+# compression as an encoding, and has no SQLite type.
+_MIME_EXTENSIONS: dict[str, str] = {
+    "application/gzip": ".gz",
+    "application/x-gzip": ".gz",
+    "application/x-bzip2": ".bz2",
+    "application/x-xz": ".xz",
+    "application/x-compress": ".Z",
+    "application/vnd.sqlite3": ".sqlite",
+    "application/x-sqlite3": ".sqlite",
+}
+
+
+def _extension_for_mime(mime: str) -> str:
+    """Return an extension for *mime*, e.g. ``".bz2"``, or ``""`` when unknown."""
+    return _MIME_EXTENSIONS.get(mime.lower()) or mimetypes.guess_extension(mime) or ""
+
+
+def _data_uri_mime(data_uri: object) -> str | None:
+    """Return a data URI's MIME type, or ``None`` when it isn't one."""
+    if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
+        return None
+    try:
+        return parse_data_uri(data_uri).mime_type or None
+    except ValueError:
+        return None
 
 
 def attachment_cache_dir(bridge_dir: Path) -> Path:
@@ -659,18 +768,25 @@ async def resolve_file_id_block(
     # Strip any charset suffix: data URIs need the media type hint.
     content_type = content_type.split(";", 1)[0]
     encoded = base64.b64encode(content_resp.content).decode("ascii")
-    new_block = {k: v for k, v in block.items() if k != "file_id"}
+    new_block = {k: v for k, v in block.items() if k not in ("file_id", DELIVERY_KEY)}
     stored_name = meta.get("name")
     if isinstance(stored_name, str) and stored_name:
         # The stored name decides delivery. The block's own filename comes from
         # the client and could steer an upload past the upload checks.
         new_block["filename"] = stored_name
+    resource_metadata = meta.get("metadata")
+    source_metadata = (
+        resource_metadata.get("source_metadata")
+        if isinstance(resource_metadata, Mapping)
+        else None
+    )
+    delivery = source_metadata.get(DELIVERY_KEY) if isinstance(source_metadata, Mapping) else None
+    if delivery in (FILESYSTEM_DELIVERY, INLINE_DELIVERY):
+        new_block[DELIVERY_KEY] = delivery
     notice: dict[str, int] | None = None
     if block.get("type") == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
-        resource_metadata = meta.get("metadata")
-        if isinstance(resource_metadata, Mapping):
-            notice = resize_dimensions(resource_metadata.get("source_metadata"))
+        notice = resize_dimensions(source_metadata)
     else:
         new_block["file_data"] = f"data:{content_type};base64,{encoded}"
     return new_block, notice

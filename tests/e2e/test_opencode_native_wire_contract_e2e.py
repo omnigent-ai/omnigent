@@ -100,7 +100,7 @@ async def test_opencode_native_wire_contract_against_real_server() -> None:
 
             try:
                 event = await asyncio.wait_for(_first_event(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 event = None
             if event is not None:
                 assert isinstance(event.type, str)

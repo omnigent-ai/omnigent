@@ -489,7 +489,7 @@ class TunnelRegistry:
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         finally:
             with self._lock:

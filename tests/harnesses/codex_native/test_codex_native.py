@@ -7,6 +7,7 @@ import base64
 import contextlib
 import json
 import os
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -17,7 +18,6 @@ from typing import Any
 import click
 import httpx
 import pytest
-import tomllib
 import yaml
 from PIL import Image
 

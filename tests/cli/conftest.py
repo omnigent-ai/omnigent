@@ -28,3 +28,4 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
     monkeypatch.delenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", raising=False)
+    monkeypatch.setattr("omnigent.session_host._session_hosts", {})

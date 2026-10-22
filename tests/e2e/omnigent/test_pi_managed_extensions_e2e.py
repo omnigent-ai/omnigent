@@ -24,9 +24,9 @@ import uuid
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests.e2e._harness_probes import cli_unavailable_reason
+from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
 from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
 _EXTENSION_PATH = (
@@ -44,29 +44,6 @@ pytestmark = pytest.mark.skipif(
         f"{_pytest_pi_unavailable}. Install/fix Pi to run this test."
     ),
 )
-
-
-def _write_pi_gateway_config(config_home: Path, *, mock_url: str, model: str) -> None:
-    """Write a provider config that puts pi in gateway mode against the mock LLM."""
-    config = {
-        "auth": {"type": "api_key"},
-        "providers": {
-            "mock-oai": {
-                "kind": "key",
-                "default": True,
-                "openai": {
-                    "base_url": f"{mock_url}/v1",
-                    "api_key": "mock-key",
-                    "models": {"default": model},
-                },
-            },
-        },
-    }
-    config_home.mkdir(parents=True, exist_ok=True)
-    (config_home / "config.yaml").write_text(
-        yaml.safe_dump(config, sort_keys=False),
-        encoding="utf-8",
-    )
 
 
 def _seed_pi_extension_home(home: Path) -> Path:
@@ -113,7 +90,7 @@ def test_pi_gateway_run_loads_global_extensions(
     assert not marker_path.exists()
 
     config_home = tmp_path / "omnigent-config"
-    _write_pi_gateway_config(config_home, mock_url=mock_llm_server_url, model=model)
+    write_pi_gateway_config(config_home, mock_url=mock_llm_server_url, model=model)
 
     env = dict(mock_credentials_env)
     env["HOME"] = str(fake_home)
