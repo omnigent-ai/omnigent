@@ -1124,6 +1124,37 @@ function makeAnchoredComment(
 }
 
 describe("classifyAndRemapComments", () => {
+  it.each(["doc.md", "doc.markdown", "doc.MD"])(
+    "preserves a markup-spanning raw range in %s instead of relocating to a literal copy",
+    (path) => {
+      const comment = makeAnchoredComment({
+        id: "split-word",
+        path,
+        start_index: 21,
+        end_index: 27,
+        anchor_content: "word",
+      });
+
+      expect(classifyAndRemapComments([comment], "[Details](word) word wo**rd**").open).toEqual([
+        comment,
+      ]);
+    },
+  );
+
+  it.each(["file1.py", "doc.md"])("still remaps literal source selections in %s", (path) => {
+    const comment = makeAnchoredComment({
+      id: "literal-word",
+      path,
+      start_index: 0,
+      end_index: 4,
+      anchor_content: "word",
+    });
+
+    expect(classifyAndRemapComments([comment], "prefix word").open).toEqual([
+      { ...comment, start_index: 7, end_index: 11 },
+    ]);
+  });
+
   it("buckets addressed comments separately and never remaps them", () => {
     const fileContent = "AAAA\nhello world\n";
     const addressed = makeAnchoredComment({

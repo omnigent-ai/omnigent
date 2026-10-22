@@ -75,6 +75,11 @@ function slice(source: Source, start: number, end = source.text.length): Source 
   };
 }
 function rawText(token: MarkdownToken): string {
+  if (token.type === "list_item" && token.text === undefined) {
+    const nested = token.tokens?.at(-1);
+    if (nested?.type === "list" && nested.ordered && nested.raw)
+      return `${token.raw ?? ""}\n${nested.raw}`;
+  }
   return token.type === "taskList" ? (token.raw ?? "").replace(/\n$/, "") : (token.raw ?? "");
 }
 
@@ -92,6 +97,34 @@ function locate(source: Source, text: string, from = 0): Source | null {
     cursor = found + line.length;
   }
   return offsets.length === text.length ? { text, start: offsets[0], offsets } : null;
+}
+
+function tableCellSources(row: Source): Source[] {
+  const cells: Source[] = [];
+  let start = 0;
+  for (const separator of row.text.matchAll(/\|/g)) {
+    let escapeStart = separator.index;
+    while (escapeStart > 0 && row.text[escapeStart - 1] === "\\") escapeStart--;
+    if ((separator.index - escapeStart) % 2 !== 0) continue;
+    cells.push(slice(row, start, separator.index));
+    start = separator.index + 1;
+  }
+  cells.push(slice(row, start));
+  if (!cells[0].text.trim()) cells.shift();
+  if (cells.length && !cells[cells.length - 1].text.trim()) cells.pop();
+  return cells.map((cell) => {
+    const leading = cell.text.length - cell.text.trimStart().length;
+    const trimmed = slice(cell, leading, cell.text.trimEnd().length);
+    if (!trimmed.text.includes("\\|")) return trimmed;
+    let text = "";
+    const offsets: number[] = [];
+    for (let index = 0; index < trimmed.text.length; index++) {
+      if (trimmed.text[index] === "\\" && trimmed.text[index + 1] === "|") continue;
+      text += trimmed.text[index];
+      offsets.push(offset(trimmed, index));
+    }
+    return { text, start: offsets[0] ?? trimmed.start, offsets };
+  });
 }
 
 // Returns the text-bearing top-level blocks, or null when a token cannot be
@@ -171,7 +204,6 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): TokenBlock[]
         emit(token.text ?? "", slice(view, 1));
         return;
       case "table": {
-        if (/\\\|/.test(view.text)) unmapped();
         const rows = [token.header, ...(token.rows ?? [])] as {
           text: string;
           tokens: MarkdownToken[];
@@ -183,14 +215,16 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): TokenBlock[]
           if (rowIndex === 1) lineStart += lines[1]?.length ?? 0;
           const lineIndex = rowIndex === 0 ? 0 : rowIndex + 1;
           const line = slice(view, lineStart, lineStart + (lines[lineIndex]?.length ?? 0));
-          let cursor = 0;
-          for (const cell of rows[rowIndex]) {
+          const sources = tableCellSources(line);
+          for (const [cellIndex, cell] of rows[rowIndex].entries()) {
             textblock++;
-            if (!cell.text) continue;
-            const at = line.text.indexOf(cell.text, cursor);
-            if (at === -1) unmapped();
-            children(cell.tokens, slice(line, at, at + cell.text.length));
-            cursor = at + cell.text.length;
+            const cellSource = sources[cellIndex];
+            if (!cell.text) {
+              if (cellSource?.text) unmapped();
+              continue;
+            }
+            if (!cellSource || cellSource.text !== cell.text) unmapped();
+            children(cell.tokens, cellSource);
           }
           lineStart += line.text.length;
         }
@@ -234,7 +268,7 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): TokenBlock[]
       }
       case "list_item":
       case "taskItem": {
-        const marker = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.exec(view.text);
+        const marker = /^[ \t]*(?:[-+*]|(?:\d+|[a-zA-Z]+)[.)])[ \t]+/.exec(view.text);
         const body = slice(view, marker?.[0].length ?? 0);
         const inner = token.text === undefined ? body : locate(body, token.text);
         if (!inner) unmapped();

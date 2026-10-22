@@ -6,6 +6,8 @@ import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
 import { markdownSourceMap } from "./markdownSourceMap";
 import callTable from "../../../tests/e2e_ui/comments/fixtures/call-table.md?raw";
+import mixedStructures from "../../../tests/e2e_ui/comments/fixtures/mixed-structures.md?raw";
+import escapedPipe from "../../../tests/e2e_ui/comments/fixtures/escaped-pipe.md?raw";
 
 installMarkdownParserPatch();
 let editor: Editor;
@@ -35,6 +37,35 @@ function legacySelection(from: number, to: number, doc: ReturnType<typeof parse>
 const link = `[Details](https://example.com/${"x".repeat(2000)})`;
 // Brackets identify the expected raw range independently of the implementation.
 const cases: [string, string, number, string?][] = [
+  ["escaped pipe elsewhere in document", escapedPipe.replace("**word**", "**⟦word⟧**"), 1],
+  ["escaped pipe cell", "| A | B |\n| --- | --- |\n| word \\| ⟦word⟧ | word |", 1],
+  ["escaped pipe header", "| word \\| ⟦word⟧ | B |\n| --- | --- |\n| word | word |", 1],
+  ["escaped pipe CRLF", "| A | B |\r\n| --- | --- |\r\n| word \\| ⟦word⟧ | word |", 1],
+  ["escaped pipe without outer delimiters", "A | B\n--- | ---\nword \\| ⟦word⟧ | word", 1],
+  ["escaped pipe in bold", "| A | B |\n| --- | --- |\n| **word \\| ⟦word⟧** | word |", 1],
+  ["escaped pipe in code", "| A | B |\n| --- | --- |\n| `word \\| ⟦word⟧` | word |", 1],
+  ["escaped pipe in quote", "> | A | B |\n> | --- | --- |\n> | word \\| ⟦word⟧ | word |", 1],
+  ["escaped pipe span", "| A | B |\n| --- | --- |\n| ⟦left \\| right⟧ | word |", 0, "left | right"],
+  ["escaped pipe character", "| A | B |\n| --- | --- |\n| left \\⟦|⟧ right | word |", 0, "|"],
+  ["repeated pipe cells", "| A | B |\n| --- | --- |\n| \\| | \\⟦|⟧ |", 1, "|"],
+  [
+    "empty cells before duplicate",
+    "| A | B | C |\n| --- | --- | --- |\n| | word \\| | ⟦word⟧ |",
+    1,
+  ],
+  ["missing cells", "| A | B |\n| --- | --- |\n| word \\| ⟦word⟧ |", 1],
+  ["extra cells", "| A | B |\n| --- | --- |\n| word \\| ⟦word⟧ | word | ignored |", 1],
+  ...[1, 2, 3, 4, 5, 6].map((slashes): [string, string, number] => [
+    `pipe after ${slashes} backslashes`,
+    `| A | B |\n| --- | --- |\n| word ${"\\".repeat(slashes)}| ⟦word⟧ |`,
+    1,
+  ]),
+  ["mixed structures", mixedStructures.replace("2. word **word**", "2. word **⟦word⟧**"), 17],
+  ["nested ordered list parent", "1. word\n2. **⟦word⟧**\n   1. word\n3. word", 1],
+  ["nested ordered list child", "1. word\n2. **word**\n   1. ⟦word⟧\n3. word", 2],
+  ["deep ordered marker duplicate", "1. word\n   1. word\n      1. ⟦1⟧\n2. word", 0, "1"],
+  ["alphabetic and roman list markers", "a. word\n   i. word\n   ii. **⟦word⟧**\nb. word", 2],
+  ["ordered list blank lines", "1. word\n\n   1. word\n\n2. ⟦word⟧\n", 2],
   ["heading marker", "# ⟦#⟧ hello\n\n#", 0, "#"],
   ["ordered list marker", "1. ⟦1⟧\n2. 1", 0, "1"],
   ["single-tilde strikethrough", `~word~ **⟦word⟧** word\n\n${link}`, 1],
@@ -44,6 +75,18 @@ const cases: [string, string, number, string?][] = [
   ["escaped ampersand", "\\& word ⟦word⟧", 1],
   ["original repro", `# Anchors\n\n**word** and **⟦word⟧**\n\n**word**\n\n${link}`, 1],
   ["hidden URL and split bold", "[Details](word) ⟦word⟧ wo**rd**", 0],
+  ["selected split bold after hidden URL", "[Details](word) word ⟦wo**rd⟧**", 1],
+  ["selected split italic", "word ⟦wo*rd⟧* word", 1],
+  ["selected split strike", "word ⟦wo~~rd⟧~~ word", 1],
+  ["selected split code", "word ⟦wo`rd⟧` word", 1],
+  ["selected split HTML", "[Details](word) word ⟦wo<em>rd⟧</em>", 1],
+  ["selected repeated split bold", "wo**rd** wo**rd** ⟦wo**rd⟧**", 2],
+  ["selected nested marks", "word **⟦wo*rd⟧*** word", 1],
+  ["selected split link", "word [⟦wo](word)rd⟧ word", 1],
+  ["selected entity", "word ⟦&#119;ord⟧ word", 1],
+  ["selected emoji entity", "😀 ⟦&#x1F600;⟧ 😀", 1, "😀"],
+  ["selected formatted phrase", "say word now ⟦say **word** now⟧", 1, "say word now"],
+  ["selected split table word", "| Call | B |\n| --- | --- |\n| Call | ⟦Ca**ll⟧** |", 2, "Call"],
   ["hidden URL and split HTML", "[Details](word) ⟦word⟧ wo<em>rd</em>", 0],
   ["hidden image label and split bold", "![word](logo.png)\n\n⟦word⟧ wo**rd**", 0],
   ["URL", `[Details](https://example.com/word/${"x".repeat(2000)})\n\nword ⟦word⟧ word`, 1],
@@ -92,15 +135,24 @@ describe("validated Markdown source positions", () => {
       ["bold", callTable.replaceAll("Call.", "**Call.**")],
       ["inline code", callTable.replaceAll("Call.", "`Call.`")],
       ["Unicode heading and hidden URL", `# Notes 😀\n\n${link}\n\n${callTable}`],
-    ].flatMap(([name, raw]) =>
-      ["Call", "Call.", "call", "(preview: as before). No call (preview: call)."].map((phrase) => [
-        name,
-        phrase,
-        raw,
+    ]
+      .flatMap(([name, raw]) =>
+        ["Call", "Call.", "call", "(preview: as before). No call (preview: call)."].map(
+          (phrase) => [name, phrase, raw],
+        ),
+      )
+      .concat([
+        ["mixed structures", "word", mixedStructures],
+        ["mixed structures CRLF", "word", mixedStructures.replaceAll("\n", "\r\n")],
+        ["mixed structures after hidden URL", "word", `${link}\n\n${mixedStructures}`],
+        ["serialized mixed structures", "word", mixedStructures],
+        ["escaped pipe repeated calls", "call", escapedPipe],
+        ["escaped pipe repeated previews", "preview", escapedPipe],
+        ["escaped pipe repeated No", "No", escapedPipe],
       ]),
-    ),
-  )("preserves every table occurrence: %s / %s", (_name, phrase, raw) => {
-    const doc = parse(raw);
+  )("preserves every fixture occurrence: %s / %s", (name, phrase, source) => {
+    const doc = parse(source);
+    const raw = name === "serialized mixed structures" ? editor.getMarkdown() : source;
     expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
     let sourceCursor = 0;
     let matched = 0;
@@ -166,6 +218,30 @@ describe("validated Markdown source positions", () => {
     },
   );
 
+  it("restores a legacy-captured offset to its stored copy rather than the old heuristic's copy", () => {
+    const raw = `word word word\n\n${link}`;
+    const doc = parse(raw);
+    const selectedOccurrence = { from: 6, to: 10 };
+    const legacyComment = {
+      start_index: 10,
+      end_index: 14,
+      anchor_content: "word",
+    } as Comment;
+
+    expect(doc.textBetween(selectedOccurrence.from, selectedOccurrence.to)).toBe("word");
+    expect(legacySelection(selectedOccurrence.from, selectedOccurrence.to, doc, raw)).toEqual(
+      legacyComment,
+    );
+    expect(findPmRangeForComment(doc, legacyComment, raw)).toEqual({ from: 0, to: 5 });
+
+    expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
+    expect(findPmRangeForComment(doc, legacyComment, raw, editor.markdown)).toEqual({
+      from: 11,
+      to: 15,
+    });
+    expect(legacyComment).toEqual({ start_index: 10, end_index: 14, anchor_content: "word" });
+  });
+
   it("reuses one mapping across comments and invalidates it when source or document changes", () => {
     const raw = "word **word** word";
     const doc = parse(raw);
@@ -220,7 +296,12 @@ describe("validated Markdown source positions", () => {
   it("keeps the whole document on legacy anchors when a block cannot be verified", () => {
     const raw = `| A | B |\n| --- | --- |\n| a\\|b | word |\n\nword\n\n${link}`;
     const doc = parse(raw);
+    const manager = editor.markdown!;
+    const tokens = new manager.instance.Lexer(manager.instance.defaults).lex(raw);
+    tokens[0] = { type: "unsupported", raw: tokens[0].raw };
+    const lexer = vi.spyOn(manager.instance.Lexer.prototype, "lex").mockReturnValueOnce(tokens);
     expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
+    lexer.mockRestore();
     const positions: number[] = [];
     doc.descendants((node, pos) => {
       if (node.isText && node.text?.includes("word"))
@@ -267,7 +348,7 @@ describe("validated Markdown source positions", () => {
     expect(markdownSourceMap(movedInList, list, editor.markdown)).toBeNull();
   });
 
-  it("does not store a fallback anchor on another mapped copy", () => {
+  it("stores the exact source span rather than another literal copy", () => {
     const raw = "word wo**rd** word";
     const doc = parse(raw);
     expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
@@ -275,10 +356,22 @@ describe("validated Markdown source positions", () => {
     const to = from + 4;
     expect(doc.textBetween(from, to)).toBe("word");
     const captured = computeSelectionData(from, to, doc, raw, editor.markdown);
+    expect(captured).toEqual({ start_index: 5, end_index: 11, anchor_content: "word" });
     expect(findPmRangeForComment(doc, captured as Comment, raw, editor.markdown)).toEqual({
       from,
       to,
     });
+  });
+
+  it("does not expand a partial surrogate selection to an entire decoded entity", () => {
+    const raw = "&#x1F600;";
+    const doc = parse(raw);
+    expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
+    for (const from of [1, 2]) {
+      expect(computeSelectionData(from, from + 1, doc, raw, editor.markdown)).toEqual(
+        legacySelection(from, from + 1, doc, raw),
+      );
+    }
   });
 
   it("lexes once per editor and source without sharing tokens between editors", () => {

@@ -331,19 +331,25 @@ def test_heading_text_anchor_content_excludes_prefix(
     record_video_size={"width": 1600, "height": 1200},
 )
 @pytest.mark.parametrize(
-    ("fixture", "phrase", "occurrence", "expected_start", "paragraph_selector"),
+    ("fixture", "phrase", "occurrence", "expected_start", "expected_end", "paragraph_selector"),
     [
-        ("repeated-word.md", "Repeated", 1, 30, "p"),
-        ("hidden-word.md", "word", 0, 16, "p"),
-        ("hidden-url.md", "word", 1, 242, "p"),
-        ("wrapped-word.md", "word", 2, 247, "p"),
-        ("call-table.md", "Call", 0, 445, "tr:nth-child(3) td:nth-child(2) p"),
-        ("call-table.md", "Call.", 0, 445, "tr:nth-child(3) td:nth-child(2) p"),
-        ("call-table.md", "call", 0, 582, "tr:nth-child(3) td:nth-child(3) p"),
+        ("repeated-word.md", "Repeated", 1, 30, 38, "p"),
+        ("escaped-pipe.md", "word", 1, 40, 44, "p"),
+        ("hidden-word.md", "word", 0, 16, 20, "p"),
+        ("hidden-word.md", "word", 1, 21, 27, "p"),
+        ("mixed-structures.md", "word", 1, 118, 122, "ol > li:nth-child(2) > p"),
+        ("hidden-url.md", "word", 1, 242, 246, "p"),
+        ("wrapped-word.md", "word", 2, 247, 251, "p"),
+        ("call-table.md", "Call", 0, 445, 449, "tr:nth-child(3) td:nth-child(2) p"),
+        ("call-table.md", "Call.", 0, 445, 450, "tr:nth-child(3) td:nth-child(2) p"),
+        ("call-table.md", "call", 0, 582, 586, "tr:nth-child(3) td:nth-child(3) p"),
     ],
     ids=[
         "repeated-word",
+        "escaped-pipe-outside-selection",
         "hidden-url-and-split-word",
+        "selected-split-word",
+        "mixed-structures-ordered-list",
         "hidden-url",
         "hard-wrapped",
         "table-call",
@@ -358,6 +364,7 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     phrase: str,
     occurrence: int,
     expected_start: int,
+    expected_end: int,
     paragraph_selector: str,
 ) -> None:
     """Keep the selected word's raw offset and highlight through save/reopen."""
@@ -413,10 +420,32 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     def check_highlight() -> None:
         """The decoration covers exactly the selected visible occurrence."""
         highlight = editor.locator("[data-comment-id]")
-        expect(highlight).to_have_count(1)
-        expect(highlight).to_have_text(phrase)
-        expect(paragraph.locator("[data-comment-id]")).to_have_count(1)
-        before = highlight.evaluate(
+        expect(highlight.first).to_be_visible()
+        fragments = highlight.all_text_contents()
+        assert "".join(fragments) == phrase
+        expect(paragraph.locator("[data-comment-id]")).to_have_count(len(fragments))
+        assert (
+            len(
+                set(
+                    highlight.evaluate_all(
+                        "elements => elements.map(element => element.dataset.commentId)"
+                    )
+                )
+            )
+            == 1
+        )
+        assert (
+            highlight.evaluate_all(
+                """elements => {
+                const range = document.createRange();
+                range.setStartBefore(elements[0]);
+                range.setEndAfter(elements[elements.length - 1]);
+                return range.toString();
+            }"""
+            )
+            == phrase
+        )
+        before = highlight.first.evaluate(
             """element => {
                 const range = document.createRange();
                 range.selectNodeContents(element.closest('p'));
@@ -434,10 +463,123 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     saved = response.json()
     assert len(saved) == 1
     assert saved[0]["start_index"] == expected_start
-    assert saved[0]["end_index"] == expected_start + len(phrase)
+    assert saved[0]["end_index"] == expected_end
     assert saved[0]["anchor_content"] == phrase
 
     page.get_by_role("button", name=f"Close {fixture}", exact=True).first.click()
     file_button.click()
     expect(editor).to_be_visible()
     check_highlight()
+
+
+@pytest.mark.browser_context_args(
+    viewport={"width": 1600, "height": 1200},
+    record_video_size={"width": 1600, "height": 1200},
+)
+def test_mixed_structures_accumulated_comments_after_autosave(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Comment on every duplicate after serialization, then reload all anchors."""
+    base_url, session_id = seeded_session
+    file_path = "mixed-structures.md"
+    content = (Path(__file__).parent / "fixtures" / file_path).read_text(encoding="utf-8")
+    file_url = (
+        f"{base_url}/v1/sessions/{session_id}"
+        f"/resources/environments/default/filesystem/{file_path}"
+    )
+    response = httpx.put(file_url, json={"content": content, "encoding": "utf-8"}, timeout=10)
+    response.raise_for_status()
+    page.goto(f"{base_url}/c/{session_id}?file={file_path}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    editor = viewer.locator("[contenteditable='true']")
+    expect(editor).to_be_visible(timeout=30_000)
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    editor.locator("p").last.click()
+    page.keyboard.press("ControlOrMeta+End")
+    with page.expect_response(
+        lambda response: response.request.method == "PUT" and file_path in response.url
+    ) as autosave:
+        page.keyboard.type(" saved edit")
+    assert autosave.value.ok
+    response = httpx.get(file_url, timeout=10)
+    response.raise_for_status()
+    serialized = response.json()["content"]
+    assert serialized.endswith("saved edit")
+    assert serialized != content
+    raw_positions = [match.start() for match in re.finditer("word", serialized)]
+    pm_positions = editor.evaluate(
+        """element => {
+            const positions = [];
+            element.editor.state.doc.descendants((node, position) => {
+                if (!node.isText) return;
+                for (const match of node.text.matchAll(/word/g)) {
+                    positions.push(position + match.index);
+                }
+            });
+            return positions;
+        }"""
+    )
+    assert len(raw_positions) == len(pm_positions)
+    target_index = raw_positions.index(118)
+    selection_order = [index for index in range(len(raw_positions)) if index != target_index]
+    selection_order.append(target_index)
+    saved_comments = []
+    comment_blur_settle_ms = 200
+
+    def check_highlight(comment_id: str, position: int) -> None:
+        highlight = editor.locator(f'[data-comment-id="{comment_id}"]')
+        expect(highlight).to_have_text("word")
+        actual_position = highlight.evaluate(
+            "element => element.closest('[contenteditable]').editor.view.posAtDOM(element, 0)"
+        )
+        assert actual_position == position
+
+    def select_word(position: int) -> None:
+        page.wait_for_timeout(comment_blur_settle_ms)
+        editor.evaluate(
+            """(element, position) => {
+                const view = element.editor.view;
+                view.focus();
+                const start = view.domAtPos(position);
+                const end = view.domAtPos(position + 4);
+                const range = document.createRange();
+                range.setStart(start.node, start.offset);
+                range.setEnd(end.node, end.offset);
+                range.startContainer.parentElement.scrollIntoView({block: 'nearest'});
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }""",
+            position,
+        )
+        page.get_by_role("button", name="Add comment", exact=True).click()
+
+    for index in selection_order:
+        position = pm_positions[index]
+        select_word(position)
+        body = f"Occurrence {index}"
+        viewer.locator("textarea[placeholder='Add a comment…']").fill(body)
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST" and response.url.endswith("/comments")
+            )
+        ) as saved:
+            viewer.get_by_role("button", name="Add Comment", exact=True).click()
+        assert saved.value.ok
+        comment = saved.value.json()
+        assert comment["start_index"] == raw_positions[index]
+        assert comment["end_index"] == raw_positions[index] + 4
+        assert comment["anchor_content"] == "word"
+        check_highlight(comment["id"], position)
+        saved_comments.append((comment["id"], position))
+
+    page.reload()
+    expect(editor).to_be_visible(timeout=30_000)
+    for comment_id, position in saved_comments:
+        check_highlight(comment_id, position)
+    select_word(pm_positions[target_index])
+    expect(editor.locator(".md-comment-active")).to_have_attribute(
+        "data-comment-id", saved_comments[-1][0]
+    )
+    expect(viewer.locator("textarea[placeholder='Add a comment…']")).to_have_count(0)

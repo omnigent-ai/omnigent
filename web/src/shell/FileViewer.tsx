@@ -136,6 +136,10 @@ const MonacoDiffViewer = lazy(() =>
  *   moved, or at stored offsets if the anchor is no longer present
  *   (never silently dropped).
  * - **addressed**: handled by the agent or user (status "addressed").
+ *
+ * Markdown spans with a different source/quote length may contain formatting
+ * or entities. Leave their offsets for the editor's source map to resolve;
+ * literal search would relocate them to an unrelated unformatted copy.
  */
 export function classifyAndRemapComments(
   comments: Comment[],
@@ -162,6 +166,13 @@ export function classifyAndRemapComments(
     }
     // File not yet loaded — keep at stored offsets rather than dropping.
     if (!fileContent) {
+      open.push(c);
+      continue;
+    }
+    if (
+      detectLang(c.path) === "markdown" &&
+      c.end_index - c.start_index !== c.anchor_content.length
+    ) {
       open.push(c);
       continue;
     }

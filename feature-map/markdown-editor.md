@@ -139,6 +139,17 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_heading_text_anchor_content_excludes_prefix`.
+  `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_repeated_word_keeps_selected_occurrence_after_reopen`
+  checks exact raw endpoints and the highlighted occurrence after save/reopen,
+  including a word split across formatting beside a hidden URL and a plain copy,
+  a bold word in an ordered-list parent followed by a nested ordered list,
+  and a repeated bold word outside a table containing an escaped pipe.
+  `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_mixed_structures_accumulated_comments_after_autosave`
+  edits the mixed fixture, waits for real autosave, then comments on every
+  duplicate through the UI, selecting the nested-list parent last. It checks
+  persisted raw endpoints and every highlight again after a full page reload.
+  This covers accumulated decorations and serialization, unlike single-comment
+  tests or parser-only input matrices.
 - `agent-api`, desktop and phone-sized browser:
   `tests/e2e_ui/files/test_right_panel.py::test_agent_opens_workspace_file`
   drives a scripted agent tool call through the runner, server and stream into
@@ -171,6 +182,16 @@ instead of treating one comparison clip as complete feature verification.
 
 ## Gotchas
 
+- A rebuilt server does not update JavaScript in an already-open browser tab.
+  Check the tab's loaded asset against the server entry point before validating
+  a fix; preserve unsaved drafts when opening a fresh tab or reloading.
+- Comment offsets remain raw-source ranges; the quote is rendered text. A
+  selection such as `wo**rd**` can span markup, and its minimal source range
+  ends at the last selected character, before the closing `**`. The parent
+  viewer does not literal-search remap Markdown ranges whose source and quote
+  lengths differ; the editor resolves them using its validated source map or
+  existing fallback. This does not repair previously mis-saved offsets or
+  guarantee tracking through arbitrary subsequent edits.
 - The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
   It applies above 1 MiB regardless of the saved view preference. The choice
   stays fixed for that file visit so an autosave cannot replace an editor with

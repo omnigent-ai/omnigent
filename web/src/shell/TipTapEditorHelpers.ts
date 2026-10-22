@@ -102,11 +102,9 @@ export function findPmRangeForComment(
   const { anchor_content, start_index, end_index } = comment;
   if (!anchor_content?.trim()) return null;
 
-  if (rawContent.slice(start_index, end_index) === anchor_content) {
-    const map = markdownSourceMap(doc, rawContent, manager);
-    const range = map && mappedRange(doc, map, start_index, end_index, anchor_content);
-    if (range) return range;
-  }
+  const map = markdownSourceMap(doc, rawContent, manager);
+  const range = map && mappedRange(doc, map, start_index, end_index, anchor_content);
+  if (range) return range;
   const textContent = doc.textBetween(0, doc.content.size, SEP);
   if (!textContent) return null;
 
@@ -154,7 +152,8 @@ export function computeSelectionData(
     const [first, last] = indexes;
     const start_index = map.starts[first];
     const end_index = map.ends[last];
-    if (rawContent.slice(start_index, end_index) === anchor_content) {
+    const range = mappedRange(doc, map, start_index, end_index, anchor_content);
+    if (range?.from === from && range.to === to) {
       return { start_index, end_index, anchor_content };
     }
   }
