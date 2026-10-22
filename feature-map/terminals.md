@@ -47,8 +47,10 @@ with their own terminal retain the switcher.
   The shortcut targets the active cell; shells remain in the shared Workspace.
 - On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
   right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
-  divider (or focus it and use arrow keys) to resize; "Close pane" kills the
-  focused shell. Panes are saved per session in this browser.
+  divider (or focus it and use the arrow keys along its axis) to resize. "Close
+  pane" asks for confirmation, then kills the focused shell; the agent pane
+  cannot be closed. Panes are saved per session in this browser and show only
+  for desktop owners outside grid cells.
 
 **User shells:**
 

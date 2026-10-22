@@ -51,7 +51,7 @@ export interface SessionWorkspaceState {
   terminalSplit?: TerminalSplitState;
 }
 
-const STORAGE_KEY = "omnigent:session-workspace-state";
+export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
 // cap is exceeded.
@@ -148,7 +148,7 @@ function sanitize(entry: unknown): SessionWorkspaceState {
 function readStore(): Store {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(SESSION_WORKSPACE_STATE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -168,7 +168,7 @@ function readStore(): Store {
 function writeStore(store: Store): void {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
   } catch {
     // Storage quota/access errors must not break panel interactions.
   }

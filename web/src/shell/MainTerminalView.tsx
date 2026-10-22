@@ -26,8 +26,10 @@ import {
 } from "@/hooks/useTerminals";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   removeTerminalLayoutKey,
+  replaceTerminalLayoutKey,
   resizeTerminalSplit,
   terminalLayoutGeometry,
   terminalLayoutKeys,
@@ -106,7 +108,7 @@ export function MainTerminalView({
   onSurfaceElement,
   splittable = false,
 }: MainTerminalViewProps) {
-  const { terminals } = useTerminals(conversationId);
+  const { terminals, isFetching: terminalsFetching = false } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
@@ -196,25 +198,38 @@ export function MainTerminalView({
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
   const serverInfo = useServerInfo();
-  const splitEnabled = splittable && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui");
+  const isMobile = useIsMobileViewport();
+  // Splits are managed only by desktop owners, so only they see them.
+  const splitEnabled =
+    splittable &&
+    !readOnly &&
+    !isMobile &&
+    isFeatureEnabled(serverInfo, "splittable_terminal_view_ui");
   const savedSplit = useTerminalSplitPanes(conversationId);
-  // A rail-opened shell takes over the view unsplit; the panes return with the agent view.
-  const split = splitEnabled && !isShellView ? savedSplit : undefined;
-  // Ratios follow the pointer locally and persist once the drag ends.
-  const [draftLayout, setDraftLayout] = useState<TerminalLayout | null>(null);
+  // A rail-opened shell takes over the view unsplit, and hidden pre-warmed
+  // surfaces attach only the agent pane.
+  const split = splitEnabled && visible && !isShellView ? savedSplit : undefined;
+  // The divider being dragged; applied to the latest saved layout until release.
+  const [drag, setDrag] = useState<{ path: number[]; ratio: number } | null>(null);
   const panesRef = useRef<HTMLDivElement>(null);
+  useEffect(() => setDrag(null), [savedSplit]);
 
-  // Drop panes whose shell has gone away. The agent pane stays (it shows the
-  // unavailable state) so a relaunched agent terminal lands back in place.
+  // Drop panes whose shell has gone away, but only once the list is
+  // authoritative: SSE fills it one terminal at a time while a fetch runs.
+  // A stale agent pane follows the live agent terminal instead.
   useEffect(() => {
-    if (!splitEnabled || terminals.length === 0) return;
+    if (!splitEnabled || terminalsFetching || terminals.length === 0) return;
     const liveKeys = new Set(terminals.map(terminalTabKey));
+    const liveAgentKey = agentTerminal ? terminalTabKey(agentTerminal) : null;
     updateTerminalSplit(conversationId, (current) => {
       if (!current) return current;
       let layout: TerminalLayout | null = current.layout;
       for (const key of terminalLayoutKeys(current.layout)) {
-        if (layout && !liveKeys.has(key) && !isAgentTerminalKey(key)) {
+        if (layout === null || liveKeys.has(key)) continue;
+        if (!isAgentTerminalKey(key)) {
           layout = removeTerminalLayoutKey(layout, key);
+        } else if (liveAgentKey && !terminalLayoutKeys(layout).includes(liveAgentKey)) {
+          layout = replaceTerminalLayoutKey(layout, key, liveAgentKey);
         }
       }
       if (layout === current.layout) return current;
@@ -225,22 +240,27 @@ export function MainTerminalView({
         focusedKey: keys.includes(current.focusedKey) ? current.focusedKey : keys[0],
       };
     });
-  }, [splitEnabled, terminals, conversationId]);
+  }, [splitEnabled, terminalsFetching, terminals, agentTerminal, conversationId]);
 
   const focusPane = (key: string) =>
     updateTerminalSplit(conversationId, (current) =>
       current && current.focusedKey !== key ? { ...current, focusedKey: key } : current,
     );
-  const commitDraftLayout = () => {
-    if (draftLayout === null) return;
+  const resizePane = (path: number[], ratio: number) =>
     updateTerminalSplit(conversationId, (current) =>
-      current ? { ...current, layout: draftLayout } : current,
+      current ? { ...current, layout: resizeTerminalSplit(current.layout, path, ratio) } : current,
     );
-    setDraftLayout(null);
+  const commitDrag = () => {
+    if (drag === null) return;
+    resizePane(drag.path, drag.ratio);
+    setDrag(null);
   };
-  const geometry = terminalLayoutGeometry(
-    split ? (draftLayout ?? split.layout) : activeTerminal ? terminalTabKey(activeTerminal) : "",
-  );
+  const singlePaneKey = activeTerminal ? terminalTabKey(activeTerminal) : "";
+  const splitLayout =
+    split && drag ? resizeTerminalSplit(split.layout, drag.path, drag.ratio) : split?.layout;
+  const geometry = terminalLayoutGeometry(splitLayout ?? singlePaneKey);
+  // Saved panes keep rendering while the agent terminal is missing but shells are live.
+  const showPanes = activeTerminal !== null || (split !== undefined && terminals.length > 0);
 
   const setSurfaceElement = useCallback(
     (element: HTMLDivElement | null) => {
@@ -267,7 +287,7 @@ export function MainTerminalView({
       className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
-        {activeTerminal === null ? (
+        {!showPanes ? (
           startingUp ? (
             // Passive startup state: same centered geometry as the stopped
             // state so the swap doesn't jump, and nothing actionable — the
@@ -345,12 +365,9 @@ export function MainTerminalView({
                 const terminal = terminals.find((t) => terminalTabKey(t) === pane.key);
                 const focused = !split || pane.key === split.focusedKey;
                 return (
-                  // Panes are flat siblings keyed by terminal, so splitting or
-                  // closing a neighbor never remounts a live xterm. Scope the
-                  // key to the session: agent terminals share a fixed id
-                  // across same-shape sessions (e.g. `terminal_claude_main`).
+                  // Flat siblings keyed by session+terminal, so splits never remount a live xterm.
                   <div
-                    key={`${conversationId}:${pane.key}`}
+                    key={`${conversationId}:${terminal?.id ?? pane.key}`}
                     data-terminal-pane={pane.key}
                     style={{
                       left: `${pane.left}%`,
@@ -383,7 +400,7 @@ export function MainTerminalView({
                       </Suspense>
                     ) : (
                       <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
-                        Agent terminal unavailable.
+                        Terminal unavailable.
                       </div>
                     )}
                   </div>
@@ -395,20 +412,10 @@ export function MainTerminalView({
                     key={divider.path.join(".")}
                     divider={divider}
                     containerRef={panesRef}
-                    onResize={(path, ratio, final) => {
-                      if (!final) {
-                        setDraftLayout((draft) =>
-                          resizeTerminalSplit(draft ?? split.layout, path, ratio),
-                        );
-                        return;
-                      }
-                      updateTerminalSplit(conversationId, (current) =>
-                        current
-                          ? { ...current, layout: resizeTerminalSplit(current.layout, path, ratio) }
-                          : current,
-                      );
-                    }}
-                    onCommit={commitDraftLayout}
+                    onResize={(path, ratio, final) =>
+                      final ? resizePane(path, ratio) : setDrag({ path, ratio })
+                    }
+                    onCommit={commitDrag}
                   />
                 ))}
             </div>

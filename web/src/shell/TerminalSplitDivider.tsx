@@ -25,6 +25,7 @@ export function TerminalSplitDivider({
   const resizeToPointer = (event: PointerEvent<HTMLDivElement>) => {
     if (!event.currentTarget.hasPointerCapture(event.pointerId) || !containerRef.current) return;
     const bounds = containerRef.current.getBoundingClientRect();
+    if (bounds.width === 0 || bounds.height === 0) return;
     const position = columns
       ? ((event.clientX - bounds.left) / bounds.width) * 100
       : ((event.clientY - bounds.top) / bounds.height) * 100;
@@ -36,7 +37,10 @@ export function TerminalSplitDivider({
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    const step = { ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 }[event.key];
+    const keys: Record<string, number> = columns
+      ? { ArrowLeft: -1, ArrowRight: 1 }
+      : { ArrowUp: -1, ArrowDown: 1 };
+    const step = keys[event.key];
     if (step === undefined) return;
     event.preventDefault();
     onResize(path, ratio + step * KEYBOARD_STEP, true);
@@ -59,6 +63,7 @@ export function TerminalSplitDivider({
       }}
       onPointerMove={resizeToPointer}
       onPointerUp={onCommit}
+      onPointerCancel={onCommit}
       onLostPointerCapture={onCommit}
       onKeyDown={onKeyDown}
       // A 7px hit area centered on a 1px line.

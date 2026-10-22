@@ -1,7 +1,4 @@
-// Header controls that split the main terminal view's focused pane into a
-// new shell (right or below) and close the focused shell pane. Gated on
-// `splittable_terminal_view_ui`, a desktop viewport, the agent's Terminal
-// view being shown, owner access, and the agent declaring shell types.
+// Header split/close controls for the main terminal view (flag-gated, desktop owners).
 
 import { useState, type ReactNode } from "react";
 import { Columns2Icon, Rows2Icon, XIcon } from "lucide-react";
@@ -19,7 +16,9 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   findAgentTerminal,
+  terminalDisplayLabel,
   terminalTabKey,
+  type TerminalInfo,
   useCreateTerminal,
   useDeleteTerminal,
   useTerminals,
@@ -52,7 +51,8 @@ export function TerminalSplitControls({
   const create = useCreateTerminal(conversationId);
   const deleteTerminal = useDeleteTerminal(conversationId);
   const split = useTerminalSplitPanes(conversationId);
-  const [closeOpen, setCloseOpen] = useState(false);
+  // The shell a pending close targets, fixed when the dialog opens.
+  const [closeTarget, setCloseTarget] = useState<TerminalInfo | null>(null);
   const agentTerminal = findAgentTerminal(terminals);
   const declaredShells = agent?.terminals ?? [];
   if (
@@ -117,7 +117,7 @@ export function TerminalSplitControls({
             size="icon-xs"
             aria-label="Close pane"
             disabled={deleteTerminal.isPending}
-            onClick={() => setCloseOpen(true)}
+            onClick={() => setCloseTarget(focusedShell)}
             className="border-none text-muted-foreground hover:text-foreground"
           >
             <XIcon className="size-3.5" />
@@ -125,19 +125,13 @@ export function TerminalSplitControls({
         </HeaderTooltip>
       )}
       <CloseShellDialog
-        open={closeOpen && focusedShell !== undefined}
-        shellLabel={
-          focusedShell
-            ? focusedShell.session
-              ? `${focusedShell.name} · ${focusedShell.session}`
-              : focusedShell.name
-            : null
-        }
-        onCancel={() => setCloseOpen(false)}
+        open={closeTarget !== null}
+        shellLabel={closeTarget && terminalDisplayLabel(closeTarget)}
+        onCancel={() => setCloseTarget(null)}
         onConfirm={() => {
           // MainTerminalView prunes the pane once the terminal leaves the list.
-          if (focusedShell) deleteTerminal.mutate(focusedShell.id);
-          setCloseOpen(false);
+          if (closeTarget) deleteTerminal.mutate(closeTarget.id);
+          setCloseTarget(null);
         }}
       />
     </div>

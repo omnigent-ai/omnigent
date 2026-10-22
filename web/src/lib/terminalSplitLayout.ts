@@ -33,6 +33,8 @@ export const MIN_SPLIT_RATIO = 0.25;
 export const MAX_SPLIT_RATIO = 0.75;
 
 export function clampSplitRatio(ratio: number): number {
+  // A zero-size container yields NaN; never persist a ratio the parser would reject.
+  if (!Number.isFinite(ratio)) return 0.5;
   return Math.min(MAX_SPLIT_RATIO, Math.max(MIN_SPLIT_RATIO, ratio));
 }
 
@@ -71,6 +73,21 @@ export function removeTerminalLayoutKey(
   if (second === null) return first;
   if (first === layout.children[0] && second === layout.children[1]) return layout;
   return { ...layout, children: [first, second] };
+}
+
+export function replaceTerminalLayoutKey(
+  layout: TerminalLayout,
+  oldKey: string,
+  newKey: string,
+): TerminalLayout {
+  if (typeof layout === "string") return layout === oldKey ? newKey : layout;
+  return {
+    ...layout,
+    children: [
+      replaceTerminalLayoutKey(layout.children[0], oldKey, newKey),
+      replaceTerminalLayoutKey(layout.children[1], oldKey, newKey),
+    ],
+  };
 }
 
 export function resizeTerminalSplit(

@@ -619,14 +619,24 @@ describe("MainTerminalView — split panes", () => {
     focusedKey: BASH_KEY,
   };
 
-  function splitTree(conversationId: string, terminals: TerminalInfo[], enabled = true) {
-    useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
+  function splitTree(
+    conversationId: string,
+    terminals: TerminalInfo[],
+    enabled = true,
+    { isFetching = false, visible = true, readOnly = false } = {},
+  ) {
+    useTerminalsMock.mockReturnValue({ terminals, isLoading: false, isFetching, error: null });
     return (
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, features: { splittable_terminal_view_ui: enabled } }}
       >
         <TerminalFirstContextProvider value={makeCtx(false)}>
-          <MainTerminalView conversationId={conversationId} splittable />
+          <MainTerminalView
+            conversationId={conversationId}
+            visible={visible}
+            readOnly={readOnly}
+            splittable
+          />
         </TerminalFirstContextProvider>
       </CapabilitiesProvider>
     );
@@ -682,6 +692,97 @@ describe("MainTerminalView — split panes", () => {
     expect(divider).toHaveAttribute("aria-valuenow", "75");
     expect(readSessionWorkspaceState("conv_split_resize").terminalSplit?.layout).toMatchObject({
       ratio: 0.75,
+    });
+  });
+
+  it("keeps a saved split while the terminal list is still filling in", async () => {
+    writeSessionWorkspaceState("conv_split_reload", { terminalSplit: savedSplit });
+    const view = render(
+      splitTree("conv_split_reload", [REPL_TERMINAL], true, { isFetching: true }),
+    );
+    view.rerender(splitTree("conv_split_reload", [REPL_TERMINAL, BASH_SHELL]));
+
+    await waitFor(() => expect(screen.getAllByTestId("terminal-view")).toHaveLength(2));
+    expect(readSessionWorkspaceState("conv_split_reload").terminalSplit).toEqual(savedSplit);
+  });
+
+  it("keeps live shell panes while the agent terminal is missing", async () => {
+    writeSessionWorkspaceState("conv_split_no_agent", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_no_agent", [BASH_SHELL]));
+
+    expect(await screen.findByTestId("terminal-view")).toHaveAttribute(
+      "data-terminal-id",
+      "terminal_bash_s1",
+    );
+    expect(screen.getByText("Terminal unavailable.")).toBeInTheDocument();
+  });
+
+  it("moves a stale agent pane onto the live agent terminal", async () => {
+    writeSessionWorkspaceState("conv_split_agent_swap", { terminalSplit: savedSplit });
+    const claude = { id: "terminal_claude_main", name: "claude", session: "main", running: true };
+    render(splitTree("conv_split_agent_swap", [claude, BASH_SHELL]));
+
+    await waitFor(() =>
+      expect(readSessionWorkspaceState("conv_split_agent_swap").terminalSplit?.layout).toEqual({
+        ...savedSplit.layout,
+        children: ["terminal:terminal_claude_main", BASH_KEY],
+      }),
+    );
+  });
+
+  it("renders hidden and read-only surfaces unsplit", async () => {
+    writeSessionWorkspaceState("conv_split_gates", { terminalSplit: savedSplit });
+    const terminals = [REPL_TERMINAL, BASH_SHELL];
+    const view = render(splitTree("conv_split_gates", terminals, true, { visible: false }));
+    expect(await screen.findAllByTestId("terminal-view")).toHaveLength(1);
+    view.rerender(splitTree("conv_split_gates", terminals, true, { readOnly: true }));
+    expect(screen.getAllByTestId("terminal-view")).toHaveLength(1);
+    expect(readSessionWorkspaceState("conv_split_gates").terminalSplit).toEqual(savedSplit);
+  });
+
+  it("moves split focus to the pane the user focuses", async () => {
+    writeSessionWorkspaceState("conv_split_focus", { terminalSplit: savedSplit });
+    const { container } = render(splitTree("conv_split_focus", [REPL_TERMINAL, BASH_SHELL]));
+    await waitFor(() => expect(screen.getAllByTestId("terminal-view")).toHaveLength(2));
+
+    fireEvent.focus(container.querySelector(`[data-terminal-pane="${AGENT_KEY}"]`)!);
+
+    expect(readSessionWorkspaceState("conv_split_focus").terminalSplit?.focusedKey).toBe(AGENT_KEY);
+    expect(screen.getAllByTestId("terminal-view")[0]).toHaveAttribute("data-active", "true");
+  });
+
+  it("commits a pointer drag onto the latest layout, ignoring cross-axis keys", async () => {
+    writeSessionWorkspaceState("conv_split_drag", { terminalSplit: savedSplit });
+    const { container } = render(splitTree("conv_split_drag", [REPL_TERMINAL, BASH_SHELL]));
+    const divider = await screen.findByRole("separator", { name: "Resize terminal panes" });
+    const panes = divider.parentElement!;
+    vi.spyOn(panes, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1000,
+      height: 500,
+    } as DOMRect);
+    let captured = false;
+    divider.setPointerCapture = () => {
+      captured = true;
+    };
+    divider.hasPointerCapture = () => captured;
+
+    fireEvent.keyDown(divider, { key: "ArrowDown" });
+    expect(divider).toHaveAttribute("aria-valuenow", "50");
+    fireEvent.pointerDown(divider, { pointerId: 1 });
+    fireEvent.pointerMove(divider, { pointerId: 1, clientX: 650, clientY: 100 });
+    expect(divider).toHaveAttribute("aria-valuenow", "65");
+    expect(readSessionWorkspaceState("conv_split_drag").terminalSplit?.layout).toMatchObject({
+      ratio: 0.5,
+    });
+    fireEvent.pointerUp(divider, { pointerId: 1 });
+
+    expect(readSessionWorkspaceState("conv_split_drag").terminalSplit?.layout).toMatchObject({
+      ratio: 0.65,
+    });
+    expect(container.querySelector(`[data-terminal-pane="${BASH_KEY}"]`)).toHaveStyle({
+      left: "65%",
     });
   });
 });

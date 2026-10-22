@@ -2,7 +2,11 @@
 // MainTerminalView, persisted to the browser's session workspace state.
 
 import { useCallback, useSyncExternalStore } from "react";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  readSessionWorkspaceState,
+  SESSION_WORKSPACE_STATE_KEY,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import type { TerminalSplitState } from "@/lib/terminalSplitLayout";
 
 const cache = new Map<string, TerminalSplitState | undefined>();
@@ -26,6 +30,15 @@ export function updateTerminalSplit(
   cache.set(conversationId, next);
   writeSessionWorkspaceState(conversationId, { terminalSplit: next });
   for (const listener of listeners) listener();
+}
+
+// Another tab changed the stored workspace state: re-read on next access.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.key !== null && event.key !== SESSION_WORKSPACE_STATE_KEY) return;
+    cache.clear();
+    for (const listener of listeners) listener();
+  });
 }
 
 function subscribe(listener: () => void): () => void {

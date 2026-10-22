@@ -82,6 +82,11 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
  * briefly while the agent terminal is starting or reconciling; treating that
  * shell as a fallback duplicates it in the main viewport.
  */
+/** Display label for a terminal, e.g. ``"zsh · u-abc123"``. */
+export function terminalDisplayLabel(terminal: TerminalInfo): string {
+  return terminal.session ? `${terminal.name} · ${terminal.session}` : terminal.name;
+}
+
 export function findAgentTerminal(terminals: TerminalInfo[]): TerminalInfo | null {
   return terminals.find((terminal) => AGENT_TERMINAL_IDS.has(terminal.id)) ?? null;
 }
@@ -109,6 +114,8 @@ export function inventoryTerminals(
 interface UseTerminalsResult {
   terminals: TerminalInfo[];
   isLoading: boolean;
+  /** True while the authoritative list is (re)fetching; SSE may have filled it partially. */
+  isFetching?: boolean;
   error: Error | null;
 }
 
@@ -389,7 +396,7 @@ export function useTerminals(
   // continuous mask would read stale-`false` during a cold/relaunch boot and
   // wrongly hide a terminal the SSE just delivered.
   const runnerOnline = useSessionRunnerOnline(conversationId ?? undefined);
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error } = useQuery({
     queryKey:
       conversationId === null
         ? ["conversation", null, "terminals"]
@@ -449,6 +456,7 @@ export function useTerminals(
     // corrected on poll edges above). No continuous runner-online mask.
     terminals: data ?? [],
     isLoading,
+    isFetching,
     error: (error as Error | null) ?? null,
   };
 }

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   parseTerminalSplitState,
+  clampSplitRatio,
   removeTerminalLayoutKey,
+  replaceTerminalLayoutKey,
   resizeTerminalSplit,
   splitTerminalLayout,
   terminalLayoutGeometry,
@@ -42,6 +44,15 @@ describe("terminalSplitLayout", () => {
     expect(wide.ratio).toBe(0.75);
     const tall = resizeTerminalSplit(twoByOne, [1], 0.1) as Exclude<TerminalLayout, string>;
     expect((tall.children[1] as Exclude<TerminalLayout, string>).ratio).toBe(0.25);
+    expect(clampSplitRatio(Number.NaN)).toBe(0.5);
+  });
+
+  it("swaps one pane key in place", () => {
+    expect(terminalLayoutKeys(replaceTerminalLayoutKey(twoByOne, "agent", "codex"))).toEqual([
+      "codex",
+      "a",
+      "b",
+    ]);
   });
 
   it("maps the tree onto percent rectangles with one divider per split", () => {
@@ -66,6 +77,11 @@ describe("terminalSplitLayout", () => {
       { layout: { axis: "rows", ratio: 0.9, children: ["a", "b"] }, focusedKey: "a" },
       { layout: { axis: "rows", ratio: 0.5, children: ["a", "a"] }, focusedKey: "a" },
       { layout: { axis: "diagonal", ratio: 0.5, children: ["a", "b"] }, focusedKey: "a" },
+      { layout: { axis: "rows", ratio: null, children: ["a", "b"] }, focusedKey: "a" },
+      {
+        layout: { axis: "rows", ratio: 0.5, children: ["a", { axis: "rows", children: [] }] },
+        focusedKey: "a",
+      },
       null,
     ]) {
       expect(parseTerminalSplitState(value)).toBeUndefined();
