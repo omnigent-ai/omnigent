@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -163,8 +164,9 @@ async def test_quiescence_idle_for_legacy_native_harness_still_completes() -> No
         rig.close()
 
 
-def _accept_claude_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+def _accept_claude_interrupt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Make the claude-native Escape inject succeed without a real pane."""
+    del tmp_path
     import omnigent.harnesses.claude_native.bridge as claude_bridge
     from omnigent.runner.native import interrupt as interrupt_mod
 
@@ -177,7 +179,7 @@ def _accept_claude_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: None)
 
 
-def _accept_opencode_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+def _accept_opencode_interrupt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Make OpenCode's native abort report that it stopped active work."""
     import omnigent.harnesses.opencode_native.app_server as opencode_app_server
     import omnigent.harnesses.opencode_native.bridge as opencode_bridge
@@ -196,7 +198,8 @@ def _accept_opencode_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     def _no_cli(opencode_path: str | None = None) -> str:
         raise opencode_app_server.OpenCodeCliNotFoundError(opencode_path or "opencode")
 
-    # Keep session creation from launching a real ``opencode serve`` where one is installed.
+    # Keep session creation off the real home and from launching an installed ``opencode``.
+    monkeypatch.setattr(opencode_bridge, "_BRIDGE_ROOT", tmp_path / "opencode-native")
     monkeypatch.setattr(opencode_app_server, "find_opencode_cli", _no_cli)
     monkeypatch.setattr(opencode_bridge, "read_bridge_state", lambda bridge_dir: state)
     monkeypatch.setattr(opencode_app_server, "client_for_state", lambda **_: _AbortingClient())
@@ -208,7 +211,7 @@ def _accept_opencode_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
     [("claude-native", _accept_claude_interrupt), ("opencode-native", _accept_opencode_interrupt)],
 )
 async def test_interrupt_then_quiescence_idle_delivers_cancelled_with_output(
-    monkeypatch: pytest.MonkeyPatch, harness: str, accept_interrupt: Any
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str, accept_interrupt: Any
 ) -> None:
     """The interrupt defers the wake; the settling idle reports cancelled + output.
 
@@ -217,7 +220,7 @@ async def test_interrupt_then_quiescence_idle_delivers_cancelled_with_output(
     -- and the output the edge carried (a survivor's real result, or partial
     work) must reach the parent instead of being discarded.
     """
-    accept_interrupt(monkeypatch)
+    accept_interrupt(monkeypatch, tmp_path)
 
     rig = _Rig(harness)
     try:

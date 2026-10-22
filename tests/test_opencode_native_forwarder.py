@@ -309,7 +309,7 @@ async def test_session_error_message_aborted_takes_idle_path() -> None:
 
 
 async def test_late_aborted_message_update_does_not_reopen_the_turn() -> None:
-    """OpenCode can update the aborted message after the turn ended; that is no new turn."""
+    """A late update for the aborted message is no new turn; the next real message is."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     fwd = _forwarder(server, opencode)
     aborted = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
@@ -319,7 +319,10 @@ async def test_late_aborted_message_update_does_not_reopen_the_turn() -> None:
     await fwd.handle_event(
         _event("message.updated", info={"id": "msg_1", "role": "assistant", "error": aborted})
     )
-    assert [edge["status"] for edge in _status_edges(server.posts)] == ["running", "idle", "idle"]
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_2", "role": "assistant"}))
+    edges = _status_edges(server.posts)
+    assert [edge["status"] for edge in edges] == ["running", "idle", "idle", "running"]
+    assert edges[-1]["response_id"] == "msg_2"
 
 
 def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
