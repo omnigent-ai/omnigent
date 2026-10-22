@@ -36,7 +36,7 @@ from omnigent.preference_sync import (
 )
 
 _PATH = "/v1/preferences/shared"
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 MAX_PENDING_OPERATIONS = 512
 _Result = TypeVar("_Result")
 
@@ -183,6 +183,20 @@ class PreferenceClient:
                     (_encode(self._binding),),
                 )
                 connection.execute("PRAGMA user_version = 1")
+                version = 1
+            if version == 1:
+                connection.execute(
+                    "CREATE TABLE machine (key VARCHAR(64) PRIMARY KEY NOT NULL "
+                    "CHECK(length(key) = 64), payload BLOB NOT NULL "
+                    "CHECK(length(payload) <= 16000)) WITHOUT ROWID"
+                )
+                connection.execute(
+                    "CREATE TABLE import_entries (operation_id BLOB PRIMARY KEY NOT NULL "
+                    "CHECK(length(operation_id) = 16), "
+                    "previous BLOB NOT NULL CHECK(length(previous) <= 16000), "
+                    "result BLOB CHECK(length(result) <= 16000)) WITHOUT ROWID"
+                )
+                connection.execute("PRAGMA user_version = 2")
             elif version != _CACHE_VERSION:
                 raise ValueError(f"Unsupported preference cache version: {version}")
             binding = connection.execute("SELECT binding FROM state WHERE id = 1").fetchone()[0]
@@ -408,6 +422,10 @@ class PreferenceClient:
                     "UPDATE outbox SET operation = ?, predecessor = NULL WHERE sequence = ?",
                     (_encode(successor), successor_id),
                 )
+            connection.execute(
+                "UPDATE import_entries SET result = ? WHERE operation_id = ?",
+                (_encode(result), operation.operation_id.bytes),
+            )
             connection.execute("DELETE FROM outbox WHERE sequence = ?", (sequence,))
 
     async def sync(

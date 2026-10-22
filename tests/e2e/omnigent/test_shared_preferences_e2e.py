@@ -5,6 +5,7 @@ The CLI config explicitly enables the API on these isolated local servers.
 """
 
 import json
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -264,3 +265,49 @@ def test_durable_preference_clients_offline_reconnect_and_restart(tmp_path, db_u
             is None
         )
         assert drive("remote", restarted)["snapshot"] == cleared
+
+
+def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri):
+    config = tmp_path / "cli-server.yaml"
+    config.write_text("shared_preferences_authority_id: cli-preference-test\n")
+    arguments = ("--config", str(config), "--database-uri", db_uri)
+    home = tmp_path / "cli-home"
+    home.mkdir()
+    environment = isolated_process_env(home, {}, base_env={"PATH": os.environ["PATH"]})
+    source = tmp_path / "source.yaml"
+    source.write_text(
+        "model: imported-model\nharness:\n  default: pi-native\n"
+        "  pi-native:\n    args: []\n    command: private-command\n"
+    )
+    with isolated_local_server(tmp_path / "cli-server", extra_args=arguments) as server:
+
+        def cli(*args):
+            result = subprocess.run(
+                [sys.executable, "-m", "omnigent", "preferences", "--server", server, *args],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            return result.stdout
+
+        cli("connect")
+        before = json.loads(cli("show"))
+        assert before["shared"]["entries"] == [] and before["pending"] == []
+        plan = tmp_path / "plan.json"
+        plan.write_text(cli("import", str(source)))
+        assert "private-command" not in plan.read_text()
+        cli("apply", str(plan))
+        cli("set", "--scope", "machine", "model", '"experiment"')
+        shown = json.loads(cli("show"))
+        assert shown["machine"][0]["value"] == "experiment"
+        assert "imported-model" in json.dumps(shown["shared"])
+        cli("set", "--scope", "machine", "model", "null")
+        assert json.loads(cli("show"))["machine"] == []
+        restore = tmp_path / "restore.json"
+        restore.write_text(cli("restore"))
+        cli("apply", str(restore))
+        assert all(
+            entry["value"] is None for entry in json.loads(cli("show"))["shared"]["entries"]
+        )

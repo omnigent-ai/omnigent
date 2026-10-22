@@ -3,8 +3,8 @@
 Users can save local model and harness defaults, override them for a project,
 and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
-and an opt-in server API for durable edits and conflicts. Automatic client sync
-and shared/machine scope controls are not available through the CLI or UI yet.
+and an opt-in server API for durable edits and conflicts. Explicit shared/machine scope controls and import previews are available through
+the CLI. Automatic startup adoption and browser controls remain separate.
 An explicit Python client can persist offline edits and synchronize them on reconnect.
 
 ## Sub-features
@@ -28,6 +28,9 @@ An explicit Python client can persist offline edits and synchronize them on reco
 - `shared-client`: explicit Python client; preserve offline edits across process
   restarts, retry uncertain deliveries, refresh the cache, and surface conflicts. Cache records are versioned and bounded; lock contention
   and unsupported cache versions remain visible.
+
+- `shared-cli`: connect to an authenticated workspace, inspect shared/machine values,
+  preview/apply an import or restore, retry edits and resolve conflicts.
 
 ## How to get to it (user POV)
 
@@ -63,11 +66,15 @@ and the caller's authenticated HTTP client. Queue explicit edits locally, then
 synchronize on reconnect. The caller schedules synchronization; launchers, the
 host daemon, and the settings UI do not call this API automatically yet.
 
-**Shared scope controls:** the CLI and UI do not yet offer importing/reimporting
-preferences, saving shared or machine defaults, removing a machine override,
-resolving conflicts, or continuing with temporary defaults. The API above can
-save shared defaults and resolve conflicts. Add CLI/UI routes and their journey
-tests here as those controls are implemented.
+**Shared scope controls:** `omnigent preferences --server URL connect` binds the
+local cache without uploading existing defaults. Use `show`, `sync`, and
+`set --scope shared|machine KEY JSON_VALUE`; `null` removes an override, `[]`
+clears arguments, and `false` disables a plugin. A shared `set --resolve UUID`
+resolves only the named conflict. `discard UUID` abandons the first pending edit.
+Use `import SOURCE.yaml > plan.json`, review that file, then `apply plan.json`.
+`restore > undo.json` previews undoing the most recent import; review and apply it
+in the same way. The [CLI guide](../docs/shared-preferences-workflows.md) covers
+key spelling, scopes and recovery. Browser controls remain unavailable.
 
 ## Driving it with the repro environment
 
@@ -128,7 +135,10 @@ each user entry point.
 uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reruns 0 -q -rs
 ```
 
-This drives two isolated CLI servers sharing a SQLite database through actual
+The CLI scenario also crosses separate command processes: connect, preview/apply
+a portable YAML import, set/remove a machine override, and restore the import.
+
+The server scenario drives two isolated CLI servers sharing a SQLite database through actual
 HTTP requests (or another isolated backend via `OMNIGENT_TEST_DB_URI`). It checks
 conflicting edits, explicit resolution, retries, deletion, and persistence after
 restart. Key/value and authentication matrices stay in the store and route tests.
