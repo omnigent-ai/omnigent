@@ -60,9 +60,9 @@ export interface TerminalFirstContextValue {
   /** Switch view. `"terminal"` opens the terminal surface. */
   setView: (view: TerminalFirstView) => void;
   /**
-   * True when the agent terminal exists and is reachable. This controls
-   * background pre-warming, not whether the Terminal view can be selected;
-   * user shells open separately through the workspace rail.
+   * True when the agent terminal exists and is reachable. This does not
+   * control whether the Terminal view can be selected; user shells open
+   * separately through the workspace rail.
    */
   terminalsAvailable: boolean;
   /**

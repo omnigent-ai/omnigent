@@ -216,8 +216,7 @@ def test_terminal_touch_swipe_scrolls_back(
         drawer.get_by_role("button", name="New shell").click()
 
         # The shell opens in the full-screen terminals panel; wait for the
-        # xterm bridge to connect (visible pane only — a hidden pre-warmed
-        # agent pane also carries the testid).
+        # visible pane's xterm bridge to connect.
         terminal_view = page.locator('[data-testid="terminal-view"]:visible').first
         expect(terminal_view).to_be_visible(timeout=60_000)
         expect(terminal_view).to_have_attribute("data-state", "connected", timeout=30_000)

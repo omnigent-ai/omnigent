@@ -975,8 +975,7 @@ export class TerminalSession {
   /**
    * Give the terminal keyboard focus. The WS-open handler focuses
    * automatically, but that call is a browser no-op while the surface is
-   * hidden (a pre-warmed attach behind the chat view), so the view calls
-   * this when the surface is revealed.
+   * hidden, so the view calls this when the surface is revealed.
    */
   focus(): void {
     this.term.focus();

@@ -504,9 +504,8 @@ describe("MainTerminalView — native wrapper sessions", () => {
 
 describe("MainTerminalView — persistent hidden mount", () => {
   it("toggles inert without remounting the terminal across a hide/show flip", () => {
-    // ChatPage keeps this surface mounted as a hidden overlay while the
-    // user is in chat. A new data-instance after the round-trip means
-    // the flip tore down the xterm + WS it exists to preserve.
+    // A hidden mount keeps its xterm + WS. A new data-instance after the
+    // round-trip means the flip tore them down.
     const { rerender } = renderView({ terminals: [REPL_TERMINAL] });
     const view = screen.getByTestId("terminal-view");
     const instance = view.getAttribute("data-instance");
@@ -542,7 +541,7 @@ describe("MainTerminalView — persistent hidden mount", () => {
     expect(screen.getByTestId("terminal-view").getAttribute("data-instance")).toBe(instance);
   });
 
-  it("makes an initially hidden pre-warmed terminal inert on mount", () => {
+  it("makes an initially hidden terminal inert on mount", () => {
     renderView({ terminals: [REPL_TERMINAL], visible: false });
 
     expect(screen.getByTestId("main-terminal-view")).toHaveAttribute("data-visible", "false");

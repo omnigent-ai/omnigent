@@ -23,8 +23,9 @@ reattach when the session moves to another host.
   directly, and falls back to the relay when the direct route is unreachable.
 - `tmux-outage`: terminals stay usable through temporary tmux health-check
   failures and still notice a real exit afterwards.
-- `hidden-terminal`: in chat view, the background terminal never draws over the
-  chat or composer.
+- `chat-view-detach`: chat view holds no agent-terminal attach, so it cannot
+  draw over the chat or resize a tmux window the user has open elsewhere.
+  Terminal view attaches; returning to chat releases the attach.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
   says so and routes the user to the terminal.
 
@@ -132,8 +133,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   resource facade through three failed launches and a successful retry for
   Claude/Codex terminal roles and an auxiliary shell. The successful real pane
   must accept input, and final cleanup must release every allocated instance.
-- **`hidden-terminal`:**
-  `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
+- **`chat-view-detach`:**
+  `tests/e2e_ui/chat/test_chat_view_terminal_detach.py::test_terminal_attaches_only_while_terminal_view_is_shown`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC

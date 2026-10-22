@@ -42,12 +42,9 @@ interface MainTerminalViewProps {
    */
   initialTerminalKey?: string | null;
   /**
-   * False while the surface is mounted but hidden behind the chat view
-   * (the pre-warmed overlay in MainAgentSurface). The WS attach and
-   * xterm buffer stay alive so flipping to Terminal is instant; on the
-   * visible→hidden edge a user-shell selection resets to the agent
-   * terminal so the next open targets the agent pane, matching the old
-   * unmount-on-close behavior. Default true.
+   * False while mounted but hidden. No caller does this: a hidden attach
+   * still resizes the shared tmux window, so ChatPage mounts this view only
+   * while Terminal view is shown. Default true.
    */
   visible?: boolean;
   /** A visible grid cell may be inactive and must not claim keyboard focus. */
@@ -155,11 +152,8 @@ export function MainTerminalView({
     if (!stillValid) setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
   }, [terminals, agentTerminal, activeKey]);
 
-  // While hidden, drop a user-shell selection back to the agent terminal.
-  // The surface used to unmount on close (forgetting the selection), so
-  // reopening always showed the agent pane; the persistent pre-warmed
-  // mount must reproduce that, and it points the background attach at
-  // the pane the next open will actually show.
+  // While hidden, drop a user-shell selection back to the agent terminal so
+  // a reveal shows the agent pane, as a fresh mount would.
   useEffect(() => {
     if (visible || terminals.length === 0) return;
     setActiveKey(agentTerminal ? terminalTabKey(agentTerminal) : "");
@@ -199,8 +193,7 @@ export function MainTerminalView({
       // Exposed for e2e assertions that an expand targeted the right
       // terminal (not just that the view opened).
       data-active-terminal={activeKey}
-      // Distinguishes the revealed surface from the hidden pre-warmed
-      // mount for tests — both are in the DOM.
+      // Distinguishes a revealed surface from a hidden mount for tests.
       data-visible={visible}
       className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
     >

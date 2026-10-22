@@ -155,9 +155,7 @@ def test_right_panel_terminals_and_file_viewer(
 
         # Agent-spawned shells don't steal focus, so click the tab to open it;
         # its xterm renders inside the rail's content slot and the chat page is
-        # left undisturbed (no main-column takeover). Assert no VISIBLE main
-        # terminal surface: terminal-first sessions keep a hidden pre-warmed
-        # surface mounted (data-visible="false"), which is not a takeover.
+        # left undisturbed (no main-column takeover).
         shell_tab.click()
         terminal_view = rail.get_by_test_id("terminal-view")
         expect(terminal_view.last).to_be_visible(timeout=20_000)

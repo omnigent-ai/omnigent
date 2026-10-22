@@ -1138,11 +1138,10 @@ describe("terminal clipboard", () => {
   });
 });
 
-describe("hidden pre-warmed surface", () => {
+describe("hidden surface", () => {
   it("keeps one live session across an active flip and focuses on reveal", async () => {
-    // Mount hidden (a pre-warmed attach behind the chat view): the
-    // session dials immediately — that is the whole point of the
-    // pre-warm — but must not take focus away from the composer.
+    // Mount hidden: the session dials immediately but must not take
+    // focus away from the rest of the page.
     const { rerender } = render(
       <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
     );
@@ -1164,7 +1163,7 @@ describe("hidden pre-warmed surface", () => {
     expect(inst.focus).toHaveBeenCalledTimes(1);
   });
 
-  it("toggles clipboard bridging when a warm surface is revealed", async () => {
+  it("toggles clipboard bridging when a hidden surface is revealed", async () => {
     const { rerender } = render(
       <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
     );
@@ -1647,9 +1646,8 @@ describe("automatic reconnect", () => {
     async (code) => {
       vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
       setSessionHost("conv_abc", "host_oss");
-      // A warm surface parked behind another session's view: the transport
-      // flaps with nobody watching and the background reconnect loop burns
-      // its whole budget.
+      // A hidden surface: the transport flaps with nobody watching and the
+      // background reconnect loop burns its whole budget.
       const { rerender } = render(
         <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
       );

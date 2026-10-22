@@ -1252,7 +1252,7 @@ interface SessionLayoutProps {
 function SessionLayout({ mainAgent }: SessionLayoutProps) {
   return (
     <div className="flex min-h-0 flex-1 overflow-hidden">
-      {/* `relative`: positions MainAgentSurface's persistent terminal overlay
+      {/* `relative`: positions MainAgentSurface's terminal overlay
           and the composer's file-drop overlay (both absolute inset-0) against
           the main column. */}
       <div data-chat-surface className="relative flex min-w-0 flex-1 flex-col">
@@ -1370,71 +1370,6 @@ export function shouldShowTerminalSurface(
 }
 
 /**
- * Whether the terminal surface should be MOUNTED (kept alive), as opposed
- * to shown. Broader than {@link shouldShowTerminalSurface}: once a
- * terminal is reachable, the surface mounts hidden behind the chat view
- * so the WS attach pre-warms in the background and survives Chat/Terminal
- * flips — making both the first open and every return near-instant. With
- * no reachable terminal the surface still mounts while the view is open
- * (it owns the "No terminals available" / reconnect states), but a hidden
- * mount would just dial a dead runner, so it stays unmounted.
- */
-export function shouldMountTerminalSurface(
-  conversationId: string | null,
-  terminalFirst:
-    | {
-        isTerminalFirst: boolean;
-        view: "chat" | "terminal";
-        terminalsAvailable: boolean;
-      }
-    | null
-    | undefined,
-): boolean {
-  if (!conversationId || terminalFirst?.isTerminalFirst !== true) return false;
-  return terminalFirst.view === "terminal" || terminalFirst.terminalsAvailable;
-}
-
-/**
- * One recently-viewed terminal-first session whose terminal surface stays
- * mounted (hidden) after navigating away, so switching back re-reveals a
- * live attach instead of re-dialing. ``readOnly`` is snapshotted from the
- * session's own permission level while it was active — the current
- * session's permissions must never leak onto a warm background surface.
- */
-export interface WarmTerminalEntry {
-  conversationId: string;
-  readOnly: boolean;
-}
-
-/**
- * How many sessions' terminal surfaces stay warm at once (the active one
- * included). Each warm surface holds a WebSocket + a runner-side
- * tmux control client, a WebGL context (browsers cap those per page; losing
- * one falls back to xterm's DOM renderer), and keeps parsing any output
- * its TUI streams while hidden — so the cache is bounded rather than
- * unbounded, but sized to cover a working set of sessions, not just a
- * pair. Idle shells cost ~nothing in the background; the practical
- * ceiling is many simultaneously *busy* TUIs.
- */
-export const MAX_WARM_TERMINAL_SURFACES = 8;
-
-/**
- * LRU update for the warm terminal-surface cache: move (or insert)
- * *conversationId* at the most-recent end with the given *readOnly*
- * snapshot, evicting the least-recent entry past
- * {@link MAX_WARM_TERMINAL_SURFACES}. Pure — exported for direct unit
- * testing.
- */
-export function updateWarmTerminalSurfaces(
-  prev: WarmTerminalEntry[],
-  conversationId: string,
-  readOnly: boolean,
-): WarmTerminalEntry[] {
-  const rest = prev.filter((e) => e.conversationId !== conversationId);
-  return [...rest, { conversationId, readOnly }].slice(-MAX_WARM_TERMINAL_SURFACES);
-}
-
-/**
  * The conversation scroll surface + composer — the content of the
  * "Main Agent" tab (and also the standalone view on `/`).
  *
@@ -1505,8 +1440,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   // All hook calls below must run on every render regardless of
   // `showTerminal` — Rules of Hooks. The single return at the bottom
-  // renders the persistent terminal overlay and, when the terminal view
-  // is closed, the chat surface beside it.
+  // renders either the terminal overlay or the chat surface.
   //
   // The bubble pipeline (buildBubbles, the turn rail, elicitation floats,
   // the working indicator) and its streaming-hot store subscriptions live in
@@ -1663,26 +1597,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
   }, [scroller]);
 
-  // Pre-warm terminal attaches across Chat/Terminal flips and session switches.
-  // Hidden overlays retain layout so FitAddon geometry stays stable; the chat
-  // surface unmounts while Terminal is shown.
-  const mountTerminal = shouldMountTerminalSurface(conversationId, terminalFirst);
-  // Non-owners attach read-only: a shared PTY can't attribute input
-  // per-user, so only the owner may type. They drive the agent via the
-  // composer instead. Server enforces this too.
-  const terminalReadOnly = !isOwnerLevel(permissionLevel);
-  const [warmTerminals, setWarmTerminals] = useState<WarmTerminalEntry[]>([]);
-  useEffect(() => {
-    if (!mountTerminal || !conversationId) return;
-    setWarmTerminals((prev) => updateWarmTerminalSurfaces(prev, conversationId, terminalReadOnly));
-  }, [mountTerminal, conversationId, terminalReadOnly]);
-  // Derive from warmTerminals only — the effect above adds the active session
-  // after the first paint, so xterm (a lazy chunk) never loads on the initial
-  // render. Previously the active session was included here same-commit to
-  // avoid the one-frame delay; that optimization is removed so the terminal
-  // chunk defers until after first paint. Returning to an already-warm
-  // background session is still same-commit (it's already in warmTerminals).
-  const renderedTerminals = warmTerminals;
   const handleTerminalResume = useCallback(async () => {
     if (!conversationId) throw new Error("Session is not available");
     if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
@@ -1694,42 +1608,26 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       throw new Error("The session is already connected; no recovery was performed");
     }
   }, [conversationId, liveness.kind, onShowReconnectHelp]);
-  const terminalSurfaces = renderedTerminals.map((entry) => {
-    const isActive = mountTerminal && entry.conversationId === conversationId;
-    const isShown = isActive && showTerminal;
-    return (
-      <div
-        key={entry.conversationId}
-        // xterm's .visible scrollbar overrides inherited visibility. Opacity
-        // hides the entire subtree without disturbing its layout or connection.
-        className={cn("absolute inset-0 flex flex-col", !isShown && "invisible opacity-0")}
-        aria-hidden={!isShown}
-      >
-        <MainTerminalView
-          conversationId={entry.conversationId}
-          initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
-          visible={isShown}
-          runnerOnline={isActive ? runnerOnline : undefined}
-          onResume={isActive ? handleTerminalResume : undefined}
-          sandboxOffline={isActive && liveness.kind === "host_asleep"}
-          onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
-          readOnly={entry.readOnly}
-        />
-        {isShown && (
-          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
-        )}
-      </div>
-    );
-  });
-
-  // Single return so both surfaces keep stable fragment positions across
-  // view flips — an early return would change the tree shape and remount
-  // the terminal overlays, disposing the live attaches they exist to
-  // preserve. The chat surface still unmounts entirely while the
-  // terminal is shown (a heavy transcript shouldn't render behind it).
+  // Mount the terminal only while it is shown: every mounted surface is a tmux
+  // client whose size can resize a window the user also has open elsewhere.
   return (
     <>
-      {terminalSurfaces}
+      {showTerminal && conversationId && (
+        <div key={conversationId} className="absolute inset-0 flex flex-col">
+          <MainTerminalView
+            conversationId={conversationId}
+            initialTerminalKey={terminalFirst?.terminalViewKey}
+            runnerOnline={runnerOnline}
+            onResume={handleTerminalResume}
+            sandboxOffline={liveness.kind === "host_asleep"}
+            onSurfaceElement={setTerminalSurfaceEl}
+            // Non-owners attach read-only: a shared PTY can't attribute input
+            // per-user, so only the owner may type. Server enforces this too.
+            readOnly={!isOwnerLevel(permissionLevel)}
+          />
+          <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+        </div>
+      )}
       {!showTerminal && (
         <>
           {/* The scrolling transcript column owns every streaming-hot store
