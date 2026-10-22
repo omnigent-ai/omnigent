@@ -3004,7 +3004,7 @@ describe("Composer shared visible controls", () => {
       }),
     );
     expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
-      "Working directory: /home/alice/worktrees/feature-x",
+      "Copy working directory: /home/alice/worktrees/feature-x",
     );
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature-x");
   });
@@ -3026,7 +3026,7 @@ describe("Composer shared visible controls", () => {
       expect.objectContaining({ workspace: "/home/alice/legacy-repo" }),
     );
     expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
-      "Working directory: /home/alice/legacy-repo",
+      "Copy working directory: /home/alice/legacy-repo",
     );
   });
 
