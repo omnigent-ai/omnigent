@@ -1721,6 +1721,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           sandboxOffline={isActive && liveness.kind === "host_asleep"}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
+          splittable
         />
         {isShown && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />

@@ -2425,13 +2425,14 @@ class PiExecutor(Executor):
                 model_catalog.catalog_model_entries,
                 "databricks",
             )
+            models = await run_sync_on_thread(
+                enrich_databricks_model_catalog, models, metadata_models
+            )
         except Exception:  # live availability remains authoritative
             logger.info(
                 "Pi could not enrich the live Databricks model list with MLflow metadata",
                 exc_info=True,
             )
-        else:
-            models = enrich_databricks_model_catalog(models, metadata_models)
         self._gateway_model_entries = tuple(models)
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis
