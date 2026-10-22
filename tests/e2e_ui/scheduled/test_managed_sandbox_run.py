@@ -140,10 +140,10 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
         snapshot = await _poll(
             client,
             f"{rig.a}/v1/sessions/{session_id}",
-            lambda body: (body.get("labels") or {}).get("omnigent.startup") == "failed",
+            lambda body: any(
+                item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
+                for item in body["items"]
+            ),
         )
+        assert snapshot["labels"]["omnigent.startup"] == "failed"
         assert snapshot["pending_inputs"] == []
-        assert any(
-            item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
-            for item in snapshot["items"]
-        ), snapshot["items"]
