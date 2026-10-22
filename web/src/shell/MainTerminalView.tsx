@@ -28,12 +28,9 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
-  removeTerminalLayoutKey,
-  replaceTerminalLayoutKey,
+  reconcileTerminalSplit,
   resizeTerminalSplit,
   terminalLayoutGeometry,
-  terminalLayoutKeys,
-  type TerminalLayout,
 } from "@/lib/terminalSplitLayout";
 import { TerminalSplitDivider } from "./TerminalSplitDivider";
 import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanesStore";
@@ -108,7 +105,11 @@ export function MainTerminalView({
   onSurfaceElement,
   splittable = false,
 }: MainTerminalViewProps) {
-  const { terminals, isFetching: terminalsFetching = false } = useTerminals(conversationId);
+  const {
+    terminals,
+    isFetching: terminalsFetching = false,
+    listCompleteAt = 0,
+  } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
@@ -214,33 +215,33 @@ export function MainTerminalView({
   const panesRef = useRef<HTMLDivElement>(null);
   useEffect(() => setDrag(null), [savedSplit]);
 
-  // Drop panes whose shell has gone away, but only once the list is
-  // authoritative: SSE fills it one terminal at a time while a fetch runs.
-  // A stale agent pane follows the live agent terminal instead.
+  // Terminals seen since the list was last empty. A seen terminal that leaves
+  // the list is gone; an unseen one is gone only per a complete runner answer
+  // newer than that reset, since SSE refills the list one terminal at a time.
+  const listGenerationRef = useRef({ conversationId, seen: new Set<string>(), startedAt: 0 });
   useEffect(() => {
-    if (!splitEnabled || terminalsFetching || terminals.length === 0) return;
+    if (!splitEnabled) return;
+    let generation = listGenerationRef.current;
+    if (generation.conversationId !== conversationId || terminals.length === 0) {
+      generation = { conversationId, seen: new Set(), startedAt: Date.now() };
+      listGenerationRef.current = generation;
+      if (terminals.length === 0) return;
+    }
     const liveKeys = new Set(terminals.map(terminalTabKey));
-    const liveAgentKey = agentTerminal ? terminalTabKey(agentTerminal) : null;
-    updateTerminalSplit(conversationId, (current) => {
-      if (!current) return current;
-      let layout: TerminalLayout | null = current.layout;
-      for (const key of terminalLayoutKeys(current.layout)) {
-        if (layout === null || liveKeys.has(key)) continue;
-        if (!isAgentTerminalKey(key)) {
-          layout = removeTerminalLayoutKey(layout, key);
-        } else if (liveAgentKey && !terminalLayoutKeys(layout).includes(liveAgentKey)) {
-          layout = replaceTerminalLayoutKey(layout, key, liveAgentKey);
-        }
-      }
-      if (layout === current.layout) return current;
-      if (layout === null || typeof layout === "string") return undefined;
-      const keys = terminalLayoutKeys(layout);
-      return {
-        layout,
-        focusedKey: keys.includes(current.focusedKey) ? current.focusedKey : keys[0],
-      };
-    });
-  }, [splitEnabled, terminalsFetching, terminals, agentTerminal, conversationId]);
+    const listComplete = !terminalsFetching && listCompleteAt > generation.startedAt;
+    const { seen } = generation;
+    updateTerminalSplit(
+      conversationId,
+      (current) =>
+        current &&
+        reconcileTerminalSplit(current, liveKeys, {
+          liveAgentKey: agentTerminal ? terminalTabKey(agentTerminal) : null,
+          isAgentKey: isAgentTerminalKey,
+          removable: (key) => listComplete || seen.has(key),
+        }),
+    );
+    for (const key of liveKeys) seen.add(key);
+  }, [splitEnabled, terminalsFetching, listCompleteAt, terminals, agentTerminal, conversationId]);
 
   const focusPane = (key: string) =>
     updateTerminalSplit(conversationId, (current) =>

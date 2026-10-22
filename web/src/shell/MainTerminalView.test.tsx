@@ -623,9 +623,15 @@ describe("MainTerminalView — split panes", () => {
     conversationId: string,
     terminals: TerminalInfo[],
     enabled = true,
-    { isFetching = false, visible = true, readOnly = false } = {},
+    { isFetching = false, listCompleteAt = 0, visible = true, readOnly = false } = {},
   ) {
-    useTerminalsMock.mockReturnValue({ terminals, isLoading: false, isFetching, error: null });
+    useTerminalsMock.mockReturnValue({
+      terminals,
+      isLoading: false,
+      isFetching,
+      listCompleteAt,
+      error: null,
+    });
     return (
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, features: { splittable_terminal_view_ui: enabled } }}
@@ -674,12 +680,47 @@ describe("MainTerminalView — split panes", () => {
 
   it("drops a closed shell's pane and returns to the single agent view", async () => {
     writeSessionWorkspaceState("conv_split_prune", { terminalSplit: savedSplit });
-    render(splitTree("conv_split_prune", [REPL_TERMINAL]));
+    const view = render(splitTree("conv_split_prune", [REPL_TERMINAL, BASH_SHELL]));
+    view.rerender(splitTree("conv_split_prune", [REPL_TERMINAL]));
 
     await waitFor(() =>
       expect(readSessionWorkspaceState("conv_split_prune").terminalSplit).toBeUndefined(),
     );
     expect(screen.getAllByTestId("terminal-view")).toHaveLength(1);
+  });
+
+  it("drops a never-seen shell's pane once a complete runner answer lands", async () => {
+    writeSessionWorkspaceState("conv_split_stale", { terminalSplit: savedSplit });
+    const view = render(splitTree("conv_split_stale", []));
+    view.rerender(
+      splitTree("conv_split_stale", [REPL_TERMINAL], true, { listCompleteAt: Date.now() + 1 }),
+    );
+
+    await waitFor(() =>
+      expect(readSessionWorkspaceState("conv_split_stale").terminalSplit).toBeUndefined(),
+    );
+  });
+
+  it("keeps a never-seen shell's pane while the list is not known complete", async () => {
+    // A failed or soft-status fetch, or an SSE-only fill, leaves the list partial
+    // with no fetch in flight and no complete answer.
+    writeSessionWorkspaceState("conv_split_partial", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_partial", [REPL_TERMINAL]));
+
+    expect(await screen.findByText("Terminal unavailable.")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_split_partial").terminalSplit).toEqual(savedSplit);
+  });
+
+  it("does not trust a complete answer older than the last empty list", async () => {
+    writeSessionWorkspaceState("conv_split_reset", { terminalSplit: savedSplit });
+    const staleAnswer = Date.now() - 1;
+    const view = render(splitTree("conv_split_reset", [], true, { listCompleteAt: staleAnswer }));
+    view.rerender(
+      splitTree("conv_split_reset", [REPL_TERMINAL], true, { listCompleteAt: staleAnswer }),
+    );
+
+    expect(await screen.findByText("Terminal unavailable.")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_split_reset").terminalSplit).toEqual(savedSplit);
   });
 
   it("persists keyboard resizes within the 25-75% bounds", async () => {

@@ -103,6 +103,41 @@ export function resizeTerminalSplit(
   return { ...layout, children };
 }
 
+/**
+ * Drop panes whose terminal is gone and move a stale agent pane onto the live
+ * agent terminal. ``removable`` says whether a missing key is known gone, as
+ * opposed to not yet delivered. Returns ``state`` itself when nothing changes.
+ */
+export function reconcileTerminalSplit(
+  state: TerminalSplitState,
+  liveKeys: ReadonlySet<string>,
+  {
+    liveAgentKey,
+    isAgentKey,
+    removable,
+  }: {
+    liveAgentKey: string | null;
+    isAgentKey: (key: string) => boolean;
+    removable: (key: string) => boolean;
+  },
+): TerminalSplitState | undefined {
+  let layout: TerminalLayout | null = state.layout;
+  for (const key of terminalLayoutKeys(state.layout)) {
+    if (layout === null || liveKeys.has(key)) continue;
+    if (isAgentKey(key)) {
+      if (liveAgentKey && !terminalLayoutKeys(layout).includes(liveAgentKey)) {
+        layout = replaceTerminalLayoutKey(layout, key, liveAgentKey);
+      }
+    } else if (removable(key)) {
+      layout = removeTerminalLayoutKey(layout, key);
+    }
+  }
+  if (layout === state.layout) return state;
+  if (layout === null || typeof layout === "string") return undefined;
+  const keys = terminalLayoutKeys(layout);
+  return { layout, focusedKey: keys.includes(state.focusedKey) ? state.focusedKey : keys[0] };
+}
+
 /** Flatten the tree into pane and divider rectangles (percent of the view). */
 export function terminalLayoutGeometry(
   layout: TerminalLayout,

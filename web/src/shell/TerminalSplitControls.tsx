@@ -16,6 +16,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
   findAgentTerminal,
+  isAgentTerminalKey,
   terminalDisplayLabel,
   terminalTabKey,
   type TerminalInfo,
@@ -27,6 +28,7 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import {
+  removeTerminalLayoutKey,
   splitTerminalLayout,
   terminalLayoutKeys,
   type TerminalSplitAxis,
@@ -76,6 +78,20 @@ export function TerminalSplitControls({
         (terminal) => terminalTabKey(terminal) === split.focusedKey && terminal !== agentTerminal,
       )
     : undefined;
+  // A focused shell pane whose terminal isn't listed has nothing to kill: closing just drops it.
+  const focusedMissingPane =
+    split && !focusedShell && !isAgentTerminalKey(split.focusedKey) ? split.focusedKey : null;
+  const closePane = () => {
+    if (focusedShell) {
+      setCloseTarget(focusedShell);
+      return;
+    }
+    updateTerminalSplit(conversationId, (current) => {
+      const layout = current && removeTerminalLayoutKey(current.layout, focusedMissingPane ?? "");
+      if (!layout || typeof layout === "string") return undefined;
+      return { layout, focusedKey: terminalLayoutKeys(layout)[0] };
+    });
+  };
 
   const splitWith = (shell: string, axis: TerminalSplitAxis) => {
     writePreferredShell(shell);
@@ -109,7 +125,7 @@ export function TerminalSplitControls({
         shells={shellOptions}
         onPick={(shell) => splitWith(shell, "rows")}
       />
-      {focusedShell && (
+      {(focusedShell || focusedMissingPane) && (
         <HeaderTooltip label="Close pane">
           <Button
             type="button"
@@ -117,7 +133,7 @@ export function TerminalSplitControls({
             size="icon-xs"
             aria-label="Close pane"
             disabled={deleteTerminal.isPending}
-            onClick={() => setCloseTarget(focusedShell)}
+            onClick={closePane}
             className="border-none text-muted-foreground hover:text-foreground"
           >
             <XIcon className="size-3.5" />

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseTerminalSplitState,
   clampSplitRatio,
+  reconcileTerminalSplit,
   removeTerminalLayoutKey,
   replaceTerminalLayoutKey,
   resizeTerminalSplit,
@@ -45,6 +46,32 @@ describe("terminalSplitLayout", () => {
     const tall = resizeTerminalSplit(twoByOne, [1], 0.1) as Exclude<TerminalLayout, string>;
     expect((tall.children[1] as Exclude<TerminalLayout, string>).ratio).toBe(0.25);
     expect(clampSplitRatio(Number.NaN)).toBe(0.5);
+  });
+
+  it("reconciles missing panes only when they are known gone", () => {
+    const state = { layout: twoByOne, focusedKey: "b" };
+    const live = new Set(["agent", "a"]);
+    const options = (removable: boolean, liveAgentKey: string | null = "agent") => ({
+      liveAgentKey,
+      isAgentKey: (key: string) => key === "agent" || key === "codex",
+      removable: () => removable,
+    });
+
+    expect(reconcileTerminalSplit(state, live, options(false))).toBe(state);
+    expect(reconcileTerminalSplit(state, live, options(true))).toEqual({
+      layout: { axis: "columns", ratio: 0.5, children: ["agent", "a"] },
+      focusedKey: "agent",
+    });
+    expect(
+      reconcileTerminalSplit(state, new Set(["codex", "a", "b"]), options(false, "codex")),
+    ).toMatchObject({ focusedKey: "b" });
+    expect(
+      reconcileTerminalSplit(
+        { layout: twoByOne, focusedKey: "a" },
+        new Set(["agent"]),
+        options(true),
+      ),
+    ).toBeUndefined();
   });
 
   it("swaps one pane key in place", () => {

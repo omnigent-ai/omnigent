@@ -155,3 +155,13 @@ it("offers no close for the agent pane", () => {
   expect(screen.getByRole("button", { name: "Split right" })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Close pane" })).toBeNull();
 });
+
+it("drops an unlisted shell pane without killing anything", () => {
+  saveSplit("conv_controls_missing", BASH_KEY);
+  renderControls("conv_controls_missing");
+
+  fireEvent.click(screen.getByRole("button", { name: "Close pane" }));
+
+  expect(fixture.deleteTerminal).not.toHaveBeenCalled();
+  expect(readSessionWorkspaceState("conv_controls_missing").terminalSplit).toBeUndefined();
+});
