@@ -277,6 +277,18 @@ _UNIFORM_STOP: dict[str, _UniformStop] = {
 }
 
 
+def forwarder_retires_with_pane(terminal_name: str) -> bool:
+    """Whether *terminal_name*'s transcript forwarder must stop when its pane dies.
+
+    The uniform-stop harnesses mirror a store that only their own pane writes,
+    so a forwarder outliving its required terminal has nothing left to mirror.
+    Left running, it keeps refreshing its chat claim and can adopt a chat the
+    next session in the same cwd creates. Claude's forwarder deliberately tails
+    its transcript across pane death and Codex owns its teardown separately.
+    """
+    return terminal_name in _UNIFORM_STOP
+
+
 def native_agent_for_cancel(wrapper_label: str | None) -> NativeCodingAgent | None:
     """Resolve a native agent from a session wrapper or sub-agent wrapper label.
 
@@ -601,6 +613,13 @@ class NativeInterruptRunner:
             # error against a still-running pane. This is not proof the pane
             # is already gone. Claude's genuine gone case is
             # ``TmuxSessionNotAdvertised`` and returns 204 from ``_claude_stop``.
+            terminal_registry = self._resource_registry.terminal_registry
+            if terminal_registry is not None and not terminal_registry.list_for_conversation(
+                conv_id
+            ):
+                # No pane is registered, so the kill had nothing to hit; the
+                # forwarder must still go, or it holds the session's chat claim.
+                await _cancel_auto_forwarder_task(conv_id)
             return JSONResponse(
                 status_code=503,
                 content={
