@@ -228,11 +228,13 @@ async def parent_side_chat_settings(
     """
     from omnigent.harnesses.codex_native.app_server import resolve_codex_effort_for_model
     from omnigent.harnesses.codex_native.bridge import (
+        read_bridge_state,
         read_codex_config_effort,
         read_codex_config_model,
         read_unmirrored_codex_settings,
     )
 
+    state = await asyncio.to_thread(read_bridge_state, bridge_dir)
     unmirrored = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
     model = unmirrored.get("model") or await asyncio.to_thread(read_codex_config_model, bridge_dir)
     effort = unmirrored.get("effort") or await asyncio.to_thread(
@@ -242,7 +244,12 @@ async def parent_side_chat_settings(
     if model:
         settings["model"] = model
     if effort:
-        settings["effort"] = await resolve_codex_effort_for_model(codex_client, effort, model)
+        settings["effort"] = await resolve_codex_effort_for_model(
+            codex_client,
+            effort,
+            model,
+            transport=state.socket_path if state is not None else None,
+        )
     return settings
 
 

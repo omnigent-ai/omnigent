@@ -15,11 +15,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.harnesses.codex_native import app_server as codex_app_server
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
+    CodexNativeBridgeState,
     codex_home_for_bridge_dir,
+    write_bridge_state,
     write_unmirrored_codex_settings,
 )
 
@@ -149,6 +152,34 @@ async def test_parent_side_chat_settings_follow_the_parent_thread(
     client = _FakeCodexClient({"model/list": _CATALOG})
 
     assert await side_chat.parent_side_chat_settings(client, tmp_path) == expected
+
+
+@pytest.mark.asyncio
+async def test_parent_side_chat_settings_reuse_the_parent_turns_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_app_server, "_effort_catalog_misses", {})
+    socket_path = str(tmp_path / "app-server.sock")
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path=socket_path,
+            thread_id="thread_parent",
+            codex_home=str(codex_home_for_bridge_dir(tmp_path)),
+        ),
+    )
+    _write_parent_settings(tmp_path, "gpt-6-sol", "max")
+    await codex_app_server.resolve_codex_effort_for_model(
+        _FakeCodexClient({"model/list": _CATALOG}), "max", "gpt-6-sol", transport=socket_path
+    )
+    side_client = _FakeCodexClient({})
+
+    settings = await side_chat.parent_side_chat_settings(side_client, tmp_path)
+
+    assert settings == {"model": "gpt-6-sol", "effort": "max"}
+    assert side_client.calls == []
 
 
 @pytest.mark.asyncio
