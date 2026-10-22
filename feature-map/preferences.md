@@ -129,10 +129,37 @@ one-time prompts and noninteractive no-network startup. Managed authentication,
 external launcher startup and plugin housekeeping require that launcher's
 integration recipe.
 
-For a human check, use two temporary `OMNIGENT_CONFIG_HOME` directories against
-an isolated enabled server. Save a model from A, decline import in B and confirm
-B is unchanged, then accept. Edit A again and confirm B only changes after another
-save/import. `show` should contain no provider credentials or harness commands.
+For a human check, use temporary homes and `OMNIGENT_CONFIG_HOME` directories
+against an isolated enabled server. Strip ambient `OMNIGENT_*` and `DATABRICKS_*`
+settings and use a private harness temp root. Record the exact source revision,
+interpreter, server identity/auth mode and database; use synthetic settings.
+
+- Save a model from A, decline import in B and confirm B's bytes, mtime and mode
+  are unchanged with no backups. Accept and check portable values, preserved
+  local commands/credentials/host, private backups and the import receipt. Edit
+  and save A again: B must stay unchanged until another explicit import. Restart
+  the server on the same database and confirm `show` still returns the snapshot.
+- Drive `config cloud --server URL onboard` directly in a real terminal or PTY
+  with terminal stdin and stdout. Cover both import-existing and save-first
+  choices with fresh login contexts. Check remembered accept/decline, silent
+  repeats with zero requests (also with the server stopped), a changed login
+  context prompting again, and noninteractive stdin/stdout/both doing nothing.
+  Supply `--plugin-opt-outs PATH` when checking a launcher's opt-out file.
+- For two-machine proof, run the server on the remote machine's loopback address
+  and forward it from the laptop: `ssh -N -o ExitOnForwardFailure=yes -L
+  127.0.0.1:LOCAL_PORT:127.0.0.1:REMOTE_PORT USER@REMOTE` (replace placeholders).
+  Use the forwarded port on the laptop and the server port remotely. Save on
+  the laptop, decline/accept remotely, then repeat after a server restart and
+  another laptop save. Two homes on one host are not two-machine coverage.
+- Record commands, output, exit codes and before/after state; identify pasted
+  terminal output separately from captured transcripts. Check `show` excludes
+  credentials and commands. A missing server or failed connection should report
+  the configuration/connection error without advising `omnigent stop`.
+
+Direct `onboard` and SSH tunneling verify the OSS CLI path. They do not verify
+deployed OAuth, workspace routing/identity, managed rollout gates, or automatic
+launcher startup and plugin housekeeping. Record those gaps separately, along
+with live conflict/rollback faults and any databases not exercised.
 
 **Shared scopes (component coverage only):**
 
@@ -221,3 +248,6 @@ observed results, any mocked services, and remaining entry-point gaps.
   File writes are individually atomic with backups and best-effort rollback.
   Concurrent external config writers and process death between two files are not
   a cross-file transaction; stop other configuration edits while importing.
+- On Unix, the pinned FileLock leaves an empty `config.yaml.import.lock` after
+  release. Its presence does not mean an import is still running. Leave it in
+  place so concurrent import processes coordinate on the same lock file.
