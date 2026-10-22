@@ -11,7 +11,13 @@ from omnigent.spec import load
 from omnigent.spec.omnigent import agent_def_to_agent_spec, agent_spec_to_agent_def
 
 
-def _write_agent(tmp_path: Path, *, directory: bool, executor: dict) -> Path:
+def _write_agent(
+    tmp_path: Path,
+    *,
+    directory: bool,
+    executor: dict,
+    instructions: str | None = "Explicit agent instructions.",
+) -> Path:
     source = tmp_path / "agent"
     source.mkdir()
     if directory:
@@ -21,15 +27,16 @@ def _write_agent(tmp_path: Path, *, directory: bool, executor: dict) -> Path:
             "spec_version": 1,
             "name": "pi-context-files",
             "executor": {"type": "omnigent", "model": model, "config": executor_config},
-            "instructions": "AGENTS.md",
+            "instructions": "AGENTS.md" if instructions is not None else None,
         }
-        (source / "AGENTS.md").write_text("Explicit agent instructions.")
+        if instructions is not None:
+            (source / "AGENTS.md").write_text(instructions)
         (source / "config.yaml").write_text(yaml.safe_dump(config))
         return source
     config = {
         "name": "pi-context-files",
         "executor": executor,
-        "prompt": "Explicit agent instructions.",
+        "prompt": instructions,
     }
     path = source / "agent.yaml"
     path.write_text(yaml.safe_dump(config))
@@ -168,3 +175,30 @@ tools:
         assert candidate.executor.config["context_files"] is False
         worker = candidate.sub_agents[0]
         assert worker.executor.config["context_files"] is True
+
+
+@pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
+@pytest.mark.parametrize(
+    "instructions", [None, "", " \n  "], ids=["missing", "empty", "whitespace"]
+)
+def test_native_replacement_rejects_blank_instructions_at_load(
+    tmp_path: Path, directory: bool, instructions: str | None
+) -> None:
+    path = _write_agent(
+        tmp_path,
+        directory=directory,
+        executor={"harness": "pi-native", "system_prompt_mode": "replace"},
+        instructions=instructions,
+    )
+    with pytest.raises(OmnigentError, match="requires non-empty authored instructions"):
+        load(_bundle_agent(path), dest=tmp_path / "uploaded")
+
+
+def test_sdk_replacement_allows_runtime_instructions(tmp_path: Path) -> None:
+    path = _write_agent(
+        tmp_path,
+        directory=True,
+        executor={"harness": "pi", "system_prompt_mode": "replace"},
+        instructions=None,
+    )
+    assert load(path).instructions is None

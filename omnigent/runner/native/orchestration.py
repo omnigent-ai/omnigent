@@ -2669,13 +2669,17 @@ async def _auto_create_pi_terminal(
     raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
     instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
-    prompt_config = pi_spec.executor.config if pi_spec is not None else {}
+    context_files = True
+    system_prompt_mode = "append"
+    if pi_spec is not None:
+        context_files = pi_spec.executor.config.get("context_files", True)
+        system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         instructions_path=instructions_path,
-        context_files=prompt_config.get("context_files", True),
-        system_prompt_mode=str(prompt_config.get("system_prompt_mode", "append")),
+        context_files=context_files,
+        system_prompt_mode=system_prompt_mode,
         session_dir=session_dir,
         external_session_id=resume_session_id,
         approve=pi_cli_version is not None and pi_cli_version >= PI_APPROVE_MIN_VERSION,

@@ -162,16 +162,20 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("env_denylist", "expected_env_unset"),
+    ("instruction_spec", "env_denylist", "expected_env_unset"),
     [
-        (None, []),
+        ("missing", None, []),
         (
+            "missing",
             " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
             ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
         ),
+        ("empty", None, []),
+        ("raw", None, []),
+        ("resolved", None, []),
+        ("resolved-replace", None, []),
     ],
 )
-@pytest.mark.parametrize("instruction_spec", ["missing", "empty", "raw", "resolved"])
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -223,7 +227,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     captured: dict[str, Any] = {}
 
     class _FakeResourceRegistry:
-        """Records the launch; exposes ONLY the required-terminal launch API."""
+        """Omit launch_terminal so regressions to the optional-terminal API fail."""
 
         terminal_registry = None
 
@@ -261,8 +265,9 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             executor=ExecutorSpec(),
             instructions=instructions if instruction_spec != "empty" else "   ",
         )
-        if instruction_spec == "resolved":
+        if instruction_spec == "resolved-replace":
             agent_spec.executor.config.update(context_files=False, system_prompt_mode="replace")
+        if instruction_spec.startswith("resolved"):
             agent_spec = ResolvedSpec(spec=agent_spec, workdir=tmp_path)
 
     bridge_dir = pi_native_bridge.prepare_bridge_dir("47f049b9d13df4db397c7f46859b825f")
@@ -296,14 +301,16 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     args = captured["spec"].args
     assert args[-2:] == ["--append-system-prompt", "User addition"]
-    if instruction_spec in {"raw", "resolved"}:
+    if instruction_spec in {"raw", "resolved", "resolved-replace"}:
         assert args.count("--append-system-prompt") == 2
         prompt_flag = (
-            "--system-prompt" if instruction_spec == "resolved" else "--append-system-prompt"
+            "--system-prompt"
+            if instruction_spec == "resolved-replace"
+            else "--append-system-prompt"
         )
         path = Path(args[args.index(prompt_flag) + 1])
-        assert ("--no-context-files" in args) is (instruction_spec == "resolved")
-        if instruction_spec == "resolved":
+        assert ("--no-context-files" in args) is (instruction_spec == "resolved-replace")
+        if instruction_spec == "resolved-replace":
             assert args[args.index("--append-system-prompt") + 1] == ""
         assert (
             path.parent

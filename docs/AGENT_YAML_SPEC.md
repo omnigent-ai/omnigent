@@ -212,7 +212,8 @@ instructions: AGENTS.md
 
 Regular `pi` delivers composed agent/request/runtime instructions. Native Pi
 loads the spec's resolved authored instructions at terminal launch; replacement
-requires non-empty authored instructions. Per-turn runtime delivery is unchanged.
+requires non-empty authored instructions, checked at spec load. Per-turn runtime
+delivery is unchanged.
 Both modes preserve explicit agent instructions. Replacement removes Pi's default
 tool summaries and coding guidelines; tool schemas and execution still work.
 `context_files` is independent and still defaults to `true`. Skills, the working

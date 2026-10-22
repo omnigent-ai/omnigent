@@ -62,16 +62,3 @@ def test_native_startup_raw_instructions_from_spec_never_returns_stripped_form()
     """The original resolved text is preserved verbatim, not the stripped form."""
     padded = "  Keep leading/trailing whitespace exactly.  "
     assert _native_startup_raw_instructions_from_spec(_spec(padded)) == padded
-
-
-def test_native_pi_replacement_requires_authored_instructions(tmp_path: Path) -> None:
-    from omnigent.runner.native.orchestration import _build_pi_native_args
-
-    with pytest.raises(ValueError, match="requires non-empty instructions"):
-        _build_pi_native_args(
-            terminal_launch_args=None,
-            extension_path=tmp_path / "extension.js",
-            session_dir=tmp_path,
-            external_session_id=None,
-            system_prompt_mode="replace",
-        )

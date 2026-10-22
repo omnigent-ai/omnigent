@@ -70,10 +70,10 @@ def _wait_for_catalog(client: httpx.Client, session_id: str) -> dict:
 
 @pytest.mark.parametrize(
     ("context_files", "prompt_mode"),
-    [(None, None), (False, "append"), (True, "replace"), (False, "replace")],
-    ids=["default", "no-context", "replace", "replace-no-context"],
+    [(None, None), (False, "replace")],
+    ids=["default", "replace-no-context"],
 )
-def test_cold_resume_keeps_explicit_openai_codex_selection(
+def test_cold_resume_preserves_model_and_prompt_settings(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,

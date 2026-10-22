@@ -200,6 +200,15 @@ def validate_omnigent_executor(
                 "executor.config.system_prompt_mode",
                 "only supported with harness 'pi' or 'pi-native'",
             )
+        elif (
+            harness == "pi-native"
+            and spec.executor.config["system_prompt_mode"] == "replace"
+            and not (spec.instructions or "").strip()
+        ):
+            result.add(
+                "instructions",
+                "pi-native system_prompt_mode='replace' requires non-empty authored instructions",
+            )
     if not harness:
         result.add(
             "executor.config.harness",

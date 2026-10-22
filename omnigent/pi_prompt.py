@@ -2,7 +2,7 @@
 
 
 def pi_prompt_args(instructions: str | None, mode: str = "append") -> list[str]:
-    """Append authored text/a file, or replace Pi's base without ambient append discovery."""
+    """Return Pi prompt flags; replacement suppresses SYSTEM.md/APPEND_SYSTEM.md discovery."""
     if mode not in ("append", "replace"):
         raise ValueError("system_prompt_mode must be 'append' or 'replace'")
     if mode == "replace":

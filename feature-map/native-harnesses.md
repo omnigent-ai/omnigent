@@ -288,14 +288,14 @@ Cross-harness journeys:
   input through the real Pi process; only model replies are scripted locally.
   Each case owns its stack and saves terminal recordings plus API evidence.
 - **`agent-instructions`, Pi native (own environment):**
-  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_keeps_explicit_openai_codex_selection`
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_preserves_model_and_prompt_settings`
   uploads a spec with a bundled instruction file through a real server, host,
   runner and Pi terminal. A test-owned extension reads the real system prompt
-  at launch/resume across default, no-context, replace and combined settings.
+  at launch/resume with defaults and combined replacement/no-context settings.
   Authored instructions remain once; explicit additions survive, discovered
   context follows the setting, and replacement excludes built-in/SYSTEM.md and
   APPEND_SYSTEM.md prompts. The selected model survives. No model call is made.
-  The compatibility test above checks wrapper instructions with scripted turns. Run with the CI-pinned Pi executable:
+  Run with the CI-pinned Pi executable:
 
   ```sh
   OMNIGENT_PI_PATH=/path/to/pi uv run --no-sync pytest tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py --reruns 0 -q
