@@ -9,6 +9,8 @@
  */
 export const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
   provisioning: "Provisioning sandbox",
+  // Still provisioning; `ArcletDbcertBanner` carries the warning.
+  dbcert_missing: "Provisioning sandbox",
   cloning: "Cloning repository",
   starting: "Connecting host",
   connecting: "Starting agent",

@@ -771,6 +771,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // step — the snapshot re-seeds the indicator on the next load.
     if (
       stage !== "provisioning" &&
+      stage !== "dbcert_missing" &&
       stage !== "cloning" &&
       stage !== "starting" &&
       stage !== "connecting" &&

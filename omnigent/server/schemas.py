@@ -2012,9 +2012,12 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# ``failed`` are terminal. ``dbcert_missing`` is a warning while
+# provisioning, from deployments that can tell: the sandbox (a Databricks
+# Arclet) hasn't received its owner's dbcert, so its host may not connect.
 SandboxLaunchStage = Literal[
     "provisioning",
+    "dbcert_missing",
     "cloning",
     "starting",
     "connecting",
@@ -2034,7 +2037,8 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox) → ``cloning``
+        ``provisioning`` (creating the sandbox; ``dbcert_missing``
+        while it also lacks its owner's dbcert) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /

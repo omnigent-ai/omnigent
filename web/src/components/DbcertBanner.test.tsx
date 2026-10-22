@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DbcertBanner, LaptopDbcertBanner } from "./DbcertBanner";
+import { ArcletDbcertBanner, DbcertBanner, LaptopDbcertBanner } from "./DbcertBanner";
 import type * as HostModule from "@/lib/host";
 import { isDatabricksWorkspace } from "@/lib/host";
 import type * as HostDbcertModule from "@/lib/hostDbcert";
@@ -10,6 +10,8 @@ import {
   readHostDbcertExpiry,
   startHostDbcertRefresh,
 } from "@/lib/hostDbcert";
+import type { SandboxStatus } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 
 const NOW = Date.UTC(2026, 9, 18, 21);
 const EXPIRED = Date.UTC(2026, 9, 18, 20, 8, 15);
@@ -394,4 +396,51 @@ describe("LaptopDbcertBanner", () => {
       expect(desktopCheck).toHaveBeenCalledTimes(verifying ? 1 : 0);
     },
   );
+});
+
+describe("ArcletDbcertBanner", () => {
+  const MISSING: SandboxStatus = { stage: "dbcert_missing", error: null, provider: "arclet" };
+
+  function showSession(conversationId: string, sandboxStatus: SandboxStatus | null) {
+    act(() => useChatStore.setState({ conversationId, sandboxStatus }));
+  }
+
+  afterEach(() => {
+    useChatStore.setState({ conversationId: null, sandboxStatus: null });
+  });
+
+  it("says how to refresh a dbcert the Arclet hasn't received", () => {
+    showSession("conv_a", MISSING);
+    render(<ArcletDbcertBanner />);
+    const warning = screen.getByRole("status");
+    expect(warning).toHaveTextContent(/hasn't received your dbcert/i);
+    expect(warning).toHaveTextContent(/click dbcert in the Arca Companion menu on your laptop/i);
+    expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
+  });
+
+  it.each([
+    ["no launch", null],
+    ["a launch that has its dbcert", { stage: "provisioning", error: null }],
+    ["a failed launch", { stage: "failed", error: "managed host did not come online" }],
+  ] as const)("stays hidden for %s", (_label, status) => {
+    showSession("conv_a", status);
+    render(<ArcletDbcertBanner />);
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("goes away once the launch moves on", () => {
+    showSession("conv_a", MISSING);
+    render(<ArcletDbcertBanner />);
+    showSession("conv_a", { stage: "provisioning", error: null, provider: "arclet" });
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("stays dismissed only in the session it was dismissed in", () => {
+    showSession("conv_a", MISSING);
+    render(<ArcletDbcertBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("status")).toBeNull();
+    showSession("conv_b", MISSING);
+    expect(screen.getByRole("status")).toHaveTextContent(/hasn't received your dbcert/i);
+  });
 });

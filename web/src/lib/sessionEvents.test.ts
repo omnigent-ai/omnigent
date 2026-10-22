@@ -1428,6 +1428,18 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.error).toBe("managed sandbox launch failed: spend limit reached");
   });
 
+  it("keeps a dbcert_missing frame", () => {
+    const out = parse("session.sandbox_status", {
+      type: "session.sandbox_status",
+      conversation_id: "conv_abc",
+      stage: "dbcert_missing",
+      error: null,
+      provider: "arclet",
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as SessionSandboxStatusEvent).stage).toBe("dbcert_missing");
+  });
+
   it("drops frames with an unknown stage", () => {
     // A bogus stage must not render a bogus step — the snapshot
     // re-seeds the indicator on the next load.

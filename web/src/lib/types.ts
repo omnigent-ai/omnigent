@@ -547,11 +547,13 @@ export interface Session {
 /**
  * Stages of a managed-sandbox launch, in pipeline order. `cloning`
  * only occurs when the session requested a repository workspace;
- * `ready` and `failed` are terminal (`ready` is delivered via SSE
- * only — the snapshot field clears to null on success).
+ * `dbcert_missing` is a warning while provisioning: the sandbox (a
+ * Databricks Arclet) hasn't received its owner's dbcert yet. `ready`
+ * and `failed` are terminal (`ready` is delivered via SSE only — the
+ * snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
+  "provisioning" | "dbcert_missing" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors

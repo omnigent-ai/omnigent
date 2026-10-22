@@ -5679,9 +5679,10 @@
             "title": "Provider"
           },
           "stage": {
-            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
+            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox; `dbcert_missing` while it also lacks its owner's dbcert) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
             "enum": [
               "provisioning",
+              "dbcert_missing",
               "cloning",
               "starting",
               "connecting",
@@ -8309,6 +8310,7 @@
             "description": "The launch stage just entered, e.g. `\"provisioning\"` \u2014 see `SandboxStatus` for the full pipeline order.",
             "enum": [
               "provisioning",
+              "dbcert_missing",
               "cloning",
               "starting",
               "connecting",

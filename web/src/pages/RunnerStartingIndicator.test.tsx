@@ -118,6 +118,19 @@ describe("RunnerStartingIndicator", () => {
     },
   );
 
+  it.each(["hero", "row"] as const)(
+    "%s: still says provisioning while the Arclet waits for its dbcert",
+    (variant) => {
+      // ArcletDbcertBanner carries the warning; the indicator's copy doesn't change.
+      useChatStore.setState({
+        sandboxStatus: { stage: "dbcert_missing", error: null, provider: "arclet" },
+      });
+      renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
+      const indicator = screen.getByTestId("runner-starting-indicator");
+      expect(indicator).toHaveTextContent(/provisioning sandbox/i);
+    },
+  );
+
   it("row: sandbox stage still renders during terminal startup", () => {
     useChatStore.setState({ sandboxStatus: { stage: "cloning", error: null } });
     renderWithContext("row", makeCtx({ terminalStartingUp: true }));
