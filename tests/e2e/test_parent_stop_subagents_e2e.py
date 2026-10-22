@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -176,6 +177,19 @@ def test_native_parent_teardown_preserves_child_outcome(
         for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
     }
+    if harness == "codex":
+        # Set the app-server's MCP budget; --remote TUI overrides cannot change it.
+        codex = shutil.which("codex")
+        assert codex is not None
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        launcher = bin_dir / "codex"
+        launcher.write_text(
+            f'#!/bin/sh\nexec {shlex.quote(codex)} "$@" '
+            "-c mcp_servers.omnigent.startup_timeout_sec=60\n"
+        )
+        launcher.chmod(0o755)
+        base_env["PATH"] = f"{bin_dir}{os.pathsep}{base_env['PATH']}"
     env = {
         "OMNIGENT_CONFIG_HOME": str(config),
         "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"),

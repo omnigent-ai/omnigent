@@ -47,6 +47,11 @@ and steers messages while the agent is busy.
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI.
+- `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
+  suggestions with a read-only list of MCP servers enabled for that session and
+  links to harness Settings with the session’s host preselected. Host-native entries are limited to the
+  active harness, and a host lookup failure leaves known agent entries visible.
+  It is absent before a session starts and from side chat.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -124,6 +129,9 @@ and steers messages while the agent is busy.
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- Select `/mcp` to replace the suggestions with the MCP servers enabled for the
+  session. An empty list points to Settings; the command is absent on the
+  new-session composer.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
@@ -343,6 +351,16 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
+- **`session-mcp-status`, in-session composer:** component coverage lives in
+  `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
+  select `/mcp`, and expect the effective MCP names and descriptions under
+  **Enabled for this session**. Repeat with no MCPs and expect the empty state
+  and Settings link; confirm `/mcp` is absent on the landing page and side chat.
+  Native host entries must match the active harness; a host error is shown
+  without hiding MCPs declared by the bound session agent. While the host loads,
+  its loading status stays visible alongside agent entries; a session without a
+  known host shows unavailable status rather than an empty inventory. Click
+  **Go to Settings** and confirm the session’s harness and host are selected.
 - **`codex-plugin-skills`, both composers:**
   `tests/e2e_ui/chat/test_codex_plugin_skills.py::test_plugin_skill_in_both_composers_after_inventory_failure`
   installs an enabled local plugin using the real Codex CLI, moves away its

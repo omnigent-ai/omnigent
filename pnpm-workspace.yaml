@@ -31,6 +31,8 @@ packageExtensions:
 catalog:
   react: ^18.2.0
   react-dom: ^18.2.0
+  # KaTeX 0.18.11 was accidentally published with breaking changes.
+  katex: 0.18.10
   # Upgrade Shiki and its Monaco adapter together with their shared packages.
   shiki: 4.5.0
   '@shikijs/monaco': 4.5.0
@@ -68,8 +70,8 @@ overrides:
   react: "catalog:"
   react-dom: "catalog:"
   dompurify: 3.4.14
-  # KaTeX 0.18.11 was accidentally published with breaking changes.
-  'katex@0.18.11': 0.18.10
+  # Math renderers and their imported stylesheet must share the same classes.
+  katex: "catalog:"
   mermaid: 11.16.1
   tar: 7.5.21
   'node-gyp>undici': 6.28.0

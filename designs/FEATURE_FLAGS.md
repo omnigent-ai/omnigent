@@ -59,3 +59,18 @@ for Claude working-status acceptance and kill-switch verification.
 5. Roll back with `-feature_name` and redeploy the same image. For runner
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
+
+Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
+
+The persistence layer is available, but the persistent scheduler and its flag
+wiring are not integrated yet. The startup-recovery and cleanup-sweep rollback
+instructions below apply once that integration lands.
+
+Even with the flag off, an interrupted deletion can leave a hidden task row for
+cleanup. During a mixed-version deployment, older replicas can still show and
+edit that row until all replicas are upgraded.
+
+Before disabling `automations_v2`, stop new dispatch and let existing startups
+finish or complete recovery, including any required resource cleanup. Disabling
+the flag stops startup recovery and deleted-task sweeps; clearing scheduling
+cursors does not resolve unfinished runs or remove their retained task rows.

@@ -253,10 +253,16 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   fireEvent.click(within(workspace).getByText("Open other"));
   expect(workspace).toHaveTextContent("other.md");
   fireEvent.click(within(workspace).getByText("Maximize"));
-  expect(screen.getByTestId("session-grid")).toHaveAttribute("inert");
+  const gridContent = screen.getByTestId("session-grid").parentElement!;
+  expect(gridContent).toHaveAttribute("inert");
+  expect(gridContent).toContainElement(
+    screen.getByRole("button", { name: "Collapse grid workspace" }),
+  );
+  fireEvent.click(within(workspace).getByText("Maximize"));
+  expect(gridContent).not.toHaveAttribute("inert");
   fireEvent.click(screen.getByRole("button", { name: "Collapse grid workspace" }));
   expect(screen.queryByRole("complementary", { name: "Workspace" })).not.toBeInTheDocument();
-  expect(screen.getByTestId("session-grid")).not.toHaveAttribute("inert");
+  expect(gridContent).not.toHaveAttribute("inert");
   expect(readSessionWorkspaceState("first").widthPx).toBe(320);
   expect(readSessionWorkspaceState("second").widthPx).toBe(900);
   expect(readSessionWorkspaceState("grid:saved")).toEqual({ open: false, widthPx: 504 });
