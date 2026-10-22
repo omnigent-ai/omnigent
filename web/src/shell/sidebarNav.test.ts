@@ -777,3 +777,17 @@ it("keeps Created stable across updates, active-row overrides, and hover freezes
   expect(ids([{ ...old, updated_at: 1000 }, sameSecond, newer])).toEqual(["c", "b", "a"]);
   expect(sortConversations([old, newer], null).map((row) => row.id)).toEqual(["a", "b"]);
 });
+
+it("orders equal-updated_at rows by id whether or not the order is frozen", () => {
+  const same = new Date("2026-10-14T10:00:00Z");
+  const a = conversation("a", "A", same);
+  const b = conversation("b", "B", same);
+  const c = conversation("c", "C", same);
+  const frozen = new Map<string, number>();
+  const first = sortConversations([a, b, c], null, frozen).map((row) => row.id);
+  // A refresh can hand the same rows back in another order while the pointer is inside.
+  expect(sortConversations([c, a, b], null, frozen).map((row) => row.id)).toEqual(first);
+  // With the pointer outside, arrival order still must not show through.
+  expect(first).toEqual(["c", "b", "a"]);
+  expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
+});

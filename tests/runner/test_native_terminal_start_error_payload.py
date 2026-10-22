@@ -421,11 +421,19 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
         exc = RuntimeError(private_detail)
         exc.__cause__ = httpx.ReadTimeout("private upstream URL")
 
+    events: list[dict[str, object]] = []
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
         payload = _publish_native_terminal_start_error(
-            lambda _session_id, _event: None, "child-session", "Codex", exc
+            lambda _session_id, event: events.append(event), "child-session", "Codex", exc
         )
 
+    assert len(events) == 1
+    context = events[0]["failure_context"]
+    assert isinstance(context, dict)
+    assert context["failure_id"] == payload["error_id"]
+    assert context["failure_source"] == "native_terminal_start"
+    assert context["exception_type"] == type(exc).__name__
+    assert private_detail not in str(context)
     record = next(r for r in caplog.records if payload["error_id"] in r.getMessage())
     row = record_to_row(record, source="runner")
     assert row["session_id"] == "child-session"

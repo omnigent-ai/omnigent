@@ -127,4 +127,5 @@ def test_shipped_codes_are_stable() -> None:
         "succeeded": 3,
         "failed": 4,
         "skipped": 5,
+        "starting": 6,
     }

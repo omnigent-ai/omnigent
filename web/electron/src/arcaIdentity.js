@@ -41,13 +41,19 @@ function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
     // The selected workspace remains bound by the command's --server argument.
     const expected = new URL(target);
     expected.search = "";
+    // The CLI reuses a daemon on another URL for the same workspace and names
+    // the requested target in same_workspace_as.
+    const servesTarget =
+      (arcaTarget(daemon.target) === expected.href &&
+        arcaTarget(daemon.server_url) === expected.href) ||
+      (typeof daemon.same_workspace_as === "string" &&
+        arcaTarget(daemon.same_workspace_as) === expected.href);
     if (
       daemon.mode !== "server" ||
       daemon.process !== "online" ||
       daemon.host_status !== "online" ||
       daemon.error != null ||
-      arcaTarget(daemon.target) !== expected.href ||
-      arcaTarget(daemon.server_url) !== expected.href ||
+      !servesTarget ||
       typeof daemon.host_id !== "string" ||
       !/^[a-f0-9]{32}$/i.test(daemon.host_id)
     ) {

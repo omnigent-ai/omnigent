@@ -67,7 +67,6 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -114,7 +113,6 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
-    _managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -160,6 +158,7 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
+    _start_managed_launch_task,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -197,6 +196,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -386,6 +386,16 @@ def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
+def _unsupported_model_detail(result: _RunnerForwardResult | None) -> str | None:
+    """Return the runner's reason when the terminal has no way to select the requested model."""
+    if result is None or _runner_reply_field(result.body, "error") != (
+        "claude_native_model_unsupported"
+    ):
+        return None
+    detail = _runner_reply_field(result.body, "detail")
+    return detail if isinstance(detail, str) and detail else "This terminal cannot use that model."
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -406,6 +416,85 @@ def register_core_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the core session routes on router."""
+
+    async def _check_initial_input(request: Request, event: SessionEventInput | None) -> None:
+        """Refuse a malformed first input before the session exists."""
+        from starlette.datastructures import UploadFile as FormUploadFile
+
+        form = (
+            await request.form()
+            if request.headers.get("content-type", "").startswith("multipart/form-data")
+            else None
+        )
+        files = form.getlist("initial_files") if form is not None else []
+        if event is None:
+            if files:
+                raise OmnigentError(
+                    "initial_files requires initial_input", code=ErrorCode.INVALID_INPUT
+                )
+            return
+        if getattr(request.app.state, "startup_inputs", None) is None:
+            raise OmnigentError(
+                "durable initial input is not configured", code=ErrorCode.INVALID_INPUT
+            )
+        if files and (
+            file_store is None or not all(isinstance(file, FormUploadFile) for file in files)
+        ):
+            raise OmnigentError(
+                "initial_files must contain uploaded files", code=ErrorCode.INVALID_INPUT
+            )
+
+    async def _accept_initial_input(
+        request: Request, session_id: str, event: SessionEventInput | None, user_id: str | None
+    ) -> None:
+        """Save a checked first input, deleting the new session if that fails."""
+        if event is None:
+            return
+        startup = request.app.state.startup_inputs
+        try:
+            form = (
+                await request.form()
+                if request.headers.get("content-type", "").startswith("multipart/form-data")
+                else None
+            )
+            blocks = []
+            for file in form.getlist("initial_files") if form is not None else []:
+                assert file_store is not None  # _check_initial_input refused files without one
+                resource = await request.app.state.initial_file_upload(request, session_id, file)
+                stored = await asyncio.to_thread(
+                    file_store.get, resource["id"], session_id=session_id
+                )
+                assert stored is not None
+                blocks.append(
+                    {
+                        "type": "input_image"
+                        if (stored.content_type or "").startswith("image/")
+                        else "input_file",
+                        "file_id": stored.id,
+                        "filename": stored.filename,
+                    }
+                )
+            if blocks:
+                event = event.model_copy(
+                    update={
+                        "data": {
+                            **event.data,
+                            "content": [*blocks, *event.data.get("content", [])],
+                        }
+                    }
+                )
+            await startup.enqueue(session_id, event, user_id=user_id, headers=request.headers)
+        except Exception:
+            # The create fails, so leave no session (or uploaded file) for a retry
+            # to duplicate.
+            if file_store is not None:
+                blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+                if artifact_store is not None:
+                    for blob_key in blob_keys:
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(artifact_store.delete, blob_key)
+            await conversation_store.delete_conversation(session_id)
+            raise
 
     async def _schedule_managed_launch(
         request: Request,
@@ -512,6 +601,12 @@ def register_core_routes(
                 session_id,
                 managed_labels,
             )
+        if getattr(request.app.state, "startup_inputs", None) is not None:
+            from omnigent.server.startup_inputs import STARTUP_LABEL
+
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
+            )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
@@ -522,27 +617,30 @@ def register_core_routes(
             "provisioning",
             provider=sandbox_provider or sandbox_config.default.provider,
         )
-        launch_task = asyncio.create_task(
-            _run_managed_launch(
-                session_id=session_id,
-                # On auth-disabled servers user_id is None; the sandbox
-                # host registers under the reserved local owner.
-                owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                sandbox_config=sandbox_config,
-                repos=repos,
-                tracker=managed_launches,
-                conversation_store=conversation_store,
-                host_store=host_store_for_managed,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                provider=sandbox_provider,
-                agent_store=agent_store,
-                agent_id=agent_id,
-                host_id=requested_host_id,
-            )
+        launch = _run_managed_launch(
+            session_id=session_id,
+            # On auth-disabled servers user_id is None; the sandbox
+            # host registers under the reserved local owner.
+            owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=managed_launches,
+            conversation_store=conversation_store,
+            host_store=host_store_for_managed,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            provider=sandbox_provider,
+            agent_store=agent_store,
+            agent_id=agent_id,
+            host_id=requested_host_id,
         )
-        _managed_launch_tasks.add(launch_task)
-        launch_task.add_done_callback(_managed_launch_tasks.discard)
+        _start_managed_launch_task(
+            session_id,
+            launch,
+            conversation_store=conversation_store,
+            tracker=managed_launches,
+            startup=getattr(request.app.state, "startup_inputs", None),
+        )
 
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None
@@ -707,6 +805,8 @@ def register_core_routes(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
@@ -715,7 +815,7 @@ def register_core_routes(
             launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             launch_result = {
                 "status": "failed",
                 "error": (
@@ -791,7 +891,8 @@ def register_core_routes(
         """
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-        if content_type == "multipart/form-data":
+        form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
+        if form is not None and (form.get("bundle") is not None or "initial_files" not in form):
             result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
@@ -799,8 +900,14 @@ def register_core_routes(
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             return result
 
+        if form is not None and not isinstance(form.get("metadata"), str):
+            raise HTTPException(status_code=422, detail=[_multipart_missing_detail("metadata")])
         try:
-            payload = await request.json()
+            payload = (
+                json.loads(str(form.get("metadata", "{}")))
+                if form is not None
+                else await request.json()
+            )
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -832,6 +939,7 @@ def register_core_routes(
 
         # Checked before the session exists so a rejected create leaves nothing
         # behind.
+        await _check_initial_input(request, body.initial_input)
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
@@ -937,6 +1045,7 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
+        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The
@@ -1063,6 +1172,7 @@ def register_core_routes(
             project_store=project_store,
         )
         parsed_metadata = project_resolution.body
+        await _check_initial_input(request, parsed_metadata.initial_input)
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -1089,7 +1199,7 @@ def register_core_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
 
         if parsed_metadata.mcp_registry_services:
@@ -1203,6 +1313,9 @@ def register_core_routes(
                 await asyncio.to_thread(
                     permission_store.grant, user_id, result.session_id, LEVEL_OWNER
                 )
+        await _accept_initial_input(
+            request, result.session_id, parsed_metadata.initial_input, user_id
+        )
         _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as
@@ -2425,7 +2538,8 @@ def register_core_routes(
         #   session may pin it — including a read-only collaborator on a session
         #   shared with them. Only when the pinned label is the request's ONLY
         #   mutation.
-        # * OWNER — archiving/unarchiving or filing into a project. Both are
+        # * OWNER — launch arguments and permission mode control host execution.
+        #   Archiving/unarchiving and filing into a project are also
         #   owner-only: projects are owner-private (an editor must not move a
         #   session between them), and archive pairs with a client-driven,
         #   owner-gated stop (an editor must not hide/stop a session they can't
@@ -2442,13 +2556,19 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_launch_args = (
+            body.terminal_launch_args is not None
+            or body.permission_mode is not None
+            or body.approval_mode is not None
+            or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
+        )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project:
+        elif body.archived is not None or set_project or set_launch_args:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -3061,13 +3181,20 @@ def register_core_routes(
                 unconfirmed = _model_forward is not None and _codex_update_unconfirmed(
                     _model_forward
                 )
-                forward_failed = not unconfirmed and _surface_model_change_forward_failure(
-                    session_id,
-                    updated.model_override,
-                    _model_forward,
+                # A model the terminal can't select is a bad request, not a failed session.
+                unsupported = _unsupported_model_detail(_model_forward)
+                forward_failed = (
+                    unsupported is None
+                    and not unconfirmed
+                    and _surface_model_change_forward_failure(
+                        session_id,
+                        updated.model_override,
+                        _model_forward,
+                    )
                 )
                 if conv is not None and (
-                    (wake_for_model_change and (_model_forward is None or forward_failed))
+                    unsupported is not None
+                    or (wake_for_model_change and (_model_forward is None or forward_failed))
                     or (forward_failed and configured_snapshot(conv.inference_snapshot))
                 ):
                     if combined_model_forward:
@@ -3091,6 +3218,8 @@ def register_core_routes(
                         model_override=conv.model_override,
                         _unset_model_override=conv.model_override is None,
                     )
+                    if unsupported is not None:
+                        raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
                         "The previous selection has been restored.",
@@ -3749,10 +3878,12 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.inner.native_attachments import uses_filesystem_delivery
 
             filesystem_sources = [
-                stored for stored in fork_source_files if requires_filesystem(stored.filename)
+                stored
+                for stored in fork_source_files
+                if uses_filesystem_delivery(stored.filename, stored.source_metadata)
             ]
             if filesystem_sources:
                 await asyncio.to_thread(

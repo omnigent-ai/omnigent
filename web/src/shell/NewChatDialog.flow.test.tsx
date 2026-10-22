@@ -91,6 +91,7 @@ const SEEDED_WORKSPACE = "/Users/corey/universe/src/foo";
 // (`@/lib/routing`), not react-router directly — mock that so the create
 // flow's navigate() lands on our spy regardless of router/provider setup.
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
@@ -764,6 +765,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         project,
+        false,
       ),
     );
   });
@@ -871,6 +873,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
     expect(resolveCreate).toBeTypeOf("function");
@@ -917,6 +920,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
   });
@@ -1127,6 +1131,7 @@ describe("NewChatLandingScreen create flow", () => {
         navigateMock,
         expect.any(Function),
         undefined,
+        false,
       ),
     );
 

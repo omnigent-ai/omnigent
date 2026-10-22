@@ -991,7 +991,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
 
         try:
             await asyncio.wait_for(_hook_did_its_job(), timeout=budget(5.0))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             registry_entry = ap_app.state.tunnel_registry.get(_RUNNER_ID)
             raise AssertionError(
                 "Reconnect did not drive the connect hook to completion within 5s.\n"
@@ -1169,7 +1169,7 @@ async def _reconnect_fires_connect_hook(
 
         try:
             await asyncio.wait_for(recovery_finished.wait(), timeout=budget(5.0))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise AssertionError(
                 "Reconnect did not finish recovery of the connection containing "
                 f"{wait_for_recover!r} "
@@ -2018,6 +2018,96 @@ async def test_server_initiated_close_never_fails_the_turn(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_server_retired_tunnel_never_fails_the_turn(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel THIS server retired for the runner to reconnect leaves the turn alone.
+
+    Retiring through the registry closes the socket with 1001 while the server
+    stays up, so no shutdown mark is set. The runner usually re-tunnels to
+    another replica, which then owns the turn: this replica must record the
+    handoff, keep the liveness stamp, and skip the offline-marking once the
+    grace runs out. The mark clears when the runner tunnels back here.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state, shutdown_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-server-retired"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    cleared_runners: list[str] = []
+    monkeypatch.setattr(session_live_state, "clear_runner_liveness", cleared_runners.append)
+    touched_runners: list[str] = []
+    monkeypatch.setattr(session_live_state, "touch_runner_liveness", touched_runners.extend)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    touched_runners.clear()
+    reconnect_communicator: ApplicationCommunicator | None = None
+    try:
+        assert ap_app.state.tunnel_registry.deregister(runner_id) is not None
+
+        async def _disconnect_hook_ran() -> None:
+            while runner_id not in touched_runners and runner_id not in cleared_runners:
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_disconnect_hook_ran(), timeout=budget(2.0))
+        assert shutdown_state.runner_handoff_reason(runner_id) == "tunnel_retired"
+        assert not shutdown_state.server_shutting_down()
+        assert runner_id not in cleared_runners
+        assert runner_id in touched_runners
+
+        # Well past the grace: the timer has fired and must have skipped the marking.
+        await asyncio.sleep(grace * 3)
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+        conv = store.get_conversation(session_id)
+        assert conv is not None
+        assert sessions_module._last_task_error_from_labels(conv.labels) is None
+
+        reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(
+            reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        assert shutdown_state.runner_handoff_reason(runner_id) is None
+    finally:
+        shutdown_state.reset_for_tests()
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await communicator.wait(timeout=budget(2.0))
+        if reconnect_communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect_communicator.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
 # TODO: factor ``FakeProcessManager`` and ``_build_harness_agent_bundle``
 # out of ``test_sessions_three_layer.py`` + this file into a shared
 # ``_three_layer_helpers.py`` module once a third caller arrives. Kept
@@ -2348,3 +2438,111 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         )
         assert store.get_conversation(child.id).runner_id == _RUNNER_ID
         assert store.get_conversation(finished.id).runner_id == child_runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    "scenario", ["reconnect", "expired", "host_back_without_runner", "unreadable", "host_online"]
+)
+async def test_runner_disconnect_holds_turn_while_host_offline(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """A mid-turn session whose host went offline waits for it instead of failing.
+
+    A sleeping laptop takes its runner along and resumes the turn on wake, so
+    the turn fails only when the hold expires or the host returns without its
+    runner. An unreadable host row mid-hold keeps holding. A host that stayed
+    online fails the turn at the grace, as before.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    grace = 0.2
+    hold = 1.0 if scenario == "expired" else 30.0
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
+    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 0.05)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    host_checks: list[str] = []
+    # What the host row reads: offline, back online, or unreadable.
+    host_row: list[bool | None] = [scenario != "host_online"]
+
+    async def scripted_host_row_offline(host_store: object, host_id: str) -> bool | None:
+        host_checks.append(host_id)
+        return host_row[0]
+
+    async def _host_checked(times: int) -> None:
+        # The hold re-checks the host every HOST_OFFLINE_RECHECK_S.
+        target = len(host_checks) + times
+        while len(host_checks) < target:
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(sessions_module, "_host_row_offline", scripted_host_row_offline)
+
+    response = await tunnel_three_layer_stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["session_id"]
+    runner_id = f"runner-host-offline-{scenario}"
+    host_id = "0123456789abcdef0123456789abcdef"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    store.set_host_id(session_id, host_id, workspace="/tmp/host-offline")
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    reconnect: ApplicationCommunicator | None = None
+
+    async def _failed() -> dict[str, str]:
+        # The status publishes first; the cause labels persist on a later await.
+        while True:
+            conv = store.get_conversation(session_id)
+            error = sessions_module._last_task_error_from_labels(conv.labels) if conv else None
+            if sessions_module._session_status_cache.get(session_id) == "failed" and error:
+                return error
+            await asyncio.sleep(0.02)
+
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+        if scenario == "host_online":
+            await asyncio.wait_for(_failed(), timeout=budget(5.0))
+            return
+        # Past the grace and re-checking the host, the turn is held rather than failed.
+        await asyncio.wait_for(_host_checked(3), timeout=budget(5.0))
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+        assert host_checks[0] == host_id
+
+        if scenario == "unreadable":
+            # Re-checks that can't read the host row outlast the grace twice over.
+            host_row[0] = None
+            await asyncio.wait_for(_host_checked(10), timeout=budget(5.0))
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+        if scenario == "host_back_without_runner":
+            host_row[0] = False
+        if scenario in ("reconnect", "unreadable"):
+            reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+            await _send_hello_and_wait(
+                reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+            )
+            await asyncio.sleep(grace * 2)
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            return
+        # Expiry, or one more grace after the host returned: the turn fails.
+        error = await asyncio.wait_for(_failed(), timeout=budget(5.0))
+        assert error["code"] == "runner_disconnected"
+        assert ("did not come back within" in error["message"]) == (scenario == "expired")
+    finally:
+        if reconnect is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect.wait(timeout=budget(2.0))

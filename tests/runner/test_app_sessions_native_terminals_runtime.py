@@ -403,9 +403,11 @@ async def test_codex_native_launch_config_reads_the_bridge_id_label(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
+@pytest.mark.parametrize("dependency", ["launch-routing", "gateway-host"])
+async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credential_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    dependency: str,
 ) -> None:
     """A blocking builder dependency must not stop the runner's event loop."""
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
@@ -415,10 +417,25 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     lookup_release = threading.Event()
     loop_progressed: list[bool] = []
 
-    def resolve_host(profile: str | None) -> None:
-        assert profile == "test-profile"
+    def wait_for_loop() -> None:
         loop.call_soon_threadsafe(lookup_started.set)
         loop_progressed.append(lookup_release.wait(timeout=1.0))
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        if dependency == "gateway-host":
+            wait_for_loop()
+
+    launch_resolutions = 0
+
+    def resolve_launch(
+        *, model: str | None, spec: Any = None, terminal_launch_args: Any = ()
+    ) -> codex_app_mod.NativeCodexLaunch:
+        nonlocal launch_resolutions
+        launch_resolutions += 1
+        if dependency == "launch-routing" and launch_resolutions == 1:
+            wait_for_loop()
+        return codex_app_mod.NativeCodexLaunch([], model, "test-profile")
 
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
@@ -436,13 +453,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
     monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
-    monkeypatch.setattr(
-        codex_app_mod,
-        "resolve_native_codex_launch",
-        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
-            [], model, "test-profile"
-        ),
-    )
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", resolve_launch)
 
     task = asyncio.create_task(
         _auto_create_codex_terminal(
@@ -461,7 +472,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         lookup_release.set()
         await asyncio.gather(task, return_exceptions=True)
 
-    assert loop_progressed == [True], "profile resolution blocked the runner's event loop"
+    assert loop_progressed == [True], f"{dependency} resolution blocked the runner's event loop"
 
 
 @pytest.mark.asyncio
@@ -2724,9 +2735,11 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authenticated: bool,
 ) -> None:
     """
     Snapshot ``terminal_launch_args`` reach the launched kimi argv.
@@ -2751,7 +2764,20 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     workspace.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
-    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    loop = asyncio.get_running_loop()
+    auth_started = asyncio.Event()
+    auth_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def auth_factory() -> str:
+        loop.call_soon_threadsafe(auth_started.set)
+        loop_progressed.append(auth_release.wait(timeout=1.0))
+        return "mock-hook-token"
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda: auth_factory if authenticated else None,
+    )
     monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
     # Keep the session-home build off the user's real kimi config.
     monkeypatch.setattr(
@@ -2802,17 +2828,32 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
                 name="Kimi",
             )
 
-    try:
-        await _auto_create_kimi_terminal(
+    task = asyncio.create_task(
+        _auto_create_kimi_terminal(
             session_id,
             cast(SessionResourceRegistry, _FakeResourceRegistry()),
             lambda _sid, _event: None,
             server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
         )
+    )
+    try:
+        if authenticated:
+            await asyncio.wait_for(auth_started.wait(), timeout=2.0)
+        auth_release.set()
+        await task
         await asyncio.sleep(0)
     finally:
+        auth_release.set()
+        await asyncio.gather(task, return_exceptions=True)
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
+    assert loop_progressed == ([True] if authenticated else [])
+    hook_config = kimi_bridge_mod.read_hook_config(
+        kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    )
+    headers = hook_config["ap_auth_headers"]
+    assert isinstance(headers, dict)
+    assert headers.get("Authorization") == ("Bearer mock-hook-token" if authenticated else None)
     assert len(launched_specs) == 1
     spec = launched_specs[0]
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.

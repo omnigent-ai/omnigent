@@ -43,7 +43,7 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runtime import inflight_text, pending_elicitations
+from omnigent.runtime import disconnect_outcome, inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
 
@@ -331,6 +331,7 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     # no-op unless a sink is enabled). Done first so it captures every event the
     # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
+    disconnect_outcome.observe_event(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
     live_event = inflight_text.record_publish(conversation_id, event)
@@ -536,7 +537,7 @@ async def subscribe(
             else:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval_s)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Queue was idle past the heartbeat deadline. Emit
                     # a synthetic keepalive. Its wire bytes give the
                     # route's ``request.is_disconnected()`` check and

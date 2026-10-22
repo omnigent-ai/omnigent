@@ -1435,6 +1435,9 @@ def _build_claude_sdk_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+    # Explicitly clear inherited presets for agents that have not opted in.
+    preset = spec.executor.config.get("system_prompt_preset")
+    env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
     return env
 
 
@@ -1570,7 +1573,9 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<dir>/``.
+        from ``<bundle>/skills/<dir>/`` and ``<bundle>/.pi/skills/<dir>/``,
+        extensions from ``<bundle>/.pi/extensions``, and a bundle-root
+        context file (``AGENTS.md`` et al.).
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """

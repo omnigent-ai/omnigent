@@ -62,6 +62,7 @@ const REPO = "/Users/corey/projects/alpha";
 // screen stays mounted; only the param changes).
 let searchParams = new URLSearchParams("project=Alpha");
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));

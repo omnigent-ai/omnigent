@@ -40,15 +40,24 @@ def _builtin_agent_id(base_url: str, name: str) -> str:
     :param name: Built-in agent name, e.g. ``"hello_world"``.
     :returns: The agent id.
     """
-    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
-    resp.raise_for_status()
-    agents = resp.json()["data"]
-    matches = [a["id"] for a in agents if a["name"] == name]
-    assert matches, (
+    names: list[str] = []
+    after: str | None = None
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        while True:
+            resp = client.get("/v1/agents", params={"after": after} if after else {})
+            resp.raise_for_status()
+            result = resp.json()
+            for agent in result["data"]:
+                if agent["name"] == name:
+                    return agent["id"]
+                names.append(agent["name"])
+            if not result["has_more"]:
+                break
+            after = result["last_id"]
+    pytest.fail(
         f"built-in agent {name!r} not listed in /v1/agents "
-        f"(got {[a['name'] for a in agents]}) — nothing to seed a task against."
+        f"(got {names}) — nothing to seed a task against."
     )
-    return matches[0]
 
 
 def _create_task(
@@ -321,9 +330,11 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(page.get_by_test_id("schedule-preset-trigger")).to_contain_text("Daily")
 
     time_input = page.get_by_test_id("schedule-time")
-    time_input.fill("")
     time_input.click()
-    page.keyboard.type("9:37")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    expect(time_input).to_be_focused()
+    time_input.press("ControlOrMeta+A")
+    time_input.press_sequentially("9:37")
     assert time_input.input_value() == "9:37"
     # force=True: focusing the time input opened the picker popover, so a normal
     # click here can resolve to the dialog overlay (see _pick_minute's note). A
@@ -365,9 +376,13 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     assert submit_box is not None
     assert submit_box["y"] + submit_box["height"] <= dialog_box["y"] + dialog_box["height"] + 1
 
-    time_input.fill("")
+    expect(time_input).to_have_value("09:00 AM")
     time_input.click()
-    page.keyboard.type("10:37")
+    expect(page.get_by_test_id("schedule-time-picker")).to_be_visible()
+    expect(time_input).to_be_focused()
+    time_input.press("ControlOrMeta+A")
+    time_input.press_sequentially("10:37")
+    assert time_input.input_value() == "10:37"
     # force=True: the time input's focus reopened the picker popover, so blur it
     # with a forced click that can't be swallowed by the dialog overlay.
     page.get_by_test_id("task-name-input").click(force=True)

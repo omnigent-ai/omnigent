@@ -240,6 +240,23 @@ def test_deregister_unknown_runner_is_noop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deregister_reports_only_a_deliberate_retirement() -> None:
+    retired: list[str] = []
+    reg = TunnelRegistry(on_retire=retired.append)
+    reg.register("r1", _NoopWS(), _hello())
+    closed = reg.register("r2", _NoopWS(), _hello())
+    stale = reg.register("r3", _NoopWS(), _hello())
+    reg.register("r3", _NoopWS(), _hello())
+
+    assert reg.deregister("ghost") is None
+    assert reg.deregister("r3", stale) is None
+    # The route's cleanup after the socket closed is not a retirement.
+    assert reg.deregister("r2", closed, retire=False) is closed
+    assert reg.deregister("r1") is not None
+    assert retired == ["r1"]
+
+
+@pytest.mark.asyncio
 async def test_register_replacing_existing_session_aborts_inflight() -> None:
     """Newest-wins (RUNNER.md §2): old session's in-flight requests get
     a ConnectionError so awaiters don't hang."""
