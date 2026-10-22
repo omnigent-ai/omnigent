@@ -62,6 +62,21 @@ class NativeCodingAgent:
     wrapper_label: str
     terminal_name: str
     subagent_wrapper_label: str | None = None
+    # Agent-facing summary seeded into the built-in agent's spec, so
+    # ``sys_agent_list`` rows say what the agent is. ``None`` derives one from
+    # ``display_name`` and ``harness`` (see ``resolved_description``).
+    description: str | None = None
+
+    @property
+    def resolved_description(self) -> str:
+        """Return ``description``, or a default derived from the identity fields."""
+        if self.description is not None:
+            return self.description
+        return (
+            f"Interactive {self.display_name} CLI session on this host, running "
+            f"the {self.harness} harness. Launch with sys_session_create to use "
+            f"{self.display_name} as a sub-agent."
+        )
 
     @property
     def presentation_labels(self) -> dict[str, str]:

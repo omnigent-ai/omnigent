@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from omnigent.tools.base import Tool
+from omnigent.tools.harness_keywords import CROSS_HARNESS_AGENT_NAMES
 
 
 class SysAgentGetTool(Tool):
@@ -222,7 +223,11 @@ class SysAgentListTool(Tool):
         return (
             "List launchable agents across three sources: built-in / "
             "template agents, agents bound to sessions you can access, "
-            "and locally-authored agent config YAMLs. Returns "
+            "and locally-authored agent config YAMLs. Step one for "
+            "running another agent as a sub-agent: builtins include an "
+            "interactive agent per coding-agent "
+            f"CLI ({CROSS_HARNESS_AGENT_NAMES}); pass its agent_id to "
+            "sys_session_create. Returns "
             "{builtins: [...], session_agents: [...], local_configs: "
             "[...]}. Both builtins and session_agents rows carry an "
             "agent_id that launches the agent directly via "

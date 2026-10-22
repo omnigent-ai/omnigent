@@ -20,6 +20,7 @@ from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
 from omnigent.spec import AgentSpec
 from omnigent.stores import ConversationStore
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.harness_keywords import CROSS_HARNESS_AGENT_NAMES
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -125,7 +126,10 @@ class SysSessionSendTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Send a message to a sub-agent session. Sub-agent sessions "
+            "Send a message to a sub-agent session and get its reply: "
+            "converse with or continue a child agent, including one "
+            "running another vendor's harness "
+            f"({CROSS_HARNESS_AGENT_NAMES}). Sub-agent sessions "
             "are separate Omnigent agent sessions (own conversation, "
             "visible in the session tree) — distinct from any built-in "
             "subagent/Task tool your harness provides. Two modes: pass "
@@ -692,7 +696,9 @@ class SysSessionGetInfoTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Return a session's metadata: lifecycle status, title, "
+            "Return a session's metadata (e.g. check whether a sub-agent "
+            "launched with sys_session_create is running, idle or waiting "
+            "on approval): lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
             "parent session, workspace, "
@@ -908,7 +914,13 @@ class SysSessionCreateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Create a child session from an agent. This launches a "
+            "Create a child session from an agent: launch another "
+            "registered agent as a durable sub-agent, including a "
+            "different vendor's coding-agent CLI "
+            f"({CROSS_HARNESS_AGENT_NAMES}) via its built-in "
+            "agent. Prefer this over running that CLI in a shell. Workflow: "
+            "sys_agent_list for the agent_id, then sys_session_create, "
+            "then sys_session_send to converse. This launches a "
             "separate Omnigent agent session — its own conversation, "
             "visible in the session tree, optionally a different "
             "registered agent. It is not your harness's built-in "
@@ -1529,7 +1541,8 @@ class SysSessionGetHistoryTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "Read the most recent items from a session's conversation "
-            "without sending input. Global read — any session you can "
+            "without sending input — e.g. monitor a sub-agent launched "
+            "with sys_session_create. Global read — any session you can "
             "access (not just sub-agents in your spawn tree), bounded "
             "by the server's per-user permission model. Returns the "
             "tail of conversation items (assistant/user messages, tool "

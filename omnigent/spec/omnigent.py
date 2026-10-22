@@ -1149,9 +1149,16 @@ def agent_def_to_agent_spec(
     # error regardless of which spec format the user is on.
     skills_filter = _translate_skills_filter_from_yaml(raw_yaml)
 
+    # Top-level ``description:`` is not carried on AgentDef either; lift it
+    # from the raw YAML so single-file agents report it via ``GET /v1/agents``
+    # like directory bundles do.
+    raw_description = raw_yaml.get("description") if raw_yaml is not None else None
+    description = raw_description if isinstance(raw_description, str) else None
+
     return AgentSpec(
         spec_version=_SYNTHETIC_SPEC_VERSION,
         name=name,
+        description=description,
         llm=llm_config,
         instructions=instructions,
         local_tools=local_tools,
@@ -1296,8 +1303,9 @@ def _self_agent_tool_to_sub_spec(
     cloned.tools = {n: t for n, t in cloned.tools.items() if not isinstance(t, SelfAgentTool)}
     cloned.name = tool_name
     sub_spec = agent_def_to_agent_spec(cloned, raw_yaml=raw_yaml)
-    if self_tool.description is not None:
-        sub_spec.description = self_tool.description
+    # Only the clone's own hint, never the parent's top-level description
+    # that the shared ``raw_yaml`` would otherwise carry over.
+    sub_spec.description = self_tool.description
     return sub_spec
 
 

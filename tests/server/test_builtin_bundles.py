@@ -284,3 +284,44 @@ def test_native_seed_loop_covers_every_native_agent() -> None:
 
     missing = [a.key for a in NATIVE_CODING_AGENTS if native_provider_for_key(a.key) is None]
     assert missing == [], f"native agents without a provider row to seed from: {missing}"
+
+
+def _bundled_spec(blob: bytes, spec_entry: str) -> dict:
+    """Return the parsed spec YAML ``spec_entry`` from a gzipped bundle tarball."""
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if member.isfile() and member.name.lstrip("./").endswith(spec_entry):
+                extracted = tf.extractfile(member)
+                assert extracted is not None
+                return yaml.safe_load(extracted.read())
+    raise AssertionError(f"{spec_entry!r} not in bundle")
+
+
+@pytest.mark.parametrize(("key", "spec_entry"), _NATIVE_BUILDERS)
+def test_native_bundle_carries_agent_description(
+    key: str, spec_entry: str, tmp_path: Path
+) -> None:
+    """The seeded native spec carries the registry description sys_agent_list shows.
+
+    ``GET /v1/agents`` falls back to ``spec.description`` for built-ins, so this is
+    what makes each native-UI row self-describing (omnigent-ai/omnigent#11001).
+    """
+    agent = next(a for a in _NATIVE_CODING_AGENTS if a.key == key)
+    provider = native_provider_for_key(key)
+    assert provider is not None
+    blob = app._build_native_bundle(provider, description=agent.resolved_description)
+    spec = _bundled_spec(blob, spec_entry)
+    assert spec["description"] == agent.resolved_description
+    assert agent.display_name in spec["description"]
+    # The spec loader agrees, so the server's ``spec.description`` fallback sees it.
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+        tf.extractall(tmp_path, filter="data")
+    assert load(tmp_path / spec_entry, expand_env=False).description == agent.resolved_description
+
+
+def test_native_bundle_without_description_leaves_spec_untouched() -> None:
+    """``description=None`` keeps the materialized spec as the harness wrote it."""
+    provider = native_provider_for_key("codex")
+    assert provider is not None
+    spec = _bundled_spec(app._build_native_bundle(provider), "codex-native-ui.yaml")
+    assert "description" not in spec

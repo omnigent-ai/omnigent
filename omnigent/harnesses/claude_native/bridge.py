@@ -101,6 +101,7 @@ from omnigent.inner.hook_scripts.subagent_router import (
 )
 from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.harness_keywords import CROSS_HARNESS_AGENT_NAMES
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
@@ -7806,6 +7807,29 @@ def _handle_and_write_mcp_request(
         request_slots.release()
 
 
+# The only Omnigent text always in the agent's context: with deferred tool
+# loading the agent sees tool names plus these instructions until it searches.
+# Lead with capabilities (and the harness names a keyword search would use) so
+# "launch Codex as a sub-agent" finds sys_session_create instead of a shell.
+_MCP_SERVER_INSTRUCTIONS = (
+    "Omnigent orchestrates agents, terminals and environments. Sub-agent "
+    "sessions: launch and drive other registered agents, including other "
+    f"vendors' coding-agent CLIs ({CROSS_HARNESS_AGENT_NAMES}), as durable "
+    "multi-turn child sessions. Workflow: sys_agent_list to find an agent_id, "
+    "sys_session_create to launch it, sys_session_send to converse, "
+    "sys_session_get_history / sys_session_get_info to monitor. Prefer this "
+    "over running another agent's CLI in a shell when asked to use a "
+    "different agent or vendor as a sub-agent; for quick in-context helpers "
+    "your own native subagent tool is fine. Also: tmux terminals "
+    "(sys_terminal_*), async calls and inbox (sys_call_async, "
+    "sys_read_inbox), scheduled tasks (sys_scheduled_task_*), runtime "
+    "policies (sys_add_policy) and model listing (sys_list_models). "
+    "Availability: Omnigent tools appear as MCP tools when the active "
+    "Omnigent turn advertises them; local sys_os_* tools are available "
+    "outside an active turn for workspace file and shell access."
+)
+
+
 def _handle_mcp_request(
     method: str,
     params: object,
@@ -7832,12 +7856,7 @@ def _handle_mcp_request(
                 "name": _MCP_SERVER_NAME,
                 "version": "0.1.0",
             },
-            "instructions": (
-                "Omnigent tools are available as MCP tools when the "
-                "active Omnigent turn advertises them; local sys_os_* "
-                "tools are available outside an active turn for "
-                "workspace file and shell access."
-            ),
+            "instructions": _MCP_SERVER_INSTRUCTIONS,
         }
     if method == "tools/list":
         return {"tools": _combined_mcp_tool_schemas(tools, bridge_dir)}

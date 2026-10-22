@@ -1024,7 +1024,11 @@ def _ensure_extra_builtin_agents(
         _logger.info("Registered extra built-in agent %r from %s", name, source)
 
 
-def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
+def _build_native_bundle(
+    provider: NativeHarnessProvider,
+    *,
+    description: str | None = None,
+) -> bytes:
     """
     Materialize a built-in native agent's spec and tar it (registry-driven).
 
@@ -1037,10 +1041,16 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
     passed ``model=None`` where accepted).
 
     :param provider: The native harness provider row.
+    :param description: Agent summary written into the spec's ``description``
+        when the materialized spec sets none, so ``GET /v1/agents`` (and
+        ``sys_agent_list``) report what the built-in is. ``None`` leaves the
+        spec untouched.
     :returns: Gzipped tarball bytes suitable for the artifact store.
     """
     import inspect
     import tempfile
+
+    import yaml
 
     from omnigent.native.native_dispatch import resolve_hook
     from omnigent.spec import materialize_bundle
@@ -1056,6 +1066,11 @@ def _build_native_bundle(provider: NativeHarnessProvider) -> bytes:
         # add that axis explicitly if/when it appears.
         kwargs = {"model": None} if "model" in inspect.signature(materialize).parameters else {}
         spec_path = materialize(Path(tmpdir), **kwargs)
+        if description is not None and spec_path.is_file():
+            raw = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("description") is None:
+                raw["description"] = description
+                spec_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
         bundle_dir = materialize_bundle(spec_path, Path(tmpdir) / "bundle")
         return _tar_gz_dir(bundle_dir)
 
@@ -1092,7 +1107,7 @@ def _ensure_default_native_agents(
             artifact_store,
             agent_cache,
             name=agent.agent_name,
-            bundle_bytes=_build_native_bundle(provider),
+            bundle_bytes=_build_native_bundle(provider, description=agent.resolved_description),
         )
 
 

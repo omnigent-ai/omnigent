@@ -2590,3 +2590,33 @@ def test_compat_yaml_executor_api_key_auth_is_not_dropped(tmp_path: Path) -> Non
 
     assert isinstance(spec.executor.auth, ApiKeyAuth)
     assert spec.executor.auth.api_key == "sk-test-key"
+
+
+def test_single_file_yaml_top_level_description_reaches_spec(tmp_path: Path) -> None:
+    """
+    A single-file YAML's top-level ``description:`` lands on ``AgentSpec``.
+
+    ``GET /v1/agents`` falls back to ``spec.description``; the translator used to
+    drop it, so single-file agents (including the seeded native-UI built-ins)
+    listed ``description: null`` in ``sys_agent_list``. A self-clone sub-agent
+    keeps only its own hint and does not inherit the parent's description.
+    """
+    yaml_path = tmp_path / "agent.yaml"
+    yaml_path.write_text(
+        yaml.dump(
+            {
+                "name": "code_assistant",
+                "description": "Reviews pull requests.",
+                "prompt": "You are a coding assistant.",
+                "executor": {
+                    "model": "databricks-claude-sonnet-4-6",
+                    "harness": "claude-sdk",
+                },
+                "tools": {"subtask": "self"},
+            }
+        )
+    )
+    spec = load(yaml_path, expand_env=False)
+    assert spec.description == "Reviews pull requests."
+    (clone,) = spec.sub_agents
+    assert clone.description is None
