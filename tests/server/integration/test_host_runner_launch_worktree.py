@@ -11,7 +11,8 @@ the worktree at bind time and roll it back if the bind/launch fails.
 Drives the endpoint through the full app and a fake host that auto-replies
 to the host control frames (``host.stat`` for workspace validation,
 ``host.create_worktree``, ``host.launch_runner``, and
-``host.remove_worktree`` for rollback). See designs/SESSION_GIT_WORKTREE.md.
+``host.list_worktrees`` / ``host.remove_worktree`` for rollback). See
+designs/SESSION_GIT_WORKTREE.md.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
+    HostListWorktreesFrame,
     HostRemoveWorktreeFrame,
     HostStatFrame,
     decode_host_frame,
@@ -107,11 +109,14 @@ class _HostCapture:
     :param launch: ``host.launch_runner`` frames received.
     :param remove: ``host.remove_worktree`` frames received (a non-empty
         list proves the rollback path fired).
+    :param worktrees: Linked worktrees this host created and still has,
+        reported by ``host.list_worktrees``.
     """
 
     create: list[HostCreateWorktreeFrame] = field(default_factory=list)
     launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
+    worktrees: list[dict[str, object]] = field(default_factory=list)
     create_started: asyncio.Event = field(default_factory=asyncio.Event)
     remove_started: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -128,8 +133,9 @@ async def register_host(
     """Yield a factory that registers a fake host with a replying drain.
 
     The drain answers ``host.stat`` (workspace validation passes),
-    ``host.create_worktree``, ``host.launch_runner``, and
-    ``host.remove_worktree`` — capturing each into a :class:`_HostCapture`.
+    ``host.create_worktree``, ``host.launch_runner``,
+    ``host.list_worktrees``, and ``host.remove_worktree`` — capturing each
+    into a :class:`_HostCapture`.
     Every drain is poisoned and awaited at teardown so no background task
     leaks into the next test's event loop.
 
@@ -171,10 +177,14 @@ async def register_host(
                 return
             if create_status == "ok":
                 dirname = frame.branch_name.replace("/", "-")
+                worktree_path = f"{_SOURCE_REPO}-worktrees/{dirname}"
+                cap.worktrees.append(
+                    {"path": worktree_path, "branch": frame.branch_name, "is_main": False}
+                )
                 future.set_result(
                     {
                         "status": "ok",
-                        "worktree_path": f"{_SOURCE_REPO}-worktrees/{dirname}",
+                        "worktree_path": worktree_path,
                         "workspace": workspace,
                         "branch": frame.branch_name,
                         "error": None,
@@ -191,7 +201,7 @@ async def register_host(
                 )
 
         async def _drain() -> None:
-            """Answer stat/create/launch/remove frames; capture them."""
+            """Answer stat/create/launch/list/remove frames; capture them."""
             while True:
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
@@ -228,9 +238,17 @@ async def register_host(
                                 "error": None if launch_status == "launched" else "boom",
                             }
                         )
+                elif isinstance(frame, HostListWorktreesFrame):
+                    fut = conn.pending_list_worktrees.pop(frame.request_id, None)
+                    if fut is not None and not fut.done():
+                        main = {"path": _SOURCE_REPO, "branch": "main", "is_main": True}
+                        fut.set_result({"status": "ok", "worktrees": [main, *cap.worktrees]})
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
                     cap.remove_started.set()
+                    cap.worktrees = [
+                        tree for tree in cap.worktrees if tree["path"] != frame.worktree_path
+                    ]
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
@@ -518,6 +536,31 @@ async def test_launch_runner_rolls_back_worktree_on_launch_failure(
     assert conv.git_branch is None, (
         f"git_branch should be cleared (branch was removed); got {conv.git_branch!r}"
     )
+
+
+async def test_inline_create_rolls_back_worktree_on_launch_failure(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+) -> None:
+    """A create whose runner fails to launch removes the worktree it created."""
+    cap = register_host(launch_status="failed")
+    agent = await create_test_agent(client, name="wt-inline-launch-failure-agent")
+
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "workspace": _SOURCE_REPO,
+            "git": {"branch_name": "feature/leak", "base_branch": "main"},
+        },
+    )
+
+    assert len(cap.create) == 1, resp.text
+    assert len(cap.launch) == 1, resp.text
+    assert len(cap.remove) == 1, f"failed launch left its new worktree behind: {resp.text}"
+    assert cap.remove[0].worktree_path == f"{_SOURCE_REPO}-worktrees/feature-leak"
+    assert cap.remove[0].delete_branch is True
 
 
 async def test_launch_runner_retry_succeeds_after_failed_launch(

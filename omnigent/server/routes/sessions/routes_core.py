@@ -154,6 +154,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
+    _rollback_create_launch_worktree,
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
@@ -165,6 +166,7 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
     reconcile_orphaned_running_status,
+    relaunch_lock_for,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -698,13 +700,17 @@ def register_core_routes(
         sends the ``host.launch_runner`` frame and waits for the host's
         verdict.
 
-        Lenient on every launch failure: the picker's readiness data can
-        be stale (the user may have run ``omnigent setup`` since the host
-        last connected), so the create is never blocked. The session
-        keeps the binding; the first message drives the real runner
-        start, and if the host still refuses there, that path consults
-        the daemon and persists a transcript error (see post_event's
-        relaunch branch). No create-time harness gating.
+        Lenient on launch failure: the picker's readiness data can be
+        stale (the user may have run ``omnigent setup`` since the host
+        last connected), so the create is never blocked. A session
+        without a newly created worktree keeps the binding; the first
+        message drives the real runner start, and if the host still
+        refuses there, that path consults the daemon and persists a
+        transcript error (see post_event's relaunch branch). The JSON
+        create path instead rolls back a worktree it just created and
+        unbinds the session once the host confirms the removal (see
+        ``_rollback_create_launch_worktree``). No create-time harness
+        gating.
 
         :param request: The create request (for ``app.state`` lookups).
         :param user_id: Authenticated caller, or ``None`` when auth is
@@ -1056,6 +1062,9 @@ def register_core_routes(
         # problems and malformed repo workspaces still fail the POST
         # synchronously.
         launch_host_id = body.host_id
+        # Set when a concurrent delete drops the row during launch-failure
+        # cleanup, so the default-public grant below skips the vanished session.
+        session_vanished = False
         try:
             if body.host_type == "managed" and resp.runner_id is None:
                 await _schedule_managed_launch(
@@ -1102,11 +1111,32 @@ def register_core_routes(
                     _publish_terminal_pending(resp.id, False)
                 resp.runner_id = runner_id
                 resp.host_id = launch_host_id
+                if (
+                    launch_failed
+                    and body.git is not None
+                    and not body.git.existing_worktree
+                    and conv is not None
+                    and conv.workspace is not None
+                    and conv.git_branch is not None
+                ):
+                    (
+                        conv,
+                        session_vanished,
+                        launch_host_id,
+                    ) = await _rollback_create_launch_worktree(
+                        conversation_store=conversation_store,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        resp=resp,
+                        conv=conv,
+                        runner_id=runner_id,
+                        launch_host_id=launch_host_id,
+                        keep_branch=body.git.existing_branch,
+                    )
 
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
         # children follow their parent's grants instead.
-        if user_id is not None and body.parent_session_id is None:
+        if user_id is not None and body.parent_session_id is None and not session_vanished:
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -2816,13 +2846,15 @@ def register_core_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
-        previous_runner_id = conv.runner_id
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             if body.runner_id == "":
                 try:
-                    await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                    # Binding writes share the relaunch lock, so the launch-failure
+                    # rollback and relaunch re-read a settled binding.
+                    async with relaunch_lock_for(session_id):
+                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
                 _logger.info(
@@ -2859,81 +2891,94 @@ def register_core_routes(
                         runner_router.require_mcp_registry_support,
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
-                try:
-                    await asyncio.to_thread(
-                        conversation_store.replace_runner_id, session_id, runner_id
+                # Hold the relaunch lock across the re-read, rebind, acceptance
+                # check, and revert so the launch-failure rollback and relaunch
+                # never see a half-moved binding or restore a runner they cleared.
+                async with relaunch_lock_for(session_id):
+                    fresh = await asyncio.to_thread(
+                        conversation_store.get_conversation, session_id
                     )
-                except ConversationNotFoundError as exc:
-                    raise _session_not_found() from exc
-                set_current_runner_id(runner_id)
-                _logger.info(
-                    "Session bound to runner",
-                    extra=debug_event(
-                        "session_runner_bound",
-                        session_id=session_id,
-                        runner_id=runner_id,
-                        operation="bind",
-                        stage="runner_launch",
-                    ),
-                )
-                _runner_client = await _get_runner_client(
-                    session_id,
-                    runner_router,
-                )
-                # Notify the runner about the session so it can
-                # resolve the spec and cache it before the first turn.
-                # This is the design doc's "Server POST /v1/sessions
-                # (to runner)" step from §7 Flow: session creation.
-                conv = conversation_store.get_conversation(
-                    session_id,
-                )
-                parent_initialized = False
-                if _runner_client is not None and conv is not None and conv.agent_id is not None:
-                    # The versioned payload's snapshot carries harness_override,
-                    # so a rebind after a cross-harness create initializes the
-                    # override harness — a bare body left the runner resolving
-                    # from the spec, and the recovery turn that executes seeded
-                    # initial_items ran on the spec's harness. Recovery stays
-                    # enabled: on rebind it is what runs the pending kickoff.
+                    if fresh is None:
+                        raise _session_not_found()
+                    previous_runner_id = fresh.runner_id
                     try:
-                        runner_init_resp = await _runner_client.post(
-                            "/v1/sessions",
-                            json=build_runner_session_init_payload(
-                                conv,
-                                server_version=VERSION,
-                            ),
-                            timeout=10.0,
-                        )
-                    except (httpx.HTTPError, ConnectionError):
-                        # ConnectionError covers a tunnel close mid-POST
-                        # (same source as the relay's except clause).
-                        _logger.warning(
-                            "Failed to notify runner about session %s",
-                            session_id,
-                            exc_info=True,
-                        )
-                    else:
-                        from omnigent.server.runner_session_init import runner_inference_verified
-
-                        parent_initialized = (
-                            runner_init_resp.status_code < 400
-                            and runner_inference_verified(conv, runner_init_resp)
-                        )
-                if (
-                    conv is not None
-                    and conv.inference_snapshot is not None
-                    and not parent_initialized
-                ):
-                    if previous_runner_id is None:
-                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
-                    else:
                         await asyncio.to_thread(
-                            conversation_store.replace_runner_id, session_id, previous_runner_id
+                            conversation_store.replace_runner_id, session_id, runner_id
                         )
-                    raise OmnigentError(
-                        "The runner did not accept this session's saved inference configuration",
-                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    except ConversationNotFoundError as exc:
+                        raise _session_not_found() from exc
+                    set_current_runner_id(runner_id)
+                    _logger.info(
+                        "Session bound to runner",
+                        extra=debug_event(
+                            "session_runner_bound",
+                            session_id=session_id,
+                            runner_id=runner_id,
+                            operation="bind",
+                            stage="runner_launch",
+                        ),
                     )
+                    _runner_client = await _get_runner_client(
+                        session_id,
+                        runner_router,
+                    )
+                    # Notify the runner about the session so it can
+                    # resolve the spec and cache it before the first turn.
+                    # This is the design doc's "Server POST /v1/sessions
+                    # (to runner)" step from §7 Flow: session creation.
+                    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                    parent_initialized = False
+                    if (
+                        _runner_client is not None
+                        and conv is not None
+                        and conv.agent_id is not None
+                    ):
+                        # The snapshot carries harness_override so a rebind initializes
+                        # the override harness; recovery stays enabled because on rebind
+                        # it is what runs the pending kickoff.
+                        try:
+                            runner_init_resp = await _runner_client.post(
+                                "/v1/sessions",
+                                json=build_runner_session_init_payload(
+                                    conv,
+                                    server_version=VERSION,
+                                ),
+                                timeout=10.0,
+                            )
+                        except (httpx.HTTPError, ConnectionError):
+                            # ConnectionError covers a tunnel close mid-POST
+                            # (same source as the relay's except clause).
+                            _logger.warning(
+                                "Failed to notify runner about session %s",
+                                session_id,
+                                exc_info=True,
+                            )
+                        else:
+                            from omnigent.server.runner_session_init import (
+                                runner_inference_verified,
+                            )
+
+                            parent_initialized = (
+                                runner_init_resp.status_code < 400
+                                and runner_inference_verified(conv, runner_init_resp)
+                            )
+                    if (
+                        conv is not None
+                        and conv.inference_snapshot is not None
+                        and not parent_initialized
+                    ):
+                        if previous_runner_id is None:
+                            await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                        else:
+                            await asyncio.to_thread(
+                                conversation_store.replace_runner_id,
+                                session_id,
+                                previous_runner_id,
+                            )
+                        raise OmnigentError(
+                            "The runner did not accept this session's saved inference configuration",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
                 if _runner_client is None:
                     # Runner deregistered between validation and
                     # lookup; PATCH still returns 200 but no
