@@ -1771,7 +1771,7 @@ async def _probe_workspace_upload_hello(manager: object, state: _UploadHelloCapa
             # Reconnect retries transient helper failures; definitive rejection stays cached.
             state.failed = result.get("code") in ("busy", "timeout", "gone")
             supported = "error" not in result and "code" not in result and raw_upload is True
-    except Exception:  # noqa: BLE001 — optional upload probing must never abort hello
+    except Exception:  # optional upload probing must never abort hello
         supported = False
         state.failed = True
         _logger.warning("Workspace upload hello probe unavailable", exc_info=True)
@@ -1781,7 +1781,7 @@ async def _probe_workspace_upload_hello(manager: object, state: _UploadHelloCapa
                 client.interrupt()
                 async with asyncio.timeout(_UPLOAD_HELLO_PROBE_TIMEOUT_S):
                     await asyncio.to_thread(client.close)
-            except Exception:  # noqa: BLE001 — optional probe cleanup must never abort hello
+            except Exception:  # optional probe cleanup must never abort hello
                 supported = False
                 state.failed = True
                 _logger.warning("Workspace upload hello probe cleanup unavailable", exc_info=True)
@@ -1825,9 +1825,9 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
-    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
     from fastapi import FastAPI
 
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
     from omnigent.host.frames import CAP_MCP_REGISTRY, CAP_TCP_EGRESS
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
