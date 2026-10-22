@@ -18,6 +18,7 @@ from tests._helpers.polling import poll_until
 from tests._helpers.session import bundle_files, post_session_bundle
 
 _INSTRUCTIONS = "OMNI_PI_AUTHORED_ROLE: act as the chief of staff."
+_USER_ADDITION = "OMNI_PI_USER_ADDITION: keep replies concise."
 _OBSERVER = """const fs = require('fs');
 module.exports = function(pi) {
   pi.on('session_start', (_event, ctx) => {
@@ -127,6 +128,7 @@ os_env:
             metadata={
                 "host_id": host.host_id,
                 "workspace": str(workspace),
+                "terminal_launch_args": ["--append-system-prompt", _USER_ADDITION],
                 "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
             },
             timeout=60,
@@ -142,6 +144,7 @@ os_env:
             poll_until(lambda: prompts.exists(), timeout_s=30, interval_s=0.2)
             first_prompt = json.loads(prompts.read_text().splitlines()[0])
             assert first_prompt["prompt"].count(_INSTRUCTIONS) == 1
+            assert first_prompt["prompt"].count(_USER_ADDITION) == 1
             assert "coding assistant" in first_prompt["prompt"].lower()
             old_pane = terminal.json()["metadata"]
             http_client.delete(f"{terminal_url}/terminal_pi_main", timeout=30).raise_for_status()
@@ -198,6 +201,7 @@ os_env:
             resumed_prompt = json.loads(prompts.read_text().splitlines()[-1])
             assert resumed_prompt["pid"] != first_prompt["pid"]
             assert resumed_prompt["prompt"].count(_INSTRUCTIONS) == 1
+            assert resumed_prompt["prompt"].count(_USER_ADDITION) == 1
         finally:
             with contextlib.suppress(httpx.HTTPError):
                 http_client.delete(f"/v1/sessions/{session_id}", timeout=10)

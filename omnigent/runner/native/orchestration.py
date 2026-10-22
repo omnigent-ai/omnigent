@@ -2567,6 +2567,7 @@ async def _auto_create_pi_terminal(
         pi_native_env_unset,
         pi_session_dir,
         prepare_bridge_dir,
+        write_agent_instructions,
         write_extension_files,
     )
     from omnigent.harnesses.pi_native.bridge import extension_path as pi_extension_path
@@ -2658,10 +2659,7 @@ async def _auto_create_pi_terminal(
         server_client=server_client,
     )
     raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
-    instructions_path = None
-    if raw_instructions is not None:
-        instructions_path = bridge_dir / "agent_instructions.md"
-        instructions_path.write_text(raw_instructions, encoding="utf-8")
+    instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,

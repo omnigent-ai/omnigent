@@ -264,6 +264,10 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         if instruction_spec == "resolved":
             agent_spec = ResolvedSpec(spec=agent_spec, workdir=tmp_path)
 
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("47f049b9d13df4db397c7f46859b825f")
+    instructions_path = bridge_dir / "agent_instructions.md"
+    instructions_path.write_text("Stale role")
+
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -302,6 +306,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         assert instructions not in args
     else:
         assert args.count("--append-system-prompt") == 1
+        assert not instructions_path.exists()
 
 
 @pytest.mark.asyncio

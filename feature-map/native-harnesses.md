@@ -288,10 +288,10 @@ Cross-harness journeys:
   `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_keeps_explicit_openai_codex_selection`
   uploads a spec with a bundled instruction file through a real server, host,
   runner and Pi terminal. A test-owned extension reads the real system prompt
-  at fresh launch and process resume; the authored role appears once, Pi's
-  default prompt remains, and the selected model survives. No model call is
-  made. The compatibility test above checks the CLI/server wrapper instructions
-  alongside scripted-provider turns. Run with the CI-pinned Pi executable:
+  at fresh launch and process resume; the authored role and explicit user
+  addition each appear once, Pi's default prompt remains, and the selected
+  model survives. No model call is made. The compatibility test above checks
+  the CLI/server wrapper instructions alongside scripted-provider turns. Run with the CI-pinned Pi executable:
 
   ```sh
   OMNIGENT_PI_PATH=/path/to/pi uv run --no-sync pytest tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py --reruns 0 -q
