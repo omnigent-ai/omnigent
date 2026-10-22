@@ -99,6 +99,28 @@ def test_message_entry_keeps_text_and_raw_blocks() -> None:
     assert "sealed" not in line
 
 
+def test_every_entry_carries_the_stored_payload_without_the_envelope() -> None:
+    """``raw`` is the item minus ``id``/``type``/``status``/..., so import is lossless."""
+    item = _item(
+        "message",
+        role="user",
+        content=[{"type": "input_text", "text": "hi"}],
+        user_authored=True,
+        subagent_return_id="ret_1",
+        stream_message_id="sm_1",
+    )
+    line = json.loads(entry_from_item(item, turn=1, seq=1).to_line())
+
+    assert line["raw"] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hi"}],
+        "user_authored": True,
+        "subagent_return_id": "ret_1",
+        "stream_message_id": "sm_1",
+    }
+    assert not {"id", "type", "status", "response_id", "created_at"} & line["raw"].keys()
+
+
 def test_tool_call_parses_json_arguments() -> None:
     item = _item(
         "function_call",
@@ -148,7 +170,10 @@ def test_encrypted_reasoning_is_sealed_with_reason() -> None:
     assert line["text"] == "Plan the query"
     assert line["sealed"] is True
     assert "encrypted" in line["sealed_reason"]
-    assert "encrypted_content" not in line
+    # The readable fields stay summary-only; ``raw`` keeps the blob so an
+    # imported Codex session can still resume with its reasoning.
+    assert "content" not in line
+    assert line["raw"]["encrypted_content"] == "gAAAA..."
 
 
 def test_readable_reasoning_is_not_sealed() -> None:
@@ -165,12 +190,15 @@ def test_readable_reasoning_is_not_sealed() -> None:
 
 
 def test_compaction_marks_the_boundary() -> None:
+    compacted = [{"role": "user", "content": "churn stats"}]
     item = _item(
         "compaction",
         summary="User asked for churn stats; agent loaded data.csv.",
         last_item_id="msg_9",
         model="openai/gpt-4o",
         token_count=42,
+        compacted_messages=compacted,
+        window_id=2,
     )
     entry = entry_from_item(item, turn=3, seq=10)
 
@@ -178,10 +206,21 @@ def test_compaction_marks_the_boundary() -> None:
     assert entry.text.startswith("User asked")
     assert entry.covers_through == "msg_9"
     assert entry.token_count == 42
+    # The model context the summary replaced rides along for import.
+    assert entry.raw["compacted_messages"] == compacted
+    assert entry.raw["window_id"] == 2
 
 
 def test_error_entry() -> None:
-    item = _item("error", source="harness", code="codex_not_signed_in", message="Sign in first")
+    item = _item(
+        "error",
+        source="harness",
+        code="codex_not_signed_in",
+        message="Sign in first",
+        title="Codex is signed out",
+        cause="No ChatGPT login was found.",
+        remediation="Run `codex login`.",
+    )
     entry = entry_from_item(item, turn=1, seq=1)
 
     assert entry.kind == "error"
@@ -189,6 +228,11 @@ def test_error_entry() -> None:
     assert entry.code == "codex_not_signed_in"
     assert entry.source == "harness"
     assert entry.text == "Sign in first"
+    assert (entry.raw["title"], entry.raw["cause"], entry.raw["remediation"]) == (
+        "Codex is signed out",
+        "No ChatGPT login was found.",
+        "Run `codex login`.",
+    )
 
 
 def test_provider_hosted_tool_is_sealed() -> None:
@@ -212,7 +256,7 @@ def test_terminal_command_pairs_as_call_and_result() -> None:
     assert (result.kind, result.role, result.tool_output) == ("tool_result", "tool", "/work\n")
 
 
-def test_lifecycle_items_become_notes_with_raw_payload() -> None:
+def test_routing_decision_becomes_a_note_with_its_rationale() -> None:
     item = _item(
         "routing_decision",
         model="databricks-claude-opus-4-8",
@@ -221,10 +265,23 @@ def test_lifecycle_items_become_notes_with_raw_payload() -> None:
     )
     entry = entry_from_item(item, turn=1, seq=1)
 
-    assert entry.kind == "note"
-    assert entry.note_type == "routing_decision"
+    assert (entry.kind, entry.role, entry.note_type) == ("note", "system", "routing_decision")
     assert entry.text == "Multi-file refactor needs deep reasoning."
-    assert entry.data["model"] == "databricks-claude-opus-4-8"
+    assert entry.raw["model"] == "databricks-claude-opus-4-8"
+
+
+def test_resource_event_becomes_a_note_without_a_reading() -> None:
+    item = _item(
+        "resource_event",
+        event_type="terminal.exited",
+        resource_id="term_1",
+        resource_type="terminal",
+        resource={"name": "main"},
+    )
+    entry = entry_from_item(item, turn=1, seq=1)
+
+    assert (entry.kind, entry.note_type, entry.text) == ("note", "resource_event", None)
+    assert entry.raw["event_type"] == "terminal.exited"
 
 
 def test_unknown_item_type_is_kept_as_note() -> None:
@@ -232,23 +289,40 @@ def test_unknown_item_type_is_kept_as_note() -> None:
 
     assert entry.kind == "note"
     assert entry.note_type == "future_thing"
-    assert entry.data == {"payload": {"x": 1}}
+    assert entry.raw == {"payload": {"x": 1}}
 
 
 # ── Numbering ───────────────────────────────────────────────
 
 
-def test_turns_advance_with_response_id() -> None:
+def test_turns_start_at_each_user_message() -> None:
+    """A turn is one user request; lifecycle items with their own response ids
+    (resource events, compactions) and meta context stay in the current turn."""
     items = [
         _user("one", "resp_1"),
+        _item("resource_event", "resource_1", event_type="terminal.created", resource_id="t"),
         _assistant("1", "resp_1"),
+        _item("compaction", "codex:compaction", summary="s", last_item_id="x", token_count=1),
+        _item(
+            "message",
+            "resp_2",
+            role="user",
+            content=[{"type": "input_text", "text": "context"}],
+            is_meta=True,
+        ),
         _user("two", "resp_2"),
         _assistant("2", "resp_2"),
     ]
     entries = list(iter_transcript_entries(items))
 
-    assert [e.turn for e in entries] == [1, 1, 2, 2]
-    assert [e.seq for e in entries] == [1, 2, 3, 4]
+    assert [e.turn for e in entries] == [1, 1, 1, 1, 1, 2, 2]
+    assert [e.seq for e in entries] == [1, 2, 3, 4, 5, 6, 7]
+
+
+def test_a_file_that_opens_without_a_user_message_still_starts_at_turn_one() -> None:
+    entries = list(iter_transcript_entries([_assistant("hello")]))
+
+    assert [e.turn for e in entries] == [1]
 
 
 # ── Writer ↔ reader ─────────────────────────────────────────
@@ -282,6 +356,17 @@ def test_reader_refuses_empty_file() -> None:
         read_transcript(["\n", "   \n"])
 
 
+def test_reader_reports_a_malformed_header_as_a_schema_error() -> None:
+    """A header that names the schema but fails validation is still our error type."""
+    with pytest.raises(TranscriptSchemaError, match="line 1: invalid header"):
+        read_transcript([json.dumps({"schema": TRANSCRIPT_SCHEMA, "session": 42}) + "\n"])
+
+
+def test_reader_refuses_a_schema_that_is_not_a_string() -> None:
+    with pytest.raises(TranscriptSchemaError, match="unsupported transcript schema"):
+        read_transcript([json.dumps({"schema": ["omnigent.transcript/1"], "session": "x"}) + "\n"])
+
+
 def test_reader_ignores_fields_it_does_not_know() -> None:
     """A future minor addition inside the same schema must not break reading."""
     lines = [
@@ -296,72 +381,143 @@ def test_reader_ignores_fields_it_does_not_know() -> None:
 # ── Entry → item ────────────────────────────────────────────
 
 
+_ROUND_TRIP_ITEMS: list[dict[str, Any]] = [
+    _user("hi"),
+    _assistant("hello"),
+    _item(
+        "message",
+        role="user",
+        content=[{"type": "input_text", "text": "hi"}],
+        user_authored=True,
+        subagent_return_id="ret_1",
+        stream_message_id="sm_1",
+    ),
+    _item("function_call", model="a", name="shell", arguments='{"c": 1}', call_id="c1"),
+    _item("function_call", model="a", name="shell", arguments="raw", call_id="c1"),
+    _item("function_call_output", call_id="c1", output="done", subagent_return_id="ret_2"),
+    _item("reasoning", model="a", summary=[{"type": "summary_text", "text": "s"}]),
+    _item(
+        "reasoning",
+        model="a",
+        summary=[{"type": "summary_text", "text": "s"}],
+        encrypted_content="gAAAA",
+    ),
+    _item(
+        "reasoning",
+        model="a",
+        summary=[],
+        content=[{"type": "reasoning_text", "text": "full"}],
+    ),
+    _item(
+        "error",
+        source="llm",
+        code="rate_limited",
+        message="slow down",
+        title="Rate limited",
+        cause="Too many requests.",
+        remediation="Wait a minute.",
+    ),
+    _item(
+        "compaction",
+        summary="sum",
+        last_item_id="msg_1",
+        model="openai/gpt-4o",
+        token_count=3,
+        compacted_messages=[{"role": "user", "content": "hi"}],
+        window_id="w1",
+    ),
+    _item("native_tool", item={"type": "web_search_call", "id": "ws_1"}),
+    _item("terminal_command", kind="input", input="pwd"),
+    _item("terminal_command", kind="output", stdout="/work", stderr="warn"),
+    _item("slash_command", model="claude-native-ui", name="compact", arguments=""),
+    _item(
+        "routing_decision",
+        model="databricks-claude-opus-4-8",
+        applied=True,
+        rationale="deep",
+    ),
+    _item(
+        "resource_event",
+        event_type="terminal.exited",
+        resource_id="term_1",
+        resource_type="terminal",
+        resource={"name": "main"},
+    ),
+]
+
+
+def _expected_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """The ``{"type", "data"}`` create payload that reproduces *item* exactly."""
+    from omnigent.export import ITEM_ENVELOPE_KEYS, agent_serializes_as_model
+
+    data = {k: v for k, v in item.items() if k not in ITEM_ENVELOPE_KEYS}
+    if agent_serializes_as_model(item["type"]) and "model" in data:
+        data["agent"] = data.pop("model")
+    return {"type": item["type"], "data": data}
+
+
 @pytest.mark.parametrize(
     "item",
-    [
-        _user("hi"),
-        _assistant("hello"),
-        _item("function_call", model="a", name="shell", arguments='{"c": 1}', call_id="c1"),
-        _item("function_call", model="a", name="shell", arguments="raw", call_id="c1"),
-        _item("function_call_output", call_id="c1", output="done"),
-        _item("reasoning", model="a", summary=[{"type": "summary_text", "text": "s"}]),
-        _item(
-            "reasoning",
-            model="a",
-            summary=[],
-            content=[{"type": "reasoning_text", "text": "full"}],
-        ),
-        _item("error", source="llm", code="rate_limited", message="slow down"),
-        _item("compaction", summary="sum", last_item_id="msg_1", token_count=3),
-        _item("native_tool", item={"type": "web_search_call", "id": "ws_1"}),
-        _item("terminal_command", kind="input", input="pwd"),
-        _item("terminal_command", kind="output", stdout="/work", stderr="warn"),
-        _item("slash_command", model="claude-native-ui", name="compact", arguments=""),
-        _item(
-            "routing_decision",
-            model="databricks-claude-opus-4-8",
-            applied=True,
-            rationale="deep",
-        ),
-    ],
+    _ROUND_TRIP_ITEMS,
     ids=lambda item: item["type"] + ("/" + str(item.get("kind") or "")).rstrip("/"),
 )
-def test_every_item_type_rebuilds_into_a_valid_item(item: dict[str, Any]) -> None:
-    """Export → read → rebuild yields a payload the entity model accepts."""
+def test_every_item_type_round_trips_field_for_field(item: dict[str, Any]) -> None:
+    """Export → read → rebuild reproduces the stored item, and the entity accepts it."""
     line = entry_from_item(item, turn=1, seq=1).to_line()
     transcript = read_transcript(
         [json.dumps({"schema": TRANSCRIPT_SCHEMA, "session": "x"}) + "\n", line + "\n"]
     )
     payload = item_from_entry(transcript.entries[0])
 
-    assert payload["type"] == item["type"]
+    assert payload == _expected_payload(item)
     parse_item_data(payload["type"], payload["data"])
 
 
-def test_rebuilt_message_restores_agent_and_blocks() -> None:
-    payload = item_from_entry(entry_from_item(_assistant("hello"), turn=1, seq=1))
+def test_round_trip_matrix_covers_every_known_item_type() -> None:
+    """A new item type must be added to the matrix, or it ships untested."""
+    from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
+
+    assert {item["type"] for item in _ROUND_TRIP_ITEMS} >= set(ITEM_TYPE_TO_DATA_CLS)
+
+
+# ── Entry → item without ``raw`` (hand-written or trimmed files) ─────────
+
+
+def _entry(**fields: Any):
+    return read_transcript(
+        [
+            json.dumps({"schema": TRANSCRIPT_SCHEMA, "session": "x"}) + "\n",
+            json.dumps({"turn": 1, "seq": 1, **fields}) + "\n",
+        ]
+    ).entries[0]
+
+
+def test_text_only_message_rebuilds_a_text_block() -> None:
+    payload = item_from_entry(_entry(role="assistant", kind="message", text="hi", agent="a"))
 
     assert payload == {
         "type": "message",
         "data": {
             "role": "assistant",
-            "content": [{"type": "output_text", "text": "hello"}],
-            "agent": "analyst",
+            "content": [{"type": "output_text", "text": "hi"}],
+            "agent": "a",
         },
     }
 
 
-def test_rebuilt_tool_call_restores_argument_string() -> None:
-    item = _item("function_call", model="a", name="shell", arguments='{"c": 1}', call_id="c1")
-    payload = item_from_entry(entry_from_item(item, turn=1, seq=1))
+def test_tool_call_without_raw_reserializes_its_arguments() -> None:
+    payload = item_from_entry(
+        _entry(role="assistant", kind="tool_call", tool="shell", tool_input={"c": 1}, call_id="c1")
+    )
 
-    assert payload["data"]["name"] == "shell"
+    assert payload["type"] == "function_call"
     assert json.loads(payload["data"]["arguments"]) == {"c": 1}
     assert payload["data"]["call_id"] == "c1"
 
 
-def test_rebuilt_terminal_output_keeps_stderr() -> None:
-    item = _item("terminal_command", kind="output", stdout="out", stderr="err")
-    payload = item_from_entry(entry_from_item(item, turn=1, seq=1))
+def test_terminal_output_without_raw_keeps_the_text_as_stdout() -> None:
+    payload = item_from_entry(
+        _entry(role="tool", kind="tool_result", tool="terminal", tool_output="out")
+    )
 
-    assert payload["data"] == {"kind": "output", "stdout": "out", "stderr": "err"}
+    assert payload["data"] == {"kind": "output", "stdout": "out", "stderr": ""}

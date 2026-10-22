@@ -13,7 +13,8 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.export import TRANSCRIPT_SCHEMA, read_transcript
+from omnigent.export import TRANSCRIPT_SCHEMA, item_from_entry, read_transcript
+from omnigent.server.routes.sessions.routes_items import _EXPORT_PAGE_SIZE
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -78,7 +79,8 @@ async def test_export_streams_a_versioned_transcript(client: httpx.AsyncClient) 
 
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("application/x-ndjson")
-    assert resp.headers["content-disposition"] == f'attachment; filename="{session_id}.jsonl"'
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith(f'attachment; filename="{session_id}.jsonl"'), disposition
 
     transcript = read_transcript(resp.text.splitlines(keepends=True))
     header = transcript.header
@@ -102,6 +104,52 @@ async def test_export_streams_a_versioned_transcript(client: httpx.AsyncClient) 
     assert call.tool_input == {"query": "select region, count(*) from churn group by 1"}
     assert call.call_id == result.call_id == "call_1"
     assert result.tool_output == "west,12\neast,7"
+
+
+async def test_export_entries_rebuild_the_stored_items(client: httpx.AsyncClient) -> None:
+    """Every entry carries ``raw``, so the file reproduces what the server stored."""
+    session_id = await _seed_session(client)
+
+    resp = await client.get(f"/v1/sessions/{session_id}/export")
+    transcript = read_transcript(resp.text.splitlines(keepends=True))
+
+    rebuilt = [item_from_entry(entry) for entry in transcript.entries]
+    assert [item["type"] for item in rebuilt] == [item["type"] for item in _INITIAL_ITEMS]
+    for seeded, item in zip(_INITIAL_ITEMS, rebuilt, strict=True):
+        # Everything seeded comes back; so do fields the server stamped on
+        # top of it, which is what the readable entry alone would have lost.
+        assert seeded["data"].items() <= item["data"].items(), (seeded, item)
+    assert rebuilt[0]["data"]["user_authored"] is True
+
+
+async def test_export_numbers_across_item_pages(client: httpx.AsyncClient) -> None:
+    """``seq`` and ``turn`` keep counting past the route's page size."""
+    agent = await create_test_agent(client, name="export-paging-agent")
+    count = _EXPORT_PAGE_SIZE + 7
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "external",
+            "initial_items": [
+                {
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": f"m{i}"}]},
+                }
+                for i in range(count)
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    resp = await client.get(f"/v1/sessions/{session_id}/export")
+
+    transcript = read_transcript(resp.text.splitlines(keepends=True))
+    assert [e.seq for e in transcript.entries] == list(range(1, count + 1))
+    # Each user message is a request of its own, so it opens a turn.
+    assert [e.turn for e in transcript.entries] == list(range(1, count + 1))
+    assert [e.text for e in transcript.entries][-1] == f"m{count - 1}"
 
 
 async def test_export_unknown_session_is_404(client: httpx.AsyncClient) -> None:

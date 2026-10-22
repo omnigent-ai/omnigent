@@ -1456,11 +1456,73 @@ export async function fetchSessionItemsPage(
  * item in chronological order, so the download round-trips through
  * `omnigent session import`. The server pages the items; the SPA just
  * passes the body through.
+ *
+ * An older server has no `/export` route. FastAPI answers an unknown route
+ * with `{"detail": "Not Found"}`, while a missing or unreadable session
+ * answers with the AP `{"error": {...}}` envelope; only the former falls back
+ * to {@link exportSessionTranscriptLegacy}, so a real "not found" still
+ * surfaces as the error it is.
  */
 export async function exportSessionTranscript(sessionId: string): Promise<string> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/export`);
+  if (res.status === 404 && !(await isApiErrorEnvelope(res))) {
+    return exportSessionTranscriptLegacy(sessionId);
+  }
   if (!res.ok) throw await apiErrorFromResponse(res);
   return await res.text();
+}
+
+/** Whether a non-OK response body is the AP `{"error": {...}}` envelope. */
+async function isApiErrorEnvelope(res: Response): Promise<boolean> {
+  try {
+    const body = (await res.clone().json()) as { error?: unknown };
+    return typeof body === "object" && body !== null && typeof body.error === "object";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build the pre-schema export client-side for a server without `/export`.
+ *
+ * The first line is the session metadata (`record_type: "session_meta"`),
+ * every following line one committed item (`record_type: "item"`) in
+ * chronological order. `omnigent session import` still reads this shape.
+ */
+async function exportSessionTranscriptLegacy(sessionId: string): Promise<string> {
+  const metaParams = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  const metaRes = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
+  );
+  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+  const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
+
+  // Pages are a cursor chain (each request needs the previous last_id),
+  // so the fetches cannot run in parallel.
+  /* oxlint-disable no-await-in-loop */
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: "500", order: "asc" });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
+    const page = await readJsonOrThrow<{
+      data: Record<string, unknown>[];
+      has_more?: boolean;
+      last_id?: string | null;
+    }>(res);
+    for (const item of page.data) {
+      lines.push(JSON.stringify({ record_type: "item", ...item }));
+    }
+    if (!page.has_more || page.last_id == null) break;
+    after = page.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return lines.join("\n") + "\n";
 }
 
 /**

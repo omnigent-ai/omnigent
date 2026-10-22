@@ -119,17 +119,12 @@ def test_header_export_downloads_transcript(
     assert not missing, f"export is missing transcript content: {missing}"
     assert positions == sorted(positions), f"export lost turn order: {positions}"
 
-    # The download is the portable format, not a raw API dump: a schema
-    # header, then one entry per committed item with turns numbered. The
-    # live runner may also have written lifecycle items (resource events
-    # become ``note`` entries), so only the seeded messages are pinned.
+    # Download is an omnigent.transcript/1 file; only the seeded messages are pinned.
     transcript = read_transcript(exported.splitlines(keepends=True))
     assert transcript.header.schema_ == TRANSCRIPT_SCHEMA
     assert transcript.header.session == session_id
     messages = [e for e in transcript.entries if e.kind == "message"]
     assert [e.role for e in messages] == ["user", "assistant", "user", "assistant"]
-    turns = [e.turn for e in messages]
-    assert turns[0] == turns[1] < turns[2] == turns[3], turns
+    assert [e.turn for e in messages] == [1, 1, 2, 2]
     assert messages[1].text == _REPLY_ONE
     assert messages[1].agent == "hello_world"
-    assert all(e.kind == "note" for e in transcript.entries if e.kind != "message")

@@ -1,6 +1,7 @@
 """Portable, versioned session transcripts (``omnigent.transcript/1``)."""
 
 from omnigent.export.transcript import (
+    ITEM_ENVELOPE_KEYS,
     SUPPORTED_SCHEMAS,
     TRANSCRIPT_SCHEMA,
     EntryNumbering,
@@ -8,6 +9,7 @@ from omnigent.export.transcript import (
     TranscriptEntry,
     TranscriptHeader,
     TranscriptSchemaError,
+    agent_serializes_as_model,
     entry_from_item,
     header_from_session,
     item_from_entry,
@@ -17,6 +19,7 @@ from omnigent.export.transcript import (
 )
 
 __all__ = [
+    "ITEM_ENVELOPE_KEYS",
     "SUPPORTED_SCHEMAS",
     "TRANSCRIPT_SCHEMA",
     "EntryNumbering",
@@ -24,6 +27,7 @@ __all__ = [
     "TranscriptEntry",
     "TranscriptHeader",
     "TranscriptSchemaError",
+    "agent_serializes_as_model",
     "entry_from_item",
     "header_from_session",
     "item_from_entry",

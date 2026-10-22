@@ -7636,46 +7636,15 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
 
-# Fields on an exported item that belong to the store/envelope, not the typed
-# ``data`` payload — dropped before rebuilding the item for re-append.
-_IMPORT_ITEM_ENVELOPE_FIELDS = frozenset(
-    {"record_type", "id", "type", "status", "response_id", "created_by"}
-)
-
-
-def _import_agent_aliased_types() -> frozenset[str]:
-    """
-    Return the item types whose ``agent`` field serializes as ``model``.
-
-    ``to_api_dict`` renders items with ``by_alias=True``, so a data model with
-    ``agent: ... = Field(serialization_alias="model")`` exports ``agent`` as
-    ``model``. On import that must be reversed — but ONLY for those types.
-    Other types (``compaction``, ``routing_decision``) carry a genuine ``model``
-    field that must be left alone; ``routing_decision`` even has both ``model``
-    and ``agent``. Derive the set from the field definitions so it can't drift
-    if aliases are added or removed.
-
-    :returns: Item-type strings whose ``model`` export must map back to
-        ``agent`` on import, e.g. ``{"message", "function_call", ...}``.
-    """
-    from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
-
-    aliased: set[str] = set()
-    for item_type, cls in ITEM_TYPE_TO_DATA_CLS.items():
-        field = cls.model_fields.get("agent")
-        if field is not None and field.serialization_alias == "model":
-            aliased.add(item_type)
-    return frozenset(aliased)
-
-
 def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
     """
-    Rebuild one exported item into a ``{"type", "data"}`` create payload.
+    Rebuild one legacy exported item into a ``{"type", "data"}`` create payload.
 
-    Strips envelope fields the server reassigns, reverses the ``agent``→
-    ``model`` serialization alias (only for the types that carry it), and
-    validates the result with :func:`parse_item_data` so a malformed item
-    fails loud client-side before the create request.
+    Strips the API envelope plus the legacy ``record_type`` marker, reverses
+    the ``agent``→``model`` serialization alias (only for the types that carry
+    it, see :func:`omnigent.export.agent_serializes_as_model`), and validates
+    the result with :func:`parse_item_data` so a malformed item fails loud
+    client-side before the create request.
 
     :param item: One ``record_type == "item"`` object from an export JSONL.
     :returns: A ``SessionEventInput``-shaped dict for ``initial_items``.
@@ -7683,15 +7652,14 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
         does not validate for that type.
     """
     from omnigent.entities.conversation import parse_item_data
+    from omnigent.export import ITEM_ENVELOPE_KEYS, agent_serializes_as_model
 
     item_type = item.get("type")
     if not isinstance(item_type, str) or not item_type:
         raise click.ClickException(f"Export item is missing a 'type': {item!r}")
-    raw = {key: value for key, value in item.items() if key not in _IMPORT_ITEM_ENVELOPE_FIELDS}
-    # Reverse the agent→model alias only for types that actually use it, so a
-    # genuine ``model`` field on other types (compaction, routing_decision) is
-    # preserved rather than corrupted.
-    if item_type in _import_agent_aliased_types() and "model" in raw:
+    envelope = ITEM_ENVELOPE_KEYS | {"record_type"}
+    raw = {key: value for key, value in item.items() if key not in envelope}
+    if agent_serializes_as_model(item_type) and "model" in raw:
         raw["agent"] = raw.pop("model")
     try:
         parse_item_data(item_type, raw)

@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from omnigent.entities import Conversation
 from omnigent.errors import StaleCursorError
 from omnigent.export import EntryNumbering, header_from_session
+from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -46,7 +47,11 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import _resolve_harness, _resolve_llm_model
+from omnigent.server.routes._sessions.helpers import (
+    _attachment_disposition,
+    _resolve_harness,
+    _resolve_llm_model,
+)
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
@@ -59,6 +64,16 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.session_lifecycle import title_without_closed_marker
+
+#: Items per page when streaming an export; one store round trip per page.
+_EXPORT_PAGE_SIZE = 500
+
+
+class _NdjsonResponse(StreamingResponse):
+    """A streamed NDJSON body; declares the media type for the OpenAPI schema too."""
+
+    media_type = "application/x-ndjson"
 
 # ``?descendants=true`` depth: the default matches the CLI tree and the web
 # Agents rail; the cap bounds the in-memory walk.
@@ -82,8 +97,9 @@ def register_items_routes(
 
     @router.get(
         "/sessions/{session_id}/export",
-        # response_model=None: returns a StreamingResponse, not a model.
+        # response_model=None: returns a streamed body, not a model.
         response_model=None,
+        response_class=_NdjsonResponse,
         responses={
             200: {
                 "description": (
@@ -103,7 +119,9 @@ def register_items_routes(
 
         Builds the same ``omnigent.transcript/1`` file as ``omnigent session
         export`` (see ``docs/session-export.md``) server-side, paging the
-        items so a long session never has to fit in memory at once.
+        items so a long session never has to fit in memory at once. The
+        header's ``title`` and ``model`` are resolved the way the session
+        snapshot (``GET /v1/sessions/{id}``) resolves them.
 
         :param request: Inbound HTTP request; carries the caller identity
             used to authorize READ on the session.
@@ -111,8 +129,8 @@ def register_items_routes(
             e.g. ``"conv_abc123"``.
         :returns: An ``application/x-ndjson`` download named
             ``<session_id>.jsonl``.
-        :raises OmnigentError: 403 if the caller lacks READ; 404 if no
-            session exists.
+        :raises OmnigentError: 404 when no such session exists or the caller
+            has no READ access to it (the two are not distinguished).
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -127,18 +145,21 @@ def register_items_routes(
         def _session_snapshot() -> dict[str, object]:
             """Resolve the header fields the way the session snapshot does."""
             agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+            # The harness's own report supersedes the spec-derived model, as
+            # on the snapshot's ``llm_model``.
+            llm_model = concrete_reported_model(conv.reported_model) or _resolve_llm_model(
+                conv, agent_store=agent_store, agent_cache=agent_cache
+            )
             return {
                 "id": conv.id,
                 "created_at": conv.created_at,
-                "title": conv.title,
+                "title": title_without_closed_marker(conv.title),
                 "agent_name": agent.name if agent is not None else None,
                 "agent_id": conv.agent_id,
                 "harness": _resolve_harness(
                     conv, agent_store=agent_store, agent_cache=agent_cache
                 ),
-                "llm_model": _resolve_llm_model(
-                    conv, agent_store=agent_store, agent_cache=agent_cache
-                ),
+                "llm_model": llm_model,
                 "workspace": conv.workspace,
                 "parent_session_id": conv.parent_conversation_id,
                 "root_conversation_id": conv.root_conversation_id,
@@ -159,20 +180,21 @@ def register_items_routes(
                 page = await asyncio.to_thread(
                     conversation_store.list_items,
                     session_id,
-                    limit=500,
+                    limit=_EXPORT_PAGE_SIZE,
                     after=after,
                     order="asc",
                 )
                 for item in page.data:
                     yield numbering.entry(item.to_api_dict()).to_line() + "\n"
-                if not page.has_more:
+                # A page that says "more" without a cursor cannot be followed;
+                # restarting from the first page would loop forever.
+                if not page.has_more or page.last_id is None:
                     break
                 after = page.last_id
 
-        return StreamingResponse(
+        return _NdjsonResponse(
             _lines(),
-            media_type="application/x-ndjson",
-            headers={"Content-Disposition": f'attachment; filename="{conv.id}.jsonl"'},
+            headers={"Content-Disposition": _attachment_disposition(f"{conv.id}.jsonl")},
         )
 
     @router.get(

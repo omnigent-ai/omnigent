@@ -40,12 +40,15 @@ function mockJsonResponse(
   body: unknown,
   init?: { ok?: boolean; status?: number; statusText?: string },
 ): Response {
-  return {
+  const response = {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
     statusText: init?.statusText ?? "OK",
     json: async () => body,
-  } as unknown as Response;
+    // A body probe (`res.clone().json()`) must not consume the response.
+    clone: () => response,
+  };
+  return response as unknown as Response;
 }
 
 // An NDJSON streaming response: each line is emitted as its own chunk so the
@@ -1614,7 +1617,53 @@ describe("exportSessionTranscript", () => {
 
     await expect(exportSessionTranscript("sess_missing")).rejects.toMatchObject({
       status: 404,
+      code: "not_found",
     });
+    // A session 404 carries the AP error envelope and must not be mistaken
+    // for an older server without the route.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("builds the legacy export client-side when the server has no /export route", async () => {
+    // FastAPI's unknown-route 404 has no `error` envelope.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { detail: "Not Found" },
+        { ok: false, status: 404, statusText: "Not Found" },
+      ),
+    );
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "sess_1", title: "Planning" }));
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        data: [{ id: "it_1", type: "message", role: "user" }],
+        has_more: true,
+        last_id: "it_1",
+      }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        data: [{ id: "it_2", type: "message", role: "assistant" }],
+        has_more: false,
+        last_id: "it_2",
+      }),
+    );
+
+    const transcript = await exportSessionTranscript("sess_1");
+
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls[0]).toBe("/v1/sessions/sess_1/export");
+    expect(urls[1]).toContain("/v1/sessions/sess_1?");
+    expect(urls[2]).toContain("/v1/sessions/sess_1/items?limit=500&order=asc");
+    expect(urls[3]).toContain("after=it_1");
+    const lines = transcript
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line) as unknown);
+    expect(lines).toEqual([
+      { record_type: "session_meta", id: "sess_1", title: "Planning" },
+      { record_type: "item", id: "it_1", type: "message", role: "user" },
+      { record_type: "item", id: "it_2", type: "message", role: "assistant" },
+    ]);
   });
 });
 

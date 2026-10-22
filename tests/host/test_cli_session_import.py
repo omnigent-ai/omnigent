@@ -384,6 +384,65 @@ def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
     assert body["initial_items"][3]["data"]["agent"] == "claude-native-ui"
 
 
+@respx.mock
+def test_session_import_rebuilds_items_from_raw_payloads(tmp_path: Path) -> None:
+    """An Omnigent-written transcript imports field for field, including what the
+    readable fields only summarize (encrypted reasoning, compacted messages)."""
+    src = tmp_path / "t.jsonl"
+    reasoning_raw = {
+        "model": "codex",
+        "summary": [{"type": "summary_text", "text": "Plan"}],
+        "encrypted_content": "gAAAA",
+    }
+    compaction_raw = {
+        "summary": "User asked for churn; agent loaded data.",
+        "last_item_id": "msg_9",
+        "model": "openai/gpt-4o",
+        "token_count": 42,
+        "compacted_messages": [{"role": "user", "content": "churn"}],
+        "window_id": 2,
+    }
+    _write_transcript(
+        src,
+        header={"session": "conv_old", "agent_id": "ag_abc", "harness": "codex"},
+        entries=[
+            {
+                "turn": 1,
+                "seq": 1,
+                "role": "assistant",
+                "kind": "reasoning",
+                "origin_type": "reasoning",
+                "raw": reasoning_raw,
+                "text": "Plan",
+                "sealed": True,
+            },
+            {
+                "turn": 1,
+                "seq": 2,
+                "role": "system",
+                "kind": "compaction",
+                "origin_type": "compaction",
+                "raw": compaction_raw,
+                "text": compaction_raw["summary"],
+            },
+        ],
+    )
+    route = respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "conv_new", "agent_id": "ag_abc"})
+    )
+
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code == 0, result.output
+    items = json.loads(route.calls.last.request.content)["initial_items"]
+    # ``model`` on the wire is the entity's ``agent``; everything else is verbatim.
+    expected_reasoning = {k: v for k, v in reasoning_raw.items() if k != "model"}
+    assert items[0] == {"type": "reasoning", "data": {**expected_reasoning, "agent": "codex"}}
+    assert items[1] == {"type": "compaction", "data": compaction_raw}
+
+
 def test_session_import_refuses_unknown_schema(tmp_path: Path) -> None:
     """A newer schema version is refused rather than misread."""
     src = tmp_path / "future.jsonl"

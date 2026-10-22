@@ -7,19 +7,24 @@ harness-neutral (``message``, ``reasoning``, ``tool_call``, ``tool_result``,
 ``error``, ``compaction``, ``note``) so a reviewer can read the file without
 an Omnigent server, and so a reader never has to grow a case per harness.
 
-Two properties the format guarantees:
+Three properties the format guarantees:
 
 * **Sealed content is explicit.** When a provider returned something the
   client could not read (encrypted reasoning, a provider-hosted tool
-  result), the entry says so instead of silently looking complete.
+  result), the readable fields say so instead of silently looking complete.
 * **Compaction is a boundary, not a gap.** The entries before a compaction
   stay in the file; the ``compaction`` entry carries the summary the model
   continued from and names the last entry it covers.
+* **Nothing is lost on import.** Every entry also carries ``raw``, the item
+  payload exactly as the exporting server stored it, so a re-import rebuilds
+  the item field for field even where the readable fields summarize.
 
-Both the server route (``GET /v1/sessions/{id}/export``) and the CLI
-(``omnigent session export``) build the file through :func:`iter_transcript_lines`
-from the flat API item shape (:meth:`ConversationItem.to_api_dict`), and
-``omnigent session import`` reads it back through :func:`read_transcript` /
+The CLI (``omnigent session export``) builds the file through
+:func:`iter_transcript_lines`; the server route (``GET /v1/sessions/{id}/export``)
+streams the same header and numbering through :func:`header_from_session` and
+:class:`EntryNumbering`, one page of items at a time. Both start from the flat
+API item shape (:meth:`ConversationItem.to_api_dict`). ``omnigent session
+import`` reads the file back through :func:`read_transcript` /
 :func:`item_from_entry`.
 """
 
@@ -62,7 +67,7 @@ _SETTING_KEYS: tuple[str, ...] = (
 )
 
 #: Envelope keys the API puts on every item; everything else is payload.
-_ITEM_ENVELOPE_KEYS: frozenset[str] = frozenset(
+ITEM_ENVELOPE_KEYS: frozenset[str] = frozenset(
     {"id", "type", "status", "response_id", "created_at", "created_by"}
 )
 
@@ -121,8 +126,8 @@ class TranscriptEntry(BaseModel):
     Fields past ``kind`` are present only when they apply to that kind;
     ``None`` fields are omitted from the serialized line.
 
-    :param turn: 1-based turn number; one turn per user request and the
-        agent's response to it.
+    :param turn: 1-based turn number; a new turn starts at each user
+        message that a person typed (``is_meta`` context does not count).
     :param seq: 1-based position of the entry in the file.
     :param time: When the item was recorded, ISO 8601 UTC.
     :param role: Who produced it.
@@ -130,7 +135,12 @@ class TranscriptEntry(BaseModel):
     :param id: The exporting server's item id.
     :param origin_type: The producer's own item type (``"message"``,
         ``"native_tool"``, ...). Readers may ignore it; a re-import uses it
-        to rebuild the exact item.
+        with ``raw`` to rebuild the exact item.
+    :param raw: The item payload as the exporting server stored it, with
+        the envelope (``id``, ``type``, ``status``, ...) stripped. Readers
+        may ignore it; it is what makes a re-import lossless, including
+        fields the readable entry only summarizes (encrypted reasoning,
+        compacted messages, error remediation).
     :param text: Readable text for messages, reasoning summaries, errors and
         compaction summaries.
     :param content: Raw message content blocks (the harness's own shape).
@@ -149,10 +159,9 @@ class TranscriptEntry(BaseModel):
     :param model: Model that produced a compaction summary.
     :param token_count: Approximate size of a compaction summary.
     :param sealed: ``True`` when the provider withheld content from the
-        client; what the model saw is not fully in this file.
+        readable fields; what the model saw is in ``raw`` at most.
     :param sealed_reason: Why the entry is sealed.
     :param note_type: For ``note`` entries, the producer's event type.
-    :param data: For ``note`` entries, the raw payload.
     :param meta: Durable context injected as a message rather than typed
         by a person (``is_meta``).
     :param interrupted: The assistant message was cut off by a stop.
@@ -167,6 +176,7 @@ class TranscriptEntry(BaseModel):
     kind: EntryKind
     id: str | None = None
     origin_type: str | None = None
+    raw: dict[str, Any] | None = None
     text: str | None = None
     content: list[dict[str, Any]] | None = None
     agent: str | None = None
@@ -185,7 +195,6 @@ class TranscriptEntry(BaseModel):
     sealed: bool = False
     sealed_reason: str | None = None
     note_type: str | None = None
-    data: dict[str, Any] | None = None
     meta: bool = False
     interrupted: bool = False
 
@@ -264,17 +273,18 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
     :param item: The item as rendered by :meth:`ConversationItem.to_api_dict`.
     :param turn: Turn number assigned by the caller.
     :param seq: File position assigned by the caller.
-    :returns: The entry; unknown item types become ``note`` entries that
-        carry the raw payload so nothing is dropped.
+    :returns: The entry. Every entry carries the payload in ``raw``; unknown
+        item types become ``note`` entries so nothing is dropped.
     """
     item_type = str(item.get("type") or "unknown")
-    payload = {k: v for k, v in item.items() if k not in _ITEM_ENVELOPE_KEYS}
+    payload = {k: v for k, v in item.items() if k not in ITEM_ENVELOPE_KEYS}
     base: dict[str, Any] = {
         "turn": turn,
         "seq": seq,
         "time": _iso(item.get("created_at")),
         "id": item.get("id"),
         "origin_type": item_type,
+        "raw": payload,
     }
 
     if item_type == "message":
@@ -379,8 +389,7 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
             role="tool",
             kind="tool_result",
             tool="terminal",
-            tool_output=stdout if not stderr else f"{stdout}{stderr}",
-            data={"stdout": stdout, "stderr": stderr} if stderr else None,
+            tool_output=f"{stdout}{stderr}",
         )
     if item_type == "slash_command":
         args = payload.get("arguments") or ""
@@ -391,7 +400,6 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
             kind="note",
             note_type=item_type,
             text=f"/{name} {args}".rstrip(),
-            data=payload,
         )
     # routing_decision, resource_event, and anything added later.
     text = payload.get("rationale") if item_type == "routing_decision" else None
@@ -401,34 +409,41 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
         kind="note",
         note_type=item_type,
         text=text,
-        data=payload,
+    )
+
+
+def _starts_turn(item: Mapping[str, Any]) -> bool:
+    """Whether *item* is a user request: a user message a person typed."""
+    return (
+        item.get("type") == "message"
+        and item.get("role") == "user"
+        and not bool(item.get("is_meta"))
     )
 
 
 class EntryNumbering:
     """Assign ``turn`` / ``seq`` to items fed in order, one page at a time.
 
-    A new turn starts whenever the ``response_id`` changes, so a streaming
+    A new turn starts at each user message a person typed, so lifecycle
+    items with their own response ids (resource events, compactions) stay in
+    the turn they interrupted. The state is one counter pair, so a streaming
     producer can number across pages without holding the whole session.
     """
 
     def __init__(self) -> None:
         self._turn = 0
         self._seq = 0
-        self._response_id: str | None = None
 
     def entry(self, item: Mapping[str, Any]) -> TranscriptEntry:
         """Number the next item and map it to an entry."""
-        response_id = item.get("response_id")
-        if self._turn == 0 or response_id != self._response_id:
+        if self._turn == 0 or _starts_turn(item):
             self._turn += 1
-            self._response_id = response_id
         self._seq += 1
         return entry_from_item(item, turn=self._turn, seq=self._seq)
 
 
 def iter_transcript_entries(items: Iterable[Mapping[str, Any]]) -> Iterator[TranscriptEntry]:
-    """Number items into entries, starting a new turn at each ``response_id``.
+    """Number items into entries, starting a new turn at each user message.
 
     :param items: Flat API items in chronological order.
     :returns: Entries with ``turn`` and ``seq`` assigned.
@@ -482,12 +497,15 @@ def read_transcript(lines: Iterable[str]) -> Transcript:
                 raise TranscriptSchemaError(
                     "line 1: missing 'schema' — not an omnigent transcript"
                 )
-            if schema not in SUPPORTED_SCHEMAS:
+            if not isinstance(schema, str) or schema not in SUPPORTED_SCHEMAS:
                 raise TranscriptSchemaError(
                     f"unsupported transcript schema {schema!r}; "
                     f"this reader understands {sorted(SUPPORTED_SCHEMAS)}"
                 )
-            header = TranscriptHeader.model_validate(record)
+            try:
+                header = TranscriptHeader.model_validate(record)
+            except ValueError as exc:
+                raise TranscriptSchemaError(f"line {line_no}: invalid header ({exc})") from exc
             continue
         try:
             entries.append(TranscriptEntry.model_validate(record))
@@ -509,9 +527,11 @@ def _message_blocks(entry: TranscriptEntry) -> list[dict[str, Any]]:
 def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
     """Rebuild a ``{"type", "data"}`` item payload from an entry.
 
-    The inverse of :func:`entry_from_item` for everything the file can
-    carry. Sealed reasoning comes back with its summary only, which is all
-    the file ever had.
+    The inverse of :func:`entry_from_item`. An entry written by Omnigent
+    carries ``raw`` and ``origin_type``, and the item is rebuilt from those
+    field for field. The readable fields are the fallback for a hand-written
+    or trimmed entry; a sealed reasoning entry without ``raw`` comes back
+    with its summary only, which is all such a file has.
 
     :param entry: One parsed transcript entry.
     :returns: A create payload in the ``SessionEventInput`` shape, with
@@ -519,6 +539,11 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
     """
     origin = entry.origin_type
     data: dict[str, Any]
+    if entry.raw is not None and origin:
+        data = dict(entry.raw)
+        if "model" in data and agent_serializes_as_model(origin):
+            data["agent"] = data.pop("model")
+        return {"type": origin, "data": data}
     if entry.kind == "message":
         data = {"role": entry.role, "content": _message_blocks(entry)}
         if entry.agent is not None:
@@ -552,14 +577,10 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
         return {"type": "function_call", "data": data}
     if entry.kind == "tool_result":
         if origin == "terminal_command" or (origin is None and entry.tool == "terminal"):
-            streams = entry.data or {}
+            # Without ``raw`` the two streams were joined; keep the text as stdout.
             return {
                 "type": "terminal_command",
-                "data": {
-                    "kind": "output",
-                    "stdout": streams.get("stdout", entry.tool_output or ""),
-                    "stderr": streams.get("stderr", ""),
-                },
+                "data": {"kind": "output", "stdout": entry.tool_output or "", "stderr": ""},
             }
         return {
             "type": "function_call_output",
@@ -590,16 +611,24 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
                 "token_count": entry.token_count or 0,
             },
         }
-    # note: the raw payload is the item, keyed by the producer's type.
+    # A note without ``raw`` has only its one-line reading left.
     note_type = entry.note_type or origin or "note"
-    data = dict(entry.data or {})
-    if "model" in data and _agent_serializes_as_model(note_type):
-        data["agent"] = data.pop("model")
-    return {"type": note_type, "data": data}
+    return {"type": note_type, "data": {"text": entry.text} if entry.text else {}}
 
 
-def _agent_serializes_as_model(item_type: str) -> bool:
-    """Whether this item type's ``agent`` field is rendered as ``model`` on the wire."""
+def agent_serializes_as_model(item_type: str) -> bool:
+    """Whether this item type's ``agent`` field is rendered as ``model`` on the wire.
+
+    ``to_api_dict`` renders items ``by_alias=True``, so a data model declaring
+    ``agent: ... = Field(serialization_alias="model")`` exports ``agent`` as
+    ``model``. Rebuilding an item must reverse that for exactly those types:
+    ``compaction`` and ``routing_decision`` carry a genuine ``model`` field
+    that must be left alone. Derived from the field definitions so it cannot
+    drift when aliases are added or removed.
+
+    :param item_type: The item type string, e.g. ``"message"``.
+    :returns: ``True`` for types whose exported ``model`` is really ``agent``.
+    """
     from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 
     cls = ITEM_TYPE_TO_DATA_CLS.get(item_type)
