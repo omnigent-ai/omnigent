@@ -511,6 +511,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TMPDIR",
+        # Non-secret tuning knob: harness spawn-to-ready deadline for slow hosts.
+        "OMNIGENT_HARNESS_SPAWN_TIMEOUT_S",
         # The daemon and runner resolve OS-keyring credentials in the user's session.
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",

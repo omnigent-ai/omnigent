@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -163,6 +164,23 @@ _RELEASE_GRACE_S = 5.0
 # forever.
 _SPAWN_READY_TIMEOUT_S = 30.0
 
+SPAWN_READY_TIMEOUT_ENV_VAR = "OMNIGENT_HARNESS_SPAWN_TIMEOUT_S"
+
+
+def _spawn_ready_timeout_s() -> float:
+    """Return the harness spawn-to-ready deadline in seconds.
+
+    :returns: ``OMNIGENT_HARNESS_SPAWN_TIMEOUT_S`` when it is a positive
+        finite number, else :data:`_SPAWN_READY_TIMEOUT_S`.
+    """
+    raw = os.environ.get(SPAWN_READY_TIMEOUT_ENV_VAR, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SPAWN_READY_TIMEOUT_S
+    return value if math.isfinite(value) and value > 0 else _SPAWN_READY_TIMEOUT_S
+
+
 # Polling interval while waiting for the socket to appear. Short
 # enough that fast spawns return quickly; not so short that we
 # hammer the filesystem.
@@ -297,7 +315,8 @@ async def _wait_for_bind(
         or the deadline elapses (after killing the subprocess).
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _SPAWN_READY_TIMEOUT_S
+    timeout_s = _spawn_ready_timeout_s()
+    deadline = loop.time() + timeout_s
     while True:
         if process.returncode is not None:
             # Subprocess inherits stderr so the failure message
@@ -322,7 +341,8 @@ async def _wait_for_bind(
             raise RuntimeError(
                 f"harness {harness!r} for conversation "
                 f"{conversation_id!r} did not bind its endpoint "
-                f"within {_SPAWN_READY_TIMEOUT_S:.0f}s"
+                f"within {timeout_s:g}s (on slow hosts, set "
+                f"{SPAWN_READY_TIMEOUT_ENV_VAR} higher and restart the host)"
             )
         await asyncio.sleep(_SPAWN_POLL_INTERVAL_S)
 
