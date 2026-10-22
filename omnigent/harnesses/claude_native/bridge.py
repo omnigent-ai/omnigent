@@ -79,6 +79,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
 )
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
+    launcher_password_prompt,
     sign_in_next_step,
     sign_in_running_elsewhere,
 )
@@ -6518,6 +6519,8 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
+        A launcher password prompt (see :func:`launcher_password_prompt`) on
+        two consecutive polls is reported the same way.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -6552,6 +6555,7 @@ def _wait_for_claude_prompt_ready(
     dialog_headline: str | None = None
     sign_in_url: str | None = None
     waited_on_sign_in = False
+    waited_on_password = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -6583,6 +6587,17 @@ def _wait_for_claude_prompt_ready(
                 "prompt, then resend your message." + _format_terminal_failure_tail(pane)
             )
         dialog_headline = headline
+        # A launcher asking for a password, e.g. sudo writing managed settings.
+        # Only the person can type it, so report it rather than wait out the
+        # budget and reap the pane holding the prompt.
+        at_password_prompt = launcher_password_prompt(pane)
+        if at_password_prompt and waited_on_password:
+            raise ClaudeTerminalDialog(
+                "Claude Code's launch command is waiting for a password in its terminal, "
+                "so the message was not delivered. Open the terminal, enter the password, "
+                "then resend your message." + _format_terminal_failure_tail(pane)
+            )
+        waited_on_password = at_password_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address
         # to open, often with a device code. Real when the same address shows
         # on two consecutive polls. Fail now with the link rather than wait out
