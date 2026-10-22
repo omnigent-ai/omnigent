@@ -2012,9 +2012,8 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal. ``action_required`` is a warning while
-# provisioning: the user needs to do something, described by the status's
-# ``details``, before the sandbox's host can connect.
+# ``failed`` are terminal. ``action_required`` is a provisioning-time
+# warning: the user needs to do what the status's ``details`` say.
 SandboxLaunchStage = Literal[
     "provisioning",
     "action_required",

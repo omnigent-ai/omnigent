@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import time
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
@@ -120,7 +119,6 @@ def test_action_banner_follows_the_launch(
     chat = chat_session_contract
     chat.set_health(runner_online=False, host_online=True)
     chat.update_session(
-        created_at=time.time(),
         host_id=None,
         workspace=None,
         sandbox_status={

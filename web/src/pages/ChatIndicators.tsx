@@ -12,11 +12,8 @@ import { useChatStore } from "@/store/chatStore";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 /**
- * Warns while a managed launch reports `action_required`: the user needs to do
- * something, which the launch's `details` describe, before the sandbox's host
- * can connect. Only a warning, since the launch keeps going, and it leaves once
- * the launch moves on. Styled like `DbcertBanner`, which it sits beside in the
- * transcript's `FloatingBannerStack`.
+ * Shows what a launch in `action_required` needs the user to do. Only a
+ * warning: the launch keeps going, and the banner leaves when it moves on.
  */
 export function SandboxActionBanner() {
   const status = useChatStore((s) => s.sandboxStatus);
