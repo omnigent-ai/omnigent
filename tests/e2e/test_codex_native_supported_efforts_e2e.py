@@ -440,7 +440,10 @@ def test_codex_model_switch_clamps_inherited_effort(codex_effort_rig: _Rig) -> N
         _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
 
 
-def test_codex_side_chat_uses_switched_model_and_effort(codex_effort_rig: _Rig) -> None:
+@pytest.mark.parametrize("main_turn_first", [True, False], ids=["after_main_turn", "side_first"])
+def test_codex_side_chat_uses_switched_model_and_effort(
+    codex_effort_rig: _Rig, main_turn_first: bool
+) -> None:
     """A /side fork opened after a model and effort switch sends the parent's new settings."""
     rig = codex_effort_rig
     assert "max" in rig.capabilities(_EXTENDED_MODEL)
@@ -453,7 +456,8 @@ def test_codex_side_chat_uses_switched_model_and_effort(codex_effort_rig: _Rig) 
                 json={"model_override": _EXTENDED_MODEL, "reasoning_effort": "max"},
             )
         )
-        _assert_turn(rig, session, _EXTENDED_MODEL, "max")
+        if main_turn_first:
+            _assert_turn(rig, session, _EXTENDED_MODEL, "max")
 
         # Longer than the turn markers, which the fork's inherited history also contains.
         marker = f"SIDE_CHAT_REPLY_OK_{uuid.uuid4().hex}"
@@ -491,15 +495,10 @@ def test_codex_side_chat_uses_switched_model_and_effort(codex_effort_rig: _Rig) 
                 )["data"]
             )
             time.sleep(0.5)
-        (rig.stack.root / f"{marker}-all-requests.json").write_text(json.dumps(requests, indent=2))
-        (rig.stack.root / f"{marker}-requests.json").write_text(
-            json.dumps(side_requests, indent=2)
-        )
         observed = [
             (request.get("model"), request.get("reasoning", {}).get("effort"))
             for request in side_requests
         ]
-        print(json.dumps({"side_requests": observed, "replied": replied}), flush=True)
         assert side_requests, f"The side fork never reached the model.\n{rig.stack.log_tail()}"
         assert set(observed) == {(_EXTENDED_MODEL, "max")}, observed
         assert replied, f"The side chat never showed its reply.\n{rig.stack.log_tail()}"

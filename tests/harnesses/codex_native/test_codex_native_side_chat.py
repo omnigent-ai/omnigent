@@ -58,12 +58,15 @@ _CATALOG: _JsonObject = {
 }
 
 
-def _write_parent_settings(bridge_dir: Path, model: str, effort: str) -> None:
+def _write_parent_settings(bridge_dir: Path, model: str | None, effort: str | None) -> None:
     codex_home = codex_home_for_bridge_dir(bridge_dir)
     codex_home.mkdir(parents=True, exist_ok=True)
-    (codex_home / "config.toml").write_text(
-        f'model = "{model}"\nmodel_reasoning_effort = "{effort}"\n', encoding="utf-8"
-    )
+    lines = [
+        f'{key} = "{value}"\n'
+        for key, value in (("model", model), ("model_reasoning_effort", effort))
+        if value
+    ]
+    (codex_home / "config.toml").write_text("".join(lines), encoding="utf-8")
 
 
 def _text_items(text: str) -> list[_JsonObject]:
@@ -136,13 +139,15 @@ async def test_fork_sends_ephemeral_fork_rpc_and_returns_child_id() -> None:
         ),
         # An effort the model does not advertise is clamped.
         (("gpt-5.5", "max"), {}, {"model": "gpt-5.5", "effort": "xhigh"}),
+        (("gpt-6-sol", None), {}, {"model": "gpt-6-sol"}),
+        ((None, "high"), {}, {"effort": "high"}),
         (None, {}, {}),
     ],
 )
 @pytest.mark.asyncio
 async def test_parent_side_chat_settings_follow_the_parent_thread(
     tmp_path: Path,
-    config: tuple[str, str] | None,
+    config: tuple[str | None, str | None] | None,
     unmirrored: dict[str, str],
     expected: dict[str, str],
 ) -> None:
@@ -152,6 +157,19 @@ async def test_parent_side_chat_settings_follow_the_parent_thread(
     client = _FakeCodexClient({"model/list": _CATALOG})
 
     assert await side_chat.parent_side_chat_settings(client, tmp_path) == expected
+
+
+@pytest.mark.asyncio
+async def test_parent_side_chat_settings_keep_the_effort_when_the_catalog_fails(
+    tmp_path: Path,
+) -> None:
+    _write_parent_settings(tmp_path, "gpt-6-sol", "max")
+    client = SimpleNamespace(request=AsyncMock(side_effect=RuntimeError("app-server unavailable")))
+
+    settings = await side_chat.parent_side_chat_settings(client, tmp_path)
+
+    assert settings == {"model": "gpt-6-sol", "effort": "max"}
+    client.request.assert_awaited_once()
 
 
 @pytest.mark.asyncio
