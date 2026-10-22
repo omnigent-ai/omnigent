@@ -107,6 +107,9 @@ class OidcLoginManager {
     internal var pollIntervalMillis = POLL_INTERVAL_MS
     internal var pollTimeoutMillis = POLL_TIMEOUT_MS
     internal var browserLauncher: (Activity, String) -> Boolean = ::launchTab
+    internal var pollConnectionFactory: (URL) -> HttpURLConnection = {
+        it.openConnection() as HttpURLConnection
+    }
 
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
@@ -298,17 +301,18 @@ class OidcLoginManager {
         var lastNetworkError: IOException? = null
         while (System.currentTimeMillis() < deadline) {
             Thread.sleep(pollIntervalMillis) // throws InterruptedException on shutdownNow()
-            val conn = (
-                URL(
-                    "$origin/auth/cli-poll?ticket=$encoded",
-                ).openConnection() as HttpURLConnection
-            )
+            val conn =
+                pollConnectionFactory(
+                    URL("$origin/auth/cli-poll?ticket=$encoded"),
+                )
             conn.requestMethod = "GET"
             conn.setRequestProperty("X-Omnigent-Code-Verifier", codeVerifier)
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
             try {
-                when (conn.responseCode) {
+                val responseCode = conn.responseCode
+                lastNetworkError = null
+                when (responseCode) {
                     202 -> {
                         continue
                     }
@@ -330,7 +334,7 @@ class OidcLoginManager {
 
                     else -> {
                         return TicketPollResult.Failed(
-                            LegacyTicketFailure.HttpStatus(conn.responseCode),
+                            LegacyTicketFailure.HttpStatus(responseCode),
                         )
                     }
                 }

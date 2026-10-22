@@ -42,12 +42,15 @@ import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowRestrictionsManager
 import org.robolectric.shadows.ShadowSslErrorHandler
+import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.URI
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -459,6 +462,64 @@ class MainActivityTest {
                     shadowOf(
                         activity,
                     ).nextStartedActivity.getStringExtra(ConnectActivity.EXTRA_ERROR),
+                )
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `legacy ticket poll recovers from a network error before neutral timeout`() {
+        val pollConnections = AtomicInteger()
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+            } else {
+                LocalHttpServer.Response(202)
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                activity.declared<OidcLoginManager>("oidcLoginManager").apply {
+                    pollIntervalMillis = 20
+                    pollTimeoutMillis = 600
+                    pollConnectionFactory = { url ->
+                        if (pollConnections.getAndIncrement() == 0) {
+                            object : HttpURLConnection(url) {
+                                override fun getResponseCode(): Int =
+                                    throw IOException("transient poll failure")
+
+                                override fun connect() = Unit
+
+                                override fun disconnect() = Unit
+
+                                override fun usingProxy(): Boolean = false
+                            }
+                        } else {
+                            url.openConnection() as HttpURLConnection
+                        }
+                    }
+                }
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread { pollConnections.get() >= 2 }
+                awaitMainThread {
+                    activity.isFinishing ||
+                        activity.declared<ConnectionStatus?>(
+                            "connectionStatus",
+                        ) is ConnectionStatus.ServerUnreachable
+                }
+                assertTrue("a later 202 must clear the earlier network error", activity.isFinishing)
+                assertTrue(pollConnections.get() >= 2)
+                assertTrue(server.requests.any { it.path == "/auth/cli-poll" })
+                assertEquals(
+                    "Sign-in timed out. Try again.",
+                    shadowOf(activity)
+                        .nextStartedActivity
+                        .getStringExtra(ConnectActivity.EXTRA_ERROR),
                 )
             } finally {
                 controller.pause().stop().destroy()
