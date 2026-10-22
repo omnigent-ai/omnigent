@@ -6490,69 +6490,6 @@ export function NewChatLandingScreen() {
                         {maxSandboxRepos === 1 ? "repositories" : "ones"} to continue.
                       </p>
                     )}
-                    {/* Selected repos: each clones into its own sibling dir.
-                  A connected repo gets its branch combobox; a pasted URL a
-                  free-text branch. The remove button drops it. */}
-                    {sandboxRepoSelections.map((sel) => {
-                      const repo = repoForUrl(sel.url);
-                      const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
-                      return (
-                        <div
-                          key={sel.url}
-                          className="flex items-center gap-2"
-                          data-testid="new-chat-landing-repo-row"
-                        >
-                          <span className="min-w-0 flex-1 truncate text-sm" title={sel.url}>
-                            {name}
-                          </span>
-                          {repo ? (
-                            <div className="w-36 shrink-0">
-                              <SandboxRepoBranchSelect
-                                fullName={repo.full_name}
-                                value={sel.branch}
-                                defaultBranch={repo.default_branch}
-                                allowCustom={sandboxSessionWorkspaces}
-                                unselectedLabel={
-                                  sandboxSessionWorkspaces
-                                    ? sandboxCreateWorktrees
-                                      ? "New worktree"
-                                      : "Shared folder"
-                                    : undefined
-                                }
-                                onChange={(b) => setSandboxRepoBranch(sel.url, b)}
-                              />
-                            </div>
-                          ) : (
-                            <input
-                              type="text"
-                              value={sel.branch}
-                              onChange={(e) => setSandboxRepoBranch(sel.url, e.target.value)}
-                              placeholder={
-                                sandboxSessionWorkspaces
-                                  ? sandboxCreateWorktrees
-                                    ? "New worktree"
-                                    : "Shared folder"
-                                  : "branch"
-                              }
-                              aria-label={`Branch for ${name}`}
-                              className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
-                            />
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => removeSandboxRepo(sel.url)}
-                            aria-label={`Remove ${name}`}
-                            className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
-                            data-testid="new-chat-landing-repo-remove"
-                          >
-                            <XIcon className="size-3.5" />
-                          </button>
-                        </div>
-                      );
-                    })}
-                    {sandboxRepoSelections.length > 0 && (
-                      <div className="my-0.5 border-t border-border" />
-                    )}
                     {/* Add-repository controls, hidden once the provider's
                   repo cap is reached — so a single-repo provider shows one
                   slot and no multi-repo affordance. */}
@@ -6635,6 +6572,70 @@ export function NewChatLandingScreen() {
                         </div>
                       </>
                     )}
+                    {sandboxRepoSelections.length > 0 &&
+                      sandboxRepoSelections.length < maxSandboxRepos && (
+                        <div className="my-0.5 border-t border-border" />
+                      )}
+                    {/* Selected repos: each clones into its own sibling dir.
+                  A connected repo gets its branch combobox; a pasted URL a
+                  free-text branch. The remove button drops it. */}
+                    {sandboxRepoSelections.map((sel) => {
+                      const repo = repoForUrl(sel.url);
+                      const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
+                      return (
+                        <div
+                          key={sel.url}
+                          className="flex items-center gap-2"
+                          data-testid="new-chat-landing-repo-row"
+                        >
+                          <span className="min-w-0 flex-1 truncate text-sm" title={sel.url}>
+                            {name}
+                          </span>
+                          {repo ? (
+                            <div className="w-36 shrink-0">
+                              <SandboxRepoBranchSelect
+                                fullName={repo.full_name}
+                                value={sel.branch}
+                                defaultBranch={repo.default_branch}
+                                allowCustom={sandboxSessionWorkspaces}
+                                unselectedLabel={
+                                  sandboxSessionWorkspaces
+                                    ? sandboxCreateWorktrees
+                                      ? "New worktree"
+                                      : "Shared folder"
+                                    : undefined
+                                }
+                                onChange={(b) => setSandboxRepoBranch(sel.url, b)}
+                              />
+                            </div>
+                          ) : (
+                            <input
+                              type="text"
+                              value={sel.branch}
+                              onChange={(e) => setSandboxRepoBranch(sel.url, e.target.value)}
+                              placeholder={
+                                sandboxSessionWorkspaces
+                                  ? sandboxCreateWorktrees
+                                    ? "New worktree"
+                                    : "Shared folder"
+                                  : "branch"
+                              }
+                              aria-label={`Branch for ${name}`}
+                              className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
+                            />
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => removeSandboxRepo(sel.url)}
+                            aria-label={`Remove ${name}`}
+                            className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
+                            data-testid="new-chat-landing-repo-remove"
+                          >
+                            <XIcon className="size-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
                     {sandboxSessionWorkspaces ? (
                       <div className="mt-1 border-t border-border pt-3">
                         <div className="flex items-center gap-2">
