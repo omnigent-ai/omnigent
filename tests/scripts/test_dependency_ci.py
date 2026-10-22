@@ -475,6 +475,39 @@ def test_matrix_skip_output_matches_job_guard(tmp_path, script, event, draft, ru
 
 
 @pytest.mark.parametrize(
+    ("dependency", "ui_scope", "rendered"),
+    [
+        ("true", "full", True),
+        ("true", "none", False),
+        ("true", "sidecar", False),
+        ("false", "full", True),
+    ],
+)
+def test_ui_snapshot_detect_renders_web_dependency_bumps(tmp_path, dependency, ui_scope, rendered):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ui-snapshot.yml").read_text())
+    step = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "changes")
+    fake_gh = tmp_path / "bin" / "gh"
+    fake_gh.parent.mkdir()
+    fake_gh.write_text("#!/bin/sh\nprintf 'pnpm-lock.yaml\\nweb/package.json\\n'\n")
+    fake_gh.chmod(0o755)
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", "-c", step["run"]],
+        env=dict(
+            os.environ,
+            PATH=f"{fake_gh.parent}{os.pathsep}{os.environ['PATH']}",
+            GITHUB_OUTPUT=str(output),
+            DEPENDENCY=dependency,
+            UI_SCOPE=ui_scope,
+            PR="1",
+            REPO="omnigent-ai/omnigent",
+        ),
+        check=True,
+    )
+    assert output.read_text().strip() == f"ui={str(rendered).lower()}"
+
+
+@pytest.mark.parametrize(
     "fault",
     [
         "wrong_head",
