@@ -468,10 +468,9 @@ def user_opencode_config_paths() -> list[Path]:
     config home — the per-session override is set only on the spawned server),
     defaulting to ``~/.config/opencode``.
 
-    OpenCode deep-merges its global config from ``config.json`` →
-    ``opencode.json`` → ``opencode.jsonc`` (later files win on conflicting
-    keys). Return every file that exists, in that merge order, so callers can
-    reproduce the same effective config the opencode CLI itself resolves.
+    OpenCode deep-merges ``config.json``, ``opencode.json`` and
+    ``opencode.jsonc`` in that order (later files win), so every existing file
+    is returned in that order.
     """
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(xdg) if xdg else Path.home() / ".config"

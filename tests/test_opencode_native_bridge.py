@@ -251,7 +251,7 @@ def test_user_opencode_config_paths_default_location(
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     fake_home = tmp_path / "fake_home"
     monkeypatch.setattr(Path, "home", lambda: fake_home)
-    # No config files exist → empty list.
+    # No config files exist: empty list.
     assert user_opencode_config_paths() == []
     # Create a file and verify the path is as expected.
     (fake_home / ".config" / "opencode").mkdir(parents=True)
@@ -260,45 +260,10 @@ def test_user_opencode_config_paths_default_location(
     assert user_opencode_config_paths() == [expected]
 
 
-def test_user_opencode_config_paths_honors_xdg_config_home(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """XDG_CONFIG_HOME env var redirects the lookup."""
-    cfg_dir = tmp_path / "my-config" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.jsonc").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "my-config"))
-    paths = user_opencode_config_paths()
-    assert [p.name for p in paths] == ["opencode.jsonc"]
-    assert all(p.exists() for p in paths)
-
-
-def test_user_opencode_config_paths_single_json(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """When only opencode.json exists, it is the sole entry."""
-    cfg_dir = tmp_path / "cfg" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "opencode.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    assert [p.name for p in user_opencode_config_paths()] == ["opencode.json"]
-
-
-def test_user_opencode_config_paths_include_config_json(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """config.json is consulted too — opencode loads it first in its merge."""
-    cfg_dir = tmp_path / "legacy" / "opencode"
-    cfg_dir.mkdir(parents=True)
-    (cfg_dir / "config.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "legacy"))
-    assert [p.name for p in user_opencode_config_paths()] == ["config.json"]
-
-
 def test_user_opencode_config_paths_ordered_by_merge_precedence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """All existing files are returned in opencode's merge order (later wins)."""
+    """XDG_CONFIG_HOME redirects the lookup; files come back in opencode's merge order."""
     cfg_dir = tmp_path / "pref" / "opencode"
     cfg_dir.mkdir(parents=True)
     for name in ("opencode.jsonc", "opencode.json", "config.json"):

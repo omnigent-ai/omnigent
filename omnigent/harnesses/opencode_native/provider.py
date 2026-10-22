@@ -653,16 +653,13 @@ def maybe_merge_user_provider_config(config: dict[str, object]) -> dict[str, obj
     """
     Merge the user's global OpenCode provider definitions into *config*.
 
-    OpenCode resolves its global config by deep-merging
-    ``XDG_CONFIG_HOME/opencode/config.json`` → ``opencode.json`` →
-    ``opencode.jsonc`` (later files win on conflicting keys), and users keep
+    OpenCode deep-merges ``XDG_CONFIG_HOME/opencode/config.json``,
+    ``opencode.json`` and ``opencode.jsonc`` (later files win), and users keep
     custom provider definitions there (e.g. OpenAI-compatible endpoints with
-    custom base URLs). When running under Omnigent, the per-session
-    ``XDG_CONFIG_HOME`` override hides this global config. This function
-    resolves the user's effective config the same way opencode does and merges
-    any ``provider`` block into *config* so the spawned server sees both the
-    user's providers (with their custom base URLs) and any
-    Omnigent-synthesized providers (e.g. Databricks gateway).
+    custom base URLs). The per-session ``XDG_CONFIG_HOME`` override hides that
+    config, so this resolves it the same way and merges any ``provider`` block
+    into *config*, next to Omnigent-synthesized providers (e.g. Databricks
+    gateway).
 
     ``provider`` entries are merged, and the user's top-level ``plugin``
     entries are appended after any synthesized ones (synthesized policy
