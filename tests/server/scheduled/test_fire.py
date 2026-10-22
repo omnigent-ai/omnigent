@@ -20,10 +20,12 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.datastructures import Headers
 
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
@@ -32,6 +34,7 @@ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, R
 from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from tests.server.helpers import build_agent_bundle
@@ -138,6 +141,43 @@ class FakeScheduledTaskStore:
             }
         )
         return None
+
+    def get_running_run_by_conversation(self, conversation_id: str) -> Any:
+        for run in self.runs:
+            if run["conversation_id"] == conversation_id and run["status"] == "running":
+                return SimpleNamespace(id=run["run_id"])
+        return None
+
+    def update_run(self, run_id: str, *, status: str, finished_at: int, **kwargs: Any) -> Any:
+        run = next(run for run in self.runs if run["run_id"] == run_id)
+        run.update(status=status, finished_at=finished_at, **kwargs)
+        return None
+
+
+class FakeStartupInputs:
+    """Records saved prompts and launch failures in call order."""
+
+    def __init__(self, calls: list[str] | None = None) -> None:
+        self.calls = calls if calls is not None else []
+        self.enqueued: list[dict[str, Any]] = []
+        self.launch_failures: list[tuple[str, str]] = []
+
+    async def enqueue(
+        self,
+        session_id: str,
+        event: SessionEventInput,
+        *,
+        user_id: str | None,
+        headers: Headers,
+        first: bool = True,
+    ) -> None:
+        self.calls.append("enqueue")
+        self.enqueued.append(
+            {"session_id": session_id, "event": event, "user_id": user_id, "headers": headers}
+        )
+
+    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+        self.launch_failures.append((session_id, reason))
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
@@ -330,6 +370,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         artifact_store=overrides.get("artifact_store"),
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
+        startup_inputs=overrides.get("startup_inputs"),
     )
 
 
@@ -1533,20 +1574,10 @@ async def test_managed_sandbox_dispatch_failure_records_one_failed_run() -> None
     assert store.runs[0]["error_code"] == "launch_failed"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("dispatch_fails", [False, True])
-async def test_managed_fires_use_regular_launch_with_unchanged_server_config(
-    monkeypatch: pytest.MonkeyPatch, dispatch_fails: bool
-) -> None:
-    """Each fire uses a fresh managed launch with the server's lifecycle settings."""
-    from omnigent.server.managed_hosts import (
-        ManagedLaunchTracker,
-        ManagedSandboxConfig,
-        ManagedSandboxDeployment,
-    )
-    from omnigent.server.routes import sessions
+def _managed_sandbox_config() -> Any:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 
-    config = ManagedSandboxDeployment.single(
+    return ManagedSandboxDeployment.single(
         ManagedSandboxConfig(
             server_url="https://server.example.com",
             launcher_factory=lambda: pytest.fail("managed launch is stubbed"),
@@ -1555,69 +1586,136 @@ async def test_managed_fires_use_regular_launch_with_unchanged_server_config(
             host_config={"runner": {"idle_timeout_s": 7200}},
         )
     )
-    conversations = FakeConversationStore()
-    hosts = FakeHostStore()
-    bound: dict[str, _FakeConversation] = {}
+
+
+async def _drain_managed_launches() -> None:
+    """Await the background managed launches fires started."""
+    from omnigent.server.routes import sessions
+
+    await asyncio.gather(*list(sessions._managed_launch_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launch_outcome", ["bound", "tracker_failed", "raised"])
+async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
+    monkeypatch: pytest.MonkeyPatch, launch_outcome: str
+) -> None:
+    """A managed fire saves its prompt before provisioning; a failed launch fails the run."""
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    config = _managed_sandbox_config()
+    calls: list[str] = []
+    startup = FakeStartupInputs(calls)
 
     async def launch(**kwargs: Any) -> None:
-        session_id = kwargs["session_id"]
-        host_id = f"sandbox_host_{session_id}"
-        hosts.hosts[host_id] = _FakeHost(
-            host_id,
-            RESERVED_USER_LOCAL,
-            sandbox_provider="agent_sandbox",
-            sandbox_id=f"sandbox_{session_id}",
-        )
-        bound[session_id] = _FakeConversation(
-            id=session_id,
-            agent_id="ag_1",
-            host_id=host_id,
-            workspace="/home/omnigent/workspace",
-            runner_id=f"runner_{session_id}",
-        )
-        kwargs["tracker"].finish(session_id)
+        calls.append("launch")
+        if launch_outcome == "raised":
+            raise RuntimeError("allocation failed")
+        if launch_outcome == "tracker_failed":
+            kwargs["tracker"].fail(kwargs["session_id"], "provider refused")
+        else:
+            kwargs["tracker"].finish(kwargs["session_id"])
 
     managed_launch = AsyncMock(side_effect=launch)
-    runner_client = object()
-    dispatch = AsyncMock(side_effect=RuntimeError("dispatch failed") if dispatch_fails else None)
-    terminate = AsyncMock()
-    monkeypatch.setattr(conversations, "get_conversation", bound.get)
+    direct_dispatch = AsyncMock()
     monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
-    monkeypatch.setattr(sessions, "_wait_for_runner_client", AsyncMock(return_value=runner_client))
-    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
-    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", dispatch)
-    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", terminate)
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", direct_dispatch)
     store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
     on_fire = build_on_fire(
         _deps(
             store,
-            conversation_store=conversations,
-            host_store=hosts,
             sandbox_config=config,
             managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
         )
     )
 
     for _ in range(2):
         await on_fire(0, "task_1")
         await _drain()
+        await _drain_managed_launches()
 
-    assert managed_launch.await_count == 2
-    assert len(bound) == 2
-    assert len({conv.host_id for conv in bound.values()}) == 2
+    assert calls == ["enqueue", "launch"] * 2
+    assert len({saved["session_id"] for saved in startup.enqueued}) == 2
+    for saved in startup.enqueued:
+        assert saved["user_id"] == RESERVED_USER_LOCAL
+        assert saved["event"].data["content"] == [{"type": "input_text", "text": "do the thing"}]
+        assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
         assert call.kwargs["sandbox_config"] is config
         assert call.kwargs["owner"] == RESERVED_USER_LOCAL
         assert call.kwargs.get("relaunch_host") is None
         assert call.kwargs["repos"] == ()
     assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
-    assert dispatch.await_count == 2
-    for call in dispatch.await_args_list:
-        assert call.args[1] is bound[call.args[0]]
-        assert call.args[2].data["content"] == [{"type": "input_text", "text": "do the thing"}]
-        assert call.args[4] is runner_client
-    assert [run["status"] for run in store.runs] == ["failed" if dispatch_fails else "running"] * 2
-    terminate.assert_not_awaited()
+    # The saved prompt is delivered by the host's replica, never directly here.
+    direct_dispatch.assert_not_awaited()
+    if launch_outcome == "bound":
+        assert [run["status"] for run in store.runs] == ["running"] * 2
+        assert startup.launch_failures == []
+    else:
+        assert [run["status"] for run in store.runs] == ["failed"] * 2
+        assert {run["error_code"] for run in store.runs} == {"launch_failed"}
+        assert len(startup.launch_failures) == 2
+
+
+@pytest.mark.asyncio
+async def test_managed_launch_that_cannot_start_fails_run_and_saved_prompt() -> None:
+    """A launch that can't be started fails the run and doesn't leave the prompt pending."""
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    startup = FakeStartupInputs()
+    # No tracker: the launch can't be scheduled after the prompt is saved.
+    on_fire = build_on_fire(
+        _deps(store, sandbox_config=_managed_sandbox_config(), startup_inputs=startup)
+    )
+
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(startup.enqueued) == 1
+    assert [run["status"] for run in store.runs] == ["failed"]
+    assert store.runs[0]["error_code"] == "launch_failed"
+    assert [session for session, _ in startup.launch_failures] == [
+        startup.enqueued[0]["session_id"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_managed_fire_does_not_block_next_fire_while_provisioning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fire due while the previous sandbox still provisions runs in its own sandbox."""
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    release = asyncio.Event()
+
+    async def launch(**kwargs: Any) -> None:
+        await release.wait()
+        kwargs["tracker"].finish(kwargs["session_id"])
+
+    managed_launch = AsyncMock(side_effect=launch)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    startup = FakeStartupInputs()
+    run_now = build_run_now(
+        _deps(
+            store,
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
+        )
+    )
+
+    try:
+        for _ in range(2):
+            assert await run_now(0, "task_1") is True
+            await _drain()
+        assert managed_launch.await_count == 2
+        assert [run["status"] for run in store.runs] == ["running"] * 2
+    finally:
+        release.set()
+        await _drain_managed_launches()
 
 
 @pytest.mark.asyncio

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import tomllib
 import yaml
 
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server

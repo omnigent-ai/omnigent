@@ -42,8 +42,9 @@ def test_auth_keys_by_session_host_on_workspace_mount() -> None:
 
     keyed = _DatabricksTokenAuth(server_url=mount, session_id="conv_1")
     assert _slice_key(keyed, f"{mount}/v1/sessions/conv_1/events") == "host_abc"
-    # Any request on this client rides the same key (it is single-session).
     assert _slice_key(keyed, f"{mount}/v1/sessions/conv_1/stream") == "host_abc"
+    for route in ("agents", "hosts", "runners", "sessions", "sessions-other", "me"):
+        assert _slice_key(keyed, f"{mount}/v1/{route}") is None
 
     # Unmapped session → no key (workspace fallback).
     unmapped = _DatabricksTokenAuth(server_url=mount, session_id="conv_unknown")
@@ -70,15 +71,21 @@ async def test_request_routing_follows_the_target_session(
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
     monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_fallback")
     monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: "1234")
     mount = "http://127.0.0.1/api/2.0/omnigent"
     set_session_host("conv_old", "host_old")
     set_session_host("conv_new", target_host)
     auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_old")
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/2.0/omnigent/v1/sessions/conv_new"
-        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (target_host or "host_fallback")
         assert request.headers["Authorization"] == "Bearer test-token"
+        assert request.headers["X-Databricks-Org-Id"] == "1234"
+        route = request.url.path.removeprefix("/api/2.0/omnigent/v1/")
+        if route in {"agents", "hosts", "runners"}:
+            assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host_fallback"
+            return httpx.Response(200, json={"data": [], "hosts": []})
+        assert route == "sessions/conv_new"
+        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (target_host or "host_fallback")
         return httpx.Response(
             200, json={"id": "conv_new", "agent_id": "ag_new", "status": "idle", "created_at": 0}
         )
@@ -88,6 +95,9 @@ async def test_request_routing_follows_the_target_session(
             with monkeypatch.context() as patcher:
                 patcher.setattr(client._http, "_transport", transport)
                 assert (await client.sessions.get("conv_new")).id == "conv_new"
+                assert await client.sessions.list_registered_agents() == []
+                assert await client.sessions.list_launch_hosts() == []
+                assert await client.sessions.resolve_online_runner() is None
                 assert OMNIGENT_SLICE_KEY_HEADER not in client._http.headers
 
 

@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -88,6 +88,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.event_loop_watchdog import monitor_event_loop
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -102,6 +103,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -121,6 +123,7 @@ from omnigent.server.routes.sessions import (
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
+    set_relay_host_offline_probe,
     set_server_host_registry,
     set_server_runner_router,
 )
@@ -154,6 +157,10 @@ from omnigent.stores.preference_store import PreferenceStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
+if TYPE_CHECKING:
+    from omnigent.entities import Conversation
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
 
@@ -174,6 +181,13 @@ class BrandingInfo(BaseModel):
     heading: str | None
     logos: BrandingLogosInfo
     powered_by: bool
+
+
+class FilesystemAttachmentsInfo(BaseModel):
+    """Which uploads native sessions receive as files, for client-side checks."""
+
+    extensions: list[str]
+    all_types: bool
 
 
 class ServerInfoResponse(BaseModel):
@@ -213,6 +227,8 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Absent on older servers, which clients treat as the default extensions.
+    filesystem_attachments: FilesystemAttachmentsInfo | None = None
     branding: BrandingInfo
 
 
@@ -227,7 +243,7 @@ def _resolve_extension_state(
     # Distribution metadata is an external installation boundary. Preserve the
     # rest of the server if global discovery itself fails before per-plugin
     # failure isolation can apply.
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
         return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
 
@@ -246,7 +262,7 @@ def _resolve_extension_assets(
                 ", ".join(sorted(overrides)),
             )
         return build_asset_index(state, overrides=overrides)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
 
@@ -1173,7 +1189,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+    except Exception:  # a malformed acp: block must never break startup
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -1352,6 +1368,9 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
+    filesystem_attachment_allowed_extensions: (
+        str | list[str] | Callable[[], str | list[str] | None] | None
+    ) = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1359,6 +1378,7 @@ def create_app(
     host_sharded: bool = False,
     *,
     preference_store: PreferenceStore | None = None,
+    preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1489,6 +1509,12 @@ def create_app(
         ``None`` reads ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` (default ``off``)
         with an admin-editable file override; a static value or callable is
         authoritative. Never grants past ``sharing_mode``/``public_sharing``.
+    :param filesystem_attachment_allowed_extensions: Which uploads native
+        Claude Code and Codex sessions receive as files: a list of extensions,
+        ``[]`` for none, or ``"*"`` for everything that can't be inlined (see
+        :func:`~omnigent.server.server_config.parse_filesystem_attachment_policy`).
+        A callable is evaluated per request. ``None`` uses the server config
+        key of the same name, read at startup.
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
@@ -1781,6 +1807,7 @@ def create_app(
                 # (before this lifespan runs), so it is already on state here.
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
+                startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
             )
             on_fire = build_on_fire(fire_deps)
@@ -1829,7 +1856,8 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         try:
-            yield
+            with monitor_event_loop():
+                yield
         finally:
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
@@ -1971,6 +1999,27 @@ def create_app(
             f"{_provider.name}_client",
             _provider.client_factory(_cfg) if _on else None,
         )
+    # Managed-sandbox owner identity: a launcher that acts as the host's owner
+    # (e.g. the `databricks` provider) resolves that user's
+    # connected credential through these, keyed by connection provider.
+    if sandbox_config is not None:
+        from dataclasses import replace as _dc_replace
+
+        from omnigent.server.connections_registry import blocking_owner_resolver
+
+        _owner_credentials = {
+            _provider.name: blocking_owner_resolver(
+                _provider.owner_identity_resolver,
+                store=getattr(app.state, f"{_provider.name}_store"),
+                client=getattr(app.state, f"{_provider.name}_client"),
+            )
+            for _provider in connection_providers()
+            if _provider.owner_identity_resolver is not None
+            and getattr(app.state, f"{_provider.name}_store", None) is not None
+        }
+        if _owner_credentials:
+            sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
+            app.state.sandbox_config = sandbox_config
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -2094,6 +2143,23 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    from omnigent.server.server_config import parse_filesystem_attachment_policy
+
+    if callable(filesystem_attachment_allowed_extensions):
+        _allowed_extensions = filesystem_attachment_allowed_extensions
+
+        def _resolve_filesystem_attachment_policy() -> "FilesystemAttachmentPolicy":
+            return parse_filesystem_attachment_policy(_allowed_extensions())
+
+        app.state.filesystem_attachment_policy = _resolve_filesystem_attachment_policy
+    else:
+        # A static setting is parsed once; /v1/info serves it without file reads.
+        _static_policy = parse_filesystem_attachment_policy(
+            resolved_server_config.get("filesystem_attachment_allowed_extensions")
+            if filesystem_attachment_allowed_extensions is None
+            else filesystem_attachment_allowed_extensions
+        )
+        app.state.filesystem_attachment_policy = lambda: _static_policy
     # Tracks in-flight background managed-host launches (POST
     # /v1/sessions returns before the sandbox exists) so a message
     # racing the provision can rendezvous instead of failing with
@@ -3151,6 +3217,7 @@ def create_app(
         from omnigent.server.dictation import engine_availability
 
         dictation_available, _ = engine_availability()
+        filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3180,6 +3247,10 @@ def create_app(
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "filesystem_attachments": {
+                    "extensions": sorted(filesystem_attachment_policy.extensions),
+                    "all_types": filesystem_attachment_policy.all_types,
+                },
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3262,7 +3333,7 @@ def create_app(
             try:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
@@ -3504,7 +3575,7 @@ def create_app(
 
     if preference_store is not None:
         app.include_router(
-            create_preferences_router(preference_store, auth_provider),
+            create_preferences_router(preference_store, auth_provider, policy=preference_policy),
             prefix="/v1",
             tags=["preferences"],
         )
@@ -3564,6 +3635,7 @@ def create_app(
             active work, so a stale mid-turn status is settled like a Stop.
         """
         from omnigent.server.routes.sessions import (
+            HOST_OFFLINE_HOLD_S,
             RUNNER_DISCONNECT_GRACE_S,
             _mark_runner_sessions_offline,
             _note_runner_idle_shutdown,
@@ -3627,6 +3699,34 @@ def create_app(
                 runner_id,
             )
             return
+        error = ErrorDetail(
+            code="runner_disconnected",
+            message="Runner disconnected unexpectedly.",
+        )
+        hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        if hold in ("runner_reconnected", "server_shutdown"):
+            return
+        if hold is not None:
+            # Sessions may have moved, stopped, or gone live elsewhere meanwhile.
+            affected = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+            if tunnel_registry.get(runner_id) is not None:
+                return
+            if _runner_live_on_another_replica_from_conversations(
+                affected, runner_id, reference_stamp
+            ):
+                for conv in affected:
+                    _relinquish_session_live_state(conv.id)
+                return
+            if hold == "expired":
+                error = ErrorDetail(
+                    code="runner_disconnected",
+                    message=(
+                        "The host for this session went offline and did not come back "
+                        f"within {HOST_OFFLINE_HOLD_S / 3600:g} hours."
+                    ),
+                )
         if idle_shutdown:
             # The sweep's stop path settles these to idle instead of failing them.
             _note_runner_idle_shutdown(runner_id, affected)
@@ -3646,14 +3746,128 @@ def create_app(
                 runner_id,
                 len(affected),
             )
-        await _mark_runner_sessions_offline(
-            affected,
-            ErrorDetail(
-                code="runner_disconnected",
-                message="Runner disconnected unexpectedly.",
-            ),
-            conversation_store,
+        await _mark_runner_sessions_offline(affected, error, conversation_store)
+
+    async def _routing_host_id(convs: "list[Conversation]") -> str | None:
+        """Return the host *convs*' shared runner runs on, or ``None`` when unknown."""
+        from omnigent.runner.routing import routing_host_id
+
+        own = next((conv.host_id for conv in convs if conv.host_id is not None), None)
+        if own is not None or not convs:
+            return own
+        try:
+            return await asyncio.to_thread(routing_host_id, convs[0], conversation_store)
+        except Exception:  # an unreadable ancestor leaves the host unknown
+            _logger.warning("Host lookup failed for session=%s", convs[0].id, exc_info=True)
+            return None
+
+    async def _host_offline(host_id: str | None) -> bool | None:
+        """Whether a user-run host is gone from every replica; ``None`` when unreadable."""
+        from omnigent.server.routes.sessions import _host_row_offline
+
+        if host_id is None or host_registry.get(host_id) is not None:
+            return False
+        return await _host_row_offline(host_store, host_id)
+
+    async def _hold_for_offline_host(runner_id: str, affected: "list[Conversation]") -> str | None:
+        """Wait for a runner whose user-run host dropped with it mid-turn.
+
+        A laptop that sleeps or loses Wi-Fi takes its runner along and usually
+        resumes the turn when it wakes, so the turn waits for it instead of
+        failing. A host that comes back without its runner gets one more grace.
+        A crash report cancels this task and fails the turn as before.
+
+        :returns: ``None`` when nothing was held, else how the hold ended:
+            ``"runner_reconnected"``, ``"server_shutdown"``,
+            ``"host_back_without_runner"`` or ``"expired"``.
+        """
+        from omnigent.server.routes.sessions import (
+            _MID_TURN_STATUSES,
+            HOST_OFFLINE_HOLD_S,
+            HOST_OFFLINE_RECHECK_S,
+            RUNNER_DISCONNECT_GRACE_S,
+            _intentional_stop_sessions,
+            _session_status_cache,
         )
+
+        held = [
+            conv
+            for conv in affected
+            if conv.id not in _intentional_stop_sessions
+            and _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES
+        ]
+        host_id = await _routing_host_id(held)
+        if not held or await _host_offline(host_id) is not True:
+            return None
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + HOST_OFFLINE_HOLD_S
+        host_back = False
+        outcome = "cancelled"
+        for conv in held:
+            _logger.info(
+                "Runner %s: host offline, holding session=%s",
+                runner_id,
+                conv.id,
+                extra=debug_event(
+                    "runner_disconnect_held_host_offline",
+                    session_id=conv.id,
+                    runner_id=runner_id,
+                    host_id=host_id,
+                    hold_s=HOST_OFFLINE_HOLD_S,
+                ),
+            )
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    outcome = "host_back_without_runner" if host_back else "expired"
+                    break
+                if (
+                    await tunnel_registry.wait_for_runner(
+                        runner_id, timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining)
+                    )
+                    is not None
+                ):
+                    outcome = "runner_reconnected"
+                    break
+                if shutdown_state.server_shutting_down():
+                    outcome = "server_shutdown"
+                    break
+                # An unreadable host row keeps holding; only a live one ends it early.
+                if not host_back and await _host_offline(host_id) is False:
+                    # The host is back; give its runner one more grace to follow.
+                    host_back = True
+                    deadline = min(deadline, loop.time() + RUNNER_DISCONNECT_GRACE_S)
+        finally:
+            for conv in held:
+                _logger.info(
+                    "Runner %s: host-offline hold ended (%s) for session=%s",
+                    runner_id,
+                    outcome,
+                    conv.id,
+                    extra=debug_event(
+                        "runner_disconnect_hold_ended",
+                        session_id=conv.id,
+                        runner_id=runner_id,
+                        outcome=outcome,
+                        held_s=round(loop.time() - started, 3),
+                    ),
+                )
+        return outcome
+
+    async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
+        """Whether this replica's disconnect task holds a lost relay's turn for its host."""
+        task = _disconnect_grace_tasks.get(runner_id)
+        if task is None or task.done():
+            return False
+        try:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
+            return False
+        return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
+
+    set_relay_host_offline_probe(_relay_turn_held_for_host)
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.

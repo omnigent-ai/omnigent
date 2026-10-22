@@ -1050,6 +1050,12 @@ export interface ConversationState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  /**
+   * The `action_required` details the user dismissed for this session's launch, or `null`.
+   * Keeps the launch's banner hidden while it keeps asking for the same thing; a
+   * `session.sandbox_status` event for any other stage clears it.
+   */
+  sandboxActionDismissed: string | null;
   /** Managed startup accepts sends durably before its first harness dispatch. */
   startupPending: boolean;
   /**
@@ -1380,6 +1386,8 @@ export interface ChatActions {
   refreshSessionState: (conversationId?: string) => Promise<void>;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
+  /** Hide the launch's `action_required` banner while the launch keeps asking for *details*. */
+  dismissSandboxAction: (details: string) => void;
   /**
    * Dismiss the /btw sidechat overlay.
    * TODO: reconcile with terminal Escape on native sessions.
@@ -2079,6 +2087,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
+  sandboxActionDismissed: null,
   startupPending: false,
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
@@ -3368,6 +3377,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
 
+  dismissSandboxAction: (details) => setActive({ sandboxActionDismissed: details }),
+
   dismissBtwSidechat: () => {
     const { conversationId } = get();
     setActive({ btwSidechat: null });
@@ -4465,7 +4476,11 @@ function sessionBindingPatch(
   session: Session,
   state: Pick<
     ConversationState,
-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+    | "mcpStartupLaunch"
+    | "sessionModelSeeded"
+    | "llmModel"
+    | "sessionModelOverride"
+    | "sandboxActionDismissed"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
@@ -4490,6 +4505,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "sandboxActionDismissed"
   | "startupPending"
   | "mcpStartup"
   | "mcpStartupLaunch"
@@ -4526,6 +4542,9 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    // A reload that shows the launch moved on ends the dismissal of its last warning.
+    sandboxActionDismissed:
+      session.sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null,
     // "ready" with saved inputs left: a native first input awaits its transcript
     // receipt, and the server still saves new messages behind it.
     startupPending:
@@ -5087,13 +5106,18 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  */
 function launchSnapshotPatch(
   session: Session,
-  state: Pick<ConversationState, "sandboxStatus">,
-): Partial<Pick<ConversationState, "sandboxStatus" | "runnerLaunchedAt">> {
+  state: Pick<ConversationState, "sandboxStatus" | "sandboxActionDismissed">,
+): Partial<
+  Pick<ConversationState, "sandboxStatus" | "sandboxActionDismissed" | "runnerLaunchedAt">
+> {
   if (state.sandboxStatus === null || state.sandboxStatus.stage === "failed") return {};
   const sandboxStatus = session.sandboxStatus ?? null;
+  // A snapshot that shows the launch moved on ends the dismissal of its last warning.
+  const sandboxActionDismissed =
+    sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null;
   return sandboxStatus === null
-    ? { sandboxStatus, runnerLaunchedAt: Date.now() }
-    : { sandboxStatus };
+    ? { sandboxStatus, sandboxActionDismissed, runnerLaunchedAt: Date.now() }
+    : { sandboxStatus, sandboxActionDismissed };
 }
 
 /**
@@ -7647,10 +7671,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // `ready` clears the launch indicator and starts the launch grace (the runner is
       // up, its terminal not yet); `failed` keeps the reason so the page can explain
       // why the sandbox never came up.
-      applyToConversation(
+      applyToConversation((s) =>
         event.stage === "ready"
-          ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
-          : { sandboxStatus: { stage: event.stage, error: event.error, provider: event.provider } },
+          ? { sandboxStatus: null, sandboxActionDismissed: null, runnerLaunchedAt: Date.now() }
+          : {
+              sandboxStatus: {
+                stage: event.stage,
+                error: event.error,
+                provider: event.provider,
+                details: event.details,
+              },
+              // A dismissal lasts while the launch keeps asking; any other stage ends it.
+              sandboxActionDismissed:
+                event.stage === "action_required" ? s.sandboxActionDismissed : null,
+            },
       );
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.

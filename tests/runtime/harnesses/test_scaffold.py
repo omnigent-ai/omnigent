@@ -553,7 +553,7 @@ async def test_heartbeat_carries_server_time_and_last_event_seq(
     import datetime
 
     parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=datetime.timezone.utc
+        tzinfo=datetime.UTC
     )
     assert parsed.year >= 2026
 

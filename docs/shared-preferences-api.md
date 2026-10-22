@@ -105,6 +105,18 @@ the operation ID remains reusable with a smaller request.
 
 ## Storage and limits
 
+Both preference APIs share a per-process worker budget and a best-effort
+per-user/workspace rate limiter. Busy requests return 429 with `Retry-After`.
+The rate limiter stops tracking new identities when its bounded table is full;
+the worker cap still applies, but it does not guarantee fairness between users.
+Deployments need their normal ingress concurrency and upload controls.
+
+Writes are limited to five seconds of body streaming and return 408 on timeout
+or 413 when oversized. Shared operations accept at most 64 KiB; configuration
+snapshots accept at most 16,000 bytes. These limits apply before JSON parsing.
+Invalid operation bodies return 422 with a short `detail` string, rather than
+FastAPI's field-error list. Streaming request bodies are not described in OpenAPI.
+
 Values, conflicts and retry receipts commit atomically in the existing
 `preferences` table. See the [store](../omnigent/stores/preference_store/sqlalchemy_store.py)
 for locking and bounded-query details.

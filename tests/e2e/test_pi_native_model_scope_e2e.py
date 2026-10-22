@@ -219,6 +219,9 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
                 supported_capabilities=frozenset({ModelCapability.REASONING})
                 if reasoning
                 else frozenset(),
+                unsupported_capabilities=frozenset({ModelCapability.REASONING})
+                if not reasoning
+                else frozenset(),
                 wire_apis=frozenset(
                     {
                         ModelWireAPI.OPENAI_CHAT

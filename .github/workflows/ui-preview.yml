@@ -142,7 +142,7 @@ jobs:
       contents: read
     timeout-minutes: 30
     env:
-      CI_UV_VERSION: "0.12.15"
+      CI_UV_VERSION: "0.13.4"
     steps:
       # Install before checking out the PR head so retry logic comes only from
       # this trusted workflow definition and cannot write a shared cache.

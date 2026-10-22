@@ -210,7 +210,7 @@ async def _proxy_model_options(
             status_code=502,
             detail=f"host '{host_conn.host_id}' connection lost",
         ) from exc
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise HTTPException(
             status_code=504,
             detail=(
@@ -278,7 +278,7 @@ async def _proxy_list_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_LIST_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -338,7 +338,7 @@ async def _proxy_create_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -399,7 +399,7 @@ async def _proxy_install_harness(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_INSTALL_HARNESS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -436,7 +436,7 @@ async def _proxy_refresh_harnesses(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_REFRESH_HARNESSES_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -488,7 +488,7 @@ async def _proxy_store_secret(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -530,7 +530,7 @@ async def _proxy_detect_credentials(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -1196,7 +1196,7 @@ def create_hosts_router(
                 future,
                 timeout=launch_timeout_s,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             conn.pending_launches.pop(request_id, None)
             await _rollback_failed_launch()
             raise HTTPException(

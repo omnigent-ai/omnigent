@@ -10,8 +10,10 @@ talks to a forge goes through that provider's
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import suppress
@@ -33,6 +35,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
+    ReviewerRef,
     local_git,
     unsupported_remote_info,
 )
@@ -51,6 +54,11 @@ _PR_TITLE_REQUEST_SECONDS = 8.0
 _PROVIDER_CONFIG_KEY = "omnigent.gitprovider"
 # GitHub allows at most 100 labels on a pull request, so no larger edit can apply.
 _MAX_LABEL_EDIT = 100
+_MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
+# A full SHA-1 or SHA-256 commit id; ``gh`` would reject an abbreviation.
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+# Bounds one reviewer edit's request body; the panel sends one reviewer at a time.
+_MAX_REVIEWER_EDIT = 100
 
 _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
 _DISCOVERY_LOCK = Lock()
@@ -113,7 +121,7 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
         if parsed is not None and parsed.provider not in found:
             try:
                 facet = _facet(parsed.provider)
-            except Exception:  # noqa: BLE001 — optional integrations must not hide other remotes
+            except Exception:  # optional integrations must not hide other remotes
                 _logger.warning("Could not load git provider %s", parsed.provider, exc_info=True)
                 continue
             if facet is not None:
@@ -230,7 +238,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         if facet is None:
             return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
         return facet.reference_info(root, reference)
-    except Exception:  # noqa: BLE001 — retain the selector and healthy providers on failure
+    except Exception:  # retain the selector and healthy providers on failure
         _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
         return {
             **unsupported_remote_info(reference.host),
@@ -244,7 +252,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
 def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]:
     try:
         return _workspace_info(root, resolution)
-    except Exception:  # noqa: BLE001 — one unavailable forge must not hide the others
+    except Exception:  # one unavailable forge must not hide the others
         _logger.warning("Git provider %s failed discovery", resolution.provider, exc_info=True)
         return {
             **unsupported_remote_info(resolution.remote_host or ""),
@@ -271,7 +279,7 @@ def _title_facets(root: str, entries: list[SessionPullRequest]) -> dict[str, Pul
             facet = _facet(provider_id)
             if facet is not None and facet.titles_available(root):
                 facets[provider_id] = facet
-        except Exception:  # noqa: BLE001 — optional titles must not hide the selected PR
+        except Exception:  # optional titles must not hide the selected PR
             _logger.warning(
                 "Git provider %s could not prepare PR title lookup", provider_id, exc_info=True
             )
@@ -315,7 +323,7 @@ def _session_prs_with_titles(
             return None
         try:
             title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
-        except Exception:  # noqa: BLE001 — keep the existing cache when an optional lookup fails
+        except Exception:  # keep the existing cache when an optional lookup fails
             _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
             return None
         return entry.url, title, timed_out
@@ -366,12 +374,12 @@ def _associate_discovered_pr(
                     title = _pr_title(pr)
                     if title is not None:
                         registry.update_titles({inferred.url: title})
-                except Exception:  # noqa: BLE001 — metadata cannot undo a valid association
+                except Exception:  # metadata cannot undo a valid association
                     _logger.warning("Could not cache discovered PR metadata", exc_info=True)
             else:
                 candidate["pr"] = None
                 candidate.pop("selected_pr_url", None)
-        except Exception:  # noqa: BLE001 — failed optional inference preserves selected PRs
+        except Exception:  # failed optional inference preserves selected PRs
             _logger.warning("Could not associate discovered pull request", exc_info=True)
             candidate["pr"] = None
             candidate.pop("selected_pr_url", None)
@@ -538,23 +546,72 @@ def set_pr_preference(
     return pr_info(root, session_id=session_id)
 
 
-def _label_target(
-    session_id: str | None, pr_url: str | None
+def _capable_target(
+    session_id: str | None,
+    pr_url: str | None,
+    *,
+    capable: Callable[[ProviderCapabilities], bool],
+    unselected: str,
+    unsupported: str,
 ) -> tuple[PullRequestFacet, SessionPullRequest]:
-    """Return the selected tracked PR and its facet, which must support label editing."""
+    """Return the selected tracked PR and its facet, which must pass ``capable``.
+
+    :param unselected: Message when no PR is selected.
+    :param unsupported: Message with a ``{kind}`` placeholder, such as
+        ``"GitLab merge request"``, when the provider lacks the capability.
+    """
     if not session_id or not pr_url:
-        raise ValueError("Select a pull request to edit its labels")
+        raise ValueError(unselected)
     reference = _selected_pr(session_id, pr_url)
     facet = _facet(reference.provider)
-    if facet is None or not facet.capabilities.label_editing:
+    if facet is None or not capable(facet.capabilities):
         display = provider_display(reference.provider)
         kind = (
             f"{display['display_name']} {display['request_name']}"
             if display
             else f"{reference.provider} pull request"
         )
-        raise ValueError(f"Editing {kind} labels is not supported")
+        raise ValueError(unsupported.format(kind=kind))
     return facet, reference
+
+
+def _label_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[PullRequestFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must support label editing."""
+    return _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.label_editing,
+        unselected="Select a pull request to edit its labels",
+        unsupported="Editing {kind} labels is not supported",
+    )
+
+
+def _reviewer_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[PullRequestFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must support reviewer editing."""
+    return _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.reviewer_editing,
+        unselected="Select a pull request to edit its reviewers",
+        unsupported="Editing {kind} reviewers is not supported",
+    )
+
+
+def _merge_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[PullRequestFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must support merging."""
+    return _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.merging,
+        unselected="Select a pull request to merge",
+        unsupported="Merging a {kind} is not supported",
+    )
 
 
 def _label_names(value: object, field: str) -> list[str]:
@@ -614,6 +671,115 @@ def update_pr_labels(
         raise ValueError(f"Edit at most {_MAX_LABEL_EDIT} labels at once")
     facet, reference = _label_target(session_id, pr_url)
     return facet.edit_labels(root, reference, add=add_names, remove=remove_names)
+
+
+def pr_merge_options(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
+    """Return the merge methods the selected PR's repository allows.
+
+    :raises ValueError: Without a selected tracked PR, or when its provider cannot merge.
+    """
+    facet, reference = _merge_target(session_id, pr_url)
+    return facet.merge_options(root, reference)
+
+
+def merge_pr(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    merge_method: object = None,
+    expected_head: object = None,
+) -> dict[str, Any]:
+    """Merge the selected PR, only while its head is still ``expected_head``.
+
+    :param merge_method: ``merge``, ``squash``, or ``rebase``.
+    :param expected_head: The full head commit SHA the user reviewed.
+    :returns: A ``session.github.pr_merge``.
+    :raises ValueError: On an unknown method or malformed SHA, without a
+        selected tracked PR, or when the provider refuses the merge.
+    """
+    if not isinstance(merge_method, str) or merge_method not in _MERGE_METHODS:
+        raise ValueError("Expected merge_method to be merge, squash, or rebase")
+    if not isinstance(expected_head, str) or not _COMMIT_SHA.fullmatch(expected_head):
+        raise ValueError("Expected expected_head to be the pull request's head commit SHA")
+    facet, reference = _merge_target(session_id, pr_url)
+    return facet.merge(root, reference, merge_method=merge_method, expected_head=expected_head)
+
+
+def disable_pr_auto_merge(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
+    """Turn off the selected PR's auto-merge.
+
+    :returns: A ``session.github.pr_merge``.
+    :raises ValueError: Without a selected tracked PR, when its provider cannot
+        merge, or when the provider refuses.
+    """
+    facet, reference = _merge_target(session_id, pr_url)
+    return facet.disable_auto_merge(root, reference)
+
+
+def _reviewer_refs(value: object, field: str) -> list[ReviewerRef]:
+    """Return a request field's ``{login, kind}`` reviewers, without case-insensitive repeats.
+
+    GitHub logins and team slugs ignore case, so the first spelling sent is kept.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"Expected {field} to be a list of reviewers")
+    unique: dict[tuple[str, str], ReviewerRef] = {}
+    for item in value:
+        login = item.get("login") if isinstance(item, dict) else None
+        kind = item.get("kind") if isinstance(item, dict) else None
+        if not isinstance(login, str) or not login.strip() or kind not in ("user", "team"):
+            raise ValueError(f"Expected {field} to be a list of reviewers")
+        unique.setdefault((kind, login.casefold()), ReviewerRef(login=login.strip(), kind=kind))
+    return list(unique.values())
+
+
+def pr_review_candidates(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
+    """List the users and teams a review of the selected PR can be requested from.
+
+    :raises ValueError: Without a selected tracked PR, or when its provider
+        cannot edit reviewers.
+    """
+    facet, reference = _reviewer_target(session_id, pr_url)
+    return facet.review_candidates(root, reference)
+
+
+def update_pr_reviewers(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    add: object = (),
+    remove: object = (),
+) -> dict[str, Any]:
+    """Request reviews on the selected PR and withdraw pending requests.
+
+    :param add: ``{login, kind}`` users and teams to request a review from; one
+        who already reviewed is asked again.
+    :param remove: ``{login, kind}`` reviewers whose pending request to withdraw;
+        one without a request is ignored.
+    :returns: A ``session.github.pr_reviewers`` with the PR's resulting reviewers.
+    :raises ValueError: On an empty, overlapping, or oversized edit, without a
+        selected tracked PR, or when the provider refuses the change.
+    """
+    add_refs = _reviewer_refs(add, "add")
+    remove_refs = _reviewer_refs(remove, "remove")
+    if not add_refs and not remove_refs:
+        raise ValueError("Expected reviewers to add or remove")
+    if {(ref.kind, ref.login.casefold()) for ref in add_refs} & {
+        (ref.kind, ref.login.casefold()) for ref in remove_refs
+    }:
+        raise ValueError("A reviewer cannot be both added and removed")
+    if len(add_refs) + len(remove_refs) > _MAX_REVIEWER_EDIT:
+        raise ValueError(f"Edit at most {_MAX_REVIEWER_EDIT} reviewers at once")
+    facet, reference = _reviewer_target(session_id, pr_url)
+    return facet.edit_reviewers(root, reference, add=add_refs, remove=remove_refs)
 
 
 def pr_changed_files(

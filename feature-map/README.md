@@ -139,7 +139,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
 - [Preferences and config defaults](./preferences.md) covers local user/project
   defaults, invocation overrides, related settings surfaces, and the boundary
-  between the shared-preference foundation and user journeys not yet available.
+  between explicit cloud save/import, the shared-preference foundation, and
+  deferred automatic following.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.

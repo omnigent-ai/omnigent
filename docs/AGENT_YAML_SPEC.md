@@ -112,10 +112,10 @@ executor:
 
 ### Pi context files
 
-With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
-and `CLAUDE.md` from the workspace, its ancestors, Pi's global agent directory,
-and the agent bundle's root. To disable this discovery for an agent, set
-`context_files: false`:
+With `harness: pi` or `pi-native`, Pi automatically appends context files such
+as `AGENTS.md` and `CLAUDE.md` from the workspace, its ancestors, and Pi's global
+agent directory. Regular `pi` also loads context from the agent bundle's root.
+To disable this discovery for an agent, set `context_files: false`:
 
 ```yaml
 name: focused-agent
@@ -143,8 +143,7 @@ The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
 `instructions:` content (including an explicitly referenced `AGENTS.md`) and
 Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 `--no-context-files` flag. It does not disable skills, extensions, or Pi's
-separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
-or other harnesses.
+separate `SYSTEM.md` discovery. It supports `pi` and `pi-native` only.
 
 ### Pi bundle resources
 
@@ -175,15 +174,27 @@ exposed.
 
 ### Pi system prompt
 
-With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed
-instructions to Pi:
+With `harness: pi` or `pi-native`, `system_prompt_mode` controls how Omnigent
+sends agent instructions to Pi:
 
-- `append` (default) keeps Pi's base prompt and appends Omnigent's instructions
+- `append` (default) keeps Pi's base prompt and appends agent instructions
   using `--append-system-prompt`. The base is Pi's built-in coding prompt or a
   discovered `SYSTEM.md`.
-- `replace` sends Omnigent's instructions as the base using `--system-prompt`.
+- `replace` sends agent instructions as the base using `--system-prompt`.
   Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
   empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
+
+For native Pi in append mode, authored instructions are added after the normally
+selected `APPEND_SYSTEM.md`: the trusted workspace's `.pi/APPEND_SYSTEM.md`, or
+the active Pi agent directory's file as a fallback. `--no-approve` / `-na`
+exclude the project file. If the Pi version cannot be detected, project selection
+requires an explicit `--approve` / `-a`; stored or interactive trust is not inferred.
+Explicit native `--append-system-prompt` arguments
+select append inputs themselves and disable this automatic selection, matching
+Pi's CLI behavior. `context_files: false` does not disable `APPEND_SYSTEM.md`;
+use replacement mode or explicit append arguments to exclude it.
+Regular Pi SDK sessions use explicit composed instructions rather than
+automatically loading `APPEND_SYSTEM.md`.
 
 To replace the base prompt and disable workspace context discovery:
 
@@ -211,12 +222,16 @@ executor:
 instructions: AGENTS.md
 ```
 
-Both modes preserve explicit agent instructions, per-request instructions, and
-Omnigent's appended runtime instructions. Replacement removes Pi's default tool
-summaries and coding guidelines; tool schemas and execution still work.
+Regular `pi` delivers composed agent/request/runtime instructions. Native Pi
+loads the spec's resolved authored instructions at terminal launch; replacement
+requires non-empty authored instructions, checked at spec load. Per-turn runtime
+delivery is unchanged.
+Both modes preserve explicit agent instructions. Replacement removes Pi's default
+tool summaries and coding guidelines; tool schemas and execution still work.
 `context_files` is independent and still defaults to `true`. Skills, the working
 directory footer, and extension hooks remain active; extensions can modify the
-final prompt. This setting only supports `pi`, not `pi-native` or other harnesses.
+final prompt. This setting supports `pi` and `pi-native` only. Native settings
+apply on the next terminal launch; explicit native CLI arguments remain available.
 
 ### GitHub Copilot
 

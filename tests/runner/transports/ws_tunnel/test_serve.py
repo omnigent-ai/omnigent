@@ -11,10 +11,9 @@ import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace, TracebackType
-from typing import Any, TypedDict
+from typing import Any, TypedDict, Unpack
 
 import pytest
-from typing_extensions import Unpack
 from websockets.exceptions import (
     ConnectionClosedError,
     ConnectionClosedOK,

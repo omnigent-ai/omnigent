@@ -395,6 +395,7 @@ async def test_claude_pending_prompt_blocks_model_pick_without_answering_it(
 
     session.assert_refused(response)
     assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
+    assert "Answer it, then switch models again" in session.errors[0]["message"]
     assert any(
         record.exc_info and isinstance(record.exc_info[1], claude_bridge.ClaudeUserPromptPending)
         for record in caplog.records
