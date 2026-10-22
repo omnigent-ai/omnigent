@@ -14,15 +14,27 @@
 // shells are opened and created from the rail's tab strip ("+" menu).
 
 import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   AGENT_TERMINAL_IDS,
   findAgentTerminal,
+  isAgentTerminalKey,
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import {
+  removeTerminalLayoutKey,
+  resizeTerminalSplit,
+  terminalLayoutGeometry,
+  terminalLayoutKeys,
+  type TerminalLayout,
+} from "@/lib/terminalSplitLayout";
+import { TerminalSplitDivider } from "./TerminalSplitDivider";
+import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanesStore";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -77,6 +89,8 @@ interface MainTerminalViewProps {
    * server switcher only while this surface is actually frontmost.
    */
   onSurfaceElement?: (element: HTMLElement | null) => void;
+  /** Render the session's saved split panes (the main view only, not grid cells). */
+  splittable?: boolean;
 }
 
 export function MainTerminalView({
@@ -90,6 +104,7 @@ export function MainTerminalView({
   onResume,
   sandboxOffline = false,
   onSurfaceElement,
+  splittable = false,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
@@ -180,6 +195,53 @@ export function MainTerminalView({
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
+  const serverInfo = useServerInfo();
+  const splitEnabled = splittable && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui");
+  const savedSplit = useTerminalSplitPanes(conversationId);
+  // A rail-opened shell takes over the view unsplit; the panes return with the agent view.
+  const split = splitEnabled && !isShellView ? savedSplit : undefined;
+  // Ratios follow the pointer locally and persist once the drag ends.
+  const [draftLayout, setDraftLayout] = useState<TerminalLayout | null>(null);
+  const panesRef = useRef<HTMLDivElement>(null);
+
+  // Drop panes whose shell has gone away. The agent pane stays (it shows the
+  // unavailable state) so a relaunched agent terminal lands back in place.
+  useEffect(() => {
+    if (!splitEnabled || terminals.length === 0) return;
+    const liveKeys = new Set(terminals.map(terminalTabKey));
+    updateTerminalSplit(conversationId, (current) => {
+      if (!current) return current;
+      let layout: TerminalLayout | null = current.layout;
+      for (const key of terminalLayoutKeys(current.layout)) {
+        if (layout && !liveKeys.has(key) && !isAgentTerminalKey(key)) {
+          layout = removeTerminalLayoutKey(layout, key);
+        }
+      }
+      if (layout === current.layout) return current;
+      if (layout === null || typeof layout === "string") return undefined;
+      const keys = terminalLayoutKeys(layout);
+      return {
+        layout,
+        focusedKey: keys.includes(current.focusedKey) ? current.focusedKey : keys[0],
+      };
+    });
+  }, [splitEnabled, terminals, conversationId]);
+
+  const focusPane = (key: string) =>
+    updateTerminalSplit(conversationId, (current) =>
+      current && current.focusedKey !== key ? { ...current, focusedKey: key } : current,
+    );
+  const commitDraftLayout = () => {
+    if (draftLayout === null) return;
+    updateTerminalSplit(conversationId, (current) =>
+      current ? { ...current, layout: draftLayout } : current,
+    );
+    setDraftLayout(null);
+  };
+  const geometry = terminalLayoutGeometry(
+    split ? (draftLayout ?? split.layout) : activeTerminal ? terminalTabKey(activeTerminal) : "",
+  );
+
   const setSurfaceElement = useCallback(
     (element: HTMLDivElement | null) => {
       // xterm scrollbars can override inherited visibility. React 18 drops
@@ -278,33 +340,77 @@ export function MainTerminalView({
                 </button>
               </div>
             )}
-            <div className="min-h-0 flex-1">
-              {activeTerminal && (
-                // Scope the key to the session: agent terminals share a fixed
-                // id across same-shape sessions (e.g. `terminal_claude_main`),
-                // so id alone reuses the xterm mount and shows stale scrollback.
-                <div
-                  key={`${conversationId}:${activeTerminal.id}`}
-                  className="flex h-full flex-col"
-                >
-                  <Suspense fallback={null}>
-                    <TerminalView
-                      sessionId={conversationId}
-                      terminalId={activeTerminal.id}
-                      readOnly={readOnly}
-                      active={visible && active}
-                      directAttachUrl={activeTerminal.directAttachUrl}
-                      onResume={runnerOffline && onResume ? handleResume : undefined}
-                      resumeTarget={resumeTarget}
-                      resumePending={resumePending}
-                      onStateChange={(state) => {
-                        setTerminalConnectionState(activeTerminal.id, state);
-                      }}
-                      onActivity={() => markTerminalActive(activeTerminal.id)}
-                    />
-                  </Suspense>
-                </div>
-              )}
+            <div ref={panesRef} className="relative min-h-0 flex-1">
+              {geometry.panes.map((pane) => {
+                const terminal = terminals.find((t) => terminalTabKey(t) === pane.key);
+                const focused = !split || pane.key === split.focusedKey;
+                return (
+                  // Panes are flat siblings keyed by terminal, so splitting or
+                  // closing a neighbor never remounts a live xterm. Scope the
+                  // key to the session: agent terminals share a fixed id
+                  // across same-shape sessions (e.g. `terminal_claude_main`).
+                  <div
+                    key={`${conversationId}:${pane.key}`}
+                    data-terminal-pane={pane.key}
+                    style={{
+                      left: `${pane.left}%`,
+                      top: `${pane.top}%`,
+                      width: `${pane.width}%`,
+                      height: `${pane.height}%`,
+                    }}
+                    className={cn(
+                      "absolute flex flex-col",
+                      split && focused && "ring-1 ring-ring ring-inset",
+                    )}
+                    onFocusCapture={split ? () => focusPane(pane.key) : undefined}
+                  >
+                    {terminal ? (
+                      <Suspense fallback={null}>
+                        <TerminalView
+                          sessionId={conversationId}
+                          terminalId={terminal.id}
+                          readOnly={readOnly}
+                          active={visible && active && focused}
+                          directAttachUrl={terminal.directAttachUrl}
+                          onResume={runnerOffline && onResume ? handleResume : undefined}
+                          resumeTarget={resumeTarget}
+                          resumePending={resumePending}
+                          onStateChange={(state) => {
+                            setTerminalConnectionState(terminal.id, state);
+                          }}
+                          onActivity={() => markTerminalActive(terminal.id)}
+                        />
+                      </Suspense>
+                    ) : (
+                      <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
+                        Agent terminal unavailable.
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {split &&
+                geometry.dividers.map((divider) => (
+                  <TerminalSplitDivider
+                    key={divider.path.join(".")}
+                    divider={divider}
+                    containerRef={panesRef}
+                    onResize={(path, ratio, final) => {
+                      if (!final) {
+                        setDraftLayout((draft) =>
+                          resizeTerminalSplit(draft ?? split.layout, path, ratio),
+                        );
+                        return;
+                      }
+                      updateTerminalSplit(conversationId, (current) =>
+                        current
+                          ? { ...current, layout: resizeTerminalSplit(current.layout, path, ratio) }
+                          : current,
+                      );
+                    }}
+                    onCommit={commitDraftLayout}
+                  />
+                ))}
             </div>
           </>
         )}

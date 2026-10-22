@@ -7,6 +7,7 @@
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
+import { parseTerminalSplitState, type TerminalSplitState } from "./terminalSplitLayout";
 import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
 const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
@@ -46,6 +47,8 @@ export interface SessionWorkspaceState {
   openSideChats?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
+  /** Split panes of the main terminal view; absent while unsplit. */
+  terminalSplit?: TerminalSplitState;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -137,6 +140,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
+  const terminalSplit = parseTerminalSplitState(record.terminalSplit);
+  if (terminalSplit) state.terminalSplit = terminalSplit;
   return state;
 }
 

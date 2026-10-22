@@ -1,9 +1,13 @@
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { useLayoutEffect, useRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { updateTerminalSplit } from "./terminalSplitPanesStore";
 import { MainTerminalView } from "./MainTerminalView";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
 import { TerminalFirstContextProvider } from "./TerminalFirstContext";
@@ -18,6 +22,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     sessionId,
     terminalId,
     readOnly,
+    active,
     directAttachUrl,
     onResume,
     resumeTarget,
@@ -26,6 +31,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     sessionId: string;
     terminalId: string;
     readOnly?: boolean;
+    active?: boolean;
     directAttachUrl?: string;
     onResume?: () => void | Promise<void>;
     resumeTarget?: string;
@@ -42,6 +48,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
         data-session-id={sessionId}
         data-terminal-id={terminalId}
         data-read-only={String(readOnly ?? false)}
+        data-active={String(active ?? true)}
         data-instance={String(instance.current)}
         data-direct-attach-url={directAttachUrl ?? ""}
         data-resume-pending={String(resumePending ?? false)}
@@ -597,5 +604,84 @@ describe("MainTerminalView — persistent hidden mount", () => {
       "data-terminal-id",
       "terminal_tui_main",
     );
+  });
+});
+
+describe("MainTerminalView — split panes", () => {
+  const AGENT_KEY = "terminal:terminal_tui_main";
+  const BASH_KEY = "terminal:terminal_bash_s1";
+  const savedSplit = {
+    layout: {
+      axis: "columns" as const,
+      ratio: 0.5,
+      children: [AGENT_KEY, BASH_KEY] as [string, string],
+    },
+    focusedKey: BASH_KEY,
+  };
+
+  function splitTree(conversationId: string, terminals: TerminalInfo[], enabled = true) {
+    useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
+    return (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { splittable_terminal_view_ui: enabled } }}
+      >
+        <TerminalFirstContextProvider value={makeCtx(false)}>
+          <MainTerminalView conversationId={conversationId} splittable />
+        </TerminalFirstContextProvider>
+      </CapabilitiesProvider>
+    );
+  }
+
+  it("renders saved panes side by side with only the focused one active", async () => {
+    writeSessionWorkspaceState("conv_split_render", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_render", [REPL_TERMINAL, BASH_SHELL]));
+
+    await waitFor(() => expect(screen.getAllByTestId("terminal-view")).toHaveLength(2));
+    const [agentPane, bashPane] = screen.getAllByTestId("terminal-view");
+    expect(agentPane).toHaveAttribute("data-terminal-id", "terminal_tui_main");
+    expect(agentPane).toHaveAttribute("data-active", "false");
+    expect(bashPane).toHaveAttribute("data-active", "true");
+    expect(screen.getByRole("separator", { name: "Resize terminal panes" })).toBeInTheDocument();
+  });
+
+  it("ignores a saved split while the feature is off", async () => {
+    writeSessionWorkspaceState("conv_split_off", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_off", [REPL_TERMINAL, BASH_SHELL], false));
+
+    expect(await screen.findAllByTestId("terminal-view")).toHaveLength(1);
+    expect(screen.queryByRole("separator")).toBeNull();
+  });
+
+  it("keeps the agent xterm mounted when a split appears", async () => {
+    render(splitTree("conv_split_mount", [REPL_TERMINAL, BASH_SHELL]));
+    const before = (await screen.findByTestId("terminal-view")).getAttribute("data-instance");
+
+    act(() => updateTerminalSplit("conv_split_mount", () => savedSplit));
+
+    await waitFor(() => expect(screen.getAllByTestId("terminal-view")).toHaveLength(2));
+    expect(screen.getAllByTestId("terminal-view")[0]).toHaveAttribute("data-instance", before);
+  });
+
+  it("drops a closed shell's pane and returns to the single agent view", async () => {
+    writeSessionWorkspaceState("conv_split_prune", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_prune", [REPL_TERMINAL]));
+
+    await waitFor(() =>
+      expect(readSessionWorkspaceState("conv_split_prune").terminalSplit).toBeUndefined(),
+    );
+    expect(screen.getAllByTestId("terminal-view")).toHaveLength(1);
+  });
+
+  it("persists keyboard resizes within the 25-75% bounds", async () => {
+    writeSessionWorkspaceState("conv_split_resize", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_resize", [REPL_TERMINAL, BASH_SHELL]));
+    const divider = await screen.findByRole("separator", { name: "Resize terminal panes" });
+
+    for (let step = 0; step < 10; step++) fireEvent.keyDown(divider, { key: "ArrowRight" });
+
+    expect(divider).toHaveAttribute("aria-valuenow", "75");
+    expect(readSessionWorkspaceState("conv_split_resize").terminalSplit?.layout).toMatchObject({
+      ratio: 0.75,
+    });
   });
 });
