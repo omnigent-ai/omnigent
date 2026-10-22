@@ -174,7 +174,9 @@ function SplitMenu({
           </Button>
         </DropdownMenuTrigger>
       </HeaderTooltip>
-      <DropdownMenuContent align="end">
+      {/* Don't hand focus back to the trigger: the new pane claims it on connect,
+          and typing into a refocused trigger would reopen the menu. */}
+      <DropdownMenuContent align="end" onCloseAutoFocus={(event) => event.preventDefault()}>
         <DropdownMenuLabel>{label} with</DropdownMenuLabel>
         {shells.map((shell, index) => (
           <DropdownMenuItem key={shell} onSelect={() => onPick(shell)}>

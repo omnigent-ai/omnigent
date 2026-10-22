@@ -59,11 +59,15 @@ it("splits the agent pane with the picked shell and focuses the new pane", async
   renderControls("conv_controls_split", true);
 
   // Radix menus open on pointerdown, not click.
-  fireEvent.pointerDown(screen.getByRole("button", { name: "Split down" }), { button: 0 });
+  const trigger = screen.getByRole("button", { name: "Split down" });
+  fireEvent.pointerDown(trigger, { button: 0 });
   expect(await screen.findByRole("menuitem", { name: "zsh (default)" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("menuitem", { name: "bash" }));
 
   expect(createTerminal).toHaveBeenCalledWith("bash", expect.anything());
+  // Focus must not return to the trigger, where typing would reopen the menu.
+  await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+  expect(trigger).not.toHaveFocus();
   await waitFor(() =>
     expect(readSessionWorkspaceState("conv_controls_split").terminalSplit).toEqual({
       layout: {
