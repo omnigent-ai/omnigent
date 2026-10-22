@@ -120,9 +120,9 @@ jobs:
     # all shards concurrently so one wedged shard can't block the others.
     # Two pytest workers per shard allow up to 16 concurrent test workers.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
-    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
+    # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: setup
+    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.

@@ -444,6 +444,36 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
         assert bool(matrix["include"]) == selected
 
 
+@pytest.mark.parametrize("script", ["integration-matrix.sh", "e2e-shard-matrix.sh"])
+@pytest.mark.parametrize(
+    ("event", "draft", "run_tests", "selected"),
+    [
+        ("pull_request", "false", "false", False),
+        ("pull_request", "true", "true", False),
+        ("pull_request", "false", "true", True),
+        ("schedule", "", "true", True),
+        ("workflow_dispatch", "", "true", True),
+    ],
+)
+def test_matrix_skip_output_matches_job_guard(tmp_path, script, event, draft, run_tests, selected):
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", str(CI / script)],
+        env=dict(
+            os.environ,
+            GITHUB_OUTPUT=str(output),
+            EVENT_NAME=event,
+            IS_DRAFT=draft,
+            RUN_TESTS=run_tests,
+            NUM_SHARDS="4",
+        ),
+        check=True,
+    )
+    matrix = output.read_text().strip().removeprefix("matrix=")
+    assert (matrix != '{"include":[]}') == selected
+    assert bool(json.loads(matrix)["include"]) == selected
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -497,6 +527,11 @@ def test_workflows_connect_selection_to_jobs():
         assert any(
             step.get("uses") == "./.github/actions/dependency-ci-scope" for step in setup["steps"]
         )
+    for name in ("integration", "e2e", "e2e-ui"):
+        job = workflows[name]["jobs"][name]
+        # Job conditions run before GitHub expands (and rejects) an empty matrix.
+        assert job.get("if") == "needs.setup.outputs.matrix != '{\"include\":[]}'"
+        assert job["strategy"]["matrix"] == "${{ fromJSON(needs.setup.outputs.matrix) }}"
     assert workflows["ci"]["jobs"]["scope"]["name"] == "CI coverage scope"
     assert workflows["e2e"]["jobs"]["setup"]["name"] == "E2E coverage scope"
     assert workflows["e2e-ui"]["jobs"]["setup"]["name"] == "UI coverage scope"
@@ -819,6 +854,35 @@ def _gate_snapshot(
         },
         "runs": {"workflow_runs": runs},
     }
+
+
+@pytest.mark.parametrize(
+    ("status", "conclusion", "green"),
+    [
+        ("completed", "success", True),
+        ("completed", "failure", False),
+        ("completed", "cancelled", False),
+        ("in_progress", None, False),
+    ],
+)
+def test_merge_gate_requires_successful_workflow_for_empty_integration(
+    tmp_path, status, conclusion, green
+):
+    snapshot = _gate_snapshot("completed")
+    snapshot["checks"]["check_runs"].append(
+        {
+            "id": 100,
+            "name": "Integration (${{ matrix.name }})",
+            "status": "completed",
+            "conclusion": "skipped",
+        }
+    )
+    run = next(
+        run for run in snapshot["runs"]["workflow_runs"] if run["name"] == "Integration Tests"
+    )
+    run.update(status=status, conclusion=conclusion)
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert (process.returncode == 0) == green, process.stdout + process.stderr
 
 
 def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
