@@ -34,10 +34,9 @@ catalog:
   shiki: 4.2.0
 
 overrides:
-  # Build-tool pins that match the legacy npm lockfile. Removing them allowed pnpm
-  # to resolve newer Vite/Tailwind patches whose new bundler/chunking produced a
-  # broken split of the Shiki bundle and lost the PDF worker asset.
-  vite: 8.1.0
+  # Keep build-tool upgrades explicit and validate their bundles: incompatible
+  # Vite/Tailwind chunking can split Shiki incorrectly or lose the PDF worker.
+  vite: 8.1.6
   tailwindcss: 4.3.1
   '@tailwindcss/vite': 4.3.1
   '@tailwindcss/node': 4.3.1
