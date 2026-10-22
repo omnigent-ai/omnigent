@@ -143,6 +143,7 @@ describe("SandboxActionBanner", () => {
     ["no launch", null],
     ["a launch in progress", { stage: "provisioning", error: null }],
     ["a failed launch", { stage: "failed", error: "managed host did not come online" }],
+    ["a report without details", { stage: "action_required", error: null }],
   ] as const)("stays hidden for %s", (_label, status) => {
     showSession("conv_a", status);
     render(<SandboxActionBanner />);
@@ -168,6 +169,16 @@ describe("SandboxActionBanner", () => {
     expect(screen.getByRole("status")).toHaveTextContent(DETAILS);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     showSession("conv_a");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("keeps a dismissal when the session's status reloads with the same warning", () => {
+    showSession("conv_a");
+    report("conv_a", "action_required");
+    render(<SandboxActionBanner />);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    // A rebind seeds the store from the session snapshot, a new object with the same warning.
+    showSession("conv_a", { stage: "action_required", error: null, details: DETAILS });
     expect(screen.queryByRole("status")).toBeNull();
   });
 

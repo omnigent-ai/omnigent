@@ -5364,7 +5364,7 @@ def _publish_sandbox_status_impl(
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``.
         Later stages keep the cached launch's provider when omitted.
     :param details: What the user needs to do when *stage* is
-        ``"action_required"``, e.g. ``"Refresh your dbcert on your laptop."``. ``None`` for
+        ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for
         other stages.
     """
     # "ready" evicts: from then on the session looks like any

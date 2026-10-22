@@ -1,5 +1,5 @@
 import { AlertTriangleIcon, Loader2Icon, WifiOffIcon, XIcon } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -16,11 +16,24 @@ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
  * warning: the launch keeps going, and the banner leaves when it moves on.
  */
 export function SandboxActionBanner() {
-  const status = useChatStore((s) => s.sandboxStatus);
-  // Each launch report is a new object, so a dismissal hides only the report it was shown for:
-  // a later warning shows again, and so does one in another session.
-  const [dismissed, setDismissed] = useState<ReadonlySet<SandboxStatus>>(() => new Set());
-  if (status?.stage !== "action_required" || !status.details || dismissed.has(status)) {
+  const conversationId = useChatStore((s) => s.conversationId);
+  const asking = useChatStore((s) =>
+    s.sandboxStatus?.stage === "action_required" && s.sandboxStatus.details
+      ? s.sandboxStatus.details
+      : null,
+  );
+  // Each session's dismissed warning. It holds while the launch keeps asking the same thing, even
+  // when the session's status reloads, and ends once the launch moves on.
+  const [dismissed, setDismissed] = useState<ReadonlyMap<string, string>>(() => new Map());
+  useEffect(() => {
+    if (asking !== null || conversationId === null || !dismissed.has(conversationId)) return;
+    setDismissed((current) => {
+      const next = new Map(current);
+      next.delete(conversationId);
+      return next;
+    });
+  }, [asking, conversationId, dismissed]);
+  if (asking === null || conversationId === null || dismissed.get(conversationId) === asking) {
     return null;
   }
   return (
@@ -36,10 +49,10 @@ export function SandboxActionBanner() {
       )}
     >
       <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
-      <p className="min-w-0 flex-1">{status.details}</p>
+      <p className="min-w-0 flex-1">{asking}</p>
       <button
         type="button"
-        onClick={() => setDismissed((current) => new Set(current).add(status))}
+        onClick={() => setDismissed((current) => new Map(current).set(conversationId, asking))}
         aria-label="Dismiss"
         className={cn(
           "-mr-1 shrink-0 rounded p-0.5 text-amber-900/60",

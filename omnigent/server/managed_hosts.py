@@ -3712,7 +3712,7 @@ class SandboxStageObserver(Protocol):
 
         :param stage: The stage just entered, e.g. ``"cloning"``.
         :param details: What the user needs to do when *stage* is
-            ``"action_required"``, e.g. ``"Refresh your dbcert on your laptop."``. ``None``
+            ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None``
             otherwise.
         """
 

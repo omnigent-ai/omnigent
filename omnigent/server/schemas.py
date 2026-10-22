@@ -2044,11 +2044,11 @@ class SandboxStatus(BaseModel):
         ``failed``.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
-        ``None`` otherwise.
-    :param details: What the user needs to do when
-        ``stage == "action_required"``, e.g. ``"Refresh your dbcert on your laptop."``.
         ``None`` otherwise.
     """
 
@@ -3647,11 +3647,11 @@ class SessionSandboxStatusEvent(_SSEEventBase):
         pipeline order.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
-        ``None`` otherwise.
-    :param details: What the user needs to do when
-        ``stage == "action_required"``, e.g. ``"Refresh your dbcert on your laptop."``.
         ``None`` otherwise.
 
     Category: **transient** (SSE-only). On reconnect, clients seed the
