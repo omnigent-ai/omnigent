@@ -33,6 +33,7 @@ _SELECTION = "openai-codex/gpt-5.6-sol"
 _CONTEXT_MARKERS = ["PI_GLOBAL_CONTEXT", "PI_ANCESTOR_CONTEXT", "PI_WORKSPACE_CONTEXT"]
 _BASE_MARKER = "PI_DISCOVERED_BASE"
 _APPEND_MARKER = "PI_DISCOVERED_APPEND"
+_GLOBAL_APPEND_MARKER = "PI_GLOBAL_APPEND"
 
 
 def _pane_command(metadata: dict) -> subprocess.CompletedProcess[str]:
@@ -69,9 +70,13 @@ def _wait_for_catalog(client: httpx.Client, session_id: str) -> dict:
 
 
 @pytest.mark.parametrize(
-    ("context_files", "prompt_mode"),
-    [(None, None), (False, "replace")],
-    ids=["default", "replace-no-context"],
+    ("context_files", "prompt_mode", "terminal_args"),
+    [
+        (None, None, []),
+        (False, "replace", ["--append-system-prompt", _USER_ADDITION]),
+        (None, None, ["--no-approve"]),
+    ],
+    ids=["default", "replace-no-context", "untrusted-project"],
 )
 def test_cold_resume_preserves_model_and_prompt_settings(
     live_server: str,
@@ -79,6 +84,7 @@ def test_cold_resume_preserves_model_and_prompt_settings(
     tmp_path: Path,
     context_files: bool | None,
     prompt_mode: str | None,
+    terminal_args: list[str],
 ) -> None:
     agent = tmp_path / "home" / ".pi" / "agent"
     seed_pi_own_login_catalog(agent, "openai-codex", ["gpt-5.6-sol", "gpt-5.5"])
@@ -92,6 +98,7 @@ def test_cold_resume_preserves_model_and_prompt_settings(
     observer = agent / "prompt-observer.js"
     observer.write_text(_OBSERVER)
     (agent / "AGENTS.md").write_text(_CONTEXT_MARKERS[0])
+    (agent / "APPEND_SYSTEM.md").write_text(_GLOBAL_APPEND_MARKER)
     (agent / "settings.json").write_text(json.dumps({"extensions": [str(observer)]}))
     config = {
         "providers": {
@@ -127,11 +134,6 @@ def test_cold_resume_preserves_model_and_prompt_settings(
             settings += f"  context_files: {str(context_files).lower()}\n"
         if prompt_mode is not None:
             settings += f"  system_prompt_mode: {prompt_mode}\n"
-        user_args = (
-            []
-            if (prompt_mode == "replace" and context_files is False)
-            else ["--append-system-prompt", _USER_ADDITION]
-        )
         bundle = bundle_files(
             {
                 "pi-native-ui.yaml": f"""
@@ -157,7 +159,7 @@ os_env:
             metadata={
                 "host_id": host.host_id,
                 "workspace": str(workspace),
-                "terminal_launch_args": user_args,
+                "terminal_launch_args": terminal_args,
                 "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
             },
             timeout=60,
@@ -173,9 +175,19 @@ os_env:
             poll_until(lambda: prompts.exists(), timeout_s=30, interval_s=0.2)
             first_prompt = json.loads(prompts.read_text().splitlines()[0])
             assert first_prompt["prompt"].count(_INSTRUCTIONS) == 1
-            assert first_prompt["prompt"].count(_USER_ADDITION) == bool(user_args)
-            assert (_BASE_MARKER in first_prompt["prompt"]) is (prompt_mode != "replace")
-            assert _APPEND_MARKER not in first_prompt["prompt"]
+            assert first_prompt["prompt"].count(_USER_ADDITION) == (
+                _USER_ADDITION in terminal_args
+            )
+            project_trusted = "--no-approve" not in terminal_args
+            assert (_BASE_MARKER in first_prompt["prompt"]) is (
+                prompt_mode != "replace" and project_trusted
+            )
+            assert first_prompt["prompt"].count(_APPEND_MARKER) == (
+                prompt_mode != "replace" and project_trusted
+            )
+            assert first_prompt["prompt"].count(_GLOBAL_APPEND_MARKER) == (
+                prompt_mode != "replace" and not project_trusted
+            )
             for marker in _CONTEXT_MARKERS:
                 assert (marker in first_prompt["prompt"]) is (context_files is not False)
             old_pane = terminal.json()["metadata"]
@@ -186,6 +198,7 @@ os_env:
                 time.sleep(0.5)
 
             base_prompt.unlink()
+            (project_config / "APPEND_SYSTEM.md").unlink()
             # Hiding a saved model must preserve its launch identity.
             (agent / "settings.json").write_text(
                 json.dumps(
@@ -234,12 +247,17 @@ os_env:
             resumed_prompt = json.loads(prompts.read_text().splitlines()[-1])
             assert resumed_prompt["pid"] != first_prompt["pid"]
             assert resumed_prompt["prompt"].count(_INSTRUCTIONS) == 1
-            assert resumed_prompt["prompt"].count(_USER_ADDITION) == bool(user_args)
+            assert resumed_prompt["prompt"].count(_USER_ADDITION) == (
+                _USER_ADDITION in terminal_args
+            )
             assert ("coding assistant" in resumed_prompt["prompt"].lower()) is (
                 prompt_mode != "replace"
             )
             assert _BASE_MARKER not in resumed_prompt["prompt"]
             assert _APPEND_MARKER not in resumed_prompt["prompt"]
+            assert resumed_prompt["prompt"].count(_GLOBAL_APPEND_MARKER) == (
+                prompt_mode != "replace"
+            )
             for marker in _CONTEXT_MARKERS:
                 assert (marker in resumed_prompt["prompt"]) is (context_files is not False)
         finally:

@@ -42,6 +42,7 @@ import pytest
 from tests._helpers.live_server import isolated_process_env
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
+from tests.e2e.omnigent._pexpect_harness import strip_ansi
 
 pexpect = pytest.importorskip("pexpect")
 
@@ -159,13 +160,25 @@ def _launch_pi(env: dict[str, str]) -> tuple[Any, str, str]:
         dimensions=(40, 140),
         timeout=_LAUNCH_TIMEOUT,
     )
-    child.logfile_read = (Path(env["HOME"]) / "terminal.txt").open("w")
+    # Under the logs dir so the E2E job uploads the transcript with the other logs.
+    transcript = Path(env["HOME"]) / ".omnigent" / "logs" / "pi-terminal.log"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    child.logfile_read = transcript.open("w")
     try:
         child.expect(r"Web UI:\s*(\S+)", timeout=_LAUNCH_TIMEOUT)
         web_url = child.match.group(1)
         match = re.match(r"(https?://[^/]+)/c/(\S+)", web_url)
         assert match, f"could not parse Web UI url: {web_url!r}"
         return child, match.group(1), match.group(2)
+    except pexpect.TIMEOUT as exc:
+        child.logfile_read.flush()
+        output = child.before or ""
+        _teardown(child, env)
+        raise AssertionError(
+            f"omnigent pi printed no Web UI line within {_LAUNCH_TIMEOUT}s "
+            f"('Web UI' in the raw output: {'Web UI' in output}); transcript: {transcript}\n"
+            f"{strip_ansi(output)[:2000]}\n...\n{strip_ansi(output)[-1000:]}"
+        ) from exc
     except BaseException:
         _teardown(child, env)
         raise

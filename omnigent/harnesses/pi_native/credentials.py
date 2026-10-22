@@ -442,7 +442,7 @@ class PiProviderConfig:
         )
 
 
-def _global_pi_agent_dir() -> Path:
+def global_pi_agent_dir() -> Path:
     """Return Pi's own agent config root (``~/.pi/agent`` by default).
 
     Honours Pi's ``PI_CODING_AGENT_DIR`` override so the pre-launch catalog
@@ -525,7 +525,7 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
         qualified as ``provider/model`` — the reference form Pi's ``--model``
         resolves natively against its own providers.
     """
-    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    root = agent_dir if agent_dir is not None else global_pi_agent_dir()
     entries = _pi_own_login_models(root)
     patterns = _pi_enabled_model_patterns(root)
     if patterns:
@@ -584,7 +584,7 @@ def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None 
     """Check a saved Pi reference independently of the picker shortlist."""
     if not reference:
         return False
-    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    root = agent_dir if agent_dir is not None else global_pi_agent_dir()
     return any(model.reference == reference for model in _pi_own_login_models(root))
 
 

@@ -251,7 +251,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _to_entity(row)
 
     def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
-        """List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+        """List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         When *owner_user_id* is given, only tasks owned by that user are returned.
         """
@@ -259,6 +259,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             stmt = (
                 select(SqlScheduledTask)
                 .where(SqlScheduledTask.workspace_id == current_workspace_id())
+                .where(SqlScheduledTask.state != encode_scheduled_task_state("deleted"))
                 .order_by(asc(SqlScheduledTask.created_at), asc(SqlScheduledTask.id))
             )
             if owner_user_id is not None:
@@ -454,7 +455,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if cursor is None:
                     break
         except Exception:
-            # Deletion already committed; the retained row lets maintenance retry.
+            # Deletion already committed; cleanup can be retried explicitly.
+            # Automatic retries require an enabled persistent-scheduler sweep.
             _logger.exception("History cleanup deferred for deleted task %s", scheduled_task_id)
         return removed
 

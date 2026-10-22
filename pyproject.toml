@@ -208,7 +208,7 @@ openshell = ["openshell>=0.1.0,<1"]
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
-kubernetes = ["kubernetes>=36,<37"]
+kubernetes = ["kubernetes>=36,<38"]
 # Vault Transit backend for the credential store's SecretCipher — the
 # non-AWS alternative to the built-in KMS cipher (selected by
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so

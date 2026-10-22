@@ -690,7 +690,10 @@ def create_scheduled_tasks_router(
         request: Request,
         scheduled_task_id: str,
     ) -> dict[str, Any]:
-        """Delete a task and drop its timer from the scheduler."""
+        """Check ownership, then delete the task and history in a worker thread.
+
+        The ownership lookup remains synchronous; remove the timer after deletion.
+        """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)

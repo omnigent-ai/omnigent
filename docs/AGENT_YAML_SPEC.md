@@ -184,6 +184,18 @@ sends agent instructions to Pi:
   Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
   empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
 
+For native Pi in append mode, authored instructions are added after the normally
+selected `APPEND_SYSTEM.md`: the trusted workspace's `.pi/APPEND_SYSTEM.md`, or
+the active Pi agent directory's file as a fallback. `--no-approve` / `-na`
+exclude the project file. If the Pi version cannot be detected, project selection
+requires an explicit `--approve` / `-a`; stored or interactive trust is not inferred.
+Explicit native `--append-system-prompt` arguments
+select append inputs themselves and disable this automatic selection, matching
+Pi's CLI behavior. `context_files: false` does not disable `APPEND_SYSTEM.md`;
+use replacement mode or explicit append arguments to exclude it.
+Regular Pi SDK sessions use explicit composed instructions rather than
+automatically loading `APPEND_SYSTEM.md`.
+
 To replace the base prompt and disable workspace context discovery:
 
 ```yaml

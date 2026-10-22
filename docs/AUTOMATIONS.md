@@ -106,7 +106,7 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 | `failed` | The firing or the turn failed; see `error_code`. |
 | `skipped` | The firing was deliberately not attempted -- for example an unsupported `execution_target`. |
 
-`ScheduledTaskRun` also declares a `scheduled` status, but the legacy scheduler creates runs at dispatch with status `running`. The persistent scheduler adds `starting` while it prepares a run; this status is only produced with `automations_v2` enabled.
+`ScheduledTaskRun` also declares `scheduled` and `starting` statuses, but the current scheduler creates runs at dispatch with status `running`. Once integrated, the persistent scheduler will use `starting` while preparing a run, with `automations_v2` enabled.
 
 ## Lifecycle
 
