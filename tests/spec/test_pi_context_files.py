@@ -36,20 +36,22 @@ def _write_agent(tmp_path: Path, *, directory: bool, executor: dict) -> Path:
     return path
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
 @pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
 @pytest.mark.parametrize("enabled", [None, True, False], ids=["default", "enabled", "disabled"])
 def test_context_files_survives_bundle_transport(
-    tmp_path: Path, directory: bool, enabled: bool | None
+    tmp_path: Path, directory: bool, enabled: bool | None, harness: str
 ) -> None:
-    executor: dict[str, object] = {"harness": "pi"}
+    executor: dict[str, object] = {"harness": harness, "model": "mock-pi"}
     if enabled is not None:
         executor["context_files"] = enabled
     path = _write_agent(tmp_path, directory=directory, executor=executor)
 
     spec = load(_bundle_agent(path), dest=tmp_path / "uploaded")
 
-    assert spec.executor.config.get("context_files", True) is (enabled is not False)
-    assert spec.instructions == "Explicit agent instructions."
+    for candidate in (spec, agent_def_to_agent_spec(agent_spec_to_agent_def(spec))):
+        assert candidate.executor.config.get("context_files", True) is (enabled is not False)
+        assert candidate.instructions == "Explicit agent instructions."
 
 
 @pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
@@ -65,7 +67,7 @@ def test_context_files_rejects_non_boolean_values(
         load(path)
 
 
-@pytest.mark.parametrize("harness", ["pi-native", "codex"])
+@pytest.mark.parametrize("harness", ["codex"])
 def test_context_files_rejects_unsupported_harness(tmp_path: Path, harness: str) -> None:
     path = _write_agent(
         tmp_path, directory=False, executor={"harness": harness, "context_files": False}
@@ -75,12 +77,13 @@ def test_context_files_rejects_unsupported_harness(tmp_path: Path, harness: str)
         load(path)
 
 
+@pytest.mark.parametrize("harness", ["pi", "pi-native"])
 @pytest.mark.parametrize("directory", [False, True], ids=["yaml", "bundle"])
 @pytest.mark.parametrize("mode", [None, "append", "replace"], ids=["default", "append", "replace"])
 def test_system_prompt_mode_survives_bundle_transport(
-    tmp_path: Path, directory: bool, mode: str | None
+    tmp_path: Path, directory: bool, mode: str | None, harness: str
 ) -> None:
-    executor: dict[str, object] = {"harness": "pi", "model": "mock-pi"}
+    executor: dict[str, object] = {"harness": harness, "model": "mock-pi"}
     if mode is not None:
         executor["system_prompt_mode"] = mode
     path = _write_agent(tmp_path, directory=directory, executor=executor)
@@ -103,7 +106,7 @@ def test_system_prompt_mode_rejects_invalid_values(
         load(path)
 
 
-@pytest.mark.parametrize("harness", ["pi-native", "codex"])
+@pytest.mark.parametrize("harness", ["codex"])
 def test_system_prompt_mode_rejects_unsupported_harness(tmp_path: Path, harness: str) -> None:
     path = _write_agent(
         tmp_path, directory=False, executor={"harness": harness, "system_prompt_mode": "replace"}

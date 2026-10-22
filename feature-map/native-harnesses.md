@@ -10,8 +10,8 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
-- `agent-instructions`: Pi native appends authored agent instructions at launch,
-  including resumed sessions, while retaining Pi defaults and explicit additions.
+- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
+  authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -79,8 +79,11 @@ view appear in the session.
 
 **Agent instructions (Pi native):** launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
-check the same authored role is present once. The `omnigent pi` wrapper also
-appends its own startup instructions.
+check the same authored role is present once. For a custom Pi-native agent,
+`executor.context_files: false` excludes automatic workspace/global notes, and
+`executor.system_prompt_mode: replace` replaces Pi's base prompt. Explicit agent
+instructions remain; these options do not restrict file access or extensions.
+The `omnigent pi` wrapper also appends its own startup instructions.
 
 **Working status:** watch the session's Chat indicator after sending from the
 new-session composer, an existing-session composer, or the agent terminal.
@@ -288,10 +291,11 @@ Cross-harness journeys:
   `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_keeps_explicit_openai_codex_selection`
   uploads a spec with a bundled instruction file through a real server, host,
   runner and Pi terminal. A test-owned extension reads the real system prompt
-  at fresh launch and process resume; the authored role and explicit user
-  addition each appear once, Pi's default prompt remains, and the selected
-  model survives. No model call is made. The compatibility test above checks
-  the CLI/server wrapper instructions alongside scripted-provider turns. Run with the CI-pinned Pi executable:
+  at launch/resume across default, no-context, replace and combined settings.
+  Authored instructions remain once; explicit additions survive, discovered
+  context follows the setting, and replacement excludes built-in/SYSTEM.md and
+  APPEND_SYSTEM.md prompts. The selected model survives. No model call is made.
+  The compatibility test above checks wrapper instructions with scripted turns. Run with the CI-pinned Pi executable:
 
   ```sh
   OMNIGENT_PI_PATH=/path/to/pi uv run --no-sync pytest tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py --reruns 0 -q

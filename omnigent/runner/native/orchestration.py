@@ -74,6 +74,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
+from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -2349,6 +2350,8 @@ def _build_pi_native_args(
     external_session_id: str | None,
     approve: bool = False,
     instructions_path: Path | None = None,
+    context_files: bool = True,
+    system_prompt_mode: str = "append",
 ) -> list[str]:
     """
     Build Pi CLI args for a runner-owned native TUI session.
@@ -2360,12 +2363,17 @@ def _build_pi_native_args(
     :param approve: When ``True``, pass ``--approve`` to pre-accept Pi's
         project-folder trust dialog (supported from Pi 0.79+).
     :param instructions_path: Session-local file containing authored instructions.
+    :param context_files: Allow Pi to discover workspace and global context files.
+    :param system_prompt_mode: Append to Pi’s base prompt, or replace it.
     :returns: Complete Pi arg vector excluding the executable.
     """
     user_args = list(terminal_launch_args or [])
     args = ["--extension", str(extension_path)]
-    if instructions_path is not None:
-        args.extend(["--append-system-prompt", str(instructions_path)])
+    args.extend(
+        pi_prompt_args(str(instructions_path) if instructions_path else None, system_prompt_mode)
+    )
+    if not context_files:
+        args.append("--no-context-files")
     if approve:
         # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
         # blocking TUI prompt on first launch in a directory with .pi/
@@ -2660,10 +2668,14 @@ async def _auto_create_pi_terminal(
     )
     raw_instructions = _native_startup_raw_instructions_from_spec(agent_spec)
     instructions_path = write_agent_instructions(bridge_dir, raw_instructions)
+    pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    prompt_config = pi_spec.executor.config if pi_spec is not None else {}
     pi_args = _build_pi_native_args(
         terminal_launch_args=launch_config.terminal_launch_args,
         extension_path=pi_extension,
         instructions_path=instructions_path,
+        context_files=prompt_config.get("context_files", True),
+        system_prompt_mode=str(prompt_config.get("system_prompt_mode", "append")),
         session_dir=session_dir,
         external_session_id=resume_session_id,
         approve=pi_cli_version is not None and pi_cli_version >= PI_APPROVE_MIN_VERSION,
@@ -2700,7 +2712,6 @@ async def _auto_create_pi_terminal(
 
         # Provider-qualified picker values select one of the configured models.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
         # Provider discovery does network I/O; keep the runner's stream and
         # tunnel heartbeats responsive while Pi starts.
         if pi_binding is not None and pi_spec is not None:

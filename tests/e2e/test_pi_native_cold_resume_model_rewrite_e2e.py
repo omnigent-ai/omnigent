@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 
 from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from tests._helpers.host import isolated_host
@@ -29,6 +30,9 @@ module.exports = function(pi) {
 """
 
 _SELECTION = "openai-codex/gpt-5.6-sol"
+_CONTEXT_MARKERS = ["PI_GLOBAL_CONTEXT", "PI_ANCESTOR_CONTEXT", "PI_WORKSPACE_CONTEXT"]
+_BASE_MARKER = "PI_DISCOVERED_BASE"
+_APPEND_MARKER = "PI_DISCOVERED_APPEND"
 
 
 def _pane_command(metadata: dict) -> subprocess.CompletedProcess[str]:
@@ -64,10 +68,17 @@ def _wait_for_catalog(client: httpx.Client, session_id: str) -> dict:
     raise AssertionError(f"Pi never published its session ID and catalog: {snapshot}")
 
 
+@pytest.mark.parametrize(
+    ("context_files", "prompt_mode"),
+    [(None, None), (False, "append"), (True, "replace"), (False, "replace")],
+    ids=["default", "no-context", "replace", "replace-no-context"],
+)
 def test_cold_resume_keeps_explicit_openai_codex_selection(
     live_server: str,
     http_client: httpx.Client,
     tmp_path: Path,
+    context_files: bool | None,
+    prompt_mode: str | None,
 ) -> None:
     agent = tmp_path / "home" / ".pi" / "agent"
     seed_pi_own_login_catalog(agent, "openai-codex", ["gpt-5.6-sol", "gpt-5.5"])
@@ -80,6 +91,7 @@ def test_cold_resume_keeps_explicit_openai_codex_selection(
     )
     observer = agent / "prompt-observer.js"
     observer.write_text(_OBSERVER)
+    (agent / "AGENTS.md").write_text(_CONTEXT_MARKERS[0])
     (agent / "settings.json").write_text(json.dumps({"extensions": [str(observer)]}))
     config = {
         "providers": {
@@ -103,6 +115,23 @@ def test_cold_resume_keeps_explicit_openai_codex_selection(
         host.wait_online(http_client)
         workspace = host.home / "workspace"
         workspace.mkdir()
+        (host.home / "AGENTS.md").write_text(_CONTEXT_MARKERS[1])
+        (workspace / "AGENTS.md").write_text(_CONTEXT_MARKERS[2])
+        project_config = workspace / ".pi"
+        project_config.mkdir()
+        base_prompt = project_config / "SYSTEM.md"
+        base_prompt.write_text(_BASE_MARKER)
+        (project_config / "APPEND_SYSTEM.md").write_text(_APPEND_MARKER)
+        settings = ""
+        if context_files is not None:
+            settings += f"  context_files: {str(context_files).lower()}\n"
+        if prompt_mode is not None:
+            settings += f"  system_prompt_mode: {prompt_mode}\n"
+        user_args = (
+            []
+            if (prompt_mode == "replace" and context_files is False)
+            else ["--append-system-prompt", _USER_ADDITION]
+        )
         bundle = bundle_files(
             {
                 "pi-native-ui.yaml": f"""
@@ -111,7 +140,7 @@ instructions: role.md
 executor:
   harness: pi-native
   model: {_SELECTION}
-spawn: true
+{settings}spawn: true
 os_env:
   type: caller_process
   cwd: .
@@ -128,7 +157,7 @@ os_env:
             metadata={
                 "host_id": host.host_id,
                 "workspace": str(workspace),
-                "terminal_launch_args": ["--append-system-prompt", _USER_ADDITION],
+                "terminal_launch_args": user_args,
                 "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "pi-native-ui"},
             },
             timeout=60,
@@ -144,8 +173,11 @@ os_env:
             poll_until(lambda: prompts.exists(), timeout_s=30, interval_s=0.2)
             first_prompt = json.loads(prompts.read_text().splitlines()[0])
             assert first_prompt["prompt"].count(_INSTRUCTIONS) == 1
-            assert first_prompt["prompt"].count(_USER_ADDITION) == 1
-            assert "coding assistant" in first_prompt["prompt"].lower()
+            assert first_prompt["prompt"].count(_USER_ADDITION) == bool(user_args)
+            assert (_BASE_MARKER in first_prompt["prompt"]) is (prompt_mode != "replace")
+            assert _APPEND_MARKER not in first_prompt["prompt"]
+            for marker in _CONTEXT_MARKERS:
+                assert (marker in first_prompt["prompt"]) is (context_files is not False)
             old_pane = terminal.json()["metadata"]
             http_client.delete(f"{terminal_url}/terminal_pi_main", timeout=30).raise_for_status()
             deadline = time.monotonic() + 30
@@ -153,6 +185,7 @@ os_env:
                 assert time.monotonic() < deadline, "initial Pi terminal did not stop"
                 time.sleep(0.5)
 
+            base_prompt.unlink()
             # Hiding a saved model must preserve its launch identity.
             (agent / "settings.json").write_text(
                 json.dumps(
@@ -201,7 +234,14 @@ os_env:
             resumed_prompt = json.loads(prompts.read_text().splitlines()[-1])
             assert resumed_prompt["pid"] != first_prompt["pid"]
             assert resumed_prompt["prompt"].count(_INSTRUCTIONS) == 1
-            assert resumed_prompt["prompt"].count(_USER_ADDITION) == 1
+            assert resumed_prompt["prompt"].count(_USER_ADDITION) == bool(user_args)
+            assert ("coding assistant" in resumed_prompt["prompt"].lower()) is (
+                prompt_mode != "replace"
+            )
+            assert _BASE_MARKER not in resumed_prompt["prompt"]
+            assert _APPEND_MARKER not in resumed_prompt["prompt"]
+            for marker in _CONTEXT_MARKERS:
+                assert (marker in resumed_prompt["prompt"]) is (context_files is not False)
         finally:
             with contextlib.suppress(httpx.HTTPError):
                 http_client.delete(f"/v1/sessions/{session_id}", timeout=10)

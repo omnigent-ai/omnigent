@@ -262,6 +262,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
             instructions=instructions if instruction_spec != "empty" else "   ",
         )
         if instruction_spec == "resolved":
+            agent_spec.executor.config.update(context_files=False, system_prompt_mode="replace")
             agent_spec = ResolvedSpec(spec=agent_spec, workdir=tmp_path)
 
     bridge_dir = pi_native_bridge.prepare_bridge_dir("47f049b9d13df4db397c7f46859b825f")
@@ -297,7 +298,13 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert args[-2:] == ["--append-system-prompt", "User addition"]
     if instruction_spec in {"raw", "resolved"}:
         assert args.count("--append-system-prompt") == 2
-        path = Path(args[args.index("--append-system-prompt") + 1])
+        prompt_flag = (
+            "--system-prompt" if instruction_spec == "resolved" else "--append-system-prompt"
+        )
+        path = Path(args[args.index(prompt_flag) + 1])
+        assert ("--no-context-files" in args) is (instruction_spec == "resolved")
+        if instruction_spec == "resolved":
+            assert args[args.index("--append-system-prompt") + 1] == ""
         assert (
             path.parent
             == Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
