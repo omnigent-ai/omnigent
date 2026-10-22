@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
@@ -1480,6 +1481,10 @@ class SqlScheduledTask(OmnigentBase):
 
     __tablename__ = "scheduled_tasks"
     account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    next_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    project_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Opaque grant reference, never credentials.
+    delegation_ref: Mapped[str | None] = mapped_column(String(1024), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1536,19 +1541,18 @@ class SqlScheduledTask(OmnigentBase):
     # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
     # store converts to/from the string name at the row↔entity boundary.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
-    last_run_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
     last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    created_at: Mapped[int] = mapped_column(Integer)
-    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+    updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
         CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
-        # One user-scoped listing index. Covers "a user's tasks ordered by
-        # created_at" (GET /scheduled-tasks) as a covered seek; the scheduler's
-        # state scan reads whole rows regardless of any index.
+        Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
+        # Covers a user's task listing ordered by creation time.
         Index(
             "ix_scheduled_tasks_user_scope",
             "workspace_id",
@@ -1592,6 +1596,16 @@ class SqlScheduledTaskRun(OmnigentBase):
     """
 
     __tablename__ = "scheduled_task_runs"
+    # Canonical occurrence key, without trailing whitespace.
+    trigger_key: Mapped[str | None] = mapped_column(
+        String(256).with_variant(
+            MySQLVarchar(256, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+        ),
+        nullable=True,
+    )
+    # The occurrence's assigned host, independent of later task edits.
+    host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    lease_expires_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1607,14 +1621,11 @@ class SqlScheduledTaskRun(OmnigentBase):
     scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Relates to conversations.id. No DB foreign key; app nulls on delete.
     conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_RUN_STATUS: scheduled=1, running=2, succeeded=3, failed=4,
-    # skipped=5). The store converts to/from the string name at the
-    # row↔entity boundary.
+    # SCHEDULED_TASK_RUN_STATUS int code; 6 is reserved for starting.
     status: Mapped[int] = mapped_column(SmallInteger)
-    scheduled_at: Mapped[int] = mapped_column(Integer)
-    fired_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    finished_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scheduled_at: Mapped[int] = mapped_column(BigInteger)
+    fired_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    finished_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque free-text error blob, never SQL-queried — stored compressed.
     error: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Short, queryable failure classification token (e.g. "timeout",
@@ -1624,8 +1635,21 @@ class SqlScheduledTaskRun(OmnigentBase):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN (1, 2, 3, 4, 5)",
-            name="ck_scheduled_task_runs_status",
+            "status IN (1, 2, 3, 4, 5, 6)",
+            name="ck_scheduled_task_runs_dispatch_status",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "scheduled_task_id",
+            "trigger_key",
+            name="uq_scheduled_task_runs_occurrence",
+        ),
+        Index(
+            "ix_scheduled_task_runs_expired_claims",
+            "status",
+            "lease_expires_at",
+            "workspace_id",
+            "id",
         ),
         Index(
             "ix_scheduled_task_runs_scheduled_task_id",

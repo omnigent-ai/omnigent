@@ -522,7 +522,7 @@ def resolve_managed_agent_label(
         return None
     try:
         agent = agent_store.get(agent_id)
-    except Exception:  # noqa: BLE001 — the label is an optimization, never a
+    except Exception:  # the label is an optimization, never a
         # create precondition. Any store failure degrades to an unlabeled runner
         # (the admission policy skips it) rather than 500-ing a create that has
         # already committed and announced the session.
@@ -4492,7 +4492,7 @@ async def _terminate_sandbox_best_effort(
     try:
         await asyncio.to_thread(launcher.terminate, sandbox_id)
         return True
-    except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
+    except Exception:  # provider cleanup must remain best-effort.
         _logger.warning(
             "Failed to terminate managed sandbox %s (provider=%s) for host %s",
             sandbox_id,

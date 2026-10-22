@@ -148,7 +148,7 @@ def _prewarm_first_turn() -> None:
             importlib.import_module(module)
         # Cached by the stdlib; openai reads it for its request headers.
         platform.platform()
-    except Exception:  # noqa: BLE001 — the first turn reports it instead
+    except Exception:  # the first turn reports it instead
         _logger.debug("openai-agents first-turn prewarm failed", exc_info=True)
 
 

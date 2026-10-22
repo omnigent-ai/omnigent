@@ -1920,7 +1920,7 @@ def _stop_headless_session(*, base_url: str, session_id: str) -> None:
     # Teardown must never turn a completed run into a failed one.
     try:
         _stop_session_on_server(base_url=base_url, session_id=session_id)
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -2657,7 +2657,7 @@ async def _stop_launched_session(client: OmnigentClient, session_id: str) -> Non
     # Teardown must never turn a completed run into a failed one.
     try:
         await client.sessions.post_event(session_id, {"type": "stop_session", "data": {}})
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 

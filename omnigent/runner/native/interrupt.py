@@ -741,7 +741,7 @@ class NativeInterruptRunner:
                     },
                     timeout=10.0,
                 )
-            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
+            except Exception:  # the bridge flip already took effect locally.
                 self._logger.warning(
                     "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
                 )
@@ -758,7 +758,7 @@ class NativeInterruptRunner:
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # noqa: BLE001 - the local cancel already took effect.
+                except Exception:  # the local cancel already took effect.
                     self._logger.warning(
                         "Codex-native MCP startup interrupt failed for session=%s thread=%s",
                         conv_id,
@@ -792,7 +792,7 @@ class NativeInterruptRunner:
                                 self._resource_registry.note_external_session_status(
                                     conv_id, "idle"
                                 )
-                            except Exception:  # noqa: BLE001 - the clear already succeeded.
+                            except Exception:  # the clear already succeeded.
                                 self._logger.warning(
                                     "Codex-native idle publish failed for session=%s",
                                     conv_id,
@@ -827,7 +827,7 @@ class NativeInterruptRunner:
                     # deferred parent-wake cancel. A dropped sub-agent completion
                     # can still leave its parent waiting; reconciled separately.
                     return Response(status_code=204)
-        except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures.
+        except Exception as exc:  # surface active-turn interrupt failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
                 conv_id,

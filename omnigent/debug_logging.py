@@ -1497,7 +1497,7 @@ def attach_debug_log_sink(
                     _active_sink = ZerobusLogHandler(config, source)
                 else:
                     return
-            except Exception:  # noqa: BLE001 — the sink must never break logging setup
+            except Exception:  # the sink must never break logging setup
                 # Handler construction must not take down process logging setup.
                 _logger.warning("debug-log sink disabled: handler init failed", exc_info=True)
                 return
@@ -1572,7 +1572,7 @@ def attach_sse_file_sink(*, source: str, level: int) -> None:
         log_dir = process_log_dir(source)
         try:
             handler = SseFileHandler(log_dir, source)
-        except Exception:  # noqa: BLE001 — the sink must never break logging setup
+        except Exception:  # the sink must never break logging setup
             _logger.warning("SSE file sink disabled: handler init failed", exc_info=True)
             return
         handler.setLevel(level)

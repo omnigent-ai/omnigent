@@ -113,7 +113,7 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
         if parsed is not None and parsed.provider not in found:
             try:
                 facet = _facet(parsed.provider)
-            except Exception:  # noqa: BLE001 — optional integrations must not hide other remotes
+            except Exception:  # optional integrations must not hide other remotes
                 _logger.warning("Could not load git provider %s", parsed.provider, exc_info=True)
                 continue
             if facet is not None:
@@ -230,7 +230,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         if facet is None:
             return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
         return facet.reference_info(root, reference)
-    except Exception:  # noqa: BLE001 — retain the selector and healthy providers on failure
+    except Exception:  # retain the selector and healthy providers on failure
         _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
         return {
             **unsupported_remote_info(reference.host),
@@ -244,7 +244,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
 def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]:
     try:
         return _workspace_info(root, resolution)
-    except Exception:  # noqa: BLE001 — one unavailable forge must not hide the others
+    except Exception:  # one unavailable forge must not hide the others
         _logger.warning("Git provider %s failed discovery", resolution.provider, exc_info=True)
         return {
             **unsupported_remote_info(resolution.remote_host or ""),
@@ -271,7 +271,7 @@ def _title_facets(root: str, entries: list[SessionPullRequest]) -> dict[str, Pul
             facet = _facet(provider_id)
             if facet is not None and facet.titles_available(root):
                 facets[provider_id] = facet
-        except Exception:  # noqa: BLE001 — optional titles must not hide the selected PR
+        except Exception:  # optional titles must not hide the selected PR
             _logger.warning(
                 "Git provider %s could not prepare PR title lookup", provider_id, exc_info=True
             )
@@ -315,7 +315,7 @@ def _session_prs_with_titles(
             return None
         try:
             title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
-        except Exception:  # noqa: BLE001 — keep the existing cache when an optional lookup fails
+        except Exception:  # keep the existing cache when an optional lookup fails
             _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
             return None
         return entry.url, title, timed_out
@@ -366,12 +366,12 @@ def _associate_discovered_pr(
                     title = _pr_title(pr)
                     if title is not None:
                         registry.update_titles({inferred.url: title})
-                except Exception:  # noqa: BLE001 — metadata cannot undo a valid association
+                except Exception:  # metadata cannot undo a valid association
                     _logger.warning("Could not cache discovered PR metadata", exc_info=True)
             else:
                 candidate["pr"] = None
                 candidate.pop("selected_pr_url", None)
-        except Exception:  # noqa: BLE001 — failed optional inference preserves selected PRs
+        except Exception:  # failed optional inference preserves selected PRs
             _logger.warning("Could not associate discovered pull request", exc_info=True)
             candidate["pr"] = None
             candidate.pop("selected_pr_url", None)

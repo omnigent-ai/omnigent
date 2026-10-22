@@ -937,7 +937,7 @@ async def _attach_cost_budget(deps: FireDeps, task: ScheduledTask, conversation_
             factory_params={"max_cost_usd": task.max_cost_usd},
             enabled=True,
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "scheduled fire: failed to attach cost budget for task %s (session %s)",
             task.id,

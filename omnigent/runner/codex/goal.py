@@ -158,7 +158,7 @@ class CodexGoalRunner:
             )
         except ValueError as exc:
             return self._malformed_response(action, str(exc))
-        except Exception as exc:  # noqa: BLE001 - surface app-server goal failures to AP.
+        except Exception as exc:  # surface app-server goal failures to AP.
             self._logger.warning(
                 "Codex-native %s failed for session=%s",
                 method,
