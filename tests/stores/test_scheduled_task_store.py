@@ -311,8 +311,8 @@ def test_list_orders_by_created_at_then_id(store: SqlAlchemyScheduledTaskStore) 
     assert ids == [id_a, id_b]
 
 
-def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) -> None:
-    """``list_active`` returns only active tasks, excluding paused/deleted."""
+def test_task_lists_exclude_deleted(store: SqlAlchemyScheduledTaskStore) -> None:
+    """General lists keep paused tasks; ``list_active`` returns only active tasks."""
     store.create(
         scheduled_task_id=_uid("st_active"),
         name="active",
@@ -336,6 +336,11 @@ def test_list_active_excludes_non_active(store: SqlAlchemyScheduledTaskStore) ->
         )
     active_ids = [r.id for r in store.list_active()]
     assert active_ids == [_uid("st_active")]
+    expected_ids = {_uid("st_active"), _uid("st_paused")}
+    assert {task.id for task in store.list()} == expected_ids
+    assert {task.id for task in store.list(owner_user_id="u")} == expected_ids
+    assert store.list(owner_user_id="another-user") == []
+    assert store.get(_uid("st_deleted")).state == "deleted"
 
 
 def test_list_active_all_workspaces_includes_tenant_tasks(

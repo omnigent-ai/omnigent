@@ -98,7 +98,7 @@ class ScheduledTaskStore(ABC):
     @abstractmethod
     def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
         """
-        List all scheduled tasks ordered by ``created_at ASC, id ASC``.
+        List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         :param owner_user_id: When given, return only tasks owned by this user.
         :returns: List of :class:`ScheduledTask` instances.
