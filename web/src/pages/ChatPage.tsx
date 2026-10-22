@@ -200,7 +200,7 @@ import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
-import { useHostMcpServers } from "@/hooks/useHarnessInventory";
+import { isBrandHarness, useHostMcpServers } from "@/hooks/useHarnessInventory";
 import {
   getSessionHost,
   sessionRoutingHostId,
@@ -2463,9 +2463,7 @@ function ComposerImpl(
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
   const hostMcpHarness =
-    nativeMcpHarness === "claude" || nativeMcpHarness === "codex" || nativeMcpHarness === "cursor"
-      ? nativeMcpHarness
-      : null;
+    nativeMcpHarness !== undefined && isBrandHarness(nativeMcpHarness) ? nativeMcpHarness : null;
   const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
     composerSessionId === null ? null : getSessionHost(composerSessionId),
   );

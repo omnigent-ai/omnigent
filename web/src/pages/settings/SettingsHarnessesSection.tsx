@@ -102,8 +102,9 @@ export const SettingsHarnessesSection = () => {
   const [searchParams] = useSearchParams();
   const requestedHostId = searchParams.get("host");
   const [selectedHostId, setSelectedHostId] = useState<string | null>(requestedHostId);
+  // In-section links drop `?host`, so only a new deep link replaces the pick.
   useEffect(() => {
-    setSelectedHostId(requestedHostId);
+    if (requestedHostId !== null) setSelectedHostId(requestedHostId);
   }, [requestedHostId]);
   const [credentialKinds, setCredentialKinds] = useState<Record<string, HarnessCredentialKind>>({});
   const [readyNotice, setReadyNotice] = useState<{
@@ -131,7 +132,7 @@ export const SettingsHarnessesSection = () => {
     [sortedHosts],
   );
   const selectedHost =
-    sortedHosts.find((h) => h.host_id === selectedHostId) ?? onlineHosts[0] ?? null;
+    onlineHosts.find((h) => h.host_id === selectedHostId) ?? onlineHosts[0] ?? null;
 
   // Capture the selected host when the fix opens so a later host change cannot
   // redirect an in-progress install or credential write to another machine.

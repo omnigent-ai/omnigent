@@ -145,6 +145,12 @@ export function rankedSlashCommandNames(
     .sort((a, b) => rank(a) - rank(b));
 }
 
+/** One row of the read-only `/mcp` inventory. */
+interface McpServerRow {
+  name: string;
+  description?: string | null;
+}
+
 interface SlashCommandMenuProps {
   /** The text typed after the leading ``/``, used to filter suggestions. */
   query: string;
@@ -171,7 +177,7 @@ interface SlashCommandMenuProps {
   /** Replace suggestions with the read-only MCP inventory for an exact `/mcp`. */
   showMcpServers?: boolean;
   /** Effective MCP servers: agent-declared plus host-native for the active harness. */
-  mcpServers?: readonly { name: string; description?: string | null }[];
+  mcpServers?: readonly McpServerRow[];
   mcpServersStatus?: string;
   mcpSettingsHref?: string;
 }
@@ -180,7 +186,7 @@ function McpServerRows({
   servers,
   status,
 }: {
-  servers?: readonly { name: string; description?: string | null }[];
+  servers?: readonly McpServerRow[];
   status?: string;
 }) {
   if (!servers?.length && !status) {
@@ -219,7 +225,7 @@ function McpServerMenu({
   status,
   settingsHref = "/settings/harnesses",
 }: {
-  servers?: readonly { name: string; description?: string | null }[];
+  servers?: readonly McpServerRow[];
   status?: string;
   settingsHref?: string;
 }) {

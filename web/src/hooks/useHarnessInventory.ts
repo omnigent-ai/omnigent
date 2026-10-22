@@ -132,7 +132,7 @@ export function installedHarnesses(host: Host): BrandHarness[] {
   });
 }
 
-function isBrandHarness(value: string): value is BrandHarness {
+export function isBrandHarness(value: string): value is BrandHarness {
   return (BRAND_HARNESSES as readonly string[]).includes(value);
 }
 

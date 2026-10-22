@@ -257,20 +257,22 @@ afterEach(() => {
 });
 
 describe("Harnesses grid", () => {
-  it.each(["online", "offline"] as const)(
-    "preselects the linked %s host instead of the first host",
-    (status) => {
-      hosts = [ONLINE, { ...ONLINE, host_id: "host & two", name: "session-host", status }];
-      renderHarnesses("claude-native", "?host=host%20%26%20two&tab=settings");
-      expect(screen.getByText("session-host")).toBeInTheDocument();
-      expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
-    },
-  );
+  it("preselects the linked online host and keeps it after returning to the grid", () => {
+    hosts = [ONLINE, { ...ONLINE, host_id: "host & two", name: "session-host" }];
+    renderHarnesses("claude-native", "?host=host%20%26%20two&tab=settings");
+    expect(startupCalls).toHaveBeenCalledWith("host & two", "claude-native");
+    fireEvent.click(screen.getByRole("link", { name: /Harnesses/ }));
+    expect(screen.getByRole("button", { name: "session-host" })).toBeInTheDocument();
+  });
 
-  it("falls back to an online host if the linked host is no longer listed", () => {
-    hosts = [ONLINE];
-    renderHarnesses("claude-native", "?host=removed&tab=settings");
+  it.each([
+    ["offline", [ONLINE, { ...ONLINE, host_id: "linked", status: "offline" as const }]],
+    ["no longer listed", [ONLINE]],
+  ])("falls back to an online host if the linked host is %s", (_, linkedHosts) => {
+    hosts = linkedHosts;
+    renderHarnesses("claude-native", "?host=linked&tab=settings");
     expect(startupCalls).toHaveBeenCalledWith("h1", "claude-native");
+    expect(startupCalls).not.toHaveBeenCalledWith("linked", "claude-native");
   });
 
   it("shows the configured credential and a reconfiguration warning with its reason", async () => {
