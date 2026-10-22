@@ -46,7 +46,8 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -4149,17 +4150,24 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
         ) as fetch,
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            return_value=(
-                ModelEntry(
-                    id="databricks-gpt-next",
-                    family="openai",
-                    metadata=ModelMetadata(
-                        context_window=400_000,
-                        max_output_tokens=128_000,
-                    ),
-                ),
-            ),
+            return_value=(),
         ) as enrich,
+        patch(
+            "omnigent.onboarding.providers.get_models",
+            side_effect=lambda provider: (
+                [
+                    ModelInfo(
+                        name="gpt-next",
+                        provider="openai",
+                        supports_reasoning=True,
+                        max_input_tokens=400_000,
+                        max_output_tokens=128_000,
+                    )
+                ]
+                if provider == "openai"
+                else []
+            ),
+        ),
     ):
         executor = PiExecutor(gateway=True)
         first = _run(executor._load_gateway_model_wire_apis())
@@ -4170,6 +4178,7 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
     assert executor._gateway_model_entries is not None
     assert executor._gateway_model_entries[0].metadata.context_window == 400_000
     assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    assert executor._gateway_model_entries[0].metadata.supports(ModelCapability.REASONING) is True
     fetch.assert_called_once_with("https://h.example.com", "tok")
     enrich.assert_called_once_with("databricks")
 

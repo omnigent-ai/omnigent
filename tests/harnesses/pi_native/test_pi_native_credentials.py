@@ -21,6 +21,7 @@ import pytest
 from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
 from omnigent.inner._proc import process_alive
+from omnigent.onboarding.providers import ModelInfo
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 
 
@@ -4335,9 +4336,6 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
                 id="databricks-claude-fable-5-1", family="claude", metadata=capable
             ),
             model_catalog.ModelEntry(
-                id="databricks-gpt-6-luna", family="openai", metadata=capable
-            ),
-            model_catalog.ModelEntry(
                 id="databricks-gemini-3-8-flash", family="other", metadata=capable
             ),
             model_catalog.ModelEntry(
@@ -4351,6 +4349,14 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
         )
 
     monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider: (
+            [ModelInfo(name="gpt-6-luna", provider="openai", supports_reasoning=True)]
+            if provider == "openai"
+            else []
+        ),
+    )
 
     class _MockTransport(httpx.BaseTransport):
         def handle_request(self, request: httpx.Request) -> httpx.Response:
