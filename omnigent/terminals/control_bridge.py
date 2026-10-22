@@ -321,7 +321,7 @@ async def _communicate_tmux_process(
     except asyncio.CancelledError:
         await _kill_and_reap()
         raise
-    except (asyncio.TimeoutError, OSError, ValueError):
+    except (TimeoutError, OSError, ValueError):
         await _kill_and_reap()
         return None
 
