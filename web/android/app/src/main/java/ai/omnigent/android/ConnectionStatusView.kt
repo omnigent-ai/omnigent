@@ -6,6 +6,7 @@ import android.animation.ValueAnimator
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import android.os.SystemClock
 import android.text.SpannableStringBuilder
 import android.text.Spanned
@@ -14,6 +15,7 @@ import android.text.style.AbsoluteSizeSpan
 import android.text.style.ForegroundColorSpan
 import android.view.LayoutInflater
 import android.view.View
+import android.webkit.WebView
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -25,6 +27,7 @@ import android.widget.Toast
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import java.time.Instant
 import java.util.Date
 import kotlin.math.max
 import kotlin.math.min
@@ -37,6 +40,7 @@ internal class ConnectionStatusView(
         Regex(
             "^net::ERR_[A-Z0-9_]{1,64} \\((?:ERROR_HOST_LOOKUP|ERROR_CONNECT|ERROR_IO|ERROR_TIMEOUT|ERROR_FAILED_SSL_HANDSHAKE)\\)$",
         )
+    private val safeHttpStatus = Regex("^HTTP [1-5][0-9]{2}$")
     private val scroll =
         LayoutInflater
             .from(
@@ -395,9 +399,22 @@ internal class ConnectionStatusView(
         }
         detailsText.text = styled
         copyDetails.setOnClickListener {
+            val webViewVersion =
+                runCatching { WebView.getCurrentWebViewPackage()?.versionName }.getOrNull()
+                    ?: context.getString(R.string.status_version_unavailable)
+            val copied =
+                buildString {
+                    append(detailsText.text)
+                    append("\n\n").append(context.getString(R.string.status_time_utc))
+                    append('\n').append(Instant.ofEpochMilli(details.timeMillis))
+                    append("\n\n").append(context.getString(R.string.status_android_api))
+                    append('\n').append(Build.VERSION.SDK_INT)
+                    append("\n\n").append(context.getString(R.string.status_webview_version))
+                    append('\n').append(webViewVersion)
+                }
             val clipboard = ContextCompat.getSystemService(context, ClipboardManager::class.java)
             clipboard?.setPrimaryClip(
-                ClipData.newPlainText(context.getString(R.string.status_details), detailsText.text),
+                ClipData.newPlainText(context.getString(R.string.status_details), copied),
             )
             if (android.os.Build.VERSION.SDK_INT <= 32) {
                 Toast.makeText(context, R.string.status_copied, Toast.LENGTH_SHORT).show()
@@ -438,7 +455,7 @@ internal class ConnectionStatusView(
                     "WorkspaceRequired",
                     "UnsupportedWebView",
                     "RENDERER_CRASH",
-                ) || safeWebViewError.matches(it)
+                ) || safeWebViewError.matches(it) || safeHttpStatus.matches(it)
         } ?: "ERROR_UNKNOWN"
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + .5f).toInt()

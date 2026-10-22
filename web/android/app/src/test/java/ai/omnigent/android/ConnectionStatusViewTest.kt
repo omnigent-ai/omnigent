@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Rect
 import android.graphics.drawable.ColorDrawable
+import android.os.Build
 import android.os.Looper
 import android.text.Spanned
 import android.text.style.AbsoluteSizeSpan
@@ -165,8 +166,8 @@ class ConnectionStatusViewTest {
                 "example.com",
                 UnreachableKind.GENERIC,
                 ConnectionFailureDetails(
-                    "https://example.com/oauth/callback?code=private-code&state=private-state",
-                    "https://example.com/oauth/callback?code=private-code&state=ERR_PRIVATESTATE",
+                    "https://example.com/oauth/callback?code=private-code&state=private-state&ticket=private-ticket#private-fragment",
+                    "https://example.com/oauth/callback?code=private-code&state=ERR_PRIVATESTATE&ticket=private-ticket#private-fragment",
                     1234L,
                 ),
             ),
@@ -182,7 +183,13 @@ class ConnectionStatusViewTest {
                 .getItemAt(0)
                 .text
                 .toString()
-        assertEquals(rendered, copied)
+        assertTrue(copied.startsWith(rendered))
+        assertTrue(copied.contains("Time (UTC)\n1970-01-01T00:00:01.234Z"))
+        assertTrue(copied.contains("Android API\n${Build.VERSION.SDK_INT}"))
+        assertTrue(Regex("WebView version\\n[^\\n]+").containsMatchIn(copied))
+        assertFalse(rendered.contains("Time (UTC)"))
+        assertFalse(rendered.contains("Android API"))
+        assertFalse(rendered.contains("WebView version"))
 
         for (text in listOf(rendered, copied)) {
             assertTrue(text.contains("https://example.com"))
@@ -191,6 +198,10 @@ class ConnectionStatusViewTest {
             assertFalse(text.contains("private-code"))
             assertFalse(text.contains("private-state"))
             assertFalse(text.contains("ERR_PRIVATESTATE"))
+            assertFalse(text.contains("ticket="))
+            assertFalse(text.contains("private-ticket"))
+            assertFalse(text.contains("private-fragment"))
+            assertFalse(text.contains("Cookie"))
         }
     }
 

@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import org.json.JSONObject
+import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -18,6 +19,32 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 private const val UPGRADE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+
+internal sealed class LegacyTicketFailure : Exception() {
+    class BrowserUnavailable : LegacyTicketFailure()
+
+    class Refused : LegacyTicketFailure()
+
+    class NetworkDeadline(
+        val lastError: IOException,
+    ) : LegacyTicketFailure()
+
+    class HttpStatus(
+        val code: Int,
+    ) : LegacyTicketFailure()
+
+    class TimedOut : LegacyTicketFailure()
+}
+
+private sealed interface TicketPollResult {
+    data class Token(
+        val value: String,
+    ) : TicketPollResult
+
+    data class Failed(
+        val reason: LegacyTicketFailure,
+    ) : TicketPollResult
+}
 
 internal fun isUpgradeRequiredErrorResponse(
     responseCode: Int,
@@ -77,6 +104,10 @@ class OidcLoginManager {
     // cancel/server switch/destroy can never open the obsolete server's URL.
     private val flowGeneration = AtomicInteger(0)
 
+    internal var pollIntervalMillis = POLL_INTERVAL_MS
+    internal var pollTimeoutMillis = POLL_TIMEOUT_MS
+    internal var browserLauncher: (Activity, String) -> Boolean = ::launchTab
+
     /**
      * Begin a login against [origin] (the pinned server). Opens the browser and
      * polls in the background; [onSession] is invoked on the main thread with the
@@ -122,19 +153,22 @@ class OidcLoginManager {
                         }
                     } else {
                         postCurrent {
-                            if (launchTab(activity, origin + ticket.loginUrl)) {
+                            if (browserLauncher(activity, origin + ticket.loginUrl)) {
                                 onBrowserOpened()
                             } else {
-                                onTicketFailure(IllegalStateException("Browser unavailable"))
+                                onTicketFailure(LegacyTicketFailure.BrowserUnavailable())
                             }
                         }
-                        token = pollForToken(origin, ticket.id, codeVerifier)
+                        val pollResult = pollForToken(origin, ticket.id, codeVerifier)
+                        token = (pollResult as? TicketPollResult.Token)?.value
                         authLog(
                             "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
                         )
-                        if (token == null && !Thread.currentThread().isInterrupted) {
+                        if (pollResult is TicketPollResult.Failed &&
+                            !Thread.currentThread().isInterrupted
+                        ) {
                             postCurrent {
-                                onTicketFailure(IllegalStateException("Ticket poll ended"))
+                                onTicketFailure(pollResult.reason)
                             }
                         }
                     }
@@ -258,11 +292,12 @@ class OidcLoginManager {
         origin: String,
         ticket: String,
         codeVerifier: String,
-    ): String? {
-        val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
+    ): TicketPollResult {
+        val deadline = System.currentTimeMillis() + pollTimeoutMillis
         val encoded = Uri.encode(ticket)
+        var lastNetworkError: IOException? = null
         while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(POLL_INTERVAL_MS) // throws InterruptedException on shutdownNow()
+            Thread.sleep(pollIntervalMillis) // throws InterruptedException on shutdownNow()
             val conn = (
                 URL(
                     "$origin/auth/cli-poll?ticket=$encoded",
@@ -281,21 +316,36 @@ class OidcLoginManager {
                     // still pending
                     200 -> {
                         val body = conn.inputStream.bufferedReader().use { it.readText() }
-                        return JSONObject(body).optString("token").ifEmpty { null }
+                        val token = JSONObject(body).optString("token")
+                        return if (token.isNotEmpty()) {
+                            TicketPollResult.Token(token)
+                        } else {
+                            TicketPollResult.Failed(LegacyTicketFailure.Refused())
+                        }
+                    }
+
+                    410 -> {
+                        return TicketPollResult.Failed(LegacyTicketFailure.Refused())
                     }
 
                     else -> {
-                        return null
-                    } // 410 expired/rejected, or other
+                        return TicketPollResult.Failed(
+                            LegacyTicketFailure.HttpStatus(conn.responseCode),
+                        )
+                    }
                 }
-            } catch (_: Throwable) {
-                if (Thread.currentThread().isInterrupted) return null // shutdown mid-request
+            } catch (error: IOException) {
+                if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                lastNetworkError = error
                 continue // transient network error — keep polling until the deadline
             } finally {
                 conn.disconnect()
             }
         }
-        return null
+        return TicketPollResult.Failed(
+            lastNetworkError?.let(LegacyTicketFailure::NetworkDeadline)
+                ?: LegacyTicketFailure.TimedOut(),
+        )
     }
 
     private companion object {
