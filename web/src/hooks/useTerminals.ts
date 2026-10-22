@@ -217,16 +217,16 @@ export async function fetchTerminals(conversationId: string): Promise<TerminalIn
  * Create (launch) a terminal for a conversation over HTTP.
  *
  * POSTs the server's terminal-create route, which gates the request on
- * the agent's declared ``terminals:`` names (400 otherwise) and
- * proxies the launch to the runner. The created terminal lands in the
- * same per-conversation registry the agent's ``sys_terminal_*`` tools
- * read, so it is immediately visible to the agent.
+ * the terminals the session agent offers (400 otherwise) and proxies the
+ * launch to the runner. A terminal the agent declares is also visible to
+ * its ``sys_terminal_*`` tools.
  *
  * :param conversationId: Session/conversation identifier,
  *     e.g. ``"conv_abc123"``.
- * :param terminal: Declared terminal name from the agent spec,
- *     e.g. ``"shell"`` (or a shell basename like ``"zsh"`` for a native
- *     session offering the host's installed shells).
+ * :param terminal: A terminal name the session agent offers (see
+ *     `useSessionAgent().terminals`), e.g. ``"shell"``, the default
+ *     ``"bash"``, or a shell basename like ``"zsh"`` for a native session
+ *     offering the host's installed shells.
  * :returns: The created terminal mapped to :class:`TerminalInfo`.
  * :raises Error: When the server rejects the create (e.g. the agent
  *     has no terminal access) or the launch fails.

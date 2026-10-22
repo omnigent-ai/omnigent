@@ -127,6 +127,14 @@ def test_session_rename_is_registered_for_every_agent() -> None:
     assert "sys_session_rename" in names
 
 
+def test_sys_terminal_tools_stay_unregistered_without_declared_terminals() -> None:
+    """The default user shell offered to the UI is not an agent capability:
+    a spec that declares no ``terminals:`` still registers no ``sys_terminal_*``."""
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert not {name for name in names if name.startswith("sys_terminal_")}
+
+
 @pytest.fixture()
 def skill_with_resources(tmp_path: Path) -> SkillSpec:
     """

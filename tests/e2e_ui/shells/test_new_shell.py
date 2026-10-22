@@ -1,14 +1,15 @@
 """E2E: creating a shell from the tab strip's "+" menu and typing into it.
 
-The right rail's tab strip carries a "+" ("Open new") menu whenever the
-session agent declares a non-empty ``terminals:`` block (``NewTabMenu`` in
-``web/src/shell/WorkspacePanel.tsx``). Picking "Shell" with a single
-declared terminal name creates it directly, POSTing ``/resources/terminals``
-and opening the new terminal as a rail tab (its xterm renders in the rail's
-content slot). None of this needs an LLM turn — the user, not the agent,
-launches the shell — so these tests never send a chat message.
+The right rail's tab strip carries a "+" ("Open new") menu whose "Shell" item
+offers the terminals the session agent reports (``NewTabMenu`` in
+``web/src/shell/WorkspacePanel.tsx``): its declared ``terminals:``, or a
+default ``bash`` shell when it declares none. Picking "Shell" with a single
+terminal name creates it directly, POSTing ``/resources/terminals`` and
+opening the new terminal as a rail tab (its xterm renders in the rail's
+content slot). The user, not the agent, launches the shell, so only the
+dialog-created agent test sends a chat message (to create its session).
 
-Five behaviors are covered:
+These behaviors are covered:
 
 1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
    ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
@@ -34,9 +35,12 @@ Five behaviors are covered:
    followed by a hard reload inside the cold-boot window — renders the
    stopped copy with an enabled Resume action and no startup status.
 
-All use the function-scoped ``terminal_session`` fixture (registers the
+These use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
-independent session.
+independent session. The dialog-created agent test instead runs a real host
+and builds its agent through the landing page's Create custom agent dialog;
+that agent declares no ``terminals:``, so its "+" menu and the new-shell
+shortcut open the default ``bash`` shell.
 """
 
 from __future__ import annotations
@@ -46,13 +50,17 @@ import os
 import re
 import signal
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import _server_state, open_right_rail
+from tests._helpers.compat import runner_executable
+from tests._helpers.host import isolated_host
+from tests.e2e_ui.conftest import _server_state, configure_mock_llm, open_right_rail
 
 
 def _open_new_shell(page: Page) -> None:
@@ -576,3 +584,105 @@ def test_shell_inventory_refreshes_after_provisioning(
     expect(rail.get_by_role("button", name=re.compile(r"^Close zsh · u-"))).to_be_visible(
         timeout=60_000
     )
+
+
+def test_dialog_created_agent_offers_shell_in_rail_menu(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """An agent from the Create custom agent dialog offers a shell in the rail "+" menu."""
+    nonce = uuid.uuid4().hex[:8]
+    agent_name = f"shell-check-{nonce}"
+    configure_mock_llm(
+        mock_llm_server_url, [{"text": "Ready."}] * 8, match=nonce, required_tools=[]
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    base_env = {
+        "PATH": os.environ["PATH"],
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "NO_PROXY": "localhost,127.0.0.1,::1",
+        "no_proxy": "localhost,127.0.0.1,::1",
+    }
+    host_env = {
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        "ANTHROPIC_BASE_URL": mock_llm_server_url,
+        "ANTHROPIC_API_KEY": "mock-key",
+    }
+    with (
+        httpx.Client(base_url=live_server, trust_env=False, timeout=30.0) as client,
+        isolated_host(
+            tmp_path / "host",
+            live_server,
+            env=host_env,
+            base_env=base_env,
+            name=f"dialog-shell-{nonce}",
+            command=[
+                runner_executable(),
+                "-m",
+                "omnigent",
+                "host",
+                "--server",
+                live_server,
+                "--non-interactive",
+            ],
+        ) as host,
+    ):
+        host.wait_online(client, timeout=180, poll_interval=1)
+        page = request.getfixturevalue("page")
+        page.goto(f"{live_server}/")
+
+        expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_enabled(timeout=60_000)
+        page.get_by_test_id("new-chat-landing-workspace-chip").click()
+        page.get_by_test_id("new-chat-landing-workspace-open-folder").click()
+        folder = page.get_by_test_id("workspace-picker-path-input")
+        folder.fill(str(workspace))
+        folder.press("Enter")
+        confirm = page.get_by_test_id("workspace-picker-select")
+        expect(confirm).to_have_attribute("title", f"Confirm folder: {workspace.name}")
+        confirm.click()
+        expect(page.get_by_test_id("workspace-picker")).to_be_hidden()
+
+        page.get_by_test_id("new-chat-landing-agent-select").click()
+        page.get_by_test_id("new-chat-landing-custom-agents").click()
+        page.get_by_test_id("new-chat-landing-create-agent").click()
+        dialog = page.get_by_test_id("create-agent-dialog")
+        expect(dialog).to_be_visible()
+        page.get_by_test_id("create-agent-name").fill(agent_name)
+        page.get_by_test_id("create-agent-description").fill("Custom agent for the shell check")
+        page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+        page.get_by_test_id("create-agent-instructions").fill("You are a helpful assistant.")
+        page.get_by_test_id("create-agent-submit").click()
+        expect(dialog).to_be_hidden()
+        expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(agent_name)
+
+        page.get_by_test_id("new-chat-landing-input").fill(f"Hello {nonce}")
+        page.get_by_test_id("new-chat-landing-submit").click()
+        session_url = re.compile(rf"^{re.escape(live_server)}/c/[0-9a-f]{{32}}$")
+        expect(page).to_have_url(session_url, timeout=60_000)
+        expect(
+            page.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+        ).to_be_visible(timeout=60_000)
+
+        open_right_rail(page)
+        rail = page.get_by_role("complementary", name="Workspace")
+        rail.get_by_role("button", name="Open new").click()
+        menu = page.get_by_role("menu")
+        expect(menu.get_by_role("menuitem", name="Side chat")).to_be_visible()
+        shell_item = menu.get_by_role("menuitem", name=re.compile(r"^Shell \(bash\)"))
+        expect(shell_item).to_be_visible()
+
+        shell_item.click()
+        shell_tabs = rail.get_by_role("button", name=re.compile(r"^Close bash · u-"))
+        expect(shell_tabs).to_have_count(1, timeout=60_000)
+        terminal_view = rail.get_by_test_id("terminal-view")
+        expect(terminal_view.last).to_have_attribute("data-state", "connected", timeout=30_000)
+
+        # The focused xterm keeps the chord, so press it from the composer.
+        page.get_by_placeholder("Send a message…").click()
+        page.keyboard.press("Control+Alt+KeyT")
+        expect(shell_tabs).to_have_count(2, timeout=60_000)
