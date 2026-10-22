@@ -229,7 +229,9 @@ async def _multipart_create(
     )
 
 
+@pytest.mark.parametrize("temporary", [False, True])
 async def test_multipart_create_with_host_id_binds_and_launches(
+    temporary: bool,
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     conv_store: SqlAlchemyConversationStore,
@@ -244,7 +246,14 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     cap = register_host()
 
     with capture_debug_rows("server") as rows:
-        resp = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": _WORKSPACE})
+        resp = await _multipart_create(
+            client,
+            {
+                "host_id": _HOST_ID,
+                "workspace": _WORKSPACE,
+                "labels": {"omnigent.preferences.temporary": "true"} if temporary else {},
+            },
+        )
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["session_id"]
     accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
@@ -261,6 +270,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     # The host actually received a launch frame for this session with
     # the validated workspace (not just a row write).
     assert len(cap.launch) == 1, f"expected one launch frame, got {len(cap.launch)}"
+    assert cap.launch[0].temporary_preferences is temporary
     assert cap.launch[0].session_id == session_id
     assert cap.launch[0].workspace == _WORKSPACE
     # Workspace validation ran against the host (host.stat round-trip).

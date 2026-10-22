@@ -226,6 +226,12 @@ def load_effective_config(
     config directory instead of the process cwd.
     """
     local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
+    if preference_context is None:
+        from omnigent.preference_startup import inherited_launch
+
+        launch = inherited_launch()
+        if launch is not None:
+            return launch.resolve(load_global_config(), load_local_config(local_path)).config
     return resolve_effective_config(
         load_global_config(),
         load_local_config(local_path),

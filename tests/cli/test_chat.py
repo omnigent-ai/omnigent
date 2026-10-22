@@ -1494,9 +1494,12 @@ class _FakeSessionsApi:
     def __init__(self, captured: dict[str, object]) -> None:
         self._captured = captured
 
-    async def create(self, bundle: bytes, *, filename: str, workspace: str) -> SimpleNamespace:
+    async def create(
+        self, bundle: bytes, *, filename: str, workspace: str, labels: dict[str, str] | None = None
+    ) -> SimpleNamespace:
         """Record a session create and return a stub with a new id."""
         self._captured["create"] = {"workspace": workspace, "filename": filename}
+        self._captured["labels"] = labels
         return SimpleNamespace(id="conv_created")
 
     async def fork(self, session_id: str) -> dict[str, str]:
@@ -1553,26 +1556,31 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     monkeypatch.setattr("omnigent.native.native_terminal.bind_session_runner", _fake_bind)
 
 
+@pytest.mark.parametrize("temporary", [False, True])
 def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
     monkeypatch: pytest.MonkeyPatch,
+    temporary: bool,
 ) -> None:
     """No resume/fork → create a fresh session, then launch the daemon runner."""
     captured: dict[str, object] = {}
     _patch_daemon_launch(monkeypatch, captured)
 
-    prepared = asyncio.run(
-        _prepare_chat_session_via_daemon(
-            base_url="https://example.databricksapps.com",
-            headers={},
-            auth=None,
-            host_id="host_x",
-            bundle=b"bundle-bytes",
-            resume_conversation_id=None,
-            fork_session_id=None,
-            workspace="/tmp/proj",
+    with click.Context(click.Command("run")) as context:
+        context.meta["temporary_preferences"] = temporary
+        prepared = asyncio.run(
+            _prepare_chat_session_via_daemon(
+                base_url="https://example.databricksapps.com",
+                headers={},
+                auth=None,
+                host_id="host_x",
+                bundle=b"bundle-bytes",
+                resume_conversation_id=None,
+                fork_session_id=None,
+                workspace="/tmp/proj",
+            )
         )
-    )
 
+    assert captured["labels"] == ({"omnigent.preferences.temporary": "true"} if temporary else {})
     assert "create" in captured  # a fresh session was created
     assert "fork" not in captured
     assert prepared.session_id == "conv_created"
@@ -1697,7 +1705,14 @@ def test_prepare_chat_session_via_daemon_reports_create_failure_as_click_error(
     captured: dict[str, object] = {}
     _patch_daemon_launch(monkeypatch, captured)
 
-    async def _boom(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
+    async def _boom(
+        _self: object,
+        _bundle: bytes,
+        *,
+        filename: str,
+        workspace: str,
+        labels: dict[str, str] | None = None,
+    ) -> object:
         raise ClientOmnigentError({"detail": "Method Not Allowed"}, 405, "")
 
     monkeypatch.setattr(_FakeSessionsApi, "create", _boom)
@@ -1757,7 +1772,14 @@ def test_prepare_chat_session_via_daemon_reports_unreachable_server_as_click_err
     captured: dict[str, object] = {}
     _patch_daemon_launch(monkeypatch, captured)
 
-    async def _refused(_self: object, _bundle: bytes, *, filename: str, workspace: str) -> object:
+    async def _refused(
+        _self: object,
+        _bundle: bytes,
+        *,
+        filename: str,
+        workspace: str,
+        labels: dict[str, str] | None = None,
+    ) -> object:
         raise transport_error
 
     monkeypatch.setattr(_FakeSessionsApi, "create", _refused)
@@ -4343,7 +4365,12 @@ def test_prepare_chat_session_via_daemon_reports_unparseable_proxy_env(
     _patch_daemon_launch(monkeypatch, captured)
 
     async def _invalid_proxy_env(
-        _self: object, _bundle: bytes, *, filename: str, workspace: str
+        _self: object,
+        _bundle: bytes,
+        *,
+        filename: str,
+        workspace: str,
+        labels: dict[str, str] | None = None,
     ) -> object:
         raise httpx.InvalidURL("Invalid port: ':'")
 
@@ -4690,7 +4717,9 @@ class _FakeSessionsNamespace:
         self._forbid_list_items = list_items_must_not_be_called
         self.list_items_calls = 0
 
-    async def create(self, bundle: bytes, *, filename: str, workspace: str) -> SimpleNamespace:
+    async def create(
+        self, bundle: bytes, *, filename: str, workspace: str, labels: dict[str, str] | None = None
+    ) -> SimpleNamespace:
         """Pretend to create a session; return an object with an ``id``."""
         return SimpleNamespace(id="conv_test")
 

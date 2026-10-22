@@ -1,0 +1,319 @@
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import click
+import httpx
+import pytest
+
+from omnigent.config import load_effective_config
+from omnigent.preference_connection import PreferenceConnection
+from omnigent.preference_startup import (
+    PREFERENCE_SNAPSHOT_ENV,
+    host_preference_environment,
+    prepare_preferences,
+    retry_pending_preferences,
+    temporary_preference_labels,
+)
+from omnigent.preference_sync import PreferenceSnapshot
+from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
+from tests.test_preference_client import MODEL, transport
+
+
+@pytest.fixture
+def startup(tmp_path, db_uri, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="startup")
+    connection = PreferenceConnection(
+        server_url="http://test", identity=store.identity("alice"), installation_id="machine"
+    )
+
+    async def open_http(_url):
+        return httpx.AsyncClient(base_url="http://test", transport=transport(store))
+
+    monkeypatch.setattr("omnigent.preference_startup.open_preference_http", open_http)
+    monkeypatch.setattr("omnigent.preference_connection.load_connection", lambda _url: connection)
+    return store, connection
+
+
+@pytest.mark.asyncio
+async def test_startup_requires_initial_choice_then_pins_session_across_reconnect(
+    startup, monkeypatch, tmp_path
+):
+    store, connection = startup
+    local = connection.workspace().client
+    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+        await local.sync(http)
+        with pytest.raises(ValueError, match="Choose your shared defaults"):
+            await prepare_preferences(connection)
+        local.enqueue(MODEL, "initial")
+        await local.sync(http)
+    connection.workspace().set_machine(MODEL, "experiment")
+    env = await host_preference_environment("http://test", "session-a")
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, env[PREFERENCE_SNAPSHOT_ENV])
+    assert load_effective_config(workspace=tmp_path)["model"] == "experiment"
+    local.enqueue(MODEL, "next-session")
+    connection.workspace().set_machine(MODEL, None)
+    monkeypatch.setattr("random.uniform", lambda *_: 0)
+    await retry_pending_preferences("http://test")
+    assert local.pending() == []
+    assert load_effective_config(workspace=tmp_path)["model"] == "experiment"
+    assert await host_preference_environment("http://test", "session-a") == env
+    newer = await host_preference_environment("http://test", "session-b")
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, newer[PREFERENCE_SNAPSHOT_ENV])
+    assert load_effective_config(workspace=tmp_path)["model"] == "next-session"
+    assert await host_preference_environment("http://test", "temporary", temporary=True) == {}
+    before = Path(newer[PREFERENCE_SNAPSHOT_ENV]).read_bytes()
+    assert json.loads(before)["shared"]["identity"] == connection.identity.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_cached_outage_wrong_identity_and_fresh_timeout(startup, monkeypatch):
+    store, connection = startup
+    local = connection.workspace().client
+    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+        await local.sync(http)
+        local.enqueue(MODEL, "saved")
+        await local.sync(http)
+
+    async def offline(_url):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr("omnigent.preference_startup.open_preference_http", offline)
+    launch = await prepare_preferences(connection)
+    assert launch.state == "cached" and launch.warning
+    assert launch.resolve({}, {}).config["model"] == "saved"
+    fresh = connection.model_copy(update={"identity": store.identity("bob")})
+    with pytest.raises(ValueError, match="temporary defaults"):
+        await prepare_preferences(fresh)
+
+    async def wrong_user(_url):
+        return httpx.AsyncClient(base_url="http://test", transport=transport(store, user="bob"))
+
+    monkeypatch.setattr("omnigent.preference_startup.open_preference_http", wrong_user)
+    with pytest.raises(ValueError, match="another identity"):
+        await prepare_preferences(connection)
+    assert local.cached().entries[0].value == "saved"
+
+    async def stalled(_url):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("omnigent.preference_startup.open_preference_http", stalled)
+    with pytest.raises(ValueError, match="temporary defaults"):
+        await prepare_preferences(fresh, timeout=0.02)
+
+
+def test_temporary_choice_only_labels_its_cli_context():
+    with click.Context(click.Command("run")) as context:
+        assert temporary_preference_labels() == {}
+        context.meta["temporary_preferences"] = True
+        assert temporary_preference_labels() == {"omnigent.preferences.temporary": "true"}
+    assert temporary_preference_labels() == {}
+
+
+@pytest.mark.asyncio
+async def test_reconnect_is_idle_or_bounded_and_retains_failed_edits(startup, monkeypatch):
+    store, connection = startup
+    calls = []
+    delays = []
+
+    async def unavailable(_url):
+        calls.append(_url)
+        raise httpx.ConnectError("offline")
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr("omnigent.preference_startup.open_preference_http", unavailable)
+    monkeypatch.setattr(
+        "omnigent.preference_startup.asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": sleep})
+    )
+    await retry_pending_preferences("http://test")
+    assert calls == [] and delays == []
+    local = connection.workspace().client
+    local._accept_snapshot(
+        PreferenceSnapshot.model_validate(
+            store.read(user_id="alice").model_dump(exclude={"next_cursor"})
+        )
+    )
+    operation = local.enqueue(MODEL, "pending")
+    await retry_pending_preferences("http://test")
+    assert len(calls) == 4 and len(delays) == 4
+    assert all(0 <= delay <= 2**attempt for attempt, delay in enumerate(delays))
+    assert local.pending()[0].operation_id == operation
+
+
+@pytest.mark.asyncio
+async def test_discovery_budget_and_gate_off(monkeypatch):
+    from omnigent.preference_startup import prepare_server_preferences
+
+    monkeypatch.setattr("omnigent.preference_connection.load_connection", lambda _: None)
+    monkeypatch.delenv("OMNIGENT_SHARED_PREFERENCES", raising=False)
+    assert await prepare_server_preferences("http://test") is None
+
+    async def stalled(_url):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("omnigent.preference_connection.connect_preferences", stalled)
+    monkeypatch.setenv("OMNIGENT_SHARED_PREFERENCES", "1")
+    with pytest.raises(ValueError, match="temporary defaults"):
+        await prepare_server_preferences("http://test", timeout=0.02)
+
+
+def test_cli_resolves_once_and_skips_resume_and_temporary(startup, monkeypatch):
+    from omnigent.preference_cli_startup import resolve_cli_preferences
+    from omnigent.preference_startup import PreferenceLaunch
+    from omnigent.preference_sync import PreferenceSnapshot, SharedPreferenceEntry
+
+    _, connection = startup
+    calls = []
+
+    async def prepare(server):
+        calls.append(server)
+        return PreferenceLaunch(
+            shared=PreferenceSnapshot(
+                identity=connection.identity,
+                revision=1,
+                entries=[SharedPreferenceEntry(key=MODEL, version=1, value="shared")],
+            ),
+            installation_id="machine",
+            state="current",
+        )
+
+    monkeypatch.setattr("omnigent.preference_cli_startup.prepare_server_preferences", prepare)
+    config = {"server": "http://test", "model": "legacy"}
+    with click.Context(click.Command("run"), info_name="run") as context:
+        assert resolve_cli_preferences(config, {}).config["model"] == "shared"
+        assert resolve_cli_preferences(config, {"model": "project"}).config["model"] == "project"
+        assert calls == ["http://test"]
+        context.params["resume"] = "session"
+        assert resolve_cli_preferences(config, {}).config["model"] == "legacy"
+        context.params.clear()
+        context.meta["temporary_preferences"] = True
+        assert resolve_cli_preferences(config, {}).config["model"] == "legacy"
+        assert calls == ["http://test"]
+
+
+def test_login_change_cannot_borrow_offline_cache(tmp_path, monkeypatch):
+    from omnigent.cli_auth import clear_token, store_token
+    from omnigent.config import save_global_config
+    from omnigent.preference_connection import account_context, connection_key, load_connection
+    from omnigent.preference_sync import PreferenceNamespace
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    server = "http://test"
+    store_token(server, "first-token", "alice", 9999999999)
+    connection = PreferenceConnection(
+        server_url=server,
+        identity=PreferenceNamespace(authority_id="test", workspace_id="one", user_id="alice"),
+        installation_id="machine",
+        account_context=account_context(server),
+    )
+    save_global_config({"shared_preferences": {connection_key(server): connection.model_dump()}})
+    assert load_connection(server) == connection
+    store_token(server, "refreshed-token", "alice", 9999999999)
+    assert load_connection(server) == connection
+    store_token(server, "other-token", "bob", 9999999999)
+    with pytest.raises(ValueError, match="login changed"):
+        load_connection(server)
+    clear_token(server)
+    with pytest.raises(ValueError, match="login changed"):
+        load_connection(server)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_limit_and_installation_mismatch_are_visible(
+    startup, tmp_path, monkeypatch
+):
+    from omnigent.preference_startup import write_launch_snapshot
+
+    _, connection = startup
+    client = connection.workspace().client
+    store, _ = startup
+    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+        await client.sync(http)
+        client.enqueue(MODEL, "saved")
+        await client.sync(http)
+    launch = await prepare_preferences(connection)
+    path = tmp_path / "snapshots" / "one.json"
+    write_launch_snapshot(path, launch)
+    assert path.stat().st_mode & 0o777 == 0o600
+    monkeypatch.setattr("omnigent.preference_startup.MAX_SESSION_SNAPSHOTS", 1)
+    write_launch_snapshot(path, launch)
+    with pytest.raises(ValueError, match="cache is full"):
+        write_launch_snapshot(path.with_name("two.json"), launch)
+    with pytest.raises(ValueError, match="another identity"):
+        write_launch_snapshot(path, launch.model_copy(update={"installation_id": "other"}))
+
+
+def test_blocked_auth_does_not_hold_cli_executor_shutdown(tmp_path):
+    import subprocess
+    import sys
+    import time
+
+    script = """
+import asyncio, time, pathlib, sys
+from unittest.mock import patch
+from omnigent.preference_startup import prepare_server_preferences
+
+def blocked(**kwargs):
+    pathlib.Path(sys.argv[1]).write_text("auth started")
+    time.sleep(30)
+
+async def run():
+    with patch("omnigent.preference_connection.load_connection", return_value=None), \
+         patch("omnigent.runner._entry._make_auth_token_factory", blocked):
+        try:
+            await prepare_server_preferences("http://test", timeout=0.05)
+        except ValueError as exc:
+            assert "temporary defaults" in str(exc)
+        else:
+            raise AssertionError("startup did not time out")
+asyncio.run(run())
+print("deadline respected")
+"""
+    from tests._helpers.live_server import isolated_process_env
+
+    environment = isolated_process_env(tmp_path, {"OMNIGENT_SHARED_PREFERENCES": "1"}, base_env={})
+    started = time.monotonic()
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "auth-started")],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "auth-started").is_file()
+    assert result.stdout.strip() == "deadline respected"
+    assert time.monotonic() - started < 10
+
+
+@pytest.mark.asyncio
+async def test_timed_out_reconnects_share_unfinished_credential_lookup(tmp_path, monkeypatch):
+    import threading
+
+    from omnigent.preference_connection import open_preference_http
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def blocked(**_kwargs):
+        calls.append(1)
+        started.set()
+        assert release.wait(10)
+        return lambda: None
+
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", blocked)
+    try:
+        for _ in range(2):
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await open_preference_http("http://credentials-test")
+        assert started.is_set() and len(calls) == 1
+    finally:
+        release.set()

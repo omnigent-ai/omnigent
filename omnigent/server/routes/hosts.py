@@ -1171,6 +1171,9 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                temporary_preferences=(
+                    target.conv.labels.get("omnigent.preferences.temporary") == "true"
+                ),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot

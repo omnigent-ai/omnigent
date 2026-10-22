@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+from contextlib import ExitStack
 from pathlib import Path
 
+import pytest
+
+from tests._helpers.live_server import isolated_local_server
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 _RUN_TIMEOUT_SEC = 60
@@ -178,7 +182,10 @@ def test_global_config_unknown_key_rejected_at_subprocess_boundary(
     )
 
 
+@pytest.mark.parametrize("preference_mode", ["legacy", "shared", "cached", "temporary"])
 def test_global_config_default_agent_drives_bare_omnigent(
+    preference_mode: str,
+    db_uri: str,
     omnigent_python: Path,
     omnigent_repo_root: Path,
     mock_credentials_env: dict[str, str],
@@ -204,6 +211,13 @@ def test_global_config_default_agent_drives_bare_omnigent(
     home.mkdir()
     env = dict(mock_credentials_env)
     env["HOME"] = str(home)
+    env["OMNIGENT_DATA_DIR"] = str(home / "data")
+    config_home = home / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text("auth:\n  type: api_key\n")
+    env["OMNIGENT_CONFIG_HOME"] = str(config_home)
+    env.pop("OMNIGENT_PREFERENCE_SNAPSHOT", None)
+    env.pop("OMNIGENT_SHARED_PREFERENCES", None)
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
     write = _run_omnigent(
@@ -223,16 +237,58 @@ def test_global_config_default_agent_drives_bare_omnigent(
         f"config set --global write failed: stdout={write.stdout!r} stderr={write.stderr!r}"
     )
 
-    run = _run_omnigent(
-        omnigent_python=omnigent_python,
-        omnigent_repo_root=omnigent_repo_root,
-        env=env,
-        args=["run", "-p", "say hi in 5 words", "--no-session", "--no-log"],
+    with ExitStack() as stack:
+        if preference_mode != "legacy":
+            config = tmp_path / "preference-server.yaml"
+            config.write_text("shared_preferences_authority_id: cli-startup-test\n")
+            server = stack.enter_context(
+                isolated_local_server(
+                    tmp_path / "server",
+                    extra_args=("--config", str(config), "--database-uri", db_uri),
+                )
+            )
+            for args in (
+                ["config", "set", "--global", f"server={server}"],
+                ["preferences", "connect"],
+                [
+                    "preferences",
+                    "set",
+                    "--scope",
+                    "shared",
+                    "model",
+                    '"mock-shared-default-model"',
+                ],
+                ["preferences", "set", "--scope", "shared", "harness", '"openai-agents"'],
+            ):
+                result = _run_omnigent(
+                    omnigent_python=omnigent_python,
+                    omnigent_repo_root=omnigent_repo_root,
+                    env=env,
+                    args=args,
+                )
+                assert result.returncode == 0, result.stdout + result.stderr
+            configure_mock_llm(
+                mock_llm_server_url,
+                [{"text": "Shared preference model selected!"}],
+                key="mock-shared-default-model",
+            )
+            if preference_mode == "cached":
+                stack.close()
+        args = ["run", "-p", "say hi in 5 words", "--no-session", "--no-log"]
+        if preference_mode == "temporary":
+            args.insert(0, "--temporary-preferences")
+        run = _run_omnigent(
+            omnigent_python=omnigent_python,
+            omnigent_repo_root=omnigent_repo_root,
+            env=env,
+            args=args,
+        )
+    assert run.returncode == 0, run.stdout + run.stderr
+    expected = (
+        "Shared preference model selected!"
+        if preference_mode in {"shared", "cached"}
+        else "Hello from config default agent!"
     )
-    assert run.returncode == 0, (
-        f"bare ``omnigent run`` with global default_agent failed: "
-        f"stdout={run.stdout!r} stderr={run.stderr!r}"
-    )
-    assert len(run.stdout.strip()) >= 4, (
-        f"Expected an assistant reply in stdout; got {run.stdout!r}"
-    )
+    assert expected in run.stdout, run.stdout + run.stderr
+    if preference_mode == "cached":
+        assert "last complete cache" in run.stderr

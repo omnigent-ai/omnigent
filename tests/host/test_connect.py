@@ -102,6 +102,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 from tests._helpers.providers import isolate_provider_resolution
+from tests.test_preference_startup import startup as startup
 
 pytestmark = pytest.mark.asyncio
 
@@ -836,8 +837,12 @@ def _cleanup_host(host: HostProcess) -> None:
         task.cancel()
 
 
+@pytest.mark.parametrize("preference_mode", ["legacy", "shared", "temporary"])
 async def test_handle_launch_spawns_subprocess(
     tmp_path: Path,
+    startup,
+    monkeypatch,
+    preference_mode: str,
 ) -> None:
     """
     Verify that _handle_launch spawns a subprocess with the correct
@@ -846,6 +851,28 @@ async def test_handle_launch_spawns_subprocess(
     If the result status is not 'launched', the subprocess spawn
     failed or the result frame construction is wrong.
     """
+    import httpx
+
+    from omnigent.config import save_global_config
+    from omnigent.host.frames import decode_host_frame, encode_host_frame
+    from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+    from tests._helpers.polling import poll_until_async
+    from tests.test_preference_client import MODEL, transport
+
+    store, connection = startup
+    save_global_config({"model": "legacy"})
+    if preference_mode == "legacy":
+        monkeypatch.setattr("omnigent.preference_connection.load_connection", lambda _: None)
+        monkeypatch.delenv("OMNIGENT_SHARED_PREFERENCES", raising=False)
+    else:
+        local = connection.workspace().client
+        async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as client:
+            await local.sync(client)
+            local.enqueue(MODEL, "shared")
+            await local.sync(client)
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, "/another/session.json")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", PREFERENCE_SNAPSHOT_ENV)
+    child_result = tmp_path / "child-result.json"
     host = _make_host_process()
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True
@@ -856,7 +883,10 @@ async def test_handle_launch_spawns_subprocess(
         request_id="req_001",
         binding_token="test_token_abc",
         workspace=str(workspace),
+        temporary_preferences=preference_mode == "temporary",
     )
+    frame = decode_host_frame(encode_host_frame(frame))
+    assert isinstance(frame, HostLaunchRunnerFrame)
 
     spawned_env: dict[str, str] = {}
     spawned_kwargs: dict[str, object] = {}
@@ -875,9 +905,15 @@ async def test_handle_launch_spawns_subprocess(
         spawned_kwargs.update(kwargs)
         # Spawn a real process that sleeps briefly so poll() returns None.
         return original_popen(
-            ["sleep", "10"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            [
+                sys.executable,
+                "-c",
+                "import json, pathlib, time; from omnigent.config import load_effective_config; "
+                f"result = pathlib.Path({str(child_result)!r}); "
+                "result.write_text(json.dumps(load_effective_config())); "
+                "time.sleep(10)",
+            ],
+            **kwargs,
         )
 
     with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
@@ -918,8 +954,13 @@ async def test_handle_launch_spawns_subprocess(
         "runner subprocess must be spawned with cwd=<session workspace>"
     )
 
-    # Clean up the spawned sleep process (and its exit watcher).
-    _cleanup_host(host)
+    try:
+        await poll_until_async(child_result.exists, timeout_s=10, interval_s=0.05)
+        child_config = json.loads(child_result.read_text())
+        assert child_config["model"] == ("shared" if preference_mode == "shared" else "legacy")
+        assert (PREFERENCE_SNAPSHOT_ENV in spawned_env) == (preference_mode == "shared")
+    finally:
+        _cleanup_host(host)
 
 
 @pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])

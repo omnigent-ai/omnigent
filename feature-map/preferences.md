@@ -4,8 +4,9 @@ Users can save local model and harness defaults, override them for a project,
 and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
 and an opt-in server API for durable edits and conflicts. Explicit shared/machine scope controls and import previews are available through
-the CLI. Automatic startup adoption and browser controls remain separate.
-An explicit Python client can persist offline edits and synchronize them on reconnect.
+the CLI. Connected CLI launches and user-owned hosts adopt cached/shared defaults
+at startup; browser controls and managed startup remain separate. Pending edits
+retry on host reconnect without polling between messages.
 
 ## Sub-features
 
@@ -29,6 +30,9 @@ An explicit Python client can persist offline edits and synchronize them on reco
   restarts, retry uncertain deliveries, refresh the cache, and surface conflicts. Cache records are versioned and bounded; lock contention
   and unsupported cache versions remain visible.
 
+- `shared-startup`: refresh once for a new launch, use a verified workspace cache
+  during an outage, or explicitly choose temporary defaults. Resume keeps its
+  frozen handoff; reconnect retries pending edits with bounded jitter.
 - `shared-cli`: connect to an authenticated workspace, inspect shared/machine values,
   preview/apply an import or restore, retry edits and resolve conflicts.
 
@@ -63,8 +67,8 @@ omitting an auth provider uses the reserved `local` user namespace.
 **Embedded client:** use the [client API](../docs/shared-preferences-client.md)
 with a private cache file, an expected account/workspace/deployment identity,
 and the caller's authenticated HTTP client. Queue explicit edits locally, then
-synchronize on reconnect. The caller schedules synchronization; launchers, the
-host daemon, and the settings UI do not call this API automatically yet.
+synchronize on reconnect. Standalone callers schedule synchronization. Connected CLI launches refresh at
+startup; a user-owned host retries pending edits on reconnect.
 
 **Shared scope controls:** `omnigent preferences --server URL connect` binds the
 local cache without uploading existing defaults. Use `show`, `sync`, and
@@ -75,6 +79,13 @@ Use `import SOURCE.yaml > plan.json`, review that file, then `apply plan.json`.
 `restore > undo.json` previews undoing the most recent import; review and apply it
 in the same way. The [CLI guide](../docs/shared-preferences-workflows.md) covers
 key spelling, scopes and recovery. Browser controls remain unavailable.
+
+**Shared startup:** after `preferences connect` and the first explicit import/edit,
+new CLI sessions follow the workspace. An unused workspace requires an import or
+`preferences initialize-empty`. During an outage a verified cache is used with a
+warning; a fresh machine offers Retry or `omnigent --temporary-preferences COMMAND`.
+A deployment can opt new machines into discovery with `OMNIGENT_SHARED_PREFERENCES=1`;
+the default is off. See the [startup guide](../docs/shared-preferences-startup.md).
 
 ## Driving it with the repro environment
 
@@ -92,6 +103,26 @@ uv run --no-sync pytest tests/e2e/omnigent/test_config_defaults_e2e.py --reruns 
 
 This verifies config write/list/unset across processes, rejection of an unknown
 key without persisting it, and a default-agent launch with a mock reply.
+
+**Shared startup (own environment):** the default-agent test above has legacy,
+connected, offline-cache and explicit temporary variants. Each launches an actual
+CLI process and verifies the selected model by its mock-provider reply. It does
+not run a vendor CLI or a managed host.
+
+```sh
+uv run --no-sync pytest tests/test_preference_startup.py \
+  tests/host/test_connect.py::test_handle_launch_spawns_subprocess \
+  tests/native/test_preference_launch.py \
+  tests/server/integration/test_multipart_create_host_launch.py --reruns 0 -q
+```
+
+The host scenario decodes the wire frame, builds the real launch environment,
+and spawns a Python child that loads effective defaults. The server scenario
+covers multipart metadata through SQL to the outbound frame. The native matrix
+checks temporary intent in all twelve adapters' multipart requests using simulated
+HTTP. Those checks do not prove vendor model/plugin application or availability UI.
+Component cases cover login changes, initial choice, startup timeout, frozen
+session choices, bounded snapshots, and idle/bounded reconnect retries.
 
 **Project and invocation compatibility (component tests):**
 
@@ -206,8 +237,9 @@ the correctness scenarios above.
   resolutions stop permanently; reads and identical retries still work.
 - Request parsing currently has no route-specific body-size or rate limit.
   Add these before broad activation; the value cap applies after JSON parsing.
-- Managed deployment, Universe wiring, Arclet startup, automatic outbox/reconnect,
-  import/rollback, and native plugin isolation remain unverified follow-ups.
+- Managed deployment, Universe wiring, Arclet startup, native plugin isolation,
+  and per-harness model availability remain unverified follow-ups. Startup adoption
+  carries portable intent; each adapter must still apply and report its capabilities.
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.
 - `config list` displays user and project defaults under their file paths;

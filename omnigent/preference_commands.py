@@ -178,3 +178,15 @@ def apply(plan: Path) -> None:
     operations = connection.workspace().apply_import(preview)
     click.echo(f"Queued {len(operations)} edits; retained locally if sync fails.", err=True)
     _print(asyncio.run(_sync(connection)))
+
+
+@preferences.command("initialize-empty")
+def initialize_empty() -> None:
+    """Explicitly choose no shared defaults for an unused workspace."""
+    connection = _connection()
+    workspace = connection.workspace()
+    snapshot = workspace.client.cached()
+    if snapshot is None or snapshot.revision != 0:
+        raise ValueError("This workspace already has shared preference history; inspect it first")
+    workspace.client.enqueue(SharedPreferenceKey(kind="harness", name="default"), None)
+    _print(asyncio.run(_sync(connection)))

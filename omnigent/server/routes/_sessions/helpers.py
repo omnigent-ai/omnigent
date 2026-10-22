@@ -6227,6 +6227,9 @@ async def _launch_runner_on_host_locked(
                 # same configuration check it does at create-time launch. None
                 # (agent not resolvable) skips the host-side check — fail open.
                 harness=_resolve_harness(conv),
+                temporary_preferences=(
+                    conv.labels.get("omnigent.preferences.temporary") == "true"
+                ),
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),

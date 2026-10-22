@@ -70,6 +70,7 @@ from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.native_dispatch import resolve_hook_for_key
+from omnigent.preference_startup import temporary_preference_labels
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -1843,7 +1844,10 @@ async def _prepare_chat_session_via_daemon(
                 if resume_conversation_id is not None:
                     return resume_conversation_id, False
                 created = await sdk.sessions.create(
-                    bundle, filename="agent.tar.gz", workspace=workspace
+                    bundle,
+                    filename="agent.tar.gz",
+                    workspace=workspace,
+                    labels=temporary_preference_labels(),
                 )
                 return created.id, True
             except ClientOmnigentError as exc:
@@ -2630,12 +2634,14 @@ async def _query_sessions_once(
             created = await client.sessions.create_from_agent_id(
                 agent.id,
                 workspace=os.getcwd(),
+                labels=temporary_preference_labels(),
             )
         else:
             created = await client.sessions.create(
                 session_bundle,
                 filename=session_bundle_filename,
                 workspace=os.getcwd(),
+                labels=temporary_preference_labels(),
             )
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
         set_session_host(bound.id, getattr(bound, "host_id", None))

@@ -46,6 +46,7 @@ from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native.native_terminal import url_component
+from omnigent.preference_startup import temporary_preference_labels
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -510,7 +511,7 @@ async def _create_pi_session(
     :param terminal_launch_args: Pass-through Pi CLI args to persist.
     :returns: New Omnigent session id.
     """
-    metadata: _JsonObject = {"labels": dict(_SESSION_LABELS)}
+    metadata: _JsonObject = {"labels": {**_SESSION_LABELS, **temporary_preference_labels()}}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(

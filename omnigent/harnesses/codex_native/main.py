@@ -107,6 +107,7 @@ from omnigent.native.native_terminal import request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.preference_startup import temporary_preference_labels
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1696,7 +1697,7 @@ async def _create_codex_session(
         ``["--config", "approval_policy=on-request"]``.
     :returns: New Omnigent session id.
     """
-    labels = dict(_SESSION_LABELS)
+    labels = {**_SESSION_LABELS, **temporary_preference_labels()}
     if bridge_id is not None:
         labels[CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
     metadata: _JsonObject = {

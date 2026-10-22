@@ -1115,6 +1115,7 @@ def test_launch_runner_frame_legacy_payload_decodes_harness_none() -> None:
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.session_id is None
     assert decoded.harness is None
+    assert decoded.temporary_preferences is False
 
 
 def test_launch_runner_result_frame_error_code_round_trip() -> None:
@@ -2503,3 +2504,12 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_temporary_preferences_rejects_non_boolean_wire_values(value):
+    frame = HostLaunchRunnerFrame(request_id="r", binding_token="t", workspace="/w")
+    payload = json.loads(encode_host_frame(frame))
+    payload["temporary_preferences"] = value
+    with pytest.raises(ValueError, match="required bool"):
+        decode_host_frame(json.dumps(payload))

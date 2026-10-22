@@ -940,6 +940,8 @@ def _build_runner_env(
         or key.startswith(_RUNNER_ENV_ALLOWLIST_PREFIXES)
         or key in forwarded
     }
+    # Only this launch's handoff may select preferences, even with explicit passthrough.
+    env.pop("OMNIGENT_PREFERENCE_SNAPSHOT", None)
     env["RUNNER_SERVER_URL"] = server_url
     env[RUNNER_ID_ENV_VAR] = runner_id
     env[RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR] = binding_token
@@ -1195,6 +1197,7 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        self._preference_retry: asyncio.Task[None] | None = None
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
         # files). Each entry remembers the repository root it was built for.
@@ -1982,6 +1985,18 @@ class HostProcess:
             harness_tmp_parent=self._harness_tmp_parent,
             inference_config=frame.inference_config,
         )
+        from omnigent.preference_startup import host_preference_environment
+
+        try:
+            env.update(
+                await host_preference_environment(
+                    self._server_url,
+                    frame.session_id or runner_id,
+                    temporary=frame.temporary_preferences,
+                )
+            )
+        except (ValueError, OSError, httpx.HTTPError, TimeoutError) as exc:
+            return self._launch_failed(frame, f"Cannot load shared preferences: {exc}")
         if frame.inference_config is not None:
             try:
                 inference_path = await asyncio.to_thread(
@@ -4365,6 +4380,10 @@ class HostProcess:
                 from omnigent.models.model_catalog_store import shutdown_catalog_probes
 
                 await shutdown_catalog_probes()
+            if self._preference_retry is not None:
+                self._preference_retry.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._preference_retry
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4553,6 +4572,9 @@ class HostProcess:
         try:
             async with diagnostics.monitoring(report_diagnostics, connection_id=connection_id):
                 await self._ensure_owner_user_id(headers=headers)
+                if self._preference_retry is None or self._preference_retry.done():
+                    self._preference_retry = asyncio.create_task(self._retry_preferences())
+
                 _logger.info(
                     "Host tunnel connected",
                     extra=debug_event(
@@ -4626,6 +4648,16 @@ class HostProcess:
             # ``async with`` this replaced; the manual enter is only so the
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
+
+    async def _retry_preferences(self) -> None:
+        from omnigent.preference_startup import retry_pending_preferences
+
+        try:
+            await retry_pending_preferences(self._server_url)
+        except Exception:  # noqa: BLE001 — preference errors must not stop registration
+            _logger.warning(
+                "Shared preferences need attention; pending edits retained", exc_info=True
+            )
 
     async def _ensure_owner_user_id(self, *, headers: dict[str, str] | None = None) -> None:
         """Resolve this host's owning user once and publish it for attribution.

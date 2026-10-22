@@ -310,6 +310,7 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    temporary_preferences: bool = False
 
 
 @dataclass
@@ -1446,6 +1447,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.temporary_preferences:
+            payload["temporary_preferences"] = True
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2364,6 +2367,11 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        temporary_preferences=(
+            _required_bool(msg, "temporary_preferences")
+            if "temporary_preferences" in msg
+            else False
+        ),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))

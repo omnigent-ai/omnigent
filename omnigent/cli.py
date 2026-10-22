@@ -64,7 +64,6 @@ from omnigent.config import (
     global_config_path,
     load_global_config,
     load_local_config,
-    resolve_effective_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
@@ -105,6 +104,7 @@ from omnigent.host.local_server import (
 from omnigent.inner import _proc, ui
 from omnigent.integration_daemon import IntegrationDaemon
 from omnigent.onboarding.sandboxes import available_providers as _sandbox_providers
+from omnigent.preference_cli_startup import temporary_preferences_option
 from omnigent.preference_commands import preferences as _preferences_command
 from omnigent.process_logging import (
     LOG_LEVEL_ENV_VAR,
@@ -841,7 +841,9 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
 
     :returns: Merged config dict.
     """
-    return resolve_effective_config(_load_global_config(), _load_local_config()).config
+    from omnigent.preference_cli_startup import resolve_cli_preferences
+
+    return resolve_cli_preferences(_load_global_config(), _load_local_config()).config
 
 
 def _peek_default_agent_harness(target: str) -> str | None:
@@ -2044,6 +2046,13 @@ def _extract_global_logging_flags(argv: list[str]) -> tuple[list[str], bool, boo
 
 @click.group(cls=_OmnigentCLI)
 @click.option(
+    "--temporary-preferences",
+    is_flag=True,
+    expose_value=False,
+    callback=temporary_preferences_option,
+    help="Use local defaults for this launch without publishing them. Place before COMMAND.",
+)
+@click.option(
     "--profiling",
     is_flag=True,
     is_eager=True,
@@ -2292,6 +2301,7 @@ def main() -> None:
             "-h",
             "--version",
             "--profiling",
+            "--temporary-preferences",
         }
     ):
         argv = ["run", *argv]
@@ -2469,7 +2479,10 @@ def _is_removed_ad_hoc_invocation(argv: list[str]) -> bool:
         return False
     # A root profiling flag may precede an eager help/version flag or stand
     # alone. These are valid Click invocations, not removed ad-hoc chat.
-    if all(token in {"--profiling", "--help", "-h", "--version"} for token in argv):
+    if all(
+        token in {"--profiling", "--temporary-preferences", "--help", "-h", "--version"}
+        for token in argv
+    ):
         return False
     # Skip leading flags to find the first positional. If all
     # tokens are flags (e.g. ``omnigent --system-prompt "..."``),

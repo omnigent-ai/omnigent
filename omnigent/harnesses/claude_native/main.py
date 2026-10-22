@@ -24,6 +24,7 @@ import sys
 import uuid
 
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.preference_startup import temporary_preference_labels
 from omnigent.runtime.tool_result_replay import (
     blocks_from_parsed_list,
     image_payloads_in_blocks,
@@ -6260,7 +6261,7 @@ async def _create_claude_session(
     :returns: New session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If creation fails.
     """
-    labels = dict(_SESSION_LABELS)
+    labels = {**_SESSION_LABELS, **temporary_preference_labels()}
     if bridge_id is not None:
         labels[BRIDGE_ID_LABEL_KEY] = bridge_id
     metadata: _JsonObject = {"labels": labels}

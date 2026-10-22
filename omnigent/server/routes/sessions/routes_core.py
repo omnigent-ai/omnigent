@@ -834,6 +834,9 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                temporary_preferences=(
+                    target.conv.labels.get("omnigent.preferences.temporary") == "true"
+                ),
                 inference_config=(
                     target.conv.inference_snapshot["runtime_config"]
                     if target.conv.inference_snapshot
