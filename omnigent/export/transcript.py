@@ -34,9 +34,15 @@ import json
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from omnigent.stores.conversation_store.overrides import SESSION_OVERRIDE_KEYS
+from omnigent.util.session_lifecycle import title_without_closed_marker
+
+if TYPE_CHECKING:
+    from omnigent.entities import Conversation
 
 #: Schema identifier written on the header line and required on read.
 TRANSCRIPT_SCHEMA = "omnigent.transcript/1"
@@ -56,13 +62,16 @@ EntryKind = Literal[
 
 EntryRole = Literal["user", "assistant", "tool", "system"]
 
-#: Session fields carried under ``header.settings`` so a re-import can
-#: restore the same per-session configuration.
+#: Stored overrides that are state, not configuration: ``reported_model`` is
+#: what the harness last reported; ``share_workspace_files`` is a sharing
+#: toggle on the exporting server. Neither is a setting to re-apply.
+_NON_SETTING_OVERRIDES: frozenset[str] = frozenset({"reported_model", "share_workspace_files"})
+
+#: Session fields carried under ``header.settings`` so a re-import can restore
+#: the same per-session configuration: every stored override that is a
+#: setting, plus the launch args, which live in their own column.
 _SETTING_KEYS: tuple[str, ...] = (
-    "harness_override",
-    "model_override",
-    "reasoning_effort",
-    "cost_control_mode_override",
+    *(k for k in SESSION_OVERRIDE_KEYS if k not in _NON_SETTING_OVERRIDES),
     "terminal_launch_args",
 )
 
@@ -143,7 +152,9 @@ class TranscriptEntry(BaseModel):
         compacted messages, error remediation).
     :param text: Readable text for messages, reasoning summaries, errors and
         compaction summaries.
-    :param content: Raw message content blocks (the harness's own shape).
+    :param content: Message or reasoning content blocks for an entry written
+        without ``raw`` (a hand-authored file). Omnigent-written entries keep
+        the blocks in ``raw`` only, so nothing in the file is stored twice.
     :param agent: Agent name that produced an assistant-side entry.
     :param tool: Tool name for ``tool_call`` / ``tool_result``.
     :param tool_input: Parsed tool arguments as raw JSON.
@@ -198,6 +209,19 @@ class TranscriptEntry(BaseModel):
     meta: bool = False
     interrupted: bool = False
 
+    @model_validator(mode="after")
+    def _fields_match_kind(self) -> TranscriptEntry:
+        """Refuse a field that does not belong to the entry's kind."""
+        allowed = _COMMON_FIELDS | _KIND_FIELDS[self.kind]
+        stray = sorted(
+            name
+            for name, value in self.__dict__.items()
+            if name not in allowed and value not in (None, False)
+        )
+        if stray:
+            raise ValueError(f"{self.kind} entry cannot carry {', '.join(stray)}")
+        return self
+
     def to_line(self) -> str:
         """Serialize as one JSON line (unset optionals and false flags omitted)."""
         payload = self.model_dump(exclude_none=True)
@@ -205,6 +229,26 @@ class TranscriptEntry(BaseModel):
             if payload.get(flag) is False:
                 del payload[flag]
         return json.dumps(payload)
+
+
+#: Fields every entry may carry.
+_COMMON_FIELDS: frozenset[str] = frozenset(
+    {"turn", "seq", "time", "role", "kind", "id", "origin_type", "raw"}
+)
+
+#: Fields that belong to each kind; anything else on that kind is a malformed line.
+_KIND_FIELDS: dict[str, frozenset[str]] = {
+    "message": frozenset({"text", "content", "agent", "meta", "interrupted"}),
+    "reasoning": frozenset({"text", "content", "agent", "sealed", "sealed_reason"}),
+    "tool_call": frozenset(
+        {"tool", "tool_input", "tool_input_raw", "call_id", "namespace", "agent"}
+        | {"sealed", "sealed_reason"}
+    ),
+    "tool_result": frozenset({"tool", "tool_output", "call_id"}),
+    "error": frozenset({"text", "code", "source", "level"}),
+    "compaction": frozenset({"text", "covers_through", "model", "token_count"}),
+    "note": frozenset({"note_type", "text"}),
+}
 
 
 @dataclass(frozen=True)
@@ -239,20 +283,89 @@ def header_from_session(
     :param exported_at: Export time; defaults to now.
     :returns: The populated header.
     """
-    settings = {k: session[k] for k in _SETTING_KEYS if session.get(k) is not None}
-    stamp = exported_at or datetime.now(UTC)
-    return TranscriptHeader(
-        session=str(session["id"]),
-        created=_iso(session.get("created_at")),
-        exported=stamp.isoformat().replace("+00:00", "Z"),
+    return _header(
+        session_id=str(session["id"]),
+        created_at=session.get("created_at"),
         title=session.get("title"),
-        agent=session.get("agent_name"),
+        agent_name=session.get("agent_name"),
         agent_id=session.get("agent_id"),
         harness=session.get("harness"),
-        model=session.get("llm_model"),
+        llm_model=session.get("llm_model"),
         workspace=session.get("workspace"),
-        parent_session=session.get("parent_session_id"),
-        root_session=session.get("root_conversation_id"),
+        parent_session_id=session.get("parent_session_id"),
+        root_conversation_id=session.get("root_conversation_id"),
+        settings={k: session[k] for k in _SETTING_KEYS if session.get(k) is not None},
+        exported_at=exported_at,
+    )
+
+
+def header_from_conversation(
+    conv: Conversation,
+    *,
+    agent_name: str | None,
+    harness: str | None,
+    llm_model: str | None,
+    exported_at: datetime | None = None,
+) -> TranscriptHeader:
+    """Build the header from a stored conversation, as the server route does.
+
+    Resolves the fields the way the session snapshot does: the title drops the
+    closed marker, and the caller supplies the agent-derived values the
+    snapshot computes (``agent_name``, ``harness``, ``llm_model``).
+
+    :param conv: The conversation row.
+    :param agent_name: Display name of the bound agent, if any.
+    :param harness: Canonical harness, as the snapshot resolves it.
+    :param llm_model: The reported model, else the spec model.
+    :param exported_at: Export time; defaults to now.
+    :returns: The populated header.
+    """
+    return _header(
+        session_id=conv.id,
+        created_at=conv.created_at,
+        title=title_without_closed_marker(conv.title),
+        agent_name=agent_name,
+        agent_id=conv.agent_id,
+        harness=harness,
+        llm_model=llm_model,
+        workspace=conv.workspace,
+        parent_session_id=conv.parent_conversation_id,
+        root_conversation_id=conv.root_conversation_id,
+        settings={
+            k: getattr(conv, k) for k in _SETTING_KEYS if getattr(conv, k, None) is not None
+        },
+        exported_at=exported_at,
+    )
+
+
+def _header(
+    *,
+    session_id: str,
+    created_at: Any,
+    title: str | None,
+    agent_name: str | None,
+    agent_id: str | None,
+    harness: str | None,
+    llm_model: str | None,
+    workspace: str | None,
+    parent_session_id: str | None,
+    root_conversation_id: str | None,
+    settings: dict[str, Any],
+    exported_at: datetime | None,
+) -> TranscriptHeader:
+    stamp = exported_at or datetime.now(UTC)
+    return TranscriptHeader(
+        session=session_id,
+        created=_iso(created_at),
+        exported=stamp.isoformat().replace("+00:00", "Z"),
+        title=title,
+        agent=agent_name,
+        agent_id=agent_id,
+        harness=harness,
+        model=llm_model,
+        workspace=workspace,
+        parent_session=parent_session_id,
+        root_session=root_conversation_id,
         settings=settings,
     )
 
@@ -289,12 +402,12 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
 
     if item_type == "message":
         role = payload.get("role")
+        # The blocks stay in ``raw``; ``text`` is the reading.
         return TranscriptEntry(
             **base,
             role="assistant" if role == "assistant" else "user",
             kind="message",
             text=_blocks_text(payload.get("content")),
-            content=payload.get("content"),
             agent=payload.get("model"),
             meta=bool(payload.get("is_meta")),
             interrupted=bool(payload.get("interrupted")),
@@ -330,12 +443,13 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
                 if payload.get("encrypted_content")
                 else _SEALED_REASONING_WITHHELD
             )
+        # Readable reasoning blocks stay in ``raw``; ``sealed`` says whether
+        # they are there to read.
         return TranscriptEntry(
             **base,
             role="assistant",
             kind="reasoning",
             text=_blocks_text(payload.get("summary")),
-            content=content if readable else None,
             agent=payload.get("model"),
             sealed=not readable,
             sealed_reason=sealed_reason,

@@ -83,20 +83,34 @@ def test_header_names_schema_and_session() -> None:
     assert "parent_session" not in line
 
 
+def test_header_settings_track_the_stored_overrides_the_create_route_accepts() -> None:
+    """Every stored override that is a setting is exported, and every exported
+    setting is something ``POST /v1/sessions`` can re-apply on import."""
+    from omnigent.export.transcript import _NON_SETTING_OVERRIDES, _SETTING_KEYS
+    from omnigent.server.schemas import SessionCreateRequest
+    from omnigent.stores.conversation_store.overrides import SESSION_OVERRIDE_KEYS
+
+    exported = set(_SETTING_KEYS)
+    assert exported >= set(SESSION_OVERRIDE_KEYS) - _NON_SETTING_OVERRIDES
+    assert exported <= set(SessionCreateRequest.model_fields)
+
+
 # ── Entry mapping ───────────────────────────────────────────
 
 
-def test_message_entry_keeps_text_and_raw_blocks() -> None:
+def test_message_entry_keeps_text_and_leaves_the_blocks_to_raw() -> None:
     entry = entry_from_item(_assistant("hello"), turn=1, seq=2)
     line = json.loads(entry.to_line())
 
     assert line["kind"] == "message"
     assert line["role"] == "assistant"
     assert line["text"] == "hello"
-    assert line["content"] == [{"type": "output_text", "text": "hello"}]
     assert line["agent"] == "analyst"
     assert line["time"] == "2023-11-14T22:13:21Z"
     assert "sealed" not in line
+    # Nothing is stored twice: the blocks live in ``raw`` only.
+    assert "content" not in line
+    assert line["raw"]["content"] == [{"type": "output_text", "text": "hello"}]
 
 
 def test_every_entry_carries_the_stored_payload_without_the_envelope() -> None:
@@ -186,7 +200,8 @@ def test_readable_reasoning_is_not_sealed() -> None:
     entry = entry_from_item(item, turn=1, seq=1)
 
     assert entry.sealed is False
-    assert entry.content == [{"type": "reasoning_text", "text": "full chain"}]
+    assert entry.content is None
+    assert entry.raw["content"] == [{"type": "reasoning_text", "text": "full chain"}]
 
 
 def test_compaction_marks_the_boundary() -> None:
@@ -365,6 +380,40 @@ def test_reader_reports_a_malformed_header_as_a_schema_error() -> None:
 def test_reader_refuses_a_schema_that_is_not_a_string() -> None:
     with pytest.raises(TranscriptSchemaError, match="unsupported transcript schema"):
         read_transcript([json.dumps({"schema": ["omnigent.transcript/1"], "session": "x"}) + "\n"])
+
+
+@pytest.mark.parametrize(
+    ("kind", "stray"),
+    [
+        ("tool_call", {"covers_through": "msg_1"}),
+        ("message", {"call_id": "c1"}),
+        ("note", {"tool_output": "x"}),
+        ("compaction", {"sealed": True}),
+    ],
+)
+def test_reader_refuses_a_field_that_does_not_belong_to_the_kind(
+    kind: str, stray: dict[str, Any]
+) -> None:
+    """The kind table is enforced on read, not only described in the docs."""
+    line = {"turn": 1, "seq": 1, "role": "system", "kind": kind, **stray}
+    with pytest.raises(TranscriptSchemaError, match=f"{kind} entry cannot carry"):
+        read_transcript(
+            [
+                json.dumps({"schema": TRANSCRIPT_SCHEMA, "session": "x"}) + "\n",
+                json.dumps(line) + "\n",
+            ]
+        )
+
+
+def test_every_written_entry_satisfies_its_kind_table() -> None:
+    """The writer never produces a line the reader would refuse."""
+    for item in _ROUND_TRIP_ITEMS:
+        read_transcript(
+            [
+                json.dumps({"schema": TRANSCRIPT_SCHEMA, "session": "x"}) + "\n",
+                entry_from_item(item, turn=1, seq=1).to_line() + "\n",
+            ]
+        )
 
 
 def test_reader_ignores_fields_it_does_not_know() -> None:

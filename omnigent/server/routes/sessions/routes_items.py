@@ -14,7 +14,7 @@ from fastapi.responses import StreamingResponse
 
 from omnigent.entities import Conversation
 from omnigent.errors import StaleCursorError
-from omnigent.export import EntryNumbering, header_from_session
+from omnigent.export import EntryNumbering, TranscriptHeader, header_from_conversation
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -64,7 +64,6 @@ from omnigent.server.schemas import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.util.session_lifecycle import title_without_closed_marker
 
 #: Items per page when streaming an export; one store round trip per page.
 _EXPORT_PAGE_SIZE = 500
@@ -142,35 +141,19 @@ def register_items_routes(
             if conv is None:
                 raise _session_not_found()
 
-        def _session_snapshot() -> dict[str, object]:
-            """Resolve the header fields the way the session snapshot does."""
+        def _header() -> TranscriptHeader:
+            """Resolve the agent-derived header fields the way the snapshot does."""
             agent = agent_store.get(conv.agent_id) if conv.agent_id else None
-            # The harness's own report supersedes the spec-derived model, as
-            # on the snapshot's ``llm_model``.
-            llm_model = concrete_reported_model(conv.reported_model) or _resolve_llm_model(
-                conv, agent_store=agent_store, agent_cache=agent_cache
+            return header_from_conversation(
+                conv,
+                agent_name=agent.name if agent is not None else None,
+                harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache),
+                # The harness's own report supersedes the spec-derived model.
+                llm_model=concrete_reported_model(conv.reported_model)
+                or _resolve_llm_model(conv, agent_store=agent_store, agent_cache=agent_cache),
             )
-            return {
-                "id": conv.id,
-                "created_at": conv.created_at,
-                "title": title_without_closed_marker(conv.title),
-                "agent_name": agent.name if agent is not None else None,
-                "agent_id": conv.agent_id,
-                "harness": _resolve_harness(
-                    conv, agent_store=agent_store, agent_cache=agent_cache
-                ),
-                "llm_model": llm_model,
-                "workspace": conv.workspace,
-                "parent_session_id": conv.parent_conversation_id,
-                "root_conversation_id": conv.root_conversation_id,
-                "harness_override": conv.harness_override,
-                "model_override": conv.model_override,
-                "reasoning_effort": conv.reasoning_effort,
-                "cost_control_mode_override": conv.cost_control_mode_override,
-                "terminal_launch_args": conv.terminal_launch_args,
-            }
 
-        header = header_from_session(await asyncio.to_thread(_session_snapshot))
+        header = await asyncio.to_thread(_header)
 
         async def _lines() -> AsyncIterator[str]:
             yield header.to_line() + "\n"

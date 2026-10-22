@@ -98,7 +98,9 @@ def test_session_export_writes_jsonl(tmp_path: Path) -> None:
     assert [e["role"] for e in entries] == ["user", "assistant"]
     assert [(e["turn"], e["seq"]) for e in entries] == [(1, 1), (1, 2)]
     assert entries[1]["text"] == "hi there"
-    assert entries[1]["content"] == [{"type": "output_text", "text": "hi there"}]
+    # The blocks are carried once, in ``raw``.
+    assert "content" not in entries[1]
+    assert entries[1]["raw"]["content"] == [{"type": "output_text", "text": "hi there"}]
     assert entries[1]["agent"] == "my-agent"
 
 

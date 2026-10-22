@@ -20,11 +20,11 @@ entry. Fields that do not apply are omitted, never written as `null`.
 
 ```json
 {"schema":"omnigent.transcript/1","session":"conv_abc123","created":"2026-10-08T09:12:00Z","exported":"2026-10-08T10:00:00Z","title":"Quarterly churn analysis","agent":"analyst","agent_id":"ag_1","harness":"codex","model":"gpt-5.2-codex","workspace":"/work/churn","root_session":"conv_abc123","settings":{"reasoning_effort":"high"}}
-{"turn":1,"seq":1,"time":"2026-10-08T09:12:01Z","role":"user","kind":"message","id":"msg_1","origin_type":"message","raw":{"role":"user","content":[{"type":"input_text","text":"churn by region"}]},"text":"churn by region","content":[{"type":"input_text","text":"churn by region"}]}
+{"turn":1,"seq":1,"time":"2026-10-08T09:12:01Z","role":"user","kind":"message","id":"msg_1","origin_type":"message","raw":{"role":"user"},"text":"churn by region"}
 {"turn":1,"seq":2,"time":"2026-10-08T09:12:03Z","role":"assistant","kind":"reasoning","id":"rs_1","origin_type":"reasoning","raw":{"model":"analyst","summary":[{"type":"summary_text","text":"Group by region"}],"encrypted_content":"gAAAA…"},"text":"Group by region","agent":"analyst","sealed":true,"sealed_reason":"reasoning returned encrypted; only the summary is readable"}
 {"turn":1,"seq":3,"time":"2026-10-08T09:12:04Z","role":"assistant","kind":"tool_call","id":"fc_1","origin_type":"function_call","raw":{"model":"analyst","name":"sql","arguments":"{\"query\": \"select region, count(*) from churn group by 1\"}","call_id":"call_1"},"agent":"analyst","tool":"sql","tool_input":{"query":"select region, count(*) from churn group by 1"},"call_id":"call_1"}
 {"turn":1,"seq":4,"time":"2026-10-08T09:12:05Z","role":"tool","kind":"tool_result","id":"fo_1","origin_type":"function_call_output","raw":{"call_id":"call_1","output":"west,12\neast,7"},"tool_output":"west,12\neast,7","call_id":"call_1"}
-{"turn":1,"seq":5,"time":"2026-10-08T09:12:09Z","role":"assistant","kind":"message","id":"msg_2","origin_type":"message","raw":{"role":"assistant","content":[{"type":"output_text","text":"West churns most."}],"model":"analyst"},"text":"West churns most.","content":[{"type":"output_text","text":"West churns most."}],"agent":"analyst"}
+{"turn":1,"seq":5,"time":"2026-10-08T09:12:09Z","role":"assistant","kind":"message","id":"msg_2","origin_type":"message","raw":{"role":"assistant","model":"analyst"},"text":"West churns most.","agent":"analyst"}
 ```
 
 ### Header
@@ -38,7 +38,7 @@ entry. Fields that do not apply are omitted, never written as `null`.
 | `harness`, `model` | Canonical harness and the model the session last reported running on, falling back to the agent spec's model. |
 | `workspace` | Absolute workspace path on the runner. |
 | `parent_session`, `root_session` | Spawn-tree position for sub-agent sessions. |
-| `settings` | Per-session overrides worth restoring on import: `harness_override`, `model_override`, `reasoning_effort`, `cost_control_mode_override`, `terminal_launch_args`. Only set keys appear. |
+| `settings` | Per-session overrides worth restoring on import: `harness_override`, `model_override`, `reasoning_effort`, `cost_control_mode_override`, `subagent_routing_override`, `terminal_launch_args`. Only set keys appear. |
 
 ### Entries
 
@@ -53,13 +53,17 @@ small and does not grow a case per harness:
 
 | `kind` | Carries | Produced from |
 | --- | --- | --- |
-| `message` | `text` (joined text blocks), `content` (raw blocks), `agent`; `meta` / `interrupted` flags when true | user and assistant messages |
-| `reasoning` | `text` (the summary), `content` when the provider returned readable reasoning, `agent` | reasoning items |
+| `message` | `text` (joined text blocks), `agent`; `meta` / `interrupted` flags when true | user and assistant messages |
+| `reasoning` | `text` (the summary), `agent`; `sealed` is false when `raw.content` holds readable reasoning | reasoning items |
 | `tool_call` | `tool`, `tool_input` (raw JSON; `tool_input_raw` when the arguments were not JSON), `call_id`, `namespace`, `agent` | function calls, provider-hosted tools, `!cmd` terminal input (`tool: "terminal"`) |
 | `tool_result` | `tool_output`, `call_id` (matches its call); `tool: "terminal"` for `!cmd` output (stdout then stderr) | function-call outputs, terminal output |
 | `error` | `text` (message), `code`, `source`, `level` | error items |
 | `compaction` | `text` (the summary the model continued from), `covers_through`, `model`, `token_count` | compaction items |
 | `note` | `note_type` (the producer's event type), `text` when there is a one-line reading | routing decisions, resource events, slash commands, and any item type this version does not know |
+
+The table is enforced on read: a line whose fields do not belong to its `kind`
+(a `tool_call` with `covers_through`, a `message` with `call_id`) is refused
+with the same error as an unknown schema.
 
 Two fields appear on every entry for the benefit of `session import`, and
 readers may ignore both. `origin_type` names the Omnigent item type the entry
@@ -69,6 +73,13 @@ stripped. The readable fields above summarize; `raw` is complete, so an import
 restores fields the summary leaves out: a message's `user_authored` flag, an
 error's `title` / `cause` / `remediation`, a compaction's `compacted_messages`,
 a reasoning item's `encrypted_content`.
+
+Nothing is stored twice. A readable field only ever holds a *reading* of the
+payload (joined text, a parsed tool input, a one-line note), never a copy of a
+`raw` value: message and reasoning content blocks appear in `raw` alone, and a
+`content` field is accepted only on a hand-written entry that has no `raw`. The
+size cost of `raw` is therefore one copy of each item plus the short readings,
+not two copies of the content.
 
 ### Sealed entries
 
@@ -113,9 +124,9 @@ so a compaction's `covers_through` still names the source session's item; the
 importing server treats that boundary as stale and compacts afresh when needed.
 
 A file whose entries lack `raw` (one written by hand, or trimmed) is rebuilt
-from the readable fields instead: a text-only message becomes one text block,
-sealed reasoning comes back as summary only, and terminal output is kept as
-stdout.
+from the readable fields instead: a message's `content` blocks are used when
+present, else its `text` becomes one block; sealed reasoning comes back as
+summary only; terminal output is kept as stdout.
 
 Files written before this schema (`record_type: "session_meta"` / `"item"`
 lines) are still accepted by `session import`. Scripts that parsed those

@@ -1488,6 +1488,9 @@ async function isApiErrorEnvelope(res: Response): Promise<boolean> {
  * The first line is the session metadata (`record_type: "session_meta"`),
  * every following line one committed item (`record_type: "item"`) in
  * chronological order. `omnigent session import` still reads this shape.
+ *
+ * @deprecated Compatibility shim for servers older than the `/export` route
+ * (added in 0.20.0). Remove in 0.22.0, when those servers are out of support.
  */
 async function exportSessionTranscriptLegacy(sessionId: string): Promise<string> {
   const metaParams = new URLSearchParams({

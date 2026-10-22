@@ -11,7 +11,8 @@ SESSION_OVERRIDES_MAX_LENGTH = 512
 
 # Per-session config overrides packed into the ``conversations.session_overrides``
 # JSON blob. Order is fixed so the encoded object is stable across writes.
-_SESSION_OVERRIDE_KEYS = (
+# Public so the session export can carry every override without its own list.
+SESSION_OVERRIDE_KEYS: tuple[str, ...] = (
     "reasoning_effort",
     "model_override",
     "reported_model",
@@ -22,6 +23,7 @@ _SESSION_OVERRIDE_KEYS = (
     # with view-level collaborators; absent (SQL NULL blob key) otherwise.
     "share_workspace_files",
 )
+_SESSION_OVERRIDE_KEYS = SESSION_OVERRIDE_KEYS
 
 
 def encode_session_overrides(overrides: dict[str, str | None]) -> str | None:
