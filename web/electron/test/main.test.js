@@ -773,6 +773,8 @@ describe("Arca extend IPC", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
+        // Chrome cookie import is macOS-only: the v10 decryptor needs Keychain.
+        chromeCookieImport: process.platform === "darwin",
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -4166,6 +4168,8 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
+        // Chrome cookie import is macOS-only: the v10 decryptor needs Keychain.
+        chromeCookieImport: process.platform === "darwin",
       },
     );
   });

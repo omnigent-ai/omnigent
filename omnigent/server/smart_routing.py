@@ -614,7 +614,7 @@ class LLMRoutingClient:
             # INFO; the chosen model is logged by the caller either way.
             _logger.debug("LLMRoutingClient: raw response: %s", text[:500])
             verdict = json.loads(text)
-        except Exception as exc:  # noqa: BLE001  # fail-open
+        except Exception as exc:  # fail-open
             _logger.warning("LLMRoutingClient: judge call failed", exc_info=True)
             self.last_error = f"routing judge call failed: {failure_detail(exc)}"
             return None
@@ -694,7 +694,7 @@ def _config_bearer(
     """
     try:
         headers = config.authenticate()
-    except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+    except Exception:  # auth failure degrades to unauthenticated
         _logger.warning(
             "ExternalRoutingClient: could not resolve auth from %s", label, exc_info=True
         )
@@ -1751,7 +1751,7 @@ class ExternalRoutingClient:
         """Call the injected provider for this request's auth headers."""
         try:
             headers = self._auth_provider() if self._auth_provider is not None else None
-        except Exception:  # noqa: BLE001 — a caller with no credential still routes
+        except Exception:  # a caller with no credential still routes
             _logger.warning(
                 "ExternalRoutingClient: auth_provider raised; sending no credential",
                 exc_info=True,
@@ -1766,7 +1766,7 @@ class ExternalRoutingClient:
                 from databricks.sdk.config import Config
 
                 self._sdk_config = Config(profile=self._databricks_profile)
-            except Exception:  # noqa: BLE001 — auth failure degrades to unauthenticated
+            except Exception:  # auth failure degrades to unauthenticated
                 _logger.warning(
                     "ExternalRoutingClient: could not resolve auth for profile %r",
                     self._databricks_profile,
@@ -1800,7 +1800,7 @@ class ExternalRoutingClient:
                 from databricks.sdk.config import Config
 
                 config = Config()
-            except Exception:  # noqa: BLE001 — no ambient credential is the normal case
+            except Exception:  # no ambient credential is the normal case
                 _logger.debug(
                     "ExternalRoutingClient: no ambient Databricks credential", exc_info=True
                 )

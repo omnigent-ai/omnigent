@@ -979,7 +979,7 @@ def _fetch_pi_model_lists(
     """
     try:
         models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
-    except Exception:  # noqa: BLE001 — HTTP/network failure → empty
+    except Exception:  # HTTP/network failure → empty
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
             "Pi will show only the selected model",
@@ -1001,7 +1001,7 @@ def _fetch_pi_model_lists(
         models = enrich_databricks_model_catalog(
             models, model_catalog.catalog_model_entries("databricks")
         )
-    except Exception:  # noqa: BLE001 — live availability remains authoritative
+    except Exception:  # live availability remains authoritative
         _LOGGER.info(
             "pi-native: could not enrich the live Databricks model list with MLflow metadata",
             exc_info=True,
@@ -1218,7 +1218,7 @@ def _databricks_gateway_pi_provider(
                 claude_models, gpt_models, completions_models, gemini_models = (
                     _fetch_pi_model_lists(workspace_url, list_token)
                 )
-            except Exception:  # noqa: BLE001 — network failure must not break launch
+            except Exception:  # network failure must not break launch
                 _LOGGER.info(
                     "pi-native: could not fetch workspace model list; showing default model only",
                     exc_info=True,
@@ -1499,7 +1499,7 @@ def _live_family_model_entries(
             listing = model_catalog._fetch_openai_compatible_listing(
                 listing_provider, transport=transport
             )
-    except Exception:  # noqa: BLE001 — an unreachable listing must not break the picker
+    except Exception:  # an unreachable listing must not break the picker
         _LOGGER.info(
             "pi-native: could not list models for provider %s; offering only the "
             "configured default",
@@ -1693,7 +1693,7 @@ def resolve_pi_native_provider(
             base_config = _load_config()
         else:
             base_config = config_loader()
-    except Exception:  # noqa: BLE001 — legacy config failures fall back to Pi's own login
+    except Exception:  # legacy config failures fall back to Pi's own login
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
@@ -1855,7 +1855,7 @@ def resolve_pi_native_provider(
         if resolved is not None and unmanaged_prefix_notice is not None:
             resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
-    except Exception:  # noqa: BLE001 — any resolution failure must not break launch
+    except Exception:  # any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
         # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
         # failing the terminal launch.

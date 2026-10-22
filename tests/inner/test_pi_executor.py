@@ -11,7 +11,7 @@ import socket
 import tempfile
 import textwrap
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1008,7 +1008,7 @@ class TestToolServer(unittest.TestCase):
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 stdout, stderr = await proc.communicate()
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -1130,7 +1130,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
@@ -1166,7 +1166,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -1189,7 +1189,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args, *, call_id=None):
                 self.assertEqual(call_id, "call-1")
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 

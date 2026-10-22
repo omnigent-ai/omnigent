@@ -468,7 +468,7 @@ def create_host_tunnel_router(
                                 on_host_connect(host_id, tunnel_owner),
                                 timeout=30.0,
                             )
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             _logger.warning(
                                 "on_host_connect callback timed out for %s",
                                 host_id,

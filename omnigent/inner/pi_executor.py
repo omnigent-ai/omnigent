@@ -1343,7 +1343,7 @@ class _PiRpcSession:
         """
         try:
             return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
 
     def stdout_at_eof(self) -> bool:
@@ -1373,7 +1373,7 @@ class _PiRpcSession:
                 await asyncio.wait_for(
                     self.process.wait(), timeout=_RPC_SESSION_CLOSE_REAP_TIMEOUT_S
                 )
-            except (asyncio.TimeoutError, ProcessLookupError, RuntimeError):
+            except (TimeoutError, ProcessLookupError, RuntimeError):
                 # RuntimeError can happen when the subprocess was created on a
                 # different event loop (e.g. test fixtures that call close() in
                 # a fresh loop).  Fall back to synchronous kill.
@@ -2417,7 +2417,7 @@ class PiExecutor(Executor):
                 workspace_url,
                 self._databricks_token,
             )
-        except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
+        except Exception:  # catalog outage uses conservative routing
             logger.warning(
                 "Pi could not fetch Databricks model metadata; "
                 "the picker will show only the selected model",
@@ -2431,7 +2431,7 @@ class PiExecutor(Executor):
                 model_catalog.catalog_model_entries,
                 "databricks",
             )
-        except Exception:  # noqa: BLE001 — live availability remains authoritative
+        except Exception:  # live availability remains authoritative
             logger.info(
                 "Pi could not enrich the live Databricks model list with MLflow metadata",
                 exc_info=True,
@@ -2646,7 +2646,7 @@ class PiExecutor(Executor):
                 {"type": "get_available_thinking_levels", "id": "thinking_levels"},
                 "get_available_thinking_levels",
             )
-        except Exception:  # noqa: BLE001 — a probe failure must not sink the turn
+        except Exception:  # a probe failure must not sink the turn
             logger.debug("PiExecutor: get_available_thinking_levels failed", exc_info=True)
             return None
         data = response.get("data") if response else None

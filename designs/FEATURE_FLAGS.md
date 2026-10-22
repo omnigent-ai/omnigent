@@ -28,6 +28,7 @@ lifecycle metadata.
 
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
+| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI flag reserved for the automation rollout. Defining and exposing the flag does not change scheduling behavior by itself. |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |

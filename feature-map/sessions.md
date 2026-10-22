@@ -92,7 +92,10 @@ the header menu), and each place is a separate entry point.
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
-  per-tab.
+  per-tab. On macOS the browser toolbar can also import the current site's
+  cookies from a local Chrome profile into that same session jar (Site scope
+  picks the host or a parent domain); the copy is in-memory and never written
+  back to Chrome.
 - `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps
   drafts and board state; resize, focus, and close controls adjust the split.
@@ -675,7 +678,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
-  tabs; all should be signed out.
+  tabs; all should be signed out. Chrome cookie import needs a real Keychain and
+  Chrome profile, so it is manual: sign into a site in Chrome, open that site in
+  the pane, click the cookie button, confirm the native prompt, and check the
+  page is signed in while an unrelated site in the same session is not.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide

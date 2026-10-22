@@ -446,6 +446,12 @@ session_title_instructions: |
 Server operators can set the same key in the YAML passed to
 `omnigent server --config`.
 
+Claude Code sessions generate titles with the `haiku` model alias. If that
+model answers the message instead of returning a title, set
+`OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL` to another Claude model alias, such as
+`sonnet`, in the environment of the `omnigent` or `omnigent host` process that
+runs the session.
+
 </details>
 
 ### 3. Choose & switch models

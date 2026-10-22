@@ -520,7 +520,7 @@ def test_workflows_connect_selection_to_jobs():
     matrix = next(
         step for step in workflows["e2e"]["jobs"]["setup"]["steps"] if step.get("id") == "matrix"
     )
-    assert matrix["env"]["NUM_SHARDS"] == "4"
+    assert matrix["env"]["NUM_SHARDS"] == "8"
     jobs = workflows["ci"]["jobs"]
     sidecar_cache = next(
         step for step in jobs["codex-parity"]["steps"] if step.get("id") == "sidecar-cache"
@@ -766,8 +766,8 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     )
 
 
-_E2E_SHARDS = [f"E2E Tests (shard {index}/4)" for index in range(4)] + [
-    f"E2E Tests (shard {index}/2)" for index in range(2)
+_E2E_SHARDS = [
+    f"E2E Tests (shard {index}/{count})" for count in (2, 4, 8) for index in range(count)
 ]
 
 
@@ -776,14 +776,14 @@ def _gate_snapshot(
     e2e_runs: tuple[tuple[str, str], ...] = (("completed", "2026-10-19T10:00:00Z"),),
     failed: str | None = None,
 ) -> dict[str, Any]:
-    """One API snapshot in which only ``E2E Tests (shard 1/4)`` may be unfinished.
+    """One API snapshot in which only ``E2E Tests (shard 7/8)`` may be unfinished.
 
     :param shard_status: Status of that shard's check run.
     :param e2e_runs: ``(status, created_at)`` for each E2E Tests workflow run.
     :param failed: A required check to report as completed with a failure.
     """
     checks = dict.fromkeys(["DCO", "Pre-commit checks", *_E2E_SHARDS], "completed")
-    checks["E2E Tests (shard 1/4)"] = shard_status
+    checks["E2E Tests (shard 7/8)"] = shard_status
     runs = [
         {
             "name": name,
@@ -831,11 +831,19 @@ def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     assert "All required checks green" in process.stdout
 
 
+@pytest.mark.parametrize("shard_id", range(8))
+def test_merge_gate_blocks_each_failed_eight_shard_check(tmp_path, shard_id):
+    name = f"E2E Tests (shard {shard_id}/8)"
+    process = _run_merge_gate(tmp_path, [_gate_snapshot("completed", failed=name)])
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert name in (tmp_path / "gate-output").read_text()
+
+
 def test_merge_gate_reports_red_after_the_lag_rereads_run_out(tmp_path):
     process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress")])
     assert process.returncode == 1, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 6
-    assert "E2E Tests (shard 1/4)" in (tmp_path / "gate-output").read_text()
+    assert "E2E Tests (shard 7/8)" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(

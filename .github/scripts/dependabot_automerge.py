@@ -13,6 +13,7 @@ import re
 import subprocess
 import zipfile
 import zlib
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from pathlib import Path
 from urllib.parse import urlencode
@@ -187,16 +188,57 @@ def required_workflows(candidate: dict) -> set[str]:
     return workflows
 
 
-def require_reports(repository: str, candidate: dict) -> None:
+def require_merge_ready(repository: str, candidate: dict, mode: str) -> None:
     head = candidate["head"]
     # Merge Ready is a commit status, unlike the workflow job check runs.
     statuses = paginated(f"repos/{repository}/commits/{head}/statuses")
     merge_ready = [status for status in statuses if status["context"] == "Merge Ready"]
-    require(
-        bool(merge_ready)
-        and max(merge_ready, key=lambda status: status["id"])["state"] == "success",
-        "Waiting for successful Merge Ready status",
-    )
+    if merge_ready and max(merge_ready, key=lambda status: status["id"])["state"] == "success":
+        return
+    if mode == "merge":
+        require_current_candidate(repository, candidate["number"], candidate)
+        query = urlencode(
+            {
+                "event": "workflow_dispatch",
+                "created": ">=" + (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                "per_page": 100,
+            }
+        )
+        runs = gh_json(
+            ["api", f"repos/{repository}/actions/workflows/merge-ready.yml/runs?{query}"]
+        )
+        require(runs["total_count"] <= 100, "Readiness refresh history is incomplete")
+        title = f"Merge Ready #{candidate['number']} ({head})"
+        attempts = [run for run in runs["workflow_runs"] if run["display_title"] == title]
+        require(
+            all(run["status"] == "completed" for run in attempts),
+            "Merge Ready refresh is already running",
+        )
+        require(len(attempts) < 3, "Merge Ready refresh limit reached for this head in 24 hours")
+        # Cooldown expiry and registry recovery do not emit workflow events.
+        subprocess.run(
+            [
+                "gh",
+                "workflow",
+                "run",
+                "merge-ready.yml",
+                "--repo",
+                repository,
+                "--ref",
+                "main",
+                "-f",
+                f"pr={candidate['number']}",
+                "-f",
+                f"sha={head}",
+            ],
+            check=True,
+            env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+        )
+    raise NeedsReview("Waiting for successful Merge Ready status")
+
+
+def require_reports(repository: str, candidate: dict) -> None:
+    head = candidate["head"]
     for name in (*REPORT_CHECKS, *candidate["checks"]):
         latest = latest_check(repository, head, name)
         require(
@@ -428,9 +470,10 @@ def sweep(repository: str, mode: str) -> None:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
+            require_approval(repository, decision, mode)
             refresh_failed_gates(repository, decision, mode)
             require_reports(repository, decision)
-            require_approval(repository, decision, mode)
+            require_merge_ready(repository, decision, mode)
             if mode == "merge":
                 require_current_candidate(repository, number, decision)
                 # No --admin or queued --auto: GitHub enforces required checks

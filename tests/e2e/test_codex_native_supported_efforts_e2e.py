@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import time
+import tomllib
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -27,7 +28,6 @@ from typing import Any
 
 import httpx
 import pytest
-import tomllib
 
 from omnigent.harnesses.codex_native.app_server import client_for_transport
 from omnigent.harnesses.codex_native.bridge import read_bridge_state

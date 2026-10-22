@@ -744,7 +744,7 @@ def _configure_opencode_on_demand() -> None:
             # ucode has no use for the host's launch token; don't hand it over.
             configure_env.pop("OMNIGENT_HOST_TOKEN", None)
             subprocess.run(argv, capture_output=True, timeout=120, env=configure_env)
-    except Exception:  # noqa: BLE001 - best-effort; the caller declines if config is still absent.
+    except Exception:  # best-effort; the caller declines if config is still absent.
         _logger.info("opencode on-demand ucode configure failed", exc_info=True)
 
 

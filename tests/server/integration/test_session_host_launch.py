@@ -338,7 +338,7 @@ async def _expect_no_launch(comm: ApplicationCommunicator, *, budget_s: float) -
                 continue
             if isinstance(decode_host_frame(output["text"]), HostLaunchRunnerFrame):
                 return True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False
     return False
 
@@ -367,7 +367,7 @@ async def _wait_for_launch(
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
                 return frame
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return None
     return None
 
@@ -417,7 +417,7 @@ async def _answer_runner_status_then_wait_for_launch(
                 )
             elif isinstance(frame, HostLaunchRunnerFrame):
                 return frame
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return None
     return None
 

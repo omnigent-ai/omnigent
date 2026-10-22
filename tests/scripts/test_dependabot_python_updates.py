@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import tomllib
 
 import pytest
-import tomllib
 
 from tests.scripts.test_dependabot_automerge import (
     LOCK,

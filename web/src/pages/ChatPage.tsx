@@ -2579,6 +2579,7 @@ function ComposerImpl(
     onPaste,
     clearError,
     clear: clearAttachments,
+    accept: fileAccept,
   } = useComposerAttachments({
     onAccepted: () => {
       dirtyRef.current = true;
@@ -3523,7 +3524,7 @@ function ComposerImpl(
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+        accept={fileAccept}
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {

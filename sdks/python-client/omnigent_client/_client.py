@@ -78,15 +78,15 @@ class OmnigentClient:
 
         async with OmnigentClient(base_url="http://localhost:8080") as client:
             result = await client.query(model="archer", input="hello")
-            print(result.text)        # the assistant's reply
-            print(result.files)       # any files the agent produced
+            print(result.text)  # the assistant's reply
+            print(result.files)  # any files the agent produced
 
     Streaming::
 
         stream = await client.query(model="archer", input="hi", stream=True)
         async for chunk in stream:
             print(chunk, end="", flush=True)
-        print(stream.files)            # populated after the stream ends
+        print(stream.files)  # populated after the stream ends
 
     Multi-turn conversation::
 
@@ -247,13 +247,17 @@ class OmnigentClient:
 
             from omnigent_client import tool
 
+
             @tool
             def get_time() -> str:
                 '''Return the current time.'''
                 return datetime.now().isoformat()
 
+
             result = await client.query(
-                model="archer", input="what time?", tools=[get_time],
+                model="archer",
+                input="what time?",
+                tools=[get_time],
             )
 
         Creates a single-turn session internally. For multi-turn

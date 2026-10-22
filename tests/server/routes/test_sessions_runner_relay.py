@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -3911,3 +3912,76 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [True, False], ids=["host-offline", "host-online"])
+async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    held: bool,
+) -> None:
+    """
+    A relay that loses a mid-turn runner whose host went offline does not fail it.
+
+    The runner's disconnect task holds that turn until the host returns, so
+    the relay records ``held_host_offline`` and publishes no failure. Otherwise
+    the turn fails as before.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    probed: list[tuple[str, str]] = []
+
+    async def probe(runner_id: str, session_id: str) -> bool:
+        probed.append((runner_id, session_id))
+        return held
+
+    monkeypatch.setattr(orchestration, "_relay_turn_held_for_host", probe)
+    caplog.set_level(logging.INFO)
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    frames = ['data: {"type": "session.status", "status": "running"}\n\n']
+    fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
+    store = _RecordingLabelStore()
+    session_id = "2f3e4d5c6b7a8998a7b6c5d4e3f2a1b0"
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_host_offline",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert probed == [("runner_host_offline", session_id)]
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        )
+        error = sessions_module._last_task_error_from_labels(store.labels.get(session_id, {}))
+        if held:
+            assert record.attributes["decision"] == "held_host_offline"
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            assert error is None
+        else:
+            assert record.attributes["decision"] == "failed_mid_turn"
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

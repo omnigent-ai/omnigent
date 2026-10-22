@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from omnigent_client import SessionsNamespace
 
 logger = logging.getLogger(__name__)
+REMOTE_LAUNCH_MESSAGE = "Waiting for this machine to start your agent..."
 
 
 def no_online_runner_message() -> str:
