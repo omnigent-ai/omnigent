@@ -19,6 +19,7 @@ from tests._helpers.polling import poll_until
 from tests._helpers.session import bundle_files, post_session_bundle
 
 _INSTRUCTIONS = "OMNI_PI_AUTHORED_ROLE: act as the chief of staff."
+_USER_ADDITION = "OMNI_PI_USER_ADDITION: keep replies concise."
 _OBSERVER = """const fs = require('fs');
 module.exports = function(pi) {
   pi.on('session_start', (_event, ctx) => {
@@ -70,7 +71,11 @@ def _wait_for_catalog(client: httpx.Client, session_id: str) -> dict:
 
 @pytest.mark.parametrize(
     ("context_files", "prompt_mode", "terminal_args"),
-    [(None, None, []), (False, "replace", []), (None, None, ["--no-approve"])],
+    [
+        (None, None, []),
+        (False, "replace", ["--append-system-prompt", _USER_ADDITION]),
+        (None, None, ["--no-approve"]),
+    ],
     ids=["default", "replace-no-context", "untrusted-project"],
 )
 def test_cold_resume_preserves_model_and_prompt_settings(
@@ -170,6 +175,9 @@ os_env:
             poll_until(lambda: prompts.exists(), timeout_s=30, interval_s=0.2)
             first_prompt = json.loads(prompts.read_text().splitlines()[0])
             assert first_prompt["prompt"].count(_INSTRUCTIONS) == 1
+            assert first_prompt["prompt"].count(_USER_ADDITION) == (
+                _USER_ADDITION in terminal_args
+            )
             project_trusted = "--no-approve" not in terminal_args
             assert (_BASE_MARKER in first_prompt["prompt"]) is (
                 prompt_mode != "replace" and project_trusted
@@ -239,6 +247,9 @@ os_env:
             resumed_prompt = json.loads(prompts.read_text().splitlines()[-1])
             assert resumed_prompt["pid"] != first_prompt["pid"]
             assert resumed_prompt["prompt"].count(_INSTRUCTIONS) == 1
+            assert resumed_prompt["prompt"].count(_USER_ADDITION) == (
+                _USER_ADDITION in terminal_args
+            )
             assert ("coding assistant" in resumed_prompt["prompt"].lower()) is (
                 prompt_mode != "replace"
             )

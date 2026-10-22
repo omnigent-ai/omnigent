@@ -297,7 +297,8 @@ Cross-harness journeys:
   after the project file is removed; no explicit append arguments are supplied.
   An explicit `--no-approve` keeps the global file and excludes the project file.
   Context follows its setting, and replacement excludes built-in/SYSTEM.md and
-  APPEND_SYSTEM.md prompts. The selected model survives. No model call is made.
+  APPEND_SYSTEM.md prompts while preserving explicit user append input at launch
+  and resume. The selected model survives. No model call is made.
   Run with the CI-pinned Pi executable:
 
   ```sh
@@ -305,8 +306,8 @@ Cross-harness journeys:
   ```
 
   Explicit append inputs, trust overrides, missing files and replacement
-  precedence are covered by
-  `tests/runner/test_app_native_startup_instructions.py::test_native_pi_preserves_append_discovery`.
+  precedence and inaccessible directories are covered by
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_native_pi_preserves_append_discovery`.
   Raw/resolved/absent specs and repeated user additions are covered by
   `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_launches_required_terminal`.
   `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`

@@ -2388,11 +2388,16 @@ def _build_pi_native_args(
         if project_trusted:
             candidates.append(workspace / ".pi" / "APPEND_SYSTEM.md")
         candidates.append(agent_dir / "APPEND_SYSTEM.md")
-        # Explicit append flags suppress Pi's discovery; retain its selected file.
+        # Our append flag disables Pi's discovery, so pass its selected file explicitly.
         for path in candidates:
-            if path.is_file():
-                args.extend(["--append-system-prompt", str(path.resolve())])
-                break
+            try:
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+            except OSError:
+                continue
+            args.extend(["--append-system-prompt", str(resolved)])
+            break
     args.extend(
         pi_prompt_args(str(instructions_path) if instructions_path else None, system_prompt_mode)
     )
@@ -2605,7 +2610,7 @@ async def _auto_create_pi_terminal(
     from omnigent.harnesses.pi_native.bridge import extension_path as pi_extension_path
     from omnigent.harnesses.pi_native.credentials import (
         PI_CODING_AGENT_DIR_ENV_VAR,
-        _global_pi_agent_dir,
+        global_pi_agent_dir,
     )
     from omnigent.harnesses.pi_native.main import resolve_pi_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -2769,9 +2774,7 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 provider_args.extend(["--model", own_login_model])
-    agent_dir = Path(
-        pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or _global_pi_agent_dir()
-    ).expanduser()
+    agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir()).expanduser()
     if not agent_dir.is_absolute():
         agent_dir = launch_config.workspace / agent_dir
     pi_args = _build_pi_native_args(
