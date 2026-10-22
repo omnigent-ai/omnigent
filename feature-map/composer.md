@@ -51,6 +51,11 @@ and steers messages while the agent is busy.
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI.
+- `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
+  suggestions with a read-only list of MCP servers enabled for that session and
+  links to harness Settings with the session’s host preselected. Host-native entries are limited to the
+  active harness, and a host lookup failure leaves known agent entries visible.
+  It is absent before a session starts and from side chat.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -94,6 +99,11 @@ and steers messages while the agent is busy.
   waiting for the check. Refresh is explicit; launch needs another submit after
   renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
   CLI not installed.
+- `launch-action-required`: while a managed launch needs the user to do
+  something, such as an Arclet waiting for its owner's dbcert, the session's chat
+  transcript shows a yellow banner with the deployment's instructions. Provisioning
+  continues, and the banner leaves when the launch moves on. Dismissing hides
+  only that warning; a later one shows again.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -123,6 +133,9 @@ and steers messages while the agent is busy.
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- Select `/mcp` to replace the suggestions with the MCP servers enabled for the
+  session. An empty list points to Settings; the command is absent on the
+  new-session composer.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
@@ -153,6 +166,11 @@ and steers messages while the agent is busy.
   alone must not open the browser, and renewal alone must not create a sandbox.
   While **Checking laptop credentials…** is visible, **Skip** starts that launch
   without waiting for verification or opening sign-in. Later launches check again.
+- On a deployment whose launches report that the user needs to act, such as
+  Databricks' managed Arclets, start a managed session whose launch needs you,
+  e.g. an Arclet whose owner's dbcert hasn't arrived. The session's chat
+  transcript keeps showing **Provisioning sandbox…** and adds a yellow banner
+  saying what to do. The terminal view doesn't show it.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
@@ -343,6 +361,16 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
+- **`session-mcp-status`, in-session composer:** component coverage lives in
+  `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
+  select `/mcp`, and expect the effective MCP names and descriptions under
+  **Enabled for this session**. Repeat with no MCPs and expect the empty state
+  and Settings link; confirm `/mcp` is absent on the landing page and side chat.
+  Native host entries must match the active harness; a host error is shown
+  without hiding MCPs declared by the bound session agent. While the host loads,
+  its loading status stays visible alongside agent entries; a session without a
+  known host shows unavailable status rather than an empty inventory. Click
+  **Go to Settings** and confirm the session’s harness and host are selected.
 - **`codex-plugin-skills`, both composers:**
   `tests/e2e_ui/chat/test_codex_plugin_skills.py::test_plugin_skill_in_both_composers_after_inventory_failure`
   installs an enabled local plugin using the real Codex CLI, moves away its
@@ -442,6 +470,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/shell/NewChatDialog.test.tsx` and
   `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
   results after skipping, retry, dismissal, check errors, and older shells.
+- **`launch-action-required`, session chat transcript:**
+  `tests/browser_ui/chat/test_status_indicators.py::test_action_banner_follows_the_launch`
+  shows the snapshot's instructions in the banner and clears it when the stream
+  moves on. Component tests in `web/src/pages/ChatIndicators.test.tsx` cover
+  dismissals, and
+  `tests/server/integration/test_host_session_binding.py::test_managed_launch_action_required_reaches_snapshot_and_stream`
+  covers the server. Nothing in this repo emits the stage, so a live check needs
+  a deployment that does.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the
@@ -462,6 +498,9 @@ Other connection providers alone do not enable the managed MCP picker.
   certificate instead; refreshing it does not prove new-session gating works.
   Skip bypasses only this launch's check; it does not renew credentials or
   guarantee that sandbox authentication will succeed.
+- The launch action banner appears only on deployments whose launch code
+  reports it; Omnigent's own sandbox providers never do. Its text comes from the
+  deployment, so check the wording there rather than in the web UI.
 - Session choices and server-stored project defaults are separate from local
   YAML and the shared-preference foundation; see
   [Preferences and config defaults](./preferences.md) for those boundaries.

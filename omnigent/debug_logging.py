@@ -45,6 +45,8 @@ from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.version import VERSION
 
+CAPTURED_STACK_TRACE_FIELD = "captured_stack_trace"
+
 # ── environment contract ────────────────────────────────────────────────────
 # The insert endpoint carries the table (in its path) and the workspace id (in
 # its host), so only four values are needed. See config_from_env.
@@ -558,7 +560,7 @@ def debug_event(
 def _stack_trace(record: logging.LogRecord) -> str | None:
     if record.exc_info:
         return "".join(traceback.format_exception(*record.exc_info))
-    return record.exc_text or None
+    return record.exc_text or getattr(record, CAPTURED_STACK_TRACE_FIELD, None)
 
 
 def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
@@ -1497,7 +1499,7 @@ def attach_debug_log_sink(
                     _active_sink = ZerobusLogHandler(config, source)
                 else:
                     return
-            except Exception:  # noqa: BLE001 — the sink must never break logging setup
+            except Exception:  # the sink must never break logging setup
                 # Handler construction must not take down process logging setup.
                 _logger.warning("debug-log sink disabled: handler init failed", exc_info=True)
                 return
@@ -1572,7 +1574,7 @@ def attach_sse_file_sink(*, source: str, level: int) -> None:
         log_dir = process_log_dir(source)
         try:
             handler = SseFileHandler(log_dir, source)
-        except Exception:  # noqa: BLE001 — the sink must never break logging setup
+        except Exception:  # the sink must never break logging setup
             _logger.warning("SSE file sink disabled: handler init failed", exc_info=True)
             return
         handler.setLevel(level)

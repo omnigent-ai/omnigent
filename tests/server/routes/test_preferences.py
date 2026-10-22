@@ -8,6 +8,7 @@ import pytest
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.preference_requests import PreferencePolicy
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -28,15 +29,60 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
         AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
     ]
     provider = None if auth_mode == "disabled" else UnifiedAuthProvider(source="header")
+    enabled = True
+    policy = PreferencePolicy(enabled=lambda: enabled)
     # Exercise positional auth while keeping preference_store keyword-only.
     app = (
-        create_app(*stores, *([None] * 6), provider, preference_store=store)
+        create_app(
+            *stores, *([None] * 6), provider, preference_store=store, preference_policy=policy
+        )
         if auth_mode == "positional"
-        else create_app(*stores, auth_provider=provider, preference_store=store)
+        else create_app(
+            *stores, auth_provider=provider, preference_store=store, preference_policy=policy
+        )
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
+        profile_path = "/v1/preferences/configuration"
+        if auth_mode != "disabled":
+            assert (await client.get(profile_path)).status_code == 401
+        profile_headers = (
+            {} if auth_mode == "disabled" else {"X-Forwarded-Email": "alice@example.test"}
+        )
+        profile = (await client.get(profile_path, headers=profile_headers)).json()
+        profile_save = {
+            "identity": profile["identity"],
+            "expected_revision": 0,
+            "configuration": {"model": "imported"},
+        }
+        assert (
+            await client.put(profile_path, headers=profile_headers, json=profile_save)
+        ).status_code == 200
+        assert (await client.get(profile_path, headers=profile_headers)).json()["configuration"][
+            "model"
+        ] == "imported"
+        assert (
+            await client.put(
+                profile_path,
+                headers=profile_headers,
+                json={**profile_save, "configuration": {"providers": {"token": "never-store"}}},
+            )
+        ).status_code == 422
+        if auth_mode != "disabled":
+            assert (
+                await client.put(
+                    profile_path,
+                    headers={"X-Forwarded-Email": "bob@example.test"},
+                    json=profile_save,
+                )
+            ).status_code == 403
+        enabled = False
+        assert (await client.get(profile_path, headers=profile_headers)).status_code == 404
+        assert (
+            await client.put(profile_path, headers=profile_headers, json=profile_save)
+        ).status_code == 404
+        enabled = True
         path = "/v1/preferences/shared"
         if auth_mode != "disabled":
             assert (await client.get(path)).status_code == 401
@@ -134,4 +180,26 @@ async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch
 
 
 async def test_preferences_not_mounted_by_default(client):
+    assert (await client.get("/v1/preferences/configuration")).status_code == 404
     assert (await client.get("/v1/preferences/shared")).status_code == 404
+
+
+async def test_configuration_body_limit_before_parsing(db_uri):
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.preferences import create_preferences_router
+
+    app = FastAPI()
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="bounded-test")
+    app.include_router(create_preferences_router(store))
+
+    async def chunks():
+        yield b" " * 9000
+        yield b" " * 9000
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.put("/preferences/configuration", content=chunks())
+        assert response.status_code == 413
+        assert store.read_configuration(user_id=None).configuration is None

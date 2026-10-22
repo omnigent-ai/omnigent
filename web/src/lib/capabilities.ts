@@ -66,7 +66,9 @@ export type FeatureKey =
   | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
-  | "grid_sessions_display_ui";
+  | "grid_sessions_display_ui"
+  | "automations_v2"
+  | "splittable_terminal_view_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;

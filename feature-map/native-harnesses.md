@@ -10,6 +10,8 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
+  authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -74,6 +76,14 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Agent instructions (Pi native):** launch an agent whose spec contains inline
+instructions or references a bundled instruction file. Reopen its terminal and
+check the same authored role is present once. For a custom Pi-native agent,
+`executor.context_files: false` excludes automatic workspace/global notes, and
+`executor.system_prompt_mode: replace` replaces Pi's base prompt. Explicit agent
+instructions remain; these options do not restrict file access or extensions.
+The `omnigent pi` wrapper also appends its own startup instructions.
 
 **Working status:** watch the session's Chat indicator after sending from the
 new-session composer, an existing-session composer, or the agent terminal.
@@ -277,6 +287,33 @@ Cross-harness journeys:
   before a terminal starts. The supported release must answer terminal and API
   input through the real Pi process; only model replies are scripted locally.
   Each case owns its stack and saves terminal recordings plus API evidence.
+- **`agent-instructions`, Pi native (own environment):**
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_preserves_model_and_prompt_settings`
+  uploads a spec with a bundled instruction file through a real server, host,
+  runner and Pi terminal. A test-owned extension reads the real system prompt
+  at launch/resume with defaults, replacement/no-context and untrusted-project settings.
+  Authored instructions remain once. Default append mode keeps the project's
+  APPEND_SYSTEM.md at launch and falls back to the active global file on restart
+  after the project file is removed; no explicit append arguments are supplied.
+  An explicit `--no-approve` keeps the global file and excludes the project file.
+  Context follows its setting, and replacement excludes built-in/SYSTEM.md and
+  APPEND_SYSTEM.md prompts while preserving explicit user append input at launch
+  and resume. The selected model survives. No model call is made.
+  Run with the CI-pinned Pi executable:
+
+  ```sh
+  OMNIGENT_PI_PATH=/path/to/pi uv run --no-sync pytest tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py --reruns 0 -q
+  ```
+
+  Explicit append inputs, trust overrides, missing files and replacement
+  precedence and inaccessible directories are covered by
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_native_pi_preserves_append_discovery`.
+  Raw/resolved/absent specs and repeated user additions are covered by
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_launches_required_terminal`.
+  `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
+  checks authored instructions in actual scripted-provider requests before and
+  after a real Pi fork with tool history. These checks do not prove browser
+  launch, OS sandbox access or live-model adherence to the instructions.
 - **`side-chat`, Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
@@ -558,6 +595,23 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
+  vendor model):**
+  `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`
+  interrupts through the runner's real event route, and the next idle settles
+  a sub-agent dispatch as cancelled with its output.
+  `tests/runner/test_native_interrupt_runner.py::test_opencode_interrupt_fallbacks`
+  covers missing native session state and a failed abort. Neither runs
+  OpenCode. With the CLI on `PATH`,
+  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`
+  (opt-in `OMNIGENT_E2E_OPENCODE_NATIVE=1`) checks the abort call against a
+  real server, and the matrix test covers cancelling during startup. No test
+  interrupts a running OpenCode turn: configure an OpenAI-compatible loopback
+  provider that holds the reply open, interrupt once the request arrives, then
+  confirm the session goes idle without turning busy again, a reply released
+  afterwards never appears, and a follow-up in the same session completes. The
+  harness bench does not register opencode-native, so its interrupt probe does
+  not apply.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -683,3 +737,6 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
+- OpenCode accepts an abort even when nothing is running, so an accepted
+  interrupt does not prove a turn was stopped. Check the session state and the
+  model request instead.

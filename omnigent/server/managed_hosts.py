@@ -188,7 +188,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import click
 from fastapi import HTTPException
@@ -522,7 +522,7 @@ def resolve_managed_agent_label(
         return None
     try:
         agent = agent_store.get(agent_id)
-    except Exception:  # noqa: BLE001 — the label is an optimization, never a
+    except Exception:  # the label is an optimization, never a
         # create precondition. Any store failure degrades to an unlabeled runner
         # (the admission policy skips it) rather than 500-ing a create that has
         # already committed and announced the session.
@@ -3700,6 +3700,24 @@ def build_owner_launcher(
     return launcher
 
 
+class SandboxStageObserver(Protocol):
+    """
+    Progress observer for a managed-sandbox launch, e.g. one that publishes
+    each stage to the session's event stream.
+    """
+
+    def __call__(self, stage: str, details: str | None = None) -> None:
+        """
+        Report the stage a launch just entered.
+
+        :param stage: The stage just entered, e.g. ``"cloning"``.
+        :param details: What the user needs to do when *stage* is
+            ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None``
+            otherwise. Once the user has acted, report another stage, or the
+            web UI keeps showing the warning.
+        """
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3708,7 +3726,7 @@ async def launch_managed_host(
     repos: Sequence[RepoWorkspace] = (),
     provider: str | None = None,
     agent_name: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
+    on_stage: SandboxStageObserver | None = None,
     host_id: str | None = None,
 ) -> ManagedHostLaunch:
     """
@@ -3747,10 +3765,11 @@ async def launch_managed_host(
         or ``None`` to leave it unstamped.
     :param on_stage: Progress observer invoked as the launch pipeline
         advances, with the stage just entered: ``"cloning"`` (when
-        *repo* is set) then ``"starting"``. May be called from a
-        worker thread (the sandbox exec steps run via
-        ``asyncio.to_thread``), so it must be thread-safe. ``None``
-        disables progress reporting.
+        *repo* is set) then ``"starting"``. A deployment's own launch
+        code may also report ``"action_required"``, with *details* saying
+        what the user needs to do. May be called from a worker thread
+        (the sandbox exec steps run via ``asyncio.to_thread``), so it
+        must be thread-safe. ``None`` disables progress reporting.
     :param host_id: Id to register the host under — a create's
         ``host_id`` — or ``None`` to mint one. A requested id also makes the
         host route by it (see :func:`host_slice_key_enabled`).
@@ -3802,7 +3821,7 @@ async def relaunch_managed_host(
     host_store: HostStore,
     repos: Sequence[RepoWorkspace] = (),
     agent_name: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
+    on_stage: SandboxStageObserver | None = None,
     slice_key_enabled: bool = False,
 ) -> ManagedHostLaunch:
     """
@@ -3930,7 +3949,7 @@ async def _start_sandbox_host(
     repos: Sequence[RepoWorkspace],
     host_config: dict[str, object] | None,
     agent_name: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
+    on_stage: SandboxStageObserver | None = None,
 ) -> str:
     """Start a host without sending absent optional arguments to legacy launchers."""
     # Gated on the capability, not on the value: start_host is side-effecting and
@@ -4011,7 +4030,7 @@ async def _register_and_start_host(
     sandbox_id: str,
     repos: Sequence[RepoWorkspace] = (),
     agent_name: str | None = None,
-    on_stage: Callable[[str], None] | None = None,
+    on_stage: SandboxStageObserver | None = None,
     keep_host_on_failure: bool = False,
     slice_key_enabled: bool = False,
     owner_credentials: Mapping[str, Callable[[str], Mapping[str, object] | None]] | None = None,
@@ -4282,7 +4301,7 @@ async def resume_managed_host(
     *,
     repos: Sequence[RepoWorkspace] = (),
     force: bool = False,
-    on_stage: Callable[[str], None] | None = None,
+    on_stage: SandboxStageObserver | None = None,
     agent_name: str | None = None,
     slice_key_enabled: bool = False,
 ) -> None:
@@ -4492,7 +4511,7 @@ async def _terminate_sandbox_best_effort(
     try:
         await asyncio.to_thread(launcher.terminate, sandbox_id)
         return True
-    except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
+    except Exception:  # provider cleanup must remain best-effort.
         _logger.warning(
             "Failed to terminate managed sandbox %s (provider=%s) for host %s",
             sandbox_id,

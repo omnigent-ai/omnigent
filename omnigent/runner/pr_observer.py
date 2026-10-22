@@ -333,7 +333,7 @@ def observe_tool_completion(
             source=source,
             observation_id=observation_key(source, call_id, [tool_name, arguments, result]),
         )
-    except Exception:  # noqa: BLE001 — the observer must never change a tool call's result
+    except Exception:  # the observer must never change a tool call's result
         _logger.warning(
             "Failed to record session PRs", extra={"session_id": session_id}, exc_info=True
         )

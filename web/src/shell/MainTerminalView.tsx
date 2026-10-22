@@ -14,15 +14,26 @@
 // shells are opened and created from the rail's tab strip ("+" menu).
 
 import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   AGENT_TERMINAL_IDS,
   findAgentTerminal,
+  isAgentTerminalKey,
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import {
+  reconcileTerminalSplit,
+  resizeTerminalSplit,
+  terminalLayoutGeometry,
+} from "@/lib/terminalSplitLayout";
+import { TerminalSplitDivider } from "./TerminalSplitDivider";
+import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanesStore";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -77,6 +88,8 @@ interface MainTerminalViewProps {
    * server switcher only while this surface is actually frontmost.
    */
   onSurfaceElement?: (element: HTMLElement | null) => void;
+  /** Render the session's saved split panes (the main view only, not grid cells). */
+  splittable?: boolean;
 }
 
 export function MainTerminalView({
@@ -90,8 +103,13 @@ export function MainTerminalView({
   onResume,
   sandboxOffline = false,
   onSurfaceElement,
+  splittable = false,
 }: MainTerminalViewProps) {
-  const { terminals } = useTerminals(conversationId);
+  const {
+    terminals,
+    isFetching: terminalsFetching = false,
+    listCompleteAt = 0,
+  } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
@@ -180,6 +198,71 @@ export function MainTerminalView({
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
+  const serverInfo = useServerInfo();
+  const isMobile = useIsMobileViewport();
+  // Splits are managed only by desktop owners, so only they see them.
+  const splitEnabled =
+    splittable &&
+    !readOnly &&
+    !isMobile &&
+    isFeatureEnabled(serverInfo, "splittable_terminal_view_ui");
+  const savedSplit = useTerminalSplitPanes(conversationId);
+  // A rail-opened shell takes over the view unsplit, and hidden pre-warmed
+  // surfaces attach only the agent pane.
+  const split = splitEnabled && visible && !isShellView ? savedSplit : undefined;
+  // The divider being dragged; applied to the latest saved layout until release.
+  const [drag, setDrag] = useState<{ path: number[]; ratio: number } | null>(null);
+  const panesRef = useRef<HTMLDivElement>(null);
+  useEffect(() => setDrag(null), [savedSplit]);
+
+  // Terminals seen since the list was last empty. A seen terminal that leaves
+  // the list is gone; an unseen one is gone only per a complete runner answer
+  // newer than that reset, since SSE refills the list one terminal at a time.
+  const listGenerationRef = useRef({ conversationId, seen: new Set<string>(), startedAt: 0 });
+  useEffect(() => {
+    if (!splitEnabled) return;
+    let generation = listGenerationRef.current;
+    if (generation.conversationId !== conversationId || terminals.length === 0) {
+      generation = { conversationId, seen: new Set(), startedAt: Date.now() };
+      listGenerationRef.current = generation;
+      if (terminals.length === 0) return;
+    }
+    const liveKeys = new Set(terminals.map(terminalTabKey));
+    const listComplete = !terminalsFetching && listCompleteAt > generation.startedAt;
+    const { seen } = generation;
+    updateTerminalSplit(
+      conversationId,
+      (current) =>
+        current &&
+        reconcileTerminalSplit(current, liveKeys, {
+          liveAgentKey: agentTerminal ? terminalTabKey(agentTerminal) : null,
+          isAgentKey: isAgentTerminalKey,
+          removable: (key) => listComplete || seen.has(key),
+        }),
+    );
+    for (const key of liveKeys) seen.add(key);
+  }, [splitEnabled, terminalsFetching, listCompleteAt, terminals, agentTerminal, conversationId]);
+
+  const focusPane = (key: string) =>
+    updateTerminalSplit(conversationId, (current) =>
+      current && current.focusedKey !== key ? { ...current, focusedKey: key } : current,
+    );
+  const resizePane = (path: number[], ratio: number) =>
+    updateTerminalSplit(conversationId, (current) =>
+      current ? { ...current, layout: resizeTerminalSplit(current.layout, path, ratio) } : current,
+    );
+  const commitDrag = () => {
+    if (drag === null) return;
+    resizePane(drag.path, drag.ratio);
+    setDrag(null);
+  };
+  const singlePaneKey = activeTerminal ? terminalTabKey(activeTerminal) : "";
+  const splitLayout =
+    split && drag ? resizeTerminalSplit(split.layout, drag.path, drag.ratio) : split?.layout;
+  const geometry = terminalLayoutGeometry(splitLayout ?? singlePaneKey);
+  // Saved panes keep rendering while the agent terminal is missing but shells are live.
+  const showPanes = activeTerminal !== null || (split !== undefined && terminals.length > 0);
+
   const setSurfaceElement = useCallback(
     (element: HTMLDivElement | null) => {
       // xterm scrollbars can override inherited visibility. React 18 drops
@@ -205,7 +288,7 @@ export function MainTerminalView({
       className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
-        {activeTerminal === null ? (
+        {!showPanes ? (
           startingUp ? (
             // Passive startup state: same centered geometry as the stopped
             // state so the swap doesn't jump, and nothing actionable — the
@@ -278,33 +361,64 @@ export function MainTerminalView({
                 </button>
               </div>
             )}
-            <div className="min-h-0 flex-1">
-              {activeTerminal && (
-                // Scope the key to the session: agent terminals share a fixed
-                // id across same-shape sessions (e.g. `terminal_claude_main`),
-                // so id alone reuses the xterm mount and shows stale scrollback.
-                <div
-                  key={`${conversationId}:${activeTerminal.id}`}
-                  className="flex h-full flex-col"
-                >
-                  <Suspense fallback={null}>
-                    <TerminalView
-                      sessionId={conversationId}
-                      terminalId={activeTerminal.id}
-                      readOnly={readOnly}
-                      active={visible && active}
-                      directAttachUrl={activeTerminal.directAttachUrl}
-                      onResume={runnerOffline && onResume ? handleResume : undefined}
-                      resumeTarget={resumeTarget}
-                      resumePending={resumePending}
-                      onStateChange={(state) => {
-                        setTerminalConnectionState(activeTerminal.id, state);
-                      }}
-                      onActivity={() => markTerminalActive(activeTerminal.id)}
-                    />
-                  </Suspense>
-                </div>
-              )}
+            <div ref={panesRef} className="relative min-h-0 flex-1">
+              {geometry.panes.map((pane) => {
+                const terminal = terminals.find((t) => terminalTabKey(t) === pane.key);
+                const focused = !split || pane.key === split.focusedKey;
+                return (
+                  // Flat siblings keyed by session+terminal, so splits never remount a live xterm.
+                  <div
+                    key={`${conversationId}:${terminal?.id ?? pane.key}`}
+                    data-terminal-pane={pane.key}
+                    style={{
+                      left: `${pane.left}%`,
+                      top: `${pane.top}%`,
+                      width: `${pane.width}%`,
+                      height: `${pane.height}%`,
+                    }}
+                    className={cn(
+                      "absolute flex flex-col",
+                      split && focused && "ring-1 ring-ring ring-inset",
+                    )}
+                    onFocusCapture={split ? () => focusPane(pane.key) : undefined}
+                  >
+                    {terminal ? (
+                      <Suspense fallback={null}>
+                        <TerminalView
+                          sessionId={conversationId}
+                          terminalId={terminal.id}
+                          readOnly={readOnly}
+                          active={visible && active && focused}
+                          directAttachUrl={terminal.directAttachUrl}
+                          onResume={runnerOffline && onResume ? handleResume : undefined}
+                          resumeTarget={resumeTarget}
+                          resumePending={resumePending}
+                          onStateChange={(state) => {
+                            setTerminalConnectionState(terminal.id, state);
+                          }}
+                          onActivity={() => markTerminalActive(terminal.id)}
+                        />
+                      </Suspense>
+                    ) : (
+                      <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
+                        Terminal unavailable.
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              {split &&
+                geometry.dividers.map((divider) => (
+                  <TerminalSplitDivider
+                    key={divider.path.join(".")}
+                    divider={divider}
+                    containerRef={panesRef}
+                    onResize={(path, ratio, final) =>
+                      final ? resizePane(path, ratio) : setDrag({ path, ratio })
+                    }
+                    onCommit={commitDrag}
+                  />
+                ))}
             </div>
           </>
         )}

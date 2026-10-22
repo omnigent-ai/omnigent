@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { attachmentAccept, validateAttachments } from "@/lib/attachments";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 export interface UseComposerAttachmentsOptions {
@@ -115,14 +115,7 @@ export function useComposerAttachments({
 
   const onPaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-      const pasted: File[] = [];
-      for (const item of items) {
-        if (item.kind !== "file") continue;
-        const file = item.getAsFile();
-        if (file !== null) pasted.push(file);
-      }
+      const pasted = clipboardFiles(e.clipboardData);
       if (pasted.length > 0) {
         e.preventDefault();
         addFiles(pasted);

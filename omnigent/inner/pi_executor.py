@@ -76,6 +76,7 @@ from omnigent.models.pi_model_compatibility import (
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
+from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1211,14 +1212,7 @@ class _PiRpcSession:
             )
         if thinking:
             args.extend(["--thinking", thinking])
-        if system_prompt_mode == "replace":
-            if not system_prompt or not system_prompt.strip():
-                raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
-            # An explicit empty append input suppresses APPEND_SYSTEM.md discovery.
-            args.extend(["--system-prompt", system_prompt, "--append-system-prompt", ""])
-        elif system_prompt:
-            # Keep Pi's tool snippets and default guidance in append mode.
-            args.extend(["--append-system-prompt", system_prompt])
+        args.extend(pi_prompt_args(system_prompt, system_prompt_mode))
         if extra_args:
             args.extend(extra_args)
 
@@ -2417,7 +2411,7 @@ class PiExecutor(Executor):
                 workspace_url,
                 self._databricks_token,
             )
-        except Exception:  # noqa: BLE001 — catalog outage uses conservative routing
+        except Exception:  # catalog outage uses conservative routing
             logger.warning(
                 "Pi could not fetch Databricks model metadata; "
                 "the picker will show only the selected model",
@@ -2431,13 +2425,14 @@ class PiExecutor(Executor):
                 model_catalog.catalog_model_entries,
                 "databricks",
             )
-        except Exception:  # noqa: BLE001 — live availability remains authoritative
+            models = await run_sync_on_thread(
+                enrich_databricks_model_catalog, models, metadata_models
+            )
+        except Exception:  # live availability remains authoritative
             logger.info(
                 "Pi could not enrich the live Databricks model list with MLflow metadata",
                 exc_info=True,
             )
-        else:
-            models = enrich_databricks_model_catalog(models, metadata_models)
         self._gateway_model_entries = tuple(models)
         self._gateway_model_wire_apis = _databricks_model_wire_catalog(models)
         return self._gateway_model_wire_apis
@@ -2646,7 +2641,7 @@ class PiExecutor(Executor):
                 {"type": "get_available_thinking_levels", "id": "thinking_levels"},
                 "get_available_thinking_levels",
             )
-        except Exception:  # noqa: BLE001 — a probe failure must not sink the turn
+        except Exception:  # a probe failure must not sink the turn
             logger.debug("PiExecutor: get_available_thinking_levels failed", exc_info=True)
             return None
         data = response.get("data") if response else None

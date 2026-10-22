@@ -10,6 +10,7 @@ import shutil
 import socket
 import tempfile
 import textwrap
+import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,7 +47,8 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -4129,6 +4131,19 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
 
 def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
     """Pi reuses UC availability and enriches aliases with MLflow limits."""
+    lookup_threads = []
+    vendor_model = ModelInfo(
+        name="gpt-next",
+        provider="openai",
+        supports_reasoning=True,
+        max_input_tokens=400_000,
+        max_output_tokens=128_000,
+    )
+
+    def vendor_models(provider):
+        lookup_threads.append(threading.get_ident())
+        return [vendor_model] if provider == "openai" else []
+
     responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
     entries = (
         ModelEntry(
@@ -4149,27 +4164,24 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
         ) as fetch,
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            return_value=(
-                ModelEntry(
-                    id="databricks-gpt-next",
-                    family="openai",
-                    metadata=ModelMetadata(
-                        context_window=400_000,
-                        max_output_tokens=128_000,
-                    ),
-                ),
-            ),
+            return_value=(),
         ) as enrich,
+        patch(
+            "omnigent.onboarding.providers.get_models",
+            side_effect=vendor_models,
+        ),
     ):
         executor = PiExecutor(gateway=True)
         first = _run(executor._load_gateway_model_wire_apis())
         second = _run(executor._load_gateway_model_wire_apis())
 
+    assert lookup_threads and threading.get_ident() not in lookup_threads
     assert first["databricks-gpt-next"] == responses
     assert second is first
     assert executor._gateway_model_entries is not None
     assert executor._gateway_model_entries[0].metadata.context_window == 400_000
     assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    assert executor._gateway_model_entries[0].metadata.supports(ModelCapability.REASONING) is True
     fetch.assert_called_once_with("https://h.example.com", "tok")
     enrich.assert_called_once_with("databricks")
 
@@ -4194,7 +4206,8 @@ def test_gateway_wire_catalog_failure_is_cached() -> None:
     fetch.assert_called_once_with("https://h.example.com", "tok")
 
 
-def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> None:
+@pytest.mark.parametrize("failure_stage", ["catalog", "vendor_fallback"])
+def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails(failure_stage) -> None:
     """MLflow downtime does not erase workspace-discovered picker models."""
     entries = (
         ModelEntry(
@@ -4215,14 +4228,23 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
         ),
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            side_effect=OSError("offline"),
+            return_value=(),
+            side_effect=OSError("offline") if failure_stage == "catalog" else None,
         ),
+        patch(
+            "omnigent.onboarding.providers.find_catalog_models",
+            side_effect=AttributeError("malformed catalog capabilities"),
+        ) as lookup,
     ):
         executor = PiExecutor(gateway=True)
         wire_catalog = _run(executor._load_gateway_model_wire_apis())
+        assert _run(executor._load_gateway_model_wire_apis()) is wire_catalog
 
     assert wire_catalog["system.ai.gpt-live"] == frozenset({ModelWireAPI.OPENAI_RESPONSES})
     assert executor._gateway_model_entries == entries
+
+    if failure_stage == "vendor_fallback":
+        lookup.assert_called_once_with("system.ai.gpt-live")
 
 
 def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:

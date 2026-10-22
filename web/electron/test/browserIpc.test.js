@@ -382,8 +382,14 @@ describe("browser IPC Arca context", () => {
 
 /** A stub webContents with a navigationHistory (Electron 42) and toggleable
  *  devtools + recorded navigation calls. */
-function makeWebContents({ canBack = false, canForward = false } = {}) {
+function makeWebContents({
+  canBack = false,
+  canForward = false,
+  url = "https://example.com/restored",
+} = {}) {
   const calls = [];
+  // Cookies pushed into the (fake) session by the Chrome import handlers.
+  const cookieCalls = [];
   // Full text of every executeJavaScript call, untruncated — so a test can
   // read the per-enable nonce baked into the injected design-mode script.
   const scripts = [];
@@ -396,6 +402,15 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     calls,
     scripts,
     listeners,
+    cookieCalls,
+    session: {
+      cookies: {
+        set: (cookie) => {
+          cookieCalls.push(cookie);
+          return Promise.resolve();
+        },
+      },
+    },
     navigationHistory: {
       canGoBack: () => canBack,
       canGoForward: () => canForward,
@@ -405,7 +420,7 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     reload: () => calls.push("reload"),
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
-    getURL: () => "https://example.com/restored",
+    getURL: () => url,
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -484,7 +499,15 @@ function makeRegistry(conversationId, webContents) {
 
 /** Register the IPC surface with injectable gate + registry, and capture the
  *  events sent to a fake sender. */
-function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
+function setup({
+  pinned = true,
+  conversationId = "conv_1",
+  webContents,
+  chromeCookieStore,
+  platform = "darwin",
+  confirmCookieImport = async () => true,
+  getWindowForEvent = () => null,
+} = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
   const registry = makeRegistry(conversationId, wc);
@@ -494,6 +517,10 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
     ipcMain,
     isPinnedOriginSender: () => pinned,
     getRegistryForEvent: () => registry,
+    chromeCookieStore,
+    platform,
+    confirmCookieImport,
+    getWindowForEvent,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -538,6 +565,8 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-enable-design-mode",
       "omnigent:browser-disable-design-mode",
       "omnigent:browser-signal-design-result",
+      "omnigent:browser-chrome-cookie-preview",
+      "omnigent:browser-chrome-cookie-import",
     ]) {
       assert.ok(channels.includes(ch), `missing handler: ${ch}`);
     }
@@ -552,6 +581,8 @@ describe("browserIpc — trust gate", () => {
       "omnigent:open-browser-devtools",
       "omnigent:browser-perform-action",
       "omnigent:browser-execute",
+      "omnigent:browser-chrome-cookie-preview",
+      "omnigent:browser-chrome-cookie-import",
     ];
     const results = await Promise.all(
       channels.map((ch) =>
@@ -664,6 +695,361 @@ describe("browserIpc — history navigation", () => {
     const r = await ipcMain.invoke("omnigent:browser-go-back", event, { conversationId: "nope" });
     assert.equal(r.ok, false);
     assert.equal(r.error, "No browser view");
+  });
+});
+
+describe("browserIpc — Chrome cookie import", () => {
+  /** Store stub recording what main hands it (host, profile, target jar). */
+  function stubStore({ scopes } = {}) {
+    const calls = [];
+    return {
+      calls,
+      previewSiteCookies: async (args) => {
+        calls.push({ fn: "preview", args });
+        const offered = scopes ?? [args.host];
+        return {
+          ok: true,
+          host: args.host,
+          scopes: offered,
+          profiles: [
+            {
+              id: "Default",
+              name: "Work",
+              cookieCount: 3,
+              scopes: offered.map((host) => ({ host, cookieCount: 3 })),
+            },
+          ],
+        };
+      },
+      importSiteCookies: async (args) => {
+        calls.push({ fn: "import", args });
+        return {
+          ok: true,
+          host: args.host,
+          profileId: args.profileId,
+          imported: 2,
+          skipped: 1,
+          failed: 0,
+        };
+      },
+    };
+  }
+
+  it("previews using the site derived from the view's URL", async () => {
+    const store = stubStore();
+    const { ipcMain, event } = setup({ chromeCookieStore: store });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.host, "example.com");
+    assert.deepEqual(store.calls[0], { fn: "preview", args: { host: "example.com" } });
+  });
+
+  it("imports into this conversation's own session jar", async () => {
+    const store = stubStore();
+    const { ipcMain, event, wc } = setup({ chromeCookieStore: store });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "EXAMPLE.com",
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.imported, 2);
+    assert.equal(r.skipped, 1);
+    const importCall = store.calls.find((call) => call.fn === "import");
+    assert.equal(importCall.args.host, "example.com");
+    // The store gets the normalized host, never a raw renderer string.
+    assert.equal(importCall.args.scope, "example.com");
+    assert.equal(importCall.args.profileId, "Default");
+    assert.equal(importCall.args.cookiesApi, wc.session.cookies);
+    assert.equal(typeof importCall.args.beforeWrite, "function");
+  });
+
+  it("confirms natively with counts main derived itself", async () => {
+    const store = stubStore();
+    const confirmations = [];
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+      // Ignored: a compromised page must not be able to shrink the count the
+      // user is asked to approve.
+      cookieCount: 1,
+    });
+    assert.equal(r.ok, true);
+    assert.deepEqual(confirmations, [
+      {
+        host: "example.com",
+        scope: "example.com",
+        profileName: "Work",
+        cookieCount: 3,
+        parentWindow: null,
+      },
+    ]);
+  });
+
+  it("parents the native confirmation to the sender's window", async () => {
+    const store = stubStore();
+    const confirmations = [];
+    const parentWindow = { isDestroyed: () => false };
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+      getWindowForEvent: () => parentWindow,
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+    });
+    assert.equal(r.ok, true);
+    // An unparented alert can be approved while the window it describes is
+    // hidden, so the prompt must hang off the window that owns the tab.
+    assert.equal(confirmations[0].parentWindow, parentWindow);
+  });
+
+  it("normalizes the requested scope before counting and importing", async () => {
+    const store = stubStore();
+    const confirmations = [];
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+      scope: "EXAMPLE.com.",
+    });
+    assert.equal(r.ok, true);
+    // Same count and scope as the plain request: casing can't dodge the lookup
+    // and swap in the narrower host count.
+    assert.deepEqual(confirmations, [
+      {
+        host: "example.com",
+        scope: "example.com",
+        profileName: "Work",
+        cookieCount: 3,
+        parentWindow: null,
+      },
+    ]);
+    assert.equal(store.calls.find((call) => call.fn === "import").args.scope, "example.com");
+  });
+
+  it("refuses a scope the profile doesn't offer before confirming", async () => {
+    const store = stubStore();
+    const confirmations = [];
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+      scope: "unrelated.test",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /scope isn't available/);
+    assert.deepEqual(confirmations, []);
+    assert.deepEqual(
+      store.calls.filter((call) => call.fn === "import"),
+      [],
+    );
+  });
+
+  it("refuses a profile main's preview doesn't list before confirming", async () => {
+    const store = stubStore();
+    const confirmations = [];
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Profile 9",
+      expectedHost: "example.com",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /has no cookies for this site/);
+    // The prompt can never name a renderer string, so it must not open at all.
+    assert.deepEqual(confirmations, []);
+    assert.deepEqual(
+      store.calls.filter((call) => call.fn === "import"),
+      [],
+    );
+  });
+
+  it("refuses when the preview itself fails before confirming", async () => {
+    const store = stubStore();
+    store.previewSiteCookies = async () => ({ ok: false, error: "No Chrome profiles here." });
+    const confirmations = [];
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async (request) => {
+        confirmations.push(request);
+        return true;
+      },
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+    });
+    assert.equal(r.ok, false);
+    assert.equal(r.error, "No Chrome profiles here.");
+    assert.deepEqual(confirmations, []);
+    assert.deepEqual(
+      store.calls.filter((call) => call.fn === "import"),
+      [],
+    );
+  });
+
+  it("writes nothing when the native confirmation is declined", async () => {
+    const store = stubStore();
+    const { ipcMain, event } = setup({
+      chromeCookieStore: store,
+      confirmCookieImport: async () => false,
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+    });
+    assert.deepEqual(r, { ok: false, cancelled: true });
+    assert.deepEqual(
+      store.calls.filter((call) => call.fn === "import"),
+      [],
+    );
+  });
+
+  it("refuses to write when the tab moved during the Keychain wait", async () => {
+    const store = stubStore();
+    let currentUrl = "https://example.com/restored";
+    const wc = makeWebContents();
+    wc.getURL = () => currentUrl;
+    store.importSiteCookies = async (args) => {
+      currentUrl = "https://elsewhere.test/";
+      assert.equal(args.beforeWrite(), false);
+      return {
+        ok: false,
+        error: "This tab is no longer on that site. Reopen the import dialog to retry.",
+      };
+    };
+    const { ipcMain, event } = setup({ chromeCookieStore: store, webContents: wc });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /no longer on that site/);
+  });
+
+  it("forwards the user-picked parent scope, which the store re-validates", async () => {
+    const store = stubStore({ scopes: ["files.example.com", "example.com"] });
+    const { ipcMain, event, wc } = setup({
+      chromeCookieStore: store,
+      webContents: makeWebContents({ url: "https://files.example.com/docs" }),
+    });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "files.example.com",
+      scope: "example.com",
+    });
+    assert.equal(r.ok, true);
+    const importCall = store.calls.find((call) => call.fn === "import");
+    assert.equal(importCall.args.host, "files.example.com");
+    assert.equal(importCall.args.scope, "example.com");
+    assert.equal(importCall.args.profileId, "Default");
+    assert.equal(importCall.args.cookiesApi, wc.session.cookies);
+  });
+
+  it("refuses when the tab moved to another site behind the dialog", async () => {
+    const store = stubStore();
+    const { ipcMain, event } = setup({ chromeCookieStore: store });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "mail.google.com",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /no longer on that site/);
+    assert.deepEqual(store.calls, []);
+  });
+
+  it("refuses a page with no site (non-http) instead of importing", async () => {
+    const store = stubStore();
+    const wc = makeWebContents({ url: "about:blank" });
+    const { ipcMain, event } = setup({ chromeCookieStore: store, webContents: wc });
+    for (const channel of [
+      "omnigent:browser-chrome-cookie-preview",
+      "omnigent:browser-chrome-cookie-import",
+    ]) {
+      // oxlint-disable-next-line no-await-in-loop -- both channels must refuse independently
+      const r = await ipcMain.invoke(channel, event, {
+        conversationId: "conv_1",
+        profileId: "Default",
+        expectedHost: "example.com",
+      });
+      assert.equal(r.ok, false, channel);
+      assert.match(r.error, /http\(s\) pages only/);
+    }
+    assert.deepEqual(store.calls, []);
+  });
+
+  it("reports unsupported platforms without touching Chrome", async () => {
+    const store = stubStore();
+    const { ipcMain, event } = setup({ chromeCookieStore: store, platform: "linux" });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /only supported on macOS/);
+    assert.deepEqual(store.calls, []);
+  });
+
+  it("returns 'No browser view' when the conversation has no view", async () => {
+    const { ipcMain, event } = setup({ conversationId: null, chromeCookieStore: stubStore() });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-preview", event, {
+      conversationId: "nope",
+    });
+    assert.deepEqual(r, { ok: false, error: "No browser view" });
+  });
+
+  it("surfaces a closed view as an error instead of throwing", async () => {
+    const store = stubStore();
+    store.importSiteCookies = async () => {
+      throw new Error("Object has been destroyed");
+    };
+    const { ipcMain, event } = setup({ chromeCookieStore: store });
+    const r = await ipcMain.invoke("omnigent:browser-chrome-cookie-import", event, {
+      conversationId: "conv_1",
+      profileId: "Default",
+      expectedHost: "example.com",
+    });
+    assert.deepEqual(r, { ok: false, error: "browser closed" });
   });
 });
 

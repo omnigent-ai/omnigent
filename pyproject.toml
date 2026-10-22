@@ -61,7 +61,7 @@ dependencies = [
     # a 0600 file when no keyring backend is available (e.g. headless).
     "keyring>=24,<26",
     # Decode and validate public branding assets before serving them.
-    "pillow>=12.2,<13",
+    "pillow>=13,<14",
     # Round-trip (comment/format-preserving) TOML editing of the user's
     # ~/.codex/config.toml when removing a Databricks provider
     # (omnigent/onboarding/ucode_cleanup.py). stdlib tomllib is read-only.
@@ -208,7 +208,7 @@ openshell = ["openshell>=0.1.0,<1"]
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
-kubernetes = ["kubernetes>=36,<37"]
+kubernetes = ["kubernetes>=36,<38"]
 # Vault Transit backend for the credential store's SecretCipher — the
 # non-AWS alternative to the built-in KMS cipher (selected by
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so
