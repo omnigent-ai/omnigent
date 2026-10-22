@@ -889,9 +889,28 @@ async def test_auto_create_pi_terminal_keeps_gateway_routing_for_slash_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    args = await _launch_pi_terminal_args(
-        tmp_path, monkeypatch, model_override="openai/gpt-4o-mini"
+    import omnigent.harnesses.pi_native.bridge as pi_native_bridge
+
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    agent_dir = (
+        pi_native_bridge.prepare_bridge_dir("47f049b9d13df4db397c7f46859b825f") / "pi-agent"
     )
+    agent_dir.mkdir()
+    append_file = agent_dir / "APPEND_SYSTEM.md"
+    append_file.write_text("Active global prompt")
+    own_login = tmp_path / "pi-own-login"
+    own_login.mkdir()
+    (own_login / "APPEND_SYSTEM.md").write_text("Inactive global prompt")
+    args = await _launch_pi_terminal_args(
+        tmp_path,
+        monkeypatch,
+        model_override="openai/gpt-4o-mini",
+        agent_spec=AgentSpec(
+            spec_version=1, name="pi", executor=ExecutorSpec(), instructions="Authored role"
+        ),
+    )
+    assert args[args.index("--append-system-prompt") + 1] == str(append_file)
+    assert str(own_login / "APPEND_SYSTEM.md") not in args
 
     assert "--provider" in args
     assert "--model" in args

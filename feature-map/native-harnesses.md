@@ -291,9 +291,12 @@ Cross-harness journeys:
   `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_preserves_model_and_prompt_settings`
   uploads a spec with a bundled instruction file through a real server, host,
   runner and Pi terminal. A test-owned extension reads the real system prompt
-  at launch/resume with defaults and combined replacement/no-context settings.
-  Authored instructions remain once; explicit additions survive, discovered
-  context follows the setting, and replacement excludes built-in/SYSTEM.md and
+  at launch/resume with defaults, replacement/no-context and untrusted-project settings.
+  Authored instructions remain once. Default append mode keeps the project's
+  APPEND_SYSTEM.md at launch and falls back to the active global file on restart
+  after the project file is removed; no explicit append arguments are supplied.
+  An explicit `--no-approve` keeps the global file and excludes the project file.
+  Context follows its setting, and replacement excludes built-in/SYSTEM.md and
   APPEND_SYSTEM.md prompts. The selected model survives. No model call is made.
   Run with the CI-pinned Pi executable:
 
@@ -301,6 +304,9 @@ Cross-harness journeys:
   OMNIGENT_PI_PATH=/path/to/pi uv run --no-sync pytest tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py --reruns 0 -q
   ```
 
+  Explicit append inputs, trust overrides, missing files and replacement
+  precedence are covered by
+  `tests/runner/test_app_native_startup_instructions.py::test_native_pi_preserves_append_discovery`.
   Raw/resolved/absent specs and repeated user additions are covered by
   `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_launches_required_terminal`.
   `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
