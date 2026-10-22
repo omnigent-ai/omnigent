@@ -38,6 +38,7 @@
     <string name="oidc_signing_in">Signing in…</string>
     <string name="status_opening_sign_in">Opening sign-in…</string>
     <string name="status_finish_sign_in">Finish signing in, then return to Omnigent.</string>
+    <string name="status_sign_in_timed_out">Sign-in timed out. Try again.</string>
     <string name="status_sign_in_required">Sign in to continue</string>
     <string name="status_workspace_session_ended">Your session for this workspace has ended.</string>
     <string name="status_server_unreachable">Can’t reach the server</string>
@@ -62,6 +63,10 @@
     <string name="status_error">Error</string>
     <string name="status_time">Time</string>
     <string name="status_app_version_label">App version</string>
+    <string name="status_time_utc">Time (UTC)</string>
+    <string name="status_android_api">Android API</string>
+    <string name="status_webview_version">WebView version</string>
+    <string name="status_version_unavailable">Unavailable</string>
     <string name="status_app_version">%1$s (%2$d)</string>
     <string name="menu_reload">Reload</string>
     <string name="menu_connect_new">Connect to New Server</string>

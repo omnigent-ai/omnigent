@@ -1338,13 +1338,42 @@ class MainActivity : AppCompatActivity() {
                     showStatus(ConnectionStatus.AuthTabHandoff(statusHost()))
                 },
                 onTicketFailure = { error ->
-                    if (error is IOException) {
-                        showUnreachable(failureClassName(error))
-                    } else {
-                        returnToSetup(
-                            origin,
-                            OidcSignInException.SignInRefused(statusHost(), null).message,
-                        )
+                    when (error) {
+                        is LegacyTicketFailure.BrowserUnavailable -> {
+                            returnToSetup(
+                                origin,
+                                OidcSignInException.BrowserUnavailable(statusHost()).message,
+                            )
+                        }
+
+                        is LegacyTicketFailure.NetworkDeadline -> {
+                            showUnreachable(failureClassName(error.lastError))
+                        }
+
+                        is LegacyTicketFailure.HttpStatus -> {
+                            showStatus(
+                                ConnectionStatus.ServerUnreachable(
+                                    statusHost(),
+                                    UnreachableKind.GENERIC,
+                                    failureDetails("HTTP ${error.code}"),
+                                ),
+                            )
+                        }
+
+                        is LegacyTicketFailure.TimedOut -> {
+                            returnToSetup(origin, getString(R.string.status_sign_in_timed_out))
+                        }
+
+                        is IOException -> {
+                            showUnreachable(failureClassName(error))
+                        }
+
+                        else -> {
+                            returnToSetup(
+                                origin,
+                                OidcSignInException.SignInRefused(statusHost(), null).message,
+                            )
+                        }
                     }
                 },
             )
