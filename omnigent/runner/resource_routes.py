@@ -1436,6 +1436,32 @@ def register_resource_routes(
             remove=body.get("remove", []),
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/github/merge-options")
+    async def read_github_merge_options(
+        session_id: str, pr_url: str | None = None
+    ) -> JSONResponse:
+        return await _github_call(session_id, "pr_merge_options", pr_url=pr_url)
+
+    @app.post("/v1/sessions/{session_id}/resources/github/merge")
+    async def merge_github_pr_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "merge_pr",
+            pr_url=body["pr_url"],
+            merge_method=body.get("merge_method"),
+            expected_head=body.get("expected_head"),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/disable-auto-merge")
+    async def disable_github_auto_merge_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(session_id, "disable_pr_auto_merge", pr_url=body["pr_url"])
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"

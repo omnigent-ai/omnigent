@@ -68,6 +68,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
     usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
     useUpdatePullRequestLabels: () => state.updateLabels,
+    usePullRequestMergeOptions: () => ({ data: undefined, isPending: true, isError: false }),
+    useMergePullRequest: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useDisablePullRequestAutoMerge: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     usePullRequestInfo: vi.fn(() => state.info),
     usePullRequestChangedFiles: vi.fn(() => state.changes),
     usePullRequestDiff: () => ({
@@ -398,6 +401,14 @@ describe("PullRequestPanel", () => {
       expect(
         labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
+      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      const row = reviewers.parentElement!.parentElement!;
+      expect(row).toContainElement(labels);
+      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
+        "data-orientation",
+        "vertical",
+      );
+      expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
     });
 
     it("wires editing to the selected PR: chips remove, and the picker loads on open", () => {
@@ -455,6 +466,90 @@ describe("PullRequestPanel", () => {
       renderPanel();
 
       expect(screen.queryByRole("heading", { name: "Labels" })).toBeNull();
+    });
+  });
+
+  describe("merge button", () => {
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = "https://github.com/acme/app/pull/6000";
+      state.info!.data!.pr!.head_sha = "a".repeat(40);
+      state.info!.data!.pr!.merge_state_status = "CLEAN";
+      state.info!.data!.pr!.auto_merge = null;
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+      };
+    });
+
+    it("sits below the checks and opens the merge dialog", () => {
+      renderPanel();
+
+      const merge = screen.getByRole("region", { name: "Merge" });
+      const checks = screen.getByText("Checks").closest("section")!;
+      expect(checks.compareDocumentPosition(merge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+      expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
+    });
+
+    it("divides the metadata from the description", () => {
+      renderPanel();
+
+      const divider = [...document.querySelectorAll('[data-slot="separator"]')].at(-1)!;
+      const merge = screen.getByRole("region", { name: "Merge" });
+      const description = screen.getByText("Description").closest("section")!;
+      expect(
+        merge.compareDocumentPosition(divider) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        divider.compareDocumentPosition(description) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without merging",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a provider that can't merge",
+        () => {
+          state.info!.data!.capabilities!.merging = false;
+        },
+      ],
+      [
+        "a host that doesn't report the merge state",
+        () => {
+          delete state.info!.data!.pr!.merge_state_status;
+        },
+      ],
+      [
+        "a closed PR",
+        () => {
+          state.info!.data!.pr!.state = "CLOSED";
+        },
+      ],
+      [
+        "a merged PR",
+        () => {
+          state.info!.data!.pr!.state = "MERGED";
+        },
+      ],
+    ])("is hidden for %s", (_case, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("region", { name: "Merge" })).toBeNull();
     });
   });
 

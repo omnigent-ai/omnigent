@@ -574,5 +574,19 @@ class GitLabPullRequests:
         del root, reference, add, remove
         raise ValueError("Editing GitLab merge request labels is not supported yet.")
 
+    def merge_options(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
+    def merge(
+        self, root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    ) -> dict[str, Any]:
+        del root, reference, merge_method, expected_head
+        raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
+    def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        del root, reference
+        raise ValueError("Merging GitLab merge requests from Omnigent is not supported yet.")
+
 
 PULL_REQUESTS: PullRequestFacet = GitLabPullRequests()

@@ -137,9 +137,9 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
-# Runner wait for a PR label request, above the runner's 15-second budget for all of
+# Runner wait for a PR label or merge request, above the runner's 15-second budget for all of
 # its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
-_LABEL_PROXY_TIMEOUT_S = 20.0
+_PR_EDIT_PROXY_TIMEOUT_S = 20.0
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -577,7 +577,7 @@ def register_resources_routes(
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
             ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
-            ``"github_labels"``.
+            ``"github_labels"`` / ``"github_merge_options"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -990,7 +990,8 @@ def register_resources_routes(
         runner is offline but the host holding the workspace is connected.
 
         :param op: Host-side write op — ``"github_set_preference"``,
-            ``"github_prs_update"``, or ``"github_labels_update"``.
+            ``"github_prs_update"``, ``"github_labels_update"``, ``"github_merge"``,
+            or ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
@@ -1025,6 +1026,39 @@ def register_resources_routes(
             if exc.status == 400:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _post_pr_edit(
+        session_id: str,
+        conv: Conversation,
+        *,
+        runner_path: str,
+        host_op: str,
+        params: dict[str, Any],
+        failure_detail: str,
+    ) -> dict[str, Any]:
+        """POST a PR edit to the runner, or to the host tunnel when the runner is offline.
+
+        :param host_op: Host-side write op, e.g. ``"github_merge"``.
+        :param failure_detail: Error detail when the runner's refusal carries none.
+        :returns: The runner's or host's result.
+        :raises HTTPException: With the runner's status and ``detail`` when it refuses.
+        """
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id, runner_path, params, conv, timeout=_PR_EDIT_PROXY_TIMEOUT_S
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op=host_op, host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(status_code=status, detail=result.get("detail", failure_detail))
+        return result
 
     async def _proxy_post_to_runner(
         session_id: str,
@@ -3268,7 +3302,7 @@ def register_resources_routes(
             host_params={"pr_url": pr_url},
             runner_params={"pr_url": pr_url},
             runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
-            runner_timeout=_LABEL_PROXY_TIMEOUT_S,
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
         )
 
     @router.post(
@@ -3290,33 +3324,113 @@ def register_resources_routes(
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
-        params = {
-            "pr_url": body["pr_url"],
-            "add": body.get("add", []),
-            "remove": body.get("remove", []),
-        }
-        try:
-            status, result = await _proxy_post_to_runner(
-                session_id,
-                f"/v1/sessions/{session_id}/resources/github/labels",
-                params,
-                conv,
-                timeout=_LABEL_PROXY_TIMEOUT_S,
-            )
-        except OmnigentError as exc:
-            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                raise
-            payload = await _write_workspace_via_host(
-                session_id, conv, op="github_labels_update", host_params=params
-            )
-            if payload is None:
-                raise
-            return payload
-        if status >= 400:
-            raise HTTPException(
-                status_code=status, detail=result.get("detail", "Cannot update labels")
-            )
-        return result
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            host_op="github_labels_update",
+            params={
+                "pr_url": body["pr_url"],
+                "add": body.get("add", []),
+                "remove": body.get("remove", []),
+            },
+            failure_detail="Cannot update labels",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/merge-options",
+        response_model=None,
+    )
+    async def get_session_github_merge_options(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the merge methods the selected PR's repository allows, for the merge dialog.
+
+        Requires edit access, like the merge it feeds. Falls back to the host
+        tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A ``session.github.merge_options`` with ``methods`` and ``default``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_merge_options",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-options",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR with the host's provider account.
+
+        The merge applies only while the PR's head is ``expected_head``. Served by
+        the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url``, ``merge_method`` (``merge``,
+            ``squash``, or ``rebase``), and ``expected_head``, a full commit SHA.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge",
+            host_op="github_merge",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/disable-auto-merge",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def disable_session_github_auto_merge(
+        request: Request, session_id: str
+    ) -> dict[str, Any]:
+        """
+        Turn off the selected PR's auto-merge with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url``.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/disable-auto-merge",
+            host_op="github_disable_auto_merge",
+            params={"pr_url": body["pr_url"]},
+            failure_detail="Cannot disable auto-merge",
+        )
 
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not

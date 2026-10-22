@@ -29,6 +29,10 @@ Payload contract:
 - With ``label_editing``, the repository's labels are a ``list`` of
   ``{name, color, description}`` with ``has_more``, and a label edit returns a
   ``session.github.pr_labels`` with the PR's resulting ``labels``.
+- With ``merging``, merge options are a ``session.github.merge_options`` with
+  the allowed ``methods`` (``merge``, ``squash``, ``rebase``) and the ``default``
+  to preselect (null when none is allowed), and a merge or disabling
+  auto-merge returns a ``session.github.pr_merge`` with ``pr_url``.
 - Changed files are a ``list`` of ``session.github.changed_file`` objects:
   ``path``, ``name``, ``status`` (``created``, ``modified``, ``deleted``, or
   ``renamed``), ``lines_added``, and ``lines_removed``. The PR diff is a
@@ -49,6 +53,11 @@ Additive fields:
   may be null.
 - ``pr`` may carry ``labels`` of ``{name, color, description}``; ``color`` is six
   lowercase hex digits or null, and ``description`` may be null.
+- ``pr`` may carry ``merge_state_status``, GitHub's ``mergeStateStatus`` (e.g.
+  ``"CLEAN"``, ``"BLOCKED"``, ``"UNKNOWN"``) or null, and ``auto_merge``, null
+  when auto-merge is off, else ``{merge_method, enabled_by, enabled_at}`` with
+  ``merge_method`` ``"MERGE"``, ``"SQUASH"``, or ``"REBASE"``. Both are omitted
+  when the provider or its CLI cannot report them.
 - A changed file's ``lines_added`` and ``lines_removed`` may be null.
 - Report lookup failures in ``warnings``. Mark incomplete checks/comments with
   ``checks.partial`` / ``comments_partial``; changed files use ``has_more`` or ``warning``.
@@ -74,6 +83,8 @@ CHANGED_FILE_OBJECT = "session.github.changed_file"
 FILE_DIFF_OBJECT = "session.github.file_diff"
 PR_DIFF_OBJECT = "session.github.pr_diff"
 PR_LABELS_OBJECT = "session.github.pr_labels"
+MERGE_OPTIONS_OBJECT = "session.github.merge_options"
+PR_MERGE_OBJECT = "session.github.pr_merge"
 # Info ``reason`` when no provider recognizes the workspace's git remote.
 UNSUPPORTED_REMOTE = "unsupported_remote"
 # PR diff ``unavailable_reason`` when the PR's repository is not the workspace's.
@@ -96,6 +107,9 @@ class ProviderCapabilities:
         ``unavailable_reason: "pr_outside_workspace"`` for such a PR.
     :ivar label_editing: The user can add and remove the PR's labels through
         :meth:`PullRequestFacet.repo_labels` and :meth:`PullRequestFacet.edit_labels`.
+    :ivar merging: The user can merge the PR through
+        :meth:`PullRequestFacet.merge_options` and :meth:`PullRequestFacet.merge`,
+        and turn off its auto-merge with :meth:`PullRequestFacet.disable_auto_merge`.
     """
 
     account_switching: bool
@@ -103,6 +117,7 @@ class ProviderCapabilities:
     line_counts: bool
     linked_pr_diff: bool
     label_editing: bool = False
+    merging: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
@@ -333,6 +348,36 @@ class PullRequestFacet(Protocol):
         non-empty name lists. Removing a label the PR lacks is not an error.
 
         :returns: A ``session.github.pr_labels`` with the PR's resulting ``labels``.
+        :raises ValueError: With a user-facing message when the provider refuses.
+        """
+        ...
+
+    def merge_options(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Return a ``session.github.merge_options`` for the PR's repository.
+
+        The orchestrator calls it only with ``merging``.
+        """
+        ...
+
+    def merge(
+        self, root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    ) -> dict[str, Any]:
+        """Merge the PR with ``merge_method``, refusing if its head is not ``expected_head``.
+
+        The orchestrator calls it only with ``merging``, a method from
+        ``merge``, ``squash``, and ``rebase``, and a full commit SHA.
+
+        :returns: A ``session.github.pr_merge``.
+        :raises ValueError: With a user-facing message when the provider refuses.
+        """
+        ...
+
+    def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Turn off the PR's auto-merge.
+
+        The orchestrator calls it only with ``merging``.
+
+        :returns: A ``session.github.pr_merge``.
         :raises ValueError: With a user-facing message when the provider refuses.
         """
         ...

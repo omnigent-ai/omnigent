@@ -16,6 +16,12 @@
 //                                  the labels the selected PR's repository offers.
 //   useUpdatePullRequestLabels   — POST /resources/github/labels
 //                                  add / remove labels on the selected PR.
+//   usePullRequestMergeOptions   — GET /resources/github/merge-options
+//                                  the merge methods the selected PR's repository allows.
+//   useMergePullRequest          — POST /resources/github/merge
+//                                  merge the selected PR at the head the panel showed.
+//   useDisablePullRequestAutoMerge — POST /resources/github/disable-auto-merge
+//                                  turn off the selected PR's auto-merge.
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
@@ -87,6 +93,16 @@ export interface PullRequestLabel {
   description: string | null;
 }
 
+/** A `gh pr merge` method. */
+export type PullRequestMergeMethod = "merge" | "squash" | "rebase";
+
+/** Auto-merge enabled on a PR; the method is GitHub's upper-case name, e.g. "SQUASH". */
+export interface PullRequestAutoMerge {
+  merge_method: string | null;
+  enabled_by: string | null;
+  enabled_at: string | null;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -116,6 +132,11 @@ export interface PullRequest {
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */
   labels?: PullRequestLabel[];
+  /** GitHub's `mergeStateStatus`, e.g. "CLEAN" or "BLOCKED"; null when unreported.
+   *  Absent from older hosts and providers that don't report it. */
+  merge_state_status?: string | null;
+  /** Null when auto-merge is off; absent when the host can't report it. */
+  auto_merge?: PullRequestAutoMerge | null;
 }
 
 export interface PullRequestRepo {
@@ -153,6 +174,8 @@ export interface PullRequestCapabilities {
   linked_pr_diff: boolean;
   /** The PR's labels can be added and removed; absent from older hosts. */
   label_editing?: boolean;
+  /** The PR can be merged from the panel; absent from older hosts. */
+  merging?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -746,5 +769,101 @@ export function useUpdatePullRequestLabels(conversationId: string) {
       );
     },
     onError: () => queryClient.invalidateQueries({ queryKey: infoKey }),
+  });
+}
+
+export interface PullRequestMergeOptions {
+  object: "session.github.merge_options";
+  /** The methods the repository allows, in display order. */
+  methods: PullRequestMergeMethod[];
+  /** The method to preselect; null when the repository allows none. */
+  default: PullRequestMergeMethod | null;
+}
+
+/** The merge methods the selected PR's repository allows, for the Merge button and dialog. */
+export function usePullRequestMergeOptions(
+  conversationId: string,
+  prUrl: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["github-merge-options", conversationId, prUrl],
+    queryFn: async (): Promise<PullRequestMergeOptions> => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/merge-options${prQuery(prUrl)}`,
+      );
+      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
+        throw new RunnerOfflineError();
+      }
+      if (!response.ok) throw await errorFromResponse(response);
+      return (await response.json()) as PullRequestMergeOptions;
+    },
+    enabled,
+    retry: false,
+    // A repository's merge settings rarely change while the panel is open.
+    staleTime: 5 * 60_000,
+  });
+}
+
+export interface PullRequestMergeRequest {
+  prUrl: string;
+  mergeMethod: PullRequestMergeMethod;
+  /** The head commit the panel showed; GitHub refuses the merge if the branch moved. */
+  expectedHead: string;
+}
+
+/**
+ * Merge the selected PR through the runner or host fallback. A merge can't be
+ * undone, so nothing shows it as merged until the refetched info says so.
+ */
+export function useMergePullRequest(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["github-merge", conversationId],
+    scope: { id: `github-merge-${conversationId}` },
+    mutationFn: async (request: PullRequestMergeRequest) => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/merge`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pr_url: request.prUrl,
+            merge_method: request.mergeMethod,
+            expected_head: request.expectedHead,
+          }),
+        },
+      );
+      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
+        throw new RunnerOfflineError();
+      }
+      if (!response.ok) throw await errorFromResponse(response);
+      return (await response.json()) as { object: "session.github.pr_merge"; pr_url: string };
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
+  });
+}
+
+/** Turn off the selected PR's auto-merge; the refetched info shows the result. */
+export function useDisablePullRequestAutoMerge(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["github-disable-auto-merge", conversationId],
+    mutationFn: async (prUrl: string) => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/disable-auto-merge`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pr_url: prUrl }),
+        },
+      );
+      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
+        throw new RunnerOfflineError();
+      }
+      if (!response.ok) throw await errorFromResponse(response);
+      return (await response.json()) as { object: "session.github.pr_merge"; pr_url: string };
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
   });
 }

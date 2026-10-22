@@ -9279,6 +9279,84 @@ def test_github_label_ops_are_served_on_host(
     assert calls[1][-3:] == ["repos/example/one/issues/42/labels", "-f", "labels[]=bug"]
 
 
+def test_github_merge_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host reads merge options and merges a tracked PR when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    calls: list[list[str]] = []
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        if argv[:2] == ["repo", "view"]:
+            return (
+                0,
+                json.dumps({"viewerDefaultMergeMethod": "REBASE", "rebaseMergeAllowed": True}),
+                "",
+            )
+        return 0, "", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        options = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="merge-options",
+                op="github_merge_options",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url},
+            )
+        )
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "session_id": "untrusted",
+                },
+            )
+        )
+        disabled = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="disable-auto-merge",
+                op="github_disable_auto_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "session_id": "untrusted"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert disabled.status == "ok", disabled
+    assert calls[2][-1] == "--disable-auto"
+    assert options.status == "ok", options
+    assert options.payload == {
+        "object": "session.github.merge_options",
+        "methods": ["rebase"],
+        "default": "rebase",
+    }
+    assert merged.status == "ok", merged
+    assert merged.payload == {"object": "session.github.pr_merge", "pr_url": url}
+    assert calls[1][:2] == ["pr", "merge"]
+    assert calls[1][-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+
+
 def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

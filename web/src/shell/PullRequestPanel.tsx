@@ -72,6 +72,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Separator } from "@/components/ui/separator";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -99,6 +100,7 @@ import {
   type PullRequestReviewer,
 } from "@/hooks/usePullRequests";
 import { PullRequestLabels } from "./PullRequestLabels";
+import { PullRequestMerge } from "./PullRequestMerge";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -774,11 +776,13 @@ function PullRequestCommentCard({
   );
 }
 
-/** The Summary tab body: reviewers, labels, CI checks, then the PR description. When the
- *  token can't read check runs, the Checks area says so instead of counts. */
+/** The Summary tab body: reviewers beside labels, then CI checks with the Merge button, then
+ *  the PR description, with dividers between. When the token can't read check runs, the
+ *  Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   reviewers,
   labels,
+  merge,
   checks,
   checksSupported,
   checksUnavailableHint,
@@ -786,61 +790,81 @@ function PullRequestSummaryTab({
 }: {
   reviewers: PullRequestReviewer[] | undefined;
   labels: React.ReactNode;
+  merge: React.ReactNode;
   checks: PullRequestChecks;
   checksSupported: boolean;
   checksUnavailableHint?: string;
   body: string | null | undefined;
 }) {
+  const showChecks = checks.total > 0 || checks.partial || !checksSupported;
+  const showReviewers = reviewers !== undefined;
+  const showPeople = showReviewers || !!labels;
+  const showStatus = showChecks || !!merge;
   return (
-    // Extra bottom padding so the end of a long description can scroll clear
-    // of the very bottom edge, where it's awkward to read.
-    <div className="space-y-4 p-3 pb-16">
-      {reviewers !== undefined && <PullRequestReviewers reviewers={reviewers} />}
-      {labels}
-      {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
-          pill to see the job names in that bucket. */}
-      {(checks.total > 0 || checks.partial || !checksSupported) && (
-        <section className="space-y-1.5">
-          <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Checks
-          </h3>
-          {!checksSupported ? (
-            <p role="status" className="text-ui text-muted-foreground">
-              {checksUnavailableHint ?? "Checks can’t be read with the signed-in account."}
-            </p>
-          ) : (
-            checks.partial && (
-              <p role="status" className="text-ui text-muted-foreground">
-                Some checks are unavailable. Counts include only the checks loaded.
-              </p>
-            )
+    // Blocks carry their own padding so the dividers between them span the full width.
+    <div>
+      {showPeople && (
+        <div className="flex">
+          {showReviewers && (
+            <div className="min-w-0 flex-1 p-3">
+              <PullRequestReviewers reviewers={reviewers} />
+            </div>
           )}
-          <div className="flex flex-wrap items-center gap-1.5">
-            <CheckPill
-              label="passed"
-              count={checks.passing}
-              runs={checks.runs.filter((r) => r.bucket === "passing")}
-              icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
-              className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-            />
-            <CheckPill
-              label="pending"
-              count={checks.pending}
-              runs={checks.runs.filter((r) => r.bucket === "pending")}
-              icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-              className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-            />
-            <CheckPill
-              label="failed"
-              count={checks.failing}
-              runs={checks.runs.filter((r) => r.bucket === "failing")}
-              icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-              className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-            />
-          </div>
-        </section>
+          {showReviewers && labels && <Separator orientation="vertical" />}
+          {labels && <div className="min-w-0 flex-1 p-3">{labels}</div>}
+        </div>
       )}
-      <section className="space-y-1.5">
+      {showPeople && showStatus && <Separator />}
+      {showStatus && (
+        <div className="space-y-3 p-3">
+          {showChecks && (
+            <section className="space-y-1.5">
+              <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                Checks
+              </h3>
+              {!checksSupported ? (
+                <p role="status" className="text-ui text-muted-foreground">
+                  {checksUnavailableHint ?? "Checks can’t be read with the signed-in account."}
+                </p>
+              ) : (
+                checks.partial && (
+                  <p role="status" className="text-ui text-muted-foreground">
+                    Some checks are unavailable. Counts include only the checks loaded.
+                  </p>
+                )
+              )}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <CheckPill
+                  label="passed"
+                  count={checks.passing}
+                  runs={checks.runs.filter((r) => r.bucket === "passing")}
+                  icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+                  className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+                />
+                <CheckPill
+                  label="pending"
+                  count={checks.pending}
+                  runs={checks.runs.filter((r) => r.bucket === "pending")}
+                  icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+                  className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                />
+                <CheckPill
+                  label="failed"
+                  count={checks.failing}
+                  runs={checks.runs.filter((r) => r.bucket === "failing")}
+                  icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+                  className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+                />
+              </div>
+            </section>
+          )}
+          {merge}
+        </div>
+      )}
+      {(showPeople || showStatus) && <Separator />}
+      {/* Extra bottom padding so the end of a long description can scroll clear
+          of the very bottom edge, where it's awkward to read. */}
+      <section className="space-y-1.5 p-3 pb-16">
         <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Description
         </h3>
@@ -1766,6 +1790,21 @@ function PullRequestPanelDetails({
                   prUrl={data.selected_pr_url}
                   labels={pr.labels}
                   editable={canEdit && !!data.capabilities.label_editing}
+                />
+              )
+            }
+            merge={
+              canEdit &&
+              data.capabilities.merging &&
+              pr.state === "OPEN" &&
+              pr.merge_state_status !== undefined &&
+              data.selected_pr_url && (
+                <PullRequestMerge
+                  // A different PR starts fresh, so an open dialog can't outlive its PR.
+                  key={data.selected_pr_url}
+                  conversationId={conversationId}
+                  prUrl={data.selected_pr_url}
+                  pr={pr}
                 />
               )
             }

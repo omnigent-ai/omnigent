@@ -70,7 +70,12 @@ from urllib.parse import quote
 
 from omnigent import config as _config
 from omnigent.runner import pr_resource
-from omnigent.runner.git_providers import PR_LABELS_OBJECT, local_git
+from omnigent.runner.git_providers import (
+    MERGE_OPTIONS_OBJECT,
+    PR_LABELS_OBJECT,
+    PR_MERGE_OBJECT,
+    local_git,
+)
 from omnigent.runner.session_prs import PullRequestRef
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
@@ -86,13 +91,15 @@ _gh_deadline: ContextVar[float | None] = ContextVar("gh_deadline", default=None)
 _gh_timed_out: ContextVar[bool] = ContextVar("gh_timed_out", default=False)
 
 # Always pass --json (bare gh pr view opens a pager); body, comments,
-# reviews, and labels feed the Summary and Comments tabs.
+# reviews, labels, and the merge fields feed the Summary and Comments tabs.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
-    ",reviews,reviewRequests,latestReviews,labels"
+    ",reviews,reviewRequests,latestReviews,labels,mergeStateStatus,autoMergeRequest"
 )
 _PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
 _PR_COMMENTS_FIELD = "reviews"
+# Older ``gh`` releases lack these; :func:`_gh_pr_view` retries without them.
+_PR_MERGE_FIELDS = frozenset({"mergeStateStatus", "autoMergeRequest"})
 # Reading check runs needs the Checks permission, which a fine-grained personal
 # access token cannot hold; GitHub refuses just this field and ``gh`` fails the
 # whole call, so :func:`_gh_pr_view` retries without it.
@@ -522,10 +529,23 @@ def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
 _LABEL_COLOR = re.compile(r"[0-9a-fA-F]{6}")
 # The label picker lists at most this many of the repository's labels.
 _MAX_REPO_LABELS = 1000
-# Every ``gh`` call of one label request shares this budget, under the 20-second
-# waits of the server and the host tunnel.
-_LABEL_REQUEST_SECONDS = 15.0
+# Every ``gh`` call of one label or merge request shares this budget, under the
+# 20-second waits of the server and the host tunnel.
+_PR_EDIT_REQUEST_SECONDS = 15.0
 _LABEL_EDIT_TIMED_OUT = "GitHub took too long to update the labels. Refresh to see which applied."
+_MERGE_TIMED_OUT = (
+    "GitHub took too long to merge the pull request. Refresh to see whether it merged."
+)
+_DISABLE_AUTO_MERGE_TIMED_OUT = (
+    "GitHub took too long to disable auto-merge. Refresh to see whether it is still on."
+)
+# ``gh pr merge`` method flags in the order the merge picker offers them, keyed
+# by the ``gh repo view`` field that allows each.
+_MERGE_METHODS = (
+    ("merge", "mergeCommitAllowed"),
+    ("squash", "squashMergeAllowed"),
+    ("rebase", "rebaseMergeAllowed"),
+)
 
 
 def _shape_labels(raw: Any) -> list[dict[str, str | None]]:
@@ -668,13 +688,13 @@ def _gh_pr_view(
 ) -> dict[str, Any] | None:
     """Return ``gh pr view <args> --json <fields>`` as a dict, or ``None``.
 
-    Retry without optional checks or reviewer fields only when the error names
-    them. Each retry removes fields, so unrelated failures never retry here.
+    Retry without optional checks, reviewer, or merge fields only when the error
+    names them. Each retry removes fields, so unrelated failures never retry here.
     """
     rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
     while rc != 0:
         refused = _refused_pr_fields(err) & set(fields.split(","))
-        refused &= _PR_REVIEW_FIELDS | {_PR_CHECKS_FIELD, _PR_COMMENTS_FIELD}
+        refused &= _PR_REVIEW_FIELDS | _PR_MERGE_FIELDS | {_PR_CHECKS_FIELD, _PR_COMMENTS_FIELD}
         if refused & _PR_REVIEW_FIELDS:
             refused.update(_PR_REVIEW_FIELDS)
         remaining = ",".join(field for field in fields.split(",") if field not in refused)
@@ -696,6 +716,31 @@ def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
         "checks": _summarize_checks(data.get(_PR_CHECKS_FIELD)),
         "checks_supported": _PR_CHECKS_FIELD in data,
     }
+
+
+def _merge_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """``merge_state_status`` and ``auto_merge`` for a ``gh pr view`` object.
+
+    Each is left out when :func:`_gh_pr_view` dropped its field for an older ``gh``.
+    """
+    fields: dict[str, Any] = {}
+    if "mergeStateStatus" in data:
+        status = data["mergeStateStatus"]
+        fields["merge_state_status"] = status.upper() if isinstance(status, str) else None
+    if "autoMergeRequest" in data:
+        request = data["autoMergeRequest"]
+        if isinstance(request, dict):
+            method = request.get("mergeMethod")
+            enabled_by = request.get("enabledBy")
+            login = enabled_by.get("login") if isinstance(enabled_by, dict) else None
+            fields["auto_merge"] = {
+                "merge_method": method.upper() if isinstance(method, str) else None,
+                "enabled_by": login if isinstance(login, str) else None,
+                "enabled_at": request.get("enabledAt"),
+            }
+        else:
+            fields["auto_merge"] = None
+    return fields
 
 
 def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[str, Any] | None:
@@ -804,6 +849,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             # An empty body is null so the Summary tab shows its empty state.
             "body": body if isinstance(body, str) and body.strip() else None,
             **_comments_payload(data),
+            **_merge_fields(data),
         }
         if _PR_REVIEW_FIELDS.issubset(data):
             payload["pr"]["reviewers"] = _shape_reviewers(data)
@@ -909,6 +955,7 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         **_checks_fields(data),
         "body": data.get("body") or None,
         **_comments_payload(data),
+        **_merge_fields(data),
     }
     if _PR_REVIEW_FIELDS.issubset(data):
         info["pr"]["reviewers"] = _shape_reviewers(data)
@@ -1364,9 +1411,9 @@ def _pr_file_contents(
 def _repo_labels(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """List the PR repository's labels by name for the label picker.
 
-    :raises ValueError: When ``gh`` cannot list them within :data:`_LABEL_REQUEST_SECONDS`.
+    :raises ValueError: When ``gh`` cannot list them within :data:`_PR_EDIT_REQUEST_SECONDS`.
     """
-    with _gh_deadline_scope(time.monotonic() + _LABEL_REQUEST_SECONDS):
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         _host_args(root, reference)
         rc, out, _ = _gh(
             [
@@ -1428,9 +1475,9 @@ def _edit_labels(
     """Remove, then add, the PR's labels through GitHub's issue labels API.
 
     Every ``gh`` call, including the account and host lookups, shares
-    :data:`_LABEL_REQUEST_SECONDS`; running out reports that the outcome is unknown.
+    :data:`_PR_EDIT_REQUEST_SECONDS`; running out reports that the outcome is unknown.
     """
-    with _gh_deadline_scope(time.monotonic() + _LABEL_REQUEST_SECONDS):
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
         try:
             return _apply_label_edit(root, reference, add=add, remove=remove)
         except ValueError:
@@ -1468,3 +1515,128 @@ def _apply_label_edit(
     if labels is None:
         labels = _labels_api(root, host, token, [f"{endpoint}?per_page=100"])
     return {"object": PR_LABELS_OBJECT, "labels": _shape_labels(labels)}
+
+
+def _merge_options(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """Return the merge methods the PR's repository allows and the one to preselect.
+
+    The default is the viewer's last-used method, or the repository default,
+    when it is allowed; otherwise the first allowed method.
+
+    :raises ValueError: When ``gh`` cannot read the repository's merge settings.
+    """
+    fields = ",".join(["viewerDefaultMergeMethod", *(field for _, field in _MERGE_METHODS)])
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        _host_args(root, reference)
+        rc, out, _ = _gh(
+            ["repo", "view", _repo_argument(reference), "--json", fields],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+    if rc != 0:
+        raise ValueError(
+            "GitHub could not read this repository's merge settings. Refresh to retry."
+        )
+    try:
+        data = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned unexpected merge settings") from exc
+    if not isinstance(data, dict):
+        raise ValueError("GitHub returned unexpected merge settings")
+    methods = [method for method, field in _MERGE_METHODS if data.get(field) is True]
+    preferred = data.get("viewerDefaultMergeMethod")
+    preferred = preferred.lower() if isinstance(preferred, str) else None
+    default = preferred if preferred in methods else next(iter(methods), None)
+    return {"object": MERGE_OPTIONS_OBJECT, "methods": methods, "default": default}
+
+
+def _merge_error(stderr: str, *, action: str) -> str:
+    """Turn ``gh pr merge``'s error output into a user-facing message.
+
+    :param action: What failed, e.g. ``"merge this pull request"``.
+    """
+    if "Head branch was modified" in stderr:
+        return (
+            "The pull request's branch changed since the panel loaded. "
+            "Review the new commits, then merge again."
+        )
+    if re.search(r"\(HTTP 40[13]\)|Resource not accessible|must have (?:write|push)", stderr):
+        return f"The GitHub account on the host cannot {action}."
+    detail = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
+    # gh prefixes GraphQL errors and its failure marks; neither helps the reader.
+    detail = re.sub(r"^(?:X |GraphQL: )+", "", detail).strip()[:300]
+    if not detail:
+        return f"GitHub could not {action}. Refresh to retry."
+    return f"GitHub could not {action}: {detail}"
+
+
+def _run_pr_merge(
+    root: str, reference: PullRequestRef, flags: list[str], *, action: str, timed_out: str
+) -> None:
+    """Run ``gh pr merge <flags>`` on the PR as its selected account.
+
+    Every ``gh`` call shares :data:`_PR_EDIT_REQUEST_SECONDS`. Without a saved
+    account, ``gh``'s active account runs it; a saved one without a token refuses.
+
+    :param action: What the command does, for error messages.
+    :param timed_out: Message when the deadline leaves the outcome unknown.
+    :raises ValueError: With a user-facing message when GitHub refuses.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        _host_args(root, reference)
+        token = _pr_token(root, reference)
+        # Without the selected account's token gh would run as another account.
+        if _gh_timed_out.get():
+            raise ValueError(timed_out)
+        login = (
+            None if _in_sandbox() else _config.github_account_preference(_repo_argument(reference))
+        )
+        if login and token is None:
+            raise ValueError(
+                f"The selected GitHub account {login} isn't signed in on the host. "
+                "Sign in with gh or choose another account."
+            )
+        rc, _, err = _gh(
+            ["pr", "merge", str(reference.number), "-R", _repo_argument(reference), *flags],
+            cwd=root,
+            token=token,
+        )
+        if rc != 0:
+            raise ValueError(
+                timed_out if _gh_timed_out.get() else _merge_error(err, action=action)
+            )
+
+
+def _merge_pr(
+    root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+) -> dict[str, Any]:
+    """Merge the PR with ``gh pr merge``, only while its head is ``expected_head``.
+
+    ``--match-head-commit`` makes GitHub refuse the merge when the branch moved
+    since the panel showed it.
+
+    :raises ValueError: With a user-facing message when GitHub refuses the merge.
+    """
+    _run_pr_merge(
+        root,
+        reference,
+        [f"--{merge_method}", "--match-head-commit", expected_head],
+        action="merge this pull request",
+        timed_out=_MERGE_TIMED_OUT,
+    )
+    return {"object": PR_MERGE_OBJECT, "pr_url": reference.url}
+
+
+def _disable_auto_merge(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    """Turn off the PR's auto-merge with ``gh pr merge --disable-auto``.
+
+    :raises ValueError: With a user-facing message when GitHub refuses.
+    """
+    _run_pr_merge(
+        root,
+        reference,
+        ["--disable-auto"],
+        action="disable auto-merge",
+        timed_out=_DISABLE_AUTO_MERGE_TIMED_OUT,
+    )
+    return {"object": PR_MERGE_OBJECT, "pr_url": reference.url}

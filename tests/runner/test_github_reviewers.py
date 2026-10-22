@@ -124,6 +124,8 @@ def _pr_data() -> dict[str, object]:
             {"id": "LA_1", "name": "size/XS", "color": "EDEDED", "description": "Tiny"},
             {"id": "LA_2", "name": "bug", "color": "d73a4a", "description": ""},
         ],
+        "mergeStateStatus": "CLEAN",
+        "autoMergeRequest": None,
     }
 
 

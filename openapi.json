@@ -16788,6 +16788,48 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/disable-auto-merge": {
+      "post": {
+        "description": "Turn off the selected PR's auto-merge with the host's provider account.\n\nServed by the runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "disable_session_github_auto_merge_v1_sessions__session_id__resources_github_disable_auto_merge_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Session Github Auto Merge",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/labels": {
       "get": {
         "description": "List the labels the selected PR's repository offers, for the label picker.\n\nRequires edit access, like the label edit it feeds. Falls back to the\nhost tunnel when the runner is offline.\n\n**Returns:** A list of `{name, color, description}` with `has_more`.",
@@ -16875,6 +16917,100 @@
           }
         },
         "summary": "Update Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge": {
+      "post": {
+        "description": "Merge the selected PR with the host's provider account.\n\nThe merge applies only while the PR's head is `expected_head`. Served by\nthe runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_v1_sessions__session_id__resources_github_merge_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge-options": {
+      "get": {
+        "description": "List the merge methods the selected PR's repository allows, for the merge dialog.\n\nRequires edit access, like the merge it feeds. Falls back to the host\ntunnel when the runner is offline.\n\n**Returns:** A `session.github.merge_options` with `methods` and `default`.",
+        "operationId": "get_session_github_merge_options_v1_sessions__session_id__resources_github_merge_options_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Github Merge Options",
         "tags": [
           "session_resources"
         ]

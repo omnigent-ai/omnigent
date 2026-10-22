@@ -58,6 +58,7 @@ NO_CAPABILITIES = {
     "line_counts": False,
     "linked_pr_diff": False,
     "label_editing": False,
+    "merging": False,
 }
 # Keys of the panel's end-to-end info fixture, less GitHub's legacy fields.
 INFO_KEYS = {"object", "available", "branch", "base_ref", "repo", "pr"}

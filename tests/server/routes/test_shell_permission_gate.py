@@ -37,6 +37,7 @@ workspace: only the owner's workspace-relative reads reach the runner marked
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -931,14 +932,69 @@ async def test_pr_label_routes_require_edit(
     ]
 
 
+_MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
+_MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
+_DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
+_MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+
+
 @pytest.mark.asyncio
-async def test_pr_label_edit_requires_a_json_body(
-    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_pr_merge_routes_require_edit(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    expected: int,
 ) -> None:
-    """A cross-site form post cannot change labels with the host's account."""
+    """Merging acts with the host's account, so viewers are refused before the runner."""
+    headers = {"X-Forwarded-Email": caller}
+    options = await client.get(
+        _MERGE_OPTIONS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers
+    )
+    merged = await client.post(_MERGE_PATH, json=_MERGE_BODY, headers=headers)
+    disabled = await client.post(
+        _DISABLE_AUTO_MERGE_PATH, json={"pr_url": _LABELS_PR_URL}, headers=headers
+    )
+
+    assert (options.status_code, merged.status_code, disabled.status_code) == (
+        expected,
+        expected,
+        expected,
+    ), merged.text
+    if expected == 403:
+        assert runner_client.gets == runner_client.posts == []
+        return
+    assert runner_client.gets == [_MERGE_OPTIONS_PATH]
+    assert runner_client.posts == [
+        (_MERGE_PATH, _MERGE_BODY),
+        (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"]}),
+        (_MERGE_PATH, _MERGE_BODY),
+        (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
+    ],
+    ids=["labels", "merge", "disable-auto-merge"],
+)
+async def test_pr_edit_requires_a_json_body(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    path: str,
+    body: dict[str, object],
+) -> None:
+    """A cross-site form post cannot act with the host's account."""
     resp = await client.post(
-        _LABELS_PATH,
-        content=f'{{"pr_url": "{_LABELS_PR_URL}", "add": ["bug"]}}',
+        path,
+        content=json.dumps(body),
         headers={"X-Forwarded-Email": "owner@example.com", "Content-Type": "text/plain"},
     )
 

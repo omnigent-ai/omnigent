@@ -1139,6 +1139,42 @@ class AzureDevOpsPullRequests:
         """
         raise ValueError("Editing Azure DevOps pull request labels is not supported yet.")
 
+    def merge_options(
+        self,
+        root: str,  # noqa: ARG002 - merging is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - merging is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: merging Azure DevOps pull requests is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
+    def merge(
+        self,
+        root: str,  # noqa: ARG002 - merging is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - merging is unsupported
+        *,
+        merge_method: str,  # noqa: ARG002 - merging is unsupported
+        expected_head: str,  # noqa: ARG002 - merging is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: merging Azure DevOps pull requests is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
+    def disable_auto_merge(
+        self,
+        root: str,  # noqa: ARG002 - merging is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - merging is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: merging Azure DevOps pull requests is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``az repos pr`` command, in order."""
         return azure_devops_observer.shell_pr_operations(segments)

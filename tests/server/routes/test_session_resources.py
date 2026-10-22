@@ -3264,12 +3264,44 @@ async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncCl
     assert resp.json()["detail"] == detail
     assert malformed.status_code == 400
     # The server and the host tunnel both outwait the runner's label request budget.
-    assert timeouts == [routes_resources._LABEL_PROXY_TIMEOUT_S] * 2
-    assert github_resource._LABEL_REQUEST_SECONDS < routes_resources._LABEL_PROXY_TIMEOUT_S
-    assert github_resource._LABEL_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
+    assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S] * 2
+    assert github_resource._PR_EDIT_REQUEST_SECONDS < routes_resources._PR_EDIT_PROXY_TIMEOUT_S
+    assert github_resource._PR_EDIT_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
     assert fake_runner.post_json_calls == [
         (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"], "remove": []})
     ]
+
+
+@pytest.mark.asyncio
+async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+    """A refused merge keeps the runner's status and message, with the PR edit wait."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/merge"
+    detail = "The pull request's branch changed since the panel loaded."
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    timeouts: list[float | None] = []
+    proxy_post = fake_runner.post
+
+    async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_post(url, json=json, timeout=timeout)
+
+    fake_runner.post = post  # type: ignore[method-assign]
+    body = {
+        "pr_url": "https://github.com/acme/widgets/pull/17",
+        "merge_method": "merge",
+        "expected_head": "a" * 40,
+    }
+
+    resp = await client.post(path, json={**body, "admin": True})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S]
+    # Only the known fields are forwarded.
+    assert fake_runner.post_json_calls == [(path, body)]
 
 
 @pytest.mark.asyncio
@@ -9712,6 +9744,7 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
         ("/labels", "github_labels"),
+        ("/merge-options", "github_merge_options"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -9762,30 +9795,47 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
 
 
-async def test_pr_label_edit_reaches_offline_host(
+@pytest.mark.parametrize(
+    "resource,body,op,params",
+    [
+        ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
+        (
+            "/merge",
+            {"merge_method": "squash", "expected_head": "a" * 40},
+            "github_merge",
+            {"merge_method": "squash", "expected_head": "a" * 40},
+        ),
+        ("/disable-auto-merge", {"extra": True}, "github_disable_auto_merge", {}),
+    ],
+)
+async def test_pr_edit_reaches_offline_host(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    body: dict[str, Any],
+    op: str,
+    params: dict[str, Any],
 ) -> None:
     from omnigent.server.routes import _host_filesystem
 
     captured: dict[str, Any] = {}
-    labels = {"object": "session.github.pr_labels", "labels": []}
+    result = {"object": "session.github.result"}
 
     async def write(**kwargs: Any) -> dict[str, Any]:
         captured.update(kwargs)
-        return labels
+        return result
 
     monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
     url = "https://github.com/example/second/pull/42"
     response = await offline_env_client.post(
-        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/labels",
-        json={"pr_url": url, "remove": ["bug"]},
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}",
+        json={"pr_url": url, **body},
     )
     assert response.status_code == 200, response.text
-    assert response.json() == labels
-    assert captured["op"] == "github_labels_update"
+    assert response.json() == result
+    assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
-    assert captured["params"] == {"pr_url": url, "add": [], "remove": ["bug"]}
+    assert captured["params"] == {"pr_url": url, **params}
 
 
 @pytest.mark.asyncio

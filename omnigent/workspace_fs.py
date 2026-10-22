@@ -639,3 +639,16 @@ class WorkspaceReader:
                 pr_url=pr_url,
             ),
         )
+
+    def github_merge_options(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The merge methods the selected PR's repository allows."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_merge_options(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )

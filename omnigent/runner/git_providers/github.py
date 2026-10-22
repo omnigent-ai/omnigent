@@ -29,6 +29,7 @@ _CAPABILITIES = ProviderCapabilities(
     line_counts=True,
     linked_pr_diff=True,
     label_editing=True,
+    merging=True,
 )
 
 
@@ -166,6 +167,28 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._edit_labels(root, reference, add=add, remove=remove)
+
+    def merge_options(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Read the repository's allowed merge methods with ``gh repo view``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_options(root, reference)
+
+    def merge(
+        self, root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    ) -> dict[str, Any]:
+        """Merge the PR with ``gh pr merge --match-head-commit``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_pr(
+            root, reference, merge_method=merge_method, expected_head=expected_head
+        )
+
+    def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Turn off auto-merge with ``gh pr merge --disable-auto``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._disable_auto_merge(root, reference)
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``gh pr`` or ``gh api`` segment."""

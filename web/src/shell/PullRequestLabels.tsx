@@ -92,7 +92,8 @@ function PullRequestLabelPicker({
           variant="ghost"
           size="icon-xs"
           aria-label="Edit labels"
-          className="text-muted-foreground"
+          // Negative margins keep the header row at text height, level with Reviewers.
+          className="-my-1 text-muted-foreground"
         >
           <PlusIcon aria-hidden className="size-3.5" />
         </Button>
