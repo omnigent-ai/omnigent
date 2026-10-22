@@ -871,9 +871,8 @@ class NativeInterruptRunner:
             directory=state.workspace,
         )
         try:
-            # OpenCode answers true even when idle, so the answer is not checked. It
-            # answers before emitting the abort's idle edge, and nothing awaits
-            # between here and the record, so that edge always finds it.
+            # OpenCode answers true even when idle, so the answer is not checked. Record
+            # before closing the client: the abort's idle edge usually follows within ms.
             await client.abort(state.opencode_session_id)
             self._defer_parent_wake_after_native_interrupt(conv_id)
         except (OpenCodeClientError, httpx.HTTPError) as exc:
