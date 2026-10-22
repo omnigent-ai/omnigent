@@ -72,6 +72,14 @@ Issues with no activity for 30 days are marked `stale` and close after another
 14 days without activity. New activity restarts that inactivity window. Issues
 labeled `pinned`, `security`, or `bug` are exempt.
 
+Pull requests with no activity for 60 days are marked `stale` and close after
+another 14 days without activity. New activity clears the label and restarts
+the inactivity window. This applies to both contributor and maintainer PRs,
+including drafts. PRs labeled `pinned` or `security` are exempt. Source branches
+are kept, and authors can comment `/reopen` to resume work after an automated
+closure. This policy also applies to older PRs that predate the review-state
+labels below.
+
 If a bug is labeled `needs-info`, the automation asks its author for the
 specific missing information and gives them 7 days to respond. An author reply
 triggers another triage pass; the label clears only when the new information is

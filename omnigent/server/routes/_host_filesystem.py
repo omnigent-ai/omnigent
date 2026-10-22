@@ -72,8 +72,9 @@ async def read_workspace_from_host(
     :param host_conn: Live host connection for the session's host.
     :param op: Operation name — ``"list_or_read"`` / ``"changes"`` /
         ``"diff"`` / ``"search"`` / ``"github_info"`` / ``"github_changes"`` /
-        ``"github_diff"`` / ``"github_pr_diff"``. The ``github_*`` ops serve
-        every git provider; their names are stable wire ids.
+        ``"github_diff"`` / ``"github_pr_diff"`` / ``"github_labels"`` /
+        ``"github_merge_options"`` / ``"github_reviewers"``. The ``github_*`` ops
+        serve every git provider; their names are stable wire ids.
     :param workspace: Absolute workspace path on the host.
     :param session_id: Session id, forwarded to the change registry.
     :param params: Operation-specific arguments.
@@ -103,7 +104,7 @@ async def read_workspace_from_host(
             ) from exc
         try:
             result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs op %r within %.0fs",
                 host_conn.host_id,
@@ -147,14 +148,17 @@ async def write_workspace_from_host(
     """Send a ``host.fs_write_request`` frame and await its result.
 
     The write counterpart of :func:`read_workspace_from_host` — for the small set
-    of host-servable writes (currently ``"github_set_preference"`` and
-    ``"github_prs_update"``) so a preference change or a PR attach/remove works
-    when the session's runner is offline. Shares the
-    result frame, the ``pending_fs_requests`` correlation map, and the error
-    mapping with reads.
+    of host-servable writes (currently ``"github_set_preference"``,
+    ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
+    ``"github_merge"``, and ``"github_disable_auto_merge"``) so a preference change,
+    a PR attach/remove, a label or reviewer edit, or a merge works when the session's
+    runner is offline. Shares the result frame, the ``pending_fs_requests``
+    correlation map, and the error mapping with reads.
 
-    :param op: Write op name — currently ``"github_set_preference"`` or
-        ``"github_prs_update"``.
+    :param op: Write op name — currently ``"github_set_preference"``,
+        ``"github_prs_update"``, ``"github_labels_update"``,
+        ``"github_reviewers_update"``, ``"github_merge"``, or
+        ``"github_disable_auto_merge"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
     :returns: The refreshed payload on success.
     :raises HostFsError: When the host reports a failure (reproduces the runner's
@@ -182,7 +186,7 @@ async def write_workspace_from_host(
             ) from exc
         try:
             result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs write op %r within %.0fs",
                 host_conn.host_id,

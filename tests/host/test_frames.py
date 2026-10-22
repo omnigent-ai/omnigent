@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -2320,6 +2321,9 @@ def test_fs_result_null_payload_round_trip() -> None:
         (None, "runner exited with code 1", None),
         (None, None, None),
         ("some_future_code", "any text", None),
+        # A launch-handler fault is a generic failure: the server cannot
+        # describe its cause, so the host's text must not be surfaced.
+        (LAUNCH_HANDLER_FAILED_ERROR_CODE, "host failed to handle the launch request: x", None),
     ],
 )
 def test_classify_launch_refusal(

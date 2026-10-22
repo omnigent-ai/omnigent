@@ -3,8 +3,8 @@ default:
 
 export FASTLANE_SKIP_UPDATE_CHECK := "1"
 
-# iOS device override (default: iPhone 17 Pro)
-DEVICE := env("OMNIGENT_IOS_SIMULATOR", "iPhone 17 Pro")
+# iOS simulator name override (default: an available iPhone, preferring a booted one)
+DEVICE := env("OMNIGENT_IOS_SIMULATOR", "")
 
 # --- uv Python env ---
 

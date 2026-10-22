@@ -13,6 +13,9 @@ import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
+import { GridSessionsProvider } from "@/grid/GridSessionsContext";
+import * as readStateHooks from "@/hooks/useUnseenConversations";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -1509,10 +1512,19 @@ describe("Sidebar session list", () => {
 });
 
 describe("Sidebar failed session indicator", () => {
-  function renderSessionSidebar(initialEntry = "/") {
+  function renderSessionSidebar(initialEntry = "/", gridEnabled = false) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => {
-      const sidebar = <Sidebar open onClose={vi.fn()} />;
+      const content = <Sidebar open onClose={vi.fn()} />;
+      const sidebar = gridEnabled ? (
+        <CapabilitiesProvider
+          info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: true } }}
+        >
+          <GridSessionsProvider>{content}</GridSessionsProvider>
+        </CapabilitiesProvider>
+      ) : (
+        content
+      );
       return (
         <QueryClientProvider client={qc}>
           <SidebarDataProvider>
@@ -1520,6 +1532,7 @@ describe("Sidebar failed session indicator", () => {
               <MemoryRouter initialEntries={[initialEntry]}>
                 <Routes>
                   <Route path="/c/:conversationId" element={sidebar} />
+                  <Route path="/grid/:gridId" element={sidebar} />
                   <Route path="*" element={sidebar} />
                 </Routes>
               </MemoryRouter>
@@ -1531,6 +1544,52 @@ describe("Sidebar failed session indicator", () => {
     const result = render(tree());
     return { ...result, refresh: () => result.rerender(tree()) };
   }
+
+  it("keeps rows memoized across grid renames and updates changed members", async () => {
+    projectRowsRef.current = [];
+    mockConversations([conv("conv_a", "Codex"), conv("conv_b", "Codex"), conv("conv_c", "Codex")]);
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
+    const resolve = vi.spyOn(identity, "resolveIdentity").mockResolvedValue("local");
+    const readState = vi.spyOn(readStateHooks, "useConversationReadState");
+    const key = `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:local`;
+    const grid = {
+      id: "saved",
+      name: "Original",
+      layout: { axis: "columns", children: ["conv_a", "conv_b"] },
+    };
+    localStorage.setItem(key, JSON.stringify([grid]));
+    try {
+      await act(async () => {
+        renderSessionSidebar("/grid/saved", true);
+      });
+      expect(screen.getByRole("link", { name: "Original" })).toBeVisible();
+      fireEvent.doubleClick(screen.getByRole("link", { name: "Original" }));
+      const input = screen.getByRole("textbox", { name: "Rename grid" });
+      fireEvent.change(input, { target: { value: "Renamed" } });
+      readState.mockClear();
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.getByRole("link", { name: "Renamed" })).toBeVisible();
+      expect(readState).not.toHaveBeenCalled();
+      localStorage.setItem(
+        key,
+        JSON.stringify([{ ...grid, layout: { axis: "columns", children: ["conv_a", "conv_c"] } }]),
+      );
+      await act(async () => {
+        window.dispatchEvent(new StorageEvent("storage", { key, storageArea: localStorage }));
+      });
+      expect(screen.getByRole("link", { name: "conv_b" })).not.toHaveClass(
+        "bg-[var(--sidebar-active)]",
+      );
+      expect(screen.getByRole("link", { name: "conv_c" })).toHaveClass(
+        "bg-[var(--sidebar-active)]",
+      );
+      expect(readState.mock.calls.some(([id]) => id === "conv_a")).toBe(false);
+    } finally {
+      viewer.mockRestore();
+      resolve.mockRestore();
+      readState.mockRestore();
+    }
+  });
 
   it("replaces an unread dot with the error icon and keeps it after marking read", () => {
     const session = conv("conv_error", "Codex", {

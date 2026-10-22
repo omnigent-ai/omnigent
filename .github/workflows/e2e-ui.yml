@@ -68,12 +68,13 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
-  # Compute the shard matrix once. A skipped run (draft / fork pull_request)
-  # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
-    name: UI scope
+    name: UI coverage scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -184,7 +185,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       # ci.yml skips UI-only changes, so check here that the verify-omnigent
       # feature map still names tests that exist after UI test renames.
@@ -238,10 +239,9 @@ jobs:
 
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
-    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
-    # `ready_for_review` re-fires when a draft is converted.
+    # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: [setup, build-sidecar]
+    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -277,7 +277,7 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose
@@ -330,12 +330,12 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
         with:
           harness: codex
 

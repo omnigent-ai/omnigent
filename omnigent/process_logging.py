@@ -11,7 +11,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO, TextIO, TypedDict
 
@@ -316,7 +316,7 @@ def display_log_path(path: Path) -> str:
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    return datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S-%f")
 
 
 def create_process_log_path(

@@ -53,6 +53,9 @@ const _PARK_REATTACH_MIN_ELAPSED_MS = _PARK_ATTEMPT_TIMEOUT_MS - 5_000;
 // the rounds and then deny, instead of riding the 24h park ceiling to a
 // fail-open. The brief inter-round sleep means this bounds wall-time too.
 const _MAX_RAW_ASK_ROUNDS = 50;
+
+// Allow the 5s routing call and 6s relay to fail open before the 8s client deadline.
+const _ROUTE_TURN_TIMEOUT_MS = 8_000;
 // Reason surfaced when the tool-call gate cannot obtain a usable verdict and
 // fails CLOSED. PHASE_TOOL_CALL is the sole enforcement point for a native
 // connector tool, so an unevaluable policy must block, not proceed — matching
@@ -1159,6 +1162,28 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
 }
 
+/**
+ * Route native TUI input before Pi binds its model; composer input is routed upstream.
+ * Errors and timeouts return null, preserving the current model.
+ * @returns {Promise<{action: string, model?: string, terminal?: boolean} | null>}
+ */
+async function routeTurn(config, prompt, model) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function")
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/route-turn`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: headers(config),
+      body: JSON.stringify({ harness: "pi-native", prompt, model: model || null }),
+      signal: AbortSignal.timeout(_ROUTE_TURN_TIMEOUT_MS),
+    });
+    return resp.ok ? await resp.json() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 async function postModelChangeError(config, message) {
   await postEvent(config, {
     type: "external_conversation_item",
@@ -1444,6 +1469,10 @@ module.exports = function (pi) {
   let agentRunning = false;
   let compacting = false;
   let latestContext = null;
+  // Promise of the last inbox model_change, awaited by ``input``.
+  let pendingModelChange = null;
+  // Set once route-turn gives a final answer for this session (see ``input``).
+  let turnRoutingDone = false;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -1673,18 +1702,8 @@ module.exports = function (pi) {
     if (changed) await publishTaskList();
   }
 
-  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
-  // assistant message per LLM call); session billing is their SUM — each call
-  // is billed for the full context it re-sent, so summing per-message inputs is
-  // the correct cumulative input. The server applies vendor pricing to these
-  // cumulative totals and republishes a ``session.usage`` event (the SAME
-  // contract claude-native / codex-native / cursor-native use), so the web
-  // Session-cost badge + per-model token breakdown light up with no
-  // server/frontend changes. Dedup by message fingerprint so a re-emitted
-  // ``message_end`` / ``turn_end`` / ``agent_end`` carrying the same assistant
-  // message never double-counts. ``usageModel`` tracks the latest message's
-  // model (mirrors a mid-session model switch). ``lastPostedUsageKey`` dedups
-  // the POST itself so a flush with no new tokens is skipped.
+  // Sum each assistant message once; restored totals cover pre-relaunch messages.
+  // The POST key skips unchanged totals.
   const countedUsageMessages = new Set();
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
@@ -1747,6 +1766,9 @@ module.exports = function (pi) {
     const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
+    // Persist the running total before the POST so a relaunch restores it even
+    // when the flush fails and the server never records this report.
+    persistCumulativeUsage();
     const data = {
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
@@ -1754,6 +1776,70 @@ module.exports = function (pi) {
     };
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
+  }
+
+  // Restore cumulative totals before recording new usage after a relaunch.
+  function usageStatePath() {
+    if (!config || !config.bridgeDir) return null;
+    return path.join(config.bridgeDir, "cumulative_usage.json");
+  }
+
+  function persistCumulativeUsage() {
+    const statePath = usageStatePath();
+    if (!statePath) return;
+    // Per-pid temp name: an exiting Pi process and its relaunched successor
+    // can flush concurrently, and a shared temp path could persist a torn file.
+    const tmp = `${statePath}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({
+          cumulative_input_tokens: cumulativeInputTokens,
+          cumulative_output_tokens: cumulativeOutputTokens,
+          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+          model: usageModel,
+        }),
+      );
+      fs.renameSync(tmp, statePath);
+    } catch (_err) {
+      // Remove temporary state after a failed best-effort checkpoint.
+      try {
+        fs.unlinkSync(tmp);
+      } catch (_cleanupErr) {}
+    }
+  }
+
+  function raiseUsageTotals(saved) {
+    if (!saved || typeof saved !== "object") return;
+    const input = toInt(saved.cumulative_input_tokens);
+    const output = toInt(saved.cumulative_output_tokens);
+    const cacheRead = toInt(saved.cumulative_cache_read_input_tokens);
+    // Only raise the counters; a stale file must never pull a live total down.
+    if (input > cumulativeInputTokens) cumulativeInputTokens = input;
+    if (output > cumulativeOutputTokens) cumulativeOutputTokens = output;
+    if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
+    if (!usageModel && typeof saved.model === "string" && saved.model)
+      usageModel = saved.model;
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens)
+    ) {
+      lastPostedUsageKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    }
   }
 
   function rememberContext(ctx) {
@@ -1995,6 +2081,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    restoreCumulativeUsage();
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
@@ -2022,7 +2109,11 @@ module.exports = function (pi) {
           compacting = false;
         }
       },
-      (model) => applyModelChange(pi, config, latestContext, model),
+      (model) => {
+        // Await the composer's async model switch before input binds the turn's model.
+        pendingModelChange = applyModelChange(pi, config, latestContext, model);
+        return pendingModelChange;
+      },
       (level) => pi.setThinkingLevel(level),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
@@ -2054,6 +2145,8 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
+    // Publish readiness before usage so a hung POST cannot delay input handling.
+    await postSessionUsage();
     // Readiness is not turn completion: a queued prompt may already be running.
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
@@ -2252,6 +2345,22 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
+    if (pendingModelChange) {
+      const pending = pendingModelChange;
+      pendingModelChange = null;
+      await pending.catch(() => {});
+    }
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
+    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
+      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
+      if (!decision || decision.terminal || decision.action === "route") {
+        turnRoutingDone = true;
+      }
+      if (decision && decision.action === "route" && decision.model) {
+        await applyModelChange(pi, config, ctx, decision.model);
+      }
+    }
     await postEvent(config, {
       type: "external_conversation_item",
       data: {

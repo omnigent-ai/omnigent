@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -27,6 +28,13 @@ from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view
 
 
 @pytest.mark.parametrize("refusal", ["missing_target", "draft_not_accepted"])
+@pytest.mark.parametrize(
+    "delivery_timeout_s",
+    [
+        pytest.param(2.0, id="short-delivery-budget"),
+        pytest.param(None, id="production-delivery-budget", marks=pytest.mark.nightly),
+    ],
+)
 @pytest.mark.timeout(180)
 def test_claude_refused_message_survives_reload(
     built_spa: None,
@@ -35,6 +43,7 @@ def test_claude_refused_message_survives_reload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     refusal: str,
+    delivery_timeout_s: float | None,
 ) -> None:
     marker = f"refused-input-{uuid.uuid4().hex[:8]}"
     tui = tmp_path / "controlled-tui.py"
@@ -49,12 +58,38 @@ def test_claude_refused_message_survives_reload(
     monkeypatch.setenv("OPENAI_API_KEY", "mock-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", mock_llm_server_url)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "mock-key")
+    runner_env = {}
+    observed_budget = tmp_path / "delivery-budget.json"
+    if delivery_timeout_s is not None:
+        startup = tmp_path / "startup"
+        startup.mkdir()
+        (startup / "sitecustomize.py").write_text(
+            "import json\n"
+            "from pathlib import Path\n"
+            "from omnigent.harnesses.claude_native import bridge\n"
+            f"bridge._SUBMIT_VERIFY_TIMEOUT_S = {delivery_timeout_s!r}\n"
+            "inject = bridge.inject_user_message\n"
+            "def short_inject(*args, **kwargs):\n"
+            f"    kwargs['timeout_s'] = {delivery_timeout_s!r}\n"
+            f"    Path({str(observed_budget)!r}).write_text(json.dumps(\n"
+            "        {'target_wait_s': kwargs['timeout_s'], "
+            "'submit_wait_s': bridge._SUBMIT_VERIFY_TIMEOUT_S}))\n"
+            "    return inject(*args, **kwargs)\n"
+            "bridge.inject_user_message = short_inject\n"
+        )
+        runner_env["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(startup),
+                str(Path(__file__).resolve().parents[3]),
+                os.environ.get("PYTHONPATH", ""),
+            ]
+        )
     with (
         tempfile.TemporaryDirectory(prefix="omni-refusal-") as native_tmp,
         contextlib.ExitStack() as resources,
     ):
         monkeypatch.setenv("TMPDIR", native_tmp)
-        stack = resources.enter_context(_native_stack(tmp_path, script))
+        stack = resources.enter_context(_native_stack(tmp_path, script, runner_env=runner_env))
         client = resources.enter_context(httpx.Client(trust_env=False, timeout=15))
         session = create_native_session(client, stack.base_url, harness="claude")
         session_id = session["session_id"]
@@ -97,6 +132,11 @@ def test_claude_refused_message_survives_reload(
             else "draft is still in the input box"
         )
         assert expected in detail, detail
+        if delivery_timeout_s is not None:
+            assert json.loads(observed_budget.read_text()) == {
+                "target_wait_s": delivery_timeout_s,
+                "submit_wait_s": delivery_timeout_s,
+            }
         assert (
             not client.get(f"{stack.base_url}/v1/sessions/{session_id}")
             .json()

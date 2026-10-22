@@ -2451,7 +2451,102 @@ async def test_events_model_change_reports_a_tmux_failure_as_503(
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_failed"
+    # No person can act on this, so the reply names the log, not the raw text.
+    detail = resp.json()["detail"]
+    assert detail.startswith("Request failed on the runner; see the runner log for details:")
+    assert "command not found" not in detail
     assert typed == ([] if stage == "wait" else ["/model claude-opus-4-7"])
+
+
+_PASSWORD_PANE_TAIL = (
+    " Last terminal output:\n"
+    "✔ Unity Gateway connected\n"
+    "• Enter password to configure settings for Claude Code.\n"
+    "Password:"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "error", "expected_detail"),
+    [
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudePromptTimeout(
+                "Claude Code terminal did not become ready within 9.0s. "
+                "The message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="launcher-password-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation="Open the sign-in link and sign in.",
+            ),
+            "Claude Code can't start until you sign in to Databricks. "
+            "Finish the sign-in in the terminal, then switch models again.",
+            id="sign-in",
+        ),
+        pytest.param(
+            "inject",
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request before "
+                "changing settings."
+            ),
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again.",
+            id="permission-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code is waiting for an answer in its terminal (Trust this folder?), "
+                "so the message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
+            id="dialog",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalExited(
+                "The Claude Code terminal has exited (status 1)." + _PASSWORD_PANE_TAIL,
+                exit_status="1",
+            ),
+            "The Claude Code terminal has exited. Relaunch it, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="exited",
+        ),
+    ],
+)
+async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    expected_detail: str,
+) -> None:
+    """A switch refused by a terminal awaiting the person names what to do, not the log path."""
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if stage == "wait":
+            raise error
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir, command
+        raise error
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch, wait=_wait, inject=_inject, status=lambda _bridge_dir: None
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {"error": "claude_native_model_failed", "detail": expected_detail}
 
 
 @pytest.mark.asyncio

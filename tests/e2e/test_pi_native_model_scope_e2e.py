@@ -219,6 +219,9 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
                 supported_capabilities=frozenset({ModelCapability.REASONING})
                 if reasoning
                 else frozenset(),
+                unsupported_capabilities=frozenset({ModelCapability.REASONING})
+                if not reasoning
+                else frozenset(),
                 wire_apis=frozenset(
                     {
                         ModelWireAPI.OPENAI_CHAT
@@ -237,22 +240,35 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
         "omnigent.onboarding.providers.find_catalog_models",
         lambda _: [ModelInfo(name=model, provider="openai", supports_reasoning=True)],
     )
+    gateway_chat = databricks and wire_api == "chat"
+    # The gateway deliberately repeats the tool name as its call ID across turns.
+    tool = {
+        "call_id": "bash" if gateway_chat else "effort-tool",
+        "name": "bash",
+        "arguments": '{"command":"printf PI_EFFORT_TOOL_RESULT"}',
+        **({"thoughtSignature": "first-tool-signature"} if gateway_chat else {}),
+    }
+    responses = [
+        {"tool_calls": [tool]},
+        {"text": "NATIVE_EFFORT_FIRST_ANSWER", "stream": True},
+        *(
+            [{"tool_calls": [{**tool, "thoughtSignature": "second-tool-signature"}]}]
+            if gateway_chat
+            else []
+        ),
+        {"text": "NATIVE_EFFORT_SECOND_ANSWER", "stream": True},
+    ]
+    if gateway_chat:
+        for response in responses:
+            if "text" in response:
+                response["chat_content"] = [
+                    {"type": "reasoning", "text": "PRIVATE_GATEWAY_REASONING"},
+                    {"type": "text", "text": response["text"]},
+                ]
     reset_mock_llm(mock_llm_server_url)
     configure_mock_llm(
         mock_llm_server_url,
-        [
-            {
-                "tool_calls": [
-                    {
-                        "call_id": "effort-tool",
-                        "name": "bash",
-                        "arguments": '{"command":"printf PI_EFFORT_TOOL_RESULT"}',
-                    }
-                ]
-            },
-            {"text": "NATIVE_EFFORT_FIRST_ANSWER", "stream": True},
-            {"text": "NATIVE_EFFORT_SECOND_ANSWER", "stream": True},
-        ],
+        responses,
         key=model,
     )
     with _managed_pi(
@@ -271,13 +287,31 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
         tui.send("Reply again.\r")
         tui.wait_for(lambda text: "NATIVE_EFFORT_SECOND_ANSWER" in text)
     requests = get_mock_requests(mock_llm_server_url, key=model)
-    assert len(requests) == 3
+    assert len(requests) == (4 if gateway_chat else 3)
     efforts = [
         r.get("reasoning_effort")
         if wire_api == "chat"
         else r.get("output_config" if wire_api == "anthropic" else "reasoning", {}).get("effort")
         for r in requests
     ]
-    assert efforts == (["high"] * 3 if reasoning else [None] * 3)
+    assert efforts == (["high"] if reasoning else [None]) * len(requests)
     history = json.dumps(requests[-1].get("messages", requests[-1].get("input")))
     assert "PI_EFFORT_TOOL_RESULT" in history and "NATIVE_EFFORT_FIRST_ANSWER" in history
+
+    if gateway_chat:
+        calls = [
+            call for message in requests[-1]["messages"] for call in message.get("tool_calls", [])
+        ]
+        assert [call.get("thoughtSignature") for call in calls] == [
+            "first-tool-signature",
+            "second-tool-signature",
+        ]
+        ids = [call["id"] for call in calls]
+        assert len(set(ids)) == 2 and "bash" not in ids
+        result_ids = [
+            message["tool_call_id"]
+            for message in requests[-1]["messages"]
+            if message["role"] == "tool"
+        ]
+        assert result_ids == ids
+        assert "PRIVATE_GATEWAY_REASONING" not in history and "[object Object]" not in history

@@ -1,9 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
-import { useSandboxModelOptions } from "./useSandboxModelOptions";
+import { useSandboxModelOptions, useSandboxUnsupportedAgents } from "./useSandboxModelOptions";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 const fetchMock = vi.mocked(authenticatedFetch);
@@ -85,5 +85,100 @@ describe("useSandboxModelOptions", () => {
     );
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useSandboxUnsupportedAgents", () => {
+  const entries = [
+    { agentId: "ag_codex", harness: "codex-native" },
+    { agentId: "ag_claude", harness: "claude-native" },
+    { agentId: "ag_pi", harness: "pi-native" },
+  ];
+
+  function previewBy(statusFor: (harness: string) => number | string) {
+    fetchMock.mockImplementation(async (url) => {
+      const harness = decodeURIComponent(String(url).split("/harnesses/")[1].split("/")[0]);
+      const status = statusFor(harness);
+      if (typeof status === "number") {
+        return new Response(JSON.stringify({ detail: "Gateway down" }), { status });
+      }
+      return new Response(
+        JSON.stringify({
+          ...catalog,
+          configured: false,
+          models: [],
+          status,
+          ...(status === "unsupported" ? { error: "No models for Codex." } : {}),
+        }),
+      );
+    });
+  }
+
+  function render(enabled = true) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const hook = renderHook(
+      () => useSandboxUnsupportedAgents("lakebox", entries, "alice", enabled),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        ),
+      },
+    );
+    return { client, ...hook };
+  }
+
+  it("fetches nothing until rows are prefetched", async () => {
+    render();
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports only agents whose preview is definitively unsupported", async () => {
+    previewBy(
+      (harness) =>
+        ({ "codex-native": "unsupported", "claude-native": "unavailable", "pi-native": 503 })[
+          harness
+        ]!,
+    );
+    const { result } = render();
+    act(() => result.current.prefetch(["ag_codex", "ag_claude", "ag_pi"]));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    await waitFor(() =>
+      expect([...result.current.unsupported]).toEqual([["ag_codex", "No models for Codex."]]),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sandbox-providers/lakebox/harnesses/codex-native/model-options?agent_id=ag_codex",
+    );
+  });
+
+  it("reuses a fresh preview instead of refetching on the next open", async () => {
+    previewBy(() => "ready");
+    const { result } = render();
+    act(() => result.current.prefetch(["ag_codex"]));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    act(() => result.current.prefetch(["ag_codex"]));
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops ruling an agent out once its preview fails", async () => {
+    previewBy(() => "unsupported");
+    const { client, result } = render();
+    act(() => result.current.prefetch(["ag_codex"]));
+    await waitFor(() => expect(result.current.unsupported.has("ag_codex")).toBe(true));
+    previewBy(() => 503);
+    // The next open refetches the now-stale entry through the real request.
+    await act(() => client.invalidateQueries({ refetchType: "none" }));
+    act(() => result.current.prefetch(["ag_codex"]));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.unsupported.size).toBe(0));
+  });
+
+  it("does nothing while disabled", async () => {
+    const { result } = render(false);
+    act(() => result.current.prefetch(["ag_codex"]));
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.current.unsupported.size).toBe(0);
   });
 });

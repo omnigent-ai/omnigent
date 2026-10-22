@@ -51,9 +51,12 @@ jobs:
   # Trusted authors and non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
-    name: Web scope
+    name: Web coverage scope
     needs: gate
     runs-on: ubuntu-latest
     outputs:
@@ -78,9 +81,20 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
 
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
+
+      - name: Set up uv for dependency peer validation
+        if: github.event_name == 'pull_request' && needs.scope.outputs.dependency == 'true'
+        uses: ./.github/actions/setup-uv
+
+      - name: Validate changed dependency peers
+        if: github.event_name == 'pull_request' && needs.scope.outputs.dependency == 'true'
+        run: uv run --no-project --with pyyaml==6.0.3 python .github/scripts/ci/check_npm_peers.py --base HEAD^1
 
       - name: Run Electron storage-isolation unit test
         run: node --test web/electron/test/browserViewRegistry_storage_isolation.test.js

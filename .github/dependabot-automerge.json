@@ -1,151 +1,56 @@
 {
   "cooldown_days": 7,
   "python": {
-    "minor": [
-      "coverage",
-      "pytest",
-      "pytest-cov",
-      "pytest-xdist",
-      "pytest-asyncio",
-      "pytest-playwright",
-      "pytest-playwright-visual-snapshot",
-      "ruff",
-      "pre-commit",
-      "pyrefly",
-      "build"
+    "default": "minor",
+    "manual": [
+      "claude-agent-sdk",
+      "openai-agents",
+      "cursor-sdk",
+      "google-adk",
+      "google-antigravity",
+      "github-copilot-sdk",
+      "kiro-cli",
+      "copilot-sdk",
+      "pi-coding-agent"
     ],
-    "patch": [
-      "cachetools",
-      "rich",
-      "python-dateutil",
-      "ftfy",
-      "filelock",
-      "packaging",
-      "platformdirs",
-      "click",
-      "prompt-toolkit",
-      "colorama",
-      "pygments",
-      "wcwidth",
-      "six",
-      "typing-extensions",
-      "iniconfig",
-      "pluggy",
-      "virtualenv",
-      "distlib",
-      "identify",
-      "nodeenv",
-      "cfgv",
-      "pathspec",
-      "pyproject-hooks",
-      "respx",
-      "attrs",
-      "more-itertools",
-      "wrapt",
-      "tqdm"
+    "zero_minor": [
+      "*"
     ]
   },
   "npm": {
-    "minor": [
-      "@types/*",
-      "@testing-library/dom",
-      "@testing-library/jest-dom",
-      "@testing-library/react",
-      "@testing-library/user-event",
-      "@vitest/*",
-      "vitest",
-      "typescript",
-      "oxlint",
-      "@oxlint/*",
-      "prettier",
-      "jsdom",
-      "fake-indexeddb"
+    "default": "minor",
+    "manual": [
+      "@anthropic-ai/claude-code",
+      "@openai/codex",
+      "@earendil-works/pi-coding-agent",
+      "@mariozechner/pi-*",
+      "@github/copilot*",
+      "@cursor/*",
+      "electron",
+      "@electron/*",
+      "@capacitor/*",
+      "react-native",
+      "react-pdf",
+      "pdfjs-dist"
     ],
-    "patch": [
-      "clsx",
-      "class-variance-authority",
-      "nanoid",
-      "rrule",
-      "date-fns",
-      "lodash",
-      "lodash-es",
-      "lucide-react",
-      "@fontsource-variable/*",
-      "@emoji-mart/*",
-      "emoji-mart",
-      "@dnd-kit/*",
-      "@radix-ui/*",
-      "radix-ui",
-      "@tanstack/*",
-      "react-hook-form",
-      "react-hotkeys-hook",
-      "recharts",
-      "sonner",
-      "zustand",
-      "use-stick-to-bottom",
-      "qrcode.react",
-      "tailwind-merge",
-      "tw-animate-css",
-      "next-themes",
-      "ansi-to-react",
-      "picocolors",
-      "ansi-styles",
-      "ansi-regex",
-      "strip-ansi",
-      "string-width",
-      "string-width-cjs",
-      "strip-ansi-cjs",
-      "ansi-regex-cjs",
-      "supports-color",
-      "debug",
-      "ms",
-      "picomatch",
-      "minimatch",
-      "brace-expansion",
-      "balanced-match",
-      "fast-glob",
-      "glob-parent",
-      "is-glob",
-      "is-extglob",
-      "tinyglobby",
-      "fdir",
-      "tslib",
-      "csstype",
-      "react-is",
-      "scheduler",
-      "@babel/helper-*",
-      "@babel/types",
-      "@babel/parser",
-      "@babel/runtime",
-      "@babel/code-frame",
-      "@babel/generator",
-      "@babel/traverse",
-      "@babel/template",
-      "@jridgewell/*",
-      "@rollup/rollup-*",
-      "@esbuild/*",
-      "tinypool",
-      "tinybench",
-      "tinyexec",
-      "tinyspy",
-      "chai",
-      "assertion-error",
-      "check-error",
-      "deep-eql",
-      "loupe",
-      "pathe",
-      "std-env"
+    "zero_minor": [
+      "*"
     ]
   },
-  "actions": [
-    "actions/checkout",
-    "actions/setup-python",
-    "actions/setup-node",
-    "actions/cache",
-    "actions/cache/restore",
-    "actions/cache/save",
-    "pnpm/action-setup"
-  ],
+  "actions": {
+    "default": "minor",
+    "manual": [
+      "pypa/gh-action-pypi-publish",
+      "softprops/action-gh-release",
+      "release-drafter/release-drafter",
+      "googleapis/release-please-action",
+      "actions/attest*",
+      "actions/create-github-app-token"
+    ],
+    "zero_minor": [
+      "*"
+    ]
+  },
   "action_test_paths": {
     ".github/workflows/ci.yml": "ci.yml",
     ".github/workflows/lint.yml": "lint.yml",
@@ -156,64 +61,81 @@
     ".github/actions/setup-pnpm/action.yml": "web-tests.yml",
     ".github/actions/e2e-run/action.yml": "e2e.yml",
     ".github/actions/integration-run/action.yml": "integration.yml",
-    ".github/actions/setup-uv/action.yml": "ci.yml"
+    ".github/actions/setup-uv/action.yml": "ci.yml",
+    ".github/workflows/docker-build.yml": "docker-build.yml",
+    ".github/workflows/trivy.yml": "trivy.yml",
+    ".github/workflows/windows.yml": "windows.yml"
   },
   "pre_commit": [
     "https://github.com/pre-commit/pre-commit-hooks"
   ],
   "cargo": {
-    "target": "tests/codex_parity/sidecar/Cargo.lock",
-    "patch": [
-      "anyhow",
-      "bytes",
-      "clap",
-      "clap_builder",
-      "clap_derive",
-      "clap_lex",
-      "either",
-      "futures",
-      "futures-*",
-      "itertools",
-      "memchr",
-      "once_cell",
-      "pin-project-lite",
-      "proc-macro2",
-      "quote",
-      "regex",
-      "regex-*",
-      "serde",
-      "serde_core",
-      "serde_derive",
-      "serde_json",
-      "syn",
-      "thiserror",
-      "thiserror-impl",
-      "tokio",
-      "tokio-macros",
-      "tokio-util",
-      "tracing",
-      "tracing-core",
-      "tracing-attributes",
-      "unicode-ident",
-      "itoa",
-      "ryu"
-    ]
+    "default": "minor",
+    "manual": [],
+    "zero_minor": [
+      "*"
+    ],
+    "targets": {
+      "tests/codex_parity/sidecar/Cargo.lock": {
+        "workflows": [
+          "ci.yml",
+          "e2e-ui.yml"
+        ],
+        "checks": [
+          "Pytest (codex-parity)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Pytest (codex-parity)"
+          ],
+          "e2e-ui.yml": [
+            "UI coverage scope",
+            "E2E UI result",
+            "E2E UI Tests (shard *)"
+          ]
+        }
+      },
+      "dev/omnidev/Cargo.lock": {
+        "workflows": [
+          "ci.yml"
+        ],
+        "checks": [
+          "Rust tests (omnidev)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Rust tests (omnidev)"
+          ]
+        }
+      }
+    }
   },
   "dependency_workflow_test_jobs": {
     "npm": {
-      "ci.yml": ["CI scope"]
+      "ci.yml": [
+        "CI coverage scope",
+        "CI result"
+      ]
     },
     "pre-commit": {
-      "ci.yml": ["CI scope"]
-    },
-    "cargo": {
-      "ci.yml": ["Pytest (codex-parity)"],
-      "e2e-ui.yml": ["E2E UI Tests (shard *)"]
+      "ci.yml": [
+        "CI coverage scope",
+        "CI result"
+      ]
     }
   },
   "workflow_test_jobs": {
+    "windows.yml": [
+      "Windows smoke + unit"
+    ],
     "ci.yml": [
-      "Pytest (runtime-core)"
+      "CI coverage scope",
+      "CI result",
+      "Pytest (*)"
     ],
     "lint.yml": [
       "Pre-commit checks"
@@ -226,17 +148,23 @@
       "Integration (openai-agents)"
     ],
     "e2e.yml": [
+      "E2E coverage scope",
       "E2E Tests (shard *)"
     ],
     "web-tests.yml": [
-      "web test"
+      "Web coverage scope",
+      "web test",
+      "Web result"
     ],
     "e2e-ui.yml": [
+      "UI coverage scope",
+      "E2E UI result",
       "Browser Contract UI",
       "E2E UI Tests (shard *)"
     ],
     "docker-build.yml": [
-      "Docker build"
+      "Docker build",
+      "Docker result"
     ]
   }
 }

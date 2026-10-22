@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os
@@ -2330,7 +2331,7 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
         captured["create_app_kwargs"] = kwargs
         return _original_create_app(**kwargs)
 
-    def _fake_server_run(self: Any) -> None:
+    def _fake_server_run(self: Any, **kwargs: Any) -> None:
         """Skip the blocking server loop; capture config as flat kwargs dict.
 
         :param self: The uvicorn Server instance whose config holds all options.
@@ -2427,14 +2428,14 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     captured: dict[str, str] = {}
 
-    def _fake_server_run(self: object) -> None:
+    def _fake_server_run(self: object, **kwargs: Any) -> None:
         del self
         captured["config"] = os.environ["OMNIGENT_CONFIG"]
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     # Config precedence does not depend on a machine-global port being free.
-    bind_probe = Mock()
-    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
+    bind_probe = Mock(return_value=contextlib.nullcontext(Mock()))
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", bind_probe)
 
     result = CliRunner().invoke(
         cli,
@@ -2453,6 +2454,26 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
+
+
+@pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])
+def test_server_rejects_invalid_preference_authority(monkeypatch, tmp_path, authority):
+    import json
+
+    import uvicorn.server
+
+    config = tmp_path / "invalid.yaml"
+    config.write_text("shared_preferences_authority_id: " + json.dumps(authority) + "\n")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    run = Mock()
+    monkeypatch.setattr(uvicorn.server.Server, "run", run)
+    result = CliRunner().invoke(
+        cli,
+        ["server", "-c", str(config), "--host", "127.0.0.1", "--port", "0", "--no-open"],
+    )
+    assert result.exit_code == 1
+    assert "Invalid shared_preferences_authority_id" in result.output
+    run.assert_not_called()
 
 
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
@@ -2488,7 +2509,7 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
         captured["create_app_kwargs"] = kwargs
         return _original_create_app(**kwargs)
 
-    def _fake_server_run(self: Any) -> None:
+    def _fake_server_run(self: Any, **kwargs: Any) -> None:
         """Skip the blocking server loop, record that it was called.
 
         :param self: The uvicorn Server instance.
@@ -2517,8 +2538,8 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
 
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_register)
     # The dedicated server is stubbed; occupied-port behavior has its own test.
-    bind_probe = Mock()
-    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
+    bind_probe = Mock(return_value=contextlib.nullcontext(Mock()))
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", bind_probe)
 
     db_path = tmp_path / "chat.db"
     result = CliRunner().invoke(
@@ -2569,7 +2590,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
 
     captured: dict[str, Any] = {}
 
-    def _fake_server_run(self: Any) -> None:
+    def _fake_server_run(self: Any, **kwargs: Any) -> None:
         """
         Skip the blocking server loop.
 
@@ -2597,9 +2618,10 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
 
     bind_probes: list[tuple[str, int]] = []
 
-    def _spy_port_bindable(host: str, port: int) -> None:
+    def _spy_port_bindable(host: str, port: int) -> contextlib.AbstractContextManager:
         """Record the preflight bind probe without opening a real socket."""
         bind_probes.append((host, port))
+        return contextlib.nullcontext(Mock())
 
     from omnigent.host import local_server as _local_server_mod
 
@@ -2607,7 +2629,7 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     monkeypatch.setattr(_local_server_mod, "local_server_url_if_healthy", _must_not_check_existing)
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_touch_pidfile)
     monkeypatch.setattr(_local_server_mod, "clear_local_server_record", _must_not_touch_pidfile)
-    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", _spy_port_bindable)
+    monkeypatch.setattr("omnigent.cli._bind_server_listener", _spy_port_bindable)
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
 
@@ -2666,22 +2688,13 @@ def test_server_command_explicit_occupied_port_fails() -> None:
     assert "Starting omnigent server" not in result.output
 
 
-def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
+@pytest.mark.parametrize("fail_startup", [False, True])
+def test_server_command_keeps_explicit_port_bound_through_startup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    fail_startup: bool,
 ) -> None:
-    """
-    A refused client connection does not make an explicit port unavailable.
-
-    A connect-based probe would classify this free port as unusable
-    because the pre-test client connection is refused. The CLI should
-    use a bind probe instead, continue startup, and pass the requested
-    port to uvicorn unchanged.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Per-test data directory for the SQLite store.
-    :returns: None.
-    """
+    """No competing listener can take the port during app initialization."""
     import socket
 
     import uvicorn
@@ -2689,14 +2702,11 @@ def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
 
     captured: dict[str, Any] = {}
 
-    def _fake_server_run(self: Any) -> None:
-        """
-        Skip the blocking server loop.
-
-        :param self: The uvicorn Server instance.
-        :returns: None.
-        """
+    def _fake_server_run(self: Any, sockets: list[socket.socket] | None = None) -> None:
+        assert sockets is not None and len(sockets) == 1
+        assert sockets[0].getsockname()[1] == port
         captured["uvicorn_kwargs"] = {"port": self.config.port}
+        captured["listener"] = sockets[0]
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -2705,6 +2715,20 @@ def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
     with pytest.raises(OSError):
         socket.create_connection(("127.0.0.1", port), timeout=0.01)
 
+    from omnigent.server import app as app_module
+
+    real_create_app = app_module.create_app
+
+    def create_app_with_competing_listener(**kwargs: Any) -> Any:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as competitor:
+            with pytest.raises(OSError):
+                competitor.bind(("127.0.0.1", port))
+        captured["reserved_during_startup"] = True
+        if fail_startup:
+            raise RuntimeError("test startup failure")
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", create_app_with_competing_listener)
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
     monkeypatch.setenv("OMNIGENT_AUTH_ENABLED", "0")
 
@@ -2726,9 +2750,16 @@ def test_server_command_explicit_port_uses_bind_probe_not_connect_probe(
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    assert captured["uvicorn_kwargs"]["port"] == port
-    assert f"Starting omnigent server on 127.0.0.1:{port}" in result.output
+    assert captured.get("reserved_during_startup"), result.exception
+    assert result.exit_code == (1 if fail_startup else 0), result.output
+    if fail_startup:
+        assert str(result.exception) == "test startup failure"
+    else:
+        assert captured["uvicorn_kwargs"]["port"] == port
+        assert captured["listener"].fileno() == -1
+        assert f"Starting omnigent server on 127.0.0.1:{port}" in result.output
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as released:
+        released.bind(("127.0.0.1", port))
     assert "port is unavailable" not in result.output
 
 
@@ -5043,7 +5074,125 @@ def test_run_server_without_agent_dispatches_direct_server(
         # Interactive ``run --server`` (no -p) defaults the browser-open ON,
         # including for remote servers.
         auto_open_conversation=True,
+        agent_name=None,
     )
+
+
+def test_run_server_agent_forwards_agent_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run --server URL --agent NAME -p`` hands the requested agent to ``run_chat``."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "scribe", "-p", "hi"]
+    )
+
+    assert result.exit_code == 0, result.output
+    run_chat.assert_called_once()
+    assert run_chat.call_args.kwargs["target"] == "http://localhost:8000"
+    assert run_chat.call_args.kwargs["agent_name"] == "scribe"
+    assert run_chat.call_args.kwargs["prompt"] == "hi"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["run", "--agent", "scribe"],
+        [
+            "run",
+            "tests/resources/examples/hello_world.yaml",
+            "--server",
+            "http://localhost:8000",
+            "--agent",
+            "scribe",
+        ],
+        ["run", "--server", "http://localhost:8000", "--harness", "codex", "--agent", "scribe"],
+    ],
+)
+def test_run_agent_requires_direct_server(
+    args: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--agent`` names a server-registered agent, so it needs a direct ``--server`` run."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(cli, args)
+
+    assert result.exit_code != 0
+    assert "--agent" in result.output and "--server <url>" in result.output
+    run_chat.assert_not_called()
+
+
+@pytest.mark.parametrize("flags", [["--resume", "conv_1"], ["--continue"], ["--fork", "conv_1"]])
+def test_run_agent_rejects_resume_flags(flags: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--agent`` starts a new session; resuming or forking one contradicts it."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "scribe", *flags]
+    )
+
+    assert result.exit_code != 0
+    assert "cannot be combined with --resume, --continue, or --fork" in result.output
+    run_chat.assert_not_called()
+
+
+def test_run_agent_name_is_trimmed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Surrounding whitespace in ``--agent`` is dropped before the name is checked."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "  scribe ", "-p", "hi"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run_chat.call_args.kwargs["agent_name"] == "scribe"
+
+
+def test_run_direct_server_fork_prompt_fails_before_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    discovery = Mock(side_effect=AssertionError("fork prompts must fail before discovery"))
+    monkeypatch.setattr("omnigent.chat._pick_agent", discovery)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--fork", "conv_x", "-p", "hi"]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "--fork requires interactive REPL mode" in result.output
+    assert "--agent" not in result.output
+    discovery.assert_not_called()
+
+
+def test_run_agent_rejects_a_blank_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--agent ""`` must not silently fall back to agent discovery."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+
+    result = CliRunner().invoke(
+        cli, ["run", "--server", "http://localhost:8000", "--agent", "", "-p", "hi"]
+    )
+
+    assert result.exit_code != 0
+    assert "non-empty agent name" in result.output
+    run_chat.assert_not_called()
+
+
+def test_run_help_lists_agent_option() -> None:
+    """The ``--agent`` selector the agent-discovery errors point at exists on ``run``."""
+    result = CliRunner().invoke(cli, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--agent NAME" in result.output
 
 
 @pytest.mark.parametrize("alias", ["", "local", "LOCAL", " local "])

@@ -69,7 +69,7 @@ class SessionStreamCollector:
         """
         try:
             event = await asyncio.wait_for(self.queue.get(), within)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return
         raise AssertionError(f"unexpected broadcast: {event!r}")
 

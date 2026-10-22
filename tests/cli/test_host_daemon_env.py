@@ -561,3 +561,30 @@ def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) 
     for env in (daemon, runner):
         assert env["GEMINI_API_KEY"] == "fake-gateway-key"
         assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
+
+
+def test_remote_daemon_and_runners_are_pinned_to_the_selected_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One account host can front many workspaces; each daemon keeps its own."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR, store_databricks_org_id
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    server = "https://acct.example.com/api/2.0/omnigent"
+
+    store_databricks_org_id(server, "111")
+    prod_env = _build_host_daemon_env(server_url=server)
+    store_databricks_org_id(server, "222")
+
+    assert prod_env[PINNED_DATABRICKS_ORG_ENV_VAR] == f"{server}?o=111"
+    runner_env = _build_runner_env(
+        prod_env,
+        server_url=server,
+        runner_id="runner_pinned_org",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+    assert runner_env[PINNED_DATABRICKS_ORG_ENV_VAR] == f"{server}?o=111"

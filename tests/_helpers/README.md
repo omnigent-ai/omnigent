@@ -11,6 +11,7 @@ retain configuration, fault injection and behavioral assertions.
 | Trusted fixture with Python tools, custom policies, or host paths | `operator_agent_store`, `post_operator_session` in [operator_agents.py](operator_agents.py) | [Image result policies](../integration/test_mcp_image_http_round_trip.py) |
 | Browser-suite session for an explicit identity | `create_user_session` in [_multi_user_server.py](../e2e_ui/collaboration/_multi_user_server.py) | [Default-public sessions](../e2e_ui/collaboration/test_default_public_sessions.py) |
 | Isolated local server | `isolated_local_server` in [live_server.py](live_server.py) | [Multi-user server](../e2e_ui/collaboration/_multi_user_server.py) |
+| Trusted local HTTPS for a fake upstream | `enable_https` in [https_server.py](https_server.py) | [Native agy gateway](../e2e_ui/shells/test_antigravity_gateway_setup.py) |
 | Port held until its process binds it | `reserve_port` in [live_server.py](live_server.py) | [Resilience lab](../e2e/resilience/lab/lab.py) |
 | Poll a condition until it holds, sync or async | `poll_until`, `poll_until_async` in [polling.py](polling.py) | [Approval card](../e2e_ui/approvals/test_approval_card.py), [start session](../e2e_ui/start_session/test_start_session.py) |
 | Server and runner lifecycle | `server_runner` in [server_runner.py](server_runner.py) | [Runner shutdown](../e2e/test_runner_shutdown_mcp_notify_hang_e2e.py) |

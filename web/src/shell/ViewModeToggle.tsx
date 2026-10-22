@@ -29,17 +29,17 @@ const ignoreViewChange = () => {};
  * {@link ViewModeMenuItems}), so the narrow header pill isn't split between a
  * view switch and the "…" menu.
  */
-export function ViewModeToggle() {
+export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } = {}) {
   const ctx = useTerminalFirst();
   const isMobile = useIsMobileViewport();
   useViewModeToggleHotkey({
-    enabled: Boolean(ctx?.isTerminalFirst && !ctx.isShellView),
+    enabled: Boolean(hotkeyEnabled && ctx?.isTerminalFirst && !ctx.isShellView),
     view: ctx?.view ?? "chat",
     setView: ctx?.setView ?? ignoreViewChange,
   });
   if (!ctx || !ctx.isTerminalFirst || ctx.isShellView) return null;
   // Mobile folds the switch into the header kebab (ViewModeMenuItems).
-  if (isMobile) return null;
+  if (isMobile && !alwaysVisible) return null;
 
   const { view, setView, terminalStartingUp } = ctx;
   const terminalLabel = terminalStartingUp ? "Terminal is starting up…" : "Terminal view";

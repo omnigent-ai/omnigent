@@ -5,6 +5,10 @@ This file is generated at release time from each PR's `## Changelog` section
 PRs and author credits. The concise, curated highlights live on the website
 under `/releases`.
 
+## [v0.19.1] — 2026-10-21
+
+- [Bug fix / Test/CI] The server and desktop app no longer trust the compromised eMudhra intermediate CAs (certifi 2026.10.19, Electron 42.11.16) ([#11210](https://github.com/omnigent-ai/omnigent/pull/11210), [@fanzeyi](https://github.com/fanzeyi))
+
 ## [v0.19.0] — 2026-10-20
 
 - [UI / Bug fix] Antigravity's web approval card now shows the action description and the always-allow (persist) choices from agy's own permission menu, instead of only Approve / Reject. ([#6653](https://github.com/omnigent-ai/omnigent/pull/6653), [@omni-resolve-agent[bot]](https://github.com/apps/omni-resolve-agent))
