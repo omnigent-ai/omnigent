@@ -3800,30 +3800,42 @@ def _build_host_daemon_env(
     Build the environment for the background host daemon.
 
     Remote daemons connect to an already-running Omnigent server, so they only
-    need process essentials, TLS trust, and Databricks auth. Local daemons
-    also start the local Omnigent server; that server is the user's local runtime
-    and must inherit Omnigent config plus provider credentials such as
+    need process essentials, TLS trust, Databricks auth, and explicitly
+    configured harness credentials. Local daemons also start the local Omnigent
+    server, which must inherit Omnigent config plus provider credentials such as
     ``OPENAI_API_KEY`` and ``OPENAI_BASE_URL``. Both modes are allowlisted:
     local mode carries the runtime/provider vars needed by the local server,
     but unrelated shell secrets are not inherited merely because the daemon
-    runs on the user's machine. Runners launched by the daemon still pass
-    through :func:`omnigent.host.connect._build_runner_env`, so these
-    local-server credentials do not leak into runner subprocesses.
+    runs on the user's machine. Runners launched by the daemon apply
+    :func:`omnigent.host.connect._build_runner_env` separately.
+    Passthrough names and saved provider references are trusted host-owner inputs.
 
     :param server_url: Omnigent server URL for remote mode, e.g.
         ``"https://example.databricksapps.com"``, or a falsey value
         such as ``None`` / ``""`` for local daemon mode.
     :returns: Environment dict for ``subprocess.Popen``.
     """
+    from omnigent.errors import OmnigentError
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR,
     )
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
         HOST_NAME_ENV_VAR,
         HOST_TOKEN_ENV_VAR,
     )
+    from omnigent.onboarding.provider_config import _load_config, provider_credential_env_vars
+
+    forwarded_names = {
+        name.strip()
+        for name in os.environ.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
+        if name.strip()
+    }
+    with contextlib.suppress(OSError, OmnigentError):
+        # A reusable daemon must use host config, independent of session overlays.
+        forwarded_names.update(provider_credential_env_vars(_load_config()))
 
     identity_env_vars = frozenset(
         {
@@ -3853,13 +3865,14 @@ def _build_host_daemon_env(
             or key in local_server_env_vars
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in forwarded_names
             or key.startswith(daemon_env_prefixes)
         }
     else:
         # Allowlist the remote daemon's environment (W8): pass process
         # essentials + TLS trust + standard proxy selectors + the user's
         # Databricks auth (the daemon authenticates to the server with it), but
-        # not unrelated provider secrets like ANTHROPIC_API_KEY / OPENAI_API_KEY.
+        # only explicitly configured provider credentials, not ambient secrets.
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, "DATABRICKS_")
         env = {
             key: value
@@ -3867,6 +3880,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in forwarded_names
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later

@@ -351,8 +351,11 @@ def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
 
 def test_build_host_daemon_env_remote_strips_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Remote daemon env remains allowlisted and does not carry LLM keys."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
@@ -402,6 +405,76 @@ def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 
     assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "MY_GATEWAY_TOKEN"
+
+
+@pytest.mark.parametrize("server_url", [None, "https://server.example.com"])
+@pytest.mark.parametrize("source", ["provider-config", "passthrough", "malformed-config"])
+def test_host_daemon_preserves_explicit_credential_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    server_url: str | None,
+    source: str,
+) -> None:
+    """A configured credential must survive both daemon and runner boundaries."""
+    from omnigent.host.connect import _build_runner_env
+
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("MY_GATEWAY_TOKEN", "synthetic-provider-key")
+    monkeypatch.setenv("UNRELATED_SHELL_SECRET", "unrelated-secret")
+    if source == "provider-config":
+        (tmp_path / "config.yaml").write_text(
+            "providers:\n  gateway:\n    kind: key\n    openai:\n"
+            "      base_url: https://gateway.example.com/v1\n"
+            "      api_key_ref: env:MY_GATEWAY_TOKEN\n"
+        )
+        monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", " MY_GATEWAY_TOKEN, ,MISSING ")
+        if source == "malformed-config":
+            (tmp_path / "config.yaml").write_text("providers: [")
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://127.0.0.1:6767",
+        runner_id="runner-test",
+        binding_token="binding-test",
+        workspace=str(tmp_path),
+        parent_pid=1,
+    )
+
+    assert daemon_env["MY_GATEWAY_TOKEN"] == "synthetic-provider-key"
+    assert runner_env["MY_GATEWAY_TOKEN"] == "synthetic-provider-key"
+    assert "UNRELATED_SHELL_SECRET" not in daemon_env
+    assert "UNRELATED_SHELL_SECRET" not in runner_env
+    assert "MISSING" not in daemon_env
+
+
+def test_host_daemon_does_not_forward_session_profile_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A transient session profile must not change a reusable host's credentials."""
+    from omnigent.inference_config import inference_config_scope
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setenv("SESSION_TOKEN", "session-only-credential")
+    profile = {
+        "providers": {
+            "session": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://gateway.example.com/v1",
+                    "api_key_ref": "env:SESSION_TOKEN",
+                },
+            }
+        }
+    }
+    with inference_config_scope(profile):
+        env = _build_host_daemon_env(server_url="https://server.example.com")
+
+    assert env.get("SESSION_TOKEN") is None
 
 
 def test_ensure_host_daemon_reuses_same_target(

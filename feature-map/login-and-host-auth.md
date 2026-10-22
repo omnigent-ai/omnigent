@@ -160,6 +160,15 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
   A real check needs two URLs that reach one workspace, so run it only in a
   private-network sandbox against a disposable server.
+- **Background harness credentials (own environment, installed Codex/Claude SDK):**
+  `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
+  and background hosts. Saved provider env references and named passthrough keep
+  the configured harness ready; unreferenced keys remain filtered. Uses isolated
+  homes and synthetic credentials without model requests. The Claude SDK case
+  needs bubblewrap when machine-managed settings exist. This covers fresh hosts;
+  existing-daemon refresh and installed OS services need separate verification.
+  `tests/host/test_service.py::test_service_persists_explicit_host_credentials_privately`
+  checks launchd/systemd file contents and permissions with service commands mocked.
 - **`host-inline-login` (own environment, Linux):** run
   `uv run --no-sync pytest tests/e2e/test_host_inline_login.py --reruns 0 -q`.
   It starts an isolated real server and a local HTTPS mock workspace, then
@@ -242,6 +251,10 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 
 ## Gotchas
 
+- Background hosts capture their environment when started; restart the host after
+  changing forwarded credentials. `host enable` saves explicitly forwarded values
+  in plaintext in the per-user service definition, readable only by its owner
+  (0600), so the service can retain them across logins.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one
