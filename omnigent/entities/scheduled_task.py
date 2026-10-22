@@ -59,8 +59,8 @@ class ScheduledTask:
         host runner should start. ``None`` only for legacy or invalid rows.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
         not create git worktrees at fire time.
-    :param execution_target: Reserved legacy column; scheduled tasks currently
-        run only on ``"connected_host"``.
+    :param execution_target: ``"connected_host"`` for a pinned host, or
+        ``"managed_sandbox"`` for a fresh sandbox per occurrence.
     :param host_id: Specific connected host to run on. ``None`` only for legacy
         or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,

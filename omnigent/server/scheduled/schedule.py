@@ -49,4 +49,5 @@ def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
     """Pin a host, or derive a fresh sandbox identity from tenant, task and occurrence."""
     if task.execution_target != "managed_sandbox":
         return task.host_id
+    # UUIDv5 lets every replica derive the same sandbox host ID for this task occurrence.
     return uuid.uuid5(uuid.UUID(task.id), f"{task.workspace_id}:{trigger_key}").hex
