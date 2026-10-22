@@ -39,17 +39,3 @@ missed occurrence.
 Defaults are 30-second polls and renewals, 120-second leases, 100 rows per page,
 and 100 concurrent startups per server. `ScheduledTaskSchedulerConfig` validates
 these settings; renewal must occur more frequently than lease expiry.
-
-This component is not wired into server startup. Recovery and the application
-integration must be supplied before enabling persistent scheduling. The existing
-server continues to use its in-memory scheduler.
-
-Run dispatch and configuration tests with:
-
-```sh
-.venv/bin/pytest tests/server/scheduled/test_dispatch_scheduler.py \
-  tests/server/scheduled/test_config.py -q --reruns 0
-```
-
-Tests use the real store with controlled time and fake execution callbacks;
-they do not launch real runners or sandboxes.
