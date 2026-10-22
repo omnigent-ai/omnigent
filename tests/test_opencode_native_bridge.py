@@ -244,6 +244,31 @@ def test_seed_opencode_auth_noop_without_source(
     assert bridge.seed_opencode_auth(bridge_dir) is None
 
 
+def test_seed_gh_config_copies_user_gh_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The user's gh config is copied into the per-session XDG_CONFIG_HOME."""
+    user_config = tmp_path / "user-config"
+    (user_config / "gh").mkdir(parents=True)
+    (user_config / "gh" / "hosts.yml").write_text("github.com:\n  oauth_token: x\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user_config))
+
+    bridge_dir = bridge.prepare_bridge_dir("conv_gh")
+    dest = bridge.seed_gh_config(bridge_dir)
+    assert dest == bridge.xdg_config_home_for_bridge_dir(bridge_dir) / "gh"
+    assert "oauth_token" in (dest / "hosts.yml").read_text()
+    assert (os.stat(dest / "hosts.yml").st_mode & 0o777) == 0o600
+
+
+def test_seed_gh_config_noop_without_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No user gh config → no-op (returns None)."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty-config"))
+    bridge_dir = bridge.prepare_bridge_dir("conv_nogh")
+    assert bridge.seed_gh_config(bridge_dir) is None
+
+
 def test_user_opencode_config_path_default_location(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

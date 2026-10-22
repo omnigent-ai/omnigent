@@ -1598,6 +1598,7 @@ async def _auto_create_opencode_terminal(
         OpenCodeNativeBridgeState,
         clear_bridge_state,
         prepare_bridge_dir,
+        seed_gh_config,
         seed_opencode_auth,
         write_bridge_state,
         write_opencode_policy_plugin,
@@ -1802,6 +1803,10 @@ async def _auto_create_opencode_terminal(
     # their providers and falls back to the no-auth default model. No-op on a
     # remote runner (no local auth.json) / Databricks-gateway path.
     seed_opencode_auth(bridge_dir)
+
+    # Same isolation problem for the GitHub CLI: the per-session XDG_CONFIG_HOME
+    # hides ~/.config/gh, so `gh` in the agent's shell reports "not logged in".
+    seed_gh_config(bridge_dir)
 
     # Start the Omnigent builtin-tool relay BEFORE opencode boots, so
     # ``tool_relay.json`` exists when opencode launches the ``serve-mcp`` MCP
