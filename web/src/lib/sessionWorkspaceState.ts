@@ -8,6 +8,7 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
+import { normalizeBrowserTabName } from "./browserTabLabel";
 
 const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
   "files",
@@ -41,6 +42,9 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
+  /** User-chosen names for open browser tabs, keyed by tab id. A tab without
+   *  an entry is labelled from its current URL. */
+  browserNames?: Record<string, string>;
   /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
    *  by design: side chats are ephemeral and vanish when the app is closed. */
   openSideChats?: string[];
@@ -125,6 +129,18 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }
+  if (
+    typeof record.browserNames === "object" &&
+    record.browserNames !== null &&
+    !Array.isArray(record.browserNames)
+  ) {
+    const names: Record<string, string> = {};
+    for (const [tabId, name] of Object.entries(record.browserNames)) {
+      const kept = typeof name === "string" ? normalizeBrowserTabName(name) : "";
+      if (kept) names[tabId] = kept;
+    }
+    if (Object.keys(names).length > 0) state.browserNames = names;
+  }
   if (Array.isArray(record.openSideChats)) {
     state.openSideChats = [
       ...new Set(
@@ -196,6 +212,12 @@ export function writeSessionWorkspaceState(
   // runtime cap; this keeps the persisted rail from growing without bound.
   if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
+  }
+  // A closed or pruned browser tab drops its manual name too.
+  if (next.browserNames) {
+    const openBrowsers = new Set(next.openBrowsers ?? []);
+    const names = Object.entries(next.browserNames).filter(([tabId]) => openBrowsers.has(tabId));
+    next.browserNames = names.length > 0 ? Object.fromEntries(names) : undefined;
   }
   // Same bound for side-chat tabs (also appended in open order).
   if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {

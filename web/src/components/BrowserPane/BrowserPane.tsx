@@ -23,76 +23,10 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { type Bounds, getBrowserPaneBridge } from "@/components/BrowserPane/browserPaneBridge";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
-
-/** Renderer CSS-pixel bounds pushed to the main process (converted to window
- *  DIPs there via the host zoom factor). */
-interface Bounds {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  devicePixelRatio?: number;
-}
-
-/** Result shape shared by the history-navigation bridge calls. */
-interface NavResult {
-  ok: boolean;
-  canGoBack?: boolean;
-  canGoForward?: boolean;
-  error?: string;
-}
-
-/** Subset of `window.omnigentDesktop` the pane calls. Typed locally so the
- *  component doesn't depend on the full nativeBridge type; every method is
- *  optional (an older shell may predate the browser feature). */
-interface BrowserPaneBridge {
-  browserSetActive?: (conversationId: string | null) => Promise<{ ok: boolean; error?: string }>;
-  browserResize?: (
-    conversationId: string,
-    bounds: Bounds,
-  ) => Promise<{ ok: boolean; error?: string }>;
-  browserOpenOrNavigate?: (
-    conversationId: string,
-    url: string,
-    bounds: Bounds | undefined,
-    opts: { force?: boolean } | undefined,
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
-  browserGoBack?: (conversationId: string) => Promise<NavResult>;
-  browserGoForward?: (conversationId: string) => Promise<NavResult>;
-  browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
-  onBrowserViewClosed?: (
-    callback: (payload: { conversationId: string; reason: string | null }) => void,
-  ) => () => void;
-  onBrowserUrlChanged?: (
-    callback: (payload: { conversationId: string; url: string }) => void,
-  ) => () => void;
-  onBrowserNavState?: (
-    callback: (payload: {
-      conversationId: string;
-      canGoBack: boolean;
-      canGoForward: boolean;
-    }) => void,
-  ) => () => void;
-  browserHasView?: (conversationId: string) => Promise<{
-    exists: boolean;
-    url?: string;
-    canGoBack?: boolean;
-    canGoForward?: boolean;
-  }>;
-}
-
-function getBridge(): BrowserPaneBridge | null {
-  if (!supportsBrowser()) return null;
-  const w = window as unknown as { omnigentDesktop?: BrowserPaneBridge };
-  return w.omnigentDesktop ?? null;
-}
 
 export interface BrowserPaneProps {
   /** Native view key: the session ID or a session-scoped browser tab ID. */
@@ -139,7 +73,7 @@ export function BrowserPane({
   // Host attach/detach events do not change whether the retained page exists.
   useEffect(() => {
     if (!browserSupported) return;
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
@@ -178,7 +112,7 @@ export function BrowserPane({
   // while the user is editing it (urlEditingRef).
   useEffect(() => {
     if (!browserSupported) return;
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
@@ -202,7 +136,7 @@ export function BrowserPane({
   // relay's own navigate path with force:true so it reloads even if the typed
   // URL matches the current one (explicit "go there" intent).
   const submitUrl = useCallback(() => {
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     if (!bridge?.browserOpenOrNavigate) return;
     const raw = currentUrl.trim();
     if (!raw) return;
@@ -218,7 +152,7 @@ export function BrowserPane({
   }, [conversationId, currentUrl]);
 
   const handleBack = useCallback(() => {
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     void bridge?.browserGoBack?.(conversationId).then((r) => {
       if (r?.ok) {
         setCanGoBack(!!r.canGoBack);
@@ -228,7 +162,7 @@ export function BrowserPane({
   }, [conversationId]);
 
   const handleForward = useCallback(() => {
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     void bridge?.browserGoForward?.(conversationId).then((r) => {
       if (r?.ok) {
         setCanGoBack(!!r.canGoBack);
@@ -238,17 +172,17 @@ export function BrowserPane({
   }, [conversationId]);
 
   const handleReload = useCallback(() => {
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     void bridge?.browserReload?.(conversationId);
   }, [conversationId]);
 
   const handleDevTools = useCallback(() => {
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     void bridge?.openBrowserDevTools?.(conversationId);
   }, [conversationId]);
 
   const handleToggleDesignMode = useCallback(() => {
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     if (!bridge) return;
     if (designMode) {
       designModeRef.current = false;
@@ -275,7 +209,7 @@ export function BrowserPane({
   // using the host zoom factor (they diverge after Cmd+/Cmd- zoom).
   const syncBounds = useCallback(
     (force = false) => {
-      const bridge = getBridge();
+      const bridge = getBrowserPaneBridge();
       if (!containerRef.current || !bridge?.browserResize) return;
       const rect = containerRef.current.getBoundingClientRect();
       const bounds: Bounds = {
@@ -309,7 +243,7 @@ export function BrowserPane({
   // running when the user switches away. A later mount re-attaches.
   useEffect(() => {
     if (!browserSupported || !hasView || !active) return;
-    const bridge = getBridge();
+    const bridge = getBrowserPaneBridge();
     if (!bridge?.browserSetActive) return;
     void bridge.browserSetActive(conversationId);
     // Measure after a couple of frames so any pane-open transition settles
@@ -328,11 +262,12 @@ export function BrowserPane({
     return () => {
       cancelled = true;
       lastBoundsRef.current = null;
-      if (designModeRef.current) void getBridge()?.browserDisableDesignMode?.(conversationId);
+      if (designModeRef.current)
+        void getBrowserPaneBridge()?.browserDisableDesignMode?.(conversationId);
       // Detach whatever is currently active (this pane owned it). The view
       // survives in the registry; only an explicit close destroys it.
       try {
-        void getBridge()?.browserSetActive?.(null);
+        void getBrowserPaneBridge()?.browserSetActive?.(null);
       } catch {
         /* swallow — window may be tearing down */
       }

@@ -2881,7 +2881,7 @@ describe("Right workspace card visibility", () => {
 
       fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
 
-      expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+      expect(await screen.findByRole("tab", { name: "New tab" })).toHaveAttribute(
         "aria-selected",
         "true",
       );
@@ -2916,7 +2916,7 @@ describe("Right workspace card visibility", () => {
       fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
 
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
-      expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
+      expect(await screen.findByRole("tab", { name: "New tab" })).toHaveAttribute(
         "aria-selected",
         "true",
       );
@@ -3356,10 +3356,7 @@ describe("Right workspace card visibility", () => {
 
       fireEvent.click(screen.getByTestId("nav-session"));
 
-      expect(screen.getByRole("tab", { name: /Browser/i })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      );
+      expect(screen.getByRole("tab", { name: "New tab" })).toHaveAttribute("aria-selected", "true");
       expect(readSessionWorkspaceState("conv_to").rightRailTab).toBe("browser");
     } finally {
       cleanup();
@@ -3420,7 +3417,7 @@ describe("Right workspace card visibility", () => {
 
       renderShell("/c/conv_no_browser");
 
-      expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+      expect(screen.queryByRole("tab", { name: "New tab" })).toBeNull();
       await waitFor(() =>
         expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute(
           "aria-selected",
@@ -3470,10 +3467,10 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
       expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
 
-      fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+      fireEvent.click(screen.getByRole("button", { name: "Close New tab" }));
 
       await waitFor(() =>
-        expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+        expect(screen.queryByRole("tab", { name: "New tab" })).not.toBeInTheDocument(),
       );
       expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
       expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");

@@ -63,6 +63,9 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { useBrowserTabUrls } from "@/hooks/useBrowserTabUrls";
+import { browserTabLabel } from "@/lib/browserTabLabel";
+import { BrowserTabsStrip } from "@/shell/BrowserTabsStrip";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -861,6 +864,7 @@ function WorkspacePanelImpl({
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  const browserUrls = useBrowserTabUrls(conversationId, browsers.tabs);
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
     if (!closed) toast.error("Couldn't close browser tab. Try again.");
@@ -1237,9 +1241,9 @@ function WorkspacePanelImpl({
       select: () => openTerminalTab(key),
       disabled: closingTerminalKey === key,
     })),
-    ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId) => ({
       key: `browser:${tabId}`,
-      label: `Browser ${index + 1}`,
+      label: browserTabLabel(browsers.names[tabId], browserUrls[tabId]),
       active: browserSelected && browsers.selected === tabId,
       select: () => {
         browsers.select(tabId);
@@ -1521,47 +1525,21 @@ function WorkspacePanelImpl({
                   onSelect={openTerminalTab}
                   onClose={onCloseTerminal}
                 />
-                {showBrowserTab &&
-                  browsers.tabs.map((tabId, index) => (
-                    <div
-                      key={tabId}
-                      ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        browserSelected && browsers.selected === tabId
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={browserSelected && browsers.selected === tabId}
-                        className="flex items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            void closeBrowserTab(tabId);
-                          }
-                        }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
-                      >
-                        <GlobeIcon className="size-4" />
-                        Browser {index + 1}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close Browser ${index + 1}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => void closeBrowserTab(tabId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  ))}
+                {showBrowserTab && (
+                  <BrowserTabsStrip
+                    tabs={browsers.tabs}
+                    activeTabId={browserSelected ? browsers.selected : null}
+                    names={browsers.names}
+                    urls={browserUrls}
+                    activeTabRef={activeBrowserRef}
+                    onSelect={(tabId) => {
+                      browsers.select(tabId);
+                      onRightRailTabChange("browser");
+                    }}
+                    onClose={(tabId) => void closeBrowserTab(tabId)}
+                    onRename={browsers.rename}
+                  />
+                )}
                 {sideChats.tabs.map((childId, index) => {
                   const active = sideChatSelected && sideChats.selected === childId;
                   const label = `Side chat ${index + 1}`;

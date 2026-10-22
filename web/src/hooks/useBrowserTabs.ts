@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
+import { normalizeBrowserTabName } from "@/lib/browserTabLabel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 /** Stable soft-tab id for the browser view driven by agents and opted-in links. */
@@ -26,6 +27,8 @@ export function browserViewOwnerId(viewId: string): string {
 interface BrowserTabsState {
   tabs: string[];
   selected: string | null;
+  /** Manual tab names keyed by tab id; unnamed tabs follow their URL. */
+  names: Record<string, string>;
 }
 
 const agentNavigationEpochs = new Map<string, number>();
@@ -40,11 +43,26 @@ function readBrowserTabsState(conversationId: string): BrowserTabsState {
   return {
     tabs,
     selected: tabs.includes(saved.selectedBrowserId ?? "") ? saved.selectedBrowserId! : null,
+    names: saved.browserNames ?? {},
   };
+}
+
+function writeBrowserTabsState(conversationId: string, next: BrowserTabsState): void {
+  writeSessionWorkspaceState(conversationId, {
+    openBrowsers: next.tabs,
+    selectedBrowserId: next.selected,
+    browserNames: next.names,
+  });
+}
+
+function withOpenTabNames(state: BrowserTabsState): BrowserTabsState {
+  const names = Object.entries(state.names).filter(([tabId]) => state.tabs.includes(tabId));
+  return { ...state, names: Object.fromEntries(names) };
 }
 
 function withAgentBrowserSelected(current: BrowserTabsState): BrowserTabsState {
   return {
+    ...current,
     tabs: current.tabs.includes(AGENT_BROWSER_TAB_ID)
       ? current.tabs
       : [...current.tabs, AGENT_BROWSER_TAB_ID],
@@ -56,10 +74,7 @@ function withAgentBrowserSelected(current: BrowserTabsState): BrowserTabsState {
 export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
   agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
   const next = withAgentBrowserSelected(readBrowserTabsState(conversationId));
-  writeSessionWorkspaceState(conversationId, {
-    openBrowsers: next.tabs,
-    selectedBrowserId: next.selected,
-  });
+  writeBrowserTabsState(conversationId, next);
   return next;
 }
 
@@ -71,11 +86,16 @@ export function useBrowserTabs(conversationId: string) {
 
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
-      const next = mutate(readBrowserTabsState(conversationId));
-      writeSessionWorkspaceState(conversationId, {
-        openBrowsers: next.tabs,
-        selectedBrowserId: next.selected,
-      });
+      const current = readBrowserTabsState(conversationId);
+      const mutated = mutate(current);
+      // A no-op (e.g. a late close of a gone tab) must not recreate a cleared entry.
+      if (mutated === current) {
+        setState(current);
+        return;
+      }
+      // Drop names of closed tabs so memory matches what is saved.
+      const next = withOpenTabNames(mutated);
+      writeBrowserTabsState(conversationId, next);
       setState(next);
     },
     [conversationId],
@@ -105,7 +125,19 @@ export function useBrowserTabs(conversationId: string) {
 
   const add = () => {
     const selected = crypto.randomUUID();
-    update((current) => ({ tabs: [...current.tabs, selected], selected }));
+    update((current) => ({ ...current, tabs: [...current.tabs, selected], selected }));
+  };
+
+  /** Set a tab's manual name; a blank name returns it to its URL label. */
+  const rename = (tabId: string, name: string) => {
+    const trimmed = normalizeBrowserTabName(name);
+    update((current) => {
+      if (!current.tabs.includes(tabId)) return current;
+      const names = Object.fromEntries(
+        Object.entries(current.names).filter(([namedTabId]) => namedTabId !== tabId),
+      );
+      return { ...current, names: trimmed === "" ? names : { ...names, [tabId]: trimmed } };
+    });
   };
 
   const close = async (tabId: string): Promise<boolean> => {
@@ -135,7 +167,7 @@ export function useBrowserTabs(conversationId: string) {
       const tabs = previous.tabs.filter((id) => id !== tabId);
       const selected =
         previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
-      return { tabs, selected };
+      return { ...previous, tabs, selected };
     });
     return true;
   };
@@ -144,6 +176,7 @@ export function useBrowserTabs(conversationId: string) {
     ...state,
     add,
     close,
+    rename,
     select,
     viewId: state.selected === null ? null : browserViewId(conversationId, state.selected),
     agentBrowser: state.selected === AGENT_BROWSER_TAB_ID,

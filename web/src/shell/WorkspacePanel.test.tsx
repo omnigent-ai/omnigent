@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -10,7 +10,8 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { browserViewId } from "@/hooks/useBrowserTabs";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -769,10 +770,10 @@ describe("WorkspacePanel shell tabs", () => {
       selectedTerminalKey: termKey,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close New tab" }));
 
     await waitFor(() =>
-      expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+      expect(screen.queryByRole("tab", { name: "New tab" })).not.toBeInTheDocument(),
     );
     expect(onRightRailTabChange).not.toHaveBeenCalled();
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
@@ -1157,7 +1158,7 @@ describe("WorkspacePanel browser tab", () => {
 
     fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
 
-    expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "New tab" })).toBeInTheDocument();
     expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
     expect(onReveal).toHaveBeenCalledOnce();
   });
@@ -1174,15 +1175,17 @@ describe("WorkspacePanel browser tab", () => {
     await openBrowser();
     const firstView = screen.getByTestId("browser-pane-stub").textContent;
     await openBrowser();
-    expect(screen.getAllByRole("tab", { name: /^Browser \d/ })).toHaveLength(2);
+    expect(screen.getAllByRole("tab", { name: "New tab" })).toHaveLength(2);
     expect(screen.getByTestId("browser-pane-stub").textContent).not.toBe(firstView);
-    fireEvent.click(screen.getByRole("tab", { name: "Browser 1" }));
+    fireEvent.click(screen.getAllByRole("tab", { name: "New tab" })[0]);
     expect(screen.getByTestId("browser-pane-stub")).toHaveTextContent(firstView!);
-    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
-    await waitFor(() =>
-      expect(screen.getAllByRole("tab", { name: /^Browser \d/ })).toHaveLength(1),
+    fireEvent.click(screen.getAllByRole("button", { name: "Close New tab" })[0]);
+    await waitFor(() => expect(screen.getAllByRole("tab", { name: "New tab" })).toHaveLength(1));
+    // A middle-click closes the tab too.
+    fireEvent(
+      screen.getByRole("tab", { name: "New tab" }),
+      new MouseEvent("auxclick", { bubbles: true, button: 1 }),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
     await waitFor(() => expect(screen.queryByTestId("browser-pane-stub")).not.toBeInTheDocument());
     expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
   });
@@ -1233,10 +1236,203 @@ describe("WorkspacePanel browser tab", () => {
     Object.assign(window, {
       omnigentDesktop: { browserClose: vi.fn().mockRejectedValue(new Error("disconnected")) },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close New tab" }));
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
     );
+  });
+});
+
+/** Desktop bridge stub whose views report URLs like the Electron shell does. */
+function installBrowserUrlBridge(initialUrls: Record<string, string> = {}) {
+  const urlListeners = new Set<(payload: { conversationId: string; url: string }) => void>();
+  const browserSetSuppressed = vi.fn().mockResolvedValue({ ok: true });
+  Object.assign(window, {
+    omnigentDesktop: {
+      kind: "electron",
+      browserSetSuppressed,
+      browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true }),
+      browserClose: vi.fn().mockResolvedValue({ ok: true }),
+      browserHasView: vi.fn((viewId: string) =>
+        Promise.resolve(
+          viewId in initialUrls ? { exists: true, url: initialUrls[viewId] } : { exists: false },
+        ),
+      ),
+      onBrowserUrlChanged: (
+        callback: (payload: { conversationId: string; url: string }) => void,
+      ) => {
+        urlListeners.add(callback);
+        return () => urlListeners.delete(callback);
+      },
+      onBrowserViewClosed: () => () => {},
+    },
+  });
+  return {
+    browserSetSuppressed,
+    navigate: (tabId: string, url: string) =>
+      act(() => {
+        for (const listener of urlListeners) {
+          listener({ conversationId: browserViewId("conv_ws", tabId), url });
+        }
+      }),
+  };
+}
+
+describe("WorkspacePanel browser tab names", () => {
+  const openTwoTabs = () =>
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["tab-a", "tab-b"],
+      selectedBrowserId: "tab-b",
+    });
+
+  it("names every tab after its current URL and follows navigation", async () => {
+    openTwoTabs();
+    const bridge = installBrowserUrlBridge({
+      [browserViewId("conv_ws", "tab-a")]: "https://github.com/omnigent-ai/omnigent/pull/123",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+
+    // The unselected tab's label comes from its live view, not its position.
+    const prTab = await screen.findByRole("tab", { name: "github.com/…/pull/123" });
+    expect(prTab).toHaveAttribute("aria-selected", "false");
+    expect(prTab.parentElement).toHaveAttribute(
+      "title",
+      "https://github.com/omnigent-ai/omnigent/pull/123",
+    );
+    expect(screen.getByRole("tab", { name: "New tab" })).toHaveAttribute("aria-selected", "true");
+
+    bridge.navigate("tab-b", "http://localhost:3000/settings?tab=1");
+    expect(screen.getByRole("tab", { name: "localhost:3000/settings" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close localhost:3000/settings" })).toBeVisible();
+    bridge.navigate("tab-a", "https://www.example.com/");
+    expect(screen.getByRole("tab", { name: "example.com" })).toBeInTheDocument();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "example.com" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "localhost:3000/settings" })).toBeInTheDocument();
+  });
+
+  it("keeps a double-click rename through navigation and a remount", async () => {
+    openTwoTabs();
+    const bridge = installBrowserUrlBridge();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    bridge.navigate("tab-a", "http://localhost:3000/");
+
+    fireEvent.doubleClick(screen.getByRole("tab", { name: "localhost:3000" }));
+    const field = screen.getByRole("textbox", { name: "Browser tab name" });
+    expect(field).toHaveFocus();
+    expect(field).toHaveValue("localhost:3000");
+    fireEvent.change(field, { target: { value: "  Dev server  " } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    expect(screen.getByRole("tab", { name: "Dev server" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close Dev server" })).toBeInTheDocument();
+    bridge.navigate("tab-a", "http://localhost:3000/login");
+    expect(screen.getByRole("tab", { name: "Dev server" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").browserNames).toEqual({ "tab-a": "Dev server" });
+
+    cleanup();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    expect(screen.getByRole("tab", { name: "Dev server" })).toBeInTheDocument();
+  });
+
+  it("does not pin an untouched long label, even if the page navigates during the rename", () => {
+    openTwoTabs();
+    const bridge = installBrowserUrlBridge();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    bridge.navigate("tab-a", `https://example.com/${"a".repeat(100)}`);
+    const shortened = `example.com/${"a".repeat(48)}…`;
+
+    fireEvent.doubleClick(screen.getByRole("tab", { name: shortened }));
+    const field = screen.getByRole("textbox", { name: "Browser tab name" });
+    expect(field).toHaveValue(shortened);
+    bridge.navigate("tab-a", "https://example.com/next");
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(screen.getByRole("tab", { name: "example.com/next" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").browserNames).toBeUndefined();
+  });
+
+  it("renames from the context menu and resets back to the URL label", async () => {
+    openTwoTabs();
+    const bridge = installBrowserUrlBridge();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    bridge.navigate("tab-b", "https://docs.python.org/3/library/json.html");
+    const tab = screen.getByRole("tab", { name: "docs.python.org/…/library/json.html" });
+
+    // A fresh tab has nothing to reset. The native view hides while the menu is open.
+    fireEvent.contextMenu(tab);
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Reset name" })).toBeNull();
+    expect(bridge.browserSetSuppressed).toHaveBeenLastCalledWith(true);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const field = await screen.findByRole("textbox", { name: "Browser tab name" });
+    expect(bridge.browserSetSuppressed).toHaveBeenLastCalledWith(false);
+    fireEvent.change(field, { target: { value: "JSON docs" } });
+    fireEvent.blur(field);
+    expect(screen.getByRole("tab", { name: "JSON docs" })).toBeInTheDocument();
+
+    fireEvent.contextMenu(screen.getByRole("tab", { name: "JSON docs" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reset name" }));
+    expect(screen.getByRole("tab", { name: "docs.python.org/…/library/json.html" })).toBeVisible();
+    bridge.navigate("tab-b", "https://docs.python.org/3/library/csv.html");
+    expect(screen.getByRole("tab", { name: "docs.python.org/…/library/csv.html" })).toBeVisible();
+    expect(readSessionWorkspaceState("conv_ws").browserNames).toBeUndefined();
+  });
+
+  it("clears a manual name when the field is emptied, and Escape keeps the old name", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["tab-a"],
+      selectedBrowserId: "tab-a",
+      browserNames: { "tab-a": "Staging" },
+    });
+    const bridge = installBrowserUrlBridge();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    bridge.navigate("tab-a", "https://staging.example.com/app");
+
+    fireEvent.keyDown(screen.getByRole("tab", { name: "Staging" }), { key: "F2" });
+    const escapeField = screen.getByRole("textbox", { name: "Browser tab name" });
+    fireEvent.change(escapeField, { target: { value: "Discarded" } });
+    fireEvent.keyDown(escapeField, { key: "Escape" });
+    expect(screen.getByRole("tab", { name: "Staging" })).toBeInTheDocument();
+
+    fireEvent.doubleClick(screen.getByRole("tab", { name: "Staging" }));
+    const field = screen.getByRole("textbox", { name: "Browser tab name" });
+    fireEvent.change(field, { target: { value: "   " } });
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(screen.getByRole("tab", { name: "staging.example.com/app" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_ws").browserNames).toBeUndefined();
+  });
+
+  it("types digits into a name without switching the rail, then refocuses the tab", () => {
+    openTwoTabs();
+    const bridge = installBrowserUrlBridge();
+    const { onRightRailTabChange } = renderWorkspace({
+      showBrowserTab: true,
+      rightRailTab: "browser",
+    });
+    bridge.navigate("tab-a", "http://localhost:3000/");
+    onRightRailTabChange.mockClear();
+
+    fireEvent.keyDown(screen.getByRole("tab", { name: "localhost:3000" }), { key: "F2" });
+    const field = screen.getByRole("textbox", { name: "Browser tab name" });
+    const digit = fireEvent.keyDown(field, { key: "2" });
+    fireEvent.change(field, { target: { value: "Dev server 2" } });
+    expect(digit).toBe(true);
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    fireEvent.keyDown(field, { key: "Enter" });
+    expect(screen.getByRole("tab", { name: "Dev server 2" })).toHaveFocus();
+  });
+
+  it("does not pin the URL label when a rename is saved unchanged", () => {
+    openTwoTabs();
+    const bridge = installBrowserUrlBridge();
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    bridge.navigate("tab-a", "http://localhost:3000/");
+
+    fireEvent.doubleClick(screen.getByRole("tab", { name: "localhost:3000" }));
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Browser tab name" }), { key: "Enter" });
+    bridge.navigate("tab-a", "http://localhost:3000/login");
+    expect(screen.getByRole("tab", { name: "localhost:3000/login" })).toBeInTheDocument();
   });
 });
 
@@ -1446,7 +1642,7 @@ describe("WorkspacePanel panel picker", () => {
     });
     const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "New tab" }));
     expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));

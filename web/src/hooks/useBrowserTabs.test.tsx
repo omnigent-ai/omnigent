@@ -85,6 +85,43 @@ describe("browser soft tabs", () => {
     });
   });
 
+  it("renames a tab, clears the name, and drops it when the tab closes", async () => {
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, { omnigentDesktop: { browserClose } });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.add());
+    const firstId = result.current.selected!;
+    act(() => result.current.add());
+    const secondId = result.current.selected!;
+
+    act(() => result.current.rename(firstId, `  ${"x".repeat(100)}  `));
+    act(() => result.current.rename(secondId, "Dev server"));
+    act(() => result.current.rename("not-open", "Ignored"));
+    expect(result.current.names).toEqual({ [firstId]: "x".repeat(80), [secondId]: "Dev server" });
+
+    act(() => result.current.rename(firstId, "   "));
+    expect(result.current.names).toEqual({ [secondId]: "Dev server" });
+
+    // Agent navigation adds its tab without dropping existing names.
+    act(() =>
+      emitBrowserActionRequest(
+        { type: "browser_action_request", actionId: "nav", action: "navigate", args: {} },
+        "session-a",
+      ),
+    );
+    expect(result.current.names).toEqual({ [secondId]: "Dev server" });
+
+    await act(() => result.current.close(secondId));
+    expect(result.current.names).toEqual({});
+    expect(readSessionWorkspaceState("session-a").browserNames).toBeUndefined();
+  });
+
+  it("does not save anything when renaming a tab that is not open", () => {
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.rename("closed-tab", "Docs"));
+    expect(localStorage.length).toBe(0);
+  });
+
   it("creates independent views and restores the selection on remount", () => {
     const first = renderHook(() => useBrowserTabs("session-a"));
     expect(first.result.current.viewId).toBeNull();
