@@ -108,6 +108,16 @@ def test_uv_lock_cryptography_at_fixed_version() -> None:
     )
 
 
+def test_uv_lock_pillow_at_fixed_version() -> None:
+    _assert_no_vulnerable_pin(
+        "uv.lock",
+        "pillow",
+        _uv_versions("pillow"),
+        "13.0.0",
+        "CVE-2026-112393 / CVE-2026-112403 / CVE-2026-112900",
+    )
+
+
 def test_uv_lock_mlflow_outside_ssrf_range() -> None:
     # CVE-2026-71211 (AI Gateway SSRF) flags mlflow <= 3.15.2; 3.16.0 is the
     # first release outside the advisory range. mlflow is transitive (via
