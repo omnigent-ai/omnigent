@@ -795,12 +795,14 @@ def create_device_auth_router(
             query += "&reauth=1"
         return RedirectResponse(url=f"{login_url}?{query}", status_code=302)
 
-    def _session_iat(request: Request) -> int | None:
-        """Return the ``iat`` (issue time) of the caller's session JWT.
+    def _session_login_time(request: Request) -> int | None:
+        """Return the last-login time of the caller's session JWT.
 
-        Read from the session cookie (accounts mode mints a fresh ``iat``
-        on every ``/auth/login``, so this is effectively the last-login
-        time). ``None`` when absent/invalid. Used to enforce that consent
+        Read from the session cookie: its ``auth_time`` (the interactive
+        login, preserved across sliding renewal), falling back to ``iat``
+        for legacy cookies minted before ``auth_time`` existed. A renewed
+        cookie's ``iat`` is recent without any fresh login, so it must not
+        count. ``None`` when absent/invalid. Used to enforce that consent
         follows a login started FOR this device flow.
         """
         token = request.cookies.get(session_cookie_name)
@@ -810,8 +812,8 @@ def create_device_auth_router(
             payload = jwt.decode(token, cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        iat = payload.get("iat")
-        return iat if isinstance(iat, int) else None
+        login_time = payload.get("auth_time", payload.get("iat"))
+        return login_time if isinstance(login_time, int) else None
 
     @router.get("/oauth/device")
     async def device_consent_page(request: Request) -> Response:
@@ -824,7 +826,8 @@ def create_device_auth_router(
         so any mismatch is visible before approval.
 
         **Re-authentication:** consent requires a login performed AFTER this
-        device flow began (session ``iat`` ≥ the grant's ``created_at``). A
+        device flow began (the session's ``auth_time``, its original login
+        time, ≥ the grant's ``created_at``). A
         pre-existing session — however recent — is bounced back through the
         login page with ``reauth=1``, so approving a device grant always
         costs a deliberate, fresh password entry. This closes the
@@ -852,11 +855,11 @@ def create_device_auth_router(
             )
 
         # Force a fresh login when the current session predates this grant:
-        # only a login started for THIS flow (iat ≥ the grant's created_at)
+        # only a login started for THIS flow (auth_time ≥ the grant's created_at)
         # may approve. Bounce with reauth=1 so the login page re-prompts
         # rather than auto-returning the stale session (which would loop).
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        session_login_time = _session_login_time(request)
+        if session_login_time is None or session_login_time < grant.created_at:
             return _bounce_to_login(request, user_code, reauth=True)
 
         return HTMLResponse(
@@ -894,9 +897,9 @@ def create_device_auth_router(
 
         # Re-auth gate, enforced here too (not just on the consent GET): a
         # stale session must not approve by POSTing directly. Only a login
-        # started for THIS flow (session iat ≥ the grant's created_at) passes.
-        session_iat = _session_iat(request)
-        if session_iat is None or session_iat < grant.created_at:
+        # started for THIS flow (session auth_time ≥ the grant's created_at) passes.
+        session_login_time = _session_login_time(request)
+        if session_login_time is None or session_login_time < grant.created_at:
             return HTMLResponse(
                 _consent_html(
                     error="Your session is too old to approve this login. "
