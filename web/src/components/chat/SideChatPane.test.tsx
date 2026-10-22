@@ -7,6 +7,8 @@ import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as filesApi from "@/lib/filesApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
@@ -318,13 +320,17 @@ describe("side-chat selection reply", () => {
 
   afterEach(() => window.getSelection()?.removeAllRanges());
 
-  it("restores all reply fields when dictation is cancelled after focus moves", () => {
+  it("cancels dictation without reverting other reply edits, quotes, or attachments", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     useChatStore.setState({
       sideChatComposers: {
         [childId]: {
           text: "Tail answer",
           files: [],
-          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+          quotes: [
+            { id: "quote", before: "Earlier answer", text: "Quoted passage" },
+            { id: "remove", before: "", text: "Remove this passage" },
+          ],
         },
       },
     });
@@ -343,13 +349,160 @@ describe("side-chat selection reply", () => {
       target: { files: [file] },
     });
     act(() => tail.focus());
+    fireEvent.change(tail, { target: { value: "Edited tail answer" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[1]);
+    const selectedText = "Ask a question here without affecting the main conversation.";
+    selectText(screen.getByText(selectedText));
+    fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+    fireEvent.change(tail, { target: { value: "After the added quote" } });
+    act(() => mic.current!.onVoiceDiscard!());
+
+    expect(earlier).toHaveValue("Earlier answer");
+    expect(tail).toHaveValue("After the added quote");
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 2" })).toHaveValue(
+      "Edited tail answer",
+    );
+    expect(screen.getAllByTestId("composer-reply-quote").map((card) => card.textContent)).toEqual([
+      "Quoted passage",
+      selectedText,
+    ]);
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([file]);
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+  });
+
+  it("cancels dictated tail text after a new quote moves it into an earlier field", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "Tail answer",
+          files: [],
+          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const tail = screen.getByTestId("side-chat-input") as HTMLTextAreaElement;
+    act(() => tail.focus());
+    tail.setSelectionRange(tail.value.length, tail.value.length);
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken addition"));
+    expect(tail).toHaveValue("Tail answer spoken addition");
+    selectText(screen.getByText("Ask a question here without affecting the main conversation."));
+    fireEvent.click(screen.getByRole("button", { name: "Reply ↵" }));
+    fireEvent.change(tail, { target: { value: "After the added quote" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Reply text before quote 1" }), {
+      target: { value: "Edited earlier answer" },
+    });
+    act(() => mic.current!.onVoiceDiscard!());
+
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+      "Edited earlier answer",
+    );
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 2" })).toHaveValue(
+      "Tail answer",
+    );
+    expect(screen.getAllByTestId("composer-reply-quote")).toHaveLength(2);
+    expect(tail).toHaveValue("After the added quote");
+  });
+
+  it("does not restore a quote removed during dictation", () => {
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "Tail answer",
+          files: [],
+          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const earlier = screen.getByRole("textbox", {
+      name: "Reply text before quote 1",
+    }) as HTMLTextAreaElement;
+    act(() => earlier.focus());
+    earlier.setSelectionRange(earlier.value.length, earlier.value.length);
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("spoken addition"));
+    fireEvent.click(screen.getByRole("button", { name: "Remove quote" }));
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "Edited after removing the quote" },
+    });
+    act(() => mic.current!.onVoiceDiscard!());
+
+    expect(screen.queryByTestId("composer-reply-quote")).toBeNull();
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Edited after removing the quote");
+  });
+
+  it("cancels dictation in every field used during the recording", () => {
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "Tail answer",
+          files: [],
+          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const earlier = screen.getByRole("textbox", {
+      name: "Reply text before quote 1",
+    }) as HTMLTextAreaElement;
+    const tail = screen.getByTestId("side-chat-input") as HTMLTextAreaElement;
+    act(() => earlier.focus());
+    earlier.setSelectionRange(earlier.value.length, earlier.value.length);
+    act(() => mic.current!.onVoiceStart!());
+    act(() => mic.current!.onTranscript("first addition"));
+    act(() => tail.focus());
+    tail.setSelectionRange(tail.value.length, tail.value.length);
+    act(() => mic.current!.onTranscript("second addition"));
+    expect(earlier).toHaveValue("Earlier answer first addition");
+    expect(tail).toHaveValue("Tail answer second addition");
     act(() => mic.current!.onVoiceDiscard!());
 
     expect(earlier).toHaveValue("Earlier answer");
     expect(tail).toHaveValue("Tail answer");
-    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([file]);
-    expect(screen.getByText("notes.txt")).toBeInTheDocument();
   });
+
+  it.each(["merge preceding comments", "edit away and back"])(
+    "preserves user changes to a dictated field on cancel: %s",
+    (edit) => {
+      useChatStore.setState({
+        sideChatComposers: {
+          [childId]: {
+            text: "Tail answer",
+            files: [],
+            quotes: [
+              { id: "preceding", before: "Keep introduction", text: "First passage" },
+              { id: "target", before: "Earlier answer", text: "Second passage" },
+            ],
+          },
+        },
+      });
+      renderPane(<SideChatPane childId={childId} />);
+      const target = screen.getByRole("textbox", {
+        name: "Reply text before quote 2",
+      }) as HTMLTextAreaElement;
+      act(() => target.focus());
+      target.setSelectionRange(target.value.length, target.value.length);
+      act(() => mic.current!.onVoiceStart!());
+      act(() => mic.current!.onTranscript("spoken addition"));
+      expect(target).toHaveValue("Earlier answer spoken addition");
+      if (edit === "merge preceding comments") {
+        fireEvent.click(screen.getAllByRole("button", { name: "Remove quote" })[0]);
+      } else {
+        fireEvent.change(target, { target: { value: "Temporary edit" } });
+        fireEvent.change(target, { target: { value: "Earlier answer spoken addition" } });
+      }
+      const editedText = target.value;
+      act(() => mic.current!.onVoiceDiscard!());
+
+      expect(target).toHaveValue(editedText);
+      if (edit === "merge preceding comments")
+        expect(target).toHaveValue("Keep introduction\n\nEarlier answer spoken addition");
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Tail answer");
+    },
+  );
 
   it.each([false, true])(
     "keeps answers between selected quotes across a remount (full session: %s)",
@@ -444,6 +597,48 @@ describe("side-chat selection reply", () => {
       "agent_side",
       [file],
       { pinnedConversationId: childId },
+    );
+  });
+
+  it.each([false, true])("rechecks pasted files after policy loads (remounted: %s)", (remount) => {
+    const view = renderPane(
+      <CapabilitiesProvider info="loading">
+        <SideChatPane childId={childId} />
+      </CapabilitiesProvider>,
+    );
+    const notes = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const zip = new File([new Uint8Array(4)], "bundle.zip", { type: "application/zip" });
+    fireEvent.paste(screen.getByTestId("side-chat-input"), {
+      clipboardData: {
+        items: [notes, zip].map((file) => ({
+          kind: "file",
+          type: file.type,
+          getAsFile: () => file,
+        })),
+      },
+    });
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([notes, zip]);
+    expect(screen.getByText("bundle.zip")).toBeInTheDocument();
+    const restrictedPane = (
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachments: { extensions: [], all_types: false },
+        }}
+      >
+        <SideChatPane childId={childId} />
+      </CapabilitiesProvider>
+    );
+    if (remount) {
+      view.unmount();
+      renderPane(restrictedPane);
+    } else view.rerender(restrictedPane);
+
+    expect(useChatStore.getState().sideChatComposers[childId].files).toEqual([notes]);
+    expect(screen.queryByText("bundle.zip")).toBeNull();
+    expect(screen.getByText("notes.txt")).toBeInTheDocument();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/bundle\.zip.*can't be attached/),
     );
   });
 

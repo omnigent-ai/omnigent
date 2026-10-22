@@ -34,8 +34,8 @@ the header menu), and each place is a separate entry point.
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
-  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
-  comments between quotes and attachments; removing a quote keeps its comments.
+  writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
+  interleaved comments and existing attachments; removing a quote keeps its comments.
   Live side chats accept pasted images in every reply text field.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.

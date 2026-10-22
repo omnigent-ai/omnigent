@@ -56,6 +56,7 @@ import {
   ensureConversationStreamed,
   restoredSendDraftUnchanged,
   takeFailedSendDraft,
+  type SideChatComposerDraft,
   useChatStore,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -460,6 +461,15 @@ function SideChatComposer({
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
   const info = useServerInfo();
   const attachmentPolicy = info === "loading" ? null : (info.filesystem_attachments ?? null);
+  useEffect(() => {
+    if (info === "loading") return;
+    const current = useChatStore.getState().sideChatComposers[childId];
+    if (!current) return;
+    const { accepted, errors } = validateAttachments(current.files, attachmentPolicy);
+    if (errors.length === 0) return;
+    updateComposer(childId, (draft) => ({ ...draft, files: accepted }));
+    errors.forEach((message) => toast.error(message));
+  }, [attachmentPolicy, childId, info, updateComposer]);
   const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
     fullSession ? childId : null,
   );
@@ -530,11 +540,44 @@ function SideChatComposer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const tailTextareaRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const voiceSnapshotRef = useRef({ text, quotes: composer?.quotes });
+  const voiceEditsRef = useRef(
+    new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
+  );
+  const reconcileVoiceEdits = useCallback((current: SideChatComposerDraft) => {
+    for (const [id, edit] of voiceEditsRef.current) {
+      // Appending a quote moves the old tail into that quote's preceding text.
+      const targetId =
+        id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null;
+      const value =
+        targetId === null
+          ? current.text
+          : current.quotes?.find((item) => item.id === targetId)?.before;
+      if (value !== edit.after || targetId !== id) voiceEditsRef.current.delete(id);
+      if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
+    }
+  }, []);
+  // Manual edits and merged reply fields relinquish dictation's undo ownership.
+  reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
   const activeText = composer?.quotes?.find((quote) => quote.id === activeTextId)?.before ?? text;
   const setActiveText = useCallback(
-    (next: string) => editText(activeTextId, next),
-    [activeTextId, editText],
+    (next: string) => {
+      const current =
+        useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+      reconcileVoiceEdits(current);
+      const before =
+        activeTextId === null
+          ? current.text
+          : current.quotes?.find((item) => item.id === activeTextId)?.before;
+      if (before === undefined) return;
+      const previous = voiceEditsRef.current.get(activeTextId);
+      voiceEditsRef.current.set(activeTextId, {
+        before: previous?.before ?? before,
+        after: next,
+        quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
+      });
+      editText(activeTextId, next);
+    },
+    [activeTextId, childId, editText, reconcileVoiceEdits],
   );
   const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
 
@@ -880,15 +923,15 @@ function SideChatComposer({
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}
-                onVoiceStart={() => {
-                  voiceSnapshotRef.current = { text, quotes: composer?.quotes };
+                onVoiceStart={() => voiceEditsRef.current.clear()}
+                onVoiceDiscard={() => {
+                  reconcileVoiceEdits(
+                    useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER,
+                  );
+                  const edits = [...voiceEditsRef.current];
+                  voiceEditsRef.current.clear();
+                  for (const [id, edit] of edits) editText(id, edit.before);
                 }}
-                onVoiceDiscard={() =>
-                  updateComposer(childId, (current) => ({
-                    ...current,
-                    ...voiceSnapshotRef.current,
-                  }))
-                }
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />
