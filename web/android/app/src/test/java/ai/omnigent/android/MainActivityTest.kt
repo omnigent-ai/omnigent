@@ -232,10 +232,10 @@ class MainActivityTest {
     }
 
     @Test
-    fun `legacy ticket rejection returns to sign in setup`() {
+    fun `legacy ticket request server error shows generic unreachable with numeric details`() {
         LocalHttpServer { request ->
             if (request.path == "/auth/cli-login") {
-                LocalHttpServer.Response(503)
+                LocalHttpServer.Response(503, "secret-response-body")
             } else {
                 LocalHttpServer.Response(404)
             }
@@ -246,10 +246,24 @@ class MainActivityTest {
             try {
                 val webView = activity.webView()
                 webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
-                awaitMainThread { activity.isFinishing }
-                assertEquals(
-                    ConnectActivity::class.java.name,
-                    shadowOf(activity).nextStartedActivity.component?.className,
+                awaitMainThread {
+                    activity.isFinishing ||
+                        activity.declared<ConnectionStatus?>(
+                            "connectionStatus",
+                        ) is ConnectionStatus.ServerUnreachable
+                }
+                assertFalse("HTTP 503 must show recovery instead of refusal", activity.isFinishing)
+                val status =
+                    activity.declared<ConnectionStatus.ServerUnreachable>(
+                        "connectionStatus",
+                    )
+                assertEquals(UnreachableKind.GENERIC, status.kind)
+                assertEquals("HTTP 503", status.details?.error)
+                assertFalse(
+                    status.details
+                        ?.error
+                        .orEmpty()
+                        .contains("secret-response-body"),
                 )
             } finally {
                 controller.pause().stop().destroy()
