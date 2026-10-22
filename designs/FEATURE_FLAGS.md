@@ -62,6 +62,10 @@ for Claude working-status acceptance and kill-switch verification.
 
 Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
 
+The persistence layer is available, but the persistent scheduler and its flag
+wiring are not integrated yet. The startup-recovery and cleanup-sweep rollback
+instructions below apply once that integration lands.
+
 Even with the flag off, an interrupted deletion can leave a hidden task row for
 cleanup. During a mixed-version deployment, older replicas can still show and
 edit that row until all replicas are upgraded.

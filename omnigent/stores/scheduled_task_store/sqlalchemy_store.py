@@ -454,7 +454,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if cursor is None:
                     break
         except Exception:
-            # Deletion already committed; the retained row lets maintenance retry.
+            # Deletion already committed; cleanup can be retried explicitly.
+            # Automatic retries require an enabled persistent-scheduler sweep.
             _logger.exception("History cleanup deferred for deleted task %s", scheduled_task_id)
         return removed
 
