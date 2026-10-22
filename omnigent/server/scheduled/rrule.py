@@ -100,10 +100,11 @@ class _BoundedRRule:
                 self.rule,
                 max_steps=_MAX_SEARCH_STEPS,
                 max_seconds=_MAX_SEARCH_SECONDS,
+                # This wrapper applies COUNT after iteration, so it must retain history.
                 start_at=start_at if self.count is None else None,
             )
             if self.count is not None and self.count_after is not None:
-                # Past occurrences on the creation day must not consume COUNT.
+                # Occurrences at or before creation do not consume COUNT.
                 occurrences = (occ for occ in occurrences if occ > self.count_after)
             yield from islice(occurrences, self.count)
         except RRuleSearchLimitError as exc:

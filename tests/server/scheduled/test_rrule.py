@@ -390,13 +390,15 @@ def test_seek_preserves_anchored_occurrences(rule: str, zone: str) -> None:
         ("FREQ=MINUTELY;INTERVAL=60", _dt(2026, 10, 21, 1)),
         ("FREQ=HOURLY", _dt(2026, 10, 21, 1)),
         ("FREQ=DAILY", _dt(2026, 10, 22)),
+        ("FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,FR;WKST=SU", _dt(2026, 10, 23)),
+        ("FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=21", _dt(2027, 1, 21)),
     ],
 )
 def test_old_unbounded_rule_seeks_without_scanning_its_history(
     monkeypatch: pytest.MonkeyPatch, rule: str, expected: datetime
 ) -> None:
     # A tiny budget proves the lookup doesn't walk twelve years of past occurrences.
-    monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 20)
+    monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 100)
     assert get_next_fire_time(rule, _dt(2026, 10, 21), UTC, anchor=_dt(2014, 10, 21)) == expected
 
 

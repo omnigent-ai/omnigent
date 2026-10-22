@@ -106,7 +106,7 @@ def iter_bounded(
 
     # Public dateutil stubs omit the iterator state and mask types.
     state = cast(Any, rule)
-    # COUNT needs every previous occurrence; callers must retain its full walk.
+    # Direct callers may pass a rule with COUNT intact; retain its history too.
     start = _starting_period(state, start_at if state._count is None else None)
     year, month, day, hour, minute, second, weekday, _yearday, _ = start.timetuple()
 
