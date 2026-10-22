@@ -326,15 +326,30 @@ def test_heading_text_anchor_content_excludes_prefix(
     )
 
 
+@pytest.mark.browser_context_args(
+    viewport={"width": 1600, "height": 1200},
+    record_video_size={"width": 1600, "height": 1200},
+)
 @pytest.mark.parametrize(
-    ("fixture", "phrase", "occurrence", "expected_start"),
+    ("fixture", "phrase", "occurrence", "expected_start", "paragraph_selector"),
     [
-        ("repeated-word.md", "Repeated", 1, 30),
-        ("hidden-word.md", "word", 0, 16),
-        ("hidden-url.md", "word", 1, 242),
-        ("wrapped-word.md", "word", 2, 247),
+        ("repeated-word.md", "Repeated", 1, 30, "p"),
+        ("hidden-word.md", "word", 0, 16, "p"),
+        ("hidden-url.md", "word", 1, 242, "p"),
+        ("wrapped-word.md", "word", 2, 247, "p"),
+        ("call-table.md", "Call", 0, 445, "tr:nth-child(3) td:nth-child(2) p"),
+        ("call-table.md", "Call.", 0, 445, "tr:nth-child(3) td:nth-child(2) p"),
+        ("call-table.md", "call", 0, 582, "tr:nth-child(3) td:nth-child(3) p"),
     ],
-    ids=["repeated-word", "hidden-url-and-split-word", "hidden-url", "hard-wrapped"],
+    ids=[
+        "repeated-word",
+        "hidden-url-and-split-word",
+        "hidden-url",
+        "hard-wrapped",
+        "table-call",
+        "table-call-period",
+        "table-call-lowercase",
+    ],
 )
 def test_repeated_word_keeps_selected_occurrence_after_reopen(
     page: Page,
@@ -343,6 +358,7 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     phrase: str,
     occurrence: int,
     expected_start: int,
+    paragraph_selector: str,
 ) -> None:
     """Keep the selected word's raw offset and highlight through save/reopen."""
     base_url, session_id = seeded_session
@@ -358,10 +374,12 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
     file_button = page.get_by_role("button", name=fixture, exact=True)
     expect(file_button).to_be_visible(timeout=30_000)
     file_button.click()
+    page.get_by_role("button", name="Full screen", exact=True).click()
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     editor = viewer.locator("[contenteditable='true']")
-    paragraph = editor.locator("p").first
+    paragraph = editor.locator(paragraph_selector).first
     expect(paragraph).to_contain_text(phrase)
+    paragraph.scroll_into_view_if_needed()
     paragraph.evaluate(
         """(element, {phrase, occurrence}) => {
             element.closest('[contenteditable]').focus();
@@ -397,6 +415,7 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
         highlight = editor.locator("[data-comment-id]")
         expect(highlight).to_have_count(1)
         expect(highlight).to_have_text(phrase)
+        expect(paragraph.locator("[data-comment-id]")).to_have_count(1)
         before = highlight.evaluate(
             """element => {
                 const range = document.createRange();

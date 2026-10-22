@@ -5,6 +5,7 @@ import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
 import { markdownSourceMap } from "./markdownSourceMap";
+import callTable from "../../../tests/e2e_ui/comments/fixtures/call-table.md?raw";
 
 installMarkdownParserPatch();
 let editor: Editor;
@@ -83,6 +84,51 @@ const cases: [string, string, number, string?][] = [
 ];
 
 describe("validated Markdown source positions", () => {
+  it.each(
+    [
+      ["plain", callTable],
+      ["CRLF", callTable.replaceAll("\n", "\r\n")],
+      ["padded cells", callTable.replaceAll(" | ", "   |   ")],
+      ["bold", callTable.replaceAll("Call.", "**Call.**")],
+      ["inline code", callTable.replaceAll("Call.", "`Call.`")],
+      ["Unicode heading and hidden URL", `# Notes 😀\n\n${link}\n\n${callTable}`],
+    ].flatMap(([name, raw]) =>
+      ["Call", "Call.", "call", "(preview: as before). No call (preview: call)."].map((phrase) => [
+        name,
+        phrase,
+        raw,
+      ]),
+    ),
+  )("preserves every table occurrence: %s / %s", (_name, phrase, raw) => {
+    const doc = parse(raw);
+    expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
+    let sourceCursor = 0;
+    let matched = 0;
+    doc.descendants((node, position) => {
+      if (!node.isText || !node.text) return;
+      for (
+        let index = node.text.indexOf(phrase);
+        index !== -1;
+        index = node.text.indexOf(phrase, index + 1)
+      ) {
+        const from = position + index;
+        const to = from + phrase.length;
+        const start_index = raw.indexOf(phrase, sourceCursor);
+        expect(start_index).toBeGreaterThanOrEqual(0);
+        sourceCursor = start_index + phrase.length;
+        const anchor = { start_index, end_index: sourceCursor, anchor_content: phrase };
+        expect(computeSelectionData(from, to, doc, raw, editor.markdown)).toEqual(anchor);
+        expect(findPmRangeForComment(doc, anchor as Comment, raw, editor.markdown)).toEqual({
+          from,
+          to,
+        });
+        matched++;
+      }
+    });
+    expect(matched).toBe(raw.split(phrase).length - 1);
+    expect(matched).toBeGreaterThan(0);
+  });
+
   it.each(cases)(
     "maps capture and restore independently: %s",
     (_name, fixture, ordinal, word = "word") => {
