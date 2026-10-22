@@ -390,6 +390,9 @@ def test_record_to_row_redacts_token_like_text_fields(captured_stack: bool) -> N
     assert secret not in attributes["upstream_response"]
     assert attributes["attempt"] == "3"
     assert "[REDACTED]" in str(row)
+    if captured_stack:
+        assert "blocking_call" in str(row["stack_trace"])
+        assert "[REDACTED]" in str(row["stack_trace"])
 
 
 def test_record_to_row_reads_session_id_from_extra(monkeypatch: pytest.MonkeyPatch) -> None:
