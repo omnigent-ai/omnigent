@@ -5377,7 +5377,7 @@ def _publish_sandbox_status_impl(
             "stage": stage,
             "error": error,
             "provider": provider or (previous.provider if previous else None),
-            "details": details,
+            "details": details if stage == "action_required" else None,
         }
     )
     log = _logger.error if stage == "failed" else _logger.info

@@ -3713,7 +3713,8 @@ class SandboxStageObserver(Protocol):
         :param stage: The stage just entered, e.g. ``"cloning"``.
         :param details: What the user needs to do when *stage* is
             ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None``
-            otherwise.
+            otherwise. Once the user has acted, report another stage, or the
+            web UI keeps showing the warning.
         """
 
 

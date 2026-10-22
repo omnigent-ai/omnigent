@@ -1103,6 +1103,8 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
     async def _launch_needing_action(*, on_stage: SandboxStageObserver, **_: object) -> None:
         """Stand in for a deployment's launch that finds the user has to act."""
         await subscribed.wait()
+        # Details only belong to action_required; the publisher drops them elsewhere.
+        on_stage("provisioning", "Not shown for this stage.")
         on_stage("action_required", details)
         await finish.wait()
         raise HTTPException(status_code=502, detail="managed sandbox launch failed: test over")
@@ -1120,8 +1122,8 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
 
     reports: list[dict[str, Any]] = []
 
-    async def _tail_first_report() -> None:
-        """Collect the first sandbox_status event after subscribing."""
+    async def _tail_reports() -> None:
+        """Collect sandbox_status events after subscribing, through the first action_required."""
         async for event in session_stream.subscribe(
             session_id, ready_event={"type": "_test_subscribed"}
         ):
@@ -1129,10 +1131,11 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
                 subscribed.set()
             elif event.get("type") == "session.sandbox_status":
                 reports.append(event)
-                return
+                if event["stage"] == "action_required":
+                    return
 
     try:
-        await asyncio.wait_for(_tail_first_report(), timeout=10.0)
+        await asyncio.wait_for(_tail_reports(), timeout=10.0)
         snapshot = await env.client.get(f"/v1/sessions/{session_id}")
         assert snapshot.status_code == 200, snapshot.text
         assert snapshot.json()["sandbox_status"] == {
@@ -1143,7 +1146,10 @@ async def test_managed_launch_action_required_reaches_snapshot_and_stream(
         }
     finally:
         finish.set()
-    assert [(r["stage"], r["details"]) for r in reports] == [("action_required", details)]
+    assert [(r["stage"], r["details"]) for r in reports] == [
+        ("provisioning", None),
+        ("action_required", details),
+    ]
 
     # Let the stand-in launch settle as failed so no launch task outlives the test.
     deadline = asyncio.get_running_loop().time() + 10.0

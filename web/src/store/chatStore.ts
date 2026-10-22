@@ -5106,13 +5106,18 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  */
 function launchSnapshotPatch(
   session: Session,
-  state: Pick<ConversationState, "sandboxStatus">,
-): Partial<Pick<ConversationState, "sandboxStatus" | "runnerLaunchedAt">> {
+  state: Pick<ConversationState, "sandboxStatus" | "sandboxActionDismissed">,
+): Partial<
+  Pick<ConversationState, "sandboxStatus" | "sandboxActionDismissed" | "runnerLaunchedAt">
+> {
   if (state.sandboxStatus === null || state.sandboxStatus.stage === "failed") return {};
   const sandboxStatus = session.sandboxStatus ?? null;
+  // A snapshot that shows the launch moved on ends the dismissal of its last warning.
+  const sandboxActionDismissed =
+    sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null;
   return sandboxStatus === null
-    ? { sandboxStatus, runnerLaunchedAt: Date.now() }
-    : { sandboxStatus };
+    ? { sandboxStatus, sandboxActionDismissed, runnerLaunchedAt: Date.now() }
+    : { sandboxStatus, sandboxActionDismissed };
 }
 
 /**
