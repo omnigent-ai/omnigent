@@ -1062,6 +1062,80 @@ def test_permission_request_hook_does_not_retry_rejections(
     assert "rejected" in captured.err
 
 
+@pytest.mark.parametrize("empty_response", [False, True], ids=["transport-failed", "timed-out"])
+def test_permission_request_hook_moves_unforwarded_question_to_chat_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    empty_response: bool,
+) -> None:
+    """
+    An AskUserQuestion the hook can't forward is denied with a chat-text hint.
+
+    Without a decision, Claude leaves the question in its terminal picker
+    and the web UI shows only a spinning tool call nobody can answer.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    holds: list[object] = []
+
+    def _no_verdict(*_args: object, **kwargs: object) -> httpx.Response | None:
+        holds.append(kwargs.get("hold_through_outages"))
+        return httpx.Response(200) if empty_response else None
+
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _no_verdict)
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_ask_lost")
+    payload = {
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"questions": [{"question": "Which fix?", "options": []}]},
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["hookEventName"] == "PermissionRequest"
+    decision = output["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "deny"
+    assert "normal chat message" in decision["message"]
+    assert holds == [True], "a question must be held through outages before it is denied"
+
+
+@pytest.mark.parametrize("empty_response", [False, True], ids=["transport-failed", "timed-out"])
+def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    empty_response: bool,
+) -> None:
+    """
+    Other tools the hook can't forward still fall back to Claude's own prompt.
+
+    Denying them would block an edit or command the terminal user could
+    still approve.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    holds: list[object] = []
+
+    def _no_verdict(*_args: object, **kwargs: object) -> httpx.Response | None:
+        holds.append(kwargs.get("hold_through_outages"))
+        return httpx.Response(200) if empty_response else None
+
+    monkeypatch.setattr(claude_native_hook, "_post_hook_with_reattach", _no_verdict)
+    bridge_dir = _prepare_permission_bridge(tmp_path, "conv_bash_lost")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash"}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+
+    exit_code = claude_native_hook.main(["permission-request", "--bridge-dir", str(bridge_dir)])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == ""
+    assert holds == [False], "other tools keep the bounded retry and terminal fallback"
+
+
 def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2156,6 +2230,87 @@ def test_reattach_bounds_consecutive_hard_failures(monkeypatch: pytest.MonkeyPat
     assert len(client.calls) == claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES, (
         "reattach must stop after the consecutive-hard-failure cap, not spin"
     )
+
+
+@pytest.mark.parametrize("kind", ["connect", "5xx"])
+def test_reattach_held_question_outlasts_the_hard_failure_cap(
+    monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """A held question keeps retrying a down server until it answers again.
+
+    Giving up would drop the web card and leave the question in a terminal
+    picker a web-only user never sees.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    client = _scripted_client(
+        script=[(kind, 0.0)] * (cap * 3) + [("ok", 0.0)], monkeypatch=monkeypatch
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PermissionRequest"},
+        hook_label="permission",
+        hold_through_outages=True,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert len(client.calls) == cap * 3 + 1
+
+
+def test_reattach_held_question_retries_auth_before_its_first_held_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held question waits out a login that can't be renewed yet, even unparked."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            auth = self._headers.get("Authorization", "")
+            seen_auth.append(auth)
+            req = httpx.Request("POST", url)
+            if auth == "Bearer fresh":
+                return httpx.Response(200, json={"ok": True}, request=req)
+            return httpx.Response(403, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    failed_mints = {"left": 2}
+
+    def _reauth() -> dict[str, str] | None:
+        """
+        Fail to mint until the user has signed in again.
+
+        :returns: Fresh headers once signed in, else ``None``.
+        """
+        failed_mints["left"] -= 1
+        return None if failed_mints["left"] >= 0 else {"Authorization": "Bearer fresh"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PermissionRequest"},
+        hook_label="permission",
+        reauth=_reauth,
+        hold_through_outages=True,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert seen_auth == ["Bearer stale"] * 3 + ["Bearer fresh"], seen_auth
 
 
 def test_reattach_5xx_counts_as_hard_failure(monkeypatch: pytest.MonkeyPatch) -> None:

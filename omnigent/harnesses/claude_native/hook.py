@@ -176,6 +176,13 @@ _SESSION_ROTATION_TIMEOUT_S = 70.0
 # the permission long-poll. Held at one day; the server caps the real
 # wait via the deciding policy's ``ask_timeout``.
 _EVALUATE_POLICY_TIMEOUT_S = 86400.0
+# A question Omnigent can't show on the web is otherwise left in Claude's
+# terminal picker, where a web-only user never sees it. Asking in chat text
+# reaches both the web transcript and the terminal.
+_ASK_USER_QUESTION_UNAVAILABLE_MESSAGE = (
+    "Omnigent could not show this question in its web UI. Ask the same question, "
+    "with its options, in a normal chat message instead, then wait for the user's reply."
+)
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _FORK_TRANSCRIPT_WAIT_S = 1.0
 _FORK_TRANSCRIPT_POLL_S = 0.05
@@ -685,6 +692,7 @@ def _post_hook_with_reattach(
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
     wait_marker: Path | None = None,
+    hold_through_outages: bool = False,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -769,6 +777,9 @@ def _post_hook_with_reattach(
         :func:`approval_wait_marker_path`, so the idle pane reaper spares a
         pane parked on this prompt. ``None`` skips the marker (non-approval
         callers).
+    :param hold_through_outages: Keep retrying auth lapses and hard failures
+        until the deadline, as a parked wait does, even before the first held
+        poll. For prompts with no useful terminal-only fallback.
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
@@ -831,7 +842,7 @@ def _post_hook_with_reattach(
             except httpx.HTTPStatusError as exc:
                 if (
                     reauth is not None
-                    and parked
+                    and (parked or hold_through_outages)
                     and _is_login_redirect_or_unauthorized(exc.response)
                 ):
                     # A parked prompt may outlive login; retry reauth until its deadline.
@@ -890,7 +901,7 @@ def _post_hook_with_reattach(
             if is_hard_failure:
                 # A connect that never reached the server cannot spin it, so a
                 # parked wait keeps backing off without counting toward the cap.
-                if not (parked and never_connected):
+                if not ((parked or hold_through_outages) and never_connected):
                     consecutive_hard_failures += 1
             else:
                 parked = True
@@ -904,7 +915,10 @@ def _post_hook_with_reattach(
                 # re-mint is armed again: a wait longer than the token lifetime
                 # lapses once an hour, and each lapse must be re-mintable.
                 reauthed = False
-            if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
+            if (
+                not hold_through_outages
+                and consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES
+            ):
                 print(
                     f"omnigent {hook_label} hook: giving up after "
                     f"{consecutive_hard_failures} consecutive hard failures "
@@ -932,7 +946,8 @@ def _main_permission_request(argv: list[str]) -> int:
         e.g. ``["--bridge-dir", "/tmp/x", "--omnigent-server-url",
         "http://127.0.0.1:8787"]``.
     :returns: Process exit code. Returns ``0`` on transport failures so
-        Claude Code falls back to its terminal prompt.
+        Claude Code falls back to its terminal prompt; an ``AskUserQuestion``
+        is denied instead so Claude asks it in chat text.
     """
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
@@ -972,6 +987,7 @@ def _main_permission_request(argv: list[str]) -> int:
         f"{ap_server_url.rstrip('/')}/v1/sessions/"
         f"{url_component(session_id)}/hooks/permission-request"
     )
+    is_question = payload.get("tool_name") == "AskUserQuestion"
     resp = _post_hook_with_reattach(
         url,
         headers,
@@ -979,11 +995,26 @@ def _main_permission_request(argv: list[str]) -> int:
         "claude permission",
         reauth=policy_hook_reauth(ap_server_url, headers),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
+        # Claude's picker stays answerable in the terminal while this waits, and
+        # the web card comes back as soon as Omnigent answers again.
+        hold_through_outages=is_question,
     )
-    if resp is None:
+    # The server returns an empty 200 when the question wait expires.
+    if resp is None or not resp.content:
+        if is_question:
+            decision = {"behavior": "deny", "message": _ASK_USER_QUESTION_UNAVAILABLE_MESSAGE}
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": decision,
+                        }
+                    }
+                )
+            )
         return 0
-    if resp.content:
-        sys.stdout.write(resp.text)
+    sys.stdout.write(resp.text)
     return 0
 
 
