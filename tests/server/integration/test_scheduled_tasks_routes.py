@@ -1066,7 +1066,11 @@ async def test_schedule_search_failure_returns_400_and_rolls_back(
             headers=_headers(),
         )
     assert response.status_code == 400, response.text
-    assert "schedule search limit" in response.text
+    assert "Could not calculate the next run time for this schedule." in response.text
+    expected_outcome = (
+        "The task was not created." if operation == "create" else "Your changes were not saved."
+    )
+    assert expected_outcome in response.text
     if existing is None:
         assert store.list() == []
     else:

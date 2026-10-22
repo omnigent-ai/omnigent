@@ -412,8 +412,8 @@ def create_scheduled_tasks_router(
                 agent_store.delete(bound.id)
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
-                    "Could not calculate the next run within the schedule search limit. "
-                    "Try a simpler recurrence rule.",
+                    "Could not calculate the next run time for this schedule. "
+                    "The task was not created.",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             raise
@@ -670,8 +670,8 @@ def create_scheduled_tasks_router(
                 agent_store.delete(new_copy.id)
             if isinstance(exc, RRuleSearchError):
                 raise OmnigentError(
-                    "Could not calculate the next run within the schedule search limit. "
-                    "The task was not changed. Try a simpler recurrence rule.",
+                    "Could not calculate the next run time for this schedule. "
+                    "Your changes were not saved.",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             raise
