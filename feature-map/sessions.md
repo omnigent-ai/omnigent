@@ -160,10 +160,12 @@ its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
 identify the session shown in Workspace. The grid header toggles the shared
-panel; its width is saved per grid and stays fixed when switching sessions.
+panel; it spans the full app height beside the grid header and cells. Its width
+is saved per grid and stays fixed when switching sessions; the header shrinks
+with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
-fills the grid area. Drag a cell titlebar onto another cell to swap positions,
-or focus the title and press Space, choose a cell with the arrow keys, and
+fills the grid area, including its header. Drag a cell titlebar onto another cell
+to swap positions, or focus the title and press Space, choose a cell with the arrow keys, and
 press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
 only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
 Grids wait for account identity; if it is unavailable, use Reload to retry.

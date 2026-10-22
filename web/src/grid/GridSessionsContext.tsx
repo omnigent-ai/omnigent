@@ -49,7 +49,6 @@ export const useGridSessions = () => useContext(GridSessionsContext);
 
 export function GridSessionsProvider({ children }: { children: ReactNode }) {
   const enabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
-  console.log("enabled", enabled);
   return enabled ? <EnabledGridSessionsProvider>{children}</EnabledGridSessionsProvider> : children;
 }
 

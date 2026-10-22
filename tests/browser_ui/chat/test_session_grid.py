@@ -181,7 +181,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_nav.get_by_role("link").click(button="right")
         page.get_by_role("menuitem", name="Rename", exact=True).click()
         rename.fill("Research monitor")
-        page.get_by_role("heading", name="Research grid", exact=True).click()
+        page.get_by_role("heading", name="Research grid · 2 sessions", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
         page.get_by_role("button", name="Expand grid workspace").click()
@@ -195,6 +195,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
             workspace.get_by_text(f"notes-{index}.md", exact=True).click()
             expect(workspace.get_by_test_id("file-viewer")).to_contain_text(f"Workspace {index}")
             expect(page).to_have_url(grid_url)
+        header = (
+            page.get_by_role("region", name="Session grid", exact=True).locator("header").first
+        )
+        header_box = header.bounding_box()
+        panel_box = workspace.bounding_box()
+        assert header_box and panel_box
+        assert panel_box["y"] == 0
+        assert panel_box["height"] == page.viewport_size["height"]
+        assert abs(header_box["x"] + header_box["width"] - panel_box["x"]) < 2
         page.screenshot(path=str(artifacts / "shared-workspace.png"))
         first_cell = page.locator('[data-grid-session="grid-0"]')
         first_cell.get_by_text("Transcript 0", exact=True).click()
@@ -273,6 +282,8 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert grid_box and panel_box
         assert abs(panel_box["width"] - grid_box["width"]) < 2
         assert abs(panel_box["height"] - grid_box["height"]) < 2
+        assert panel_box["y"] == 0
+        assert header.evaluate("node => !!node.closest('[inert]')")
         page.screenshot(path=str(artifacts / "workspace-maximized-in-grid.png"))
         first_workspace.get_by_role("button", name="Exit full screen", exact=True).click()
         workspace.get_by_role("separator").focus()
@@ -297,6 +308,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
         assert workspace.bounding_box()["width"] == saved_width
         page.get_by_role("button", name="Collapse grid workspace").click()
+        assert header.bounding_box()["width"] > header_box["width"]
         _drag_session(page, "grid-2", "grid-0", "bottom")
         for index in range(3):
             expect(
