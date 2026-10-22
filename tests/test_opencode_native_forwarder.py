@@ -308,6 +308,20 @@ async def test_session_error_message_aborted_takes_idle_path() -> None:
     assert "output" not in status
 
 
+async def test_late_aborted_message_update_does_not_reopen_the_turn() -> None:
+    """OpenCode can update the aborted message after the turn ended; that is no new turn."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    aborted = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_1", "role": "assistant"}))
+    await fwd.handle_event(_event("session.error", error=aborted))
+    await fwd.handle_event(_event("session.idle"))
+    await fwd.handle_event(
+        _event("message.updated", info={"id": "msg_1", "role": "assistant", "error": aborted})
+    )
+    assert [edge["status"] for edge in _status_edges(server.posts)] == ["running", "idle", "idle"]
+
+
 def _status_edges(posts: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
     return [b["data"] for _u, b in posts if b["type"] == "external_session_status"]
 
