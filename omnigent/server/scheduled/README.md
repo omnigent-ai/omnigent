@@ -9,6 +9,26 @@ through the store, and supervises the executor while it prepares the run.
 4. Call `on_fire(task, lease)` and renew the startup lease while it works.
 5. Stop renewal when the executor records `running`, `failed`, or `skipped`.
 
+```mermaid
+flowchart TD
+    A["Poll for work"] --> B["Initialize missing next_run_at values"]
+    B --> C["Find due tasks"]
+    C --> D["Check host ownership and startup capacity"]
+    D --> E["Claim occurrence: create starting run<br/>and advance next_run_at atomically"]
+    E --> F["Call executor: on_fire(task, lease)"]
+    E --> G["Renew lease while startup is in progress"]
+    F --> H["Executor records running, failed, or skipped"]
+    H --> I["Stop lease renewal"]
+    G --> J["If lease is lost: cancel local startup"]
+    J --> K["Keep unfinished run for recovery"]
+```
+
+`poll_once()` initializes missing schedules and finds due tasks. `_claim_due()`
+uses the store's atomic claim to decide which replica starts each occurrence.
+`_execute()` runs the executor callback alongside the heartbeat. The executor
+uses `StartupLease` to check its lease, attach the session, and record the startup
+outcome; the lease covers startup, not the entire agent turn.
+
 The executor checks its lease before external actions, attaches the session before
 sending the prompt, and records `running` after delivery. Lease loss stops local
 startup work. Interrupted runs remain recorded for recovery; the scheduler never
@@ -23,10 +43,6 @@ these settings; renewal must occur more frequently than lease expiry.
 This component is not wired into server startup. Recovery and the application
 integration must be supplied before enabling persistent scheduling. The existing
 server continues to use its in-memory scheduler.
-
-Start reviewing at `PersistentTaskScheduler.poll_once()` in
-[dispatch_scheduler.py](dispatch_scheduler.py), then follow `_claim_due()` and
-`_execute()`. `StartupLease` handles the executor's database checkpoints.
 
 Run dispatch and configuration tests with:
 
