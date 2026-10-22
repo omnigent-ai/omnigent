@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from math import ceil
 from time import monotonic
@@ -203,8 +203,8 @@ def _retry_after(response: httpx.Response) -> int:
         try:
             retry_at = parsedate_to_datetime(value)
             if retry_at.tzinfo is None:
-                retry_at = retry_at.replace(tzinfo=timezone.utc)
-            delay = ceil((retry_at - datetime.now(timezone.utc)).total_seconds())
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delay = ceil((retry_at - datetime.now(UTC)).total_seconds())
         except (ValueError, TypeError, OverflowError):
             delay = 0
     return max(0, min(delay, 3600))
