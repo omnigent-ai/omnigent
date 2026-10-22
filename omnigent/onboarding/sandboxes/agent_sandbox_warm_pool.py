@@ -44,6 +44,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     _new_pod_name,
     _render_workspace_prep_command,
     _resolve_pod_ready_timeout_s,
+    _resolve_workspace_prep_timeout_s,
     _terminal_failure,
     build_job_manifest,
 )
@@ -513,7 +514,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             raise SandboxGoneError("Warm Sandbox Pod ownership changed.")
         return pod
 
-    def _patch_deadline(self, handle: WarmPoolHandle, *, boot: bool) -> None:
+    def _patch_deadline(self, handle: WarmPoolHandle, *, boot: bool, prep_s: int = 0) -> None:
         self._load_custom().patch_namespaced_custom_object(
             API_GROUP,
             API_VERSION,
@@ -526,7 +527,9 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                     "operatingMode": "Running",
                     "shutdownPolicy": "Retain",
                     "shutdownTime": _shutdown_time(
-                        initial_shutdown_window_s() if boot else resolve_shutdown_window_s()
+                        initial_shutdown_window_s() + prep_s
+                        if boot
+                        else resolve_shutdown_window_s()
                     ),
                 },
             },
@@ -626,6 +629,8 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         workspace = f"{_HOME_DIR}/workspace"
         generation = hashlib.sha256(token.encode()).hexdigest()[:32]
         deadline = time.monotonic() + _resolve_pod_ready_timeout_s(self._pod_ready_timeout_s)
+        prep_timeout_s = _resolve_workspace_prep_timeout_s(self._workspace_prep_timeout_s)
+        preparing = False
         if on_stage:
             on_stage("starting")
         try:
@@ -703,9 +708,22 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                     return f"{workspace}/{repos[0].repo_name}" if len(repos) == 1 else workspace
                 elif status.get("stage") == "failed":
                     raise click.ClickException("Warm Sandbox workspace preparation failed.")
+                elif status.get("stage") == "preparing" and repos and not preparing:
+                    preparing = True
+                    deadline = time.monotonic() + prep_timeout_s
+                    try:
+                        self._patch_deadline(handle, boot=True, prep_s=prep_timeout_s)
+                    except Exception as exc:
+                        _logger.warning(
+                            "Could not extend warm Sandbox %s for its clone (%s)",
+                            handle.sandbox_name,
+                            _api_reason(exc),
+                        )
                 time.sleep(_POLL_S)
             raise click.ClickException(
-                "Timed out waiting for warm Sandbox activation and workspace preparation."
+                f"Warm Sandbox workspace preparation did not finish within {prep_timeout_s}s."
+                if preparing
+                else "Timed out waiting for warm Sandbox activation and workspace preparation."
             )
         finally:
             self._close_clients()

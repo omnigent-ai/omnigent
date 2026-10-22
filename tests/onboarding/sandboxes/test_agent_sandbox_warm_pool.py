@@ -10,6 +10,7 @@ import sys
 import time
 import types
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1111,3 +1112,97 @@ def test_incompatible_claimed_profile_preserves_allocation_before_activation(
     harness.custom.patch_namespaced_custom_object.assert_not_called()
     harness.custom.delete_namespaced_custom_object.assert_not_called()
     harness.core.delete_namespaced_persistent_volume_claim.assert_not_called()
+
+
+@pytest.mark.parametrize("extension_fails", [False, True])
+def test_start_waits_for_in_progress_workspace_preparation(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch, extension_fails: bool
+) -> None:
+    """Workspace preparation (the clone) outlasting the pod-ready budget is not a failure,
+    even when extending the Sandbox deadline for it fails."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(k8s._WORKSPACE_PREP_TIMEOUT_ENV_VAR, raising=False)
+    clone_seconds = 300.0
+    clock = {"now": 0.0}
+    monkeypatch.setattr(warm.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(warm.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+    activated = {"done": False}
+
+    def execute(handle: Any, pod_name: str, mode: str, payload: Any = None) -> str:
+        if mode == "activate":
+            activated["done"] = True
+            return ""
+        if not activated["done"]:
+            return json.dumps({"stage": "waiting", "generation": None})
+        stage = "prepared" if clock["now"] >= clone_seconds else "preparing"
+        return json.dumps({"stage": stage, "generation": _GENERATION})
+
+    monkeypatch.setattr(harness.launcher, "_exec", MagicMock(side_effect=execute))
+    patch_sandbox = harness.custom.patch_namespaced_custom_object
+    if extension_fails:
+        patch_sandbox.side_effect = [None, None, _ApiError(503)]
+    stages: list[str] = []
+    repo = RepoWorkspace("https://github.com/example/monorepo.git", None, "monorepo")
+
+    result = harness.launcher.start_host(
+        _HANDLE.encode(), **_START_ARGS, repos=[repo], on_stage=stages.append
+    )
+
+    assert result == "/home/omnigent/workspace/monorepo"
+    assert clock["now"] >= clone_seconds > k8s._POD_READY_TIMEOUT_S
+    assert stages == ["starting", "cloning"]
+    boot, during_clone = (
+        datetime.strptime(call.args[5]["spec"]["shutdownTime"], "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=UTC
+        )
+        for call in patch_sandbox.call_args_list
+        if call.args[3] == warm.SANDBOX_PLURAL
+    )
+    extension_s = (during_clone - boot).total_seconds()
+    assert abs(extension_s - k8s._WORKSPACE_PREP_TIMEOUT_S) <= 2
+
+
+@pytest.mark.parametrize(
+    ("stalled_stage", "with_repos", "expected"),
+    [
+        ("waiting", True, "Timed out waiting for warm Sandbox activation"),
+        ("preparing", True, "workspace preparation did not finish within 120s"),
+        ("preparing", False, "Timed out waiting for warm Sandbox activation"),
+    ],
+)
+def test_stalled_start_reports_the_budget_it_exhausted(
+    harness: _Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    stalled_stage: str,
+    with_repos: bool,
+    expected: str,
+) -> None:
+    """Activation stays under the pod-ready budget; a repository clone gets its own, longer one."""
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.setenv(k8s._WORKSPACE_PREP_TIMEOUT_ENV_VAR, "120")
+    clock = {"now": 0.0}
+    monkeypatch.setattr(warm.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(warm.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+    activated = {"done": False}
+
+    def execute(handle: Any, pod_name: str, mode: str, payload: Any = None) -> str:
+        if mode == "activate":
+            activated["done"] = True
+            return ""
+        if not activated["done"]:
+            return json.dumps({"stage": "waiting", "generation": None})
+        return json.dumps({"stage": "preparing", "generation": _GENERATION})
+
+    if stalled_stage == "waiting":
+        for container in harness.pod.status.container_statuses:
+            container.ready = False
+    monkeypatch.setattr(harness.launcher, "_exec", MagicMock(side_effect=execute))
+    repo = RepoWorkspace("https://github.com/example/monorepo.git", None, "monorepo")
+
+    with pytest.raises(click.ClickException, match=expected):
+        harness.launcher.start_host(
+            _HANDLE.encode(), **_START_ARGS, repos=[repo] if with_repos else []
+        )
+
+    exhausted = 120 if stalled_stage == "preparing" and with_repos else k8s._POD_READY_TIMEOUT_S
+    assert exhausted <= clock["now"] < exhausted + 2

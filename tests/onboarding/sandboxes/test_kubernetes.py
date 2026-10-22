@@ -1251,35 +1251,67 @@ def test_env_var_name_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> 
         KubernetesSandboxLauncher()._resolve_namespace()
 
 
-def test_pod_ready_timeout_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+_TIMEOUT_RESOLVERS = [
+    pytest.param(
+        k8s._resolve_pod_ready_timeout_s,
+        k8s._POD_READY_TIMEOUT_ENV_VAR,
+        k8s._POD_READY_TIMEOUT_S,
+        id="pod-ready",
+    ),
+    pytest.param(
+        k8s._resolve_workspace_prep_timeout_s,
+        k8s._WORKSPACE_PREP_TIMEOUT_ENV_VAR,
+        k8s._WORKSPACE_PREP_TIMEOUT_S,
+        id="workspace-prep",
+    ),
+]
+
+
+@pytest.mark.parametrize(("resolve", "env_var", "default"), _TIMEOUT_RESOLVERS)
+def test_wait_budget_defaults_when_unset(
+    monkeypatch: pytest.MonkeyPatch, resolve, env_var: str, default: int
+) -> None:
     """With no config and no env var, the hardcoded default wins."""
-    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
-    assert k8s._resolve_pod_ready_timeout_s(None) == k8s._POD_READY_TIMEOUT_S
+    monkeypatch.delenv(env_var, raising=False)
+    assert resolve(None) == default
 
 
-def test_pod_ready_timeout_env_var_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("resolve", "env_var", "default"), _TIMEOUT_RESOLVERS)
+def test_wait_budget_env_var_overrides_default(
+    monkeypatch: pytest.MonkeyPatch, resolve, env_var: str, default: int
+) -> None:
     """With no explicit config, the env var overrides the hardcoded default."""
-    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
-    assert k8s._resolve_pod_ready_timeout_s(None) == 300
+    monkeypatch.setenv(env_var, "300")
+    assert resolve(None) == 300
 
 
-def test_pod_ready_timeout_config_wins_over_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    """sandbox.kubernetes.pod_ready_timeout_s takes precedence over the env var."""
-    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "300")
-    assert k8s._resolve_pod_ready_timeout_s(45) == 45
+@pytest.mark.parametrize(("resolve", "env_var", "default"), _TIMEOUT_RESOLVERS)
+def test_wait_budget_config_wins_over_env_var(
+    monkeypatch: pytest.MonkeyPatch, resolve, env_var: str, default: int
+) -> None:
+    """The sandbox.kubernetes config key takes precedence over the env var."""
+    monkeypatch.setenv(env_var, "300")
+    assert resolve(45) == 45
 
 
-def test_pod_ready_timeout_env_var_accepts_float_string(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("resolve", "env_var", "default"), _TIMEOUT_RESOLVERS)
+def test_wait_budget_env_var_accepts_float_string(
+    monkeypatch: pytest.MonkeyPatch, resolve, env_var: str, default: int
+) -> None:
     """A float-looking env value is accepted, matching the E2B lifetime resolver."""
-    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "120.0")
-    assert k8s._resolve_pod_ready_timeout_s(None) == 120
+    monkeypatch.setenv(env_var, "120.0")
+    assert resolve(None) == 120
 
 
-def test_pod_ready_timeout_env_var_rejects_non_numeric(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A malformed env value fails fast with a clear error instead of a raw ValueError."""
-    monkeypatch.setenv(k8s._POD_READY_TIMEOUT_ENV_VAR, "not-a-number")
-    with pytest.raises(click.ClickException, match="must be a number of seconds"):
-        k8s._resolve_pod_ready_timeout_s(None)
+@pytest.mark.parametrize("raw", ["not-a-number", "0", "-1", "0.5", "inf"])
+@pytest.mark.parametrize(("resolve", "env_var", "default"), _TIMEOUT_RESOLVERS)
+def test_wait_budget_env_var_rejects_non_positive_or_malformed(
+    monkeypatch: pytest.MonkeyPatch, resolve, env_var: str, default: int, raw: str
+) -> None:
+    """A malformed or non-positive env value fails fast with a clear error."""
+    monkeypatch.setenv(env_var, raw)
+    with pytest.raises(click.ClickException, match=f"{env_var} must be a positive number"):
+        resolve(None)
 
 
 # ── SDK-driven tests (fake kubernetes client) ───────────────
@@ -1454,10 +1486,17 @@ def fake_clients(monkeypatch: pytest.MonkeyPatch) -> tuple[_FakeCore, _FakeBatch
     return core, batch
 
 
-def _launcher() -> KubernetesSandboxLauncher:
+def _launcher(
+    *, pod_ready_timeout_s: int | None = None, workspace_prep_timeout_s: int | None = None
+) -> KubernetesSandboxLauncher:
     """A launcher pinned to in-cluster config with explicit, env-free settings."""
     return KubernetesSandboxLauncher(
-        in_cluster=True, namespace="omnigent-sandboxes", secret_name="omnigent-creds", env=()
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=pod_ready_timeout_s,
+        workspace_prep_timeout_s=workspace_prep_timeout_s,
     )
 
 
@@ -2032,3 +2071,449 @@ def test_provision_reserves_pod_name_and_no_exec_transport() -> None:
     assert not hasattr(launcher, "run")
     assert launcher.capabilities.cli_bootstrap is False
     assert launcher.capabilities.classifies_runner_by_agent is True
+
+
+def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
+    """Drive the launcher's clock from a dict so every poll sleep advances it instantly."""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(k8s.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(k8s.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+    return clock
+
+
+def _cloning_pod():
+    """A Pending Pod whose workspace-prep init container is running (the clone is under way)."""
+    return _pod(
+        phase="Pending",
+        init_statuses=[
+            SimpleNamespace(
+                name="workspace-prep",
+                state=SimpleNamespace(
+                    running=SimpleNamespace(started_at=0.0), waiting=None, terminated=None
+                ),
+            )
+        ],
+        container_statuses=[
+            SimpleNamespace(
+                name="host",
+                state=SimpleNamespace(
+                    running=None,
+                    waiting=SimpleNamespace(reason="PodInitializing", message=None),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+
+
+def _prepared_pod():
+    """A Running Pod whose workspace-prep init container completed."""
+    return _pod(
+        phase="Running",
+        init_statuses=[_terminated(0, name="workspace-prep", reason="Completed")],
+        container_statuses=[
+            SimpleNamespace(
+                name="host",
+                state=SimpleNamespace(running=SimpleNamespace(), waiting=None, terminated=None),
+            )
+        ],
+    )
+
+
+def _crash_looping_clone_pod(restart_count: int):
+    """A Pending Pod whose failed workspace-prep init container is in kubelet back-off."""
+    return _pod(
+        phase="Pending",
+        init_statuses=[
+            SimpleNamespace(
+                name="workspace-prep",
+                restart_count=restart_count,
+                state=SimpleNamespace(
+                    running=None,
+                    waiting=SimpleNamespace(reason="CrashLoopBackOff", message="back-off 10s"),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+
+
+def test_launch_host_waits_for_in_progress_workspace_clone(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone still running past the default pod-ready budget is slow, not a dead Pod."""
+    core, batch = fake_clients
+    monkeypatch.delenv(k8s._POD_READY_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(k8s._WORKSPACE_PREP_TIMEOUT_ENV_VAR, raising=False)
+    clone_seconds = 300.0
+    clock = _fake_clock(monkeypatch)
+    cloning, running = _cloning_pod(), _prepared_pod()
+    core.pod_list_items = [cloning]
+    monkeypatch.setattr(
+        core,
+        "read_namespaced_pod",
+        lambda name, namespace, _request_timeout=None: (
+            running if clock["now"] >= clone_seconds else cloning
+        ),
+    )
+    stages: list[str] = []
+    launcher = _launcher()
+    extended: list[tuple[str, str, int]] = []
+    monkeypatch.setattr(
+        launcher, "_extend_for_workspace_prep", lambda *args: extended.append(args)
+    )
+
+    workspace = launcher.start_host(
+        "omnigent-job-slow-clone",
+        token=_TOKEN,
+        host_id="host_slow",
+        host_name="managed-slow",
+        server_url="http://srv.example.com",
+        repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        on_stage=stages.append,
+    )
+
+    assert workspace == "/home/omnigent/workspace/monorepo"
+    assert clock["now"] >= clone_seconds > k8s._POD_READY_TIMEOUT_S
+    assert stages == ["starting", "cloning", "starting"]
+    assert extended == [
+        ("omnigent-sandboxes", "omnigent-job-slow-clone", k8s._WORKSPACE_PREP_TIMEOUT_S)
+    ]
+    assert "delete_job" not in batch.calls
+
+
+def test_launch_host_without_repos_keeps_starting_stage_during_workspace_prep(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty workspace has nothing to clone, so the UI must not say it is cloning."""
+    core, _batch = fake_clients
+    _fake_clock(monkeypatch)
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [_cloning_pod(), _prepared_pod()]
+    stages: list[str] = []
+
+    _launcher().start_host(
+        "omnigent-job-empty",
+        token=_TOKEN,
+        host_id="host_empty",
+        host_name="managed-empty",
+        server_url="http://srv.example.com",
+        on_stage=stages.append,
+    )
+
+    assert stages == ["starting"]
+
+
+def test_workspace_prep_without_repos_stays_on_the_pod_ready_budget(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a clone earns the longer budget; other workspace prep that hangs fails at pod-ready."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    core.pod_list_items = [_cloning_pod()]
+    core.read_default = _cloning_pod()
+
+    with pytest.raises(click.ClickException, match="did not start within 30s"):
+        _launcher(pod_ready_timeout_s=30, workspace_prep_timeout_s=600).start_host(
+            "omnigent-job-empty-stall",
+            token=_TOKEN,
+            host_id="host_empty_stall",
+            host_name="managed-empty-stall",
+            server_url="http://srv.example.com",
+        )
+
+    assert clock["now"] <= 30 + 2 * k8s._POD_READY_POLL_S
+
+
+def test_stalled_clone_fails_after_workspace_prep_budget_with_init_log_tail(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone that never finishes is bounded by its own budget and reports its progress."""
+    core, batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    cloning = _cloning_pod()
+    core.pod_list_items = [cloning]
+    core.read_default = cloning
+    core.logs["workspace-prep"] = "Cloning into '/home/omnigent/workspace/monorepo'..."
+    launcher = _launcher(pod_ready_timeout_s=30, workspace_prep_timeout_s=600)
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.start_host(
+            "omnigent-job-stalled-clone",
+            token=_TOKEN,
+            host_id="host_stalled",
+            host_name="managed-stalled",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    assert "was still preparing its workspace after 600s" in exc.value.message
+    assert "Cloning into '/home/omnigent/workspace/monorepo'..." in exc.value.message
+    assert clock["now"] >= 600
+    assert "delete_job" in batch.calls
+
+
+def test_wait_resets_to_pod_ready_budget_when_cloning_pod_is_replaced(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cloning Pod replaced by one stuck before cloning falls back to the tight
+    pod-ready budget, not the long preparation budget it never earned."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    stuck = _pod(
+        phase="Pending",
+        init_statuses=[
+            SimpleNamespace(
+                name="workspace-prep",
+                state=SimpleNamespace(
+                    running=None,
+                    waiting=SimpleNamespace(reason="ImagePullBackOff", message="back-off"),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [_cloning_pod(), _FakeApiException(status=404, reason="Not Found")]
+    core.read_default = stuck
+    launcher = _launcher(pod_ready_timeout_s=90, workspace_prep_timeout_s=1800)
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.start_host(
+            "omnigent-job-replaced",
+            token=_TOKEN,
+            host_id="host_replaced",
+            host_name="managed-replaced",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    assert "did not start within 90s" in exc.value.message
+    assert "was still preparing" not in exc.value.message
+    assert clock["now"] <= 90 + 2 * k8s._POD_READY_POLL_S
+
+
+@pytest.mark.parametrize("replacement_clone_s", [None, 1500.0])
+def test_cloning_pod_that_disappears_restarts_from_pod_ready_budget(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_clone_s: float | None,
+) -> None:
+    """A Pod deleted mid-clone gets the tight budget to be replaced; a replacement
+    that starts cloning earns a fresh preparation budget of its own."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    deleted_at = 1000.0
+    core.pod_list_items = [_cloning_pod()]
+    state = {"replaced": False}
+
+    def read_pod(name, namespace, _request_timeout=None):
+        if clock["now"] < deleted_at:
+            return _cloning_pod()
+        if not state["replaced"]:
+            state["replaced"] = True
+            if replacement_clone_s is None:
+                core.pod_list_items = []
+            raise _FakeApiException(status=404, reason="Not Found")
+        if clock["now"] < deleted_at + replacement_clone_s:
+            return _cloning_pod()
+        return _prepared_pod()
+
+    monkeypatch.setattr(core, "read_namespaced_pod", read_pod)
+    launcher = _launcher(pod_ready_timeout_s=90, workspace_prep_timeout_s=1800)
+
+    def start() -> str:
+        return launcher.start_host(
+            "omnigent-job-deleted",
+            token=_TOKEN,
+            host_id="host_deleted",
+            host_name="managed-deleted",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    if replacement_clone_s is None:
+        with pytest.raises(click.ClickException) as exc:
+            start()
+        assert "did not create a child pod within 90s" in exc.value.message
+        assert clock["now"] <= deleted_at + 90 + 2 * k8s._POD_READY_POLL_S
+    else:
+        assert start() == "/home/omnigent/workspace/monorepo"
+        assert clock["now"] >= deleted_at + replacement_clone_s > 1800
+
+
+def test_wait_resets_to_pod_ready_budget_when_clone_finishes_but_host_stalls(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the clone finishes, a main container that cannot start is a pod-start
+    failure on the tight budget, not a workspace-preparation timeout."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    stalled = _pod(
+        phase="Pending",
+        init_statuses=[_terminated(0, name="workspace-prep", reason="Completed")],
+        container_statuses=[
+            SimpleNamespace(
+                name="host",
+                state=SimpleNamespace(
+                    running=None,
+                    waiting=SimpleNamespace(reason="ContainerCreating", message=None),
+                    terminated=None,
+                ),
+            )
+        ],
+    )
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [_cloning_pod()]
+    core.read_default = stalled
+    launcher = _launcher(pod_ready_timeout_s=90, workspace_prep_timeout_s=1800)
+
+    with pytest.raises(click.ClickException) as exc:
+        launcher.start_host(
+            "omnigent-job-host-stall",
+            token=_TOKEN,
+            host_id="host_stall",
+            host_name="managed-stall",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    assert "did not start within 90s" in exc.value.message
+    assert "ContainerCreating" in exc.value.message
+    assert "was still preparing" not in exc.value.message
+    assert clock["now"] <= 90 + 2 * k8s._POD_READY_POLL_S
+
+
+def test_restarting_clone_keeps_the_budget_from_its_first_run(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone the kubelet keeps restarting in the same Pod, backing off below the
+    crash-loop threshold, stays bounded by one preparation budget."""
+    core, _batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    core.pod_list_items = [_cloning_pod()]
+    core.logs["workspace-prep"] = "fatal: early EOF"
+
+    def read_pod(name, namespace, _request_timeout=None):
+        assert clock["now"] < 3 * 1800, "the wait outlived one preparation budget"
+        failures = int(clock["now"] // 500)
+        if failures and clock["now"] % 500 < 10:
+            return _crash_looping_clone_pod(restart_count=failures - 1)
+        return _cloning_pod()
+
+    monkeypatch.setattr(core, "read_namespaced_pod", read_pod)
+    stages: list[str] = []
+
+    with pytest.raises(click.ClickException) as exc:
+        _launcher(pod_ready_timeout_s=90, workspace_prep_timeout_s=1800).start_host(
+            "omnigent-job-retried-clone",
+            token=_TOKEN,
+            host_id="host_retried",
+            host_name="managed-retried",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+            on_stage=stages.append,
+        )
+
+    assert "was still preparing its workspace after 1800s" in exc.value.message
+    assert "fatal: early EOF" in exc.value.message
+    assert clock["now"] <= 1800 + 2 * k8s._POD_READY_POLL_S
+    assert stages == ["starting", "cloning"]
+
+
+def test_clone_that_recovers_from_back_off_completes_the_launch(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient clone failure the kubelet retries below the threshold still launches."""
+    core, batch = fake_clients
+    _fake_clock(monkeypatch)
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [
+        _cloning_pod(),
+        _crash_looping_clone_pod(restart_count=k8s._WORKSPACE_PREP_CRASHLOOP_RESTARTS - 1),
+        _cloning_pod(),
+    ]
+    core.read_default = _prepared_pod()
+    stages: list[str] = []
+
+    workspace = _launcher().start_host(
+        "omnigent-job-flaky-clone",
+        token=_TOKEN,
+        host_id="host_flaky",
+        host_name="managed-flaky",
+        server_url="http://srv.example.com",
+        repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        on_stage=stages.append,
+    )
+
+    assert workspace == "/home/omnigent/workspace/monorepo"
+    assert stages == ["starting", "cloning", "starting"]
+    assert "delete_job" not in batch.calls
+
+
+def test_crash_looping_clone_fails_fast_with_its_log_tail(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone still failing at the restart threshold (e.g. bad credentials) fails
+    with the git error instead of waiting out the preparation budget."""
+    core, batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    core.pod_list_items = [_cloning_pod()]
+    core.read_queue = [_cloning_pod()]
+    core.read_default = _crash_looping_clone_pod(
+        restart_count=k8s._WORKSPACE_PREP_CRASHLOOP_RESTARTS
+    )
+    core.logs["workspace-prep"] = "remote: Invalid username or password."
+
+    with pytest.raises(click.ClickException) as exc:
+        _launcher(pod_ready_timeout_s=90, workspace_prep_timeout_s=1800).start_host(
+            "omnigent-job-bad-creds",
+            token=_TOKEN,
+            host_id="host_bad_creds",
+            host_name="managed-bad-creds",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    restarts = k8s._WORKSPACE_PREP_CRASHLOOP_RESTARTS
+    assert f"workspace prep is crash-looping (restarts: {restarts}, CrashLoopBackOff)" in (
+        exc.value.message
+    )
+    assert "remote: Invalid username or password." in exc.value.message
+    assert clock["now"] < 10
+    assert "delete_job" in batch.calls
+
+
+def test_clone_failing_between_polls_still_fails_with_its_log_tail(
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone that fails too fast to be seen running is still a started clone, so
+    a crash loop outlasting the pod-ready budget reports the git error."""
+    core, batch = fake_clients
+    clock = _fake_clock(monkeypatch)
+    pulling = _pod(phase="Pending")
+    core.pod_list_items = [pulling]
+
+    def read_pod(name, namespace, _request_timeout=None):
+        if clock["now"] < 80:
+            return pulling
+        return _crash_looping_clone_pod(restart_count=1 + int((clock["now"] - 80) // 15))
+
+    monkeypatch.setattr(core, "read_namespaced_pod", read_pod)
+    core.logs["workspace-prep"] = "remote: Invalid username or password."
+
+    with pytest.raises(click.ClickException) as exc:
+        _launcher(pod_ready_timeout_s=90, workspace_prep_timeout_s=1800).start_host(
+            "omnigent-job-fast-bad-creds",
+            token=_TOKEN,
+            host_id="host_fast_bad_creds",
+            host_name="managed-fast-bad-creds",
+            server_url="http://srv.example.com",
+            repos=[RepoWorkspace(url="https://x/monorepo.git", branch=None, repo_name="monorepo")],
+        )
+
+    restarts = k8s._WORKSPACE_PREP_CRASHLOOP_RESTARTS
+    assert f"workspace prep is crash-looping (restarts: {restarts}" in exc.value.message
+    assert "remote: Invalid username or password." in exc.value.message
+    assert 90 < clock["now"] < 120
+    assert "delete_job" in batch.calls
