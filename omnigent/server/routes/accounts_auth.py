@@ -39,6 +39,7 @@ from omnigent.db.account_authority import bind_account_authority, target_account
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
+from omnigent.server.credential_purpose import CredentialPurpose
 from omnigent.server.oidc import mint_session_cookie
 from omnigent.server.passwords import (
     InvalidPasswordError,
@@ -266,7 +267,9 @@ def create_accounts_auth_router(
     _session_cookie = config.session_cookie_name
     _session_max_age = config.session_ttl_hours * 3600
 
-    def _reissue_session_cookie(response: Response, user_id: str, generation: str) -> None:
+    def _reissue_session_cookie(
+        response: Response, user_id: str, generation: str, purpose: CredentialPurpose
+    ) -> None:
         """Keep the caller signed in after rotating their own account generation."""
         bind_account_authority(user_id, generation)
         session_jwt = mint_session_cookie(
@@ -275,6 +278,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
+            purpose=purpose,
         )
         _set_session_cookie(
             response,
@@ -346,6 +350,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=generation,
+            purpose=CredentialPurpose.CLIENT if body.issue_refresh else CredentialPurpose.SESSION,
         )
 
         user = account_store.get_user(username)
@@ -707,6 +712,7 @@ def create_accounts_auth_router(
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
             account_generation=user.account_generation,
+            purpose=CredentialPurpose.CLIENT,
         )
         resp = RedirectResponse(url=f"{config.base_url}/", status_code=302)
         _set_session_cookie(
@@ -829,7 +835,12 @@ def create_accounts_auth_router(
         # An admin resetting their own account keeps this session, so the
         # next request cannot sign them out before they save the password.
         if user_id == admin_id and generation is not None:
-            _reissue_session_cookie(resp, admin_id, generation)
+            _reissue_session_cookie(
+                resp,
+                admin_id,
+                generation,
+                auth_provider.get_credential_purpose(request) or CredentialPurpose.CLIENT,
+            )
         return resp
 
     @router.post("/users/me/password")
@@ -865,7 +876,12 @@ def create_accounts_auth_router(
         _logger.info("auth/users/me/password: changed for %s", _redact_for_log(user_id))
         resp = Response(status_code=204)
         if generation is not None:
-            _reissue_session_cookie(resp, user_id, generation)
+            _reissue_session_cookie(
+                resp,
+                user_id,
+                generation,
+                auth_provider.get_credential_purpose(request) or CredentialPurpose.CLIENT,
+            )
         return resp
 
     return router

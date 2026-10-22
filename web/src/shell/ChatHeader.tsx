@@ -32,6 +32,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
+import { SessionLinksButton } from "@/components/SessionLinksDialog";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
@@ -613,6 +614,13 @@ export function ChatHeader({
             the three-dot "Session actions" menu below. Fork is also
             available from the session menus and assistant messages. */}
         {pending && <PendingHeaderActions isMobile={isMobile} />}
+        {!pending && conversationId && (
+          <SessionLinksButton
+            sessionId={conversationId}
+            title={conversationTitle}
+            permissionLevel={permissionLevel}
+          />
+        )}
         {/* Agent info: tools & policies for the bound agent. Desktop-only
             popover; self-hides when the agent has neither configured. */}
         {!pending && conversationId && (

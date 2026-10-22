@@ -402,6 +402,20 @@ def test_managed_runner_callback_authenticates_end_to_end(
     assert authed.headers.get("X-Agent-Name")
     assert authed.content[:2] == b"\x1f\x8b", "expected a gzip agent bundle body"
 
+    # Exercise the same issued credential over HTTP without a runner header.
+    # Transport changes cannot turn a work credential into account authority.
+    for path in ("/v1/sessions?visibility=all", "/v1/scheduled-tasks"):
+        response = asyncio.run(_get_agent_contents(base_url, path, _RunnerDatabricksAuth(factory)))
+        assert response.status_code == 200, response.text
+    denied = asyncio.run(
+        _get_agent_contents(base_url, "/auth/users", _RunnerDatabricksAuth(factory))
+    )
+    assert denied.status_code == 403
+    with httpx.Client(base_url=base_url) as client:
+        client.cookies.set("ap_session", factory())
+        assert client.get("/v1/sessions?visibility=all").status_code == 200
+        assert client.post("/auth/magic").status_code == 401
+
 
 def test_managed_runner_survives_mint_403_after_token_expiry(
     accounts_server: tuple[str, str],

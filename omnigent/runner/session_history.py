@@ -17,6 +17,7 @@ from omnigent.runner.app_support import (
     _SpecEntry,
 )
 from omnigent.runner.native import _unwrap_resolved_spec
+from omnigent.session_authority import may_replay_session_item
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -206,6 +207,8 @@ def build_session_history(
 
         _skipped_types: list[str] = []
         for item in remaining:
+            if not may_replay_session_item(item):
+                continue
             item_type = item.get("type")
             if item_type not in (
                 "message",

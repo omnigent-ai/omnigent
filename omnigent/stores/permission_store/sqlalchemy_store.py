@@ -26,11 +26,13 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
 )
 from omnigent.server.sharing_settings import effective_public_level
+from omnigent.session_authority import requester_authority_active
 from omnigent.stores.permission_store import PermissionStore
 
 # Sentinel rows excluded from list_users() — never real, actionable
@@ -124,6 +126,27 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
     )
 
 
+def resolve_access_in_session(
+    session: Session, user_id: str, conversation_id: str, *, lock: bool = False
+) -> ResolvedAccess:
+    """Read fresh grants, optionally holding them through an authority write."""
+    workspace_id = current_workspace_id()
+    user_row = session.get(SqlUser, (workspace_id, user_id), with_for_update=lock)
+    user_grant = session.get(
+        SqlSessionPermission, (workspace_id, user_id, conversation_id), with_for_update=lock
+    )
+    public_grant = session.get(
+        SqlSessionPermission,
+        (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
+        with_for_update=lock,
+    )
+    return ResolvedAccess(
+        is_admin=user_row is not None and user_row.deleted_at is None and user_row.is_admin,
+        user_grant_level=user_grant.level if user_grant is not None else None,
+        public_grant_level=public_grant.level if public_grant is not None else None,
+    )
+
+
 class SqlAlchemyPermissionStore(PermissionStore):
     """SQLAlchemy-backed implementation of :class:`PermissionStore`.
 
@@ -180,8 +203,18 @@ class SqlAlchemyPermissionStore(PermissionStore):
     ) -> SessionPermission:
         """Upsert a permission grant. See base class for contract."""
 
-        def write(session: Session) -> None:
+        def write(session: Session) -> bool:
             require_active_account(session, user_id)
+            previous = session.get(
+                SqlSessionPermission,
+                (current_workspace_id(), user_id, conversation_id),
+                with_for_update=True,
+            )
+            reduced = previous is not None and previous.level > level
+            if previous is not None and previous.level == LEVEL_OWNER and level != LEVEL_OWNER:
+                from omnigent.stores.session_link_store import invalidate_link_epoch
+
+                invalidate_link_epoch(session, conversation_id)
             dialect = self._engine.dialect.name
             values = {
                 "user_id": user_id,
@@ -215,14 +248,19 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 )
             session.execute(stmt)
             session.flush()
+            return reduced
 
-        run_write_transaction(
+        reduced = run_write_transaction(
             self._session_immediate,
             "grant_permission",
             write,
         )
         # Evict after commit: the grant changed this session's access picture.
         self._invalidate_resolve_cache_for_session(conversation_id)
+        if reduced or (user_id == RESERVED_USER_PUBLIC and level < LEVEL_EDIT):
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            SessionLinkStore(self.storage_location).wait_for_handoffs(session_id=conversation_id)
         return SessionPermission(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -233,6 +271,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Remove a permission grant. See base class for contract."""
 
         def write(session: Session) -> bool:
+            from omnigent.db.account_authority import lock_account
+            from omnigent.stores.session_link_store import invalidate_link_epoch
+
+            lock_account(session, user_id)
+            previous = session.get(
+                SqlSessionPermission,
+                (current_workspace_id(), user_id, conversation_id),
+                with_for_update=True,
+            )
+            if previous is not None and previous.level == LEVEL_OWNER:
+                invalidate_link_epoch(session, conversation_id)
             result = cast(
                 CursorResult[tuple[object]],
                 session.execute(
@@ -253,6 +302,10 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # Evict after commit: a revoke must not be served stale from this
         # instance's cache.
         self._invalidate_resolve_cache_for_session(conversation_id)
+        if deleted:
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            SessionLinkStore(self.storage_location).wait_for_handoffs(session_id=conversation_id)
         return deleted
 
     def get(self, user_id: str, conversation_id: str) -> SessionPermission | None:
@@ -281,73 +334,71 @@ class SqlAlchemyPermissionStore(PermissionStore):
             ``"alice"``.
         :returns: The number of grants repointed to *to_user_id*.
         """
+        if from_user_id == to_user_id:
+            return 0
 
-        def write(session: Session) -> tuple[int, bool]:
+        from omnigent.db.account_authority import current_account_user, lock_account
+        from omnigent.stores.session_link_store import SessionLinkStore, invalidate_link_epoch
+
+        cursor: str | None = None
+
+        def write(session: Session) -> tuple[int, bool, str | None]:
+            accounts = {from_user_id, to_user_id}
+            if actor := current_account_user():
+                accounts.add(actor)
+            for account in sorted(accounts):
+                lock_account(session, account)
             require_active_account(session, to_user_id)
-            # FK target: ensure the destination users.id row exists. Don't
-            # downgrade an existing admin flag; only create it if missing.
             if session.get(SqlUser, (current_workspace_id(), to_user_id)) is None:
                 session.add(SqlUser(id=to_user_id, is_admin=False))
-                session.flush()
-            rows = (
-                session.execute(
-                    select(SqlSessionPermission).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == from_user_id,
-                    )
-                )
-                .scalars()
-                .all()
+            query = select(SqlSessionPermission).where(
+                SqlSessionPermission.workspace_id == current_workspace_id(),
+                SqlSessionPermission.user_id == from_user_id,
             )
-            if not rows:
-                return 0, False
-            conversation_ids = [r.conversation_id for r in rows]
-            # Single query: which conversation_ids does to_user already hold?
-            existing_to = set(
-                session.execute(
-                    select(SqlSessionPermission.conversation_id).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == to_user_id,
-                        SqlSessionPermission.conversation_id.in_(conversation_ids),
-                    )
-                ).scalars()
+            if cursor is not None:
+                query = query.where(SqlSessionPermission.conversation_id > cursor)
+            rows = list(
+                session.scalars(
+                    query.order_by(SqlSessionPermission.conversation_id)
+                    .limit(100)
+                    .with_for_update()
+                )
             )
-            # Partition into duplicates (to_user already has access) vs. reassigns.
-            duplicate_ids = [cid for cid in conversation_ids if cid in existing_to]
-            reassign_ids = [cid for cid in conversation_ids if cid not in existing_to]
-            # Bulk delete duplicates (to_user already has the grant).
-            if duplicate_ids:
-                session.execute(
-                    delete(SqlSessionPermission).where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == from_user_id,
-                        SqlSessionPermission.conversation_id.in_(duplicate_ids),
-                    )
+            moved = 0
+            for row in rows:
+                if row.level == LEVEL_OWNER:
+                    invalidate_link_epoch(session, row.conversation_id)
+                destination = session.get(
+                    SqlSessionPermission,
+                    (current_workspace_id(), to_user_id, row.conversation_id),
+                    with_for_update=True,
                 )
-            # Bulk UPDATE reassigns in one statement.
-            if reassign_ids:
-                # user_id is part of the PK, so use a Core UPDATE.
-                session.execute(
-                    update(SqlSessionPermission)
-                    .where(
-                        SqlSessionPermission.workspace_id == current_workspace_id(),
-                        SqlSessionPermission.user_id == from_user_id,
-                        SqlSessionPermission.conversation_id.in_(reassign_ids),
+                if destination is None:
+                    session.add(
+                        SqlSessionPermission(
+                            user_id=to_user_id,
+                            conversation_id=row.conversation_id,
+                            level=row.level,
+                        )
                     )
-                    .values(user_id=to_user_id)
-                )
-            return len(reassign_ids), True
+                    moved += 1
+                session.delete(row)
+            next_cursor = rows[-1].conversation_id if len(rows) == 100 else None
+            return moved, bool(rows), next_cursor
 
-        moved, changed = run_write_transaction(
-            self._session_immediate,
-            "reassign_user_grants",
-            write,
-        )
-        # Grants moved between users across sessions; drop this store's cache
-        # only when the transaction found source grants to change.
+        total, changed = 0, False
+        while True:
+            moved, batch_changed, cursor = run_write_transaction(
+                self._session_immediate, "reassign_user_grants", write
+            )
+            total += moved
+            changed |= batch_changed
+            if cursor is None:
+                break
         if changed:
             self._invalidate_resolve_cache_all()
-        return moved
+            SessionLinkStore(self.storage_location).wait_for_handoffs(user_id=from_user_id)
+        return total
 
     def list_for_session(
         self,
@@ -505,6 +556,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # this store's cache.
         self._invalidate_resolve_cache_all()
 
+        if not is_admin:
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            SessionLinkStore(self.storage_location).wait_for_handoffs(user_id=user_id)
+
     def check_access(
         self,
         user_id: str | None,
@@ -620,8 +676,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 user_grant_level=None,
                 public_grant_level=None,
             )
-        workspace_id = current_workspace_id()
-        cache_enabled = self._resolve_cache_ttl_s > 0
+        cache_enabled = self._resolve_cache_ttl_s > 0 and not requester_authority_active.get()
         generation = 0
         if cache_enabled:
             cached = self._resolve_cache_lookup(conversation_id, user_id)
@@ -638,21 +693,7 @@ class SqlAlchemyPermissionStore(PermissionStore):
         # calling is_admin + check_access + get_permission_level separately
         # did — see the GET /v1/sessions/{id} snapshot path).
         with self._session("resolve_access") as session:
-            user_row = session.get(SqlUser, (workspace_id, user_id))
-            user_grant = session.get(
-                SqlSessionPermission, (workspace_id, user_id, conversation_id)
-            )
-            public_grant = session.get(
-                SqlSessionPermission,
-                (workspace_id, RESERVED_USER_PUBLIC, conversation_id),
-            )
-            access = ResolvedAccess(
-                is_admin=user_row is not None
-                and user_row.deleted_at is None
-                and user_row.is_admin,
-                user_grant_level=user_grant.level if user_grant is not None else None,
-                public_grant_level=public_grant.level if public_grant is not None else None,
-            )
+            access = resolve_access_in_session(session, user_id, conversation_id)
         # Cache only a positive standing: a no-access result is left uncached so
         # a freshly granted user is authorized on their next request, not after
         # the TTL elapses.

@@ -160,6 +160,30 @@ def test_mint_session_token_short_ttl_expires() -> None:
         jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
 
 
+@pytest.mark.parametrize(
+    ("purpose", "runner_id", "ticket"),
+    [
+        ("session", "runner", None),
+        ("runner", None, None),
+        ("runner", " ", None),
+        ("client", None, "ticket"),
+    ],
+)
+def test_session_issuer_rejects_inconsistent_provenance(purpose, runner_id, ticket) -> None:
+    from omnigent.server.credential_purpose import CredentialPurpose
+
+    with pytest.raises(ValueError):
+        mint_session_token(
+            "alice",
+            _TEST_SECRET,
+            120,
+            "accounts",
+            purpose=CredentialPurpose(purpose),
+            runner_id=runner_id,
+            cli_login_ticket=ticket,
+        )
+
+
 def test_hmac_digest_is_deterministic() -> None:
     """Same token + secret always produces the same digest.
 
@@ -685,6 +709,30 @@ def test_oidc_source_accepts_bearer_token() -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
     assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_cached_credentials_keep_expiry_and_user_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _make_oidc_config()
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    tokens = {
+        user: mint_session_cookie(user, _TEST_SECRET, 8, "google")
+        for user in ("alice@example.com", "bob@example.com")
+    }
+    for user, token in tokens.items():
+        assert (
+            provider.get_user_id(_mock_request(cookies={config.session_cookie_name: token}))
+            == user
+        )
+    provider.revoke_user_sessions("alice@example.com")
+    assert len(provider._cookie_cache) == 1
+    bob = _mock_request(cookies={config.session_cookie_name: tokens["bob@example.com"]})
+    assert provider.get_user_id(bob) == "bob@example.com"
+
+    # A clock jump must not keep a cached signature alive past its signed expiry.
+    expiry = jwt.decode(tokens["bob@example.com"], _TEST_SECRET, algorithms=["HS256"])["exp"]
+    monkeypatch.setattr("omnigent.server.auth.time.time", lambda: expiry + 1)
+    assert provider.get_user_id(bob) is None
+    assert provider.get_credential_purpose(bob) is None
 
 
 def test_oidc_source_cookie_takes_precedence_over_bearer() -> None:

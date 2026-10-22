@@ -22,6 +22,9 @@ from urllib.parse import urlsplit
 import httpx
 import jwt
 
+from omnigent.db.db_models import current_workspace_id
+from omnigent.server.credential_purpose import CREDENTIAL_VERSION, CredentialPurpose
+
 _logger = logging.getLogger(__name__)
 
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
@@ -59,6 +62,8 @@ def mint_session_token(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    purpose: CredentialPurpose = CredentialPurpose.SESSION,
+    runner_id: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -79,13 +84,24 @@ def mint_session_token(
         never included in runner, refresh, or CLI-issued credentials.
     :returns: An HS256-signed JWT string.
     """
+    if (purpose == CredentialPurpose.RUNNER) != (runner_id is not None):
+        raise ValueError("Runner credentials require a runner binding")
+    if runner_id is not None and not runner_id.strip():
+        raise ValueError("Runner binding must not be blank")
+    if cli_login_ticket is not None and purpose != CredentialPurpose.SESSION:
+        raise ValueError("Only session sign-in may carry a browser login ticket")
     now = int(time.time())
     payload = {
         "sub": user_id,
         "iat": now,
         "exp": now + ttl_seconds,
         "provider": provider,
+        "credential_version": CREDENTIAL_VERSION,
+        "credential_purpose": purpose.value,
+        "workspace_id": current_workspace_id(),
     }
+    if runner_id is not None:
+        payload["runner_id"] = runner_id
     if account_generation is not None:
         payload["account_generation"] = account_generation
     if cli_login_ticket is not None:
@@ -101,6 +117,7 @@ def mint_session_cookie(
     *,
     account_generation: str | None = None,
     cli_login_ticket: str | None = None,
+    purpose: CredentialPurpose = CredentialPurpose.SESSION,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -120,6 +137,7 @@ def mint_session_cookie(
         provider,
         account_generation=account_generation,
         cli_login_ticket=cli_login_ticket,
+        purpose=purpose,
     )
 
 

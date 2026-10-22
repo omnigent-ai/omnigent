@@ -1097,6 +1097,9 @@ def register_events_routes(
             # cannot flip a session to "running" even transiently.
             in_flight.enter_context(_mark_dispatch_in_flight(session_id))
         created_by = _attribution_user(user_id)
+        inherited_identity = getattr(getattr(request, "state", None), "link_identity", None)
+        if inherited_identity is not None:
+            body.created_by = inherited_identity.requester
         body_created_by = _attribution_user(body.created_by)
         if body_created_by is not None:
             if not _has_runner_created_by_authority(request, conv):
@@ -3237,6 +3240,9 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
+        link_service = getattr(request.app.state, "session_links", None)
+        if link_service is not None and isinstance(request, Request):
+            await asyncio.to_thread(link_service.capture_input, request, session_id, body)
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,

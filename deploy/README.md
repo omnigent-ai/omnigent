@@ -301,6 +301,35 @@ CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
 the actual native apps in staging checks before publishing a mobile build.
 
+### Accounts and OIDC credential migration
+
+The 0.20.0 credential format signs issuance purpose, workspace and, for managed
+runners, runner identity. Older access tokens and cookies are rejected because
+they cannot distinguish a runner from a normal sign-in. Plan a fresh browser/CLI
+sign-in and runner reconnect when upgrading. Existing valid refresh grants can
+issue the new access-token format; refresh does not change a grant's scope or
+absolute lifetime. Older CLI/chat clients refresh only near local token expiry,
+so a 401 does not immediately renew their token: run `omnigent login <server-url>`
+and retry. Keep server replicas on the same credential format.
+
+Password, OIDC, native-app and magic-link login remain supported. First-party
+CLI/native tokens retain their existing API permissions. Runner credentials
+retain work APIs, including discovery and scheduling, but cannot call account
+administration or mint magic-login credentials. Moving a runner token into a
+cookie does not change its purpose. A signed runner identity does not by itself
+confine every work API to that runner's sessions.
+
+Credential purpose records where a credential came from; it is not approval to
+connect sessions or change an approval policy. Session links remain a separate,
+disabled feature. Header and custom providers keep their existing login and mint
+contracts; the new provenance methods return unknown unless the provider supports
+them. Managed-provider adoption requires separate validation.
+
+Before rollout, verify password and OIDC sign-in, CLI/native refresh, magic-link
+redemption and a managed runner's reconnect against an isolated instance. A
+legacy access token must fail; renewed tokens must retain the user's identity
+and revocation behavior. No production rollout is implied by these changes.
+
 ### Register the host
 
 Then register the machine as a host, so sessions created in the web UI can

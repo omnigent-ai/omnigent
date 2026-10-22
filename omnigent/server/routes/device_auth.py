@@ -241,6 +241,9 @@ def mint_delegated_token(
         (login-grant) token. Defaults to :data:`DELEGATED_SCOPE`.
     :returns: An HS256-signed JWT string.
     """
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.credential_purpose import CREDENTIAL_VERSION, CredentialPurpose
+
     now = int(time.time())
     payload = {
         "sub": user_id,
@@ -249,6 +252,11 @@ def mint_delegated_token(
         "provider": provider,
         "jti": jti,
         "act": {"client_id": client_id},
+        "credential_version": CREDENTIAL_VERSION,
+        "credential_purpose": (
+            CredentialPurpose.CLIENT if scope is None else CredentialPurpose.DELEGATED
+        ).value,
+        "workspace_id": current_workspace_id(),
     }
     if account_generation is not None:
         payload["account_generation"] = account_generation

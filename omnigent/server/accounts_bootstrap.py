@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.auth import _RESERVED_USERS
+from omnigent.server.credential_purpose import CredentialPurpose
 from omnigent.server.passwords import hash_password
 
 logger = logging.getLogger(__name__)
@@ -224,6 +225,7 @@ def _mint_loopback_cli_token(
             cookie_secret=cookie_secret,
             ttl_hours=session_ttl_hours,
             provider="accounts",
+            purpose=CredentialPurpose.CLIENT,
             account_generation=account_generation,
         )
         cli_auth.store_token(

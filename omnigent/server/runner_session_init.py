@@ -94,6 +94,7 @@ class RunnerSessionInitializer:
         file_store: FileStore | None = None,
         agent_store: AgentStore | None = None,
         agent_cache: AgentCache | None = None,
+        request_authority_required: bool = False,
     ) -> None:
         self._registry = registry
         self._server_version = server_version
@@ -101,6 +102,7 @@ class RunnerSessionInitializer:
         self._file_store = file_store
         self._agent_store = agent_store
         self._agent_cache = agent_cache
+        self._request_authority_required = request_authority_required
         self._tasks: dict[
             tuple[str, int, str, str, str | None, bool],
             asyncio.Task[httpx.Response],
@@ -222,6 +224,7 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                request_authority_required=self._request_authority_required,
             )
 
             async def post_session_init() -> httpx.Response:

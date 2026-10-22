@@ -28,10 +28,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyNodeChanges,
   Background,
+  Handle,
+  Position,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
   type NodeChange,
+  type NodeProps,
   type Viewport,
 } from "@xyflow/react";
 import {
@@ -68,6 +71,16 @@ import {
 } from "@/canvas/canvasStorage";
 import { usePullRequests, type CanvasPullRequests } from "@/canvas/pullRequests";
 import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
+import { sessionLinkEdges, sessionLinkId, useCanvasSessionLinks } from "@/canvas/sessionLinks";
+import { sessionLinkEdgeTypes } from "@/canvas/SessionLinkEdge";
+import { SessionLinkDetails } from "@/components/SessionLinksDialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
@@ -75,12 +88,41 @@ import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { NewProjectButton } from "@/shell/NewProjectButton";
 import { ProjectRowIcon } from "@/shell/ProjectPicker";
 
 import "@xyflow/react/dist/style.css";
 
-const nodeTypes = { session: SessionCard };
+function CanvasSessionCard(props: NodeProps<SessionCardNode>) {
+  const linksEnabled = isFeatureEnabled(useServerInfo(), "session_links");
+  return (
+    <>
+      <SessionCard {...props} />
+      {linksEnabled && (
+        <>
+          <Handle
+            id="outgoing"
+            type="source"
+            position={Position.Right}
+            isConnectable={false}
+            style={{ opacity: 0 }}
+          />
+          <Handle
+            id="incoming"
+            type="target"
+            position={Position.Left}
+            isConnectable={false}
+            style={{ opacity: 0 }}
+          />
+        </>
+      )}
+    </>
+  );
+}
+
+const nodeTypes = { session: CanvasSessionCard };
 const proOptions = { hideAttribution: true };
 const FIT_VIEW = { padding: 0.2, maxZoom: 1 };
 const SNAP_GRID: [number, number] = [GRID_STEP, GRID_STEP];
@@ -157,6 +199,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const { sessions, loaded, loadingMore, networkConfirmed, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
+  const linksEnabled = isFeatureEnabled(useServerInfo(), "session_links");
+  const [selectedLinkId, setSelectedLinkId] = useState<string | null>(null);
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
   // The URL names the canvas; without it, reopen the viewer's last selection
@@ -201,6 +245,15 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
     [sessions, activeCanvas, projects, viewerId],
   );
   const pullRequests = usePullRequests(visibleSessions);
+  const canvasLinks = useCanvasSessionLinks(
+    visibleSessions.map((session) => session.id),
+    linksEnabled,
+  );
+  const linkEdges = sessionLinkEdges(
+    canvasLinks.links,
+    new Set(visibleSessions.map((session) => session.id)),
+  );
+  const selectedLink = canvasLinks.links.find((link) => sessionLinkId(link) === selectedLinkId);
   const activeProject = useMemo(
     () => projects.find((project) => projectCanvasId(project) === activeCanvas) ?? null,
     [projects, activeCanvas],
@@ -652,9 +705,34 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
         className="canvas-flow relative min-h-0 min-w-0 flex-1 border-t"
         data-testid="canvas-flow"
       >
+        {canvasLinks.error && (
+          <p
+            role="alert"
+            className="absolute top-2 left-3 z-10 rounded-md bg-card p-2 text-sm text-destructive"
+          >
+            Communication activity could not be refreshed.
+          </p>
+        )}
+        {canvasLinks.loading && (
+          <p
+            role="status"
+            className="absolute top-2 left-3 z-10 rounded-md bg-card p-2 text-sm text-muted-foreground"
+          >
+            Loading links…
+          </p>
+        )}
         <ReactFlow<SessionCardNode>
           nodes={nodes}
+          edges={linkEdges}
+          onEdgesChange={(changes) => {
+            for (const change of changes) {
+              if (change.type === "select" && change.selected) setSelectedLinkId(change.id);
+            }
+          }}
+          onEdgeClick={(_event, edge) => setSelectedLinkId(edge.id)}
+          onEdgeDoubleClick={(_event, edge) => setSelectedLinkId(edge.id)}
           nodeTypes={nodeTypes}
+          edgeTypes={sessionLinkEdgeTypes}
           onNodesChange={onNodesChange}
           onNodeDragStop={onNodeDragStop}
           onNodeClick={(_event, node) => openSession(node.id)}
@@ -682,6 +760,34 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
             onReset={resetLayout}
           />
         </ReactFlow>
+        <Dialog
+          open={!!selectedLink}
+          onOpenChange={(open) => {
+            if (!open) setSelectedLinkId(null);
+          }}
+        >
+          <DialogContent
+            onOpenAutoFocus={(event) => {
+              // Opening an edge with Enter must not activate Disconnect on keyup.
+              event.preventDefault();
+              if (event.target instanceof HTMLElement) event.target.focus();
+            }}
+          >
+            <DialogHeader>
+              <DialogTitle>Communication activity</DialogTitle>
+              <DialogDescription>
+                The arrow shows the direction of past requests. It does not grant permission.
+              </DialogDescription>
+            </DialogHeader>
+            {selectedLink && (
+              <SessionLinkDetails key={sessionLinkId(selectedLink)} link={selectedLink} />
+            )}
+            <p className="text-sm text-muted-foreground">
+              Manage communication from a session’s header. Turning it off preserves accepted work
+              and copied replies.
+            </p>
+          </DialogContent>
+        </Dialog>
         {emptyState}
         <Button
           type="button"

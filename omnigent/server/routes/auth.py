@@ -48,6 +48,7 @@ from omnigent.server.auth import (
     _RESERVED_USERS,
     UnifiedAuthProvider,
 )
+from omnigent.server.credential_purpose import CredentialPurpose
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import (
     _GITHUB_EMAILS_ENDPOINT,
@@ -902,6 +903,7 @@ def create_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
+            purpose=CredentialPurpose.CLIENT,
         )
         ticket.user_id = user_id
         if device_grant_store is not None:
@@ -1088,6 +1090,7 @@ def create_auth_router(
                 cookie_secret=config.cookie_secret,
                 ttl_hours=config.session_ttl_hours,
                 provider=config.provider_type,
+                purpose=CredentialPurpose.CLIENT,
             ),
             "user_id": pending.user_id,
             "expires_in": config.session_ttl_hours * 3600,

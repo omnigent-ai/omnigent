@@ -943,6 +943,37 @@ runner id. The write replaces any previous value in
 Codex-native session routes, including the Codex Goal subresource, are
 documented in [codex-API.md](codex-API.md).
 
+### Owner Session Communication (experimental)
+
+The default-off `session_links` feature enables these routes; disabled deployments
+return 404. A personal owner/workspace switch covers all current and future owned
+sessions, including shared ones. Each operation checks the original requester's
+current ownership at both endpoints. Shared editors cannot borrow owner authority.
+See the [tool and delivery contract](../../docs/session-links.md).
+
+| Method and path | Input | Result |
+| --- | --- | --- |
+| `GET /v1/session-orchestration/settings` | Owner UI/CLI credentials | `enabled`, `version` (nullable), `updated_at` (nullable). |
+| `PUT /v1/session-orchestration/settings` | `{"enabled":true,"expected_version":null}` on first change; use the returned version for later changes | Updated setting; 409 on stale version. Runner credentials cannot change it. |
+| `GET /v1/sessions/{source_id}/communication-activity` | `incoming=false`, `after`, `limit=50` (1–100) | Visible request directions and last request time in `data`, plus `next_cursor`. Both endpoints must be readable. |
+| `POST /v1/sessions/{source_id}/linked-requests` | `target_id`, `message`, `operation_id` | 202; durable delivery receipt. Requires a bound runner and verified consumed-input context. |
+| `GET /v1/sessions/{source_id}/linked-requests/{request_id}` | `after`, `limit=50` (1–100) | Receipt, `worker_status`, addressed `replies`, `next_cursor`; rechecks ownership and switch version. |
+| `POST /v1/sessions/{worker_id}/linked-requests/{request_id}/replies` | `message`, `operation_id` | `reply_id`, `request_id`, `published`; copies an addressed reply into the manager. |
+
+Message and operation-ID limits are 8,000 and 128 UTF-8 bytes. The runtime supplies
+retry IDs and immutable input references outside model arguments. Reusing an
+operation ID for different content returns 409. Attribution text grants no authority.
+
+Receipts contain `id`, `source_id`, `target_id`, `delivery_state`, `created_at` and
+`accepted_at`. States: `pending`, `handoff`, `claimed`, `accepted`, `rejected`,
+`uncertain`. Acceptance means the normal input path received work, not completion.
+Uncertain operations must not be resent as new work; offline workers are not launched.
+
+Off blocks new requests, polls and unpublished replies, waiting for outstanding
+handoffs to settle or expire. Accepted work continues. Copied replies remain readable
+by current and future readers of the manager; worker history/files/terminals keep
+their existing access checks. Canvas arrows record activity, not permission grants.
+
 ### Post Event
 
 ```

@@ -15,6 +15,12 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `credential-provenance`: accounts/OIDC tokens retain signed issuance purpose
+  across bearer and cookie transport, refresh and magic handoff. Managed runner
+  tokens carry the runner identity and cannot access account administration or
+  mint magic credentials; discovery and scheduling keep their existing ACLs.
+  Legacy access tokens require sign-in or refresh after the 0.20.0 format change.
+  This does not grant session-link approval or confine all work APIs.
 - `cli-browser-ticket-consent`: an OIDC sign-in opens a ticket-specific browser
   login and then an **Authorize sign-in** page. Compare its code with the CLI,
   choose **Approve** to complete sign-in, or **Deny** to stop it. Signing in
@@ -86,8 +92,11 @@ local server, `--background`, `--no-open`, `--non-interactive`, and the
 management commands `status`, `stop`, `stop-session`, `reset-id`, `enable`,
 and `disable`.
 
-**Web:** a harness that needs sign-in is marked in the harness picker, and a
-session whose host went offline offers reconnect (see [sessions](./sessions.md)).
+**Web:** open an accounts server's sign-in page or an OIDC server's app URL.
+An integration can supply a magic URL to open in a fresh browser; a device
+client supplies a consent URL that asks for fresh sign-in and approval. A
+harness that needs sign-in is marked in the harness picker, and a session whose
+host went offline offers reconnect (see [sessions](./sessions.md)).
 
 **Desktop:** Connect on the setup screen (or the server selector) to an OIDC
 server; relaunching the app, New Window, deep links, and switching servers on a
@@ -128,6 +137,9 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   approve to complete the waiting CLI. Start a separate login and deny it to
   confirm polling stops; closing the page without deciding must leave it pending.
   Older clients should see upgrade instructions and stop polling.
+- **`credential-provenance`:** use the [credential acceptance checks](#credential-acceptance-checks)
+  below. They reuse existing scenarios across component, process and browser
+  boundaries; a passing component suite alone does not cover all entry points.
 - **`proxy-env`:**
   `tests/e2e/test_login_accounts_proxy_env.py::test_login_detects_accounts_auth_despite_proxy_env`
   (starts its own accounts server; run with plain `uv run pytest`).
@@ -239,6 +251,44 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   "signs a workspace out…", "Server → Sign Out of Server…", and "holds a
   connection that starts during sign-out…" cases in `web/electron/test/main.test.js`,
   and `web/src/shell/SidebarServerPicker.test.tsx`.
+
+### Credential acceptance checks
+
+Use this checklist when changing sign-in, credential issuance or refresh. These
+tests own their accounts/OIDC servers; do not run them through the header-mode
+verification instance. Keep variant matrices in component tests and reuse the
+process/browser scenarios for transport and startup boundaries.
+
+| Journey or boundary | Expected result | Existing coverage |
+| --- | --- | --- |
+| Browser sign-in and CLI consent | OIDC returns to the app signed in. The CLI ticket stays pending until browser approval, then redeems once. | `tests/e2e_ui/auth/test_oidc_login_flow.py` — Chromium/local servers, fake IdP; confidential discovery and public PS256. Ticket initiation and polling use HTTP, not a CLI subprocess. |
+| Accounts device consent | An existing sign-in still requires fresh password entry; approval shows Connected. | `tests/e2e_ui/auth/test_device_grant_reauth.py` — Chromium/local accounts server. |
+| Magic handoff | A fresh client gets the same account and retains its account permissions; a second redemption fails. | `tests/server/test_accounts.py::test_magic_link_authenticates_in_fresh_client` and `tests/server/test_accounts.py::test_magic_link_is_single_use` — ASGI, no browser. |
+| Password change and self-reset | A browser session keeps its session purpose; a CLI bearer receives a client-purpose cookie that still authenticates. | `tests/server/test_accounts.py::test_change_own_password_round_trip` and `tests/server/test_account_revocation.py::test_admin_self_reset_keeps_admin_signed_in` — ASGI/real account store. |
+| First-party and delegated refresh | CLI refresh preserves account access and magic handoff; revocation denies access. Device refresh stays scoped and rotates. | `tests/server/test_accounts.py::test_cli_login_with_issue_refresh_issues_grant`, `tests/server/test_device_auth.py::test_login_grant_token_keeps_session_authority`, `tests/server/test_device_auth.py::test_device_grant_refresh_stays_scope_restricted` — ASGI. |
+| Native sign-in backend | Exchange, refresh and revoke through the production routes; revoked access fails. | `tests/server/integration/test_oidc_native_login.py::test_native_sign_in_delivers_code_and_exchanges_for_session` — ASGI/real grant store, simulated IdP exchange; no native app. |
+| Managed runner callbacks | Work, discovery and scheduling remain available; account administration and magic minting are denied. Renewal recovers from a simulated upstream refusal. | `tests/e2e/test_managed_runner_http_auth.py` — real local server and HTTP client; no cloud sandbox. |
+| Transport and workspace isolation | Cookie/bearer transport and caching preserve runner restrictions; identity cannot cross provider or workspace boundaries. | `tests/server/test_accounts.py::test_credential_purpose_survives_cache_and_transport` and `tests/server/test_account_revocation.py::test_cached_auth_identity_does_not_cross_provider_or_workspace` — component/ASGI. |
+| Upgrade and expiry | Old or inconsistent credentials are rejected; cache hits cannot restore expired or evicted credentials. | `tests/server/test_accounts.py::test_legacy_credentials_cannot_establish_verified_provenance`, `tests/server/test_accounts.py::test_inconsistent_credential_metadata_is_rejected`, `tests/server/test_oidc.py::test_cached_credentials_keep_expiry_and_user_eviction` — component tests, simulated clock. |
+
+From the checkout being verified, install the frozen dependencies and Chromium
+once. The browser command builds that checkout's SPA; use `--ui-skip-build` only
+when it is already built. Node/pnpm are also required.
+
+```sh
+uv sync --frozen --extra all --group dev
+uv run --no-sync playwright install chromium
+uv run --no-sync pytest tests/server/test_accounts.py tests/server/test_account_revocation.py tests/server/test_device_auth.py tests/server/test_client_credentials.py tests/server/test_oidc.py tests/server/test_oidc_cli_ticket.py tests/server/integration/test_oidc_native_login.py tests/server/integration/test_runner_tunnel_route.py tests/server/test_external_account_authority.py tests/server/routes/test_auth_routes.py tests/server/test_oidc_login_reauth.py tests/dev/test_verify_omnigent_feature_map.py --reruns 0 -q
+uv run --no-sync pytest tests/e2e/test_managed_runner_http_auth.py tests/e2e/test_login_accounts_proxy_env.py --reruns 0 -q
+uv run --no-sync pytest tests/e2e_ui/auth/test_oidc_login_flow.py tests/e2e_ui/auth/test_device_grant_reauth.py --reruns 0 --video on --screenshot on --output /tmp/auth-provenance-evidence -q
+```
+
+Record the revision, dependency pins, auth configuration, skips and evidence
+directory. The feature-map check validates references, not the journeys.
+Actual desktop/iOS/Android apps need the separate recipes above; live identity
+providers, managed custom-provider adoption (including Universe), cloud
+sandboxes and combined session-link approval remain separate checks. These auth
+tests do not execute a model or establish connection consent.
 
 ## Gotchas
 

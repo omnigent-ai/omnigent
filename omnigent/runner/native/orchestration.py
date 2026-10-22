@@ -2221,9 +2221,13 @@ def _render_opencode_transcript_text(items: list[object]) -> str:
     :param items: Raw API items.
     :returns: A ``"User: …\\n\\nAssistant: …"`` transcript, or ``""``.
     """
+    from omnigent.session_authority import may_replay_session_item
+
     lines: list[str] = []
     for item in items:
         if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        if not may_replay_session_item(item):
             continue
         role = item.get("role")
         content = item.get("content")

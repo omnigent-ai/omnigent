@@ -386,6 +386,10 @@ class SqlAlchemyAccountStore:
             )
 
         run_write_transaction(self._session_immediate, "set_user_admin_status", write)
+        if not is_admin:
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            SessionLinkStore(self.storage_location).wait_for_handoffs(user_id=user_id)
 
     def list_users(self) -> list[Account]:
         """Return all users for the admin members page.
@@ -521,7 +525,12 @@ class SqlAlchemyAccountStore:
             )
             return True
 
-        return run_write_transaction(self._session_immediate, "delete_user", write)
+        deleted = run_write_transaction(self._session_immediate, "delete_user", write)
+        if deleted:
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            SessionLinkStore(self.storage_location).wait_for_handoffs(user_id=user_id)
+        return deleted
 
     def login_snapshot(self, user_id: str) -> tuple[str | None, str | None]:
         """Read the password and generation together before password verification."""
@@ -591,7 +600,12 @@ class SqlAlchemyAccountStore:
             )
             return new_generation if result.rowcount == 1 else None
 
-        return run_write_transaction(self._session_immediate, "update_password", write)
+        generation = run_write_transaction(self._session_immediate, "update_password", write)
+        if generation is not None:
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            SessionLinkStore(self.storage_location).wait_for_handoffs(user_id=user_id)
+        return generation
 
     def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
         """Bump ``last_login_at`` on every successful login.

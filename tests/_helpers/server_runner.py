@@ -197,9 +197,12 @@ class ServerRunner:
         cwd: Path | None = None,
         python_args: Sequence[str] = (),
         wait_ready: bool = True,
+        readiness_headers: Mapping[str, str] | None = None,
     ) -> None:
         """Start the runner; callers may observe startup themselves with wait_ready=False."""
         assert self.runner is None, "runner already started"
+        if readiness_headers is not None:
+            self._client.headers.update(readiness_headers)
         args = ["-c", bootstrap] if bootstrap else ["-m", "omnigent.runner._entry"]
         self.runner = self._spawn(
             "runner",

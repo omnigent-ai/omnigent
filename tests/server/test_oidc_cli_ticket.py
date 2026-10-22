@@ -69,6 +69,7 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
             callback.cookies["ap_session"], TEST_SIGNING_KEY, algorithms=["HS256"]
         )
         assert browser_claims["cli_login_ticket"] == ticket
+        assert browser_claims["credential_purpose"] == "session"
 
         pending = await client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
         assert pending.status_code == 202
@@ -98,6 +99,7 @@ async def test_cli_ticket_requires_browser_consent_and_issues_grant(tmp_path: Pa
         payload = jwt.decode(body["token"], TEST_SIGNING_KEY, algorithms=["HS256"])
         assert payload["sub"] == "alice@example.com"
         assert "cli_login_ticket" not in payload
+        assert payload["credential_purpose"] == "client"
         assert body["user_id"] == "alice@example.com"
         assert body["refresh_token"]
 
@@ -415,7 +417,7 @@ async def test_cli_decision_requires_ticket_login_provenance(
     ) as client:
         ticket, verifier = await _create_ticket(client)
         if credential_kind == "runner":
-            token = provider.mint_runner_token("alice@example.com", ttl_seconds=1800)
+            token = provider.mint_bound_runner_token("alice@example.com", 1800, "runner-test")
             assert token is not None
         else:
             token = mint_session_cookie("alice@example.com", TEST_SIGNING_KEY, 8, "github")

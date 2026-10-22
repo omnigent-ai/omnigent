@@ -142,10 +142,13 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   between explicit cloud save/import, the shared-preference foundation, and
   deferred automatic following.
 - [Login and host authentication](./login-and-host-auth.md) covers
-  `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
-  authentication for project writes.
+  `omnigent login`, browser/device consent, credential acceptance checks, host
+  daemon credentials, Databricks auth modes, and embedded authentication for
+  project writes.
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
+- [Session communication](./session-links.md) covers the owner switch, shared
+  replies, Canvas activity, delegation and requester isolation.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
 
@@ -187,7 +190,10 @@ map an area, remove it here in the same change.
 - In-app browser: `tests/e2e_ui/browser/` (session cookie sharing is covered in
   Sessions; other browser behavior remains unmapped)
 - Desktop app: `tests/e2e_ui/desktop/`
-- Web sign-in: `tests/e2e_ui/auth/`
+- Web sign-in: `tests/e2e_ui/auth/` (OIDC login, CLI consent, accounts device
+  reauthentication and credential checks are mapped in Login and host
+  authentication; standalone accounts onboarding, recovery and magic-link
+  browser journeys remain unmapped)
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,

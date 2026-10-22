@@ -36,9 +36,11 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from starlette.requests import HTTPConnection
+
+from omnigent.server.credential_purpose import CREDENTIAL_VERSION, CredentialPurpose
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +395,23 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    def get_credential_purpose(self, request: HTTPConnection) -> CredentialPurpose | None:  # noqa: ARG002
+        """Return verified issuance provenance, or None when the provider cannot certify it."""
+        return None
+
+    def get_runner_id(self, request: HTTPConnection) -> str | None:  # noqa: ARG002
+        """Return the runner binding verified by this provider, if supported."""
+        return None
+
+    def mint_bound_runner_token(
+        self,
+        user_id: str,
+        ttl_seconds: int,
+        runner_id: str,  # noqa: ARG002
+    ) -> str | None:
+        """Keep custom providers' issuance contract without claiming a verified binding."""
+        return self.mint_runner_token(user_id, ttl_seconds)
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -416,6 +435,16 @@ class AuthProvider(ABC):
 
 
 _CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
+_VERIFIED_CREDENTIAL_KEY = "omnigent.verified_credential"
+
+
+@dataclass(frozen=True)
+class _VerifiedCredential:
+    provider: AuthProvider
+    workspace_id: int
+    user_id: str
+    purpose: CredentialPurpose
+    runner_id: str | None
 
 
 @dataclass(frozen=True)
@@ -424,6 +453,7 @@ class _ConnectionIdentity:
     workspace_id: int
     user_id: str | None
     generation: str | None
+    credential: _VerifiedCredential | None
 
 
 class UnifiedAuthProvider(AuthProvider):
@@ -486,7 +516,7 @@ class UnifiedAuthProvider(AuthProvider):
             if header_strip_prefix is not None
             else resolve_auth_header_strip_prefix()
         )
-        self._cookie_cache: dict[str, tuple[str, float]] = {}
+        self._cookie_cache: dict[str, tuple[dict[str, Any], float]] = {}
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
@@ -522,7 +552,9 @@ class UnifiedAuthProvider(AuthProvider):
         :param user_id: The deleted account, e.g. ``"alice"``.
         """
         stale = [
-            key for key, (cached_user, _) in self._cookie_cache.items() if cached_user == user_id
+            key
+            for key, (payload, _) in self._cookie_cache.items()
+            if payload.get("sub") == user_id
         ]
         for key in stale:
             del self._cookie_cache[key]
@@ -585,14 +617,48 @@ class UnifiedAuthProvider(AuthProvider):
             and identity.provider is self
             and identity.workspace_id == current_workspace_id()
         ):
+            if identity.credential is not None:
+                request.scope[_VERIFIED_CREDENTIAL_KEY] = identity.credential
+            else:
+                request.scope.pop(_VERIFIED_CREDENTIAL_KEY, None)
             if identity.user_id is not None and identity.generation is not None:
                 bind_account_authority(identity.user_id, identity.generation)
             return identity.user_id
         if self._source in ("oidc", "accounts"):
+            request.scope.pop(_VERIFIED_CREDENTIAL_KEY, None)
             return self._check_cookie(request)
         return self._check_header(request)
 
-    def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
+    def _verified_credential(self, request: HTTPConnection) -> _VerifiedCredential | None:
+        from omnigent.db.db_models import current_workspace_id
+
+        user_id = self.get_user_id(request)
+        credential = request.scope.get(_VERIFIED_CREDENTIAL_KEY)
+        if (
+            isinstance(credential, _VerifiedCredential)
+            and credential.provider is self
+            and credential.workspace_id == current_workspace_id()
+            and credential.user_id == user_id
+        ):
+            return credential
+        return None
+
+    def get_credential_purpose(self, request: HTTPConnection) -> CredentialPurpose | None:
+        credential = self._verified_credential(request)
+        return credential.purpose if credential is not None else None
+
+    def get_runner_id(self, request: HTTPConnection) -> str | None:
+        credential = self._verified_credential(request)
+        return credential.runner_id if credential is not None else None
+
+    def mint_bound_runner_token(
+        self, user_id: str, ttl_seconds: int, runner_id: str
+    ) -> str | None:
+        return self.mint_runner_token(user_id, ttl_seconds, runner_id=runner_id)
+
+    def mint_runner_token(
+        self, user_id: str, ttl_seconds: int, *, runner_id: str | None = None
+    ) -> str | None:
         """
         Mint a short-lived owner JWT for a managed-sandbox runner.
 
@@ -608,7 +674,7 @@ class UnifiedAuthProvider(AuthProvider):
         :returns: An HS256-signed JWT, or ``None`` for header mode, an
             empty/reserved user, or a missing cookie config.
         """
-        if not user_id or user_id in _RESERVED_USERS:
+        if not user_id or user_id in _RESERVED_USERS or not runner_id:
             return None
         if self._source not in ("oidc", "accounts"):
             return None
@@ -624,6 +690,8 @@ class UnifiedAuthProvider(AuthProvider):
             ttl_seconds,
             self._source,
             account_generation=account_generation(user_id),
+            purpose=CredentialPurpose.RUNNER,
+            runner_id=runner_id,
         )
 
     def _check_cookie(self, request: HTTPConnection) -> str | None:
@@ -666,32 +734,79 @@ class UnifiedAuthProvider(AuthProvider):
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
-        if self._account_check is None and cached is not None and cached[1] > time.monotonic():
-            return cached[0]
+        if cached is not None and cached[1] > time.monotonic():
+            payload = cached[0]
+        else:
+            try:
+                payload = jwt.decode(
+                    token,
+                    cookie_config.cookie_secret,
+                    algorithms=["HS256"],
+                    options={"require": ["sub", "iat", "exp"]},
+                )
+            except jwt.InvalidTokenError:
+                return None
 
+        from omnigent.db.db_models import current_workspace_id
+
+        if (
+            type(payload.get("credential_version")) is not int
+            or payload["credential_version"] != CREDENTIAL_VERSION
+            or type(payload.get("workspace_id")) is not int
+            or payload["workspace_id"] != current_workspace_id()
+            or type(payload.get("exp")) is not int
+            or payload["exp"] <= time.time()
+            or type(payload.get("iat")) is not int
+        ):
+            return None
         try:
-            payload = jwt.decode(
-                token,
-                cookie_config.cookie_secret,
-                algorithms=["HS256"],
-            )
-        except jwt.InvalidTokenError:
+            purpose = CredentialPurpose(payload.get("credential_purpose"))
+        except ValueError:
             return None
 
         user_id = payload.get("sub")
         if not isinstance(user_id, str) or not user_id or user_id in _RESERVED_USERS:
             return None
 
-        # Machine-issued tokens carry ``grant_id`` (store-backed grant),
-        # ``scope`` (restricted authority), or both. Each claim gets its own
-        # request-scoped check below, and a token carrying either is never
-        # served from the plain user-id cache — the cache is token-keyed, so
-        # a hit on one path would replay past both checks on every other.
+        # Cached signatures never bypass current grant, account or route checks.
         grant_id = payload.get("grant_id")
         scope = payload.get("scope")
+        runner_id = payload.get("runner_id")
+        if purpose == CredentialPurpose.SESSION and grant_id is not None:
+            return None
+        if purpose == CredentialPurpose.RUNNER:
+            if (
+                not isinstance(runner_id, str)
+                or not runner_id.strip()
+                or grant_id is not None
+                or scope is not None
+            ):
+                return None
+            from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+            binding = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+            if binding is not None:
+                binding = binding.strip()
+                if not binding or token_bound_runner_id(binding) != runner_id:
+                    return None
+        elif runner_id is not None:
+            return None
+        if (purpose == CredentialPurpose.DELEGATED) != (scope is not None):
+            return None
+        if purpose == CredentialPurpose.RUNNER:
+            # Preserve work APIs and their ACLs; runners cannot mint account credentials.
+            path = request.url.path
+            if not (
+                path == "/v1"
+                or path.startswith("/v1/")
+                or path in ("/health", "/auth/me", "/oauth/token", "/oauth/revoke")
+            ):
+                return None
         # Only client-credentials tokens (scope without a grant) are machine
         # principals. Every user-backed credential carries the account generation.
-        if self._account_check is not None and not (scope is not None and grant_id is None):
+        if self._account_check is not None and not (
+            purpose == CredentialPurpose.DELEGATED and grant_id is None
+        ):
             generation = payload.get("account_generation")
             if not isinstance(generation, str) or not self._account_check(user_id, generation):
                 return None
@@ -718,12 +833,13 @@ class UnifiedAuthProvider(AuthProvider):
             # replaced, so it keeps that authority (revocable via ``grant_id``).
             if scope is not None and not delegated_path_allowed(request.url.path):
                 return None
-            return user_id
-
-        if self._account_check is None:
+        request.scope[_VERIFIED_CREDENTIAL_KEY] = _VerifiedCredential(
+            self, current_workspace_id(), user_id, purpose, runner_id
+        )
+        if self._account_check is None and grant_id is None and scope is None:
             remaining = payload.get("exp", 0) - time.time()
             if remaining > 0:
-                self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
+                self._cookie_cache[cache_key] = (payload, time.monotonic() + remaining)
 
         return user_id
 
@@ -837,11 +953,13 @@ class AccountAuthenticationMiddleware:
         from omnigent.db.db_models import current_workspace_id
 
         user_id = self._auth_provider.get_user_id(connection)
+        credential = connection.scope.get(_VERIFIED_CREDENTIAL_KEY)
         return _ConnectionIdentity(
             self._auth_provider,
             current_workspace_id(),
             user_id,
             account_generation(user_id) if user_id is not None else None,
+            credential if isinstance(credential, _VerifiedCredential) else None,
         )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:

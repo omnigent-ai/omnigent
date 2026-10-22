@@ -548,9 +548,29 @@ def register_agent_routes(
             return response
 
         if method == "tools/call":
+            from omnigent.db.db_models import normalize_uuid
             from omnigent.server.mcp_identity import mcp_policy_actor
 
+            inherited_source = getattr(request.state, "link_source_id", None)
+            if inherited_source is not None and inherited_source != normalize_uuid(session_id):
+                raise OmnigentError(
+                    "Requester context belongs to a different session", code=ErrorCode.FORBIDDEN
+                )
+
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            from omnigent.server.session_links import require_bound_runner
+            from omnigent.session_authority import REQUEST_AUTHORITY_FIELD, RequestAuthority
+            from omnigent.stores.session_link_store import Endpoint
+
+            if REQUEST_AUTHORITY_FIELD in params:
+                if conv is None:
+                    raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+                require_bound_runner(request, Endpoint(conv.id, conv.id, conv.runner_id))
+                runtime_authority = RequestAuthority.from_wire(params.pop(REQUEST_AUTHORITY_FIELD))
+                verified_authority = getattr(request.state, "link_authority", None)
+                if verified_authority is not None and runtime_authority != verified_authority:
+                    raise OmnigentError("Requester context changed", code=ErrorCode.FORBIDDEN)
+                request.state.link_authority = runtime_authority
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
             return await _handle_mcp_tools_call(
                 rpc_id,

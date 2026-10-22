@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import HTTPConnection
 
 from omnigent.server.accounts_bootstrap import (
     bootstrap_admin,
@@ -43,6 +44,7 @@ from omnigent.server.auth import (
     create_auth_provider,
     resolve_auth_source,
 )
+from omnigent.server.credential_purpose import CredentialPurpose
 from omnigent.server.passwords import (
     InvalidPasswordError,
     hash_password,
@@ -257,14 +259,8 @@ def _make_accounts_config(base_url: str = "http://localhost:8000") -> AccountsCo
     )
 
 
-class _FakeReq:
-    """Minimal HTTPConnection stand-in for cookie/header tests.
-
-    Used over MagicMock because the auth code reads ``.cookies``
-    and ``.headers`` as dicts — a real dict-shaped object is
-    safer than letting MagicMock fall through to a default that
-    silently coerces.
-    """
+class _FakeReq(HTTPConnection):
+    """A real connection with explicit test credentials."""
 
     def __init__(
         self,
@@ -272,9 +268,14 @@ class _FakeReq:
         cookies: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        self.cookies = cookies or {}
-        self.headers = headers or {}
-        self.scope: dict[str, object] = {}
+        raw_headers = [
+            (key.lower().encode(), value.encode()) for key, value in (headers or {}).items()
+        ]
+        if cookies:
+            raw_headers.append(
+                (b"cookie", "; ".join(f"{key}={value}" for key, value in cookies.items()).encode())
+            )
+        super().__init__({"type": "http", "path": "/v1/sessions", "headers": raw_headers})
 
 
 def test_accounts_source_reads_valid_cookie() -> None:
@@ -377,19 +378,131 @@ def test_mint_runner_token_round_trips_to_owner() -> None:
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
 
-    token = provider.mint_runner_token("alice@example.com", 1800)
+    token = provider.mint_bound_runner_token("alice@example.com", 1800, "runner-test")
     assert token is not None
 
     request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
     assert provider.get_user_id(request) == "alice@example.com"
+    assert provider.get_runner_id(request) == "runner-test"
+    assert provider.get_credential_purpose(request) == CredentialPurpose.RUNNER
+    assert provider.mint_runner_token("alice@example.com", 1800) is None
+
+
+@pytest.mark.parametrize("source", ["accounts", "oidc"])
+def test_credential_purpose_survives_cache_and_transport(source: str) -> None:
+    from starlette.requests import HTTPConnection
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.oidc import mint_session_cookie
+    from tests.server.integration.oidc_fixtures import make_oidc_config
+
+    accounts_config = _make_accounts_config() if source == "accounts" else None
+    oidc_config = make_oidc_config() if source == "oidc" else None
+    config = accounts_config or oidc_config
+    assert config is not None
+    provider = UnifiedAuthProvider(
+        source=source, accounts_config=accounts_config, oidc_config=oidc_config
+    )
+    binding = "purpose-test-binding"
+    runner_id = token_bound_runner_id(binding)
+    token = provider.mint_bound_runner_token("alice", 1800, runner_id)
+    session = mint_session_cookie("alice", config.cookie_secret, 8, source)
+    assert token is not None
+
+    def connection(value: str, path: str, *, cookie: bool = False, binding: str | None = None):
+        headers = (
+            [(b"cookie", f"{config.session_cookie_name}={value}".encode())]
+            if cookie
+            else [(b"authorization", f"Bearer {value}".encode())]
+        )
+        if binding is not None:
+            headers.append((RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), binding.encode()))
+        return HTTPConnection({"type": "http", "path": path, "headers": headers})
+
+    for cookie in (False, True):
+        work = connection(token, "/v1/sessions", cookie=cookie)
+        assert provider.get_user_id(work) == "alice"
+        assert provider.get_runner_id(work) == runner_id
+        assert provider.get_credential_purpose(work) == CredentialPurpose.RUNNER
+        for path in ("/auth/users", "/auth/magic", "/auth/cli-approve"):
+            assert provider.get_user_id(connection(token, path, cookie=cookie)) is None
+        assert (
+            provider.get_credential_purpose(connection(session, "/auth/magic", cookie=cookie))
+            == CredentialPurpose.SESSION
+        )
+        assert (
+            provider.get_user_id(connection(token, "/v1/scheduled-tasks", cookie=cookie))
+            == "alice"
+        )
+    for invalid_binding in ("different", "", "  "):
+        assert (
+            provider.get_user_id(connection(token, "/v1/sessions", binding=invalid_binding))
+            is None
+        )
+    assert provider.get_user_id(connection(token, "/v1/sessions", binding=binding)) == "alice"
+    with workspace_scope(99):
+        assert provider.get_user_id(connection(token, "/v1/sessions")) is None
+        assert provider.get_credential_purpose(connection(session, "/auth/magic")) is None
+
+
+def test_legacy_credentials_cannot_establish_verified_provenance() -> None:
+    import time
+
+    import jwt
+
+    cfg = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
+    legacy = jwt.encode(
+        {"sub": "alice", "iat": int(time.time()), "exp": int(time.time()) + 1800},
+        cfg.cookie_secret,
+        algorithm="HS256",
+    )
+    request = _FakeReq(headers={"Authorization": f"Bearer {legacy}"})
+    assert provider.get_user_id(request) is None
+    assert provider.get_credential_purpose(request) is None
+    header = UnifiedAuthProvider(source="header")
+    assert header.get_credential_purpose(_FakeReq(headers={"X-Forwarded-Email": "alice"})) is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"credential_version": None},
+        {"credential_version": True},
+        {"credential_version": 2},
+        {"credential_purpose": "unknown"},
+        {"workspace_id": "0"},
+        {"workspace_id": True},
+        {"credential_purpose": "runner"},
+        {"runner_id": "unexpected"},
+        {"grant_id": "unexpected"},
+        {"scope": "unexpected"},
+    ],
+)
+def test_inconsistent_credential_metadata_is_rejected(overrides: dict[str, object]) -> None:
+    import jwt
+
+    from omnigent.server.oidc import mint_session_cookie
+
+    config = _make_accounts_config()
+    provider = UnifiedAuthProvider(source="accounts", accounts_config=config)
+    token = mint_session_cookie("alice", config.cookie_secret, 8, "accounts")
+    claims = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+    claims.update(overrides)
+    token = jwt.encode(claims, config.cookie_secret, algorithm="HS256")
+    request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
+    assert provider.get_user_id(request) is None
+    assert provider.get_credential_purpose(request) is None
+    assert provider.get_runner_id(request) is None
 
 
 def test_mint_runner_token_rejects_empty_and_reserved_owner() -> None:
     """No token for an empty or reserved owner — never mint reserved-identity creds."""
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
-    assert provider.mint_runner_token("", 1800) is None
-    assert provider.mint_runner_token("local", 1800) is None
+    assert provider.mint_bound_runner_token("", 1800, "runner-test") is None
+    assert provider.mint_bound_runner_token("local", 1800, "runner-test") is None
 
 
 def test_mint_runner_token_returns_none_for_header_source() -> None:
@@ -418,7 +531,7 @@ def test_mint_runner_token_expired_resolves_to_none() -> None:
     cfg = _make_accounts_config()
     provider = UnifiedAuthProvider(source="accounts", accounts_config=cfg)
 
-    token = provider.mint_runner_token("alice@example.com", -1)
+    token = provider.mint_bound_runner_token("alice@example.com", -1, "runner-test")
     assert token is not None
 
     request = _FakeReq(headers={"Authorization": f"Bearer {token}"})
@@ -1384,6 +1497,11 @@ def test_magic_link_authenticates_in_fresh_client(
     me = fresh.get("/auth/me")
     assert me.status_code == 200
     assert me.json()["id"] == "admin"
+    import jwt
+
+    claims = jwt.decode(fresh.cookies["ap_session"], options={"verify_signature": False})
+    assert claims["credential_purpose"] == "client"
+    assert fresh.get("/auth/users").status_code == 200
 
 
 def test_magic_link_is_single_use(accounts_app: TestClient) -> None:
@@ -1720,19 +1838,40 @@ def test_delete_user_revokes_durable_authority(accounts_app: TestClient, tmp_pat
     assert alice.get("/auth/me").status_code == 401
 
 
-def test_change_own_password_round_trip(accounts_app: TestClient) -> None:
+@pytest.mark.parametrize(
+    ("issue_refresh", "purpose"),
+    [(False, "session"), (True, "client")],
+    ids=["session-cookie", "client-bearer"],
+)
+def test_change_own_password_round_trip(
+    accounts_app: TestClient, issue_refresh: bool, purpose: str
+) -> None:
     """POST /auth/users/me/password rotates the password.
 
     Correct old password → 204, new password works on the next
     login, old password stops working. Covers the happy path
     that the self-serve UX depends on.
     """
-    admin = _login(accounts_app, "admin", "admin-pw-12345")
+    import jwt
+
+    admin = accounts_app
+    login = admin.post(
+        "/auth/login",
+        json={"username": "admin", "password": "admin-pw-12345", "issue_refresh": issue_refresh},
+    )
+    assert login.status_code == 200, login.text
+    if issue_refresh:
+        admin.cookies.clear()
+        admin.headers["Authorization"] = f"Bearer {login.json()['token']}"
     resp = admin.post(
         "/auth/users/me/password",
         json={"old_password": "admin-pw-12345", "new_password": "new-strong-pw-1"},
     )
     assert resp.status_code == 204, resp.text
+    claims = jwt.decode(resp.cookies["ap_session"], options={"verify_signature": False})
+    assert claims["credential_purpose"] == purpose
+    admin.headers.pop("Authorization", None)
+    assert admin.get("/auth/me").json()["id"] == "admin"
 
     from fastapi.testclient import TestClient as _TC
 
@@ -2174,3 +2313,16 @@ def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> 
     assert "access_token" in refresh_body
     # Login grants don't rotate — same token is returned.
     assert refresh_body["refresh_token"] == refresh_token
+    import jwt
+
+    for token in (body["token"], refresh_body["access_token"]):
+        accounts_app.cookies.clear()
+        headers = {"Authorization": f"Bearer {token}"}
+        assert accounts_app.get("/auth/me", headers=headers).json()["id"] == "admin"
+        assert accounts_app.get("/auth/users", headers=headers).status_code == 200
+        # First-party refresh must preserve the supported browser handoff.
+        assert accounts_app.post("/auth/magic", headers=headers).status_code == 200
+        assert (
+            jwt.decode(token, options={"verify_signature": False})["credential_purpose"]
+            == "client"
+        )

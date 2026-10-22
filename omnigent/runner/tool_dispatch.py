@@ -64,7 +64,9 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.runner.request_authority import RequesterClient, bind_tool_authority
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
+from omnigent.session_authority import RequestAuthority, current_request_authority
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -84,6 +86,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_links import LINK_TOOL_NAMES, LINK_TOOL_TYPES
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -475,6 +478,7 @@ _BROWSER_TIMEOUT_ERROR = (
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
+    | LINK_TOOL_NAMES
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
@@ -530,7 +534,9 @@ def strip_browser_tool_schemas(schemas: list[_JsonObject]) -> list[_JsonObject]:
     return kept
 
 
-def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]:
+def build_native_relay_tool_schemas(
+    spec: AgentSpec | None, *, session_links_enabled: bool = False
+) -> list[_JsonObject]:
     """Build the flat Omnigent tool surface for native harness bridges.
 
     Returns the same tool set the claude-native / codex-native relay advertises
@@ -584,7 +590,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     if spec is not None:
         from omnigent.tools.manager import ToolManager
 
-        for schema in ToolManager(spec, os_env_schema_only=True).get_tool_schemas():
+        for schema in ToolManager(
+            spec, os_env_schema_only=True, session_links_enabled=session_links_enabled
+        ).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
             if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
                 _append(function)
@@ -592,6 +600,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
 
         for _cls in (
+            *(LINK_TOOL_TYPES if session_links_enabled else ()),
             ListCommentsTool,
             UpdateCommentTool,
             SysSessionListTool,
@@ -865,6 +874,7 @@ def _bounded_discovery_result(
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
     _OS_ENV_TOOLS
+    | LINK_TOOL_NAMES
     | _REST_TOOLS
     | _FILE_TOOLS
     | _TERMINAL_TOOLS
@@ -6521,6 +6531,7 @@ async def _fetch_peek_meta(
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
 
 
+@bind_tool_authority
 async def execute_tool(
     *,
     tool_name: str,
@@ -6542,6 +6553,8 @@ async def execute_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    operation_id: str | None = None,
+    request_authority: RequestAuthority | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -6577,9 +6590,14 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
+    authority = request_authority or current_request_authority.get()
+    if authority is not None and server_client is not None and conversation_id is not None:
+        server_client = RequesterClient(server_client, conversation_id, authority)
     # MCP dispatch resolves the target against the spec inside the MCP
     # manager; every other branch is gated on the spec's granted surface.
-    if mcp_manager is None:
+    if tool_name in LINK_TOOL_NAMES and authority is None:
+        return json.dumps({"error": "Session links require verified input authority"})
+    if mcp_manager is None and tool_name not in LINK_TOOL_NAMES:
         refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
         if refusal is not None:
             return json.dumps({"error": refusal})
@@ -6671,6 +6689,12 @@ async def execute_tool(
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+            )
+        elif tool_name in LINK_TOOL_NAMES:
+            from omnigent.runner.linked_tools import execute_link_tool
+
+            output = await execute_link_tool(
+                tool_name, args, server_client, conversation_id, operation_id or uuid.uuid4().hex
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -6939,6 +6963,7 @@ async def dispatch_tool_locally(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    request_authority: RequestAuthority | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -6972,6 +6997,8 @@ async def dispatch_tool_locally(
     output = await execute_tool(
         tool_name=tool_name,
         arguments=arguments,
+        operation_id=call_id,
+        request_authority=request_authority,
         server_client=server_client,
         terminal_registry=terminal_registry,
         resource_registry=resource_registry,
@@ -8277,6 +8304,13 @@ async def _drain_inbox(
             payload = inbox.get_nowait()
         except asyncio.QueueEmpty:
             break
+        if payload.get("type") == "linked_reply":
+            items.append(
+                f"[Reply from session {payload.get('worker_id')} · "
+                f"request {payload.get('request_id')}]\n"
+                f"{_truncate_inbox_output(payload.get('message', ''))}"
+            )
+            continue
         if payload.get("type") == "terminal_idle":
             try:
                 items.append(_format_terminal_idle_item(payload))

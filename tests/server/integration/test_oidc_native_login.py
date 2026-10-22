@@ -18,9 +18,11 @@ import pytest
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
+from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import OIDCConfig, derive_code_challenge
 from omnigent.server.routes import auth as auth_routes
 from omnigent.server.routes.auth import create_auth_router
+from omnigent.server.routes.device_auth import create_oauth_token_router
 
 pytestmark = pytest.mark.asyncio
 
@@ -63,8 +65,9 @@ def _transport(
     from fastapi import FastAPI
 
     config = _config(allowed_domains)
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
     router = create_auth_router(
-        auth_provider=UnifiedAuthProvider(source="oidc", oidc_config=config),
+        auth_provider=provider,
         permission_store=None,
         # A fresh directory, so no admin list on the host can leak in.
         admin_list=AdminList(Path(tempfile.mkdtemp()) / "no-admins.txt"),
@@ -72,6 +75,9 @@ def _transport(
     )
     app = FastAPI()
     app.include_router(router, prefix="/auth")
+    if isinstance(device_grant_store, DeviceGrantStore):
+        provider.set_grant_revocation_check(device_grant_store.is_revoked)
+        app.include_router(create_oauth_token_router(provider, device_grant_store))
     return httpx.ASGITransport(app=app)
 
 
@@ -149,32 +155,44 @@ def _client(transport: httpx.ASGITransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=transport, base_url="http://test", follow_redirects=False)
 
 
-async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
+async def test_native_sign_in_delivers_code_and_exchanges_for_session(tmp_path: Path) -> None:
     """The full loopback flow ends with a session token, and the browser gets none."""
-    grant_store = MagicMock()
-    with patch.object(auth_routes, "issue_login_grant", return_value="refresh-abc") as issue:
-        async with _client(_transport(device_grant_store=grant_store)) as client:
-            idp_state, state_cookie = await _start(client)
-            callback = await _callback(client, idp_state, state_cookie)
-            query = _loopback_query(callback)
-            assert query["state"] == _NATIVE_STATE
-            assert "ap_session" not in callback.cookies
+    grant_store = DeviceGrantStore(f"sqlite:///{tmp_path}/native-grants.db")
+    async with _client(_transport(device_grant_store=grant_store)) as client:
+        idp_state, state_cookie = await _start(client)
+        callback = await _callback(client, idp_state, state_cookie)
+        query = _loopback_query(callback)
+        assert query["state"] == _NATIVE_STATE
+        assert "ap_session" not in callback.cookies
 
-            resp = await _exchange(
-                client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=_REDIRECT
-            )
+        resp = await _exchange(
+            client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=_REDIRECT
+        )
 
-    assert resp.status_code == 200
-    assert resp.headers["cache-control"] == "no-store"
-    body = resp.json()
-    assert jwt.decode(body["token"], _TEST_SECRET, algorithms=["HS256"])["sub"] == (
-        "alice@example.com"
-    )
-    assert body["user_id"] == "alice@example.com"
-    assert body["expires_in"] == 8 * 3600
-    assert body["refresh_token"] == "refresh-abc"
-    issue.assert_called_once()
-    assert issue.call_args.kwargs["user_id"] == "alice@example.com"
+        assert resp.status_code == 200
+        assert resp.headers["cache-control"] == "no-store"
+        body = resp.json()
+        assert body["user_id"] == "alice@example.com"
+        assert body["expires_in"] == 8 * 3600
+        refreshed = await client.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+        )
+        assert refreshed.status_code == 200, refreshed.text
+        access = refreshed.json()["access_token"]
+        client.cookies.clear()
+        for token in (body["token"], access):
+            claims = jwt.decode(token, _TEST_SECRET, algorithms=["HS256"])
+            assert claims["sub"] == "alice@example.com"
+            assert claims["credential_purpose"] == "client"
+            users = await client.get("/auth/users", headers={"Authorization": f"Bearer {token}"})
+            # Authenticated, but this user is not an administrator.
+            assert users.status_code == 403 and users.json()["error"] == "admin only"
+        revoked = await client.post("/oauth/revoke", data={"refresh_token": body["refresh_token"]})
+        assert revoked.status_code == 200
+        assert (
+            await client.get("/auth/users", headers={"Authorization": f"Bearer {access}"})
+        ).status_code == 401
 
 
 async def test_native_token_omits_refresh_without_grant_store() -> None:

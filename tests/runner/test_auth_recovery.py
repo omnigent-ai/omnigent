@@ -40,6 +40,29 @@ async def test_async_runner_auth_refreshes_outside_event_loop(
     assert sent == ["Bearer expired", "Bearer renewed"]
 
 
+async def test_permission_refusals_preserve_bootstrap_credentials(monkeypatch):
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *a, **k: {})
+    factory = _entry._InitialAuthTokenFactory("valid-owner-token", "https://example.invalid")
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/refused":
+            return httpx.Response(403, headers={"X-Omnigent-Error-Code": "forbidden"})
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        auth=_entry._RunnerDatabricksAuth(factory), transport=httpx.MockTransport(respond)
+    ) as client:
+        for _ in range(2):
+            assert (await client.post("https://example.invalid/refused")).status_code == 403
+        assert (await client.get("https://example.invalid/allowed")).status_code == 200
+    assert len(requests) == 3
+    assert all(
+        request.headers["Authorization"] == "Bearer valid-owner-token" for request in requests
+    )
+
+
 @pytest.mark.parametrize("login_succeeds", [False, True])
 def test_bootstrap_factory_retries_missing_credentials_after_long_outage(
     monkeypatch: pytest.MonkeyPatch, login_succeeds: bool
