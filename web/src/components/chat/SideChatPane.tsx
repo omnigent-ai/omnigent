@@ -557,7 +557,9 @@ function SideChatComposer({
     }
   }, []);
   // Manual edits and merged reply fields relinquish dictation's undo ownership.
-  reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
+  useLayoutEffect(() => {
+    reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
+  }, [composer, reconcileVoiceEdits]);
   const activeText = composer?.quotes?.find((quote) => quote.id === activeTextId)?.before ?? text;
   const setActiveText = useCallback(
     (next: string) => {
