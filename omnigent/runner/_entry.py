@@ -444,6 +444,12 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :returns: ``True`` when the response indicates the request should
         be retried with a fresh token, ``False`` otherwise.
     """
+    if (
+        response.status_code == 403
+        and response.headers.get("X-Omnigent-Error-Code") == "forbidden"
+    ):
+        # An application ACL refusal does not invalidate the runner's login.
+        return False
     if response.status_code in (401, 403):
         # Databricks Apps returns 403 "Invalid Token" for an expired bearer
         # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.

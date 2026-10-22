@@ -96,6 +96,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _ensure_runner_session_initialized,
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -1507,13 +1508,28 @@ def register_resources_routes(
         # reconnect path owns those).
         # Reuse the refreshed row returned after any wake or relaunch because
         # the runner binding may have changed.
-        _, conv = await ensure_runner_connected(
+        runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
             app_state=request.app.state,
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
+        if (
+            is_native_bootstrap
+            and runner_client is not None
+            and getattr(request.app.state, "session_messaging", None) is not None
+        ):
+            # Native tool discovery needs the server snapshot before the terminal starts.
+            await _ensure_runner_session_initialized(
+                session_id,
+                conv,
+                runner_client,
+                conversation_store,
+                initializer=getattr(request.app.state, "runner_session_initializer", None),
+                suppress_recovery_turn=True,
+                require_success=True,
+            )
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:

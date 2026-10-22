@@ -898,12 +898,16 @@ def register_events_routes(
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
                 return acks
-            return await _post_event_impl(
+            result = await _post_event_impl(
                 request,
                 session_id,
                 body,
-                in_flight=in_flight if body.type == "message" else None,
+                in_flight=in_flight if body.type in ("message", "session_message") else None,
             )
+            messaging = getattr(request.app.state, "session_messaging", None)
+            if messaging is not None:
+                await asyncio.to_thread(messaging.record_activity, session_id, body)
+            return result
 
     router.include_router(event_router)
 
@@ -1075,6 +1079,16 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        if body.type == "session_message":
+            if not isinstance(request, Request):
+                raise OmnigentError(
+                    "Messaging requires an authenticated HTTP request", code=ErrorCode.FORBIDDEN
+                )
+            from omnigent.server.session_messaging import messaging_service
+
+            await asyncio.to_thread(
+                messaging_service(request).prepare_send, request, session_id, body
+            )
         user_id, conv = await _authorized_conversation(
             request,
             session_id,
@@ -3237,6 +3251,9 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
+        messaging = getattr(request.app.state, "session_messaging", None)
+        if messaging is not None and isinstance(request, Request):
+            await asyncio.to_thread(messaging.capture_input, request, session_id, body)
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,

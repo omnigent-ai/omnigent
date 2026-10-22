@@ -34,6 +34,7 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     InjectionDeliveryAmbiguous,
     Message,
+    NativeInputAccepted,
     ReasoningChunk,
     SubAgentCompleted,
     SubAgentStarted,
@@ -58,6 +59,8 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
     InjectionConsumedEvent,
+    InjectionRefusedEvent,
+    NativeInputAcceptedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
     ReasoningStartedEvent,
@@ -246,6 +249,8 @@ class ExecutorAdapter(HarnessApp):
         for message in messages:
             message["session_id"] = self._session_key
         extra: dict[str, Any] = {}
+        if request.input_authority_id is not None:
+            extra["input_authority_id"] = request.input_authority_id
         if request.reasoning is not None:
             effort = request.reasoning.get("effort")
             if effort:
@@ -757,6 +762,10 @@ class ExecutorAdapter(HarnessApp):
                     "(supports_live_message_queue=False?); LLM will "
                     "not see the steered message until the next turn"
                 )
+                if injection_id := getattr(injection, "injection_id", None):
+                    ctx.emit(
+                        InjectionRefusedEvent(type="injection.refused", injection_id=injection_id)
+                    )
                 continue
             # Echo injection_id so the runner drops the buffered copy and doesn't re-deliver it.
             injection_id = getattr(injection, "injection_id", None)
@@ -970,7 +979,13 @@ class ExecutorAdapter(HarnessApp):
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
-        if isinstance(event, TextChunk):
+        if isinstance(event, NativeInputAccepted):
+            ctx.emit(
+                NativeInputAcceptedEvent(
+                    type="input.authority.accepted", input_id=event.input_id, turn_id=event.turn_id
+                )
+            )
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",

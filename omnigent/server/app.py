@@ -1614,6 +1614,7 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        request_authority_required=resolved_feature_flags.enabled(Feature.SESSION_MESSAGING),
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
@@ -1971,6 +1972,25 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.session_messaging = None
+    if resolved_feature_flags.enabled(Feature.SESSION_MESSAGING):
+        from omnigent.server.session_messaging import SessionMessaging
+        from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+        from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+        if (
+            auth_provider is None
+            or not isinstance(permission_store, SqlAlchemyPermissionStore)
+            or not isinstance(conversation_store, SqlAlchemyConversationStore)
+            or permission_store.storage_location != conversation_store.storage_location
+        ):
+            raise ValueError("Session messaging requires authenticated SQL-backed sessions")
+        app.state.session_messaging = SessionMessaging(
+            conversation_store, permission_store, auth_provider
+        )
+    from omnigent.server.routes.session_messaging import create_session_messaging_router
+
+    app.include_router(create_session_messaging_router(), prefix="/v1", tags=["session-messaging"])
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -2467,6 +2487,7 @@ def create_app(
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+            headers={"X-Omnigent-Error-Code": str(exc.code)},
         )
 
     @app.exception_handler(RequestValidationError)

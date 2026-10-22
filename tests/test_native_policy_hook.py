@@ -432,6 +432,7 @@ def _resp(status: int, location: str | None = None) -> httpx.Response:
         (_resp(401), True),
         # Databricks Apps returns 403 "Invalid Token" for an expired bearer.
         (_resp(403), True),
+        (httpx.Response(403, headers={"X-Omnigent-Error-Code": "forbidden"}), False),
         (_resp(302, "https://w.example.com/oidc/oauth2/v2.0/authorize"), True),
         (_resp(302, "https://omnigents.example.databricksapps.com/.auth/callback"), True),
         # Unrelated redirect / success must NOT trigger a wasted token round-trip.

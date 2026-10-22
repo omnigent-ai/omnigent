@@ -551,6 +551,15 @@ def register_agent_routes(
             from omnigent.server.mcp_identity import mcp_policy_actor
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            from omnigent.server.session_messaging import messaging_service
+            from omnigent.session_authority import REQUEST_AUTHORITY_FIELD, RequestAuthority
+
+            if REQUEST_AUTHORITY_FIELD in params:
+                authority = RequestAuthority.from_wire(params.pop(REQUEST_AUTHORITY_FIELD))
+                service = messaging_service(request)
+                await asyncio.to_thread(service.require_runner, request, session_id)
+                # Missing/unknown authority remains invalid, including on unsupported harnesses.
+                request.state.message_authority = authority
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
             return await _handle_mcp_tools_call(
                 rpc_id,

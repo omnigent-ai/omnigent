@@ -146,6 +146,7 @@ from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+from omnigent.runner.request_authority import TurnAuthority, native_snapshot
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
@@ -207,6 +208,11 @@ from omnigent.runtime.prompt import (
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
+)
+from omnigent.session_authority import (
+    INPUT_AUTHORITY_FIELD,
+    REQUEST_AUTHORITY_FIELD,
+    RequestAuthority,
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
@@ -1408,6 +1414,11 @@ def create_runner_app(
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
+    _authority_required: set[str] = set()
+    _turn_authorities: dict[str, TurnAuthority] = {}
+    _native_authorities: dict[str, TurnAuthority] = {}
+    app.state.turn_authorities = _turn_authorities
+    app.state.native_authorities = _native_authorities
     app.state.session_message_buffers = _session_message_buffers
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
@@ -2112,6 +2123,8 @@ def create_runner_app(
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
+        if snapshot.request_authority_required:
+            _authority_required.add(session_id)
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
             status_code=200,
@@ -3361,6 +3374,8 @@ def create_runner_app(
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
         _session_message_buffers.pop(session_id, None)
+        _turn_authorities.pop(session_id, None)
+        _native_authorities.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
             task
@@ -4381,6 +4396,11 @@ def create_runner_app(
                         }
                     )
                 next_body = all_bodies[-1]
+                if session_id in _authority_required:
+                    combined = RequestAuthority(())
+                    for consumed_body in all_bodies:
+                        combined = combined.consume(RequestAuthority.from_input(consumed_body))
+                    next_body = {**next_body, REQUEST_AUTHORITY_FIELD: combined.to_wire()}
 
             if _is_sdk_compact_body(next_body):
                 # This buffered /compact now dispatches as its own turn. Mirror the
@@ -4689,7 +4709,16 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        links_enabled = (
+            session_id in _authority_required
+            and _session_harness_name(session_id) == _CODEX_NATIVE_HARNESS
+        )
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and current.session_messaging_enabled == links_enabled
+            and known_bridge_dir is None
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -4710,13 +4739,16 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
+            and current.session_messaging_enabled == links_enabled
         ):
             return
 
         from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
 
         relay_spec = _unwrap_spec_entry(spec_entry)
-        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(relay_spec)
+        relay_schemas: list[_JsonObject] = build_native_relay_tool_schemas(
+            relay_spec, session_messaging_enabled=links_enabled
+        )
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
@@ -4742,11 +4774,51 @@ def create_runner_app(
             name: str,
             arguments: _JsonObject,
         ) -> _JsonObject:
+            authority = None
+            if links_enabled:
+                authority = RequestAuthority((), verified=False)
+                native_state = _native_authorities.get(_captured_session_id)
+                captured_state = dataclasses.replace(native_state) if native_state else None
+                if (
+                    _session_harness_name(_captured_session_id) == _CODEX_NATIVE_HARNESS
+                    and captured_state
+                ):
+                    try:
+                        from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+                        bridge = await _codex_native_bridge_state_for_session(
+                            _captured_session_id, action="verify consumed input"
+                        )
+                        if bridge is not None:
+                            native_client = client_for_transport(
+                                bridge.socket_path, client_name="omnigent-input-authority"
+                            )
+                            try:
+                                await native_client.connect()
+                                authority = await asyncio.wait_for(
+                                    native_snapshot(
+                                        native_client, bridge.thread_id, captured_state
+                                    ),
+                                    timeout=5,
+                                )
+                                if (
+                                    _native_authorities.get(_captured_session_id)
+                                    is not native_state
+                                    or native_state is None
+                                    or native_state.authority != captured_state.authority
+                                    or native_state.pending
+                                ):
+                                    authority = RequestAuthority((), verified=False)
+                            finally:
+                                await native_client.close()
+                    except (OSError, RuntimeError, ValueError, TimeoutError):
+                        authority = RequestAuthority((), verified=False)
             result_str = await ProxyMcpManager(
                 _captured_session_id,
                 server_client,
                 publish_event=_publish_event,
                 execution_registry=mcp_execution_registry,
+                request_authority=authority,
             ).call_tool(relay_spec, name, arguments)
             try:
                 return cast(_JsonObject, _json.loads(result_str))
@@ -4826,6 +4898,7 @@ def create_runner_app(
             relay=relay,
             spec_entry=spec_entry,
             bridge_dir=bridge_dir,
+            session_messaging_enabled=links_enabled,
         )
         # Close last: the new advertisement is already written, and
         # ClaudeNativeToolRelay.close only unlinks a tool_relay.json that
@@ -5130,6 +5203,9 @@ def create_runner_app(
                 extra={"session_id": conv},
             )
         harness_body.update(input_attributes(msg_body))
+        if conv in _authority_required:
+            harness_body[REQUEST_AUTHORITY_FIELD] = RequestAuthority.from_input(msg_body).to_wire()
+            harness_body["input_authority_id"] = msg_body.get(INPUT_AUTHORITY_FIELD)
         # Resolve the effort for this turn — an explicit per-event value, else
         # the session's remembered one — then deliver only what this harness can
         # accept. The persisted effort is validated at create against the union
@@ -5196,6 +5272,7 @@ def create_runner_app(
                         cached_spec,
                         workdir=_resolved_workdir_for_spec(cached_spec_entry, runner_workspace),
                         os_env_schema_only=True,
+                        session_messaging_enabled=conv in _authority_required,
                     )
                     all_tools.extend(_tmgr.get_tool_schemas())
                 except (
@@ -5421,6 +5498,13 @@ def create_runner_app(
         conv_id: str,
         dispatch: TurnDispatch | None = None,
     ) -> Response:
+        turn_authority = (
+            TurnAuthority(RequestAuthority.from_input(body))
+            if conv_id in _authority_required
+            else None
+        )
+        if turn_authority is not None:
+            _turn_authorities[conv_id] = turn_authority
         manager = cast(HarnessProcessManager, process_manager)
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
@@ -5888,6 +5972,39 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                call_authority = (
+                                    turn_authority.snapshot() if turn_authority else None
+                                )
+                                if _evt_type == "input.authority.accepted":
+                                    accepted_id = event.get("input_id")
+                                    native_turn_id = event.get("turn_id")
+                                    if (
+                                        isinstance(accepted_id, str)
+                                        and isinstance(native_turn_id, str)
+                                        and accepted_id == body.get("input_authority_id")
+                                        and call_authority is not None
+                                        and accepted_id in call_authority.input_ids
+                                    ):
+                                        native_state = _native_authorities.get(conv_id)
+                                        if (
+                                            native_state is None
+                                            or native_state.native_turn_id != native_turn_id
+                                        ):
+                                            native_state = TurnAuthority(
+                                                RequestAuthority(()), native_turn_id=native_turn_id
+                                            )
+                                            _native_authorities[conv_id] = native_state
+                                        native_state.authority = native_state.authority.consume(
+                                            RequestAuthority(
+                                                (accepted_id,),
+                                                proofs=(
+                                                    call_authority.proofs[
+                                                        call_authority.input_ids.index(accepted_id)
+                                                    ],
+                                                ),
+                                            )
+                                        )
+                                    continue
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
@@ -5896,8 +6013,17 @@ def create_runner_app(
                                     # up-front spinner; drop the executor's own duplicate
                                     # so the web renders a single compaction spinner.
                                     continue
+                                if _evt_type == "injection.refused":
+                                    injection_id = event.get("injection_id")
+                                    if turn_authority is not None and isinstance(
+                                        injection_id, str
+                                    ):
+                                        turn_authority.refuse_injection(injection_id)
+                                    continue
                                 if _evt_type == "injection.consumed":
                                     _inj_id = event.get("injection_id")
+                                    if turn_authority is not None and isinstance(_inj_id, str):
+                                        turn_authority.consume_injection(_inj_id)
                                     _buf = _session_message_buffers.get(conv_id)
                                     if _inj_id is not None and _buf:
                                         _consumed = [
@@ -6053,11 +6179,13 @@ def create_runner_app(
                                             server_client,
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
+                                            request_authority=call_authority,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
                                                 dispatch_tool_locally(
                                                     tool_name=tool_name,
+                                                    request_authority=call_authority,
                                                     call_id=get_call_id(event),
                                                     arguments=get_arguments(event),
                                                     response_id=_response_id,
@@ -6339,6 +6467,8 @@ def create_runner_app(
 
         body = await request.json()
         body_type = body.get("type") if isinstance(body, dict) else None
+        if isinstance(body, dict) and INPUT_AUTHORITY_FIELD in body:
+            _authority_required.add(conversation_id)
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
             "model_override=%s",
@@ -6531,6 +6661,12 @@ def create_runner_app(
                         [],
                     ).append(message_body)
                     if _can_forward and process_manager is not None:
+                        authority_state = _turn_authorities.get(conversation_id)
+                        if authority_state is not None:
+                            authority_state.begin_injection(
+                                message_body["injection_id"],
+                                RequestAuthority.from_input(message_body),
+                            )
                         try:
                             _hc = await process_manager.get_client(conversation_id, "any")
                             _injection_resp = await _hc.post(
@@ -6539,6 +6675,8 @@ def create_runner_app(
                                 timeout=5.0,
                             )
                             if _injection_resp.status_code >= 400:
+                                if authority_state is not None:
+                                    authority_state.refuse_injection(message_body["injection_id"])
                                 _logger.warning(
                                     "post_session_events: mid-turn injection forward rejected "
                                     "conv=%s status=%s body=%s",
@@ -6607,16 +6745,15 @@ def create_runner_app(
                     "role": message_body.get("role", "user"),
                     "content": message_body.get("content", []),
                 }
-                if conversation_id in _session_histories:
-                    _session_histories[conversation_id].append(new_item)
-                else:
+                history = _session_histories.get(conversation_id)
+                if history is None:
                     persisted_item_id = message_body.get("persisted_item_id")
-                    loaded = await _load_history_as_input(
+                    history = await _load_history_as_input(
                         conversation_id,
                         drop_item_id=persisted_item_id,
                     )
-                    loaded.append(new_item)
-                    _session_histories[conversation_id] = loaded
+                history.append(new_item)
+                _session_histories[conversation_id] = history
 
                 _begin_turn_slot(conversation_id)
                 _logger.info(
@@ -7544,6 +7681,8 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        _turn_authorities.pop(session_id, None)
+        _native_authorities.pop(session_id, None)
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -7574,6 +7713,8 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        _turn_authorities.pop(session_id, None)
+        _native_authorities.pop(session_id, None)
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)

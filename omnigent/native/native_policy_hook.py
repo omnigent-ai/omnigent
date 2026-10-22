@@ -276,6 +276,12 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :param response: The hook's POST response to classify.
     :returns: ``True`` when the caller should re-mint a token and retry.
     """
+    if (
+        response.status_code == 403
+        and response.headers.get("X-Omnigent-Error-Code") == "forbidden"
+    ):
+        # An application ACL refusal does not invalidate the runner's login.
+        return False
     if response.status_code in (401, 403):
         return True
     if not response.is_redirect:

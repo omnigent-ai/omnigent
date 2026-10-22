@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Session messaging](./session-messaging.md) covers the personal owner switch,
+  verified SDK/Codex sends and recent Canvas activity.
+
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 

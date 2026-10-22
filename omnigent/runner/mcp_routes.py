@@ -44,6 +44,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.session_authority import REQUEST_AUTHORITY_FIELD, RequestAuthority
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -333,6 +334,11 @@ def register_mcp_routes(
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
+                        request_authority=RequestAuthority.from_wire(
+                            body.get(REQUEST_AUTHORITY_FIELD)
+                        )
+                        if REQUEST_AUTHORITY_FIELD in body
+                        else None,
                         server_client=server_client,
                         terminal_registry=terminal_registry,
                         resource_registry=resource_registry,

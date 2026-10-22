@@ -32,6 +32,7 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     parent_session_id: str | None = None
     root_session_id: str | None = None
     inference_config: dict[str, object] | None = None
+    request_authority_required: bool = False
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -63,6 +64,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    request_authority_required: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -79,6 +81,7 @@ def build_runner_session_init_payload(
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
         snapshot=RunnerSessionInitSnapshot(
+            request_authority_required=request_authority_required,
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
             workspace=conversation.workspace,

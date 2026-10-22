@@ -403,6 +403,10 @@ class AuthProvider(ABC):
         """Return the runner binding verified by this provider, if supported."""
         return None
 
+    def message_authority_key(self) -> bytes | None:
+        """Return a key for message provenance, if the provider supports durable signatures."""
+        return None
+
     def mint_bound_runner_token(
         self,
         user_id: str,
@@ -650,6 +654,17 @@ class UnifiedAuthProvider(AuthProvider):
     def get_runner_id(self, request: HTTPConnection) -> str | None:
         credential = self._verified_credential(request)
         return credential.runner_id if credential is not None else None
+
+    def message_authority_key(self) -> bytes | None:
+        """Separate message provenance signatures from login credentials."""
+        import hmac
+
+        config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        return (
+            hmac.digest(config.cookie_secret, b"omnigent.session-message.v1", "sha256")
+            if config
+            else None
+        )
 
     def mint_bound_runner_token(
         self, user_id: str, ttl_seconds: int, runner_id: str

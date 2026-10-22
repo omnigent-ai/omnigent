@@ -1010,6 +1010,10 @@ def register_core_routes(
                         conv,
                         server_version=VERSION,
                         suppress_recovery_turn=True,
+                        request_authority_required=getattr(
+                            request.app.state, "session_messaging", None
+                        )
+                        is not None,
                     )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
@@ -2901,6 +2905,10 @@ def register_core_routes(
                             json=build_runner_session_init_payload(
                                 conv,
                                 server_version=VERSION,
+                                request_authority_required=getattr(
+                                    request.app.state, "session_messaging", None
+                                )
+                                is not None,
                             ),
                             timeout=10.0,
                         )

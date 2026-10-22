@@ -4155,6 +4155,32 @@
         "title": "MessageData",
         "type": "object"
       },
+      "MessagingSettingInput": {
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "expected_version": {
+            "anyOf": [
+              {
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Version"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "title": "MessagingSettingInput",
+        "type": "object"
+      },
       "ModelUsage": {
         "description": "Cumulative token/cost usage attributed to a single LLM model.\n\nOne value in the `usage_by_model` map on `SessionResponse` /\n`SessionUsageEvent`, keyed by the raw harness-reported model id\n(e.g. `\"claude-sonnet-4-6\"`, `\"databricks-gpt-5-5\"`). Counts are\nsummed over the session's subtree (itself + sub-agent descendants), so a\nparent folds in sub-agents that ran a different model. Token buckets\nmirror the flat per-session breakdown.",
         "properties": {
@@ -12951,6 +12977,70 @@
         ]
       }
     },
+    "/v1/session-communication/settings": {
+      "get": {
+        "operationId": "read_setting_v1_session_communication_settings_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Read Setting V1 Session Communication Settings Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Read Setting",
+        "tags": [
+          "session-messaging"
+        ]
+      },
+      "put": {
+        "operationId": "change_setting_v1_session_communication_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessagingSettingInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Change Setting V1 Session Communication Settings Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change Setting",
+        "tags": [
+          "session-messaging"
+        ]
+      }
+    },
     "/v1/sessions": {
       "get": {
         "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
@@ -14516,6 +14606,50 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/communication-activity": {
+      "get": {
+        "operationId": "activity_v1_sessions__session_id__communication_activity_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Activity V1 Sessions  Session Id  Communication Activity Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Activity",
+        "tags": [
+          "session-messaging"
         ]
       }
     },

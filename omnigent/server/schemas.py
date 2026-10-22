@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SerializerFunctionWrapHandler,
     Strict,
     field_validator,
@@ -1143,6 +1144,7 @@ class CreateResponseRequest(BaseModel):
     injection_id: str | None = None
     # Server-side identity of the native web input, independent of native transcript matching.
     input_stable_id: str | None = None
+    input_authority_id: str | None = None
     pending_id: str | None = None
     delivery_attempt_id: str | None = None
     input_enqueued_at_ms: int | None = None
@@ -1394,6 +1396,7 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+    _trusted_transport: dict[str, Any] = PrivateAttr(default_factory=dict)
 
     @field_validator("data")
     @classmethod
@@ -4100,6 +4103,14 @@ class OutputItemDoneEvent(_SSEEventBase):
     item: dict[str, Any]
 
 
+class NativeInputAcceptedEvent(_SSEEventBase):
+    """Internal harness-to-runner receipt for a server-captured native input."""
+
+    type: Literal["input.authority.accepted"]
+    input_id: str
+    turn_id: str
+
+
 class InjectionConsumedEvent(_SSEEventBase):
     """
     Runner-internal marker: a mid-turn injection was consumed.
@@ -4120,6 +4131,13 @@ class InjectionConsumedEvent(_SSEEventBase):
     """
 
     type: Literal["injection.consumed"]
+    injection_id: str
+
+
+class InjectionRefusedEvent(_SSEEventBase):
+    """Internal receipt: input remains buffered and did not enter the current turn."""
+
+    type: Literal["injection.refused"]
     injection_id: str
 
 
@@ -5173,6 +5191,8 @@ class SubagentToolCallEvent(_SSEEventBase):
 HarnessStreamEvent = (
     ServerStreamEvent
     | InjectionConsumedEvent
+    | InjectionRefusedEvent
+    | NativeInputAcceptedEvent
     | PolicyEvaluationRequestEvent
     | SubagentStartedEvent
     | SubagentCompletedEvent
