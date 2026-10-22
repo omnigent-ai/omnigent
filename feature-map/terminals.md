@@ -26,7 +26,9 @@ reattach when the session moves to another host.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
-  says so and routes the user to the terminal.
+  says so, names the Terminal view (not a rail shell tab), and offers an "Open
+  the Terminal view to respond" button that switches to it. A side chat only
+  names its own terminal.
 
 ## How to get to it (user POV)
 
@@ -40,6 +42,8 @@ with their own terminal retain the switcher.
 - Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
+- When chat is parked on a harness dialog, use the working indicator's "Open
+  the Terminal view to respond" button.
 - Choose Resume when the terminal shows as stopped.
 - On desktop with `grid_sessions_display_ui` enabled, use each grid cell's header switch.
   The shortcut targets the active cell; shells remain in the shared Workspace.
@@ -139,6 +143,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+  `tests/e2e_ui/chat/test_blocked_dialog_names_wrong_terminal.py::test_chat_blocked_on_dialog_names_the_terminal_that_holds_it`
+  opens a real Claude Code dialog with a rail shell open and clicks the
+  indicator's button.
 
 ## Gotchas
 
