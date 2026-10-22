@@ -23,11 +23,10 @@ flowchart TD
     J --> K["Keep unfinished run for recovery"]
 ```
 
-`poll_once()` initializes missing schedules and finds due tasks. `_claim_due()`
-uses the store's atomic claim to decide which replica starts each occurrence.
-`_execute()` runs the executor callback alongside the heartbeat. The executor
-uses `StartupLease` to check its lease, attach the session, and record the startup
-outcome; the lease covers startup, not the entire agent turn.
+The database claim decides which replica starts each occurrence. The executor
+runs alongside the heartbeat and uses `StartupLease` to check its lease, attach
+the session, and record the startup outcome. The lease covers startup, not the
+entire agent turn.
 
 The executor checks its lease before external actions, attaches the session before
 sending the prompt, and records `running` after delivery. Lease loss stops local
@@ -35,6 +34,17 @@ startup work. Interrupted runs remain recorded for recovery; the scheduler never
 resends a prompt automatically. After an outage it dispatches one overdue
 occurrence per task, then advances into the future instead of replaying every
 missed occurrence.
+
+The executor must await its startup work and respect cancellation. Stopping the
+scheduler cancels local startups and prevents further polling until it is started
+again. A database request already running in a worker thread can still commit:
+a claim may be left for recovery, or a renewal may delay recovery until its new
+deadline. Lease writes stay serialized until their database calls finish and
+update the local run snapshot, even if their callers were cancelled.
+
+By default, every host is eligible. Deployments that assign hosts to replicas
+supply an `owns_host` callback, including ownership of derived sandbox host IDs.
+The poll awaits this callback, so it must return promptly and respect cancellation.
 
 Defaults are 30-second polls and renewals, 120-second leases, 100 rows per page,
 and 100 concurrent startups per server. `ScheduledTaskSchedulerConfig` validates

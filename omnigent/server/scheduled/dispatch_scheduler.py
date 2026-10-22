@@ -1,10 +1,4 @@
-"""Database polling scheduler, ready to wire to the claimed-run fire path.
-
-The fire callback awaits the *whole startup*, using StartupLease.check before
-external actions and StartupLease.finish when it has sent the prompt. Expired
-startup reconciliation is supplied by the fire path: only it can check prompt
-delivery and safely clean up a sandbox. This module never retries a fire.
-"""
+"""Poll due tasks and supervise startup leases; callback contracts are in README.md."""
 
 from __future__ import annotations
 
@@ -36,12 +30,7 @@ class StartupLeaseLost(RuntimeError):
 
 
 class StartupLease:
-    """Serialize heartbeats and fire-path transitions for one locally owned startup.
-
-    The callback must not detach startup work into another task. Cancellation
-    and failed checkpoints stop further actions; they cannot undo an RPC that
-    was already accepted remotely. Recovery must check for such effects.
-    """
+    """Serialize database updates for one locally owned startup."""
 
     def __init__(
         self,
@@ -56,29 +45,16 @@ class StartupLease:
         self._now = now
         self._lease_seconds = lease_seconds
         self._lock = asyncio.Lock()
+        self._writes: set[asyncio.Task[None]] = set()
 
     async def check(self) -> None:
         """Confirm and renew the lease before advancing startup; raise if it was lost."""
-        async with self._lock:
-            with workspace_scope(self.run.workspace_id):
-                run = await asyncio.to_thread(
-                    self._store.renew_starting_run,
-                    self.run.id,
-                    now=self._now,
-                    lease_seconds=self._lease_seconds,
-                )
-            if (
-                run is None
-                or run.status != "starting"
-                or run.lease_expires_at is None
-                or run.lease_expires_at <= self._now()
-            ):
-                raise StartupLeaseLost(
-                    f"Cannot continue startup for run {self.run.id}: its startup lease "
-                    "could not be renewed. Stop further startup actions and let recovery "
-                    "check the run."
-                )
-            self.run = run
+        await self._write(
+            lambda: self._store.renew_starting_run(
+                self.run.id, now=self._now, lease_seconds=self._lease_seconds
+            ),
+            renewing=True,
+        )
 
     async def attach_session(self, conversation_id: str) -> None:
         """Persist the session before dispatch so crash recovery can inspect it."""
@@ -111,24 +87,50 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
     ) -> None:
-        async with self._lock:
-            with workspace_scope(self.run.workspace_id):
-                run = await asyncio.to_thread(
-                    self._store.transition_starting_run,
-                    self.run,
-                    now=self._now,
-                    status=status,
-                    conversation_id=conversation_id,
-                    error=error,
-                    error_code=error_code,
-                )
-            if run is None:
-                raise StartupLeaseLost(
-                    f"Cannot update startup for run {self.run.id}: the run or its lease "
-                    "has changed or expired. Stop further startup actions and let recovery "
-                    "check the run."
-                )
-            self.run = run
+        await self._write(
+            lambda: self._store.transition_starting_run(
+                self.run,
+                now=self._now,
+                status=status,
+                conversation_id=conversation_id,
+                error=error,
+                error_code=error_code,
+            )
+        )
+
+    async def _write(
+        self, operation: Callable[[], ScheduledTaskRun | None], *, renewing: bool = False
+    ) -> None:
+        async def apply() -> None:
+            async with self._lock:
+                with workspace_scope(self.run.workspace_id):
+                    run = await asyncio.to_thread(operation)
+                if run is None or (
+                    renewing
+                    and (
+                        run.status != "starting"
+                        or run.lease_expires_at is None
+                        or run.lease_expires_at <= self._now()
+                    )
+                ):
+                    raise StartupLeaseLost(
+                        f"Cannot update startup for run {self.run.id}: the run or its lease "
+                        "has changed or expired. Stop further startup actions and let recovery "
+                        "check the run."
+                    )
+                self.run = run
+
+        # Cancelling the caller cannot stop a database thread. Keep its lock and
+        # refresh the snapshot before allowing the next write to use it.
+        write = asyncio.create_task(apply())
+        self._writes.add(write)
+        write.add_done_callback(self._write_done)
+        await asyncio.shield(write)
+
+    def _write_done(self, write: asyncio.Task[None]) -> None:
+        self._writes.discard(write)
+        if not write.cancelled():
+            write.exception()  # Retrieve errors even if the caller was cancelled.
 
 
 ClaimedFire = Callable[[ScheduledTask, StartupLease], Awaitable[None]]
@@ -140,13 +142,7 @@ async def _owns_every_host(_workspace_id: int, _host_id: str | None) -> bool:
 
 
 class PersistentTaskScheduler:
-    """Poll due tasks, claim occurrences, and supervise bounded concurrent startups.
-
-    Defaults: 30s polls/heartbeats and a 120s startup lease. The DB claim chooses
-    the replica unless a host ownership callback restricts eligibility.
-    Interrupted startups retain their database records for recovery. Application
-    wiring must provide recovery before enabling persistent scheduling.
-    """
+    """Poll due tasks and supervise bounded concurrent startups."""
 
     def __init__(
         self,
@@ -182,6 +178,7 @@ class PersistentTaskScheduler:
         self._loop: asyncio.Task[None] | None = None
         self._startups: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._poll_lock = asyncio.Lock()
+        self._stopped = False
         self._initialization_cursor: TaskCursor | None = None
 
     @property
@@ -190,15 +187,14 @@ class PersistentTaskScheduler:
 
     async def start(self) -> None:
         """Start a self-retrying poll loop; a DB outage must not disable scheduling."""
-        if self._loop is None:
-            self._loop = asyncio.create_task(self._run(), name="scheduled-task-poller")
+        async with self._poll_lock:
+            if self._loop is None:
+                self._stopped = False
+                self._loop = asyncio.create_task(self._run(), name="scheduled-task-poller")
 
     async def stop(self) -> None:
-        """Stop claiming, cancel local startups and await their shutdown.
-
-        Unfinished claims expire for reconciliation; cancellation never retries
-        or assumes that an in-flight remote action failed.
-        """
+        """Stop polling and cancel local startups; unfinished claims remain recoverable."""
+        self._stopped = True
         loop = self._loop
         if loop is not None:
             loop.cancel()
@@ -223,6 +219,8 @@ class PersistentTaskScheduler:
     async def poll_once(self) -> None:
         """One non-overlapping poll; useful for deterministic tests and embedders."""
         async with self._poll_lock:
+            if self._stopped:
+                return
             try:
                 await self._initialize()
             except Exception:
@@ -271,14 +269,14 @@ class PersistentTaskScheduler:
     async def _claim_due(self) -> None:
         cutoff = int(self._now())
         cursor: DispatchCursor | None = None
-        while len(self._startups) < self._max_startups:
+        while not self._stopped and len(self._startups) < self._max_startups:
             tasks = await asyncio.to_thread(
                 self._store.list_due_tasks, cutoff, after=cursor, limit=self._batch_size
             )
             if not tasks:
                 return
             for task in tasks:
-                if len(self._startups) >= self._max_startups:
+                if self._stopped or len(self._startups) >= self._max_startups:
                     return
                 assert task.next_run_at is not None
                 cursor = (task.next_run_at, task.workspace_id, task.id)
@@ -290,6 +288,8 @@ class PersistentTaskScheduler:
                         continue
                     now = int(self._now())
                     next_run = await asyncio.to_thread(next_scheduled_time, task, now)
+                    if self._stopped:
+                        return
                     with workspace_scope(task.workspace_id):
                         run = await asyncio.to_thread(
                             self._store.claim_scheduled_run,
@@ -299,7 +299,7 @@ class PersistentTaskScheduler:
                             host_id=host_id,
                             lease_seconds=self._lease_seconds,
                         )
-                    if run is not None:
+                    if run is not None and not self._stopped:
                         key = (run.workspace_id, run.id)
                         startup = asyncio.create_task(self._execute(task, run))
                         self._startups[key] = startup

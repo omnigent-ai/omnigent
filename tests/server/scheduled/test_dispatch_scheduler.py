@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from unittest.mock import AsyncMock
 
@@ -227,6 +228,135 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
         await scheduler.stop()
 
 
+async def test_cancelled_renewal_finishes_before_the_next_lease_update(store, monkeypatch):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    clock.advance(30)
+    committed = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = store.renew_starting_run
+
+    def slow_reply(*args, **kwargs):
+        updated = original(*args, **kwargs)
+        loop.call_soon_threadsafe(committed.set)
+        assert release.wait(10)
+        return updated
+
+    monkeypatch.setattr(store, "renew_starting_run", slow_reply)
+    renewal = asyncio.create_task(lease.check())
+    try:
+        await asyncio.wait_for(committed.wait(), 10)
+        renewal.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(renewal, 10)
+        # The database committed, but the cancelled caller has not received its result.
+        assert store.list_runs(task.id)[0][0].lease_expires_at > lease.run.lease_expires_at
+        finishing = asyncio.create_task(lease.finish("running"))
+        release.set()
+        await asyncio.wait_for(finishing, 10)
+        assert lease.run == store.list_runs(task.id)[0][0]
+        assert lease.run.status == "running"
+    finally:
+        release.set()
+        await asyncio.gather(renewal, return_exceptions=True)
+
+
+@pytest.mark.parametrize("interruption", ["lease_loss", "stop", "executor_error"])
+async def test_interrupted_executor_stops_and_leaves_run_recoverable(
+    store, monkeypatch, caplog, interruption
+):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    entered = asyncio.Event()
+    exited = asyncio.Event()
+
+    async def fire(task, lease):
+        entered.set()
+        try:
+            if interruption == "executor_error":
+                raise RuntimeError("executor could not complete startup")
+            await asyncio.Event().wait()
+        finally:
+            exited.set()
+
+    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, renewal_seconds=0.01)
+    try:
+        await scheduler.poll_once()
+        startups = list(scheduler._startups.values())
+        await asyncio.wait_for(entered.wait(), 10)
+        if interruption == "lease_loss":
+            monkeypatch.setattr(store, "renew_starting_run", lambda *args, **kwargs: None)
+        elif interruption == "stop":
+            await asyncio.wait_for(scheduler.stop(), 10)
+        await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
+        assert exited.is_set()
+        assert all(startup.cancelled() or startup.exception() is None for startup in startups)
+        assert scheduler._startups == {}
+        run = store.list_runs(task.id)[0][0]
+        assert run.status == "starting"
+        assert run.lease_expires_at is not None
+        if interruption == "executor_error":
+            assert "executor could not complete startup" in caplog.text
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize("blocked_at", ["ownership", "claim"])
+async def test_stop_prevents_a_poll_from_starting_more_work(store, monkeypatch, blocked_at):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = store.claim_scheduled_run
+
+    def block():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+
+    def claim(*args, **kwargs):
+        run = original(*args, **kwargs)
+        block()
+        return run
+
+    async def owns(workspace, host):
+        if blocked_at == "ownership":
+            await asyncio.to_thread(block)
+        return True
+
+    if blocked_at == "claim":
+        monkeypatch.setattr(store, "claim_scheduled_run", claim)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, owns_host=owns)
+    poll = asyncio.create_task(scheduler.poll_once())
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await asyncio.wait_for(scheduler.stop(), 10)
+        release.set()
+        await asyncio.wait_for(poll, 10)
+        await _drain(scheduler)
+        fire.assert_not_awaited()
+        runs = store.list_runs(task.id)[0]
+        assert len(runs) == (1 if blocked_at == "claim" else 0)
+        assert all(run.status == "starting" for run in runs)
+        clock.advance(3600)
+        await scheduler.poll_once()
+        assert store.list_runs(task.id)[0] == runs
+    finally:
+        release.set()
+        await asyncio.gather(poll, return_exceptions=True)
+        await scheduler.stop()
+
+
 async def test_lease_checkpoint_cannot_revive_expired_claim(store) -> None:
     task = _task(store)
     clock = FakeClock(task.next_run_at)
@@ -272,6 +402,13 @@ async def test_loop_retries_after_boot_database_outage_and_stops(store, monkeypa
     finally:
         await scheduler.stop()
     assert not scheduler.is_started
+    recovered.clear()
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(recovered.wait(), 10)
+        assert scheduler.is_started
+    finally:
+        await scheduler.stop()
 
 
 def test_d1_dispatch_is_rejected_before_polling(store, monkeypatch) -> None:
@@ -352,14 +489,14 @@ async def test_lease_expiring_while_waiting_for_row_lock_is_not_revived(
 
 
 @pytest.mark.parametrize("bootstrap", [False, True])
-@pytest.mark.parametrize("unexpected", [False, True])
+@pytest.mark.parametrize("failure", ["validation", "calculation", "unexpected"])
 async def test_schedule_search_failure_preserves_cursor_and_retries(
-    store, monkeypatch, bootstrap, unexpected
+    store, monkeypatch, bootstrap, failure
 ) -> None:
     from sqlalchemy import update
 
     from omnigent.db.db_models import SqlScheduledTask
-    from omnigent.server.scheduled import schedule
+    from omnigent.server.scheduled import dispatch_scheduler, schedule
     from omnigent.server.scheduled.rrule import RRuleSearchError
 
     task = _task(store)
@@ -374,18 +511,25 @@ async def test_schedule_search_failure_preserves_cursor_and_retries(
             )
     snapshot = store.get(task.id)
     original = schedule.get_next_fire_time
+    original_validate = dispatch_scheduler.validate_rrule
     failing = True
+
+    def validate(rule):
+        if failing and failure == "validation" and rule == "FREQ=HOURLY":
+            raise RRuleSearchError("RRULE validation exceeds the supported time limit")
+        return original_validate(rule)
 
     def calculate(rule, after, tz, *, anchor=None):
         # Distinguish the task without replacing schedule error handling.
-        if failing and rule == "FREQ=HOURLY":
-            if unexpected:
+        if failing and failure != "validation" and rule == "FREQ=HOURLY":
+            if failure == "unexpected":
                 raise OverflowError("invalid persisted timestamp")
             raise RRuleSearchError("RRULE search exceeds the supported time limit")
         return original(rule, after, tz, anchor=anchor)
 
     store.update(healthy.id, rrule="FREQ=HOURLY;INTERVAL=1")
     monkeypatch.setattr(schedule, "get_next_fire_time", calculate)
+    monkeypatch.setattr(dispatch_scheduler, "validate_rrule", validate)
 
     async def fire(task, lease):
         await lease.finish("running")
