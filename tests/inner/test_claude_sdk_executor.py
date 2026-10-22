@@ -2507,7 +2507,7 @@ async def test_turn_without_output_cap_keeps_cli_defaults() -> None:
 
 
 class TestBundlePluginGating(unittest.TestCase):
-    def _plugins_for_bundle(self, bundle_dir):
+    def _plugins_for_bundle(self, bundle_dir, *, skills_filter="all", capture=None):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
         executor = ClaudeSDKExecutor(
@@ -2517,12 +2517,15 @@ class TestBundlePluginGating(unittest.TestCase):
             gateway_auth_command="printf token",
             bundle_dir=bundle_dir,
             agent_name="my-agent",
+            skills_filter=skills_filter,
         )
 
         captured: dict[str, object] = {}
 
         async def fake_get_or_create_client(sdk, *, session_key, options, model):
             captured["plugins"] = getattr(options, "plugins", None)
+            if capture is not None:
+                capture["settings"] = options.settings
             raise RuntimeError("stop after options built")
 
         async def _t():
@@ -2537,6 +2540,35 @@ class TestBundlePluginGating(unittest.TestCase):
 
         _run(_t())
         return captured["plugins"]
+
+    def test_shared_plugin_settings_preserve_helper_and_hermetic_filter(self):
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from tests.spec.test_skill_sources import _claude_home_with_plugin
+        from tests.test_preference_plugins import plugin_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = _claude_home_with_plugin(
+                root / "home", plugin="toolkit", marketplace="source", skill="check", enabled=True
+            )
+            snapshot = plugin_snapshot(root / "preferences", "claude", {"toolkit@source": False})
+            before = (home / ".claude/settings.json").read_bytes()
+            with patch.dict(
+                os.environ,
+                {
+                    "HOME": str(home),
+                    "OMNIGENT_CONFIG_HOME": str(root / "config"),
+                    PREFERENCE_SNAPSHOT_ENV: str(snapshot),
+                },
+            ):
+                captured = {}
+                self._plugins_for_bundle(None, capture=captured)
+                settings = json.loads(captured["settings"])
+                self.assertEqual(settings["enabledPlugins"], {"toolkit@source": False})
+                self.assertEqual(settings["apiKeyHelper"], "printf token")
+                self._plugins_for_bundle(None, skills_filter="none", capture=captured)
+                self.assertNotIn("enabledPlugins", json.loads(captured["settings"]))
+            self.assertEqual((home / ".claude/settings.json").read_bytes(), before)
 
     def test_skill_less_bundle_emits_no_plugin(self):
         # No `skills/` directory -> empty `plugins` and no manifest written

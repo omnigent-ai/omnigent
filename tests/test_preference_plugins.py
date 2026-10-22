@@ -130,3 +130,44 @@ def test_import_reads_user_toggles_without_project_or_managed_policy(tmp_path, m
         ): False,
         PreferenceKey(PreferenceKind.PLUGIN, PluginIdentity("codex", "source-b", "shared")): True,
     }
+
+
+def test_sdk_discovery_keeps_only_plugin_config_and_honors_minimal_mode(tmp_path, monkeypatch):
+    import tomllib
+
+    from omnigent.preference_plugins import codex_sdk_plugin_skills
+
+    source = tmp_path / "source"
+    (source / "plugins/cache").mkdir(parents=True)
+    (source / "auth.json").write_text('{"test": "private"}')
+    (source / "config.toml").write_text(
+        '[marketplaces.team]\nsource_type = "local"\nsource = "/test/market"\n'
+        '[plugins."tool@team"]\nenabled = true\n'
+        '[model_providers.private]\nexperimental_bearer_token = "private"\n'
+        '[mcp_servers.private]\ncommand = "do-not-run"\n'
+    )
+    snapshot = plugin_snapshot(tmp_path / "snapshot", "codex", {"tool@team": False})
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(snapshot))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("HARNESS_CODEX_MINIMAL_CONFIG", raising=False)
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "/test/codex")
+    monkeypatch.setattr("omnigent.spec.codex_plugin_skills._inventory_plugins", lambda *a, **k: [])
+    discoveries = []
+
+    def discover(private, skills_filter, *, cwd):
+        config = tomllib.loads((private / "config.toml").read_text())
+        assert set(config) == {"marketplaces", "plugins"}
+        assert config["plugins"]["tool@team"]["enabled"] is False
+        assert not (private / "auth.json").exists()
+        assert (private / "plugins/cache").resolve() == (source / "plugins/cache").resolve()
+        discoveries.append(private)
+        return []
+
+    monkeypatch.setattr("omnigent.spec.codex_plugin_skills.discover_codex_plugin_skills", discover)
+    assert codex_sdk_plugin_skills(source, tmp_path, "all") == []
+    assert len(discoveries) == 1 and not discoveries[0].exists()
+    monkeypatch.setenv("HARNESS_CODEX_MINIMAL_CONFIG", "1")
+    assert codex_sdk_plugin_skills(source, tmp_path, "all") == []
+    assert codex_sdk_plugin_skills(source, tmp_path, "none") is None
+    assert codex_sdk_plugin_skills(source, tmp_path, ["check"]) is None
+    assert len(discoveries) == 1

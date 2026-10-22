@@ -111,7 +111,8 @@ def test_installed_plugin_survives_marketplace_failure(
     assert selected_version() is None
 
 
-def test_shared_plugins_isolated_through_real_app_server_startup(tmp_path):
+@pytest.mark.parametrize("mode", ["native", "sdk"])
+def test_shared_plugins_isolated_through_real_app_server_startup(tmp_path, mode):
     import json
     import sys
     from concurrent.futures import ThreadPoolExecutor
@@ -151,6 +152,27 @@ from omnigent.harnesses.codex_native.app_server import (
 from omnigent.preference_models import adopted_model
 async def run():
     root = Path(sys.argv[2])
+    if sys.argv[4] == "sdk":
+        from omnigent.inner.codex_executor import _CodexAppServerSession
+        model = adopted_model("codex-native", Path(sys.argv[3]))
+        app = _CodexAppServerSession(codex_path=sys.argv[1], cwd=sys.argv[3],
+            env=dict(os.environ), tool_executor=None,
+            codex_config_overrides=[f"model={json.dumps(model)}"])
+        await app.start()
+        try:
+            skills = await app._request("skills/list", {"cwds": [sys.argv[3]]})
+            config = await app._request("config/read", {})
+            from omnigent.spec.skill_sources import (
+                SkillSourceContext, resolve_harness_skills,
+            )
+            ctx = SkillSourceContext((Path(sys.argv[3]),), Path.home(), "all", None)
+            menu = resolve_harness_skills(ctx, "codex")
+            assert all(skill.skill_dir.exists() for skill in menu if skill.skill_dir)
+            print(json.dumps({"skills": skills, "config": config,
+                "menu": [skill.name for skill in menu]}))
+        finally:
+            await app.close()
+        return
     app = CodexNativeAppServer(codex_path=sys.argv[1], socket_path=root / "socket",
         codex_home=root / "codex", env=dict(os.environ), config_overrides=[],
         cwd=Path(sys.argv[3]), bridge_dir=root / "bridge", trust_project=True,
@@ -210,7 +232,7 @@ asyncio.run(run())
             base_env={"PATH": os.environ["PATH"]},
         )
         result = subprocess.run(
-            [sys.executable, "-c", script, codex, str(root), str(workspace)],
+            [sys.executable, "-c", script, codex, str(root), str(workspace), mode],
             env=environment,
             capture_output=True,
             text=True,
@@ -228,6 +250,8 @@ asyncio.run(run())
             if skill.get("enabled") is True and "/plugins/cache/" in skill.get("path", "")
         ]
         assert bool(active) is enabled, skills
+        if mode == "sdk":
+            assert ("preferences-check:check" in response["menu"]) is enabled, response["menu"]
         assert all("preferences-check" in skill["path"] for skill in active)
         return root
 

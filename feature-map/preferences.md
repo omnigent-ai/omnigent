@@ -7,7 +7,7 @@ and an opt-in server API for durable edits and conflicts. Explicit shared/machin
 the CLI. Connected CLI launches and user-owned hosts adopt cached/shared defaults
 at startup; browser controls and managed startup remain separate. Pending edits
 retry on host reconnect without polling between messages.
-Native Claude/Codex sessions also apply plugin toggles in private settings.
+Claude/Codex native and SDK sessions also apply plugin toggles in private settings.
 Native startup applies adopted model defaults and retains known-unavailable choices.
 Saved native arguments are applied once by the runner, including browser launches.
 
@@ -97,7 +97,7 @@ A deployment can opt new machines into discovery with `OMNIGENT_SHARED_PREFERENC
 the default is off. See the [startup guide](../docs/shared-preferences-startup.md).
 
 **Shared plugins:** add `--plugins claude --plugins codex` to the import preview
-to include explicit native user toggles. After adoption, native sessions use
+to include explicit native user toggles. After adoption, native and SDK sessions use
 private settings for installed plugins. Missing plugins remain requested and
 produce a warning; installation stays local. See the
 [plugin guide](../docs/shared-preferences-plugins.md).
@@ -212,20 +212,22 @@ the import. Native toggles require the explicit `--plugins` options.
 
 **Shared plugins (own environment):**
 
-The real Codex scenario below also reads the native effective model config for
+The real Codex scenario below also reads the effective model config for
 each frozen workspace. Distinct model values survive concurrent startup. It does
 not send a model request or establish provider availability.
 
 ```sh
 uv run --no-sync pytest tests/test_preference_plugins.py \
+  tests/inner/test_claude_sdk_executor.py \
   tests/harnesses/claude_native/test_claude_native_bridge.py::test_shared_plugins_are_private_invocation_settings \
   tests/harnesses/codex_native/test_skill_discovery.py::test_shared_plugins_isolated_through_real_app_server_startup --reruns 0 -q -rs
 ```
 
 The Codex journey requires the native CLI. It installs a local fixture, starts
-two real app-server child processes with opposite saved toggles, reads each
-loaded skill catalog and checks the original global config remains unchanged.
-No provider/model is called. Claude checks invocation settings, project/session
+two real app-server child processes with opposite saved toggles for each native
+and SDK variant, reads each loaded skill catalog, and checks the SDK menu agrees
+and the original global config remains unchanged.
+No provider/model is called. Claude checks native/SDK invocation settings, project/session
 and managed precedence, missing-plugin intent and hermetic filtering; it does
 not execute a vendor model or prove Claude loaded the plugin. Run the shared
 operations recipe above for the actual CLI import and restore transport.
@@ -298,7 +300,7 @@ the correctness scenarios above.
   resolutions stop permanently; reads and identical retries still work.
 - Request parsing currently has no route-specific body-size or rate limit.
   Add these before broad activation; the value cap applies after JSON parsing.
-- Managed deployment, Universe wiring, Arclet startup, SDK plugin consumers,
+- Managed deployment, Universe wiring, Arclet startup,
   and live per-harness model availability remain unverified follow-ups. Startup adoption
   carries portable intent; each adapter must still apply and report its capabilities.
 - `--global` means this machine's user YAML, not a shared workspace write.

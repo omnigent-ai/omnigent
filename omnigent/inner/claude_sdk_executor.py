@@ -2670,6 +2670,25 @@ class ClaudeSDKExecutor(Executor):
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
         settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        if self._skills_filter == "all":
+            from omnigent.preference_plugins import claude_plugin_overlay
+            from omnigent.spec.skill_sources import skill_source_context_from_env
+
+            roots = tuple(
+                path
+                for path in (pathlib.Path(self._cwd) if self._cwd else None, self._bundle_dir)
+                if path is not None
+            )
+            overlay = await asyncio.to_thread(
+                claude_plugin_overlay,
+                skill_source_context_from_env(roots=roots, harness="claude-sdk"),
+            )
+            if overlay.enabled:
+                settings = json.loads(settings_payload or "{}")
+                settings["enabledPlugins"] = overlay.enabled
+                settings_payload = json.dumps(settings)
+            for warning in overlay.warnings:
+                logger.warning("%s", warning)
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []

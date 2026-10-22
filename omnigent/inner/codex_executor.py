@@ -2990,6 +2990,22 @@ class _CodexAppServerSession:
                 else None
             ),
         )
+        if (
+            self._signer is None
+            and self._skills_filter == "all"
+            and not codex_minimal_config_requested()
+        ):
+            from omnigent.preference_plugins import apply_codex_plugin_overlay
+
+            overlay = await asyncio.to_thread(
+                apply_codex_plugin_overlay,
+                self._codex_home_dir,
+                config_source,
+                Path(self._cwd or os.getcwd()),
+                codex_path=self._codex_path,
+            )
+            for warning in overlay.warnings:
+                logger.warning("%s", warning)
         self._codex_config_overrides = materialize_codex_provider_config(
             self._codex_home_dir,
             self._codex_config_overrides,

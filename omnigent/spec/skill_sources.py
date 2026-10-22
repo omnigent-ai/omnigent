@@ -389,9 +389,9 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
                 # real bool from a weaker-precedence tier).
                 if isinstance(value, bool):
                     state[key] = value
-    if ctx.is_native:
-        from omnigent.preference_plugins import claude_plugin_overlay
+    from omnigent.preference_plugins import claude_plugin_overlay
 
+    if ctx.is_native or ctx.skills_filter == "all":
         state.update(claude_plugin_overlay(ctx).enabled)
     enabled = {key for key, on in state.items() if on}
     # Managed (policy) plugins are force-enabled at the highest precedence and
@@ -567,6 +567,15 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
     cwd = ctx.roots[0] if ctx.roots else None
+    if not ctx.is_native:
+        from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+        from omnigent.preference_plugins import codex_sdk_plugin_skills
+
+        adopted = codex_sdk_plugin_skills(
+            _codex_home_config_source_from_env(), cwd or Path.cwd(), ctx.skills_filter
+        )
+        if adopted is not None:
+            return out + adopted
     out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
     return out
 

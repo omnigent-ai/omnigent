@@ -13,6 +13,7 @@ from omnigent.preferences import PluginIdentity, PreferenceKey, PreferenceKind
 
 if TYPE_CHECKING:
     from omnigent.spec.skill_sources import SkillSourceContext
+    from omnigent.spec.types import SkillSpec
 
 
 @dataclass(frozen=True)
@@ -186,3 +187,47 @@ def import_plugin_values(ecosystems: tuple[str, ...]) -> dict[PreferenceKey, boo
                 PreferenceKey(PreferenceKind.PLUGIN, PluginIdentity(ecosystem, parts[1], parts[0]))
             ] = enabled
     return values
+
+
+def codex_sdk_plugin_skills(
+    source_home: Path, workspace: Path, skills_filter: str | list[str]
+) -> list[SkillSpec] | None:
+    """Discover through the same private user tier as SDK startup; keep stable asset paths."""
+    if skills_filter != "all" or not requested_plugins("codex", workspace):
+        return None
+    import logging
+    from dataclasses import replace
+    from tempfile import TemporaryDirectory
+
+    import tomlkit
+
+    from omnigent.inner.codex_executor import _find_codex_cli, codex_minimal_config_requested
+    from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
+
+    if codex_minimal_config_requested():
+        return []
+    codex = _find_codex_cli()
+    if codex is None:
+        return []
+    with TemporaryDirectory(prefix="omnigent-preference-skills-") as directory:
+        private = Path(directory)
+        # Discovery needs marketplace registration, but no provider/auth config or hooks.
+        source_config = source_home / "config.toml"
+        document = tomlkit.parse(source_config.read_text() if source_config.exists() else "")
+        config = {
+            key: document[key]
+            for key in ("plugins", "marketplaces", "projects")
+            if key in document
+        }
+        (private / "config.toml").write_text(tomlkit.dumps(config))
+        cache = source_home / "plugins/cache"
+        if cache.is_dir():
+            (private / "plugins").mkdir()
+            (private / "plugins/cache").symlink_to(cache.resolve(), target_is_directory=True)
+        overlay = apply_codex_plugin_overlay(private, source_home, workspace, codex_path=codex)
+        for warning in overlay.warnings:
+            logging.getLogger(__name__).warning("%s", warning)
+        return [
+            replace(skill, skill_dir=skill.skill_dir.resolve() if skill.skill_dir else None)
+            for skill in discover_codex_plugin_skills(private, skills_filter, cwd=workspace)
+        ]
