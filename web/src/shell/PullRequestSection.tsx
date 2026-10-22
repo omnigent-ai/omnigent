@@ -15,12 +15,8 @@ export function PullRequestSectionHeader({
   action?: ReactNode;
 }) {
   return (
-    <div className="flex h-5 items-center gap-1">
-      {/* leading-none centers the capitals on the trigger's icon. */}
-      <h3
-        id={id}
-        className="text-xs leading-none font-medium tracking-wide text-muted-foreground uppercase"
-      >
+    <div className="flex items-center gap-1">
+      <h3 id={id} className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
         {title}
       </h3>
       {action}
@@ -28,12 +24,9 @@ export function PullRequestSectionHeader({
   );
 }
 
-/** Classes for the header's ghost `icon-xs` trigger, which overhangs the row. */
-export const PULL_REQUEST_SECTION_ACTION_CLASS = "-my-0.5 text-muted-foreground";
-
 /** Base classes of a reviewer or label chip; callers add the shape. */
 export const PULL_REQUEST_CHIP_CLASS =
-  "inline-flex h-6 max-w-full min-w-0 items-center gap-1.5 border border-border bg-muted/20 px-2 text-xs";
+  "inline-flex max-w-full min-w-0 items-center gap-1.5 border border-border bg-muted/20 px-2 py-0.5 text-xs";
 
 /** A chip's trailing icon button, e.g. remove. */
 export function PullRequestChipAction({
@@ -53,7 +46,7 @@ export function PullRequestChipAction({
       aria-label={label}
       title={title}
       onClick={onClick}
-      className="-mr-1 shrink-0 cursor-pointer rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+      className="shrink-0 cursor-pointer rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
     >
       <Icon aria-hidden className="size-3" />
     </button>

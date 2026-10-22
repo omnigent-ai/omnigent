@@ -25,7 +25,6 @@ import {
 } from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_CHIP_CLASS,
-  PULL_REQUEST_SECTION_ACTION_CLASS,
   PullRequestChipAction,
   PullRequestSectionHeader,
 } from "./PullRequestSection";
@@ -96,7 +95,7 @@ function PullRequestLabelPicker({
           variant="ghost"
           size="icon-xs"
           aria-label="Edit labels"
-          className={PULL_REQUEST_SECTION_ACTION_CLASS}
+          className="text-muted-foreground"
         >
           <PlusIcon aria-hidden className="size-3.5" />
         </Button>
