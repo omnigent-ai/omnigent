@@ -202,6 +202,10 @@ exists. Add an owner/next step for unresolved rows.
   bench observations; it does not validate this entire checklist or browser UI.
 - Tool, reasoning and interrupt probes are independent checks, not a substitute
   for a single session surviving tools, effort changes and follow-ups.
+- For Pi gateway reasoning, include a model whose metadata exists only in its
+  vendor catalog (for example GPT), alongside a Databricks-catalog model (Gemini).
+  Observe outgoing effort through a tool result and follow-up; a pre-enriched
+  model fixture or a visible High label alone misses catalog fallback failures.
 - Browser reload is not runner restart; neither is credential renewal. Test
   the boundary affected by the change and name unrun boundaries explicitly.
 - Use the same baseline for all affected harnesses. Until a gap is covered,
