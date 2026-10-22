@@ -114,11 +114,23 @@ class OidcLoginManagerTest {
     @Test
     fun `second start while in-flight returns false`() {
         val activity = this.activity
-        // Start a flow against an unreachable server — the background task stays
-        // in-flight until it fails or times out, but inFlight is set synchronously.
-        manager.start(activity, UNREACHABLE, {})
-
-        assertFalse(manager.start(activity, UNREACHABLE, {}))
+        val requestEntered = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        val (origin, _) =
+            startOrigin(onLogin = {
+                requestEntered.countDown()
+                releaseRequest.await(10, TimeUnit.SECONDS)
+            })
+        try {
+            assertTrue(manager.start(activity, origin, {}))
+            assertTrue(
+                "first ticket request did not start",
+                requestEntered.await(10, TimeUnit.SECONDS),
+            )
+            assertFalse(manager.start(activity, origin, {}))
+        } finally {
+            releaseRequest.countDown()
+        }
     }
 
     @Test
