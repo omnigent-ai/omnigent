@@ -1954,7 +1954,7 @@ def test_gateway_seeds_managed_settings_from_global_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Gateway mode copies global Pi settings into the managed agent dir."""
+    """Gateway mode seeds the managed agent dir from the user's ``PI_CODING_AGENT_DIR``."""
     global_agent = tmp_path / "pi-agent"
     global_agent.mkdir()
     (global_agent / "settings.json").write_text(
@@ -1962,10 +1962,8 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         encoding="utf-8",
     )
     (global_agent / "npm").mkdir()
-    monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
-        global_agent,
-    )
+    (global_agent / "mcp.json").write_text('{"mcpServers": {"custom": {}}}', encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
@@ -1985,6 +1983,7 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         assert settings["extensions"] == ["/ext/demo.ts"]
         assert settings["packages"] == ["npm:@x/y"]
         assert (managed_dir / "npm").is_symlink()
+        assert (managed_dir / "mcp.json").resolve() == (global_agent / "mcp.json").resolve()
     finally:
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
@@ -2111,7 +2110,7 @@ async def test_gateway_refresh_reuses_process_and_fails_closed(
     private_dir = tmp_path / "Pi's config"
     private_dir.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "pi-agent")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "pi-agent"))
     monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
     current_token = "initial-token"
 

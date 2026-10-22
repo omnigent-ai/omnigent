@@ -76,7 +76,12 @@ def _symlink_agent_resource_dirs(
     """Symlink shareable entries of *global_agent_dir* into *managed_dir*."""
     if not global_agent_dir.is_dir():
         return
-    for source in sorted(global_agent_dir.iterdir()):
+    try:
+        sources = sorted(global_agent_dir.iterdir())
+    except OSError as exc:
+        _logger.warning("Could not list Pi agent resources at %s: %s", global_agent_dir, exc)
+        return
+    for source in sources:
         if source.name in _UNSHARED_AGENT_DIR_ENTRIES:
             continue
         target = managed_dir / source.name
