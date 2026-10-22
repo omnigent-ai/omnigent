@@ -55,8 +55,9 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
+  reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
     type: databricks
     profile: oss             # Databricks profile for model routing
@@ -64,6 +65,13 @@ executor:
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
+
+`executor.reasoning_effort` sets the agent's default reasoning effort. It applies
+to the main session and to every sub-agent dispatch that doesn't pass its own
+per-dispatch effort, and is validated against the harness's effort vocabulary at
+launch. The older `llm.reasoning_effort` is still accepted as a back-compat alias
+(lifted to `executor.reasoning_effort` at parse time); when both are set,
+`executor.reasoning_effort` takes precedence.
 
 The `cursor` harness (Cursor's `cursor-agent`) is the exception: it talks
 only to Cursor's own backend and has no custom API base-URL, so the Databricks
@@ -89,14 +97,126 @@ and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
 Gemini API key, or Vertex AI (`project` / `location`) — the SDK is
 Gemini-native and has no OpenAI-compatible gateway / Databricks path.
 
+For the native `omni agy` CLI, use the separate
+[native agy gateway guide](native-agy-gateways.md), which covers native Gemini
+gateways and Databricks profiles configured through `omni setup`.
+
 ```yaml
 executor:
-  harness: antigravity         # aliases: agy, google-antigravity
+  harness: antigravity         # aliases: agy, google-antigravity (native: antigravity-native, agy-native)
   model: gemini-3.5-flash
   auth:
     type: api_key
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
+
+### Pi context files
+
+With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
+and `CLAUDE.md` from the workspace, its ancestors, Pi's global agent directory,
+and the agent bundle's root. To disable this discovery for an agent, set
+`context_files: false`:
+
+```yaml
+name: focused-agent
+executor:
+  harness: pi
+  context_files: false
+prompt: |
+  Follow these explicit agent instructions.
+```
+
+For a directory bundle using `config.yaml`, place the option in `executor.config`:
+
+```yaml
+spec_version: 1
+name: focused-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    context_files: false
+instructions: AGENTS.md
+```
+
+The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
+`instructions:` content (including an explicitly referenced `AGENTS.md`) and
+Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
+`--no-context-files` flag. It does not disable skills, extensions, or Pi's
+separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
+or other harnesses.
+
+### Pi bundle resources
+
+A `harness: pi` directory bundle can ship Pi's own project-local resources, and
+sessions load them even though Pi runs in the session workspace rather than in
+the bundle:
+
+- `.pi/extensions/<name>/` directories (or top-level `.pi/extensions/*.ts` /
+  `*.js` files) are passed to Pi with `--extension`; `package.json`
+  `pi.extensions` entries must be files inside the extension directory.
+  Extensions run as code inside the Pi process, so bundle only extensions you
+  trust. Hook-style extensions (for example `before_agent_start`) take full
+  effect; tools an extension registers are loaded but not offered to the model,
+  because sessions expose only Omnigent's bridged tools to Pi.
+- `skills/<name>/SKILL.md` and `.pi/skills/<name>/SKILL.md` are passed with
+  `--skill` and follow the `skills` filter; when both roots define the same
+  name, `skills/` wins.
+- A bundle-root `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` (Pi's order) is
+  appended to the agent's instructions as an automatic context file. It is not
+  appended twice when the spec already adopted that same file as its
+  `instructions:`, and `context_files: false` disables it; an `AGENTS.md` the
+  spec already adopted as the agent's instructions is unaffected by that option.
+
+Under an `os_env` sandbox, Pi is granted read-only access to the `skills/`,
+`.pi/skills/` and `.pi/extensions/` directories it is passed, so bundled
+resources load from inside the sandbox too; the bundle root itself is not
+exposed.
+
+### Pi system prompt
+
+With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed
+instructions to Pi:
+
+- `append` (default) keeps Pi's base prompt and appends Omnigent's instructions
+  using `--append-system-prompt`. The base is Pi's built-in coding prompt or a
+  discovered `SYSTEM.md`.
+- `replace` sends Omnigent's instructions as the base using `--system-prompt`.
+  Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
+  empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
+
+To replace the base prompt and disable workspace context discovery:
+
+```yaml
+name: support-agent
+executor:
+  harness: pi
+  system_prompt_mode: replace
+  context_files: false
+prompt: |
+  You are a customer-support assistant.
+```
+
+For a directory bundle, set `executor.config.system_prompt_mode`:
+
+```yaml
+spec_version: 1
+name: support-agent
+executor:
+  type: omnigent
+  config:
+    harness: pi
+    system_prompt_mode: replace
+    context_files: false
+instructions: AGENTS.md
+```
+
+Both modes preserve explicit agent instructions, per-request instructions, and
+Omnigent's appended runtime instructions. Replacement removes Pi's default tool
+summaries and coding guidelines; tool schemas and execution still work.
+`context_files` is independent and still defaults to `true`. Skills, the working
+directory footer, and extension hooks remain active; extensions can modify the
+final prompt. This setting only supports `pi`, not `pi-native` or other harnesses.
 
 ### GitHub Copilot
 
@@ -169,6 +289,63 @@ executor:
 CLI flags such as `--harness qwen` and `--model <id>` can override or supply
 missing executor values.
 
+## Custom ACP agents
+
+`harness: acp:<slug>` runs any configured Agent Client Protocol server command.
+Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
+derived from the agent name.
+
+OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
+`mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
+use its own tools, routing, memory, and channels:
+
+```yaml
+acp:
+  agents:
+    - name: OpenClaw
+      command: openclaw acp --url <gateway-url> --token-file <token-file>
+      omnigent_mcp: false
+```
+
+Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
+app. See the [OpenClaw integration guide](openclaw.md) for registry import,
+Gateway setup, and compatibility details.
+
+To offer a curated model picker for a custom ACP agent, explicitly reference a
+named provider in its agent spec:
+
+```yaml
+executor:
+  harness: acp:helper
+  auth:
+    type: provider
+    name: team-gateway
+```
+
+Configure at least two distinct model IDs in that provider's family `models:`
+map in `config.yaml`, for example `models: {default: model-a, fast: model-b}`.
+Tier aliases resolve to concrete IDs. The provider default leads the picker;
+session selections cannot add models to the configured list. A default-only
+map leaves model switching unrestricted, and an unrelated global default
+provider does not change custom ACP agents. An explicitly selected provider
+must resolve successfully; configuration errors do not remove model restrictions.
+
+With curation enabled, a model pinned in the spec or ACP-agent configuration
+must also appear in the list. An unlisted default prevents launch even when a
+valid override is selected; clearing a selection restores the approved default.
+
+The ACP command still owns its gateway URL and authentication; this provider
+reference supplies model choices, not credentials. Configure matching provider
+definitions on the server and execution host. Select a model from the session
+composer and send a turn to apply it through ACP without losing the live
+session, provided the command supports ACP model switching. If the switch fails,
+the turn reports an error without sending the prompt on the previous model.
+Retrying attempts the switch again in the same session.
+
+Set `OMNIGENT_ACP_ENV_UNSET` on the execution host to a comma-separated list of
+environment variable names to remove from the ACP command's environment. The
+setting propagates through the runner and affects newly spawned commands.
+
 ## Local OS access
 
 Declare `os_env` only for agents that need local file/shell tools.
@@ -184,6 +361,123 @@ os_env:
     allow_network: true
 ```
 
+On Linux, the `openai-agents` harness supports disposable copy-on-write mounts:
+
+```yaml
+executor:
+  harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    write_paths:
+      - ./artifacts
+      - path: ./dependencies
+        copy_on_write: true
+
+terminals:
+  bash:
+    command: bash
+    os_env: inherit
+```
+
+Create `artifacts` and `dependencies` before starting the session. The agent
+sees `dependencies` at its original path and can create, edit, rename, and delete
+files there. `sys_os_*` tools, shell commands, and inherited terminals share those
+changes, including across turns and terminal reopen. The host's original files
+stay unchanged. Writes to `artifacts` persist normally. A string entry is
+shorthand for `{path: ..., copy_on_write: false}`.
+
+The disposable view belongs to the session's OS environment. Its changes are
+discarded when that environment closes; they are not restored after a runner
+restart. Separate sessions get separate views. Export anything to keep into a
+persistent write path before closing the session. Overlay data uses temporary
+memory-backed storage and consumes memory/swap as files are copied up.
+
+<a id="copy-on-write-requirements"></a>
+
+**Host requirements apply only to paths with `copy_on_write: true`.** Ordinary
+`read_paths` and persistent `write_paths` retain their existing sandbox
+requirements; they do not need OverlayFS or Bubblewrap 0.11's overlay options.
+The requirements are checked on the machine running the sandbox, not the UI:
+
+- **Bubblewrap 0.11+**, providing `--overlay-src` and `--tmp-overlay`.
+- **Unprivileged OverlayFS mounts with `userxattr` support.** These are supported
+  by upstream Linux **5.11+**; some distributions backport them to older kernels.
+  The temporary upper layer has an additional requirement below.
+- **tmpfs `user.*` extended attributes**, added upstream in **Linux 6.6**,
+  for Bubblewrap's temporary upper layer. The upstream baseline for this
+  implementation is therefore **6.6+**, or equivalent distro backports of both
+  features. Older tmpfs can allow mounting but fail later directory operations.
+- **Kernel facilities:** user/mount namespaces (`CONFIG_NAMESPACES`,
+  `CONFIG_USER_NS`), OverlayFS (`CONFIG_OVERLAY_FS`, built in or an available
+  module), and tmpfs with extended attributes (`CONFIG_TMPFS`, `CONFIG_TMPFS_XATTR`).
+- **Host permission to use those facilities:** sufficient `user.max_user_namespaces`
+  and `user.max_mnt_namespaces` quotas, and `kernel.unprivileged_userns_clone=1`
+  on distributions that expose that switch. AppArmor, SELinux, seccomp, or an
+  enclosing container must allow namespace creation/entry and OverlayFS mounts.
+  For example, Ubuntu 24.04's AppArmor restrictions can block unprivileged user
+  namespaces even on a recent kernel; use an administrator-approved policy for
+  the sandbox launcher. Omnigent does not change host security settings.
+
+Omnigent attempts the actual mounts and tests tmpfs user extended attributes
+when initializing a copy-on-write environment. It does not reject a working
+distro backport based on `uname`, or accept a host solely because its kernel is
+new enough. Failure reports the running kernel,
+these prerequisites, and Bubblewrap's original error. Unsupported hosts fail
+before running tools in that environment; they never fall back to writing the
+original directory. A missing or unlaunchable Bubblewrap binary and a mount
+startup timeout also produce copy-on-write-specific errors.
+
+To check support, run this as the same user and inside the same container/VM as
+the runner, from a directory containing an existing `dependencies` folder:
+
+```bash
+uname -r
+bwrap --version
+cow_probe_dir=$(mktemp -d)
+bwrap --unshare-user --ro-bind / / \
+  --overlay-src "$PWD/dependencies" --tmp-overlay "$PWD/dependencies" \
+  --tmpfs "$cow_probe_dir" \
+  -- python3 -c 'import os,sys,tempfile; f=tempfile.TemporaryFile(dir=sys.argv[1]); os.setxattr(f.fileno(), "user.cow_probe", b"1")' "$cow_probe_dir"
+cow_probe_status=$?
+rmdir "$cow_probe_dir"
+test "$cow_probe_status" -eq 0
+```
+
+The probe should exit successfully without changing `dependencies`.
+An unknown overlay option indicates an old Bubblewrap build. A namespace or
+mount permission error can indicate host policy restrictions; an unsupported
+filesystem/option can indicate missing kernel support. The original diagnostic
+and the host's security logs distinguish these cases.
+
+See the [Bubblewrap manual](https://github.com/containers/bubblewrap/blob/v0.12.0/bwrap.xml),
+[kernel OverlayFS documentation](https://docs.kernel.org/filesystems/overlayfs.html),
+and [Linux 6.6 tmpfs extended-attribute handlers](https://github.com/torvalds/linux/blob/v6.6/mm/shmem.c#L3711).
+
+Copy-on-write paths must name existing directories. Nested copy-on-write roots,
+persistent write paths inside a copy-on-write root, and `write_files` within one
+are rejected. `os_env.fork` and sandbox overrides are also unsupported with
+copy-on-write paths. A persistent parent with a copy-on-write child is supported.
+Other harnesses are rejected because their native tools do not yet share the
+session's mount namespace. File uploads, agent bundle downloads, local agent
+config discovery, skill loading/reading, and session creation from `config_path` return an
+explicit unsupported-operation error in copy-on-write sessions. Use `sys_os_*`
+and inherited terminals for filesystem operations, and export results to a
+persistent write path.
+
+The lower directory should remain unchanged on the host while its overlay is
+active; OverlayFS does not provide a snapshot of concurrent host edits.
+
+To verify this example, ask the agent to write `dependencies/probe.txt` using
+`sys_os_write`, then read and edit it in the inherited bash terminal. Ask the
+agent to read the terminal's edit and save a copy under `artifacts`. From an
+ordinary host terminal, confirm that `dependencies/probe.txt` was not created
+and the exported artifact exists. Start a new session and confirm that its
+`dependencies` view contains only the original files.
+
 For trusted local development, examples may use `sandbox.type: none`:
 
 ```yaml
@@ -198,10 +492,23 @@ Prefer the narrowest filesystem and network access that supports the task. Do
 not pass secrets through the environment unless the tool genuinely needs them.
 
 You usually don't need to choose a `sandbox.type` — omit it and Omnigent picks
-the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS), so the
-same YAML works across platforms. For the full set of sandbox options, how to
-share one policy across `sys_os_*` and terminals, and how to set up network
-egress rules, see the `sandbox:` examples below and the sandbox source under `omnigent/inner/`.
+the platform default (`linux_bwrap` on Linux, `darwin_seatbelt` on macOS, or
+`windows_jobobject` on Windows), so the same YAML works across platforms. Use
+`type: auto` to explicitly request the platform-default sandbox backend:
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+```
+
+`auto` and an omitted `type` resolve identically. `type: null` and `type: none`
+both explicitly disable the sandbox. For the full set of sandbox options, how
+to share one policy across `sys_os_*` and terminals, and how to set up network
+egress rules, see the `sandbox:` examples below and the sandbox source under
+`omnigent/inner/`.
 
 ### Secretless credential proxy
 
@@ -237,9 +544,144 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+### Git over SSH from a sandbox
+
+`sandbox.git_ssh` grants one Git repository and one SSH operation at a time.
+The trusted parent runs OpenSSH with the private key. The sandbox receives a
+Git transport helper and a private Unix socket; it cannot read the key or
+connect directly to the SSH host. Use a read-only deploy key for `fetch` when
+the server supports one.
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto # resolves to linux_bwrap or darwin_seatbelt
+    git_ssh:
+      - host: github.com
+        port: 22
+        username: git
+        repository: my-org/my-repo.git
+        operations: [fetch]
+        identity_file: /home/runner/.ssh/my-repo-deploy-key
+        known_hosts_file: /home/runner/.ssh/github-pinned-host-key
+```
+
+The `known_hosts_file` must contain one exact host key entry for `host`, for
+example `github.com ssh-ed25519 <public-key>`. Record the expected key through
+a trusted channel; do not accept an unverified `ssh-keyscan` result. Keep both
+files outside sandbox read and write paths. Use literal absolute file paths;
+`~` is not expanded. The same binding can be used from
+`sys_os_shell` and sandboxed terminals. Run `git clone
+git@github.com:my-org/my-repo.git` or `git fetch` as usual. Add `push` to
+`operations` only for a write-capable key, and add separate bindings for
+submodules or other repositories.
+
+DNS names are resolved by the parent for each connection, and every returned
+address must be allowed. Public addresses need no extra setting. For a private
+SSH server, set `allowed_cidrs` on that binding to the narrow network range
+that contains its addresses. The parent pins the chosen address for the SSH
+connection and verifies the SSH host key against the configured name.
+Loopback remains blocked unless a local development binding uses a loopback IP
+literal, its exact `/32` CIDR, and `allow_loopback: true` together. Do not use
+that option for a shared or production SSH server.
+
+This grant covers Git's `git-upload-pack` and, when explicitly allowed,
+`git-receive-pack`. It does not grant a shell, arbitrary SSH commands, or Git
+LFS HTTP authentication. Local `linux_bwrap` and `darwin_seatbelt` sandboxes
+support it; other backends reject the setting.
+
+### Refreshing proxy credentials
+
+File and Unix socket credential sources can opt into renewal with
+`refresh_interval_seconds`. The trusted parent re-reads the source on the first
+request after that interval; sandbox placeholders stay the same. For example,
+a local token broker can mint replacement GitHub App tokens before they expire:
+
+```yaml
+credential_proxy:
+  - type: gh_basic
+    source:
+      unix_socket: /private/broker.sock
+      refresh_interval_seconds: 60
+```
+
+The parent makes an HTTP `GET /token` directly over the Unix socket. The broker
+must return HTTP 200 with a non-empty, single-line token (at most 64 KiB).
+Redirects are not followed, no shell or external executable is involved, and
+one five-second deadline covers connection setup, headers, and the response
+body, including responses that trickle in slowly. Host bindings from one source
+declaration share a cache and one in-flight refresh. Concurrent proxy requests
+await the same result or failure without occupying additional worker threads;
+cancelling one request does not cancel the refresh for other requests.
+
+Keep the broker socket and its private key outside sandbox read/write paths.
+Refresh sources require absolute paths and an active Linux bubblewrap or macOS
+Seatbelt policy. The runtime rejects sources whose paths, symlink targets, or
+parent directories fall inside sandbox read/write grants or the workspace, even
+when the workspace is read-only. Hard-linked files and sockets are rejected.
+Canonical source paths stay protected through launcher serialization: Linux
+rejects mounts that expose them, including implicit toolchain mounts; macOS
+denies file access and Unix-socket connections even under implicit read grants.
+These protections also apply to startup-only Unix socket sources. Existing
+startup-only file, environment, and command sources are unchanged.
+
+Source checks run before startup resolution and every refresh. A symlink source
+must retain its original canonical target for the session; replacing the file
+atomically at the same canonical path remains supported. The trusted broker must keep its own code,
+configuration, and dependencies outside sandbox-writable paths too.
+Choose an interval shorter than the minimum remaining lifetime of tokens
+returned by the source. A failed refresh fails the request; it does not reuse
+an old credential. Proxy requests receive a sanitized HTTP 502 on source failure,
+and a later request retries after the shared attempt finishes. The broker must
+be ready before the helper starts: a source failure during startup prevents
+launch, rather than producing a recoverable request-time 502. Without a refresh
+interval, sources resolve once at startup.
+Environment sources cannot refresh because a running process inherits a fixed
+environment. Shell command sources remain startup-only: a sandbox might otherwise
+replace a script or dependency before the trusted parent executes it again. Use
+a private broker for renewable credentials instead.
+
 ## Tools
 
 Tools are declared under `tools` by name.
+
+### Uploaded-agent compatibility
+
+HTTP-uploaded agent bundles cannot declare server-side Python or TypeScript
+source-file tools, server-side callable tools, unregistered policy handlers, or
+absolute/escaping working directories. This includes terminals and nested
+agents. These restrictions apply on multi-user servers and, starting in 0.19.0,
+on local single-user servers too, including bundles uploaded by `omnigent run`.
+Loopback requests can originate from agents as well as the operator.
+
+Invalid uploads return HTTP 400 before tools or policy handlers are imported.
+Existing uploaded agents using these features also fail bundle validation when
+adding, updating, or deleting MCP-server settings; rejected edits leave the
+stored bundle unchanged. The agent configuration read/patch endpoints enforce
+the same validation on legacy bundles.
+
+To migrate an existing uploaded agent:
+
+1. Expose its custom tools through an MCP server and replace the source-file
+   tool entries with `type: mcp` entries, as shown below. Update nested agents too.
+2. [Register custom policy handlers on the server](POLICIES.md#setting-up-server-wide-policies)
+   and change working directories to relative paths contained in the workspace.
+3. Replace the session's bundle through `PUT /v1/sessions/{id}/agent`, or upload
+   the corrected bundle and start a new session. Installing an agent version
+   alone does not rewrite existing sessions.
+4. Make subsequent MCP configuration changes on the migrated agent. Removing an
+   MCP server from an old agent does not bypass bundle validation.
+
+Use operator-registered agents (`omnigent server --agent ./my-agent`) for trusted
+in-process tools, or MCP/client tools for uploaded agents.
+`omnigent run ./my-agent --no-session` starts a dedicated local server with
+trusted startup registration and creates its session from that registration. Direct trusted
+in-process callers retain the explicit
+`validate_agent_bundle(..., enforce_handler_allowlist=False)` opt-out; HTTP
+requests cannot select it. Changing a tool's declared runtime alone is not a
+migration: client tools require a client-provided implementation.
 
 ### MCP server
 
@@ -286,6 +728,36 @@ tools:
 ```
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
+
+### Linux desktop keyrings
+
+The host and runner inherit `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
+to resolve credentials stored by `omnigent setup`. Restart the host from the
+desktop session after changing these values. The keyring must be available
+and unlocked.
+
+Headless harnesses do not inherit these desktop variables by default. For a
+trusted harness that performs its own keyring lookup, such as Goose configured
+with `goose configure`, explicitly opt out of the sandbox and request them:
+
+```yaml
+os_env:
+  type: caller_process
+  sandbox:
+    type: none
+    env_passthrough: [DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR]
+```
+
+Unsandboxed terminals retain their declared/inherited desktop environment.
+Active sandboxes remove the host bus address even when it appears in
+`env_passthrough`, and supply a private, writable `XDG_RUNTIME_DIR` instead of
+the desktop directory. Configure authentication separately for sandboxed
+harnesses; the desktop keyring is not an available credential source there.
+
+Environment filtering alone does not isolate the keyring. Desktop addresses
+can be discovered without these variables; socket/filesystem access and process
+isolation must enforce the boundary. Do not grant host desktop runtime paths to
+untrusted sandboxes. `sandbox.type: none` deliberately provides no OS isolation.
 
 ### Tool sandbox containers
 

@@ -41,14 +41,9 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import json
 import os
-import secrets
-import signal
 import subprocess
-import sys
-import tarfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -58,10 +53,11 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.server_runner import ServerRunner, server_runner
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     build_agent_bundle,
     configure_mock_llm,
-    find_free_port,
     reset_mock_llm,
 )
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
@@ -160,19 +156,11 @@ def _create_bound_session(
             _WORKSPACE_WRITER_DIR,
             rewrite_model_for_databricks=databricks_workspace_host is not None,
         )
-    create_resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-    )
+    create_resp = post_session_bundle(client.post, "/v1/sessions", bundle)
     create_resp.raise_for_status()
     session_id: str = create_resp.json()["session_id"]
 
-    bind_resp = client.patch(
-        f"/v1/sessions/{session_id}",
-        json={"runner_id": live_runner_id},
-    )
-    bind_resp.raise_for_status()
+    bind_session_runner(client.patch, "", session_id, live_runner_id)
 
     if initial_text is not None:
         event_resp = client.post(
@@ -204,12 +192,7 @@ def _build_mock_workspace_writer_bundle(mock_llm_server_url: str) -> bytes:
         "base_url": f"{mock_llm_server_url}/v1",
     }
     patched = yaml.dump(spec, sort_keys=False).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo(name="./workspace-file-writer.yaml")
-        info.size = len(patched)
-        tar.addfile(info, io.BytesIO(patched))
-    return buf.getvalue()
+    return bundle_files({"./workspace-file-writer.yaml": patched})
 
 
 # ── Workspace-rooted server+runner (for the agent-write tests) ─────────────────
@@ -233,8 +216,6 @@ def _build_mock_workspace_writer_bundle(mock_llm_server_url: str) -> bytes:
 # overwrites it and checks the diff endpoint's ``before`` against this content.
 _SEED_TRACKED_FILE = "tracked.md"
 _SEED_TRACKED_CONTENT = "# seed file\n\noriginal committed content\n"
-
-_fs_ws_runner_state: dict[str, str] = {}
 
 
 @pytest.fixture(scope="module")
@@ -275,158 +256,40 @@ def fs_workspace(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(scope="module")
-def fs_ws_runner_id() -> str:
-    """Stable runner id for the module-scoped workspace-rooted server.
-
-    :returns: Runner id string bound to a per-module binding token.
-    """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    if "runner_id" not in _fs_ws_runner_state:
-        token = secrets.token_urlsafe(32)
-        _fs_ws_runner_state["binding_token"] = token
-        _fs_ws_runner_state["runner_id"] = token_bound_runner_id(token)
-    return _fs_ws_runner_state["runner_id"]
-
-
-@pytest.fixture(scope="module")
-def fs_ws_server(
+def fs_ws_stack(
     llm_api_key: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     fs_workspace: Path,
-    fs_ws_runner_id: str,
-) -> Iterator[str]:
-    """Spawn an ``omnigent server`` + runner rooted at the isolated git workspace.
-
-    The runner is given ``OMNIGENT_RUNNER_WORKSPACE=fs_workspace`` (and the
-    server CWD matches), so ``create_filesystem_registry`` builds a
-    :class:`GitFilesystemRegistry` over that workspace and the agent's relative
-    ``sys_os_write`` lands inside it — the two prerequisites for writes to
-    surface in ``GET .../changes``.
-
-    :param llm_api_key: The ``--llm-api-key`` option value.
-    :param mock_llm_server_url: Mock LLM server URL.
-    :param tmp_path_factory: pytest temp path factory (db / artifacts / logs).
-    :param fs_workspace: The isolated git workspace to root the runner at.
-    :param fs_ws_runner_id: Runner id to register.
-    :returns: Server base URL, e.g. ``"http://localhost:18600"``.
-    """
-    port = find_free_port()
-    db_path = tmp_path_factory.mktemp("e2e_fs") / "e2e.db"
-    artifact_dir = tmp_path_factory.mktemp("e2e_fs_artifacts")
-    server_log = tmp_path_factory.mktemp("e2e_fs_logs") / "server.log"
-
-    binding_token = _fs_ws_runner_state["binding_token"]
-    env: dict[str, str] = {
-        **os.environ,
+) -> Iterator[ServerRunner]:
+    """Run both processes in the workspace observed by the filesystem registry."""
+    env = {
         "OPENAI_API_KEY": llm_api_key,
-        # PYTHONPATH stays the repo so the subprocess imports this worktree's
-        # omnigent; only the *workspace* (cwd / OMNIGENT_RUNNER_WORKSPACE) is
-        # the throwaway git dir.
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
-        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
     }
+    with server_runner(
+        tmp_path_factory.mktemp("fs_ws_stack"),
+        workspace=fs_workspace,
+        server_cwd=fs_workspace,
+        server_env=env,
+        health_timeout=HEALTH_TIMEOUT_S,
+        poll_interval=POLL_INTERVAL_S,
+        wait_ready=False,
+    ) as stack:
+        stack.start_runner(cwd=fs_workspace, env=env)
+        yield stack
 
-    log_handle = open(server_log, "w")  # noqa: SIM115 — closed in cleanup below
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-        ],
-        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        cwd=str(fs_workspace),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    base_url = f"http://localhost:{port}"
 
-    runner_log = tmp_path_factory.mktemp("e2e_fs_runner_logs") / "runner.log"
-    runner_log_handle = open(runner_log, "w")  # noqa: SIM115 — closed in cleanup below
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": fs_ws_runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-            # The crux: without a workspace the runner builds no filesystem
-            # registry (app.py) so writes never surface in GET .../changes,
-            # and sys_os_write falls back to a throwaway tmp cwd. Root it at
-            # the isolated git workspace so the GitFilesystemRegistry watches
-            # the same tree the agent writes into. The real CLI sets this via
-            # _start_cli_runner_process.
-            "OMNIGENT_RUNNER_WORKSPACE": str(fs_workspace),
-        },
-        cwd=str(fs_workspace),
-        stdout=runner_log_handle,
-        stderr=subprocess.STDOUT,
-    )
+@pytest.fixture(scope="module")
+def fs_ws_runner_id(fs_ws_stack: ServerRunner) -> str:
+    return fs_ws_stack.runner_id
 
-    health_iters = int(HEALTH_TIMEOUT_S / POLL_INTERVAL_S)
-    for _ in range(health_iters):
-        try:
-            health_resp = httpx.get(f"{base_url}/health", timeout=2)
-            runner_resp = httpx.get(
-                f"{base_url}/v1/runners/{fs_ws_runner_id}/status",
-                timeout=2,
-            )
-            if (
-                health_resp.status_code == 200
-                and runner_resp.status_code == 200
-                and runner_resp.json().get("online") is True
-            ):
-                break
-        except httpx.ConnectError:
-            # Expected while the server is still binding its port during
-            # startup; keep polling until the health checks pass or the loop
-            # times out (the ``else`` branch below).
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    else:
-        if runner_proc.poll() is None:
-            runner_proc.kill()
-            runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.kill()
-        log_handle.close()
-        log_contents = server_log.read_text() if server_log.exists() else ""
-        runner_log_contents = runner_log.read_text() if runner_log.exists() else ""
-        raise RuntimeError(
-            f"Workspace-rooted server did not start within {HEALTH_TIMEOUT_S}s.\n"
-            f"Server log: {log_contents[-3000:]}\n"
-            f"Runner log: {runner_log_contents[-3000:]}"
-        )
 
-    try:
-        yield base_url
-    finally:
-        if runner_proc.poll() is None:
-            runner_proc.send_signal(signal.SIGTERM)
-            try:
-                runner_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                runner_proc.kill()
-                runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        log_handle.close()
+@pytest.fixture(scope="module")
+def fs_ws_server(fs_ws_stack: ServerRunner) -> str:
+    return fs_ws_stack.base_url
 
 
 @pytest.fixture(scope="module")
@@ -480,6 +343,48 @@ def test_filesystem_listing_shape(
         assert "id" in entry and "name" in entry and "type" in entry, (
             f"Entry missing required fields: {entry}"
         )
+
+
+@pytest.mark.min_server_version("0.13.0")
+@pytest.mark.min_runner_version("0.13.0")
+def test_filesystem_download_returns_complete_file_past_read_cap(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    databricks_workspace_host: str | None,
+) -> None:
+    """``?download=true`` streams a file larger than the read cap intact.
+
+    The runner runs on this machine, so the workspace root the listing
+    reports is writable here: drop a file one byte over the cap into it,
+    confirm the viewer read truncates it, then download it through the
+    server (and the runner tunnel) and compare every byte.
+
+    :param http_client: HTTP client pointed at the live server.
+    :param live_runner_id: Runner id registered by the live server.
+    :param databricks_workspace_host: Workspace host URL when the
+        test suite routes LLM calls through Databricks model serving.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    session_id = _create_bound_session(
+        http_client,
+        live_runner_id=live_runner_id,
+        databricks_workspace_host=databricks_workspace_host,
+    )
+    listing = http_client.get(_fs_root_url(session_id))
+    listing.raise_for_status()
+    payload = os.urandom(_MAX_READ_BYTES + 1)
+    (Path(listing.json()["base"]) / "big.bin").write_bytes(payload)
+
+    read = http_client.get(_fs_file_url(session_id, "big.bin"))
+    read.raise_for_status()
+    assert read.json()["truncated"] is True
+
+    resp = http_client.get(_fs_file_url(session_id, "big.bin"), params={"download": "true"})
+    resp.raise_for_status()
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.content == payload
 
 
 def test_filesystem_user_write_put_round_trip(

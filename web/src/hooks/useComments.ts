@@ -1,3 +1,5 @@
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 // TanStack Query hooks for the comments API:
 // POST/GET/PATCH/DELETE /v1/sessions/{id}/comments
 // POST /v1/sessions/{id}/comments/send
@@ -157,6 +159,7 @@ export function useUpdateComment(sessionId: string) {
  * `null` as "no agent, hide the button".
  */
 export function useSendCommentsToAgent(sessionId: string, agentId: string) {
+  const gridEnabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (payload: { comment_ids: string[]; instruction?: string }) => {
@@ -175,7 +178,11 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
       };
     },
     onSuccess: (data) => {
-      void useChatStore.getState().send(data.formatted_message, agentId);
+      if (gridEnabled)
+        void useChatStore
+          .getState()
+          .send(data.formatted_message, agentId, undefined, { pinnedConversationId: sessionId });
+      else void useChatStore.getState().send(data.formatted_message, agentId);
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });

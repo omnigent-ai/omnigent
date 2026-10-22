@@ -18,15 +18,19 @@ will start instantiating them as those phases ship.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 import cachetools
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
 from omnigent.entities import Policy as StoredPolicy
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.llms.context_window import fetch_model_pricing
+from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.llms.context_window import fetch_model_pricing_with_provider
 from omnigent.policies.base import Policy
+from omnigent.policies.builtins.safety import SCHEDULED_TASK_APPROVAL_TOOLS
 from omnigent.policies.function import resolve_function_policy
 from omnigent.policies.schema import (
     SESSION_COST_ASK_APPROVED_STATE_KEY,
@@ -45,7 +49,7 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationStore, DailyCostState
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -56,6 +60,12 @@ _logger = logging.getLogger(__name__)
 # are skipped entirely, so sessions/deployments that don't use it pay
 # nothing extra per evaluation.
 _USER_DAILY_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_daily_cost_budget"
+
+# Dotted path of the per-user monthly cost-budget factory. The engine is
+# seeded with the session owner's monthly-cost rollup ONLY when a policy
+# set includes this handler.
+# Dotted path of the generic per-user period cost-budget factory.
+_USER_PERIOD_COST_POLICY_PATH = "omnigent.policies.builtins.cost.user_period_cost_budget"
 
 # Dotted path of the per-subagent cost-budget factory. The engine is
 # seeded with the subtree-scoped usage ONLY when a policy set includes
@@ -74,52 +84,116 @@ _ASK_ON_ADD_POLICY_SPEC = FunctionPolicySpec(
     ),
 )
 
+# Same posture for the scheduled-task tools in SCHEDULED_TASK_APPROVAL_TOOLS:
+# an agent cannot create or update unattended work without user approval.
+# Listing and deleting tasks stay ungated.
+_ASK_ON_SCHEDULED_TASK_CHANGE_SPEC = FunctionPolicySpec(
+    name="__ask_on_scheduled_task_change",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.safety.ask_on_scheduled_task_change",
+        arguments=None,
+    ),
+)
+
+# Appended to every engine after the session, agent, and admin policies.
+_REQUIRED_APPROVAL_SPECS: tuple[FunctionPolicySpec, ...] = (
+    _ASK_ON_ADD_POLICY_SPEC,
+    _ASK_ON_SCHEDULED_TASK_CHANGE_SPEC,
+)
+
 # Bounded cache of ``conversation_id -> session owner``. The owner
 # (``LEVEL_OWNER`` grantee) is immutable for a session's lifetime, so
 # caching it avoids a ``session_permissions`` lookup on every
 # per-tool-call engine build. Only non-``None`` owners are cached (a
 # session is granted its owner atomically at creation, so ``None`` is a
 # transient single-user/pre-grant state, not worth caching).
-_SESSION_OWNER_CACHE: cachetools.LRUCache[str, str] = cachetools.LRUCache(maxsize=4096)
+_SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.LRUCache(maxsize=4096)
+)
 
 # TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
 _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
     maxsize=256, ttl=30
 )
 
-# Invalidation-based LRU cache of ``(workspace_id, conversation_id) -> list[PolicySpec]``
-# for session-scoped policies. Unlike defaults, session policies can be added
-# mid-session (via sys_add_policy), so a TTL would delay enforcement. Instead,
-# the cache is explicitly invalidated whenever a session policy is mutated via
-# the CRUD routes. Keyed by workspace to prevent cross-tenant leakage.
-# Bounded (LRU, 4096 entries) to match _SESSION_OWNER_CACHE and prevent unbounded
-# growth — LRU eviction handles sessions that end without any policy mutation.
-_SESSION_POLICY_SPECS_CACHE: cachetools.LRUCache[tuple[int, str], list[PolicySpec]] = (
-    cachetools.LRUCache(maxsize=4096)
+# TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
+# policies, workspace-namespaced by the wrapper. Mutations call
+# invalidate_session_policy_specs_cache for immediate local eviction
+# (single-instance or lucky same-replica routing). The TTL (30 s) is the safety
+# ceiling for horizontally-scaled deployments where a DELETE/PATCH on one replica
+# cannot evict another replica's in-process cache — without it, a deleted session
+# policy would remain enforced on other replicas indefinitely (no natural expiry).
+# TTLCache subsumes LRU eviction, bounding memory the same way.
+_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
 )
 
 
-def _needs_user_daily_cost(specs: list[PolicySpec]) -> bool:
+def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
     """
-    Return whether any policy in *specs* is the per-user daily cost-budget.
+    Find the oldest period across all cost-budget policies.
 
-    Drives the conditional injection: only when this returns ``True``
-    does :func:`build_policy_engine` resolve the owner and read the
-    daily-cost rollup.
+    Scans for daily and period cost-budget policies, determines the start
+    date for each period, and returns the period string for the oldest one.
+    This allows fetching all daily cost records needed by all policies in
+    a single query.
 
     :param specs: The merged policy specs for the engine.
-    :returns: ``True`` when a :class:`FunctionPolicySpec` references the
-        ``user_daily_cost_budget`` factory.
+    :returns: The period string ("day", "week", "month", "quarter", "year")
+        for the oldest period, or None if no cost-budget policies are present.
     """
-    return any(
-        isinstance(s, FunctionPolicySpec)
-        and s.function is not None
-        and s.function.path == _USER_DAILY_COST_POLICY_PATH
-        for s in specs
-    )
+    from datetime import datetime, timedelta
+
+    from omnigent.db.utils import now_epoch
+
+    # Collect all periods from cost-budget policies
+    periods: list[str] = []
+
+    for s in specs:
+        if not isinstance(s, FunctionPolicySpec) or s.function is None:
+            continue
+        # Legacy daily cost budget policy
+        if s.function.path == _USER_DAILY_COST_POLICY_PATH:
+            periods.append("day")
+        # Generic period policy
+        elif s.function.path == _USER_PERIOD_COST_POLICY_PATH:
+            args = s.function.arguments or {}
+            period = args.get("period")
+            if period:
+                periods.append(period)
+
+    if not periods:
+        return None
+
+    # Calculate start date for each period and find the oldest
+    now = now_epoch()
+    dt = datetime.fromtimestamp(now, tz=UTC)
+
+    def period_start_date(period: str) -> datetime:
+        if period == "day":
+            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=UTC)
+        if period == "week":
+            # ISO week starts on Monday
+            start = dt.date() - timedelta(days=dt.weekday())
+            return datetime.combine(start, datetime.min.time(), tzinfo=UTC)
+        if period == "month":
+            return datetime(dt.year, dt.month, 1, tzinfo=UTC)
+        if period == "quarter":
+            quarter = (dt.month - 1) // 3 + 1
+            start_month = (quarter - 1) * 3 + 1
+            return datetime(dt.year, start_month, 1, tzinfo=UTC)
+        if period == "year":
+            return datetime(dt.year, 1, 1, tzinfo=UTC)
+        # Unknown period, treat as day
+        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=UTC)
+
+    # Find the period with the oldest start date
+    return min(periods, key=period_start_date)
 
 
 def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
@@ -160,28 +234,6 @@ def _normalize_usage_for_engine(usage: dict[str, float]) -> dict[str, float]:
     return usage
 
 
-def _subtree_usage_seed(
-    conversation_id: str,
-    conversation_store: ConversationStore,
-) -> dict[str, float]:
-    """
-    SUBTREE-scoped usage seed for the per-subagent cost budget.
-
-    Unlike :func:`_policy_usage_seed` (which seeds from the whole session
-    tree via ``root_conversation_id``), this seeds from ``conversation_id``
-    itself — so the budget gates on this conversation's own subtree cost
-    (itself + its descendants), not the whole session.
-
-    :param conversation_id: Conversation to seed the subtree usage for,
-        e.g. ``"conv_child"``.
-    :param conversation_store: Store to read the subtree usage from.
-    :returns: Subtree usage seed dict; when an enforcement cost exists its
-        ``total_cost_usd`` is the enforcement total.
-    """
-    usage = load_session_usage(conversation_id, conversation_store)
-    return _normalize_usage_for_engine(usage)
-
-
 def _resolve_session_owner_cached(
     conversation_id: str,
     conversation_store: ConversationStore,
@@ -194,7 +246,7 @@ def _resolve_session_owner_cached(
     :returns: The owner user id, or ``None`` when the session has no
         owner grant (single-user mode).
     """
-    owner = _SESSION_OWNER_CACHE.get(conversation_id)
+    owner: str | None = _SESSION_OWNER_CACHE.get(conversation_id)
     if owner is not None:
         return owner
     owner = conversation_store.get_session_owner(conversation_id)
@@ -206,32 +258,146 @@ def _resolve_session_owner_cached(
 def _load_user_daily_cost(
     conversation_id: str,
     conversation_store: ConversationStore,
-) -> dict[str, float | str]:
+) -> list[DailyCostState]:
     """
     Read the session owner's per-UTC-day cost rollup as the engine seed.
 
-    Resolves the owner (cached) and reads ``{cost_usd, ask_approved_usd}``
-    for today (UTC), tagged with the owner's ``user_id`` so the budget
-    policy can name whose spend tripped the gate. When the session has no
-    owner grant (single-user mode), returns zeros (and no ``user_id``) so
-    the per-user daily budget never trips — consistent with the write
-    path, which also no-ops without an owner.
+    Returns a single-element list containing today's cost state, formatted
+    consistently with period cost loading so both daily and period policies
+    can consume the same ``user_daily_cost`` context field.
 
     :param conversation_id: The session, e.g. ``"conv_abc123"``.
     :param conversation_store: Store for the owner + daily-cost lookups.
-    :returns: ``{"cost_usd": <float>, "ask_approved_usd": <float>,
-        "user_id": <owner>}``; ``user_id`` omitted in single-user mode.
+    :returns: Single-element list with today's cost state, or empty list
+        in single-user mode.
     """
     from omnigent.db.utils import now_epoch, utc_day
 
     owner = _resolve_session_owner_cached(conversation_id, conversation_store)
     if owner is None:
-        return {"cost_usd": 0.0, "ask_approved_usd": 0.0}
-    state: dict[str, float | str] = dict(
-        conversation_store.get_daily_cost_state(owner, utc_day(now_epoch()))
-    )
-    state["user_id"] = owner
-    return state
+        return []
+
+    today = utc_day(now_epoch())
+    # Use list_daily_cost_states to get today's record in the same format
+    # as period budgets, so both can consume the same context field
+    return conversation_store.list_daily_cost_states(owner, today)
+
+
+def _utc_day(epoch: int) -> str:
+    """Return the UTC calendar day for an epoch timestamp as ``"YYYY-MM-DD"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC day string, e.g. ``"2026-08-21"``.
+    """
+    from datetime import datetime
+
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%d")
+
+
+def _utc_week(epoch: int) -> str:
+    """Return the UTC ISO week for an epoch timestamp as ``"YYYY-Www"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC ISO week string, e.g. ``"2026-W34"``.
+    """
+    from datetime import datetime
+
+    dt = datetime.fromtimestamp(epoch, tz=UTC)
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _utc_month(epoch: int) -> str:
+    """Return the UTC calendar month for an epoch timestamp as ``"YYYY-MM"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC month string, e.g. ``"2026-08"``.
+    """
+    from datetime import datetime
+
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m")
+
+
+def _utc_quarter(epoch: int) -> str:
+    """Return the UTC calendar quarter for an epoch timestamp as ``"YYYY-Qq"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC quarter string, e.g. ``"2026-Q3"``.
+    """
+    from datetime import datetime
+
+    dt = datetime.fromtimestamp(epoch, tz=UTC)
+    quarter = (dt.month - 1) // 3 + 1
+    return f"{dt.year}-Q{quarter}"
+
+
+def _utc_year(epoch: int) -> str:
+    """Return the UTC calendar year for an epoch timestamp as ``"YYYY"``.
+
+    :param epoch: Unix epoch seconds.
+    :returns: UTC year string, e.g. ``"2026"``.
+    """
+    from datetime import datetime
+
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y")
+
+
+def _load_user_period_cost(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    period: str,
+) -> list[DailyCostState]:
+    """
+    Read the session owner's daily cost records for the current period.
+
+    Resolves the owner (cached) and queries all daily cost records for the
+    current period's date range. Returns a list of daily cost dicts, each
+    containing ``{cost_usd, ask_approved_usd, user_id, day_utc}``.
+    The policy function aggregates these to compute the period total.
+
+    When the session has no owner grant (single-user mode), returns an
+    empty list so the per-user period budget never trips.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store for the owner + daily-cost lookups.
+    :param period: Time period granularity: ``"day"``, ``"week"``,
+        ``"month"``, ``"quarter"``, or ``"year"``.
+    :returns: List of daily cost dicts, one per day in the period. Empty
+        in single-user mode.
+    """
+    from datetime import datetime, timedelta
+
+    from omnigent.db.utils import now_epoch
+
+    owner = _resolve_session_owner_cached(conversation_id, conversation_store)
+    if owner is None:
+        return []
+
+    # Calculate date range for the period
+    now = now_epoch()
+    dt = datetime.fromtimestamp(now, tz=UTC)
+
+    if period == "day":
+        start = dt.date()
+    elif period == "week":
+        # ISO week starts on Monday
+        start = dt.date() - timedelta(days=dt.weekday())
+    elif period == "month":
+        start = dt.date().replace(day=1)
+    elif period == "quarter":
+        quarter = (dt.month - 1) // 3 + 1
+        start_month = (quarter - 1) * 3 + 1
+        start = dt.date().replace(month=start_month, day=1)
+    elif period == "year":
+        start = dt.date().replace(month=1, day=1)
+    else:
+        # Fallback: treat as single day
+        start = dt.date()
+
+    start_date = start.isoformat()
+
+    # Query daily cost records for the period
+    return conversation_store.list_daily_cost_states(owner, start_date)
 
 
 def any_policies_apply(
@@ -242,11 +408,12 @@ def any_policies_apply(
     policy_store: PolicyStore | None,
     phase: Phase | None = None,
     tool_name: str | None = None,
+    conversation: Conversation | None = None,
 ) -> bool:
-    """Return ``True`` when at least one policy would run for this evaluation.
+    """Return ``True`` when this evaluation may need to run policies.
 
-    Cheaper than building a full :class:`PolicyEngine`: only checks whether
-    the combined policy list is non-empty. Used as a fast-path guard in
+    Cheaper than building a full :class:`PolicyEngine`: checks whether
+    policies may apply. Used as a fast-path guard in
     ``POST /policies/evaluate`` to skip the engine build (and the associated
     conversation-store reads for labels/state/usage) when nothing would fire.
 
@@ -260,15 +427,26 @@ def any_policies_apply(
         policies are configured.
     :param phase: The evaluation phase, if known.
     :param tool_name: The tool being called (for ``PHASE_TOOL_CALL`` events).
+    :param conversation: The conversation row when the caller holds one. For
+        sub-agent conversations this lets the check see the CHILD spec's own
+        guardrails (which :func:`build_policy_engine` enforces), so a bundle
+        whose only policies live on a sub-agent is not fast-path skipped.
+        Children with a policy store must build the engine to resolve
+        inherited session policies against their verified root.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
-    # The engine unconditionally injects _ASK_ON_ADD_POLICY_SPEC so agents
-    # cannot silently install session policies. Never fast-path sys_add_policy
-    # TOOL_CALL events — they must always reach the engine for that gate.
-    if phase == Phase.TOOL_CALL and tool_name == "sys_add_policy":
+    # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
+    # TOOL_CALL events must always reach it: never fast-path sys_add_policy
+    # or the scheduled-task mutation tools.
+    if phase == Phase.TOOL_CALL and (
+        tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
+    ):
         return True
     if spec.guardrails and spec.guardrails.policies:
+        return True
+    child_spec = _resolve_sub_agent_spec(spec, conversation)
+    if child_spec is not None and child_spec.guardrails and child_spec.guardrails.policies:
         return True
     if default_policies:
         return True
@@ -278,7 +456,50 @@ def any_policies_apply(
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
         return True
+    # The engine verifies ancestry before inheriting root session policies.
+    # A child's local policy list cannot rule out an inherited policy.
+    if (
+        policy_store is not None
+        and conversation is not None
+        and conversation.parent_conversation_id is not None
+    ):
+        return True
     return False
+
+
+def _resolve_sub_agent_spec(
+    spec: AgentSpec,
+    conversation: Conversation | None,
+) -> AgentSpec | None:
+    """
+    Resolve a sub-agent conversation's own child :class:`AgentSpec`.
+
+    Engine-build sites resolve a session's agent binding to the ROOT
+    bundle spec, so a sub-agent conversation's engine would otherwise
+    hold only the parent's guardrails and silently drop the child's
+    (e.g. a stricter ``max_tool_calls_per_session`` on the child).
+    This looks up ``conversation.sub_agent_name`` in the root spec's
+    ``sub_agents`` tree.
+
+    :param spec: The spec the caller resolved for this session —
+        the root bundle spec for sub-agent conversations.
+    :param conversation: The conversation row, or ``None`` when the
+        caller could not load one.
+    :returns: The child :class:`AgentSpec`, or ``None`` when the
+        conversation is not a sub-agent or the name does not resolve
+        in the tree (native-harness children store a display label
+        here).
+    """
+    if conversation is None or not conversation.sub_agent_name:
+        return None
+    # Lazy import: workflow imports the policies package at runtime, so a
+    # module-level import here would be circular.
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    child_spec = _find_spec_by_name(spec, conversation.sub_agent_name)
+    if child_spec is None or child_spec is spec:
+        return None
+    return child_spec
 
 
 def build_policy_engine(
@@ -286,6 +507,8 @@ def build_policy_engine(
     spec: AgentSpec,
     conversation_id: str,
     conversation_store: ConversationStore,
+    conversation: Conversation | None = None,
+    expected_agent_id: str | None = None,
     connection_override: dict[str, str] | None = None,
     default_policies: list[PolicySpec] | None = None,
     policy_store: PolicyStore | None = None,
@@ -302,11 +525,9 @@ def build_policy_engine(
     call through, they just always ALLOW.
 
     When declared labels have an ``initial`` value and no row
-    exists yet in ``conversation_labels``, seeds via
-    ``ConversationStore.set_labels`` — but only for keys not
-    already persisted, so existing label state is never
-    clobbered. The hot cache is built from the freshly seeded
-    snapshot.
+    exists yet in ``conversation_labels``, seeds missing keys via
+    :meth:`ConversationStore.set_labels`. The hot cache is built
+    from the post-seed snapshot.
 
     Policy run order: session policies (from the CRUD API)
     first, then agent spec policies, then *default_policies*
@@ -320,12 +541,32 @@ def build_policy_engine(
     before any child-specific session policies. This ensures
     guardrails set on the parent session (e.g. via
     ``sys_add_policy``) also govern spawned sub-agents.
-    Policies with the same ``name`` on both root and child
-    are deduplicated (child wins).
+    Structurally identical root and child policies evaluate once
+    at the root policy's original position. Same-named policies
+    with different handlers or parameters both run, root first,
+    so a child cannot shadow or reorder an inherited guardrail.
 
     :param spec: The parsed agent spec.
     :param conversation_id: The conversation this workflow is
         running on, e.g. ``"conv_abc123"``.
+    :param conversation: The already-loaded conversation row for
+        ``conversation_id``, when the caller holds a current one — skips
+        the builder's own read.
+
+        **Preload contract** (one rule, applied at every preload site):
+        a preloaded row may supply only IMMUTABLE identity — its ``id``
+        and ``root_conversation_id``. Every mutable field the engine
+        depends on (labels, session_state, model_override) is re-derived
+        from a fresh read taken here. A row that has since disappeared
+        fails closed rather than authorizing from the snapshot. Callers
+        that rebuild an engine specifically to observe concurrent writes
+        (the native ASK gate's post-lock re-evaluation) pass ``None``.
+    :param expected_agent_id: The ``agent_id`` the caller resolved *spec*
+        from. ``agent_id`` selects the spec, so it must be read before the
+        engine exists and cannot be re-derived here. Passing it lets the builder confirm it against
+        the fresh row and fail closed on a mismatch, instead of
+        authorizing an evaluation under the previous agent's guardrails.
+        ``None`` skips the check (callers with no spec/agent coupling).
     :param conversation_store: The store used for label reads
         and writes. Held by the engine for the life of the
         workflow.
@@ -360,48 +601,188 @@ def build_policy_engine(
     guardrails = spec.guardrails
     agent_policy_specs: list[PolicySpec] = list(guardrails.policies or []) if guardrails else []
     session_policy_specs = _load_session_policy_specs(conversation_id, policy_store)
-    # Session policies are per-conversation, but sub-agents must inherit
-    # the root conversation's policies so that guardrails set on the
-    # top-level session (e.g. via sys_add_policy) also govern spawned
-    # children. Load root policies and prepend them (root policies run
-    # first, then any child-specific overrides, matching the cost-budget
-    # root-seeding pattern below).
-    conv = conversation_store.get_conversation(conversation_id)
-    root_conversation_id = conv.root_conversation_id if conv is not None else conversation_id
-    if root_conversation_id != conversation_id:
-        root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
-        # Deduplicate: skip root policies already present on the child
-        # (keyed by policy name) to avoid double-evaluation.
-        child_names = {p.name for p in session_policy_specs}
-        root_policy_specs = [p for p in root_policy_specs if p.name not in child_names]
-        session_policy_specs = root_policy_specs + session_policy_specs
+    if conversation is not None and conversation.id != conversation_id:
+        # A misrouted preload would mix one session's labels, state, usage
+        # and model into another session's authorization decision — fail
+        # closed rather than build an engine from the wrong row.
+        raise OmnigentError(
+            f"preloaded conversation {conversation.id!r} does not match "
+            f"conversation_id {conversation_id!r}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    conv = (
+        conversation
+        if conversation is not None
+        else conversation_store.get_conversation(conversation_id)
+    )
+    # The row in hand only SUGGESTS a tree root. Loading the tree verifies it
+    # and reports the root actually used, so everything downstream — the rows,
+    # the root's own policies, the accounting sums — comes from one snapshot.
+    # Deriving the root from the pre-refresh row while taking rows from a
+    # corrected tree was the defect: a conversation deleted and recreated under
+    # another root seeded the OLD tree's spend.
+    verified = (
+        load_verified_session_tree(
+            conversation_id,
+            conversation_store,
+            conv.root_conversation_id if conv is not None else None,
+        )
+        if conv is not None
+        else VerifiedSessionTree([], conversation_id, False)
+    )
+    tree = verified.rows
+    root_conversation_id = verified.root_conversation_id
     db_default_policy_specs = _load_default_policy_specs(policy_store)
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
 
-    # Always require user approval before sys_add_policy executes.
-    # Appended unconditionally so the guard is present even when
-    # no other guardrails are declared (the noop-engine path below
-    # is no longer reachable since all_policy_specs is never empty).
-    all_policy_specs.append(_ASK_ON_ADD_POLICY_SPEC)
+    # Mandatory approval guards: appended unconditionally so sys_add_policy
+    # and scheduled-task create/update always ask the user, even when no
+    # other guardrails are declared.
+    all_policy_specs.extend(_REQUIRED_APPROVAL_SPECS)
 
-    label_defs = (guardrails.labels or {}) if guardrails else {}
+    label_defs = dict((guardrails.labels or {}) if guardrails else {})
+    # One conversation read (``conv``, resolved above for policy
+    # inheritance) and ONE spawn-tree load feed everything below: labels,
+    # session state (own + inherited root keys), both usage seeds, and the
+    # model override — on the single-page happy path, which is nearly every
+    # build; a paged tree pays one further confirming read (see below). The
+    # helpers each re-fetched the same rows before — ~4x conversation reads
+    # plus two identical tree loads per build, the dominant cost of a
+    # policies/evaluate call.
+    # Freshness contract, applied to EVERY row this function decides from,
+    # regardless of how it arrived: ONLY immutable identity (id,
+    # root_conversation_id) survives from the row read above. Every mutable
+    # field — labels, session_state, model_override, agent_id — is taken from
+    # the tree load, which happened later and is therefore the newest read.
+    #
+    # The provenance of the earlier row does not change the hazard. A caller's
+    # preload and this function's own ``get_conversation`` are both snapshots
+    # taken before the tree scan, so both can be stale by the time a decision
+    # is made; gating the refresh on ``conversation is not None`` closed the
+    # window on one path and left the identical window open on the other.
+    #
+    # The tree load includes archived rows (archived conversations still hold
+    # spend), so a row missing from the tree has genuinely been deleted.
+    # Re-read once to confirm, then fail closed — never fall back to the
+    # earlier copy, which would authorize from state captured before whatever
+    # removed the row.
+    if conv is not None:
+        fresh_self = next((c for c in tree if c.id == conversation_id), None)
+        if fresh_self is None:
+            fresh_self = conversation_store.get_conversation(conversation_id)
+        if fresh_self is None:
+            # The row existed moments ago and is now gone (deleted
+            # mid-request). Authorizing from the earlier copy would decide
+            # against state that no longer exists; authorizing from empty
+            # state would seed a $0 budget and ALLOW. Fail closed.
+            raise OmnigentError(
+                f"Conversation {conversation_id!r} disappeared while building its "
+                f"policy engine; refusing to authorize from a stale snapshot.",
+                code=ErrorCode.CONFLICT,
+            )
+        conv = fresh_self
+    # Must run AFTER the refresh: comparing the earlier (stale) row would accept
+    # a rebind in the window. Exact equality: a fresh row bound to ``None``, or no
+    # fresh row at all, is a mismatch too.
+    if expected_agent_id is not None:
+        fresh_agent_id = conv.agent_id if conv is not None else None
+        if fresh_agent_id != expected_agent_id:
+            raise OmnigentError(
+                f"Session {conversation_id!r} no longer resolves to agent "
+                f"{expected_agent_id!r} (now {fresh_agent_id!r}); the spec this "
+                f"engine would enforce is stale. Re-resolve and retry.",
+                code=ErrorCode.CONFLICT,
+            )
+    # A paged tree does not share one read instant: rows on page one were read
+    # before page two, so "the tree read is newer than the caller's row" holds
+    # for the tree but not for any row inside it. Confirm identity once when
+    # that is actually the case — single-page trees, which is nearly all of
+    # them, pay nothing.
+    if conv is not None and verified.paged:
+        confirmed = conversation_store.get_conversation(conversation_id)
+        if (
+            confirmed is None
+            or confirmed.root_conversation_id != root_conversation_id
+            or confirmed.agent_id != conv.agent_id
+        ):
+            raise OmnigentError(
+                f"Conversation {conversation_id!r} moved while its spawn tree was "
+                f"being paged; refusing to authorize against a tree assembled "
+                f"across the change.",
+                code=ErrorCode.CONFLICT,
+            )
+        conv = confirmed
+    # A sub-agent conversation runs the CHILD agent's spec, but every
+    # engine-build site resolves the session's agent binding to the ROOT
+    # bundle spec. Resolve ``conv.sub_agent_name`` to the child spec so the
+    # child's own guardrails are enforced too. Resolved from the REFRESHED
+    # row (after the tree/identity checks above), per the freshness contract
+    # — a delete/recreate race must not enforce a stale child's policies.
+    # The child's policies are APPENDED after the parent's and same-name
+    # collisions are NOT deduplicated: both instances run, and DENY
+    # short-circuit makes the stricter limit the effective one, so a child
+    # redeclaring a parent policy name with a looser configuration cannot
+    # weaken the parent's fence. Native-harness children whose
+    # ``sub_agent_name`` is a display label resolve to no spec and are
+    # unaffected.
+    child_spec = _resolve_sub_agent_spec(spec, conv)
+    child_guardrails = child_spec.guardrails if child_spec is not None else None
+    if child_guardrails is not None and child_guardrails.policies:
+        agent_policy_specs = agent_policy_specs + list(child_guardrails.policies)
+        all_policy_specs = (
+            session_policy_specs
+            + agent_policy_specs
+            + admin_policy_specs
+            + list(_REQUIRED_APPROVAL_SPECS)
+        )
+        if child_guardrails.labels:
+            # Child label schemas ADD keys; the parent's schema wins on a
+            # collision so a child cannot loosen a parent-declared label
+            # constraint.
+            label_defs = {**child_guardrails.labels, **label_defs}
+    # Session policies are per-conversation, but sub-agents inherit the root
+    # conversation's policies so guardrails set on the top-level session (e.g.
+    # via sys_add_policy) also govern spawned children. Loaded from the
+    # VERIFIED root, after the refresh: reading them from the caller's
+    # suggested root inherited another tree's guardrails.
+    if root_conversation_id != conversation_id:
+        root_policy_specs = _load_session_policy_specs(root_conversation_id, policy_store)
+        # Keep the root copy of an exact duplicate so attaching the same
+        # policy to a child cannot reorder the authoritative root pipeline.
+        child_policy_specs = [p for p in session_policy_specs if p not in root_policy_specs]
+        session_policy_specs = root_policy_specs + child_policy_specs
+        all_policy_specs = (
+            session_policy_specs
+            + agent_policy_specs
+            + admin_policy_specs
+            + list(_REQUIRED_APPROVAL_SPECS)
+        )
+    root_conv = (
+        conv
+        if root_conversation_id == conversation_id
+        else next((c for c in tree if c.id == root_conversation_id), None)
+    )
+    if root_conv is None and conv is not None and root_conversation_id != conversation_id:
+        # The tree now includes archived rows, so a missing root means the row
+        # is genuinely gone (deleted mid-request). Read once to confirm before
+        # deciding — never silently proceed on an absent root.
+        root_conv = conversation_store.get_conversation(root_conversation_id)
     initial_labels = _seed_and_load_labels(
         conversation_id=conversation_id,
         label_defs=label_defs,
         conversation_store=conversation_store,
+        existing=dict(conv.labels) if conv is not None else {},
     )
-    initial_session_state = _load_session_state(conversation_id, conversation_store)
+    initial_session_state = dict(conv.session_state) if conv is not None else {}
     # The cost-budget approval is per-SESSION: the whole spawn tree shares one
     # soft-threshold gate. A sub-agent runs as its own conversation, so seed its
     # approved-checkpoint from the ROOT conversation — otherwise approving on the
     # parent wouldn't carry to the sub-agent and it would re-ask at the same
     # threshold. Other session_state stays per-conversation; the matching
     # write-back is routed to the root by PolicyEngine.apply_state_updates.
-    # (conv and root_conversation_id already resolved above for policy
-    # inheritance — reuse them here.)
     if root_conversation_id != conversation_id:
-        root_state = _load_session_state(root_conversation_id, conversation_store)
+        root_state = dict(root_conv.session_state) if root_conv is not None else {}
         for _root_key in (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
             SESSION_COST_UNPRICED_APPROVED_KEY,
@@ -411,26 +792,71 @@ def build_policy_engine(
     # Gating is SESSION-wide: seed from the whole spawn-tree total so a
     # sub-agent gates against the session's full spend (parent + siblings),
     # not just its own subtree. The cost read is the enforcement total
-    # (in-flight sub-agent spend); see _policy_usage_seed.
-    initial_usage = _policy_usage_seed(conversation_id, conversation_store)
+    # (in-flight sub-agent spend); see _policy_usage_seed, whose semantics
+    # (including the empty seed when the root row is missing) this
+    # preserves while reusing the single tree load.
+    initial_usage = (
+        _normalize_usage_for_engine(_sum_subtree_usage(tree, root_conversation_id))
+        if conv is not None and root_conv is not None
+        else {}
+    )
     # Conditional injection (#1a): only compute subtree usage when a
-    # subagent_cost_budget policy is present.
-    initial_subtree_usage = (
-        _subtree_usage_seed(conversation_id, conversation_store)
-        if _needs_subtree_usage(all_policy_specs)
-        else None
+    # subagent_cost_budget policy is present. Per-node DISPLAY-rooted seed:
+    # same tree, rooted at the evaluated node instead of the root.
+    initial_subtree_usage: dict[str, float] | None = None
+    if _needs_subtree_usage(all_policy_specs):
+        initial_subtree_usage = (
+            _normalize_usage_for_engine(_sum_subtree_usage(tree, conversation_id))
+            if conv is not None
+            else {}
+        )
+    # Conditional injection: only load daily cost records when cost-budget
+    # policies are present. Find the oldest period across all policies and
+    # load daily records from that date forward, so all policies can filter
+    # to their own period ranges from a single seed.
+    initial_user_daily_cost = None
+    oldest_period = _get_cost_policy_oldest_period(all_policy_specs)
+    if oldest_period:
+        initial_user_daily_cost = _load_user_period_cost(
+            conversation_id, conversation_store, period=oldest_period
+        )
+    # Session model: the conversation's model_override (set when a user
+    # picks a model mid-session) wins over the spec's llm.model; None when
+    # neither is available and cost policies treat it as undeterminable.
+    # A sub-agent session runs the CHILD spec's model, so its declaration
+    # (falling back to the root's when the child declares none) is the
+    # spec-level default here.
+    spec_model = (
+        child_spec.llm.model
+        if child_spec is not None and child_spec.llm and child_spec.llm.model
+        else (spec.llm.model if spec.llm else None)
     )
-    # Conditional injection (#1): only pay the owner + daily-cost lookups
-    # when a per-user daily cost-budget policy is actually present.
-    initial_user_daily_cost = (
-        _load_user_daily_cost(conversation_id, conversation_store)
-        if _needs_user_daily_cost(all_policy_specs)
-        else None
-    )
-    initial_model = _resolve_session_model(conversation_id, conversation_store, spec)
+    initial_model = conv.model_override if conv is not None and conv.model_override else spec_model
     # Pass the full ModelPricing so the engine can price cache-read and
-    # cache-write tokens at their own rates via compute_llm_cost().
-    token_pricing = fetch_model_pricing(spec.llm.model) if spec.llm else None
+    # cache-write tokens at their own rates via compute_llm_cost(). Check
+    # provider config first for custom pricing (self-hosted models), then
+    # fall back to catalog. Use the effective model from the session (honors
+    # model_override) rather than the static spec model.
+    token_pricing: Any = None
+    if initial_model:
+        # Load provider config to check for custom pricing
+        from omnigent.onboarding.provider_config import load_config
+
+        provider_config = load_config()
+        # Match the harness running this session; an override wins over the
+        # agent's configured executor harness. A sub-agent session runs the
+        # CHILD spec's executor.
+        spec_harness = (
+            child_spec.executor.harness_kind
+            if child_spec is not None
+            else spec.executor.harness_kind
+        )
+        harness = (
+            conv.harness_override if conv is not None and conv.harness_override else spec_harness
+        )
+        token_pricing = fetch_model_pricing_with_provider(
+            initial_model, provider_config=provider_config, harness=harness
+        )
     server_connection = _resolve_server_llm_connection(server_llm)
     # host_connection carries the per-request caller token (billed to
     # the caller). It takes precedence over the static server-level
@@ -451,8 +877,15 @@ def build_policy_engine(
             for s in all_policy_specs
         ],
         label_defs=label_defs,
-        ask_timeout=guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT,
+        # A sub-agent's ASKs resolve under its own declared timeout; fall
+        # back to the root's, then the default.
+        ask_timeout=(
+            child_guardrails.ask_timeout
+            if child_guardrails is not None
+            else (guardrails.ask_timeout if guardrails else DEFAULT_ASK_TIMEOUT)
+        ),
         conversation_id=conversation_id,
+        conversation_title=conv.title if conv is not None else None,
         initial_labels=initial_labels,
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,
@@ -684,6 +1117,7 @@ def _seed_and_load_labels(
     conversation_id: str,
     label_defs: dict[str, LabelDef],
     conversation_store: ConversationStore,
+    existing: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """
     Seed declared initial values and return the current snapshot.
@@ -700,10 +1134,14 @@ def _seed_and_load_labels(
         labels start unset until a policy writes them).
     :param conversation_store: Target for both the read and
         the seed UPSERT.
+    :param existing: Pre-loaded current label snapshot, passed by callers
+        that already hold the conversation row (saves a re-read).
+        ``None`` loads it here.
     :returns: Full post-seed snapshot of the conversation's
         labels.
     """
-    existing = _load_existing_labels(conversation_id, conversation_store)
+    if existing is None:
+        existing = _load_existing_labels(conversation_id, conversation_store)
     to_seed = {
         key: ldef.initial
         for key, ldef in label_defs.items()
@@ -763,36 +1201,6 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-def _resolve_session_model(
-    conversation_id: str,
-    conversation_store: ConversationStore,
-    spec: AgentSpec,
-) -> str | None:
-    """
-    Resolve the model the session is currently using.
-
-    Prefers the conversation's ``model_override`` (set when a user
-    picks a model mid-session via ``/model`` or the web model picker)
-    and falls back to the agent spec's ``llm.model``. ``None`` when
-    neither is available — the conversation does not exist yet, has no
-    override, and the spec declares no ``llm`` block — in which case
-    cost policies treat the model as undeterminable.
-
-    :param conversation_id: Conversation to read the override from,
-        e.g. ``"conv_abc123"``.
-    :param conversation_store: Store to read the conversation from.
-    :param spec: The parsed agent spec (its ``llm.model`` is the
-        fallback when no override is set).
-    :returns: The active model id, e.g. ``"databricks-claude-opus-4-8"``
-        or the native tier alias ``"opus"``; ``None`` when
-        undeterminable.
-    """
-    conv = conversation_store.get_conversation(conversation_id)
-    if conv is not None and conv.model_override:
-        return conv.model_override
-    return spec.llm.model if spec.llm else None
-
-
 # Page size for walking a spawn tree when summing sub-agent usage.
 # Sub-agent trees are small in practice, but we still paginate so a
 # large tree is not silently truncated (see load_session_usage).
@@ -843,6 +1251,8 @@ def _merge_by_model(
 def load_session_usage(
     conversation_id: str,
     conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Load cumulative session usage for a conversation **plus all of its
@@ -866,6 +1276,14 @@ def load_session_usage(
     :param conversation_id: Conversation to load,
         e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the row. Skips the internal conversation read.
+        The root binding is immutable **per row**, not per conversation id:
+        a conversation deleted and recreated under the same id gets a new
+        row, whose root may differ. A supplied root is therefore validated
+        against the tree it produces — if this conversation is not in that
+        tree, the caller's row is stale and the root is resolved here
+        instead. ``None`` resolves it here from the start.
     :returns: Summed usage dict with keys ``input_tokens``,
         ``output_tokens``, ``total_tokens``, ``total_cost_usd`` (the
         DISPLAY cost sum — statusLine ``S`` for claude-native), and
@@ -879,10 +1297,151 @@ def load_session_usage(
         the policy seed (:func:`_policy_usage_seed`) reads
         ``policy_cost_usd`` (both unaffected by ``by_model``).
     """
+    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, conversation_id)
+
+
+def load_session_usage_and_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
+) -> tuple[dict[str, Any], list[Conversation]]:
+    """
+    Load a conversation's subtree usage together with the tree it came from.
+
+    :func:`load_session_usage` discards the tree it summed, so a caller that
+    needs both — the sums *and* the rows, e.g. to roll up which harnesses ran
+    in the tree — would otherwise load it twice. Returning both keeps that to
+    one read, and keeps the sums and the rows from the same snapshot rather
+    than two.
+
+    :param conversation_id: The conversation to sum, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the row — validated as in
+        :func:`load_session_usage`.
+    :returns: ``(usage, tree)`` — the subtree usage dict
+        :func:`load_session_usage` would return, and every conversation in
+        the tree it was summed from.
+    """
+    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, conversation_id), tree
+
+
+def load_session_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    root_conversation_id: str | None = None,
+) -> list[Conversation]:
+    """
+    Load the spawn tree *conversation_id* belongs to, verifying the root.
+
+    One place owns the reuse rule for a caller-supplied tree root, so every
+    consumer gets the same guarantee: the tree comes back containing this
+    conversation, or the supplied root was stale and is resolved again.
+
+    A caller's ``root_conversation_id`` is immutable **per row**. Deleting a
+    conversation and recreating it under the same id produces a new row that
+    may sit in a different tree, so a row read earlier in the request can
+    name a root this conversation no longer belongs to. Rather than trust it
+    or re-read unconditionally, the supplied root is checked against the
+    tree it produced — a membership test on rows already in memory, so the
+    happy path costs nothing and the stale path costs one read.
+
+    :param conversation_id: The conversation whose tree is wanted,
+        e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: Caller-supplied tree root, validated as
+        above. ``None`` resolves the root here.
+    :returns: Every conversation in the tree (root plus all descendants,
+        archived included). Empty when the conversation does not exist.
+    """
+    return load_verified_session_tree(
+        conversation_id, conversation_store, root_conversation_id
+    ).rows
+
+
+@dataclass(frozen=True)
+class VerifiedSessionTree:
+    """A spawn tree together with what is known about how it was loaded.
+
+    :param rows: Every conversation in the tree, archived included. Empty
+        when the conversation does not exist.
+    :param root_conversation_id: The root the rows were actually loaded
+        from, which is not necessarily the one the caller suggested.
+    :param paged: Whether the listing needed more than one page. Rows on an
+        earlier page were read before rows on a later one, so for a paged
+        tree "the tree read is newer than the caller's row" holds for the
+        tree as a whole but not for any individual row in it.
+    """
+
+    rows: list[Conversation]
+    root_conversation_id: str
+    paged: bool
+
+
+def load_verified_session_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    root_conversation_id: str | None = None,
+) -> VerifiedSessionTree:
+    """
+    Load a spawn tree and report the root it came from.
+
+    Same verification as :func:`load_session_tree`, but callers that derive
+    more than the sums from a tree — the tree root itself, the policies
+    attached to that root — need to know which root was used, because a
+    supplied one may have been discarded. Deriving those from the caller's
+    root while taking the rows from a corrected tree mixes two epochs.
+
+    :param conversation_id: The conversation whose tree is wanted.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: Caller-supplied root, treated as a hint.
+    :returns: The rows, the root they came from, and whether it paged.
+    """
+    if root_conversation_id is None:
+        conv = conversation_store.get_conversation(conversation_id)
+        if conv is None:
+            return VerifiedSessionTree([], conversation_id, False)
+        root_conversation_id = conv.root_conversation_id
+        rows, paged = _load_tree_pages(root_conversation_id, conversation_store)
+        return VerifiedSessionTree(rows, root_conversation_id, paged)
+
+    rows, paged = _load_tree_pages(root_conversation_id, conversation_store)
+    if any(c.id == conversation_id for c in rows):
+        return VerifiedSessionTree(rows, root_conversation_id, paged)
+    # Not in the tree the supplied root produced: either this conversation
+    # is gone, or it now lives in a different tree. Resolve it once.
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
-        return {}
-    tree = _load_tree_conversations(conv.root_conversation_id, conversation_store)
+        return VerifiedSessionTree([], root_conversation_id, paged)
+    if conv.root_conversation_id == root_conversation_id:
+        return VerifiedSessionTree(rows, root_conversation_id, paged)
+    rows, paged = _load_tree_pages(conv.root_conversation_id, conversation_store)
+    return VerifiedSessionTree(rows, conv.root_conversation_id, paged)
+
+
+def _sum_subtree_usage(
+    tree: list[Conversation],
+    conversation_id: str,
+) -> dict[str, Any]:
+    """
+    Sum usage across the subtree of *tree* rooted at *conversation_id*.
+
+    Pure aggregation over an already-loaded spawn tree — no store reads.
+    :func:`build_policy_engine` loads the tree once and derives both the
+    session-wide gating seed (rooted at the tree root) and the per-node
+    subtree seed (rooted at the evaluated node) from the same list;
+    :func:`load_session_usage` wraps this for callers that start from a
+    conversation id. See :func:`load_session_usage` for the shape of the
+    returned dict.
+
+    :param tree: All conversations in the spawn tree (from
+        :func:`_load_tree_conversations`); order-independent.
+    :param conversation_id: The subtree root to sum from.
+    :returns: Summed usage dict (see :func:`load_session_usage`).
+    """
     subtree_ids = _subtree_conversation_ids(tree, conversation_id)
     totals: dict[str, Any] = {}
     # Per-model breakdown summed across the subtree, parallel to the flat sums.
@@ -961,10 +1520,18 @@ def _policy_usage_seed(
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
         return {}
-    usage = load_session_usage(conv.root_conversation_id, conversation_store)
+    # A top-level row's ``root_conversation_id`` is its own id, so the root we
+    # are about to sum names itself as its root — pass it and the loader skips
+    # re-reading that row (it still verifies the hint, so a stale one heals).
+    usage = load_session_usage(
+        conv.root_conversation_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     return _normalize_usage_for_engine(usage)
 
 
+@restart_on_stale_cursor
 def _load_tree_conversations(
     root_conversation_id: str,
     conversation_store: ConversationStore,
@@ -975,7 +1542,11 @@ def _load_tree_conversations(
     Returns all conversations sharing ``root_conversation_id`` (the
     root plus every sub-agent, any ``kind``), paginating so a large
     tree is not silently truncated. The ``root_conversation_id`` column
-    is indexed, so this is a bounded indexed scan per page.
+    is indexed, so this is a bounded indexed scan per page. A delete
+    landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
 
     :param root_conversation_id: The tree's root conversation id (every
         conversation in a spawn tree shares it), e.g. ``"conv_abc123"``.
@@ -992,12 +1563,57 @@ def _load_tree_conversations(
             # (not just "default") are included in the tree.
             kind=None,
             root_conversation_id=root_conversation_id,
+            # Archived conversations still hold spend, and archiving must not
+            # move a budget gate: excluding them let an archive-after-preload
+            # (or an archived mid-tree node, which orphaned its descendants
+            # from the walk) seed the enforcement total as $0 and ALLOW a tool
+            # call over budget. The tree is an accounting structure, not a
+            # user-facing listing.
+            include_archived=True,
         )
         convs.extend(page.data)
         if not page.has_more or page.last_id is None:
             break
         after = page.last_id
     return convs
+
+
+@restart_on_stale_cursor
+def _load_tree_pages(
+    root_conversation_id: str,
+    conversation_store: ConversationStore,
+) -> tuple[list[Conversation], bool]:
+    """
+    Page through a spawn tree, reporting whether more than one page was read.
+
+    A delete landing on the page cursor mid-walk restarts the walk (via
+    :func:`restart_on_stale_cursor`) instead of silently dropping the
+    remaining rows — a truncated tree under-counts spend and can move a
+    budget gate.
+
+    :param root_conversation_id: The tree's root conversation id.
+    :param conversation_store: Store to read from.
+    :returns: ``(rows, paged)`` — ``paged`` is ``True`` when the listing
+        needed a second page, which means the rows do not share one read
+        instant.
+    """
+    convs: list[Conversation] = []
+    after: str | None = None
+    pages = 0
+    while True:
+        page = conversation_store.list_conversations(
+            limit=_SUBTREE_USAGE_PAGE_SIZE,
+            after=after,
+            kind=None,
+            root_conversation_id=root_conversation_id,
+            include_archived=True,
+        )
+        pages += 1
+        convs.extend(page.data)
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    return convs, pages > 1
 
 
 def _subtree_conversation_ids(
@@ -1037,6 +1653,53 @@ def _subtree_conversation_ids(
     return subtree
 
 
+def ancestor_ids_from_tree(
+    tree: list[Conversation],
+    conversation_id: str,
+) -> list[str]:
+    """
+    Walk a conversation's ancestor chain inside an already-loaded tree.
+
+    The mirror of :func:`_subtree_conversation_ids`, and public for the
+    same reason the tree loader is: the ancestor chain must come from the
+    same freshly-read rows as the sums, not from a conversation row the
+    caller read earlier. ``parent_conversation_id`` is immutable per row,
+    but a conversation deleted and recreated under the same id gets a new
+    row with a new parent, so a caller's copy can name a chain that no
+    longer exists — and walking it publishes to the wrong sessions.
+
+    Pure: no store reads, and no reads are needed, because a tree already
+    contains every row on the chain by construction.
+
+    :param tree: All conversations in the spawn tree (from
+        :func:`load_session_tree`); order-independent.
+    :param conversation_id: The node to walk upward from,
+        e.g. ``"conv_child123"``.
+    :returns: Ancestor ids nearest-parent-first. Empty when the node is
+        top-level, absent from the tree, or its chain is cyclic.
+    """
+    by_id = {c.id: c for c in tree}
+    ancestors: list[str] = []
+    seen = {conversation_id}
+    current = by_id.get(conversation_id)
+    while current is not None and current.parent_conversation_id is not None:
+        parent_id = current.parent_conversation_id
+        if parent_id in seen:
+            # A cycle makes the whole chain untrustworthy, not just the rest
+            # of it: returning the part walked so far would publish a
+            # descendant's usage to whichever ids happened to come first.
+            return []
+        parent = by_id.get(parent_id)
+        if parent is None:
+            # The parent link points outside this tree. Appending before
+            # checking published to a conversation that is not there.
+            return []
+        ancestors.append(parent_id)
+        seen.add(parent_id)
+        current = parent
+    return ancestors
+
+
 def _load_default_policy_specs(
     policy_store: PolicyStore | None,
 ) -> list[PolicySpec]:
@@ -1064,7 +1727,7 @@ def _load_default_policy_specs(
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
-    cached = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+    cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
     if cached is not None:
         return cached
     specs: list[PolicySpec] = []
@@ -1116,9 +1779,7 @@ def invalidate_session_policy_specs_cache(conversation_id: str) -> None:
     :param conversation_id: The session whose cache entry to evict,
         e.g. ``"conv_abc123"``.
     """
-    from omnigent.db.db_models import current_workspace_id
-
-    _SESSION_POLICY_SPECS_CACHE.pop((current_workspace_id(), conversation_id), None)
+    _SESSION_POLICY_SPECS_CACHE.pop(conversation_id, None)
 
 
 def _load_session_policy_specs(
@@ -1129,11 +1790,15 @@ def _load_session_policy_specs(
     Load enabled session policies from the store and convert
     them to :class:`FunctionPolicySpec` instances.
 
-    Results are cached per ``(workspace_id, conversation_id)`` and
-    invalidated on any mutation via :func:`invalidate_session_policy_specs_cache`.
-    There is no TTL — the cache entry is permanent until explicitly evicted,
-    so session policy changes (including ``sys_add_policy``) take effect
-    immediately on the next engine build.
+    Results are cached per ``(workspace_id, conversation_id)`` with a
+    30 s TTL (see :data:`_SESSION_POLICY_SPECS_CACHE`). Mutations call
+    :func:`invalidate_session_policy_specs_cache` for immediate local
+    eviction on the replica that handled the change; the TTL is the
+    safety net for replicas in a horizontally-scaled deployment that
+    never received the invalidation signal. Same-replica mutations
+    (including ``sys_add_policy``) still take effect on the next engine
+    build via the explicit invalidation; cross-replica propagation is
+    bounded to ≤ 30 s.
 
     Only ``type="python"`` policies are instantiable today. An
     enabled policy of an unsupported type (e.g. ``type="url"``)
@@ -1151,10 +1816,7 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    from omnigent.db.db_models import current_workspace_id
-
-    key = (current_workspace_id(), conversation_id)
-    cached = _SESSION_POLICY_SPECS_CACHE.get(key)
+    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
         return cached
     stored = policy_store.list_for_session(conversation_id)
@@ -1163,7 +1825,7 @@ def _load_session_policy_specs(
         if not policy.enabled:
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _SESSION_POLICY_SPECS_CACHE[key] = specs
+    _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
     return specs
 
 
@@ -1194,6 +1856,9 @@ def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:
             # Session policies self-select: on=None means the
             # engine skips phase filtering and always dispatches.
             on=None,
+            # Carry the row's owning workspace so a denial can be
+            # attributed to it in logs.
+            workspace_id=policy.workspace_id,
             function=FunctionRef(
                 path=policy.handler,
                 arguments=policy.factory_params,

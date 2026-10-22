@@ -1,12 +1,15 @@
 import { describe, it, expect } from "vitest";
+import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  insertNewRowsIntoPages,
   mergeItemsIntoPages,
   nullsToUndefined,
+  overlayArchivedIntoCaches,
   removeIdsFromPages,
 } from "./sessionListCache";
 
@@ -354,6 +357,12 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
+  it("accepts creation-order caches for live updates and optimistic mutations", () => {
+    expect(
+      filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
+    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
+  });
+
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
       "Invalid conversations query key",
@@ -384,7 +393,7 @@ describe("removeIdsFromPages", () => {
     expect(removed).toBe(false);
   });
 
-  it("recomputes page cursors when boundary rows are removed", () => {
+  it("repairs a legacy row-ID cursor when its anchor is removed", () => {
     const before = data([conv("a"), conv("b"), conv("c")]);
 
     const { data: after } = removeIdsFromPages(before, new Set(["a", "c"]));
@@ -396,7 +405,7 @@ describe("removeIdsFromPages", () => {
     expect(after!.pages[0].last_id).toBe("b");
   });
 
-  it("nulls the cursors of an emptied page", () => {
+  it("nulls a deleted legacy row-ID cursor on an emptied page", () => {
     const before = data([conv("a")]);
 
     const { data: after } = removeIdsFromPages(before, new Set(["a"]));
@@ -410,6 +419,20 @@ describe("removeIdsFromPages", () => {
   });
 });
 
+describe("opaque cursors after cached filtering", () => {
+  it.each([true, false])("preserves continuation metadata with has_more=%s", (hasMore) => {
+    const before = data([conv("a"), conv("b")]);
+    const cursor = "eyJvZmZzZXQiOjYwfQ==/+opaque";
+    before.pages[0].last_id = cursor;
+    before.pages[0].has_more = hasMore;
+    const partial = removeIdsFromPages(before, new Set(["b"])).data!;
+    expect(partial.pages[0]).toMatchObject({ last_id: cursor, has_more: hasMore });
+    expect(partial.pages[0].data.map((r) => r.id)).toEqual(["a"]);
+    const empty = removeIdsFromPages(partial, new Set(["a"])).data!;
+    expect(empty.pages[0]).toMatchObject({ data: [], last_id: cursor, has_more: hasMore });
+  });
+});
+
 describe("collectConversationIds", () => {
   it("unions ids across query variants and dedupes", () => {
     const base = data([conv("a"), conv("b")]);
@@ -419,5 +442,90 @@ describe("collectConversationIds", () => {
     // query) contributes nothing rather than throwing.
     expect(new Set(ids)).toEqual(new Set(["a", "b", "c"]));
     expect(ids.length).toBe(3);
+  });
+});
+
+describe("overlayArchivedIntoCaches", () => {
+  it("flips the flag in an include-archived list and drops the row from a folder", () => {
+    const qc = new QueryClient();
+    // Sidebar/archived-view cache keeps archived rows (client filters them).
+    qc.setQueryData(["conversations", "", true], data([conv("a"), conv("b")]));
+    // Project folder is non-archived — an archived row no longer belongs.
+    qc.setQueryData(["project-sessions", "proj"], data([conv("a")]));
+
+    overlayArchivedIntoCaches(qc, "a", true);
+
+    const list = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", true])!;
+    expect(list.pages[0].data.find((c) => c.id === "a")!.archived).toBe(true);
+
+    const folder = qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "proj"])!;
+    expect(folder.pages[0].data.map((c) => c.id)).toEqual([]);
+  });
+});
+
+describe("insertNewRowsIntoPages", () => {
+  const candidate = (id: string, extra: Partial<Conversation> = {}) =>
+    new Map<string, SessionListWireItem>([[id, { id, updated_at: 100, ...extra }]]);
+
+  it("prepends a brand-new row to the top of page 0 and reports it inserted", () => {
+    const before = data([conv("a"), conv("b")]);
+    const { data: after, inserted } = insertNewRowsIntoPages(
+      before,
+      candidate("new"),
+      DEFAULT_FILTERS,
+    );
+    expect(after!.pages[0].data.map((c) => c.id)).toEqual(["new", "a", "b"]);
+    expect(after!.pages[0].first_id).toBe("new");
+    expect(inserted.map((c) => c.id)).toEqual(["new"]);
+  });
+
+  it("skips a row already present (idempotent)", () => {
+    const before = data([conv("new"), conv("a")]);
+    const { data: after, inserted } = insertNewRowsIntoPages(
+      before,
+      candidate("new"),
+      DEFAULT_FILTERS,
+    );
+    expect(after).toBe(before);
+    expect(inserted).toHaveLength(0);
+  });
+
+  it("skips search-filtered lists (membership unknown)", () => {
+    const before = data([conv("a")]);
+    const { inserted } = insertNewRowsIntoPages(before, candidate("new"), {
+      searchQuery: "hi",
+      includeArchived: false,
+    });
+    expect(inserted).toHaveLength(0);
+  });
+
+  it("skips an archived row in a non-archived list", () => {
+    const before = data([conv("a")]);
+    const { inserted } = insertNewRowsIntoPages(before, candidate("new", { archived: true }), {
+      searchQuery: "",
+      includeArchived: false,
+    });
+    expect(inserted).toHaveLength(0);
+  });
+
+  it("never inserts a sub-agent/child session (parent_session_id set)", () => {
+    const before = data([conv("a")]);
+    const { inserted } = insertNewRowsIntoPages(
+      before,
+      candidate("child", { parent_session_id: "parent" }),
+      DEFAULT_FILTERS,
+    );
+    expect(inserted).toHaveLength(0);
+  });
+
+  it("skips ids the caller excludes (e.g. a session being deleted)", () => {
+    const before = data([conv("a")]);
+    const { inserted } = insertNewRowsIntoPages(
+      before,
+      candidate("gone"),
+      DEFAULT_FILTERS,
+      (id) => id === "gone",
+    );
+    expect(inserted).toHaveLength(0);
   });
 });

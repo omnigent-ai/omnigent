@@ -7,6 +7,46 @@
 // markers instead of normal user bubbles.
 
 import type { MessageContentBlock } from "@/lib/blocks";
+import { isTextBlock } from "@/lib/blocks";
+
+const TEAMMATE_MESSAGE_RE =
+  /^<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>[\s\S]*?<\/teammate-message>/;
+const AGENT_MESSAGE_RE = /^<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>[\s\S]*?<\/agent-message>/;
+const TEAMMATE_MESSAGE_PREFIXES = [
+  "Another Claude session sent a message:\n",
+  "Another Claude session sent a message while you were working:\n",
+  "A peer session sent a message while you were working:\n",
+];
+const TEAMMATE_DELIVERY_GUIDANCE = [
+  "This came from another Claude session — not typed by your user,",
+  'That "other Claude session" is an agent working inside this same session —',
+];
+
+/** Recognize older Claude task/team context that was persisted without is_meta. */
+export function isClaudeAgentMessageContent(content: MessageContentBlock[]): boolean {
+  if (content.some((block) => block.type !== "input_text")) return false;
+  const texts = content.map((block) => ("text" in block ? block.text.trim() : "")).filter(Boolean);
+  return texts.length > 0 && texts.every(isClaudeAgentMessageText);
+}
+
+function isClaudeAgentMessageText(text: string): boolean {
+  if (isClaudeTaskNotificationText(text)) {
+    return /<summary>\s*Agent\b/.test(text) || /<result>[\s\S]*<\/result>/.test(text);
+  }
+  const prefix = TEAMMATE_MESSAGE_PREFIXES.find((candidate) => text.startsWith(candidate));
+  let remaining = prefix ? text.slice(prefix.length).trimStart() : text;
+  let match = TEAMMATE_MESSAGE_RE.exec(remaining) ?? AGENT_MESSAGE_RE.exec(remaining);
+  if (!match) return false;
+  while (match) {
+    remaining = remaining.slice(match[0].length).trimStart();
+    if (!remaining) return true;
+    match = TEAMMATE_MESSAGE_RE.exec(remaining) ?? AGENT_MESSAGE_RE.exec(remaining);
+  }
+  // Peer wrappers can append native delivery instructions after the envelopes.
+  return Boolean(
+    prefix && TEAMMATE_DELIVERY_GUIDANCE.some((guidance) => remaining.startsWith(guidance)),
+  );
+}
 
 export type SystemMessageKind =
   | "task_completed"
@@ -38,6 +78,11 @@ const TIMER_RE = /^timer (\S+) fired$/;
 const TERMINAL_RE = /^terminal (\S+) is idle$/;
 const SUBAGENT_WAKE_RE =
   /^sub-agent .+ finished \((completed|failed|cancelled)\) — \d+ results? waiting in inbox\. Call sys_read_inbox to collect\.$/;
+
+// Claude Code's background-task wake, re-labelled by the client from the raw
+// `<task-notification>` block the CLI injects (see `claudeTaskNotificationMarker`).
+const BACKGROUND_TASK_RE = /^background task (\S+) (completed|failed|cancelled|finished)$/;
+const TASK_NOTIFICATION_MARKERS = ["<task-notification>", "<task-id>", "</task-notification>"];
 
 const TASK_KIND_LABEL: Record<string, string> = {
   tool: "Tool",
@@ -88,6 +133,19 @@ export function parseSystemMessage(text: string): ParsedSystemMessage | null {
       body: "",
     };
   }
+  const backgroundMatch = BACKGROUND_TASK_RE.exec(inner);
+  if (backgroundMatch) {
+    const status = backgroundMatch[2] ?? "finished";
+    const kind: SystemMessageKind =
+      status === "completed"
+        ? "task_completed"
+        : status === "failed"
+          ? "task_failed"
+          : status === "cancelled"
+            ? "task_cancelled"
+            : "generic";
+    return { kind, label: `Background task ${status}`, body };
+  }
   const timerMatch = TIMER_RE.exec(inner);
   if (timerMatch) {
     return {
@@ -134,12 +192,74 @@ export function isSystemUserContent(content: MessageContentBlock[]): boolean {
   const hasAttachments = content.some((c) => c.type === "input_image" || c.type === "input_file");
   if (hasAttachments) return false;
   const text = content
-    .filter(
-      (c): c is Extract<MessageContentBlock, { type: "input_text" }> => c.type === "input_text",
-    )
+    .filter(isTextBlock)
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
     .trim();
   return parseSystemMessage(text) !== null;
+}
+
+/**
+ * Whether ``text`` is the ``<task-notification>`` block Claude Code injects as
+ * a user-role entry when a background task finishes.
+ *
+ * :param text: One user message text block.
+ * :returns: ``true`` for a task notification, ``false`` otherwise.
+ */
+export function isClaudeTaskNotificationText(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    /^<task-notification>[\s\S]*<\/task-notification>$/.test(trimmed) &&
+    TASK_NOTIFICATION_MARKERS.every((marker) => trimmed.includes(marker))
+  );
+}
+
+/**
+ * Re-label a Claude Code ``<task-notification>`` block as a ``[System: …]``
+ * marker. Claude resumes on the notification with no human message in
+ * between; the marker keeps that resume visible as a turn boundary, so the
+ * answer Claude had already finished is not folded into the follow-up work.
+ *
+ * :param text: One user message text block.
+ * :returns: Marker text (header plus the notification's summary as the
+ *   body), or ``null`` when ``text`` is not a task notification.
+ */
+export function claudeTaskNotificationMarker(text: string): string | null {
+  if (!isClaudeTaskNotificationText(text)) return null;
+  // The header regex takes the id as one token; an id with inner whitespace
+  // would otherwise stop the marker parsing as a background task.
+  const rawId = /<task-id>([^<]*)<\/task-id>/.exec(text)?.[1]?.trim() ?? "";
+  const taskId = rawId !== "" && !/\s/.test(rawId) ? rawId : "unknown";
+  const rawStatus = /<status>([^<]*)<\/status>/.exec(text)?.[1]?.trim().toLowerCase();
+  const status =
+    rawStatus === "completed" || rawStatus === "failed" || rawStatus === "cancelled"
+      ? rawStatus
+      : "finished";
+  const summary = /<summary>([\s\S]*?)<\/summary>/.exec(text)?.[1]?.trim() ?? "";
+  const header = `[System: background task ${taskId} ${status}]`;
+  return summary ? `${header}\n${summary}` : header;
+}
+
+/**
+ * System-marker content for a user message that is a Claude task notification.
+ *
+ * :param content: A user message block's content array.
+ * :returns: One ``input_text`` block carrying the marker, or ``null`` for an
+ *   ordinary user message.
+ */
+export function taskNotificationMarkerContent(
+  content: MessageContentBlock[],
+): MessageContentBlock[] | null {
+  if (content.some((block) => !isTextBlock(block))) return null;
+  if (isClaudeAgentMessageContent(content)) return null;
+  if (content.some((block) => isTextBlock(block) && !isClaudeTaskNotificationText(block.text))) {
+    return null;
+  }
+  for (const block of content) {
+    if (!isTextBlock(block)) continue;
+    const marker = claudeTaskNotificationMarker(block.text);
+    if (marker !== null) return [{ type: "input_text", text: marker }];
+  }
+  return null;
 }

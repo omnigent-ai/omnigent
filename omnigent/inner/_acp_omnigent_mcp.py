@@ -2,8 +2,8 @@
 
 Shared by the ACP executors (``acp`` generic, ``goose``, ``qwen``). Reuses the
 *same* stdio ``serve-mcp`` relay the native harnesses use
-(:mod:`omnigent.claude_native_bridge`): the ACP agent spawns
-``python -Im omnigent.claude_native_bridge serve-mcp --bridge-dir <dir>`` as an
+(:mod:`omnigent.harnesses.claude_native.bridge`): the ACP agent spawns
+``python -Im omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>`` as an
 MCP server, which proxies each Omnigent tool call back through ``tool_executor``
 (→ :meth:`TurnContext.dispatch_tool` → the Omnigent server, where TOOL_CALL /
 TOOL_RESULT policy is enforced). The agent keeps its own filesystem/shell tools;
@@ -22,12 +22,16 @@ just runs without Omnigent tools, exactly as before this feature.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
+
+if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +39,15 @@ logger = logging.getLogger(__name__)
 # also disable it (the generic ``acp`` harness exposes a per-agent knob).
 _ENV_KILL_SWITCH = "OMNIGENT_ACP_MCP"
 
+# ACP and MCP payloads are agent-owned JSON; consumers narrow fields before use.
+_JsonObject: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
 
 def _mcp_enabled() -> bool:
     return os.environ.get(_ENV_KILL_SWITCH, "1").strip().lower() not in ("0", "false", "no")
 
 
-def _to_acp_mcp_servers(config: dict[str, Any]) -> list[dict[str, Any]]:
+def _to_acp_mcp_servers(config: _JsonObject) -> list[_JsonObject]:
     """Convert :func:`claude_native_bridge.build_mcp_config` → ACP ``mcpServers``.
 
     ``build_mcp_config`` returns ``{"mcpServers": {"<name>": {command, args,
@@ -50,7 +57,7 @@ def _to_acp_mcp_servers(config: dict[str, Any]) -> list[dict[str, Any]]:
     ``[{name, value}]`` list ACP requires.
     """
     servers = config.get("mcpServers", {})
-    out: list[dict[str, Any]] = []
+    out: list[_JsonObject] = []
     for name, spec in servers.items():
         if not isinstance(spec, dict):
             continue
@@ -75,19 +82,19 @@ class OmnigentAcpMcp:
 
     def __init__(self, label: str = "acp") -> None:
         self._label = label
-        self._relay: Any | None = None
+        self._relay: ClaudeNativeToolRelay | None = None
         self._bridge_dir: Path | None = None
         # ``None`` = not yet resolved; a list (possibly empty) = resolved+cached.
-        self._acp_servers: list[dict[str, Any]] | None = None
+        self._acp_servers: list[_JsonObject] | None = None
 
     def session_new_servers(
         self,
         *,
-        tools: list[Any],
-        tool_executor: Any | None,
-        loop: Any,
+        tools: list[_JsonObject],
+        tool_executor: ToolExecutor | None,
+        loop: asyncio.AbstractEventLoop,
         enabled: bool = True,
-    ) -> list[dict[str, Any]]:
+    ) -> list[_JsonObject]:
         """Return the ACP ``mcpServers`` array for ``session/new`` (may be empty).
 
         Starts the relay once (cached thereafter). Returns ``[]`` — without
@@ -109,7 +116,7 @@ class OmnigentAcpMcp:
         if tool_executor is None or not tools:
             return []  # not ready — retry on a later turn, don't cache
         try:
-            from omnigent.claude_native_bridge import (
+            from omnigent.harnesses.claude_native.bridge import (
                 build_mcp_config,
                 prepare_acp_mcp_bridge_dir,
                 start_tool_relay,

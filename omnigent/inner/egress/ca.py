@@ -106,7 +106,7 @@ def _generate_ca(cert_path: Path, key_path: Path) -> None:
         ]
     )
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -162,7 +162,7 @@ def _is_expired(cert_path: Path) -> bool:
     try:
         data = cert_path.read_bytes()
         cert = x509.load_pem_x509_certificate(data)
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         return now >= cert.not_valid_after_utc
     except Exception:  # noqa: BLE001 — invalid/missing CA cert regenerates
         return True
@@ -204,11 +204,11 @@ def _capath_ca_bytes(capath: str | None) -> bytes:
 def _system_ca_bundle() -> bytes:
     """Return the system CA bundle as PEM bytes.
 
-    Delegates cafile resolution to :func:`omnigent.tls.resolve_ca_file` (single
+    Delegates cafile resolution to :func:`omnigent.util.tls.resolve_ca_file` (single
     source of truth: OS trust store first, certifi fallback). Also includes loose
     certs under ``capath`` where corporate MDM roots often live.
     """
-    from omnigent.tls import resolve_ca_file
+    from omnigent.util.tls import resolve_ca_file
 
     cafile_bytes = Path(resolve_ca_file()).read_bytes()
 

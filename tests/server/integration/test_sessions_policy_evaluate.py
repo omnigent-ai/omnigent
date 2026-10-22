@@ -24,10 +24,14 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 from __future__ import annotations
 
 import asyncio
+import logging
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
 
 from omnigent.runtime import get_caps, session_stream
 from omnigent.runtime.caps import RuntimeCaps
@@ -37,6 +41,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from tests.server.helpers import CapturingRunnerClient, create_test_agent
+from tests.server.helpers import create_session_for_agent as _create_session
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -169,43 +175,6 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
 
 
 # ── Helpers ─────────────────────────────────────────────────
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a session bound to an agent.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a PHASE_TOOL_CALL EvaluationRequest.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict.
-    :returns: EvaluationRequest JSON dict.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 def _tool_result_request(
@@ -354,6 +323,55 @@ async def test_tool_call_deny_with_default_policy(
     )
     assert resp2.status_code == 200
     assert resp2.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
+async def test_deny_verdict_log_carries_deciding_policy_workspace_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The DENY verdict log names the *deciding policy's own* workspace id.
+
+    The denying policy carries ``workspace_id`` (as ``_stored_policy_to_spec``
+    stamps it from the stored row). The value logged is sourced from the
+    policy, not the ambient request — proven here by giving the policy a
+    distinctive id while the request context stays at the OSS default (0).
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        # Stand in for a stored row owned by this workspace; distinct from
+        # the request's current_workspace_id() (0) so the source is provable.
+        workspace_id=7780,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    original_caps = get_caps()
+    patched_caps = RuntimeCaps(
+        execution_timeout=original_caps.execution_timeout,
+        default_policies=[deny_bash_policy],
+    )
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: patched_caps,
+    )
+
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request("Bash"),
+        )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"
+
+    verdict_logs = [
+        r.getMessage() for r in caplog.records if "policy_eval_verdict" in r.getMessage()
+    ]
+    assert verdict_logs, "expected a policy_eval_verdict log for the DENY"
+    assert "policy_workspace=7780" in verdict_logs[0], verdict_logs[0]
 
 
 async def test_tool_result_deny_with_default_policy(
@@ -722,6 +740,59 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
     )
 
 
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        )
+    )
+    try:
+        # The built-in scheduled-task gate must fire even with no custom policies.
+        elicitation_id = await asyncio.wait_for(drain, timeout=5)
+        assert not evaluate.done()
+        response = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "accept"},
+        )
+        assert response.status_code == 202, response.text
+        response = await asyncio.wait_for(evaluate, timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+    finally:
+        for task in (drain, evaluate):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(drain, evaluate, return_exceptions=True)
+
+
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
+async def test_schedule_read_and_removal_do_not_require_new_approval(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    # A regression that gates these tools would park the request; fail fast instead.
+    response = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        ),
+        timeout=5,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
 async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -986,7 +1057,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         elif entries == 2:
             second_in_gate.set()
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            engine.apply_state_updates(result.state_updates, approved=True)
         return True
 
     monkeypatch.setattr(sessions_routes, "_hold_native_ask_gate", _controllable_gate)
@@ -1015,7 +1086,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
     try:
         await asyncio.wait_for(second_in_gate.wait(), timeout=1.0)
         second_entered = True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         second_entered = False
     assert not second_entered, (
         "A second concurrent cost ask entered the gate while the first was "
@@ -1359,3 +1430,176 @@ async def test_policy_evaluate_gates_every_first_party_tool_result_shape(
         assert resp.json()["result"] == "POLICY_ACTION_DENY", (
             f"{why}: the tool-scoped policy did not see a tool name — {resp.text[:160]}"
         )
+
+
+_EVALUATE_USER = "alice@example.com"
+
+
+@pytest.fixture()
+def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """App with permissions + header auth, for route-level SQL budgeting."""
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def auth_client(auth_app: FastAPI, mock_llm: Any, tmp_path: Path):
+    """Async client against the auth-enabled app."""
+    from omnigent.runtime import set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+    transport = httpx.ASGITransport(app=auth_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: str) -> str:
+    """Create a real agent-bound session and grant it to the test user.
+
+    Uses the real create path (a genuine uploaded bundle) so the agent
+    cache can load the spec — a fabricated agent row with a fake bundle
+    location cannot be loaded and the route would bail before the work
+    this budget measures.
+    """
+    import json as _json
+
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from tests.server.helpers import build_agent_bundle
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_EVALUATE_USER)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    resp = await auth_client.post(
+        "/v1/sessions",
+        data={"metadata": _json.dumps({"title": "budget"})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                # The agent MUST declare a policy: with no policies the route
+                # short-circuits via ``any_policies_apply`` before building an
+                # engine, so a budget measured without one would not cover the
+                # preload path at all (it silently didn't, first time round).
+                build_agent_bundle(
+                    name="budget-agent",
+                    guardrails={
+                        "policies": {
+                            "allow_all": {
+                                "type": "function",
+                                "on": ["tool_call"],
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                            }
+                        }
+                    },
+                ),
+                "application/gzip",
+            )
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["session_id"]
+    perms.grant(_EVALUATE_USER, session_id, LEVEL_OWNER)
+    return session_id
+
+
+# Measured SQL-statement budget for the AUTHENTICATED evaluate route — the
+# blocking PreToolUse hook. Counted as executed statements, not store-method
+# calls: a store-call oracle cannot see that one call fans out to three
+# statements (conversation + metadata + labels), which is exactly how an
+# earlier "6 queries" claim survived being wrong by five.
+#
+# Measured (both dialects) for the seed below: one owner grant, one agent
+# declaring one tool_call policy, one conversation, no declared labels, no
+# children. Composition: the handler's conversation load 3, session-policy
+# lookup, agent row, spawn-tree scan 3.
+#
+# ACL resolution used to add 3 more (users + the user and public grants). The
+# warm-up request below now also warms the permission store's resolve_access
+# cache, so the steady-state route serves the access decision from memory —
+# which is the production hot path, since the check re-runs on every event of a
+# turn. A cold process still pays those 3.
+#
+# This is the number the PR must quote — an earlier description claimed 6.
+# It is also the oracle for the preload optimisation: dropping the
+# ``conversation=`` argument makes the builder re-read the conversation and
+# pushes this up, which no behavioural assertion can see because both
+# variants return the same verdict.
+_EVALUATE_ROUTE_SQL_BUDGET = 8
+
+
+@pytest.mark.asyncio
+async def test_authenticated_evaluate_route_sql_budget(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Pin the route's SQL count so the description cannot drift from the code,
+    and so removing the preload is detectable.
+
+    This is the oracle for the preload optimisation: dropping the
+    ``conversation=`` argument in ``_build_engine`` makes the builder read
+    the conversation again, which changes this count. A behavioural
+    assertion alone cannot see that, because both variants return the same
+    verdict.
+    """
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    session_id = await _seed_authenticated_session(auth_client, db_uri)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    payload = {
+        "event": {
+            "type": "PHASE_TOOL_CALL",
+            "data": {"name": "echo", "arguments": {}},
+        }
+    }
+    # Warm the spec / policy / ACL caches so the count is the steady-state one.
+    await auth_client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+    )
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        if not statement.lstrip().upper().startswith("PRAGMA"):
+            statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json=payload, headers=headers
+        )
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+    assert resp.status_code == 200, resp.text
+    assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
+        s.split("\n")[0][:80] for s in statements
+    ]

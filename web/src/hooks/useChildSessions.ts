@@ -1,5 +1,8 @@
-import { useQuery, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { setSessionParent } from "@/lib/sessionHost";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
  * Maximum depth of sub-agent nesting the Agents rail renders, counted
@@ -27,6 +30,8 @@ export interface ChildSessionInfo {
   id: string;
   /** Full title, ``"{tool}:{session_name}"``, e.g. ``"researcher:auth"``. */
   title: string | null;
+  /** Human-readable task-derived label, e.g. ``"Investigate auth flow"``. */
+  task_summary: string | null;
   /** Sub-agent type prefix, e.g. ``"researcher"``. */
   tool: string | null;
   /** Sub-agent instance name suffix, e.g. ``"auth"``. */
@@ -51,6 +56,12 @@ export interface ChildSessionInfo {
    * the Agents rail renders an "awaiting input" badge for it.
    */
   pending_elicitations_count: number;
+  /**
+   * Model the intelligent router picked for this sub-agent, e.g.
+   * ``"databricks-claude-sonnet-5"``. ``null``/absent when the child was
+   * not routed (routing off, or a server that predates the field).
+   */
+  routed_model?: string | null;
 }
 
 /**
@@ -61,6 +72,7 @@ export interface ChildSessionInfo {
 interface ChildSessionWire {
   id: string;
   title: string | null;
+  task_summary?: string | null;
   tool: string | null;
   session_name: string | null;
   labels?: Record<string, string>;
@@ -69,6 +81,7 @@ interface ChildSessionWire {
   busy: boolean;
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
+  routed_model?: string | null;
 }
 
 interface ChildSessionsResponse {
@@ -84,6 +97,11 @@ interface ChildSessionsResponse {
  */
 export function childSessionsQueryKey(conversationId: string): readonly unknown[] {
   return ["conversation", conversationId, "child_sessions"];
+}
+
+/** True for any key built by ``childSessionsQueryKey``. */
+function isChildSessionsQueryKey(key: readonly unknown[]): boolean {
+  return key.length === 3 && key[0] === "conversation" && key[2] === "child_sessions";
 }
 
 /**
@@ -109,6 +127,26 @@ export function cachedTreeContains(
   targetId: string,
   maxDepth: number,
 ): boolean {
+  return findCachedDescendant(queryClient, rootId, targetId, maxDepth) !== null;
+}
+
+/**
+ * Find ``targetId``'s summary in the cached child-session lists under
+ * ``rootId``. Synchronous and cache-only, like ``cachedTreeContains``.
+ *
+ * @param queryClient - The app QueryClient holding child-session caches.
+ * @param rootId - Root session whose cached tree to walk, e.g. ``"conv_root"``.
+ * @param targetId - Session to look for, e.g. ``"conv_grandchild"``.
+ * @param maxDepth - Levels below the root to examine, e.g. ``MAX_TREE_DEPTH``.
+ * @returns The cached summary, or ``null`` when no cached list holds it.
+ */
+export function findCachedDescendant(
+  queryClient: QueryClient,
+  rootId: string,
+  targetId: string,
+  maxDepth: number,
+): ChildSessionInfo | null {
+  const visited = new Set([rootId]);
   let frontier = [rootId];
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: string[] = [];
@@ -116,13 +154,15 @@ export function cachedTreeContains(
       const children = queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(id));
       if (!children) continue;
       for (const child of children) {
-        if (child.id === targetId) return true;
+        if (child.id === targetId) return child;
+        if (visited.has(child.id)) continue;
+        visited.add(child.id);
         next.push(child.id);
       }
     }
     frontier = next;
   }
-  return false;
+  return null;
 }
 
 /**
@@ -169,9 +209,14 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
+  // Children run on this session's runner: record the link so their
+  // session-scoped requests key by this session's host before their own
+  // snapshot loads.
+  for (const row of json.data) setSessionParent(row.id, sessionId);
   return json.data.map((row) => ({
     id: row.id,
     title: row.title,
+    task_summary: row.task_summary ?? null,
     tool: row.tool,
     session_name: row.session_name,
     labels: row.labels ?? {},
@@ -180,6 +225,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     busy: row.busy,
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
+    routed_model: row.routed_model ?? null,
   }));
 }
 
@@ -203,13 +249,14 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
     queryKey:
-      conversationId === null
+      sessionId === null
         ? ["conversation", null, "child_sessions"]
-        : childSessionsQueryKey(conversationId),
-    queryFn: () => fetchChildSessions(conversationId as string),
-    enabled: conversationId !== null,
+        : childSessionsQueryKey(sessionId),
+    queryFn: () => fetchChildSessions(sessionId as string),
+    enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
     refetchOnMount: false,
@@ -220,4 +267,38 @@ export function useChildSessions(
     isLoading,
     error: (error as Error | null) ?? null,
   };
+}
+
+/**
+ * Summary of ``targetId`` as listed under ``ancestorId``'s spawn tree.
+ *
+ * Direct children come from ``useChildSessions`` (fetched when not yet
+ * cached); deeper descendants are read from lists the Agents rail has
+ * cached. Re-renders when any cached child-session list changes.
+ *
+ * @param ancestorId - Session whose tree to search, e.g. ``"conv_root"``;
+ *   ``null`` disables the lookup.
+ * @param targetId - Descendant to find, e.g. ``"conv_child123"``.
+ * @returns The descendant's summary, or ``null`` while unknown.
+ */
+export function useDescendantSession(
+  ancestorId: string | null,
+  targetId: string,
+): ChildSessionInfo | null {
+  const queryClient = useQueryClient();
+  useChildSessions(ancestorId);
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      queryClient.getQueryCache().subscribe((event) => {
+        if (event.type === "updated" && isChildSessionsQueryKey(event.query.queryKey)) onChange();
+      }),
+    [queryClient],
+  );
+  // Cached rows keep their identity until their list changes, so the
+  // snapshot is stable between unrelated cache events.
+  return useSyncExternalStore(subscribe, () =>
+    ancestorId === null
+      ? null
+      : findCachedDescendant(queryClient, ancestorId, targetId, MAX_TREE_DEPTH),
+  );
 }

@@ -42,6 +42,344 @@ function makeIpcMain() {
   };
 }
 
+const allowAgentNavigation = async () => ({ ok: true });
+
+describe("browser IPC pending navigation lifecycle", () => {
+  for (const action of [
+    "supersede",
+    "close",
+    "closeAll",
+    "recovery teardown",
+    "sender trust revoked",
+  ]) {
+    it(`drops pending DNS after ${action}`, async () => {
+      const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+      const registry = createBrowserViewRegistry();
+      const deferred = Promise.withResolvers();
+      const opened = [];
+      let checks = 0;
+      registry.checkAgentNavigation = () => {
+        checks++;
+        return checks === 1 ? deferred.promise : Promise.resolve({ ok: true });
+      };
+      registry.openOrNavigate = (_id, url) => {
+        opened.push(url);
+        return { ok: true, created: false };
+      };
+      const ipcMain = makeIpcMain();
+      let recoveries = 0;
+      let trusted = true;
+      registerBrowserIpc({
+        ipcMain,
+        isPinnedOriginSender: () => trusted,
+        getRegistryForEvent: () => registry,
+        recoverAgentNavigationForEvent: async () => {
+          recoveries++;
+          registry.closeAll();
+          return true;
+        },
+      });
+      const navigate = (url) =>
+        ipcMain.invoke(
+          "omnigent:browser-open-or-navigate",
+          {},
+          {
+            conversationId: "conv",
+            url,
+            opts: { agent: true },
+          },
+        );
+      const first = navigate("https://first.example/");
+      if (action === "supersede") {
+        assert.equal((await navigate("https://second.example/")).ok, true);
+      } else if (action === "close") {
+        registry.close("conv");
+      } else if (action === "closeAll") {
+        registry.closeAll();
+      } else if (action === "sender trust revoked") {
+        trusted = false;
+      }
+      deferred.resolve(
+        action === "recovery teardown" ? { ok: false, error: "blocked" } : { ok: true },
+      );
+      const result = await first;
+      assert.equal(result.ok, false);
+      assert.match(result.error, /superseded or closed/);
+      assert.deepEqual(opened, action === "supersede" ? ["https://second.example/"] : []);
+      assert.equal(recoveries, action === "recovery teardown" ? 1 : 0);
+    });
+  }
+});
+
+describe("browser IPC Arca context", () => {
+  it("adds a main-owned recovery hint only to a denied agent navigation", async () => {
+    const ipcMain = makeIpcMain();
+    let allowed = false;
+    let hints = 0;
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        beginAgentNavigation: () => () => true,
+        checkAgentNavigation: allowAgentNavigation,
+        openOrNavigate: () => ({ ok: allowed, error: allowed ? undefined : "blocked" }),
+      }),
+      getAgentNavigationHintForEvent: () => {
+        hints++;
+        return "Run on Arca";
+      },
+    });
+    const invoke = (agent) =>
+      ipcMain.invoke(
+        "omnigent:browser-open-or-navigate",
+        {},
+        { conversationId: "source", url: "http://localhost", opts: { agent } },
+      );
+    assert.equal((await invoke(true)).error, "blocked Run on Arca");
+    assert.equal((await invoke(false)).error, "blocked");
+    allowed = true;
+    assert.equal((await invoke(true)).ok, true);
+    assert.equal(hints, 1);
+  });
+
+  it("retries a denied agent navigation once after identity recovery", async () => {
+    const ipcMain = makeIpcMain();
+    let allowed = false;
+    let navigations = 0;
+    let recoveries = 0;
+    const calls = [];
+    const registry = {
+      beginAgentNavigation: () => () => true,
+      checkAgentNavigation: async () => {
+        calls.push(allowed ? "allowed" : "denied");
+        return allowed ? { ok: true } : { ok: false, error: "blocked" };
+      },
+      openOrNavigate: () => {
+        calls.push("navigate");
+        navigations++;
+        assert.equal(allowed, true);
+        return { ok: true, created: false };
+      },
+    };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => registry,
+      recoverAgentNavigationForEvent: async (
+        _event,
+        url,
+        sourceHostId,
+        rememberedArcaHostId,
+        sourceIsArcaHost,
+      ) => {
+        calls.push("recover");
+        recoveries++;
+        assert.equal(url, "http://localhost:5173");
+        assert.equal(sourceHostId, "arca-host");
+        assert.equal(rememberedArcaHostId, "arca-host");
+        assert.equal(sourceIsArcaHost, true);
+        allowed = true;
+        return true;
+      },
+      getAgentContextForEvent: () => {
+        return { sourceHostId: "arca-host" };
+      },
+    });
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: {
+          agent: true,
+          sourceHostId: "arca-host",
+          rememberedArcaHostId: "arca-host",
+          sourceIsArcaHost: true,
+        },
+      },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(recoveries, 1);
+    assert.equal(navigations, 1);
+    assert.deepEqual(calls, ["denied", "recover", "allowed", "navigate"]);
+  });
+
+  it("leaves a denied navigation untouched when recovery captures no eligible identity", async () => {
+    const ipcMain = makeIpcMain();
+    let navigations = 0;
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        beginAgentNavigation: () => () => true,
+        checkAgentNavigation: allowAgentNavigation,
+        openOrNavigate: () => {
+          navigations++;
+          return { ok: false, error: "blocked", created: false };
+        },
+      }),
+      recoverAgentNavigationForEvent: async () => false,
+    });
+
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: {
+          agent: true,
+          sourceHostId: "arca-host",
+          rememberedArcaHostId: "arca-host",
+        },
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(navigations, 1);
+  });
+
+  it("returns a structured denial when recovery rejects", async () => {
+    const ipcMain = makeIpcMain();
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        beginAgentNavigation: () => () => true,
+        checkAgentNavigation: allowAgentNavigation,
+        openOrNavigate: () => ({ ok: false, error: "blocked", created: false }),
+      }),
+      recoverAgentNavigationForEvent: async () => {
+        throw new Error("recovery failed");
+      },
+    });
+
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: { agent: true, sourceHostId: "arca-host", rememberedArcaHostId: "arca-host" },
+      },
+    );
+    assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
+  });
+
+  it("re-gates the sender registry after awaited recovery", async () => {
+    const ipcMain = makeIpcMain();
+    let registryCalls = 0;
+    const first = {
+      beginAgentNavigation: () => () => true,
+      checkAgentNavigation: allowAgentNavigation,
+      openOrNavigate: () => ({ ok: false, error: "blocked" }),
+    };
+    const second = {
+      beginAgentNavigation: () => () => true,
+      checkAgentNavigation: allowAgentNavigation,
+      openOrNavigate: () => ({ ok: true, created: false }),
+    };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => (++registryCalls === 1 ? first : second),
+      recoverAgentNavigationForEvent: async () => true,
+    });
+
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost:5173",
+        opts: { agent: true, sourceHostId: "arca-host", rememberedArcaHostId: "arca-host" },
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.error, /superseded or closed/);
+    assert.equal(registryCalls, 2);
+  });
+
+  it("pairs the renderer's source host with main's context and ignores caller exception flags", async () => {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const checks = [];
+    const context = { serverTarget: "current", sourceHostId: "actual-host" };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        beginAgentNavigation: () => () => true,
+        checkAgentNavigation: async (...args) => {
+          checks.push(args);
+          return { ok: true };
+        },
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return { ok: true };
+        },
+      }),
+      getAgentContextForEvent: (_event, host) => {
+        assert.equal(host, "actual-host");
+        return context;
+      },
+    });
+    await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "source",
+        url: "http://localhost",
+        opts: {
+          force: true,
+          agent: true,
+          sourceHostId: "actual-host",
+          allowLocalhost: true,
+          isArca: true,
+          agentContext: { serverTarget: "forged" },
+        },
+      },
+    );
+    assert.deepEqual(checks, [["source", "http://localhost", context]]);
+    assert.deepEqual(calls[0][3], { force: true, agent: true, agentContext: context });
+  });
+
+  it("refuses an agent navigation whose host does not resolve publicly before creating a view", async () => {
+    const ipcMain = makeIpcMain();
+    let navigations = 0;
+    const checked = [];
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        beginAgentNavigation: () => () => true,
+        checkAgentNavigation: async (_id, url) => {
+          checked.push(url);
+          return url.includes("lvh.me")
+            ? { ok: false, error: "navigation blocked: resolves internally" }
+            : { ok: true };
+        },
+        openOrNavigate: () => {
+          navigations++;
+          return { ok: true, created: false };
+        },
+      }),
+    });
+    const invoke = (url, opts) =>
+      ipcMain.invoke("omnigent:browser-open-or-navigate", {}, { conversationId: "c", url, opts });
+
+    assert.deepEqual(await invoke("http://lvh.me:8899/", { agent: true }), {
+      ok: false,
+      created: false,
+      error: "navigation blocked: resolves internally",
+    });
+    assert.equal(navigations, 0, "no view is created or navigated");
+    assert.equal((await invoke("http://lvh.me:8899/", { force: true })).ok, false);
+    assert.deepEqual(checked, ["http://lvh.me:8899/", "http://lvh.me:8899/"]);
+    assert.equal(navigations, 0, "renderer user-intent flags cannot skip DNS validation");
+  });
+});
+
 /** A stub webContents with a navigationHistory (Electron 42) and toggleable
  *  devtools + recorded navigation calls. */
 function makeWebContents({ canBack = false, canForward = false } = {}) {
@@ -67,6 +405,7 @@ function makeWebContents({ canBack = false, canForward = false } = {}) {
     reload: () => calls.push("reload"),
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
+    getURL: () => "https://example.com/restored",
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -109,9 +448,14 @@ function nonceFromScripts(scripts) {
 function makeRegistry(conversationId, webContents) {
   const entries = new Map();
   if (conversationId) entries.set(conversationId, { view: { webContents } });
+  const suppressedCalls = []; // booleans passed to setSuppressed, in order
+  const recentSessionSupportCalls = [];
+  let recentSessionCancelCount = 0;
   return {
     get: (id) => entries.get(id) ?? null,
     has: (id) => entries.has(id),
+    beginAgentNavigation: () => () => true,
+    checkAgentNavigation: allowAgentNavigation,
     openOrNavigate: (id) => {
       const wc = makeWebContents();
       const entry = { view: { webContents: wc } };
@@ -119,7 +463,22 @@ function makeRegistry(conversationId, webContents) {
       return { ok: true, created: true, entry };
     },
     setActive: () => ({ ok: true }),
+    setSuppressed: (s) => {
+      suppressedCalls.push(s);
+      return { ok: true };
+    },
+    cancelRecentSessionSwitch: () => {
+      recentSessionCancelCount += 1;
+      return { ok: true };
+    },
+    setRecentSessionSwitchSupported: (supported) => {
+      recentSessionSupportCalls.push(supported);
+      return { ok: true };
+    },
     close: () => ({ ok: true, removed: true }),
+    suppressedCalls,
+    recentSessionSupportCalls,
+    recentSessionCancelCount: () => recentSessionCancelCount,
   };
 }
 
@@ -139,6 +498,24 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
   return { ipcMain, registry, wc, sent, event };
 }
 
+it("restores the URL and history state for the requested browser tab only", () => {
+  const viewId = "browser-tab:conv_1:tab-two";
+  const { ipcMain, event } = setup({
+    conversationId: viewId,
+    webContents: makeWebContents({ canBack: true }),
+  });
+  assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
+    exists: true,
+    url: "https://example.com/restored",
+    canGoBack: true,
+    canGoForward: false,
+  });
+  assert.deepEqual(
+    ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" }),
+    { exists: false },
+  );
+});
+
 describe("browserIpc — trust gate", () => {
   it("registers every browser-* channel", () => {
     const { ipcMain } = setup();
@@ -146,9 +523,12 @@ describe("browserIpc — trust gate", () => {
     for (const ch of [
       "omnigent:browser-open-or-navigate",
       "omnigent:browser-set-active",
+      "omnigent:browser-set-suppressed",
+      "omnigent:browser-set-recent-session-switch-supported",
+      "omnigent:browser-cancel-recent-session-switch",
       "omnigent:browser-resize",
       "omnigent:browser-screenshot",
-      "omnigent:browser-execute",
+      "omnigent:browser-perform-action",
       "omnigent:browser-has-view",
       "omnigent:browser-close",
       "omnigent:browser-go-back",
@@ -164,20 +544,87 @@ describe("browserIpc — trust gate", () => {
   });
 
   it("rejects an unpinned sender on the new toolbar handlers", async () => {
-    const { ipcMain, event } = setup({ pinned: false });
+    const { ipcMain, event, wc } = setup({ pinned: false });
     const channels = [
       "omnigent:browser-go-back",
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
       "omnigent:open-browser-devtools",
+      "omnigent:browser-perform-action",
+      "omnigent:browser-execute",
     ];
     const results = await Promise.all(
-      channels.map((ch) => ipcMain.invoke(ch, event, { conversationId: "conv_1" })),
+      channels.map((ch) =>
+        ipcMain.invoke(ch, event, {
+          conversationId: "conv_1",
+          action: "snapshot",
+          js: require("../src/browserActionScript.mjs").buildBrowserActionScript("snapshot"),
+        }),
+      ),
     );
     results.forEach((r, i) => {
       assert.equal(r.ok, false, `${channels[i]} should be gated`);
       assert.match(r.error, /connected server's page/);
     });
+    assert.deepEqual(wc.scripts, []);
+  });
+});
+
+describe("browserIpc — overlay suppression (#3980)", () => {
+  it("delegates set-suppressed to the registry with the boolean flag", async () => {
+    const { ipcMain, registry, event } = setup();
+    let r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
+    assert.equal(r.ok, true);
+    r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: false });
+    assert.equal(r.ok, true);
+    assert.deepEqual(registry.suppressedCalls, [true, false]);
+  });
+
+  it("rejects an unpinned sender", async () => {
+    const { ipcMain, event } = setup({ pinned: false });
+    const r = await ipcMain.invoke("omnigent:browser-set-suppressed", event, { suppressed: true });
+    assert.equal(r.ok, false);
+    assert.match(r.error, /connected server's page/);
+  });
+});
+
+describe("browserIpc — recent-session cancellation", () => {
+  it("tracks whether the trusted renderer supports native forwarding", async () => {
+    const { ipcMain, registry, event } = setup();
+    await ipcMain.invoke("omnigent:browser-set-recent-session-switch-supported", event, {
+      supported: true,
+    });
+    await ipcMain.invoke("omnigent:browser-set-recent-session-switch-supported", event, {
+      supported: false,
+    });
+
+    assert.deepEqual(registry.recentSessionSupportCalls, [true, false]);
+  });
+
+  it("clears the registry latch for a trusted renderer", async () => {
+    const { ipcMain, registry, event } = setup();
+    const result = await ipcMain.invoke("omnigent:browser-cancel-recent-session-switch", event);
+
+    assert.equal(result.ok, true);
+    assert.equal(registry.recentSessionCancelCount(), 1);
+  });
+
+  it("rejects an unpinned sender", async () => {
+    const { ipcMain, registry, event } = setup({ pinned: false });
+    const cancelResult = await ipcMain.invoke(
+      "omnigent:browser-cancel-recent-session-switch",
+      event,
+    );
+    const supportResult = await ipcMain.invoke(
+      "omnigent:browser-set-recent-session-switch-supported",
+      event,
+      { supported: true },
+    );
+
+    assert.equal(cancelResult.ok, false);
+    assert.equal(supportResult.ok, false);
+    assert.equal(registry.recentSessionCancelCount(), 0);
+    assert.deepEqual(registry.recentSessionSupportCalls, []);
   });
 });
 
@@ -478,4 +925,95 @@ describe("browserIpc — navigation API helpers", () => {
     assert.equal(goBack(cantWc), false);
     assert.equal(goForward(cantWc), false);
   });
+});
+
+describe("browserIpc — typed actions", () => {
+  it("accepts an older UI's action templates without executing arbitrary input", async () => {
+    const { ipcMain, event, wc } = setup();
+    for (const { script } of require("./fixtures/browserActions-v0.18.json").requests) {
+      // oxlint-disable-next-line no-await-in-loop -- Exercise each legacy request against the same view.
+      const result = await ipcMain.invoke("omnigent:browser-execute", event, {
+        conversationId: "conv_1",
+        js: script,
+      });
+      assert.equal(result.ok, true, result.error);
+      assert.equal(wc.scripts.at(-1), script);
+    }
+  });
+
+  it("rejects raw scripts and malformed action arguments before execution", async () => {
+    const wc = makeWebContents();
+    const { ipcMain, event } = setup({ webContents: wc });
+    const legacy = await ipcMain.invoke("omnigent:browser-execute", event, {
+      conversationId: "conv_1",
+      js: "1 + 1",
+    });
+    assert.equal(legacy.ok, false);
+    for (const input of [
+      { action: "evaluate", params: { js: "1 + 1" } },
+      { action: "click", params: { ref: "7" } },
+      { action: "snapshot", params: { js: "1 + 1" } },
+      { action: "type", params: { selector: "input", text: {} } },
+    ]) {
+      // oxlint-disable-next-line no-await-in-loop -- Assert each rejected request leaves the view untouched.
+      const result = await ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        ...input,
+      });
+      assert.equal(result.ok, false);
+    }
+    assert.equal(wc.scripts.length, 0);
+  });
+
+  it("executes a fixed action without synthetic user activation", async () => {
+    const wc = makeWebContents();
+    const calls = [];
+    wc.executeJavaScript = async (...args) => {
+      calls.push(args);
+      return "ok";
+    };
+    const { ipcMain, event } = setup({ webContents: wc });
+    const result = await ipcMain.invoke("omnigent:browser-perform-action", event, {
+      conversationId: "conv_1",
+      action: "click",
+      params: { selector: "button" },
+    });
+    assert.deepEqual(result, { ok: true, result: "ok" });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][1], false);
+  });
+});
+
+it("applies navigation policy even when renderer options claim user intent", async () => {
+  for (const opts of [undefined, {}, { agent: false }, { agent: true }]) {
+    const ipcMain = makeIpcMain();
+    const calls = [];
+    const context = { serverTarget: "trusted-main-context" };
+    registerBrowserIpc({
+      ipcMain,
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        beginAgentNavigation: () => () => true,
+        checkAgentNavigation: allowAgentNavigation,
+        openOrNavigate: (...args) => {
+          calls.push(args);
+          return { ok: false, error: "blocked" };
+        },
+      }),
+      getAgentContextForEvent: () => context,
+    });
+    // oxlint-disable-next-line no-await-in-loop -- Each request checks a distinct renderer option.
+    const result = await ipcMain.invoke(
+      "omnigent:browser-open-or-navigate",
+      {},
+      {
+        conversationId: "conv_1",
+        url: "https://example.com",
+        opts,
+      },
+    );
+    assert.equal(result.ok, false);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0][3], { force: false, agent: true, agentContext: context });
+  }
 });

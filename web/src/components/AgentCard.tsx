@@ -3,6 +3,7 @@ import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
+import { DevinIcon } from "@/components/icons/DevinIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
@@ -28,7 +29,9 @@ import { AgentHoverCard } from "@/components/AgentHoverCard";
  * @param agent - The catalog entry to render.
  * @returns The icon component to render for the agent.
  */
-function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGElement>> {
+export function iconForAgent(
+  agent: Pick<AvailableAgent, "name" | "harness">,
+): ComponentType<SVGProps<SVGSVGElement>> {
   if (agent.name === "nessie") return NessieIcon;
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
@@ -41,6 +44,7 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "antigravity") return AntigravityIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
+  if (nativeAgent?.iconKind === "devin") return DevinIcon;
   // A null harness (spec couldn't load) flows through to the bot fallback.
   if (agent.harness?.includes("codex")) return CodexIcon;
   if (agent.harness?.includes("claude")) return ClaudeIcon;
@@ -49,6 +53,9 @@ function iconForAgent(agent: AvailableAgent): ComponentType<SVGProps<SVGSVGEleme
   if (agent.harness?.includes("hermes")) return HermesIcon;
   if (agent.harness?.includes("kiro")) return KiroIcon;
   if (agent.harness?.includes("goose")) return GooseIcon;
+  // Covers `devin-native`, the retired `devin-acp` id, and a user-configured
+  // `acp:devin`.
+  if (agent.harness?.includes("devin")) return DevinIcon;
   // Both the SDK "kimi"/"kimi-code" harness and "kimi-native" get the Kimi glyph.
   if (agent.harness?.includes("kimi")) return KimiIcon;
   // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
@@ -106,9 +113,9 @@ export function AgentCard({
     >
       <Icon className="size-4 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
-        <span className="text-xs font-semibold">{agent.display_name}</span>
+        <span className="text-sm font-semibold">{agent.display_name}</span>
         {!compact && agent.description && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{agent.description}</p>
+          <p className="mt-0.5 text-sm text-muted-foreground">{agent.description}</p>
         )}
       </div>
     </button>

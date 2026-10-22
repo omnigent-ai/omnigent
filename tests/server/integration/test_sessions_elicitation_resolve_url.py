@@ -32,33 +32,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-import pytest_asyncio
-from fastapi import FastAPI
 
 from omnigent.runtime import get_caps, session_stream
-from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.caps import RuntimeCaps
-from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.permission_store.sqlalchemy_store import (
-    SqlAlchemyPermissionStore,
-)
-from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -80,75 +66,6 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
     if tool == "Bash":
         return {"result": "ASK", "reason": "Approve child tool call"}
     return {"result": "ALLOW"}
-
-
-# ── Auth-enabled fixtures (per-module, matching the convention in
-#    test_sessions_permissions.py — these are redefined per test
-#    module rather than promoted to conftest) ──────────────────
-
-
-@pytest.fixture()
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    """
-    App fixture with a permission store + auth provider enabled.
-
-    Mirrors the shared ``app`` fixture from ``conftest.py`` but adds
-    a :class:`SqlAlchemyPermissionStore` and an auth provider so
-    access-control checks are live on the session routes — required
-    to exercise the cross-user gate on the resolve endpoint.
-
-    :param runtime_init: Fixture that initializes the runtime with a
-        mock LLM.
-    :param db_uri: Test database URI.
-    :param tmp_path: Pytest temporary directory fixture.
-    """
-    from omnigent.server.auth import UnifiedAuthProvider
-
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
-    )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """
-    HTTP client wired to the auth-enabled app.
-
-    Same lifecycle as the shared ``client`` fixture: starts the
-    harness process manager, yields the client, then tears down.
-
-    :param auth_app: The auth-enabled FastAPI app.
-    :param mock_llm: Controllable mock LLM (released on teardown).
-    :param tmp_path: Pytest temporary directory fixture.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 async def _create_session(
@@ -205,30 +122,6 @@ def _create_child_session(
         agent_id=agent_id,
     )
     return child.id
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a ``PHASE_TOOL_CALL`` policy-evaluate request.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict. ``None`` means no args.
-    :returns: JSON body for ``POST /policies/evaluate``.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> None:
@@ -609,6 +502,7 @@ async def test_child_codex_elicitation_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
 
         resp = await hook_task
@@ -688,6 +582,7 @@ async def test_child_policy_elicitation_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
 
         resp = await evaluate
@@ -705,6 +600,103 @@ async def test_child_policy_elicitation_bubbles_to_parent_stream(
             parent_resolved.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await parent_resolved
+        pending_elicitations.reset_for_tests()
+
+
+async def test_decline_verdict_rides_resolved_events_to_parent(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A declined child gate publishes ``action: "decline"`` on the resolve fan-out.
+
+    Regression for the fabricated-approval transcript bug: resolving a
+    parked sub-agent approval with ``action == "decline"`` via the
+    generic approval event (the exact POST a web card sends) must carry
+    the verdict on both the session's and every ancestor's resolved
+    event. A bare "resolved" left parent agents narrating an approval
+    that did not happen.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
+    agent = await create_test_agent(client, "test-child-decline-verdict")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    parent_subscribed = asyncio.Event()
+    parent_drain = asyncio.create_task(
+        _drain_until_elicitation_event(parent_id, subscribed=parent_subscribed)
+    )
+    await parent_subscribed.wait()
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{child_id}/policies/evaluate",
+            json=_tool_call_request("Bash", {"command": "date"}),
+        )
+    )
+    child_resolved: asyncio.Task[dict[str, Any]] | None = None
+    parent_resolved: asyncio.Task[dict[str, Any]] | None = None
+
+    try:
+        event = await parent_drain
+        elicitation_id = event.get("elicitation_id")
+        assert isinstance(elicitation_id, str) and elicitation_id
+
+        child_subscribed = asyncio.Event()
+        child_resolved = asyncio.create_task(
+            _drain_until_elicitation_resolved(
+                child_id,
+                elicitation_id,
+                subscribed=child_subscribed,
+            )
+        )
+        await child_subscribed.wait()
+        parent_resolved_subscribed = asyncio.Event()
+        parent_resolved = asyncio.create_task(
+            _drain_until_elicitation_resolved(
+                parent_id,
+                elicitation_id,
+                subscribed=parent_resolved_subscribed,
+            )
+        )
+        await parent_resolved_subscribed.wait()
+
+        # The exact POST shape from the repro: generic approval event,
+        # payload nested under ``data``, action decline.
+        verdict = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "approval",
+                "data": {"elicitation_id": elicitation_id, "action": "decline"},
+            },
+        )
+        assert verdict.status_code == 202, verdict.text
+
+        assert await child_resolved == {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": elicitation_id,
+            "action": "decline",
+        }
+        assert await parent_resolved == {
+            "type": "response.elicitation_resolved",
+            "elicitation_id": elicitation_id,
+            "action": "decline",
+        }
+
+        resp = await evaluate
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    finally:
+        if not evaluate.done():
+            evaluate.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await evaluate
+        for task in (child_resolved, parent_resolved):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         pending_elicitations.reset_for_tests()
 
 
@@ -798,6 +790,7 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
     finally:
         for task in [parent_drain, parent_resolved]:
@@ -873,6 +866,7 @@ async def test_child_claude_ask_user_question_bubbles_to_parent_stream(
         assert resolved_event == {
             "type": "response.elicitation_resolved",
             "elicitation_id": elicitation_id,
+            "action": "accept",
         }
 
         resp = await hook_task
@@ -1338,51 +1332,26 @@ async def test_resolve_url_cross_user_forbidden(
     auth_client: httpx.AsyncClient,
 ) -> None:
     """
-    A shared editor needs explicit approval delegation.
+    A non-owner cannot reach the resolve endpoint when auth is
+    active.
 
-    Alice owns the session and grants Bob edit access. Bob's POST to
-    its resolve URL is initially rejected before any resolution runs. The
+    Alice owns the session; Bob's POST to its resolve URL is rejected
+    by the ``LEVEL_EDIT`` access gate before any resolution runs. The
     unguessable elicitation id is a capability, but session-owner
-    delegation is the outer fence — edit access alone must not authorize
-    tools that execute with Alice's credentials. Alice can then delegate
-    that authority explicitly.
+    access control is the outer fence — Bob must not get past it even
+    with a valid-looking id.
     """
     agent = await create_test_agent(auth_client, user="alice@example.com")
     session_id = await _create_session(auth_client, agent["id"], user="alice@example.com")
-    grant = await auth_client.put(
-        f"/v1/sessions/{session_id}/permissions",
-        json={"user_id": "bob@example.com", "level": LEVEL_EDIT},
-        headers={"X-Forwarded-Email": "alice@example.com"},
-    )
-    assert grant.status_code == 200, grant.text
 
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/elicitations/elicit_whatever/resolve",
         json={"action": "accept"},
         headers={"X-Forwarded-Email": "bob@example.com"},
     )
-    assert resp.status_code == 403, resp.text
-
-    decline = await auth_client.post(
-        f"/v1/sessions/{session_id}/elicitations/elicit_decline/resolve",
-        json={"action": "decline"},
-        headers={"X-Forwarded-Email": "bob@example.com"},
-    )
-    assert decline.status_code == 202, decline.text
-
-    delegated = await auth_client.put(
-        f"/v1/sessions/{session_id}/permissions",
-        json={"user_id": "bob@example.com", "level": LEVEL_EDIT, "can_approve": True},
-        headers={"X-Forwarded-Email": "alice@example.com"},
-    )
-    assert delegated.status_code == 200, delegated.text
-
-    resp = await auth_client.post(
-        f"/v1/sessions/{session_id}/elicitations/elicit_whatever/resolve",
-        json={"action": "accept"},
-        headers={"X-Forwarded-Email": "bob@example.com"},
-    )
-    assert resp.status_code == 202, resp.text
+    # Non-owner is denied (403 forbidden, or 404 to avoid leaking
+    # existence — both are acceptable refusals).
+    assert resp.status_code in (403, 404), resp.text
 
 
 # ── GET /sessions/{id}/elicitations/{eid} (approval page) ────

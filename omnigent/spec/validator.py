@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 
 from omnigent.spec.types import AgentSpec, ToolRuntime
+from omnigent.util.reasoning_effort import EFFORT_VALUES, validate_effort
 
 _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
 # Agent names appear as components of the ``model`` field in API responses
@@ -86,6 +87,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
     _validate_spec_version(spec, result)
     _validate_executor_type(spec, result)
     _validate_llm(spec, result)
+    _validate_reasoning_effort(spec, result)
     _validate_interaction(spec, result)
     _validate_skills(spec, result)
     _validate_mcp_servers(spec, result)
@@ -221,6 +223,25 @@ def _validate_llm(spec: AgentSpec, result: ValidationResult) -> None:
         )
 
 
+def _validate_reasoning_effort(spec: AgentSpec, result: ValidationResult) -> None:
+    """
+    Validate ``executor.reasoning_effort`` against the shared effort vocabulary.
+
+    Runs the same check as session create, so a spec that validates cannot be
+    rejected when a session is created; harness-specific support is enforced
+    downstream at launch.
+
+    :param spec: The agent spec to check.
+    :param result: Accumulator for any validation errors found.
+    """
+    if spec.executor.reasoning_effort is None:
+        return
+    try:
+        validate_effort(spec.executor.reasoning_effort, "reasoning_effort", EFFORT_VALUES)
+    except ValueError as exc:
+        result.add("executor.reasoning_effort", str(exc))
+
+
 def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:
     """
     Validate input and output modalities against allowed values.
@@ -253,11 +274,11 @@ def _validate_skills(spec: AgentSpec, result: ValidationResult) -> None:
     seen_names: set[str] = set()
     for i, skill in enumerate(spec.skills):
         prefix = f"skills[{i}]"
-        # Name format
+        # Name format (the directory name; the frontmatter label is free-form)
         if not _SKILL_NAME_PATTERN.match(skill.name):
             result.add(
                 f"{prefix}.name",
-                f"must match [a-z0-9-]+, got {skill.name!r}",
+                f"skill directory name must match [a-z0-9-]+, got {skill.name!r}",
             )
         # Name length
         if len(skill.name) > _SKILL_NAME_MAX_LEN:
@@ -314,6 +335,16 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
                 result.add(f"{prefix}.args", "not allowed when transport is 'http'")
             if mcp.env:
                 result.add(f"{prefix}.env", "not allowed when transport is 'http'")
+        elif mcp.transport == "registry":
+            if (
+                mcp.url
+                or mcp.headers
+                or mcp.command
+                or mcp.args
+                or mcp.env
+                or mcp.databricks_profile
+            ):
+                result.add(prefix, "registry services cannot override server connection settings")
         elif mcp.transport == "stdio":
             if mcp.command is None:
                 result.add(f"{prefix}.command", "required when transport is 'stdio'")
@@ -415,8 +446,9 @@ def _validate_sub_agents(
     Each sub-agent is validated independently as if it were a
     top-level spec — its own ``executor.type`` determines which
     fields are valid. The parent only checks structural references
-    (every name in ``tools.agents`` has a matching directory) and
-    tree-wide uniqueness.
+    (every name in ``tools.agents`` names a discovered sub-agent) and
+    tree-wide uniqueness. Names are matched against each sub-agent's
+    declared ``name``, which need not equal its directory name.
 
     :param spec: The agent spec to check.
     :param result: Accumulator for any validation errors found.
@@ -427,8 +459,8 @@ def _validate_sub_agents(
         if agent_ref not in sub_specs:
             result.add(
                 "tools.agents",
-                f"references sub-agent {agent_ref!r} but no "
-                f"matching directory found under agents/",
+                f"references sub-agent {agent_ref!r} but no sub-agent "
+                f"under agents/ declares that name",
             )
 
     # Validate each sub-agent independently — its own executor.type
@@ -518,6 +550,7 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
     egress_rules = (
         list(getattr(sandbox, "egress_rules", None) or []) if sandbox is not None else []
     )
+    git_ssh = list(getattr(sandbox, "git_ssh", None) or []) if sandbox is not None else []
 
     if start_in_scratch and fork:
         result.add(
@@ -545,6 +578,11 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
             "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
             "darwin_seatbelt on macOS; do not use sandbox.type=none with "
             "egress_rules.",
+        )
+    if git_ssh and sandbox_type not in _EGRESS_CAPABLE_BACKENDS:
+        result.add(
+            "os_env.sandbox.git_ssh",
+            "git_ssh requires linux_bwrap or darwin_seatbelt for hard network enforcement",
         )
 
 

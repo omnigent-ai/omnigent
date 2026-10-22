@@ -33,16 +33,18 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
-from omnigent.errors import ErrorCode
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
+from omnigent.server.schemas import CreateResponseRequest
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -51,6 +53,12 @@ _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
 # (mirroring its source module). The integration test below proves the cap is
 # wired into the scaffold's dispatch_tool emit path.
 _TRUNCATION_MARKER = "[output truncated by omnigent:"
+
+
+def test_default_idle_watchdog_allows_one_hour_progress_free_calls() -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    assert _scaffold._DEFAULT_TURN_IDLE_TIMEOUT_S == 3600.0
 
 
 @dataclass
@@ -123,6 +131,55 @@ def _make_side_client(socket_path: str) -> httpx.AsyncClient:
         transport=httpx.AsyncHTTPTransport(uds=socket_path),
         base_url="http://harness.local",
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_continuation_without_model_is_rejected() -> None:
+    request = CreateResponseRequest(
+        input="continue",
+        previous_response_id="resp_stale",
+    )
+
+    with pytest.raises(OmnigentError, match="model is required"):
+        await HarnessApp()._start_or_inject_turn(request)
+
+
+@pytest.mark.asyncio
+async def test_turn_end_freezes_gc_once_only_when_armed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After its first completed turn's stream ends, the subprocess collects then freezes, once."""
+    from omnigent.runtime.harnesses import _scaffold
+
+    gc_calls: list[str] = []
+    monkeypatch.setattr(_scaffold.gc, "collect", lambda: gc_calls.append("collect") or 0)
+    monkeypatch.setattr(_scaffold.gc, "freeze", lambda: gc_calls.append("freeze"))
+    monkeypatch.setattr(_scaffold, "_freeze_gc_after_first_turn", False)
+    outcomes: list[str] = []
+
+    class _App(HarnessApp):
+        async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+            outcome = outcomes.pop(0)
+            if outcome == "fail":
+                raise RuntimeError("turn failed")
+            if outcome == "cancel":  # observed the cancel and returned normally
+                ctx.cancelled.set()
+
+    app = _App()
+    request = CreateResponseRequest(model="test-agent", input="hi")
+
+    async def _turn(outcome: str, terminal: str = "response.completed") -> list[str]:
+        outcomes.append(outcome)
+        ctx = TurnContext(f"resp_{len(gc_calls)}", asyncio.Queue(), asyncio.Event())
+        frames = [frame async for frame in app._stream_turn(request, ctx, model="test-agent")]
+        assert f"event: {terminal}".encode() in frames[-1]
+        return gc_calls[:]
+
+    assert await _turn("ok") == []  # an embedding process never arms it
+
+    _scaffold.arm_gc_freeze_after_first_turn()
+    assert await _turn("fail", "response.failed") == []  # a failed turn keeps it armed
+    assert await _turn("cancel", "response.cancelled") == []  # so does a cancelled one
+    assert await _turn("ok") == ["collect", "freeze"]
+    assert await _turn("ok") == ["collect", "freeze"]  # one-shot
 
 
 @pytest.mark.asyncio
@@ -366,10 +423,20 @@ def use_wedged_fast_heartbeat(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def use_busy_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Busy harness, 2s absolute ceiling below its ~3s runtime; idle high so only the cap fires."""
+    """Busy harness, 2s absolute ceiling below its ~3s runtime; idle high so it never trips."""
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "busy_progress")
-    # Idle high + reset on every emit → never trips; only the absolute cap can fire.
+    # Idle high + reset on every emit → never trips; progress extends the
+    # absolute ceiling, so the busy turn must outlive the 2s cap.
     monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "10")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
+
+
+@pytest.fixture
+def use_busy_strict_absolute_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Busy harness, idle watchdog disabled: the 2s absolute ceiling is a strict cap."""
+    monkeypatch.setenv("HARNESS_TEST_FIXTURE", "busy_progress")
+    # Idle disabled → no progress-driven extension; only the absolute cap fires.
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "0")
     monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "2")
 
 
@@ -485,7 +552,9 @@ async def test_heartbeat_carries_server_time_and_last_event_seq(
     # dataclass repr would fail this.
     import datetime
 
-    parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ")
+    parsed = datetime.datetime.strptime(server_time, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.UTC
+    )
     assert parsed.year >= 2026
 
     # last_event_seq: the sequence_number of the warmup event
@@ -724,50 +793,145 @@ async def test_per_turn_watchdog_ignores_heartbeats(
     )
 
 
-async def test_per_turn_absolute_watchdog_caps_runaway_active_turn(
+async def test_actively_progressing_turn_outlives_absolute_ceiling(
     use_busy_absolute_cap: None,
     manager: HarnessProcessManager,
 ) -> None:
     """
-    The absolute ceiling fails a turn that keeps emitting but never ends.
+    Real progress extends the absolute ceiling: an active turn completes.
 
-    The idle watchdog never trips an actively-streaming turn (each emit
-    resets it), so a runaway-but-active loop needs the absolute backstop.
     The ``busy_progress`` harness emits every 0.1s for ~3s; with idle=10s
-    (reset on every emit → never trips) and absolute=2s, the absolute cap
-    must fire ~1s before the harness's natural completion.
+    and absolute=2s, every emit pushes the absolute deadline at least one
+    idle window past now, so the turn must run past the 2s cap and reach
+    ``response.completed`` — never be guillotined mid-stream for total
+    duration alone.
     """
     conv_id = "conv_busy_absolute_cap"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     events: list[_ParsedSSEEvent] = []
-    # Above the 2s cap, below the ~3s natural completion's headroom and the
-    # suite timeout; 20s only guards an unrelated hang.
+    # Well above the harness's ~3s natural completion; guards only a hang.
     async with asyncio.timeout(20):
         async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
             async for event in _stream_iter(response):
                 events.append(event)
 
     event_types = [e.event for e in events]
-    # response.failed (not completed) proves the absolute ceiling fired
-    # before the harness's ~3s natural completion. response.completed would
-    # mean the cap didn't engage.
+    # response.completed (not failed) proves progress extended the ceiling
+    # past the turn's ~3s natural completion despite the 2s absolute cap.
+    assert event_types[-1] == "response.completed", (
+        f"An actively-emitting turn must outlive the absolute ceiling and "
+        f"complete; got {event_types[-1]!r} (full: {event_types!r})."
+    )
+    # Deltas streamed throughout — the turn was active the whole time.
+    assert "response.output_text.delta" in event_types, (
+        f"Expected progress deltas from the busy turn; got {event_types!r}."
+    )
+
+
+async def test_absolute_ceiling_is_strict_when_idle_watchdog_disabled(
+    use_busy_strict_absolute_cap: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """
+    With the idle watchdog disabled, the absolute ceiling is a hard cap.
+
+    No idle watchdog means no progress-driven extension, so the busy turn
+    (~3s runtime) must be failed at the 2s absolute ceiling — the ceiling
+    still backstops a runaway turn when it is the only watchdog left.
+    """
+    conv_id = "conv_busy_strict_absolute_cap"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    events: list[_ParsedSSEEvent] = []
+    async with asyncio.timeout(20):
+        async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
+            async for event in _stream_iter(response):
+                events.append(event)
+
+    event_types = [e.event for e in events]
     assert event_types[-1] == "response.failed", (
-        f"Absolute ceiling must fail a runaway-but-active turn; got "
+        f"With idle disabled the absolute ceiling must cap the turn; got "
         f"{event_types[-1]!r} (full: {event_types!r})."
     )
-    # The error must name the ABSOLUTE watchdog, not the idle one — proves
-    # the right ceiling tripped (idle was set high and reset by every emit).
+    # The error names the ABSOLUTE watchdog — the only one enabled.
     error = events[-1].data["response"]["error"]
     assert error is not None and "absolute" in error["message"], (
-        f"Failure must come from the absolute ceiling; got {error!r}. An "
-        f"'idle'-only message would mean the idle watchdog fired instead."
+        f"Failure must come from the absolute ceiling; got {error!r}."
     )
-    # Deltas streamed before the cap fired (it was actively emitting, not
-    # wedged) — distinguishes this from the idle/wedged path.
     assert "response.output_text.delta" in event_types, (
         f"Expected progress deltas before the absolute cap; got {event_types!r}."
     )
+
+
+async def test_turn_stalling_past_absolute_ceiling_fails_via_idle_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A turn that outlives the ceiling and then stalls still dies promptly.
+
+    Progress extends the absolute deadline only to one idle window past the
+    last emit, so once the turn goes quiet the idle watchdog (or the pushed
+    ceiling — whichever first) fails it within ~idle_timeout, preserving the
+    runaway backstop for a loop that stops making real progress.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _StallsAfterProgressApp(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            """Emit past the absolute ceiling, then wedge forever."""
+            del request
+            from omnigent.server.schemas import OutputTextDeltaEvent
+
+            for i in range(8):  # 0.8s of steady progress > 0.5s ceiling
+                ctx.emit(
+                    OutputTextDeltaEvent(type="response.output_text.delta", delta=f"tick-{i} ")
+                )
+                await asyncio.sleep(0.1)
+            await asyncio.Event().wait()  # stall: no further progress
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 0.5)
+
+    app = _StallsAfterProgressApp()
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_stall_after_progress",
+        event_queue=event_queue,
+        cancelled=asyncio.Event(),
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    # The stalled turn must fail within ~idle_timeout of its last emit —
+    # 5s guards only an unrelated hang.
+    async with asyncio.timeout(5):
+        with pytest.raises(RuntimeError) as excinfo:
+            await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    elapsed = loop.time() - started
+    # The turn genuinely OUTLIVED the 0.5s absolute ceiling before it was
+    # failed — the old never-rescheduled ceiling would have killed it at
+    # ~0.5s with only ~5 of the 8 progress events emitted.
+    assert elapsed > 0.8, (
+        f"Turn was failed after {elapsed:.2f}s — at/under the 0.5s absolute "
+        f"ceiling, meaning progress did not extend it."
+    )
+    # ...and the failure landed promptly: ~one idle window (1s) after the
+    # last emit at ~0.8s, with slack for a slow CI box. A stalled turn must
+    # not linger well past its extended deadline.
+    assert elapsed < 3.5, (
+        f"Stalled turn lingered {elapsed:.2f}s — the watchdog should fire "
+        f"within ~one idle window (1s) of the last progress event."
+    )
+    emitted = [
+        e
+        for e in iter(event_queue.get_nowait, None)
+        if getattr(e, "type", "") == "response.output_text.delta"
+    ]
+    assert len(emitted) == 8, (
+        f"All 8 progress events must land before the failure; got {len(emitted)}."
+    )
+    # The failure comes from the idle watchdog (the stall), not the ceiling.
+    assert "idle watchdog" in str(excinfo.value), str(excinfo.value)
 
 
 # ── Health probe ──────────────────────────────────────────────
@@ -1484,6 +1648,96 @@ async def test_interrupt_then_message_without_prev_id_starts_fresh_turn(
         await followup_client.aclose()
 
 
+async def test_steer_after_interrupt_does_not_start_a_stray_turn(
+    use_cancellable: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A steer landing after its turn was interrupted must not start a turn.
+
+    The runner forwards a mid-turn message (stamped ``injection_id``) while it
+    still sees the turn as live, and also buffers it for a continuation turn.
+    If the harness turn was already interrupted, starting a turn for the steer
+    makes the runner's continuation turn-start get a 204 injection instead —
+    the user's next message fails with "turn failed (status 204)".
+    """
+    conv_id = "conv_steer_after_interrupt"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    steer_client = _make_side_client(str(manager.socket_path(conv_id)))
+    next_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    followup = [{"type": "input_text", "text": "say hi"}]
+    steer_body = {**start_body, "content": followup, "injection_id": "inj_after_interrupt"}
+    next_body = {**start_body, "content": followup}
+    steer_status: int | None = None
+    next_status: int | None = None
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.in_progress":
+                    continue
+                cancel_resp = await side_client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+                )
+                assert cancel_resp.status_code == 204
+                # Hold the steer's response open so a stray turn it starts stays
+                # live while the runner's continuation turn-start arrives.
+                async with steer_client.stream(
+                    "POST", f"/v1/sessions/{conv_id}/events", json=steer_body
+                ) as steer:
+                    steer_status = steer.status_code
+                    async with next_client.stream(
+                        "POST", f"/v1/sessions/{conv_id}/events", json=next_body
+                    ) as nxt:
+                        next_status = nxt.status_code
+                break
+        assert next_status == 200, (
+            f"the continuation turn must start a fresh turn (200), got {next_status}"
+        )
+        assert steer_status == 409, (
+            f"a steer with no live turn must be refused, got {steer_status}"
+        )
+    finally:
+        await side_client.aclose()
+        await steer_client.aclose()
+        await next_client.aclose()
+
+
+async def test_steer_with_injection_id_injects_live_turn(
+    use_injection: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A runner steer (``injection_id`` set) still injects into a live turn."""
+    conv_id = "conv_steer_live_turn"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    steer_body = {
+        **start_body,
+        "content": [{"type": "input_text", "text": "x"}],
+        "injection_id": "inj_live",
+    }
+    deltas: list[str] = []
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.output_text.delta":
+                    continue
+                deltas.append(event.data["delta"])
+                if event.data["delta"] == "ready:":
+                    steer = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=steer_body
+                    )
+                    assert steer.status_code == 204
+        assert deltas == ["ready:", "got_1"]
+    finally:
+        await side_client.aclose()
+
+
 async def test_interrupt_then_message_with_prev_id_starts_fresh_turn(
     use_cancellable: None,
     manager: HarnessProcessManager,
@@ -1742,7 +1996,7 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
     Fails on the unfixed watchdog (reason omits the forwarder cause); passes
     once the watchdog reads ``_native_forwarder_health``.
     """
-    from omnigent import _native_forwarder_health as health
+    from omnigent.native import _native_forwarder_health as health
     from omnigent.runtime.harnesses import _scaffold
 
     class _WedgedApp(HarnessApp):
@@ -1752,14 +2006,19 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
             await asyncio.Event().wait()
 
     # Short idle window so the watchdog trips quickly; absolute kept high so the
-    # idle ceiling (not the absolute one) is what fails the turn. The reader's
-    # recency window is 2x the idle timeout, comfortably covering the record
-    # made just before run_turn started plus scheduling overhead.
-    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    # idle ceiling (not the absolute one) is what fails the turn.
+    idle_timeout = 0.2
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", idle_timeout)
     monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 3600.0)
+    # Age the failure by exactly the wedged attempts' idle windows (plus a
+    # margin) on a fake clock, so a stalled runner can't push it out of range.
+    health_clock = {"now": 1000.0}
+    monkeypatch.setattr(health, "time", SimpleNamespace(monotonic=lambda: health_clock["now"]))
 
     health.clear()
     health.record_post_failure("external_session_status", httpx.ConnectError("No route to host"))
+    attempts = 1 + _scaffold._WEDGED_TURN_RECOVERY_RETRIES
+    health_clock["now"] += idle_timeout * attempts + 0.05
 
     app = _WedgedApp()
     ctx = TurnContext(

@@ -1,0 +1,21 @@
+name: omnigent-mcp-prototype
+services:
+  vault:
+    image: hashicorp/vault:1.18
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: local-mcp-demo-only
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "127.0.0.1:18781:8200"
+    cap_add: [IPC_LOCK]
+  sandbox:
+    build:
+      context: ../..
+      dockerfile: examples/mcp-registry/Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      OMNIGENT_LOCAL_SINGLE_USER: "1"
+      OPENAI_BASE_URL: http://host.docker.internal:18783/v1
+      OPENAI_API_KEY: mock-key
+    profiles: [sandbox]

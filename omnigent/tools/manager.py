@@ -56,15 +56,8 @@ from omnigent.tools.local import load_local_python_tools
 _logger = logging.getLogger(__name__)
 
 
-class _UCFunctionSchemaTool(Tool):
-    """Schema-only tool entry for UC function tools.
-
-    UC function tools are dispatched by the runner via the SQL
-    Statement Execution API — the tool manager only exposes the
-    schema to the LLM. This avoids the ``ClientSideTool`` path
-    (which routes to ``action_required`` / client tunneling)
-    and the ``LocalCallableTool`` path (which requires a
-    server-side callable).
+class _SchemaOnlyTool(Tool):
+    """Tool metadata without an execution environment or callable.
 
     :param tool_name: Tool name shown to the LLM, e.g.
         ``"classify_text"``.
@@ -100,6 +93,10 @@ class _UCFunctionSchemaTool(Tool):
         return self._schema
 
 
+class _UCFunctionSchemaTool(_SchemaOnlyTool):
+    """UC function metadata; execution uses the runner's SQL Statement Execution API."""
+
+
 class ToolManager:
     """Registry-based tool manager for a single workflow execution.
 
@@ -115,6 +112,8 @@ class ToolManager:
         workdir: Path | None = None,
         sandbox_enabled: bool = True,
         os_env: OSEnvironment | None = None,
+        *,
+        os_env_schema_only: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -141,6 +140,9 @@ class ToolManager:
             tools use this shared instance instead of creating their
             own. ``None`` falls back to per-call creation via
             ``create_os_environment()``.
+        :param os_env_schema_only: Register static OS tool schemas without
+            creating an environment. For metadata callers only; OS tool
+            execution remains runner-owned. Preserves the ``os_env`` gate.
         """
         self._spec = spec
         self._workdir = workdir
@@ -159,7 +161,7 @@ class ToolManager:
         self._register_sub_agent_tools()
         self._register_session_tools()
         self._register_agent_mgmt_tools()
-        self._register_os_env_tools()
+        self._register_os_env_tools(schema_only=os_env_schema_only)
         self._register_terminal_tools()
         self._register_local_tools(workdir)
         self._register_client_tools(client_tool_specs or [])
@@ -331,8 +333,8 @@ class ToolManager:
             if tool is None:
                 _logger.warning(
                     "Unknown built-in tool %r — skipping. "
-                    "Available: web_search, web_fetch, upload_file, "
-                    "list_files, download_file, "
+                    "Available: web_search, web_read, web_fetch, "
+                    "upload_file, list_files, download_file, "
                     "search_conversations, export_agent. "
                     "Note: list_comments and update_comment are "
                     "framework-owned and auto-registered; they cannot "
@@ -371,25 +373,21 @@ class ToolManager:
         """
         Build a :class:`WebSearchTool` for the parent's LLM.
 
-        Uses ``parse_model_string`` to infer the provider, except for
-        ``databricks-*`` models which don't support the native
-        ``web_search_preview`` schema and fall back to function-tool mode.
+        The OpenAI-native ``web_search_preview`` passthrough is only used
+        on OpenAI Responses-compatible harnesses; everywhere else the tool
+        gets a function schema — see
+        :func:`~omnigent.llms.routing.web_search_native_passthrough_provider`.
 
         :param config: Spec-level tool config dict, e.g.
             ``{"api_key": "...", "engine_id": "..."}``.
         :returns: A configured :class:`WebSearchTool`.
         """
+        from omnigent.llms.routing import web_search_native_passthrough_provider
         from omnigent.tools.builtins.web_search import WebSearchTool
 
-        llm_provider = None
-        if self._spec.executor.model:
-            model = self._spec.executor.model
-            # Databricks doesn't support web_search_preview; skip
-            # OpenAI provider inference for all databricks-* models.
-            if not model.startswith("databricks-"):
-                from omnigent.llms.routing import parse_model_string
-
-                llm_provider = parse_model_string(model).provider
+        llm_provider = web_search_native_passthrough_provider(
+            self._spec.executor.model, self._spec.executor.harness_kind
+        )
         return WebSearchTool(config=config, llm_provider=llm_provider)
 
     def _create_web_fetch(self) -> Tool:
@@ -486,10 +484,12 @@ class ToolManager:
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.
         self._tools[SysListModelsTool.name()] = SysListModelsTool(spec=self._spec)
-        # Advise-models is capability-gated: expose it only when the server
-        # has a routing client configured. Hiding the tool prevents agents
-        # from probing router_on via a no-op call when routing is disabled.
-        if get_caps().routing_client is not None:
+        # Advise-models is capability-gated: expose it only when some router can
+        # answer. Hiding the tool prevents agents from probing router_on via a
+        # no-op call when routing is disabled.
+        from omnigent.server.routing_backend import routing_available
+
+        if routing_available(get_caps()):
             self._tools[SysAdviseModelsTool.name()] = SysAdviseModelsTool()
 
         # create: spawning OUTSIDE the declared list (existing agents
@@ -588,7 +588,7 @@ class ToolManager:
         ):
             self._tools[_cls.name()] = _cls()
 
-    def _register_os_env_tools(self) -> None:
+    def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """
         Register ``sys_os_*`` tools when the spec declares ``os_env``.
 
@@ -600,24 +600,34 @@ class ToolManager:
         When the spec declares no os_env and no pre-resolved env
         was provided, this is a no-op.
 
+        :param schema_only: Expose metadata without creating an environment.
         :raises ValueError: If a ``sys_os_*`` name collides with
             an already-registered tool.
         """
-        from omnigent.tools.builtins.os_env import build_os_env_tools
+        from omnigent.tools.builtins.os_env import (
+            OS_ENV_TOOL_TYPES,
+            build_os_env_tools,
+        )
 
         os_env = self._pre_resolved_os_env
-        if os_env is None:
-            from omnigent.inner.os_env import create_os_environment
-
-            os_env_spec_obj = self._spec.os_env
-            if os_env_spec_obj is None:
-                return
-            os_env = create_os_environment(os_env_spec_obj)
+        if os_env is None and self._spec.os_env is None:
+            return
+        tools: list[Tool]
+        if schema_only:
+            tools = [
+                _SchemaOnlyTool(tool_cls.name(), tool_cls.get_schema())
+                for tool_cls in OS_ENV_TOOL_TYPES
+            ]
+        else:
             if os_env is None:
-                return
+                from omnigent.inner.os_env import create_os_environment
 
-        self._os_env = os_env
-        for tool in build_os_env_tools(os_env):
+                os_env = create_os_environment(self._spec.os_env)
+                if os_env is None:
+                    return
+            self._os_env = os_env
+            tools = build_os_env_tools(os_env)
+        for tool in tools:
             if tool.name() in self._tools:
                 raise ValueError(
                     f"sys_os_* tool {tool.name()!r} collides with an "

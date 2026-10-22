@@ -10,14 +10,53 @@
  * UX only. Keep the limits in sync with the Python constants.
  */
 
-/** Per-type upload size limits, in megabytes. Mirrors the server caps. */
+import type { FilesystemAttachmentsInfo } from "@/lib/capabilities";
+
+/**
+ * Per-type upload size limits, in megabytes. Mirrors the server caps.
+ *
+ * Compressible raster images accept a large upload — the server
+ * downscales/re-encodes an oversized one under the provider's per-image limit
+ * before storing it, so screenshots and retina captures no longer need to be
+ * shrunk by hand. Other image types (SVG, …) can't be shrunk, so they keep the
+ * smaller `UNCOMPRESSED_IMAGE_LIMIT_MB` cap (see `validateAttachments`).
+ *
+ * These are fixed client-side ceilings, so a deployment that raises a server
+ * limit (e.g. `filesystem_attachment_max_bytes`) also needs these raised for the
+ * extra allowance to be usable from the web UI.
+ */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
-  image: 5,
+  image: 50,
   pdf: 20,
   text: 10,
+  file: 50,
 } as const;
 
+// Raster image types the server can compress under the model limit; only these
+// get the large image cap. Mirrors _COMPRESSIBLE_IMAGE_MIMES on the server.
+const COMPRESSIBLE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+
+// Image types we don't compress (SVG, …) keep this smaller cap. Mirrors
+// IMAGE_UNCOMPRESSED_UPLOAD_BYTES on the server.
+const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
+
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
+
+/** Keep unnamed clipboard images consistent before and after upload. */
+export function attachmentFilename(file: File): string {
+  return file.name || "image.png";
+}
+
+const attachmentIds = new WeakMap<File, string>();
+let nextAttachmentId = 0;
+
+export function attachmentKey(file: File): string {
+  const existing = attachmentIds.get(file);
+  if (existing) return existing;
+  const id = `attachment-${nextAttachmentId++}`;
+  attachmentIds.set(file, id);
+  return id;
+}
 
 // Text-bearing application/* MIME types (the rest of the text-like surface
 // is text/*). Mirrors _TEXT_LIKE_APPLICATION_MIMES on the server.
@@ -39,6 +78,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".md",
   ".markdown",
   ".csv",
+  ".tsv",
   ".json",
   ".jsonl",
   ".ndjson",
@@ -101,6 +141,41 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".ipynb",
 ]);
 
+// Archives, Office documents, and databases require filesystem tools unless the
+// server reports its own policy. Mirrors DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
+// in omnigent/inner/native_attachments.py.
+const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
+  ".zip",
+  ".docx",
+  ".xlsx",
+  ".pptx",
+  ".db",
+  ".sqlite",
+  ".sqlite3",
+]);
+
+// Text/code extensions a browser may not map to a `text/*` type, which then
+// greys the file out in the OS picker. `.csv` rides `text/*` everywhere; `.tsv`
+// does not, so the filter has to name it.
+const UNMAPPED_TEXT_EXTENSIONS = [".tsv"];
+
+/**
+ * The attach button's file-picker filter for *policy*, or `undefined` to
+ * offer every file when the server delivers all types as files.
+ */
+export function attachmentAccept(policy?: FilesystemAttachmentsInfo | null): string | undefined {
+  if (policy?.all_types) return undefined;
+  const extensions = policy ? policy.extensions : [...DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS];
+  return [
+    "image/*",
+    "application/pdf",
+    "text/*",
+    "application/json",
+    ...UNMAPPED_TEXT_EXTENSIONS,
+    ...extensions,
+  ].join(",");
+}
+
 function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf(".");
   return dot >= 0 ? filename.slice(dot).toLowerCase() : "";
@@ -108,14 +183,24 @@ function extensionOf(filename: string): string {
 
 /**
  * Classify a file into an attachment category, or `null` if its type is not
- * supported (e.g. pptx, docx, xlsx, zip, binaries). Uses the browser MIME
- * type first, falling back to the filename extension for code/text files
- * whose MIME is unreliable.
+ * supported (e.g. audio, video, unrecognised binaries). Files requiring local
+ * tools are identified by extension; other types also use the browser MIME.
+ * `policy` is the server's filesystem attachment policy from `/v1/info`.
  */
-export function classifyAttachment(file: File): AttachmentCategory | null {
+export function classifyAttachment(
+  file: File,
+  policy?: FilesystemAttachmentsInfo | null,
+): AttachmentCategory | null {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
+  const filesystemExtensions = policy
+    ? new Set(policy.extensions)
+    : DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS;
 
+  // Match the server even when a browser mislabels a ZIP as text/plain.
+  if (filesystemExtensions.has(ext)) return "file";
+  // A default filesystem type the server leaves out is refused, not inlined.
+  if (DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)) return null;
   if (type.startsWith("image/")) return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
@@ -125,7 +210,21 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   ) {
     return "text";
   }
-  return null;
+  return policy?.all_types ? "file" : null;
+}
+
+/** The attachment types *policy* accepts, for rejection messages. */
+function supportedAttachmentTypes(policy?: FilesystemAttachmentsInfo | null): string {
+  const extensions = policy ? [...policy.extensions].sort() : null;
+  const isDefault =
+    extensions === null ||
+    (extensions.length === DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.size &&
+      extensions.every((ext) => DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)));
+  if (isDefault) {
+    return "images, PDF, text/code, archives, office documents, and databases";
+  }
+  if (extensions.length === 0) return "images, PDF, and text/code files";
+  return `images, PDF, text/code, and ${extensions.join(", ")} files`;
 }
 
 export interface AttachmentValidation {
@@ -140,22 +239,31 @@ export interface AttachmentValidation {
  * rejected when its type is unsupported, or when it exceeds the per-type
  * size limit.
  */
-export function validateAttachments(files: File[]): AttachmentValidation {
+export function validateAttachments(
+  files: File[],
+  policy?: FilesystemAttachmentsInfo | null,
+): AttachmentValidation {
   const accepted: File[] = [];
   const errors: string[] = [];
 
   for (const file of files) {
     const name = file.name || "file";
-    const category = classifyAttachment(file);
+    const category = classifyAttachment(file, policy);
     if (category === null) {
       errors.push(
-        `"${name}" can't be attached — only images, PDF, and text/code files are supported.`,
+        `"${name}" can't be attached: only ${supportedAttachmentTypes(policy)} are supported.`,
       );
       continue;
     }
-    const limitMb = ATTACHMENT_SIZE_LIMITS_MB[category];
+    // Non-compressible images (SVG, …) can't be shrunk server-side, so they
+    // keep the smaller cap; compressible raster images get the large cap.
+    const limitMb =
+      category === "image" && !COMPRESSIBLE_IMAGE_MIMES.has(file.type || "")
+        ? UNCOMPRESSED_IMAGE_LIMIT_MB
+        : ATTACHMENT_SIZE_LIMITS_MB[category];
     if (file.size > limitMb * 1024 * 1024) {
-      errors.push(`"${name}" is too large — the limit for ${category} files is ${limitMb} MB.`);
+      const limitLabel = category === "file" ? "files" : `${category} files`;
+      errors.push(`"${name}" is too large — the limit for ${limitLabel} is ${limitMb} MB.`);
       continue;
     }
     accepted.push(file);

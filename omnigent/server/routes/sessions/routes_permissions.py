@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import TypedDict
 
 from fastapi import (
     APIRouter,
@@ -11,10 +12,13 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.db.account_authority import target_account_scope
+from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import (
     Agent,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
@@ -26,7 +30,6 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
-    LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
@@ -44,13 +47,14 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _announce_session_added,
+)
 from omnigent.server.schemas import (
     AgentObject,
     GrantPermissionRequest,
@@ -65,6 +69,11 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+
+class _PermissionListResponse(TypedDict):
+    permissions: list[PermissionObject]
+    next_cursor: str | None
 
 
 def register_permissions_routes(
@@ -128,8 +137,9 @@ def register_permissions_routes(
                     "cannot be shared on this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-        if _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY) and (
-            body.level > LEVEL_READ or body.can_approve is True
+        if (
+            _sharing_mode in (SharingMode.READ_ONLY, SharingMode.RESTRICTED_READ_ONLY)
+            and body.level > LEVEL_READ
         ):
             raise OmnigentError(
                 "Sharing is limited to read-only access on this Omnigent server.",
@@ -155,55 +165,36 @@ def register_permissions_routes(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-            if body.level > LEVEL_READ:
+            from omnigent.server.sharing_settings import PublicSharingMaxLevel
+
+            ceiling = getattr(
+                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
+            )()
+            if body.level > ceiling.level:
                 raise OmnigentError(
-                    "Public access is limited to read-only (level 1)",
+                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
-        if existing is not None and existing.level == LEVEL_OWNER:
-            raise OmnigentError(
-                "Cannot modify owner permissions",
-                code=ErrorCode.FORBIDDEN,
+        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
+        with target_account_scope(body.user_id, target.account_generation if target else None):
+            existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+            if existing is not None and existing.level == LEVEL_OWNER:
+                raise OmnigentError(
+                    "Cannot modify owner permissions",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(permission_store.ensure_user, body.user_id)
+            perm = await asyncio.to_thread(
+                permission_store.grant, body.user_id, session_id, body.level
             )
-        can_approve = (
-            existing.can_approve
-            if body.can_approve is None and existing is not None
-            else bool(body.can_approve)
-        )
-        if can_approve and body.level < LEVEL_EDIT:
-            raise OmnigentError(
-                "Approval delegation requires edit access",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        if body.user_id == RESERVED_USER_PUBLIC and can_approve:
-            raise OmnigentError(
-                "Public access cannot approve privileged actions",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        approval_capability_changed = (
-            existing.can_approve if existing is not None else False
-        ) != can_approve
-        if approval_capability_changed:
-            await _require_access(
-                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
-            )
-        await asyncio.to_thread(permission_store.ensure_user, body.user_id)
-        perm = await asyncio.to_thread(
-            permission_store.grant,
-            body.user_id,
-            session_id,
-            body.level,
-            can_approve=can_approve,
-        )
         # Push the now-shared session to the GRANTEE's open tabs so it
         # appears in their sidebar without a list poll.
         _announce_session_added(body.user_id, session_id)
+        add_audit_attrs(target_user_id=body.user_id, level=body.level)
         return PermissionObject(
             user_id=perm.user_id,
             conversation_id=perm.conversation_id,
             level=perm.level,
-            can_approve=perm.can_approve,
         )
 
     @router.delete(
@@ -216,42 +207,85 @@ def register_permissions_routes(
         session_id: str,
         target_user_id: str,
     ) -> Response:
-        """Revoke a user's permission on a session.
+        """Revoke a permission on a session — someone else's, or your own.
 
-        Requires manage-level access. Cannot revoke your own
-        manage grant (prevents orphaned sessions). Returns 204
-        whether or not the grant existed (idempotent).
+        Two shapes, one endpoint:
+
+        * *Revoke* — removing **another** user's grant is a management
+          action and needs manage access.
+        * *Leave* — removing **your own** grant ("unshare myself", so a
+          shared session stops cluttering your sidebar) needs only read
+          access, since giving up access requires no privilege.
+
+        Either way the owner grant is protected: it is what keeps the
+        session reachable, so revoking it would orphan the session. That
+        guard covers the self case too — an owner cannot leave, and
+        archives or deletes instead. A manage-level *grantee* is still a
+        guest and may leave. Leaving records no lasting refusal, so the
+        owner re-granting brings the session back.
+
+        Idempotent: 204 whether or not a grant existed.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session to revoke access from,
             e.g. ``"conv_abc123"``.
-        :param target_user_id: User whose grant to revoke,
-            e.g. ``"alice@example.com"``.
+        :param target_user_id: User whose grant to revoke, or the caller's
+            own id to leave, e.g. ``"alice@example.com"``.
         :returns: 204 No Content.
-        :raises OmnigentError: 404 if no session or no access,
-            403 if attempting to revoke own manage grant.
+        :raises OmnigentError: 404 if no session or no access, 403 when the
+            target holds the owner grant, 400 when leaving a sub-agent
+            session, 401 if unauthenticated.
         """
         user_id = _require_user(request, auth_provider)
+        # Leaving is self-service; revoking someone else is management. Read
+        # access is the floor for the self case — enough to prove the session
+        # exists and is visible to the caller without leaking others' via
+        # 403/404.
+        leaving_self = target_user_id == user_id
         await _require_access(
-            user_id, session_id, LEVEL_MANAGE, permission_store, conversation_store
+            user_id,
+            session_id,
+            LEVEL_READ if leaving_self else LEVEL_MANAGE,
+            permission_store,
+            conversation_store,
         )
         if permission_store is None:
             raise OmnigentError(
                 "Permissions not enabled",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        if target_user_id == user_id:
+        # Single-user mode has one identity that owns everything, so a
+        # self-revoke there could only strand the local user's own sessions.
+        if leaving_self and user_id is None:
             raise OmnigentError(
-                "Cannot modify your own permissions",
+                "Cannot leave a session on a single-user server.",
                 code=ErrorCode.FORBIDDEN,
             )
+        # A sub-agent holds no grant of its own — access delegates to its
+        # parent — so revoking here would delete nothing and still report
+        # success, leaving the row in place. Scoped to the self case: the
+        # manager path is unchanged.
+        if leaving_self:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is not None and conv.parent_conversation_id is not None:
+                raise OmnigentError(
+                    "This is a sub-agent session; its access comes from its parent. "
+                    f"Leave the parent session {conv.parent_conversation_id!r} instead.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         existing = await asyncio.to_thread(permission_store.get, target_user_id, session_id)
         if existing is not None and existing.level == LEVEL_OWNER:
             raise OmnigentError(
-                "Cannot revoke owner permissions",
+                "Cannot leave a session you own. Delete or archive it instead."
+                if leaving_self
+                else "Cannot revoke owner permissions",
                 code=ErrorCode.FORBIDDEN,
             )
         await asyncio.to_thread(permission_store.revoke, target_user_id, session_id)
+        # The leaver's own tab drops the row via the client mutation's success
+        # handler; their other tabs converge on the next watch-set diff, which
+        # reports the now-inaccessible id as removed. No extra push needed.
+        add_audit_attrs(target_user_id=target_user_id, left_self=leaving_self)
         return Response(status_code=204)
 
     @router.get(
@@ -287,7 +321,7 @@ def register_permissions_routes(
         session_id: str,
         limit: int = Query(default=100, ge=1, le=1000),
         after: str | None = Query(default=None, description="Cursor: user_id to start after"),
-    ) -> dict:
+    ) -> _PermissionListResponse:
         """List permission grants on a session with cursor pagination.
 
         Requires manage-level access.
@@ -318,14 +352,11 @@ def register_permissions_routes(
                     user_id=g.user_id,
                     conversation_id=g.conversation_id,
                     level=g.level,
-                    can_approve=g.can_approve,
                 )
                 for g in grants
             ],
             "next_cursor": next_cursor,
         }
-
-    return router
 
 
 def _policy_type(spec: PolicySpec) -> str:
@@ -349,7 +380,15 @@ def _policy_description(spec: PolicySpec) -> str | None:
     return None
 
 
-def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
+def _to_agent_object(
+    agent: Agent,
+    cache: AgentCache | None,
+    *,
+    mcp_servers_editable: bool,
+    terminals_override: list[str] | None = None,
+    mcp_selection: dict[str, str] | None = None,
+    mcp_registry_editable: bool = False,
+) -> AgentObject:
     """
     Convert a runtime :class:`Agent` entity to an API-layer
     :class:`AgentObject`.
@@ -363,6 +402,12 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
 
     :param agent: The runtime agent entity.
     :param cache: Agent cache, or ``None`` in test setups.
+    :param terminals_override: Selected host's shell inventory. Applied only
+        when the loaded spec is a recognized native wrapper.
+    :param mcp_selection: Session MCP selection labels, when called for a session.
+    :param mcp_registry_editable: Whether the caller can change session MCP selections.
+    :param mcp_servers_editable: Whether the authenticated caller may mutate
+        MCP configuration for the session serving this object.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -380,19 +425,27 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
                 description = loaded.spec.description
             # Declared terminal names, in spec order — the Web UI
             # gates its "new terminal" affordance on this list.
-            terminals = list(loaded.spec.terminals or {})
-            # Bundled skills only (mirrors GET /v1/agents); the merged
-            # bundled + host-discovered set lives on the session snapshot.
+            terminals = (
+                list(terminals_override)
+                if terminals_override is not None
+                and native_coding_agent_for_agent_name(loaded.spec.name) is not None
+                else list(loaded.spec.terminals or {})
+            )
+            # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
+                for s in loaded.spec.skills
+                if s.user_invocable
             ]
+            from omnigent.mcp_selection import selected_mcp_spec
+
             mcp_servers = [
                 MCPServerSummary(
                     name=srv.name,
@@ -403,7 +456,7 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
                     command=srv.command,
                     args=srv.args,
                 )
-                for srv in loaded.spec.mcp_servers
+                for srv in selected_mcp_spec(loaded.spec, mcp_selection or {}).mcp_servers
             ]
             if loaded.spec.guardrails and loaded.spec.guardrails.policies:
                 policies = [
@@ -435,8 +488,11 @@ def _to_agent_object(agent: Agent, cache: AgentCache | None) -> AgentObject:
         updated_at=agent.updated_at,
         harness=harness,
         mcp_servers=mcp_servers,
+        mcp_registry_editable=mcp_registry_editable,
         mcp_servers_editable=(
-            agent.session_id is not None and not (harness or "").endswith("-native")
+            mcp_servers_editable
+            and agent.session_id is not None
+            and not (harness or "").endswith("-native")
         ),
         policies=policies,
         skills=skills,

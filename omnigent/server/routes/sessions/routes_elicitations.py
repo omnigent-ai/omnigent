@@ -33,22 +33,31 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
-from omnigent.server.routes._auth_helpers import (
-    require_approval_access as _require_approval_access,
-)
 from omnigent.server.routes._errors import session_not_found as _session_not_found
-from omnigent.server.routes._sessions.common import *
 from omnigent.server.routes._sessions.common import (
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import *
-from omnigent.server.routes._sessions.orchestration import *
+from omnigent.server.routes._sessions.helpers import (
+    _apply_pending_policy_ask_writes,
+)
+from omnigent.server.routes._sessions.orchestration import (
+    _resolve_elicitation,
+)
 from omnigent.server.schemas import (
     ElicitationResult,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+# Level needed to view or answer an elicitation. Elicitations carry
+# collaborative prompts (``AskUserQuestion``, plan review, MCP forms) as
+# well as policy ASK gates, and the in-band ``approval`` session event
+# resolves the same elicitations at the events route's edit bar — so the
+# two paths must stay at the same level. Raising it to owner is a product
+# decision that needs a "waiting for the owner" UI state first.
+ELICITATION_RESOLVE_LEVEL: int = LEVEL_EDIT
 
 
 def register_elicitations_routes(
@@ -94,8 +103,10 @@ def register_elicitations_routes(
         The ``elicitation_id`` is taken from the URL rather than the
         body, so the unguessable id (``secrets.token_hex(16)``) is
         the capability scoping the resolution — combined with the
-        delegated approval gate below and the server-side
-        ownership check inside :func:`_resolve_elicitation`.
+        :data:`ELICITATION_RESOLVE_LEVEL` gate below (edit, not owner:
+        any collaborator who can drive the agent may answer it) and
+        the server-side ownership check inside
+        :func:`_resolve_elicitation`.
 
         :param request: The inbound request, used for identity
             extraction.
@@ -112,27 +123,14 @@ def register_elicitations_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id = _get_user_id(request, auth_provider)
-        if body.action == "accept":
-            await _require_approval_access(
-                user_id, session_id, permission_store, conversation_store
-            )
-        else:
-            await _require_access_and_level(
-                user_id,
-                session_id,
-                LEVEL_EDIT,
-                permission_store,
-                conversation_store,
-            )
-        _logger.info(
-            "approval verdict submitted: session=%s actor=%s action=%s",
-            session_id,
-            user_id,
-            body.action,
+        access = await _require_access_and_level(
+            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
         )
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        conv = access.conversation
         if conv is None:
-            raise _session_not_found()
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
@@ -171,29 +169,39 @@ def register_elicitations_routes(
             e.g. ``"elicit_abc123"``.
         :returns: JSON with ``status`` (``"pending"`` or
             ``"resolved"``), and when pending: ``message``,
-            ``phase``, ``policy_name``, ``content_preview``.
+            ``phase``, ``policy_name``, ``content_preview``. Native requests
+            may include ``resolution`` (``"unanswered"`` or ``"confirmed"``)
+            after clearing; absence alone does not prove native confirmation.
         :raises OmnigentError: 404 if the session does not exist.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
         )
         if access.conversation is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
 
-        found = pending_elicitations.lookup(elicitation_id)
-        if found is None or found[0] != session_id:
-            return {"status": "resolved"}
+        found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if found is None:
+            resolution = pending_elicitations.native_resolution_for(session_id, elicitation_id)
+            return {"status": "resolved", **({"resolution": resolution} if resolution else {})}
 
         _conv_id, event = found
-        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        params_value = event.get("params")
+        params = params_value if isinstance(params_value, dict) else {}
+        if params.get("target_session_id") not in (None, session_id):
+            return {"status": "resolved"}
         return {
             "status": "pending",
-            "can_approve": access.can_approve,
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),
             "content_preview": params.get("content_preview", ""),
+            **(
+                {"native_delivery": params["native_delivery"]}
+                if "native_delivery" in params
+                else {}
+            ),
         }

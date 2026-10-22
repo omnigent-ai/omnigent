@@ -13,7 +13,7 @@ cursor / antigravity wraps' env-var config flow.
 Like cursor and antigravity, copilot has NO gateway / Databricks-profile env
 vars: the Copilot SDK talks only to GitHub's Copilot backend (authenticated by a
 GitHub token) and has no custom API base-URL override, so there is nothing for
-the workflow layer to route through the Databricks AI gateway.
+the workflow layer to route through the Databricks Unity Gateway.
 
 Env vars read at startup:
 
@@ -24,7 +24,11 @@ Env vars read at startup:
   ``None`` falls back to ``os_env.cwd`` then the process cwd.
 - ``HARNESS_COPILOT_GITHUB_TOKEN``: GitHub token carrying Copilot access, used
   as the SDK ``github_token``. ``None`` falls back to an inherited
-  ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``.
+  ``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``, then the ``gh``
+  CLI's stored login.
+- ``HARNESS_COPILOT_GITHUB_HOST``: GitHub Enterprise hostname (e.g.
+  ``"acme.ghe.com"``) to authenticate against. ``None`` falls back to the
+  configured ``copilot.github_host``, then Copilot's default ``github.com``.
 - ``HARNESS_COPILOT_OS_ENV``: JSON-encoded :class:`OSEnvSpec` (its ``cwd`` is
   used when ``HARNESS_COPILOT_CWD`` is unset). Defaults to
   ``caller_process + sandbox=none``.
@@ -46,6 +50,7 @@ from fastapi import FastAPI
 from omnigent.inner.copilot_executor import CopilotExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -53,6 +58,7 @@ _logger = logging.getLogger(__name__)
 _ENV_MODEL = "HARNESS_COPILOT_MODEL"
 _ENV_CWD = "HARNESS_COPILOT_CWD"
 _ENV_GITHUB_TOKEN = "HARNESS_COPILOT_GITHUB_TOKEN"
+_ENV_GITHUB_HOST = "HARNESS_COPILOT_GITHUB_HOST"
 _ENV_OS_ENV = "HARNESS_COPILOT_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_COPILOT_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_COPILOT_BUNDLE_DIR"
@@ -79,7 +85,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),
@@ -133,6 +139,7 @@ def _build_copilot_executor() -> Executor:
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL) or None,
         github_token=os.environ.get(_ENV_GITHUB_TOKEN) or None,
+        github_host=os.environ.get(_ENV_GITHUB_HOST) or None,
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),

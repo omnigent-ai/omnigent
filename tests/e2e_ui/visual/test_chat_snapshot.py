@@ -168,6 +168,7 @@ _TOKEN_SPANS = '[data-streamdown="code-block-body"] span[style*="--sdm-c"]'
 
 
 @pytest.mark.visual
+@pytest.mark.workspace_panel_product_default
 def test_chat_conversation_matches_baseline(
     snapshot_page: Page,
     live_server: str,
@@ -216,7 +217,7 @@ def test_chat_conversation_matches_baseline(
     # read-only model/effort label; wait for both so the capture includes them
     # (they hydrate from the same session snapshot the bubbles above wait on).
     expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
-    expect(page.locator('[data-testid="composer-model-effort-label"]')).to_be_visible()
+    expect(page.locator('[data-testid="composer-agent-config-value"]')).to_be_visible()
 
     # Shiki loads lazily: the colored token spans mount a frame after the block
     # first paints raw. Wait until the tokens resolve more than one distinct
@@ -236,6 +237,16 @@ def test_chat_conversation_matches_baseline(
     page.evaluate(
         "() => new Promise((resolve) => "
         "requestAnimationFrame(() => requestAnimationFrame(resolve)))"
+    )
+
+    # Hide the "Jump to top" pill for the capture. It's transient, time-dependent
+    # chrome: the initial layout settle (LatestTurnSpacer + StickToBottom pinning
+    # to the bottom) fires a scroll that reveals it for a ~2s window, so whether
+    # it's on screen at capture time is a race the baseline shouldn't encode.
+    # Force it out the same way settle kills the caret, so the resting state is
+    # deterministic regardless of when the scroll settles.
+    page.add_style_tag(
+        content='[aria-label="Jump to the first message"] { display: none !important; }'
     )
 
     # Settle web fonts + kill the blinking caret (both time-dependent).

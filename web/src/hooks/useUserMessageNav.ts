@@ -9,6 +9,7 @@
 // would each hold their own anchor and diverge.
 
 import { useCallback, useMemo, useState } from "react";
+import { releaseConversationScrollLock } from "@/components/ai-elements/conversation";
 import { useChatStore } from "@/store/chatStore";
 
 export interface UserMessageNav {
@@ -41,28 +42,41 @@ function getScrollParent(node: Element): Element | null {
 }
 
 /**
- * Smooth-scroll a user message into view (centered) and flash it once the
- * scroll settles. Shared by the Cmd+Alt nav hook and the turn rail so both
- * land on the message the same way. Anchors on the `data-user-message-id`
- * DOM attribute stamped by UserBubble.
- *
- * @param itemId - The user bubble's itemId (the DOM anchor to scroll to).
- * @param flash - Optional highlight callback fired when the scroll settles.
+ * Center a user or assistant message and flash it after scrolling settles.
+ * `ensureVisible` mounts a virtualized row before the DOM lookup is retried.
  */
-export function scrollToUserMessage(itemId: string, flash?: (id: string) => void): void {
-  const el = document.querySelector(
-    // CSS.escape is defensive — itemIds are alphanumeric today.
-    `[data-user-message-id="${CSS.escape(itemId)}"]`,
-  );
+export function scrollToMessage(
+  messageId: string,
+  flash?: (id: string) => void,
+  ensureVisible?: (id: string) => boolean,
+): void {
+  // The row may be windowed out of the DOM (virtualized transcript). Ask the
+  // transcript to scroll it into the mounted range first; its node then mounts
+  // on the next frame, so retry the DOM lookup + centering scroll there.
+  const scrolledIntoWindow = ensureVisible?.(messageId) ?? false;
+  const el =
+    document.querySelector(`[data-message-id="${CSS.escape(messageId)}"]`) ??
+    document.querySelector(`[data-user-message-id="${CSS.escape(messageId)}"]`);
   if (!el) {
+    if (scrolledIntoWindow) {
+      // Row is being mounted by the virtualizer — center on it next frame.
+      requestAnimationFrame(() => scrollToMessage(messageId, flash));
+      return;
+    }
     // Fail loud: id exists in the list but DOM anchor is missing.
-    console.warn(`scrollToUserMessage: no element for itemId=${itemId}`);
+    console.warn(`scrollToMessage: no element for messageId=${messageId}`);
     return;
   }
 
   // Supersede the previous jump's pending flash so rapid nav only flashes
   // the message we finally land on.
   cancelPendingFlash?.();
+
+  // Opening a tall transcript starts StickToBottom locked to the bottom.
+  // Without releasing that lock, the next content-resize scrollToBottom
+  // yanks the view back — deep-link / rail jumps look like a no-op on
+  // multi-message sessions (single short transcripts stay in view anyway).
+  releaseConversationScrollLock();
 
   el.scrollIntoView({ block: "center", behavior: "smooth" });
 
@@ -88,7 +102,7 @@ export function scrollToUserMessage(itemId: string, flash?: (id: string) => void
     if (done) return;
     done = true;
     cleanup();
-    flash?.(itemId);
+    flash?.(messageId);
   }
 
   function onScroll(): void {
@@ -104,7 +118,20 @@ export function scrollToUserMessage(itemId: string, flash?: (id: string) => void
   maxTimer = window.setTimeout(finish, SCROLL_SETTLE_MAX_MS);
 }
 
-export function useUserMessageNav(userMessageIds: readonly string[]): UserMessageNav {
+export function scrollToUserMessage(
+  itemId: string,
+  flash?: (id: string) => void,
+  ensureVisible?: (id: string) => boolean,
+): void {
+  scrollToMessage(itemId, flash, ensureVisible);
+}
+
+export function useUserMessageNav(
+  userMessageIds: readonly string[],
+  // From the virtualized transcript: pulls a windowed-out target into the DOM
+  // before the centering scroll. Omitted in tests / non-virtualized callers.
+  ensureItemVisible?: (id: string) => boolean,
+): UserMessageNav {
   const flashUserMessage = useChatStore((s) => s.flashUserMessage);
   const [anchorId, setAnchorId] = useState<string | null>(null);
 
@@ -122,16 +149,16 @@ export function useUserMessageNav(userMessageIds: readonly string[]): UserMessag
       ? userMessageIds[userMessageIds.length - 1]
       : userMessageIds[currentIndex - 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
 
   const goNext = useCallback(() => {
     if (outside) return;
     if (currentIndex >= userMessageIds.length - 1) return;
     const target = userMessageIds[currentIndex + 1];
     setAnchorId(target);
-    scrollToUserMessage(target, flashUserMessage);
-  }, [userMessageIds, currentIndex, outside, flashUserMessage]);
+    scrollToUserMessage(target, flashUserMessage, ensureItemVisible);
+  }, [userMessageIds, currentIndex, outside, flashUserMessage, ensureItemVisible]);
 
   // Stable identity so consumers can put the return value in an
   // effect dep array without re-registering on every render.

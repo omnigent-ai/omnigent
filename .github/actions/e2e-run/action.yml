@@ -10,6 +10,10 @@ description: >
   the gate tests refs/pull/N/merge; backcompat needs fetch-depth 0 for tags).
 
 inputs:
+  dependency_smoke:
+    description: Deprecated; removal in 0.21.0. Run compatibility smoke only.
+    required: false
+    default: "false"
   shard_id:
     description: "pytest-shard shard index"
     required: true
@@ -66,43 +70,72 @@ runs:
         } >> "$GITHUB_ENV"
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
       with:
         python-version-file: ".python-version"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      uses: ./.github/actions/setup-uv
       with:
         enable-cache: true
 
     - name: Cache virtualenv
-      uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684  # v4
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: .venv
         key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
-    - name: Install project and dev dependencies
+    - name: Install project and test dependencies
       shell: bash
-      run: uv sync --locked --extra all --extra dev
+      run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
-    - name: Install binary dependencies
-      # npm install against .github/ci-deps/package.json with --ignore-scripts
-      # to block postinstall on every package. The claude-code stub binary
-      # needs its install.cjs (audited: platform detect + same-tree hardlink,
-      # no network/exec) so we run that one explicitly; codex and pi have no
-      # install scripts and ship prebuilt CLIs. bubblewrap: the linux_bwrap
-      # sandbox backend fails loud if `bwrap` is missing, and the e2e runner
-      # runs real agents with os_env. The apparmor sysctl mirrors ci.yml
-      # (Ubuntu 24.04 blocks unprivileged user namespaces, which bwrap's
-      # unshare(CLONE_NEWUSER) needs).
-      working-directory: .github/ci-deps
+    - name: Install system dependencies
+      # bubblewrap backs the linux_bwrap sandbox. Ubuntu 24.04 restricts
+      # unprivileged user namespaces, so mirror ci.yml's AppArmor override.
       shell: bash
       run: |
+        sudo apt-get update
         sudo apt-get install -y tmux bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        npm install --ignore-scripts
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Install Claude Code CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+      with:
+        harness: claude
+
+    - name: Install Claude Code billing-notice regression CLI
+      shell: bash
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: |
+        # Keep the newer notice-producing CLI isolated from other harness tests.
+        billing_cli_dir="${RUNNER_TEMP}/omnigent-e2e-claude-billing-notice"
+        mkdir -p "$billing_cli_dir"
+        cp "${GITHUB_ACTION_PATH}/claude-billing-notice/"{package.json,package-lock.json} "$billing_cli_dir/"
+        npm ci --prefix "$billing_cli_dir" --ignore-scripts --no-audit --no-fund
+        node "$billing_cli_dir/node_modules/@anthropic-ai/claude-code/install.cjs"
+        "$billing_cli_dir/node_modules/.bin/claude" --version
+        echo "OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN=$billing_cli_dir/node_modules/.bin/claude" >> "$GITHUB_ENV"
+
+    - name: Install Codex CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+      with:
+        harness: codex
+
+    - name: Install Pi CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+      with:
+        harness: pi
+
+    - name: Install jcode harness CLI
+      # The builtin jcode catalog row launches via `jcode acp`. Host-daemon
+      # e2e tests bind sessions to the FIRST registered agent row, so a host
+      # without the jcode binary refuses the launch ("harness 'jcode' is not
+      # configured") and the runner never appears. Pin the version so CI is
+      # deterministic; bump to match the image bake's default when it moves.
+      shell: bash
+      run: |
+        sudo bash "${GITHUB_WORKSPACE}/deploy/docker/install-harness-cli.sh" jcode@v0.84.0
 
     - name: Build pinned old server (backwards-compat only)
       # Only runs when server_version is set. Builds the released tag into an
@@ -162,6 +195,7 @@ runs:
         SHARD_ID: ${{ inputs.shard_id }}
         NUM_SHARDS: ${{ inputs.num_shards }}
         NIGHTLY_FULL: ${{ inputs.nightly_full }}
+        DEPENDENCY_SMOKE: ${{ inputs.dependency_smoke }}
         E2E_TMP_BASE: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}
         PYTEST_PROGRESS_LOG_DIR: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/progress
         OMNIGENT_TOKEN_USAGE_JSON: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/tokens.json
@@ -176,7 +210,9 @@ runs:
         mkdir -p "$E2E_TMP_BASE"
 
         EXTRA_ARGS=()
-        if [[ "$NIGHTLY_FULL" != "true" ]]; then
+        if [[ "$DEPENDENCY_SMOKE" == "true" ]]; then
+          EXTRA_ARGS+=(-m "compat_smoke and not nightly" -p tests._helpers.required_tests)
+        elif [[ "$NIGHTLY_FULL" != "true" ]]; then
           EXTRA_ARGS+=(-m "not nightly")
         fi
 
@@ -198,12 +234,12 @@ runs:
           --junitxml="$E2E_TMP_BASE/junit.xml" \
           -v --tb=long --showlocals --log-level=INFO -r a \
           "${EXTRA_ARGS[@]}" \
-          || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+          || { rc=$?; [ "$rc" -eq 5 ] && [ "$DEPENDENCY_SMOKE" != "true" ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
     - name: Upload server logs on failure
       # cancelled() too: failure() misses step timeouts (#426).
       if: ${{ failure() || cancelled() }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
         name: e2e-server-logs-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: |
@@ -218,7 +254,7 @@ runs:
 
     - name: Upload token usage
       if: ${{ always() }}
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
         name: e2e-tokens-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/tokens*.json

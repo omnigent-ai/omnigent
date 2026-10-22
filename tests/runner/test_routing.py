@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from omnigent.entities import Conversation
@@ -53,6 +55,14 @@ class _ConversationStore:
         :returns: The conversation or ``None``.
         """
         return self._conversations.get(conversation_id)
+
+
+class _FailOnReadConversationStore:
+    """Conversation store that rejects persistence reads."""
+
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        """Fail because the caller should use its preloaded conversation."""
+        raise AssertionError(f"unexpected conversation read for {conversation_id}")
 
 
 def _conversation(
@@ -174,6 +184,23 @@ async def test_runner_router_requires_existing_runner_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runner_router_wait_for_runner_resolves_when_runner_registers() -> None:
+    """The reconnect wait answers False on timeout and True once the runner registers."""
+    registry = TunnelRegistry()
+    router = RunnerRouter(registry=registry, conversation_store=_ConversationStore({}))  # type: ignore[arg-type]
+    try:
+        assert await router.wait_for_runner("runner_one", timeout_s=0.05) is False
+
+        waiter = asyncio.create_task(router.wait_for_runner("runner_one", timeout_s=5.0))
+        await asyncio.sleep(0)
+        registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+
+        assert await waiter is True
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
 async def test_runner_router_requires_pinned_runner_to_be_online() -> None:
     """A pinned offline runner fails instead of silently rerouting."""
     registry = TunnelRegistry()
@@ -235,6 +262,44 @@ async def test_runner_router_resources_require_existing_runner_binding() -> None
 
         _assert_omnigent_error(excinfo, code=ErrorCode.CONFLICT)
         assert conversation.runner_id is None
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_resources_reuses_preloaded_conversation() -> None:
+    """Resource routing can reuse the row already loaded for authorization."""
+    registry = TunnelRegistry()
+    registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+    conversation = _conversation(runner_id="runner_one")
+    router = RunnerRouter(
+        registry=registry,
+        conversation_store=_FailOnReadConversationStore(),  # type: ignore[arg-type]
+    )
+    try:
+        routed = router.client_for_session_resources(
+            "conv_test",
+            conversation=conversation,
+        )
+
+        assert routed.runner_id == "runner_one"
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_resources_rejects_mismatched_preloaded_conversation() -> None:
+    """A preloaded row cannot be used to route a different session id."""
+    router = RunnerRouter(
+        registry=TunnelRegistry(),
+        conversation_store=_FailOnReadConversationStore(),  # type: ignore[arg-type]
+    )
+    try:
+        with pytest.raises(ValueError, match="conversation id mismatch"):
+            router.client_for_session_resources(
+                "conv_test",
+                conversation=_conversation("conv_other"),
+            )
     finally:
         await router.aclose()
 

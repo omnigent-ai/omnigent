@@ -16,14 +16,31 @@ from omnigent_ui_sdk.terminal import (
 )
 
 
-def test_user_config_path_uses_shared_state_dir(tmp_path, monkeypatch) -> None:
+def test_user_config_path_uses_home_fallback(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     assert state_dir() == tmp_path / ".omnigent"
     assert user_config_path() == tmp_path / ".omnigent" / "config.yaml"
 
 
-def test_user_config_path_accepts_explicit_state_dir(tmp_path) -> None:
+def test_state_dir_honors_data_dir(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    assert state_dir() == tmp_path / "data"
+
+
+def test_user_config_path_honors_config_home(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+
+    assert user_config_path() == tmp_path / "config" / "config.yaml"
+
+
+def test_user_config_path_accepts_explicit_state_dir(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "ignored"))
+
     assert user_config_path(tmp_path) == tmp_path / "config.yaml"
 
 

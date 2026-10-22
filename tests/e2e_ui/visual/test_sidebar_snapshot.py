@@ -1,7 +1,7 @@
 """Visual-regression snapshot of a *populated* sidebar ("/").
 
 The empty-landing baseline (``test_landing_snapshot.py``) stubs the session list
-empty, so its sidebar only ever shows the top nav + "No active sessions" — the
+empty, so its sidebar only ever shows the top nav + "No sessions" — the
 row-alignment surface (section headers, flat session rows, project folders and
 their nested chats) is never rendered, so a padding regression there sails
 through the gate. This baseline fills that gap: a fixed session list that lays
@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -229,7 +229,7 @@ def test_populated_sidebar_matches_baseline(
 
     # Pin the clock to a fixed "now" so the rows' relative-time pills ("2h",
     # "1d") render a constant string instead of drifting each second.
-    page.clock.set_fixed_time(datetime.fromtimestamp(_NOW_S, tz=timezone.utc))
+    page.clock.set_fixed_time(datetime.fromtimestamp(_NOW_S, tz=UTC))
 
     # Silence the session-updates socket: accept the upgrade and never push a
     # frame, so no live patch mutates a row's badge or timestamp mid-capture.
@@ -266,6 +266,13 @@ def test_populated_sidebar_matches_baseline(
     landing = page.get_by_test_id("new-chat-landing")
     # Generous timeout: the SPA runs a short boot probe before the landing paints.
     expect(landing).to_be_visible(timeout=30_000)
+    # Capture settled controls, not the composer's transient metadata spinners.
+    expect(page.get_by_test_id("new-chat-landing-agent-select")).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+        "aria-label", "Claude Code, unavailable", timeout=30_000
+    )
+    expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-workspace-loading")).to_be_hidden(timeout=30_000)
     # Wait for the sidebar's populated regions to settle: the pinned row, both
     # project folders, and the nested project chat (the last row to arrive, via
     # its own `?project=` fetch). Match row text — "Sessions" as a section-header

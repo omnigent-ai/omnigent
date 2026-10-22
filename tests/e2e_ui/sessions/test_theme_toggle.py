@@ -45,7 +45,7 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(_theme_radiogroup(page)).to_be_visible(timeout=30_000)
 
 
-def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_theme_toggle_cycles_and_persists(page: Page, live_server: str) -> None:
     """On a light OS, selecting Dark then System flips the class and persists.
 
     Fresh load is the default ``system`` (System card checked, nothing stored).
@@ -56,7 +56,7 @@ def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str,
     # of the CI runner's default scheme. next-themes reads this for systemTheme.
     page.emulate_media(color_scheme="light")
 
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Fresh context → no stored preference → default "system" is selected, and
@@ -83,9 +83,7 @@ def test_theme_toggle_cycles_and_persists(page: Page, seeded_session: tuple[str,
     assert _stored_theme(page) == "system"
 
 
-def test_theme_toggle_reaches_explicit_light_on_dark_os(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_theme_toggle_reaches_explicit_light_on_dark_os(page: Page, live_server: str) -> None:
     """On a dark OS, explicit Light clears the class and persists ``"light"``.
 
     Pins the explicit-light DOM state + persistence (the light-OS path can't
@@ -93,7 +91,7 @@ def test_theme_toggle_reaches_explicit_light_on_dark_os(
     """
     page.emulate_media(color_scheme="dark")
 
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Fresh "system" on a dark OS renders dark; System is the checked card.

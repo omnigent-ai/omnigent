@@ -6,9 +6,12 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from starlette.requests import HTTPConnection
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as app_module
+from omnigent.server.auth import AuthProvider
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -285,6 +288,40 @@ async def test_me_header_mode_behaviors(
     assert reserved.json() == {"user_id": None, "is_admin": False}
 
 
+async def test_custom_auth_provider_skips_unified_login_routes(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    class _CustomAuthProvider(AuthProvider):
+        login_url = "/custom/login"
+
+        def get_user_id(self, request: HTTPConnection) -> str | None:
+            return "custom@example.com"
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=_CustomAuthProvider(),
+    )
+
+    assert "/auth/login" not in {route.path for route in app.routes if hasattr(route, "path")}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/me")
+
+    assert response.status_code == 200
+    assert response.json() == {"user_id": "custom@example.com", "is_admin": False}
+
+
 async def test_me_is_admin_honors_admin_list_before_db_promotion(
     runtime_init: None,
     db_uri: str,
@@ -346,19 +383,102 @@ async def test_me_is_admin_honors_admin_list_before_db_promotion(
     assert resp.json() == {"user_id": "alice@example.com", "is_admin": True}
 
 
-async def test_web_ui_serves_pwa_service_worker_and_manifest(
+def _header_app(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    perm_store: SqlAlchemyPermissionStore,
+) -> FastAPI:
+    """Multi-user header-auth app whose admin-list file lists only alice."""
+    from omnigent.server.auth import create_auth_provider
+
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    admin_file = tmp_path / "admins"
+    admin_file.write_text("alice@example.com\n")
+    monkeypatch.setenv("OMNIGENT_ADMIN_LIST_PATH", str(admin_file))
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        permission_store=perm_store,
+        auth_provider=create_auth_provider(),
+    )
+
+
+async def test_me_promotes_listed_admin_so_admin_routes_authorize(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Header auth has no login step, so ``/v1/me`` promotes a listed admin.
+
+    Without it, alice would see the Sharing page (``/v1/me`` reports the list)
+    but get 403 from every route that checks only the database flag. Alice has
+    no user row at all, the real header-mode case. Unlisted bob is not
+    promoted, gets no row, and is still refused.
+    """
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    assert not perm_store.user_exists("alice@example.com")
+    app = _header_app(db_uri, tmp_path, monkeypatch, perm_store)
+    alice = {"X-Forwarded-Email": "alice@example.com"}
+    bob = {"X-Forwarded-Email": "bob@example.com"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.get("/v1/sharing", headers=alice)).status_code == 403
+        me = await client.get("/v1/me", headers=alice)
+        sharing = await client.get("/v1/sharing", headers=alice)
+        bob_me = await client.get("/v1/me", headers=bob)
+        bob_sharing = await client.get("/v1/sharing", headers=bob)
+
+    assert me.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert perm_store.is_admin("alice@example.com") is True
+    assert sharing.status_code == 200, sharing.text
+    assert bob_me.json() == {"user_id": "bob@example.com", "is_admin": False}
+    assert not perm_store.user_exists("bob@example.com")
+    assert bob_sharing.status_code == 403
+
+
+async def test_me_still_answers_when_admin_promotion_fails(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed promotion write is logged, not surfaced: ``/v1/me`` still
+    returns 200 and still reports the listed admin, as it did before."""
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    app = _header_app(db_uri, tmp_path, monkeypatch, perm_store)
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(perm_store, "set_admin", _fail)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        me = await client.get("/v1/me", headers={"X-Forwarded-Email": "alice@example.com"})
+
+    assert me.status_code == 200
+    assert me.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert perm_store.is_admin("alice@example.com") is False
+
+
+async def test_web_ui_serves_service_worker_uncached(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    PWA assets are served correctly from the SPA static mount.
+    ``sw.js`` is served from the SPA static mount with ``no-cache``.
 
-    ``sw.js`` must be ``no-cache`` so a deploy is picked up promptly — a
-    stale service worker would defeat prompt-to-reload — and
-    ``manifest.webmanifest`` must carry ``application/manifest+json`` or the
-    browser silently refuses to install the app.
+    The PWA is retired and its tombstone ``sw.js`` was deleted in 0.11.0, but
+    the header exemption must outlive it: a cached ``sw.js`` would otherwise
+    shadow any service worker served at this path later.
 
     :param runtime_init: Fixture that initializes the runtime with a mock LLM.
     :param db_uri: Test database URI.
@@ -369,9 +489,7 @@ async def test_web_ui_serves_pwa_service_worker_and_manifest(
     web_ui_dist = tmp_path / "web-ui"
     web_ui_dist.mkdir(parents=True)
     (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
-    (web_ui_dist / "sw.js").write_text("self.addEventListener('install', () => {});")
-    (web_ui_dist / "manifest.webmanifest").write_text('{"name":"Omnigent"}')
-    (web_ui_dist / "version.json").write_text('{"build":"testbuild"}')
+    (web_ui_dist / "sw.js").write_text("self.addEventListener('activate', () => {});")
 
     monkeypatch.setattr(app_module, "_WEB_UI_DIST", web_ui_dist)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -388,15 +506,68 @@ async def test_web_ui_serves_pwa_service_worker_and_manifest(
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         sw = await client.get("/sw.js")
-        manifest = await client.get("/manifest.webmanifest")
-        version = await client.get("/version.json")
 
     assert sw.status_code == 200
     assert sw.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL
-    assert manifest.status_code == 200
-    assert manifest.headers["content-type"].startswith("application/manifest+json")
-    # version.json is the SW's cache sentinel: if the static mount ever stopped
-    # serving it, the SW install would fail and the update prompt never fire. It
-    # is no-cache for the same reason as sw.js — a stale sentinel must not linger.
-    assert version.status_code == 200
-    assert version.headers["cache-control"] == app_module._WEB_UI_HTML_CACHE_CONTROL
+
+
+async def test_unmatched_api_path_404s_for_every_method(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unmatched ``/v1`` path 404s regardless of HTTP method.
+
+    The web UI is mounted at ``/`` and sees every unmatched request.
+    Starlette's ``StaticFiles`` answers any non-GET with 405, which reads as
+    "the endpoint exists, wrong method", so a client pointed at the wrong
+    base URL (e.g. one carrying the workspace web-UI path) sees
+    ``405 Method Not Allowed`` from ``POST /v1/sessions`` and blames the
+    server instead of its own URL.
+
+    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
+    :param db_uri: Test database URI.
+    :param tmp_path: Pytest temporary directory fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    web_ui_dist = tmp_path / "web-ui"
+    web_ui_dist.mkdir(parents=True)
+    (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
+    monkeypatch.setattr(app_module, "_WEB_UI_DIST", web_ui_dist)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # The reported crash: a base URL carrying the web-UI path, so the
+        # bundled-create route never matches.
+        prefixed = await client.post(
+            "/omnigent/v1/sessions",
+            data={"metadata": "{}"},
+            files={"bundle": ("agent.tar.gz", b"x", "application/gzip")},
+        )
+        unmatched_post = await client.post("/v1/nope", json={})
+        unmatched_get = await client.get("/v1/nope")
+        # OPTIONS is covered too. No CORS middleware is installed, so a
+        # preflight reaching this mount was already a 405 that no browser
+        # could use; 404 is the more accurate answer, not a lost capability.
+        unmatched_options = await client.request("OPTIONS", "/v1/nope")
+        # An extensionless non-API path still gets the SPA shell.
+        spa = await client.get("/c/conv_abc123")
+
+    for resp in (prefixed, unmatched_post, unmatched_get, unmatched_options):
+        assert resp.status_code == 404, resp.text
+        assert resp.json()["error"]["code"] == "not_found"
+    assert spa.status_code == 200
+    assert "<div id='root'>" in spa.text

@@ -31,9 +31,9 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # User-supplied Python callables bound via YAML (``callable: mod.func``) —
-# the framework has no way to know their real signatures. ``Callable[..., X]``
-# is treated as ``Any`` by mypy's explicit-any check, so the ignore is needed
-# at the alias site.
+# the framework has no way to know their real signatures. The variadic callable
+# boundary is intentionally unconstrained, so keep the explicit-any ignore at
+# the alias site.
 DynamicCallable: TypeAlias = Callable[..., object]  # type: ignore[explicit-any]
 
 
@@ -223,7 +223,7 @@ class CancellableFunctionTool(Tool):
 class MCPTool(Tool):
     """A tool (or set of tools) exposed by an MCP server.
 
-    Exactly one of ``url``, ``command``, or ``databricks_server``
+    Exactly one of ``registry``, ``url``, ``command``, or ``databricks_server``
     selects how the server is reached.
 
     :param url: HTTP(S) URL of an MCP server, e.g.
@@ -250,8 +250,10 @@ class MCPTool(Tool):
         (e.g. ``"unity-catalog"``). ``None`` when ``url`` or
         ``command`` is used.
     :param headers: Extra HTTP headers for the ``url`` transport.
+    :param registry: Resolve the tool's registry key through the server catalog.
     """
 
+    registry: bool = False
     url: str | None = None
     command: str | None = None
     args: list[str] | None = None

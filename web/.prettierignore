@@ -1,5 +1,6 @@
 node_modules
 dist
+storybook-static
 ../omnigent/server/static/web-ui
 src/components/ui
 package-lock.json

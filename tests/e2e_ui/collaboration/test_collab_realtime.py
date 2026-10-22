@@ -33,7 +33,10 @@ import re
 import uuid
 
 import httpx
+import pytest
 from playwright.sync_api import Browser, expect
+
+from tests._helpers.browser import user_page
 
 
 def test_two_browser_contexts_sync_message_realtime(
@@ -66,12 +69,10 @@ def test_two_browser_contexts_sync_message_realtime(
     # streamed-reply text — it has to be the user message we sent.
     marker = f"collab-sync-{uuid.uuid4().hex[:8]}"
 
-    owner_ctx = browser.new_context()
-    collab_ctx = browser.new_context()
-    try:
-        owner = owner_ctx.new_page()
-        collab = collab_ctx.new_page()
-
+    with (
+        user_page(browser, headers={}) as owner,
+        user_page(browser, headers={}) as collab,
+    ):
         owner.goto(f"{base_url}/c/{session_id}")
         collab.goto(f"{base_url}/c/{session_id}")
 
@@ -79,8 +80,8 @@ def test_two_browser_contexts_sync_message_realtime(
         # session stream. The collaborator must be subscribed before the
         # owner sends, otherwise a passing collaborator assertion could
         # be a post-reload snapshot read rather than a live delivery.
-        owner_composer = owner.get_by_placeholder("Ask the agent anything…")
-        collab_composer = collab.get_by_placeholder("Ask the agent anything…")
+        owner_composer = owner.get_by_placeholder("Send a message…")
+        collab_composer = collab.get_by_placeholder("Send a message…")
         expect(owner_composer).to_be_visible()
         expect(collab_composer).to_be_visible()
 
@@ -116,9 +117,6 @@ def test_two_browser_contexts_sync_message_realtime(
         ).first
         expect(owner_assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
         expect(collab_assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
-    finally:
-        owner_ctx.close()
-        collab_ctx.close()
 
 
 def test_presence_circles_track_other_viewers(
@@ -164,49 +162,44 @@ def test_presence_circles_track_other_viewers(
             timeout=10.0,
         ).raise_for_status()
 
-    alice_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": alice_email})
-    bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": bob_email})
-    try:
-        alice = alice_ctx.new_page()
-        bob = bob_ctx.new_page()
-        alice.goto(f"{base_url}/c/{session_id}")
-        bob.goto(f"{base_url}/c/{session_id}")
+    with user_page(browser, headers={"X-Forwarded-Email": alice_email}) as alice:
+        with user_page(browser, headers={"X-Forwarded-Email": bob_email}) as bob:
+            alice.goto(f"{base_url}/c/{session_id}")
+            bob.goto(f"{base_url}/c/{session_id}")
 
-        # Each sees the OTHER's circle. 15s covers page boot + stream
-        # bind + the join broadcast round-trip on a cold server.
-        expect(alice.get_by_test_id(f"presence-avatar-{bob_email}")).to_be_visible(timeout=15_000)
-        expect(bob.get_by_test_id(f"presence-avatar-{alice_email}")).to_be_visible(timeout=15_000)
+            # Each sees the OTHER's circle. 15s covers page boot + stream
+            # bind + the join broadcast round-trip on a cold server.
+            expect(alice.get_by_test_id(f"presence-avatar-{bob_email}")).to_be_visible(
+                timeout=15_000
+            )
+            expect(bob.get_by_test_id(f"presence-avatar-{alice_email}")).to_be_visible(
+                timeout=15_000
+            )
 
-        # Self-filter: your own circle never renders in your own header.
-        # Count=0 proves absence from the DOM, not just invisibility.
-        expect(alice.get_by_test_id(f"presence-avatar-{alice_email}")).to_have_count(0)
-        expect(bob.get_by_test_id(f"presence-avatar-{bob_email}")).to_have_count(0)
+            # Self-filter: your own circle never renders in your own header.
+            # Count=0 proves absence from the DOM, not just invisibility.
+            expect(alice.get_by_test_id(f"presence-avatar-{alice_email}")).to_have_count(0)
+            expect(bob.get_by_test_id(f"presence-avatar-{bob_email}")).to_have_count(0)
 
-        # Hovering a circle shows the viewer's name IN THE VIEWPORT.
-        # The in-viewport check is load-bearing: when the trigger ref is
-        # dropped (React 18 + a non-forwardRef component under
-        # TooltipTrigger asChild), Radix still mounts the tooltip with
-        # the right text but anchors it at the page origin, off-screen —
-        # a DOM-presence assertion passes while users see nothing.
-        alice.get_by_test_id(f"presence-avatar-{bob_email}").hover()
-        name_tooltip = alice.locator("[data-slot=tooltip-content]", has_text=bob_email)
-        expect(name_tooltip).to_be_visible(timeout=5_000)
-        expect(name_tooltip).to_be_in_viewport()
+            # Hovering a circle shows the viewer's name IN THE VIEWPORT.
+            # The in-viewport check is load-bearing: when the trigger ref is
+            # dropped (React 18 + a non-forwardRef component under
+            # TooltipTrigger asChild), Radix still mounts the tooltip with
+            # the right text but anchors it at the page origin, off-screen —
+            # a DOM-presence assertion passes while users see nothing.
+            alice.get_by_test_id(f"presence-avatar-{bob_email}").hover()
+            name_tooltip = alice.locator("[data-slot=tooltip-content]", has_text=bob_email)
+            expect(name_tooltip).to_be_visible(timeout=5_000)
+            expect(name_tooltip).to_be_in_viewport()
 
-        # Bob leaves. His circle must clear for Alice only after the
-        # server's leave-grace window expires (the spawned test server runs
-        # with _LEAVE_GRACE_S patched to 1s; see live_server. Prod is 15s to
-        # absorb ingress reconnect churn) — 15s bounds grace + broadcast +
-        # render without masking a true ghost-viewer stall.
-        bob_ctx.close()
+        # Bob's context is now closed. Allow the leave grace (patched to 1s;
+        # production uses 15s), broadcast and render to clear his circle.
         expect(alice.get_by_test_id(f"presence-avatar-{bob_email}")).to_have_count(
             0, timeout=15_000
         )
-    finally:
-        alice_ctx.close()
-        bob_ctx.close()
 
 
+@pytest.mark.nightly
 def test_presence_idle_greys_backgrounded_viewer(
     browser: Browser,
     seeded_session: tuple[str, str],
@@ -246,11 +239,10 @@ def test_presence_idle_greys_backgrounded_viewer(
             timeout=10.0,
         ).raise_for_status()
 
-    alice_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": alice_email})
-    bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": bob_email})
-    try:
-        alice = alice_ctx.new_page()
-        bob = bob_ctx.new_page()
+    with (
+        user_page(browser, headers={"X-Forwarded-Email": alice_email}) as alice,
+        user_page(browser, headers={"X-Forwarded-Email": bob_email}) as bob,
+    ):
         alice.goto(f"{base_url}/c/{session_id}")
         bob.goto(f"{base_url}/c/{session_id}")
 
@@ -289,6 +281,3 @@ def test_presence_idle_greys_backgrounded_viewer(
             "}"
         )
         expect(bob_circle).not_to_have_class(re.compile(r"opacity-40"), timeout=15_000)
-    finally:
-        alice_ctx.close()
-        bob_ctx.close()

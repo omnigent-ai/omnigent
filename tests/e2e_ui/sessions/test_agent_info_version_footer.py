@@ -13,9 +13,11 @@ the backend (`tests/server/test_app.py`) and frontend unit suites.
 
 from __future__ import annotations
 
+import pytest
 from playwright.sync_api import Page, expect
 
 
+@pytest.mark.compat_smoke
 def test_agent_info_version_footer_shows_server_version(
     page: Page,
     seeded_session: tuple[str, str],

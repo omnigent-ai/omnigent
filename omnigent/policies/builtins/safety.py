@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib as _hashlib
 import json as _json
 import re as _re
-from typing import Any
+from typing import Literal
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -25,11 +25,18 @@ _ALLOW: PolicyResponse = {"result": "ALLOW"}
 
 _SYS_OS_TOOLS = frozenset({"sys_os_read", "sys_os_write", "sys_os_edit", "sys_os_shell"})
 
+# Claude Code / Codex native tools that MUTATE a file, surfaced via the
+# PreToolUse hook contract. Single source of truth: the write policies in
+# ``omnigent.policies.builtins.orchestration`` build their gated sets from
+# this, and it must stay equal to ``_CLAUDE_NATIVE_EDIT_TOOLS`` in
+# ``omnigent.server.routes._sessions.common`` (asserted in the tests).
+NATIVE_WRITE_TOOLS: frozenset[str] = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
+
 # Claude Code and Codex native tool names surfaced via the PreToolUse /
-# PostToolUse hook contract (see ``omnigent.native_policy_hook``).
+# PostToolUse hook contract (see ``omnigent.native.native_policy_hook``).
 # These bypass Omnigent' ``sys_os_*`` MCP tools and execute directly
 # inside the CLI subprocess.
-_NATIVE_OS_TOOLS = frozenset({"Bash", "Read", "Write", "Edit", "Glob", "Grep"})
+_NATIVE_OS_TOOLS = NATIVE_WRITE_TOOLS | {"Bash", "Read", "Glob", "Grep"}
 
 # Cursor SDK native tool names surfaced via the preToolUse hook
 # (see ``omnigent.inner.cursor_policy_hook``). Cursor uses ``Shell``
@@ -78,6 +85,14 @@ _GOOSE_NATIVE_OS_TOOLS = frozenset(
 # the file-search categories (``grep`` / ``glob``) pi lacks.
 _OPENCODE_NATIVE_OS_TOOLS = frozenset({"bash", "edit", "read", "grep", "glob"})
 
+# Codex in-process harness tool names surfaced as observational
+# ``ToolCallRequest`` events. The codex app-server executor translates
+# ``commandExecution`` items to a ``ToolCallRequest(name="shell")`` and
+# ``fileChange`` items to ``ToolCallRequest(name="apply_patch")``. Only
+# the shell tool needs to be in the OS gate here; apply_patch carries no
+# ``command`` argument, so the shell-preview branch below is not reached.
+_CODEX_IN_PROCESS_OS_TOOLS = frozenset({"shell"})
+
 
 # ── Rate limiting ────────────────────────────────────────────────────────────
 
@@ -103,7 +118,8 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
         if event.get("type") != "tool_call":
             return _ALLOW
         state = event.get("session_state") or {}
-        count = int(state.get("_policy_tool_call_count", 0))
+        count_value = state.get("_policy_tool_call_count", 0)
+        count = int(count_value) if isinstance(count_value, int | float | str) else 0
         if count >= limit:
             return {
                 "result": "DENY",
@@ -112,17 +128,23 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
         return {
             "result": "ALLOW",
             "state_updates": [
-                {"key": "_policy_tool_call_count", "action": "increment", "value": 1},
+                # SET to snapshot+1 rather than INCREMENT: a session can hold
+                # several instances of this policy (e.g. a sub-agent's own
+                # limit alongside an inherited parent limit). All instances
+                # read the same pre-evaluation snapshot, so identical SETs are
+                # idempotent per tool call, where stacked INCREMENTs would
+                # count one call multiple times and shrink every limit.
+                {"key": "_policy_tool_call_count", "action": "set", "value": count + 1},
             ],
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 _LOOP_STATE_KEY = "_policy_loop_recent_hashes"
 
 
-def _args_hash(tool_name: str, arguments: Any) -> str:  # type: ignore[explicit-any]
+def _args_hash(tool_name: str, arguments: object) -> str:
     """Deterministic hash of (tool_name, arguments).
 
     :param tool_name: Tool being called.
@@ -175,7 +197,12 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
         h = _args_hash(tool_name, arguments)
 
         state = event.get("session_state") or {}
-        recent: list[str] = list(state.get(_LOOP_STATE_KEY) or [])
+        recent_value = state.get(_LOOP_STATE_KEY)
+        recent = (
+            [item for item in recent_value if isinstance(item, str)]
+            if isinstance(recent_value, list)
+            else []
+        )
 
         recent.append(h)
         # Trim to sliding window.
@@ -202,7 +229,7 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
             ],
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── OS tool approval ────────────────────────────────────────────────────────
@@ -216,8 +243,8 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Omnigent built-in OS tools** (``sys_os_read``,
       ``sys_os_write``, ``sys_os_edit``, ``sys_os_shell``).
     - **Claude Code native tools** (``Bash``, ``Read``, ``Write``,
-      ``Edit``, ``Glob``, ``Grep``) — surfaced via the
-      ``PreToolUse`` hook contract.
+      ``Edit``, ``MultiEdit``, ``NotebookEdit``, ``Glob``, ``Grep``) —
+      surfaced via the ``PreToolUse`` hook contract.
     - **Codex native tools** — uses the same ``PreToolUse`` hook
       contract with the same tool names (e.g. ``Bash``).
     - **Cursor SDK native tools** (``Shell``) — surfaced via the
@@ -226,6 +253,9 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
     - **Pi native tools** (``read``, ``bash``, ``write``, ``edit``)
       — surfaced via the pi ``tool_call`` extension hook. Lowercase
       and distinct from the Claude/Codex casing.
+    - **Goose native tools** (``developer__shell`` and the
+      ``developer__*`` file tools) — surfaced via the goose
+      extension hook.
     - **Hermes Agent tools** (``terminal``, ``execute_code``,
       ``read_file``, ``write_file``, ``search_files``) — surfaced
       via the ``pre_tool_call`` shell hook.
@@ -255,20 +285,33 @@ def ask_on_os_tools(event: PolicyEvent) -> PolicyResponse:
         | _HERMES_OS_TOOLS
         | _GOOSE_NATIVE_OS_TOOLS
         | _OPENCODE_NATIVE_OS_TOOLS
+        | _CODEX_IN_PROCESS_OS_TOOLS
     )
     if tool in _all_os_tools:
         args = data.get("arguments", {})
         # Build a short preview of what the tool is doing.
-        if tool in ("sys_os_shell", "Bash", "bash", "Shell", "terminal", "developer__shell"):
+        if tool in (
+            "sys_os_shell",
+            "Bash",
+            "bash",
+            "Shell",
+            "terminal",
+            "developer__shell",
+            "shell",
+        ):
             preview = args.get("command", "") if isinstance(args, dict) else ""
         elif tool in ("Grep", "Glob", "search_files", "grep", "glob"):
             preview = args.get("pattern", "") if isinstance(args, dict) else ""
         elif tool == "execute_code":
-            preview = args.get("code", "")[:80] if isinstance(args, dict) else ""
+            code = args.get("code") if isinstance(args, dict) else None
+            preview = code[:80] if isinstance(code, str) else ""
         else:
-            # Omnigent tools use ``path``; Claude native tools use ``file_path``.
+            # Omnigent tools use ``path``; Claude native tools use ``file_path``,
+            # except NotebookEdit which uses ``notebook_path``.
             preview = (
-                (args.get("path") or args.get("file_path", "")) if isinstance(args, dict) else ""
+                (args.get("path") or args.get("file_path") or args.get("notebook_path") or "")
+                if isinstance(args, dict)
+                else ""
             )
         return {
             "result": "ASK",
@@ -312,7 +355,113 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+# Agent tools that create or reshape unattended work. The builder injects
+# ``ask_on_scheduled_task_change`` into every engine and exempts these names
+# from its no-policy fast path; both read this set so they cannot drift.
+SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
+    {"sys_scheduled_task_create", "sys_scheduled_task_update"}
+)
+
+
+# Settings a user weighs before approving, shown first in this order so
+# unexpected extra arguments cannot push them out of the prompt.
+_SCHEDULED_TASK_SETTINGS = (
+    "name",
+    "agent_id",
+    "rrule",
+    "timezone",
+    "state",
+    "host_id",
+    "workspace",
+    "execution_target",
+    "permission_mode",
+    "max_cost_usd",
+    "model_override",
+    "reasoning_effort",
+    "prompt",
+)
+_PREVIEW_VALUE_CHARS = 60
+_PREVIEW_EXTRA_CHARS = 200
+
+
+def _clip(value: str) -> str:
+    """Bound a preview value, marking the cut so it cannot pass for the whole value."""
+    if len(value) > _PREVIEW_VALUE_CHARS:
+        return value[: _PREVIEW_VALUE_CHARS - 3] + "..."
+    return value
+
+
+def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
+    """``key=value`` pairs for every argument but ``skip``, each value bounded.
+
+    Known settings come first and are never dropped; other arguments follow and
+    are capped as a group. The free-text prompt can be long enough to push the
+    settings out of the card's truncated argument preview, so it is reported by
+    length only.
+    """
+
+    def pair(key: str) -> str:
+        value = str(args[key])
+        if key == "prompt":
+            return f"prompt={len(value)} chars"
+        return f"{key}={_clip(value)}"
+
+    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
+    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key != skip)
+    extra: list[str] = []
+    remaining = _PREVIEW_EXTRA_CHARS
+    for index, key in enumerate(keys):
+        item = pair(key)
+        size = len(item) + (2 if extra else 0)
+        suffix = 5 if index < len(keys) - 1 else 0
+        if size + suffix > remaining:
+            extra.append("...")
+            break
+        extra.append(item)
+        remaining -= size
+    return ", ".join([*known, *extra])
+
+
+def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
+    """ASK for user approval before an agent creates or updates a scheduled task.
+
+    Matches ``event["target"]`` (the dispatched tool identity) rather than
+    ``data["name"]``, which an earlier policy may have transformed. Reads
+    and ``sys_scheduled_task_delete`` are not gated here: deleting a task
+    only removes future runs instead of scheduling new unattended work.
+
+    :param event: Policy event dict.
+    :returns: ASK if a scheduled task is being created or updated, ALLOW
+        otherwise.
+    """
+    if event.get("type") != "tool_call":
+        return _ALLOW
+    tool = event.get("target")
+    if tool not in SCHEDULED_TASK_APPROVAL_TOOLS:
+        return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    if not isinstance(args, dict):
+        args = {}
+    action = "create" if tool == "sys_scheduled_task_create" else "update"
+    if not args:
+        preview = f"{action} a scheduled task (details unavailable)"
+    elif action == "create":
+        name = _clip(str(args.get("name") or "(unnamed)"))
+        settings = _scheduled_task_settings(args, skip="name")
+        preview = f"create scheduled task {name!r} ({settings or 'no settings'})"
+    else:
+        task_id = _clip(str(args.get("scheduled_task_id") or "(no id)"))
+        settings = _scheduled_task_settings(args, skip="scheduled_task_id")
+        preview = f"update scheduled task {task_id} ({settings or 'no fields'})"
+    return {
+        "result": "ASK",
+        "reason": f"Agent wants to {preview}. Approve?",
+    }
+
+
 # ── Skill blocking ──────────────────────────────────────────────────────────
+
 
 # Omnigent runner tools that load skills in non-native (SDK) harnesses.
 _SKILL_TOOLS = frozenset({"load_skill", "read_skill_file"})
@@ -341,13 +490,45 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
        phase as synthetic ``"/<name> <args>"`` text via
        ``_build_skill_slash_command_policy_body``.
 
-    Matching is case-insensitive.
+    Matching is case-insensitive and namespace-insensitive: the same
+    installed plugin skill can be spelled ``<plugin>:<skill>`` (claude-family
+    surfaces) or bare ``<skill>`` (codex-family surfaces), and the skill
+    resolver accepts either alias — so a block on one spelling denies the
+    other too (deny-biased: an alias never bypasses the blocklist).
 
     :param blocked: Skill names to block, e.g.
         ``["code-review", "deploy"]``.
     :returns: A policy callable that DENYs blocked skill loads.
     """
     blocked_lower = frozenset(name.lower() for name in blocked)
+    # Bare forms of namespaced block entries: blocking "plugin:deploy" also
+    # denies a request for the bare "deploy", because on codex-family
+    # surfaces the blocked plugin skill is exposed under exactly that bare
+    # name (deny-biased — the bare spelling can't prove it is a different
+    # skill).
+    blocked_bare_lower = frozenset(name.split(":", 1)[1] for name in blocked_lower if ":" in name)
+
+    def _is_blocked(skill_name: str) -> bool:
+        """Whether *skill_name* (any alias spelling) hits the blocklist.
+
+        Deny when the raw name is blocked; when a bare request matches a
+        namespaced block entry's bare form; or when a namespaced request's
+        bare form is blocked outright (a bare block entry denies every
+        namespace). A namespaced block entry does NOT deny a *different*
+        exact namespace — ``otherplugin:deploy`` stays allowed when only
+        ``myplugin:deploy`` is blocked, since those are distinct skills.
+
+        :param skill_name: The requested skill name, raw.
+        :returns: True when any alias spelling of the request is blocked.
+        """
+        lowered = skill_name.lower()
+        if lowered in blocked_lower:
+            return True
+        if ":" in lowered:
+            # A bare block entry blocks the skill under every namespace.
+            return lowered.split(":", 1)[1] in blocked_lower
+        # A namespaced block entry blocks the bare alias of its skill.
+        return lowered in blocked_bare_lower
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the skill load should be blocked.
@@ -371,7 +552,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             if tool in _SKILL_TOOLS:
                 # load_skill uses "name"; read_skill_file uses "skill_name"
                 skill_name = args.get("name") if tool == "load_skill" else args.get("skill_name")
-                if skill_name and skill_name.lower() in blocked_lower:
+                if skill_name and _is_blocked(skill_name):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{skill_name}' is blocked by policy",
@@ -382,7 +563,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
             # Fired via PreToolUse hook → Omnigent /policies/evaluate.
             if tool == _NATIVE_SKILL_TOOL:
                 skill_name = args.get("skill")
-                if skill_name and skill_name.lower() in blocked_lower:
+                if skill_name and _is_blocked(skill_name):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{skill_name}' is blocked by policy",
@@ -404,7 +585,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
                 # an empty list — guard against IndexError.
                 tokens = text[1:].split(None, 1)
                 command = tokens[0] if tokens else ""
-                if command.lower() in blocked_lower:
+                if command and _is_blocked(command):
                     return {
                         "result": "DENY",
                         "reason": f"Skill '{command}' is blocked by policy",
@@ -413,7 +594,7 @@ def block_skills(blocked: list[str]) -> PolicyCallable:
 
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Sandbox enforcement ────────────────────────────────────────────────────
@@ -443,7 +624,7 @@ _SANDBOX_OVERRIDE_KEYS = frozenset(
 def enforce_sandbox(
     sandbox_type: str = "linux_bwrap",
     allow_network: bool = True,
-    write_paths: list[str] | None = None,
+    write_paths: list[str | dict[str, object]] | None = None,
     read_paths: list[str] | None = None,
     env_passthrough: list[str] | None = None,
 ) -> PolicyCallable:
@@ -473,7 +654,7 @@ def enforce_sandbox(
         ``__agent_start`` tool calls.
     """
     # Build the override dict — only include keys the admin explicitly set.
-    override: dict[str, Any] = {
+    override: dict[str, object] = {
         "type": sandbox_type,
         "allow_network": allow_network,
     }
@@ -505,7 +686,12 @@ def enforce_sandbox(
             args = {}
 
         # Merge: existing sandbox config as base, policy overrides on top.
-        current_sandbox: dict[str, Any] = args.get("sandbox") or {}
+        raw_sandbox = args.get("sandbox")
+        current_sandbox: dict[str, object] = (
+            {key: value for key, value in raw_sandbox.items() if isinstance(key, str)}
+            if isinstance(raw_sandbox, dict)
+            else {}
+        )
         forced_sandbox = {
             k: v for k, v in {**current_sandbox, **override}.items() if k in _SANDBOX_OVERRIDE_KEYS
         }
@@ -518,7 +704,7 @@ def enforce_sandbox(
             },
         }
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── PII detection on LLM requests ────────────────────────────────────────────
@@ -575,7 +761,7 @@ def deny_pii_in_llm_request(
         # None or empty list → all categories enabled.
         selected = dict(_PII_CATEGORY_PATTERNS)
 
-    effective_action = action if action in ("DENY", "ASK") else "DENY"
+    effective_action: Literal["DENY", "ASK"] = "ASK" if action == "ASK" else "DENY"
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate user input or LLM request for PII matches.
@@ -640,12 +826,12 @@ def deny_pii_in_llm_request(
                 }
         return _ALLOW
 
-    return evaluate  # type: ignore[return-value]
+    return evaluate
 
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 
-POLICY_REGISTRY: list[dict[str, Any]] = [
+POLICY_REGISTRY: list[dict[str, object]] = [
     {
         "handler": "omnigent.policies.builtins.safety.max_tool_calls_per_session",
         "kind": "factory",
@@ -694,9 +880,11 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
         "kind": "callable",
         "name": "Require Approval for File & Shell Operations",
         "description": "Asks for user approval before any file or shell tool call — "
-        "covers Omnigent sys_os_* tools, Claude Code native tools "
-        "(Bash, Read, Write, Edit, Glob, Grep), Codex native tools, "
+        "covers Omnigent sys_os_* tools, Claude Code and Codex native tools "
+        "(Bash, Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep), "
+        "Cursor native tools (Shell), Pi native tools (read, bash, write, edit), "
         "opencode native tools (bash, edit, read, grep, glob), "
+        "Goose native tools (developer__shell and the developer__* file tools), "
         "and Hermes Agent tools (terminal, execute_code, read_file, write_file, search_files)",
         "params_schema": None,
     },
@@ -741,7 +929,20 @@ POLICY_REGISTRY: list[dict[str, Any]] = [
                 },
                 "write_paths": {
                     "type": "array",
-                    "items": {"type": "string"},
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "minLength": 1},
+                                    "copy_on_write": {"type": "boolean", "default": False},
+                                },
+                                "required": ["path"],
+                                "additionalProperties": False,
+                            },
+                        ],
+                    },
                     "description": "Writable paths to enforce (null inherits agent's config)",
                 },
                 "read_paths": {

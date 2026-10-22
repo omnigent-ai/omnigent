@@ -19,12 +19,12 @@ export interface PresenceIdleTracker {
    * reconnect recomputing this keeps the flag eventually-correct even
    * if the debounce timer never fired.
    */
-  idleNow(): boolean;
+  idleNow: () => boolean;
   /** Record the flag the live stream connected with, so visibility
    * edges know whether a reconnect is actually needed. */
-  noteReported(idle: boolean): void;
+  noteReported: (idle: boolean) => void;
   /** Wire to `document.visibilitychange` with the new hidden state. */
-  handleVisibilityChange(hidden: boolean): void;
+  handleVisibilityChange: (hidden: boolean) => void;
 }
 
 /**

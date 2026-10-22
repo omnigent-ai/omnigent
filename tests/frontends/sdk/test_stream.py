@@ -18,6 +18,7 @@ from omnigent_client._blocks import (
 from omnigent_client._events import (
     MessageDone,
     ReasoningDelta,
+    ReasoningDone,
     ReasoningStarted,
     ReasoningSummaryDelta,
     ResponseCompleted,
@@ -297,6 +298,92 @@ async def test_reasoning_started_without_deltas_emits_block(
     block = next(b for b in blocks if isinstance(b, ReasoningBlock))
     assert block.reasoning_text == ""
     assert block.summary_text == ""
+
+
+@pytest.mark.asyncio()
+async def test_reasoning_done_without_deltas_renders_settled_block(
+    block_stream: BlockStream,
+) -> None:
+    """
+    A persisted reasoning item with NO prior deltas — a native
+    transcript mirror such as claude-native thinking blocks — must
+    render as one settled :class:`ReasoningBlock` before the answer,
+    or the thought the terminal showed never reaches chat consumers.
+    """
+    session = FakeSession(
+        [
+            ReasoningDone(text="the user wants the token verbatim"),
+            MessageDone(content=[{"type": "output_text", "text": "TOKEN"}]),
+        ]
+    )
+
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
+    types = [type(b).__name__ for b in blocks]
+
+    assert "ReasoningBlock" in types
+    block = next(b for b in blocks if isinstance(b, ReasoningBlock))
+    assert block.reasoning_text == "the user wants the token verbatim"
+    assert types.index("ReasoningBlock") < types.index("TextDone")
+
+
+@pytest.mark.asyncio()
+async def test_reasoning_done_after_streamed_deltas_is_deduped(
+    block_stream: BlockStream,
+) -> None:
+    """
+    When the response's reasoning already streamed via deltas, the
+    later persisted reasoning item must not re-render the same thought
+    as a trailing :class:`ReasoningBlock` — same dedup contract as
+    ``MessageDone``'s "deltas already produced the text".
+    """
+    session = FakeSession(
+        [
+            ResponseCreated(response=_make_response()),
+            ReasoningStarted(),
+            ReasoningDelta(delta="plan the answer\n"),
+            TextDelta(delta="Answer"),
+            ReasoningDone(text="plan the answer\n"),
+            MessageDone(content=[]),
+            ResponseCompleted(response=_make_response()),
+        ]
+    )
+
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
+    types = [type(b).__name__ for b in blocks]
+
+    assert "ReasoningChunk" in types
+    assert "ReasoningBlock" not in types, (
+        f"the persisted reasoning item re-rendered the streamed thought. Got: {types}"
+    )
+
+
+@pytest.mark.asyncio()
+async def test_reasoning_done_closes_open_streamed_section(
+    block_stream: BlockStream,
+) -> None:
+    """
+    A persisted reasoning item arriving while the streamed section is
+    still open marks the section's end: trailing accumulated text
+    flushes, and no duplicate :class:`ReasoningBlock` follows.
+    """
+    session = FakeSession(
+        [
+            ResponseCreated(response=_make_response()),
+            ReasoningStarted(),
+            ReasoningDelta(delta="thinking hard\n"),
+            ReasoningDone(text="thinking hard\n"),
+            TextDelta(delta="Answer"),
+            MessageDone(content=[]),
+            ResponseCompleted(response=_make_response()),
+        ]
+    )
+
+    blocks = [b async for b in block_stream.stream(session, "test")]  # type: ignore[arg-type]
+    types = [type(b).__name__ for b in blocks]
+
+    assert "ReasoningBlock" not in types
+    joined = "".join(b.text for b in blocks if isinstance(b, ReasoningChunk))
+    assert "thinking hard" in joined
 
 
 @pytest.mark.asyncio()

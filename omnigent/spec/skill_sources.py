@@ -2,8 +2,8 @@
 Harness-aware host/plugin skill discovery for the web composer's
 slash-command menu.
 
-The runner's ``_resolve_session_skills`` unions a session's bundled
-skills with the *extra* skills its harness surfaces in its own terminal.
+The host previews skills before launch; the runner unions the same
+discovery results with a session's bundled skills.
 "What a harness exposes" differs per vendor (Claude Code plugins, Codex
 ``~/.codex/skills``, Cursor ``~/.cursor``), so resolution dispatches to a
 per-family provider. Unknown harnesses fall back to the generic host walk
@@ -12,20 +12,34 @@ per-family provider. Unknown harnesses fall back to the generic host walk
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-from collections.abc import Callable
+import os
+import re
+import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Literal, cast
 
 from omnigent.errors import OmnigentError
-from omnigent.spec.parser import _discover_skills, _parse_skill, discover_host_skills
-from omnigent.spec.types import SkillSpec
+from omnigent.spec.parser import (
+    _discover_skills,
+    _parse_skill,
+    discover_host_skills,
+    skill_matches_names,
+)
+from omnigent.spec.types import AgentSpec, SkillSpec
 
 _log = logging.getLogger(__name__)
 
-_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi"})
+_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity", "devin"})
+
+# The bare ``antigravity`` harness is the in-process Gemini SDK executor, NOT the
+# agy CLI. It never launches agy, so ~/.gemini plugin/builtin skills are not its
+# skills — it keeps the generic walk, whose skills omnigent resolves+injects.
+_ANTIGRAVITY_SDK_HARNESS = "antigravity"
 
 
 def _harness_family(harness: str | None) -> str | None:
@@ -49,9 +63,16 @@ def _harness_family(harness: str | None) -> str | None:
     # SDK harness flows in as ``claude_sdk`` (canonicalize_harness leaves it
     # unchanged), and without this it would miss the ``claude`` family and
     # silently lose plugin slash-commands.
-    parts = harness.replace("_", "-").split("-")
+    normalized = harness.replace("_", "-")
+    parts = normalized.split("-")
     base = parts[1] if parts[0] == "native" and len(parts) > 1 else parts[0]
-    return base if base in _SKILL_FAMILIES else None
+    if base not in _SKILL_FAMILIES:
+        return None
+    # Unlike claude (where SDK and native share ~/.claude), antigravity's two
+    # harnesses are different runtimes: only the agy CLI reads ~/.gemini.
+    if base == _ANTIGRAVITY_SDK_HARNESS and normalized == _ANTIGRAVITY_SDK_HARNESS:
+        return None
+    return base
 
 
 @dataclass(frozen=True)
@@ -59,23 +80,63 @@ class SkillSourceContext:
     """
     Inputs a per-harness skill provider needs.
 
-    :param roots: Host-discovery roots in priority order — the session
-        workspace, then the agent bundle workdir (the same roots
-        ``_resolve_session_skills`` already computes).
+    :param roots: Discovery roots in priority order — the selected host
+        directory, or the session workspace followed by the agent bundle workdir.
     :param home: The user home directory (``Path.home()``); injected so
         tests can pin it.
     :param skills_filter: The spec's ``skills:`` filter
         (``"all"`` / ``"none"`` / list of names).
     :param bundle_dir: The materialized bundle root, or ``None``.
+    :param claude_config_dir: Claude Code's user config dir when configured
+        (``$CLAUDE_CONFIG_DIR``), else ``None`` for the ``home/.claude``
+        default; injected so tests can pin it.
+    :param codex_home: Codex's resolved host home when configured
+        (``$CODEX_HOME``), else ``None`` for the ``home/.codex`` default;
+        injected so tests can pin it. Used only for native codex, mirroring
+        the terminal, which honors ``$CODEX_HOME`` for its skills.
+    :param is_native: Whether the session's harness is a native CLI harness.
+        Set by :func:`resolve_harness_skills` from the harness id. Gates the
+        terminal-matching resolution (including config-home tiers)
+        so it applies only to native harnesses, never the in-process SDK ones.
     """
 
     roots: tuple[Path, ...]
     home: Path
     skills_filter: str | list[str]
     bundle_dir: Path | None
+    claude_config_dir: Path | None = None
+    codex_home: Path | None = None
+    is_native: bool = False
 
 
 SkillSource = Callable[[SkillSourceContext], list[SkillSpec]]
+
+
+def skill_source_context_from_env(
+    *,
+    roots: tuple[Path, ...],
+    harness: str | None,
+    skills_filter: str | list[str] = "all",
+    bundle_dir: Path | None = None,
+) -> SkillSourceContext:
+    """Use the same ambient harness configuration for host and runner discovery."""
+    configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    codex_home: Path | None = None
+    if _harness_family(harness) == "codex":
+        from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+
+        # Nested runners can inherit a private Codex home; use its original source.
+        codex_home = _codex_home_config_source_from_env()
+    return SkillSourceContext(
+        roots=roots,
+        home=Path.home(),
+        skills_filter=skills_filter,
+        bundle_dir=bundle_dir,
+        claude_config_dir=(
+            Path(configured_claude_dir).expanduser() if configured_claude_dir else None
+        ),
+        codex_home=codex_home,
+    )
 
 
 def _dedup(specs: list[SkillSpec]) -> list[SkillSpec]:
@@ -98,9 +159,87 @@ def _generic_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return _dedup(out)
 
 
+def _claude_user_dir(ctx: SkillSourceContext) -> Path:
+    """
+    Claude Code's user-scope config dir (its skills/plugins/settings root).
+
+    For a native session this mirrors Claude's own resolution
+    (``CLAUDE_CONFIG_DIR`` when set, otherwise ``~/.claude``) the way
+    :mod:`omnigent.session_import.local` and ``claude_native_status_file``
+    already do. The in-process SDK path keeps its pre-scoping ``~/.claude``
+    root, so the ``$CLAUDE_CONFIG_DIR`` tier is honored only for native
+    harnesses.
+    """
+    if ctx.is_native and ctx.claude_config_dir is not None:
+        return ctx.claude_config_dir
+    return ctx.home / ".claude"
+
+
+def _claude_code_skills(
+    ctx: SkillSourceContext, dotdir: Literal[".claude", ".agents"] = ".claude"
+) -> list[SkillSpec]:
+    """
+    Discover standalone skills for Claude, workspace-first then user-global.
+
+    Claude reads ``.claude/skills`` itself; Omnigent exposes ``.agents/skills``
+    through a session-local additional directory at launch. Both use this
+    scanner so launch selection and the menu agree.
+
+    :param ctx: Discovery roots, user home and skill filter.
+    :param dotdir: Native Claude skills or portable skills to bridge.
+    :returns: Skills with the nearest occurrence of each name winning.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    dirs: list[Path] = []
+    seen_dirs: set[Path] = set()
+
+    def _add(candidate: Path) -> None:
+        if candidate in seen_dirs or not candidate.is_dir():
+            return
+        seen_dirs.add(candidate)
+        dirs.append(candidate)
+
+    # Only workspace ancestors are skill sources; materialized bundles are local-only.
+    roots = ctx.roots[:1] if dotdir == ".claude" else ctx.roots
+    bundle_root = ctx.bundle_dir.resolve() if dotdir == ".agents" and ctx.bundle_dir else None
+    for index, root in enumerate(roots):
+        current = root.resolve()
+        while True:
+            _add(current / dotdir / "skills")
+            parent = current.parent
+            if index > 0 or parent == current or current == bundle_root:
+                break
+            current = parent
+    # User tier last, so a workspace skill wins a name collision.
+    user_dir = _claude_user_dir(ctx) if dotdir == ".claude" else ctx.home / dotdir
+    _add(user_dir / "skills")
+
+    out: list[SkillSpec] = []
+    for skills_dir in dirs:
+        skipped: list[str] = []
+        for spec in _discover_skills(skills_dir, skipped=skipped):
+            # Portable command names become directory names in the launch overlay.
+            if dotdir == ".agents" and not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", spec.name):
+                _log.warning(
+                    "Skipping portable skill with invalid command name: %s", spec.skill_dir
+                )
+                continue
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
+                continue
+            out.append(spec)
+        # Surface dropped skills so a missing command is diagnosable.
+        for detail in skipped:
+            _log.warning("Skipping skill under %s: %s", skills_dir, detail)
+    return _dedup(out)
+
+
 def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list[SkillSpec]:
     """
-    Return the extra (non-bundled) skills the session's harness exposes.
+    Return the extra (non-bundled) skills the selected harness exposes.
 
     Dispatches by harness family. An unknown/other family falls back to
     the generic host walk so behavior is unchanged for harnesses without
@@ -113,18 +252,52 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
         internal orchestration skills, not user-typeable slash commands
         (applied uniformly across every harness).
     """
+    from omnigent.harness_aliases import is_native_harness
+
     family = _harness_family(harness)
     provider = _SKILL_SOURCES.get(family, _generic_host_skills)
-    return [s for s in _dedup(provider(ctx)) if s.user_invocable]
+    # The terminal-matching resolution — a native session types ``/name`` into
+    # the vendor CLI as plaintext, so its menu must mirror what that CLI loads —
+    # is native-only. Tag the context so providers keep the in-process SDK
+    # harnesses on their pre-scoping behavior (see ``claude_host_skills``).
+    native_ctx = replace(ctx, is_native=is_native_harness(harness))
+    return [s for s in _dedup(provider(native_ctx)) if s.user_invocable]
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
-    """Best-effort JSON read; ``None`` on missing/unreadable/non-dict."""
+def resolve_session_skills(
+    spec: AgentSpec, roots: tuple[Path, ...], bundle_dir: Path | None
+) -> list[SkillSpec]:
+    """Use identical precedence and filters for menu discovery and invocation."""
+    from omnigent.harness_aliases import canonicalize_harness
+
+    merged = [s for s in spec.skills if s.user_invocable]
+    seen = {s.name for s in spec.skills}
+    seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
+    harness = canonicalize_harness(spec.executor.harness_kind)
+    ctx = skill_source_context_from_env(
+        roots=roots, harness=harness, skills_filter=spec.skills_filter, bundle_dir=bundle_dir
+    )
+    for skill in resolve_harness_skills(ctx, harness):
+        if skill.name in seen:
+            continue
+        if skill.skill_dir is not None and skill.skill_dir.resolve() in seen_dirs:
+            continue
+        seen.add(skill.name)
+        if skill.skill_dir is not None:
+            seen_dirs.add(skill.skill_dir.resolve())
+        merged.append(skill)
+    return merged
+
+
+def _read_json(path: Path) -> dict[str, object] | None:
+    """Best-effort JSON read; ``None`` unless it is a string-keyed object."""
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or not all(isinstance(key, str) for key in data):
+        return None
+    return cast(dict[str, object], data)
 
 
 def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:
@@ -149,8 +322,13 @@ def _enabled_plugin_settings_files(ctx: SkillSourceContext) -> list[Path]:
     :returns: Candidate settings paths in increasing precedence order.
     """
     files: list[Path] = []
-    # ``reversed`` puts the primary workspace (roots[0]) last → strongest.
-    for scope in (ctx.home, *reversed(ctx.roots)):
+    # User scope first (weakest): $CLAUDE_CONFIG_DIR itself carries the
+    # settings files (default ~/.claude). ``reversed`` then puts the primary
+    # workspace (roots[0]) last → strongest.
+    user_dir = _claude_user_dir(ctx)
+    files.append(user_dir / "settings.json")
+    files.append(user_dir / "settings.local.json")
+    for scope in reversed(ctx.roots):
         files.append(scope / ".claude" / "settings.json")
         files.append(scope / ".claude" / "settings.local.json")
     return files
@@ -171,7 +349,7 @@ def _managed_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     :returns: The set of managed ``<plugin>@<marketplace>`` keys, empty when
         the file is absent, unreadable, or malformed.
     """
-    data = _read_json(ctx.home / ".claude" / "plugins" / "managed_plugins.json")
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "managed_plugins.json")
     if data is None:
         return set()
     managed = data.get("managed_plugins")
@@ -218,9 +396,16 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
     return enabled | _managed_plugin_keys(ctx)
 
 
-def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[str, Path]:
-    """Map ``<plugin>@<marketplace>`` → installPath for enabled+installed plugins."""
-    data = _read_json(ctx.home / ".claude" / "plugins" / "installed_plugins.json")
+def _plugin_asset_id(key: str, kind: str, source: str = "") -> str:
+    """Stable inventory identity without exposing a plugin asset's filesystem path."""
+    return hashlib.sha256(json.dumps([key, kind, source]).encode()).hexdigest()
+
+
+def _plugin_install_paths(
+    ctx: SkillSourceContext, enabled: set[str] | None = None
+) -> dict[str, Path]:
+    """Map installed plugin keys to trusted paths, optionally filtering by enablement."""
+    data = _read_json(_claude_user_dir(ctx) / "plugins" / "installed_plugins.json")
     if data is None:
         return {}
     plugins = data.get("plugins")
@@ -230,10 +415,10 @@ def _plugin_install_paths(ctx: SkillSourceContext, enabled: set[str]) -> dict[st
     # the Claude plugins cache root; anything pointing elsewhere is logged and
     # skipped so a tampered/odd manifest can't turn an arbitrary directory into
     # a discovery root.
-    plugins_root = (ctx.home / ".claude" / "plugins").resolve()
+    plugins_root = (_claude_user_dir(ctx) / "plugins").resolve()
     out: dict[str, Path] = {}
     for key, entries in plugins.items():
-        if key not in enabled or not isinstance(entries, list):
+        if (enabled is not None and key not in enabled) or not isinstance(entries, list):
             continue
         # A plugin may have multiple scope entries (user/project); take the
         # first one carrying a usable installPath rather than assuming it's
@@ -283,7 +468,7 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
         for spec in _discover_skills(install_path / "skills", skipped=skipped):
-            if filter_names is not None and spec.name not in filter_names:
+            if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))
         # Surface dropped skills with the plugin key so a missing command is
@@ -293,14 +478,49 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def select_claude_portable_skills(
+    portable: list[SkillSpec], native: list[SkillSpec]
+) -> list[SkillSpec]:
+    """Keep native names/aliases and one portable spelling per case-insensitive name."""
+    seen = {skill.name.casefold() for skill in native}
+    seen.update(skill.skill_dir.name.casefold() for skill in native if skill.skill_dir)
+    selected: list[SkillSpec] = []
+    for skill in portable:
+        name = skill.name.casefold()
+        if name not in seen:
+            seen.add(name)
+            selected.append(skill)
+    return selected
+
+
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
-    """Generic host walk (``~/.claude/skills`` etc.) plus enabled plugins."""
-    return _generic_host_skills(ctx) + _claude_plugin_skills(ctx)
+    """
+    Claude host skills plus enabled plugins.
+
+    Native Claude loads its own tiers before the bridged ``.agents`` skills,
+    so an existing Claude command wins a collision. SDK discovery retains
+    the generic host walk.
+    """
+    if ctx.is_native:
+        # Claude still loads every native skill when a named subset is requested.
+        native_ctx = (
+            replace(ctx, skills_filter="all") if isinstance(ctx.skills_filter, list) else ctx
+        )
+        native = _claude_code_skills(native_ctx)
+        standalone = [
+            skill
+            for skill in native
+            if not isinstance(ctx.skills_filter, list)
+            or skill_matches_names(skill, ctx.skills_filter)
+        ] + select_claude_portable_skills(_claude_code_skills(ctx, ".agents"), native)
+    else:
+        standalone = _generic_host_skills(ctx)
+    return standalone + _claude_plugin_skills(ctx)
 
 
 def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Codex skills: ``<bundle>/skills`` + ``~/.codex/skills`` under the filter.
+    Codex bundle, standalone, and enabled plugin skills under the filter.
 
     Reuses the Codex executor's own helpers — ``codex_skill_sources`` (the
     shared source-list builder) and ``select_codex_skill_dirs`` (the shared
@@ -310,16 +530,30 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     so a present-but-unparseable skill is linked but not shown (correct — Codex
     won't register a malformed skill as a command either).
 
-    Names are surfaced by **directory name** (the selector's key), not the
+    A native ``codex-native`` session honors ``$CODEX_HOME``: its launch seeds
+    the per-bridge home from the ``$CODEX_HOME``-resolved host home, so the menu
+    reads the same resolved home (``ctx.codex_home``) to stay in step with the
+    terminal. The in-process ``codex`` (SDK) harness has no such terminal, so it
+    keeps the ``~/.codex`` host dir it used before this scoping.
+
+    Standalone names use the **directory name** (the selector's key), not the
     frontmatter ``name``. Codex registers a skill's slash command under its
     directory, and the executor symlinks under that dir name — so when the
     two differ, the menu label must match the directory (mirrors the Cursor
     provider). The lazy import keeps the Codex-specific dependency out of
     ``omnigent.spec``'s module-load path.
+
+    Plugins are loaded directly by Codex from its cache, outside the symlinked
+    standalone sources. Ask the CLI for installed versions and enabled state
+    so plugin namespaces survive and stale cached skills stay hidden. When that
+    inventory cannot be read, ask Codex's model-free ``skills/list`` API for the
+    plugin skills it actually loads, including its effective configuration.
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
+    from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
 
-    sources = codex_skill_sources(ctx.bundle_dir, ctx.home)
+    host_override = ctx.codex_home if ctx.is_native else None
+    sources = codex_skill_sources(ctx.bundle_dir, ctx.home, codex_home=host_override)
     out: list[SkillSpec] = []
     for name, skill_dir in select_codex_skill_dirs(ctx.skills_filter, sources).items():
         try:
@@ -327,6 +561,9 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
         except (OmnigentError, OSError):  # best-effort discovery
             continue
         out.append(replace(spec, name=name))
+    codex_home = host_override if host_override is not None else ctx.home / ".codex"
+    cwd = ctx.roots[0] if ctx.roots else None
+    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
     return out
 
 
@@ -373,6 +610,123 @@ def cursor_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return out
 
 
+def _agy_skill_dirs(ctx: SkillSourceContext) -> list[tuple[Path, str | None]]:
+    """
+    agy's skill directories with their namespace, in discovery order.
+
+    The five sources agy's own ``/skills`` panel lists (live-verified, agy
+    1.1.9 — the panel prints these paths verbatim)::
+
+        <workspace>/.agents/skills/<skill>/SKILL.md          "Workspace"
+        ~/.gemini/antigravity-cli/skills/<skill>/SKILL.md    "Global"
+        ~/.gemini/skills/<skill>/SKILL.md                    "Shared"
+        ~/.gemini/config/plugins/<plugin>/skills/<skill>/…   imported plugins
+        ~/.gemini/antigravity-cli/builtin/skills/<skill>/…   shipped builtins
+
+    Only plugin skills are namespaced — agy registers them as
+    ``<plugin>:<skill>`` and its TUI accepts only that spelling; every other
+    source is bare. The workspace source is ``.agents/skills`` (vendor-neutral),
+    NOT ``.claude/skills``: that is the one directory the old generic fallback
+    got right for agy.
+
+    A plugin is ENABLED iff it still carries ``plugin.json``: ``agy plugin
+    disable`` renames that file to ``plugin.json.disabled`` and changes nothing
+    else — ``config/import_manifest.json`` keeps listing the plugin (so does
+    ``agy plugin list``) and the ``skills/`` tree stays on disk. The manifest is
+    therefore NOT a usable enabled-signal; the manifest file's name is.
+
+    :param ctx: Session discovery context. ``home`` is the real user home, which
+        is truthful for every source above even though agy runs under a
+        bridge-owned ``--gemini_dir``: the plugin, Global and Shared trees are
+        linked back to the real home by ``_seed_isolated_agy_plugins`` /
+        ``_seed_isolated_agy_skills``; the workspace tree is not under the Gemini
+        dir at all; and agy recreates its builtins in whatever Gemini dir it is
+        launched with. Anything listed here therefore resolves in-session — a
+        menu entry agy could not expand would just fail, since a native session
+        sends ``/name`` to the CLI as plaintext.
+    :returns: ``(directory, namespace)`` pairs; ``namespace`` is ``None`` for
+        every source except plugins.
+    """
+    gemini = ctx.home / ".gemini"
+    dirs: list[tuple[Path, str | None]] = []
+    for root in ctx.roots:
+        workspace_skills = root / ".agents" / "skills"
+        if workspace_skills.is_dir():
+            dirs.append((workspace_skills, None))
+    for bare in (
+        gemini / "antigravity-cli" / "skills",
+        gemini / "skills",
+    ):
+        if bare.is_dir():
+            dirs.append((bare, None))
+    plugins_root = gemini / "config" / "plugins"
+    try:
+        plugins = sorted(plugins_root.iterdir()) if plugins_root.is_dir() else []
+    except OSError as exc:
+        # An unreadable plugins dir must not 500 the /skills endpoint.
+        _log.warning("Skipping unreadable agy plugins dir %s: %s", plugins_root, exc)
+        plugins = []
+    for plugin in plugins:
+        if not (plugin / "plugin.json").is_file():
+            continue  # absent or renamed to plugin.json.disabled
+        skills_dir = plugin / "skills"
+        if skills_dir.is_dir():
+            dirs.append((skills_dir, plugin.name))
+    builtin = gemini / "antigravity-cli" / "builtin" / "skills"
+    if builtin.is_dir():
+        dirs.append((builtin, None))
+    return dirs
+
+
+def antigravity_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    agy's own skills: enabled ``~/.gemini`` plugins plus shipped builtins.
+
+    agy owns a host-skill mechanism (a ``/skills`` TUI listing backed by
+    :func:`_agy_skill_dirs`), and unlike Pi's that mechanism is enumerable — so
+    agy gets a real provider rather than a no-op. It deliberately does NOT
+    compose with :func:`_generic_host_skills` (the way ``claude`` does): the
+    generic walk sources ``~/.claude/skills``, which are Claude's, not agy's.
+    The menu lists what this agent actually has, matching codex/cursor.
+
+    Honors ``skills_filter`` (``"none"`` hermetic, ``"all"`` everything, a list
+    selecting by the surfaced name). Names match what agy's TUI accepts —
+    ``<plugin>:<skill>`` for plugin skills, bare elsewhere — because a native
+    session's ``/name`` is sent to the vendor CLI as plaintext for it to expand
+    (there is no server-side resolve+inject on this path), so a label agy does
+    not recognise would simply fail.
+
+    :param ctx: Session discovery context.
+    :returns: Parsed skills; unparseable ones are skipped (best-effort).
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names: set[str] | None = (
+        set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    )
+    out: list[SkillSpec] = []
+    for skills_dir, namespace in _agy_skill_dirs(ctx):
+        try:
+            children = sorted(skills_dir.iterdir())
+        except OSError as exc:
+            _log.warning("Skipping unreadable agy skills dir %s: %s", skills_dir, exc)
+            continue
+        for child in children:
+            if not child.is_dir() or not (child / "SKILL.md").is_file():
+                continue
+            try:
+                spec = _parse_skill(child / "SKILL.md")
+            except (OmnigentError, OSError):  # best-effort discovery
+                continue
+            # agy is not confirmed to invoke by directory, so keep its frontmatter-name keying.
+            base = spec.display_name or spec.name
+            name = base if namespace is None else f"{namespace}:{base}"
+            if filter_names is not None and name not in filter_names:
+                continue
+            out.append(replace(spec, name=name, display_name=None))
+    return out
+
+
 def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
     Pi exposes no *extra* discoverable skills to the menu.
@@ -401,15 +755,89 @@ def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return []
 
 
+def devin_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """Devin skills: whatever ``devin skills list`` reports as user-invocable.
+
+    Devin loads slash-command skills from its own dirs (``~/.config/devin/skills``,
+    ``~/.agents/skills``, ``.devin/skills``, …) *and* from Claude Code's
+    ``.claude/skills`` for compatibility, with its own precedence — more than any
+    single dir walk here would faithfully reproduce. So the menu is sourced
+    authoritatively from the CLI itself, matching exactly the ``/`` commands the
+    Devin terminal offers.
+
+    Native only (the wrap types ``/name`` into the real Devin TUI). Best-effort:
+    a missing CLI, a non-zero exit, a timeout, or unparseable output yields no
+    host skills rather than raising — the bundled skills still show.
+
+    :param ctx: Session discovery context; the first root is the CLI's cwd.
+    :returns: One :class:`SkillSpec` per user-invocable Devin skill.
+    """
+    if not ctx.is_native:
+        return []
+    root = ctx.roots[0] if ctx.roots else ctx.home
+    try:
+        proc = subprocess.run(
+            ["devin", "skills", "list", "--json", "--trigger", "user"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # best-effort discovery
+        _log.debug("devin skills list failed to run: %s", exc)
+        return []
+    if proc.returncode != 0:
+        _log.debug("devin skills list exited %d: %s", proc.returncode, proc.stderr[:200])
+        return []
+    try:
+        entries = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    out: list[SkillSpec] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = entry.get("description")
+        base_dir = entry.get("base_dir")
+        out.append(
+            SkillSpec(
+                name=name,
+                description=description if isinstance(description, str) else "",
+                content="",
+                skill_dir=Path(base_dir) if isinstance(base_dir, str) and base_dir else None,
+                user_invocable=True,
+            )
+        )
+    return out
+
+
 # Keyed by harness family (see _harness_family). A harness with no entry
-# (antigravity, qwen, openai-agents, …) falls through to _generic_host_skills
-# in resolve_harness_skills — the unchanged pre-existing ~/.claude/skills walk,
-# whose skills omnigent resolves+injects regardless of vendor. Pi is the one
-# harness that needs an explicit no-op (see pi_host_skills) because it owns a
-# host-skill mechanism omnigent can't enumerate.
+# (qwen, openai-agents, the in-process antigravity SDK, …) falls through to
+# _generic_host_skills in resolve_harness_skills — the ~/.claude/skills walk,
+# whose skills omnigent resolves+injects regardless of vendor.
+#
+# The dividing line is whether the harness owns a host-skill mechanism, and if
+# so whether omnigent can enumerate it:
+#
+#   no mechanism            -> generic walk (omnigent injects the skill text)
+#   mechanism, enumerable   -> dedicated provider listing what the agent has
+#                              (claude, codex, cursor, antigravity/agy)
+#   mechanism, unenumerable -> explicit no-op (pi) — listing anything would
+#                              risk surfacing a command the harness can't run
+#
+# agy moved from the first row to the second when it gained plugin + builtin
+# skills; it is enumerable (see antigravity_host_skills), so it lists its own.
 _SKILL_SOURCES: dict[str | None, SkillSource] = {
     "claude": claude_host_skills,
     "codex": codex_host_skills,
     "cursor": cursor_host_skills,
+    "devin": devin_host_skills,
     "pi": pi_host_skills,
+    "antigravity": antigravity_host_skills,
 }

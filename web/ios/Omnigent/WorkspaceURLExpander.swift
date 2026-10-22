@@ -1,19 +1,17 @@
 import Foundation
 
 enum WorkspaceURLExpander {
-  static let workspaceUIPath = "/ml/omnigents"
-
-  /// Databricks Apps are served from `*.databricksapps.com` and answer with the
-  /// same `server: databricks` header as a workspace, but they are NOT
-  /// workspaces and have no `/ml/omnigents` mount, so expansion is skipped for
-  /// these hosts.
-  static let databricksAppsHostSuffix = "databricksapps.com"
+  /// Path the Omnigent SPA is mounted at inside a Databricks workspace. Matches
+  /// Android and Electron's `WORKSPACE_UI_PATH`.
+  static let workspaceUIPath = "/omnigent"
 
   static func expandIfNeeded(
     _ url: URL,
     session: URLSession = SameOriginRedirectHandler.session
   ) async -> URL {
-    guard url.scheme?.lowercased() == "https", isBareRoot(url), !isDatabricksAppsHost(url),
+    // Apps share the workspace's server header but serve their UI at the root.
+    guard url.scheme?.lowercased() == "https", isBareRoot(url),
+      ServerAuthentication(host: url.host) != .databricksApp,
       let origin = originURL(for: url)
     else {
       return url
@@ -41,22 +39,41 @@ enum WorkspaceURLExpander {
       guard (http.value(forHTTPHeaderField: "server") ?? "").lowercased() == "databricks" else {
         return url
       }
-      return URL(
-        string:
-          "\(origin.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")))\(workspaceUIPath)"
-      ) ?? url
+      return mounted(url) ?? url
     } catch {
       return url
     }
   }
 
-  private static func isBareRoot(_ url: URL) -> Bool {
-    url.path.isEmpty || url.path == "/"
+  /// The SPA-mount URL for a **bare** Databricks workspace root, or nil for
+  /// anything else — a non-workspace host, or a URL that already carries a path (a
+  /// deliberate deep link we must not override).
+  ///
+  /// A bare workspace root shows the Databricks landing page, not Omnigent, so the
+  /// shell rewrites it. Matched by domain with no probe, mirroring Android's
+  /// `databricksWorkspaceUiUrl`; query and fragment survive because `?o=<org>`
+  /// selects which workspace the request lands in.
+  static func workspaceUIURL(forBareRoot url: URL) -> URL? {
+    guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
+      ServerAuthentication(host: url.host) == .databricksWorkspace, isBareRoot(url)
+    else {
+      return nil
+    }
+    return mounted(url)
   }
 
-  private static func isDatabricksAppsHost(_ url: URL) -> Bool {
-    guard let host = url.host?.lowercased() else { return false }
-    return host == databricksAppsHostSuffix || host.hasSuffix(".\(databricksAppsHostSuffix)")
+  /// `url` with its path replaced by ``workspaceUIPath``, preserving scheme, host,
+  /// port, query and fragment.
+  private static func mounted(_ url: URL) -> URL? {
+    guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+      return nil
+    }
+    components.path = workspaceUIPath
+    return components.url
+  }
+
+  private static func isBareRoot(_ url: URL) -> Bool {
+    url.path.isEmpty || url.path == "/"
   }
 
   private static func originURL(for url: URL) -> URL? {

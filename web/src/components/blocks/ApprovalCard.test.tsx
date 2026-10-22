@@ -1,7 +1,14 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { BlockStream } from "@/lib/blockStream";
+import { buildBubbles, type RenderItem } from "@/lib/renderItems";
+import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
-import { ApprovalCard } from "./ApprovalCard";
+import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
 afterEach(() => {
   cleanup();
@@ -30,66 +37,93 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
   });
 
-  it("disables approval but leaves rejection available without authority", () => {
-    const submitSpy = vi.fn();
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared"
-        message="Run a privileged command?"
-        phase="tool_call"
-        policyName="approve_shell_commands"
-        contentPreview="sudo command"
-        requestedSchema={{}}
-        status="pending"
-        response={null}
-        canApprove={false}
-        allowAllEdits={true}
-        rememberScope={{ tool: "Bash" }}
-        onSubmit={submitSpy}
-      />,
-    );
+  it("shows the harness name instead of the synthetic policy stamp on native prompts", () => {
+    // Native-harness bridges stamp provenance ids ("claude_native_permission",
+    // phase "pre_tool_use"). The card header must show the product name and
+    // drop the constant phase chip — internal ids read as debug output.
+    const props = {
+      elicitationId: "elic_native",
+      message: "Claude wants to call **Bash**",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "Bash({})",
+      requestedSchema: {},
+    } as const;
+    const { rerender } = render(<ApprovalCard {...props} status="pending" response={null} />);
+    expect(screen.getByText(/Claude Code/)).toBeDefined();
+    expect(screen.queryByText(/claude_native_permission/)).toBeNull();
+    expect(screen.queryByText(/pre_tool_use/)).toBeNull();
 
-    for (const name of ["Approve", "Accept & allow all edits", /don't ask again for Bash/i]) {
-      expect((screen.getByRole("button", { name }) as HTMLButtonElement).disabled).toBe(true);
-    }
-    const reject = screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement;
-    expect(reject.disabled).toBe(false);
-    expect(screen.getByRole("note").textContent).toContain("delegated approver");
-
-    fireEvent.click(reject);
-    expect(submitSpy).toHaveBeenCalledWith("elic_shared", "decline");
+    // Same mapping on the responded pill (the state that lingers in the
+    // transcript after the verdict).
+    rerender(<ApprovalCard {...props} status="responded" response={{ action: "accept" }} />);
+    expect(screen.getByText(/Claude Code/)).toBeDefined();
+    expect(screen.queryByText(/claude_native_permission/)).toBeNull();
+    // A plain tool approval has no content of its own, so the gating
+    // message is the only record of WHAT was approved — it stays.
+    expect(screen.getByText(/wants to call/)).toBeDefined();
   });
 
-  it("disables Codex approval variants but leaves rejection available", () => {
+  it("names every native vendor, and shows no tag when the stamp names none", () => {
+    // The prefix table is derived from NATIVE_CODING_AGENTS, so vendors that
+    // stamp `<key>_native_permission` are covered without a per-vendor entry.
+    for (const [policyName, displayName] of [
+      ["kiro_native_permission", "Kiro"],
+      ["qwen_native_permission", "Qwen Code"],
+      ["agy_native_permission", "Antigravity"],
+    ]) {
+      render(
+        <ApprovalCard
+          elicitationId="elic_vendor"
+          message="Agent wants approval to run a tool"
+          phase="pre_tool_use"
+          policyName={policyName}
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      expect(screen.getByText(new RegExp(displayName))).toBeDefined();
+      expect(screen.queryByText(new RegExp(policyName))).toBeNull();
+      cleanup();
+    }
+
+    // The generic hook's vendor-less fallback: still provenance, so the tag
+    // slot stays empty rather than printing "native_permission".
     render(
       <ApprovalCard
-        elicitationId="elic_codex_shared"
-        message="Run tests?"
-        phase="codex_command_approval"
-        policyName="codex_native_command_approval"
+        elicitationId="elic_vendorless"
+        message="Agent wants approval to run a tool"
+        phase="pre_tool_use"
+        policyName="native_permission"
         contentPreview=""
         requestedSchema={{}}
         status="pending"
         response={null}
-        canApprove={false}
-        codexCommand={{
-          command: "pytest",
-          cwd: "/workspace",
-          reason: null,
-          execPolicyAmendment: ["pytest"],
-        }}
       />,
     );
+    expect(screen.queryByText(/native_permission/)).toBeNull();
+    expect(screen.queryByText(/pre_tool_use/)).toBeNull();
+  });
 
-    expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(
-      true,
+  it("keeps user-authored policy names and phase verbatim", () => {
+    // Policy asks are gated by a policy the user wrote — its name and
+    // phase tell them which rule fired, so no prettifying.
+    render(
+      <ApprovalCard
+        elicitationId="elic_policy"
+        message="Approve running rm -rf /tmp/cache?"
+        phase="tool_call"
+        policyName="approve_shell_commands"
+        contentPreview="rm -rf /tmp/cache"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
     );
-    expect(
-      (screen.getByRole("button", { name: "Approve and remember" }) as HTMLButtonElement).disabled,
-    ).toBe(true);
-    expect((screen.getByRole("button", { name: "Reject" }) as HTMLButtonElement).disabled).toBe(
-      false,
-    );
+    expect(screen.getByText(/approve_shell_commands/)).toBeDefined();
+    expect(screen.getByText(/tool_call/)).toBeDefined();
   });
 
   it("renders Codex command approvals from structured extras instead of raw JSON", () => {
@@ -167,6 +201,112 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
       execpolicy_amendment: [".venv/bin/python", "-m", "pytest"],
     });
+  });
+});
+
+describe("ApprovalCard — approve & switch to auto mode", () => {
+  const props = {
+    elicitationId: "elic_auto",
+    message: "Claude wants to call **Bash**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"git status"})',
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it.each([undefined, false])("does not offer auto mode when the hint is %s", (allowAutoMode) => {
+    render(<ApprovalCard {...props} allowAutoMode={allowAutoMode} />);
+    expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
+  });
+
+  it("preserves the server capability through parsing, reduction, and rendering", () => {
+    const events = [
+      ...parseEventLines([
+        JSON.stringify({
+          event: "response.elicitation_request",
+          data: {
+            type: "response.elicitation_request",
+            elicitation_id: props.elicitationId,
+            params: {
+              mode: "form",
+              message: props.message,
+              phase: props.phase,
+              policy_name: props.policyName,
+              requestedSchema: {},
+              allow_auto_mode: true,
+            },
+          },
+        }),
+      ]),
+    ];
+    const blocks = new BlockStream().reduceSync(events);
+    const bubbles = buildBubbles(blocks, null);
+    const bubble = bubbles[0];
+    expect(bubble.kind).toBe("assistant");
+    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+    const item = bubble.items[0];
+    expect(item.kind).toBe("elicitation");
+    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy });
+
+    render(<ElicitationCard item={item} />);
+    fireEvent.click(screen.getByRole("button", { name: /approve & switch to auto mode/i }));
+
+    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", {
+      allow_auto_mode: true,
+    });
+  });
+
+  it("keeps ordinary approval and rejection separate from the mode switch", () => {
+    const onSubmit = vi.fn();
+    render(<ApprovalCard {...props} allowAutoMode onSubmit={onSubmit} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^approve$/i }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept");
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "decline");
+    fireEvent.click(screen.getByRole("button", { name: /switch to auto mode/i }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept", {
+      allow_auto_mode: true,
+    });
+  });
+
+  it.each([
+    {
+      allowAllEdits: true,
+      button: /accept & allow all edits/i,
+      content: { allow_all_edits: true },
+    },
+    {
+      rememberScope: { tool: "Bash" },
+      button: /don't ask again for Bash/i,
+      content: { remember: true },
+    },
+  ])("retains the narrower $button action alongside auto mode", (scope) => {
+    const onSubmit = vi.fn();
+    render(<ApprovalCard {...props} {...scope} allowAutoMode onSubmit={onSubmit} />);
+    expect(screen.getByRole("button", { name: /switch to auto mode/i })).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: scope.button }));
+    expect(onSubmit).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", scope.content);
+  });
+
+  it.each([
+    ["accept", "Approved · auto mode"],
+    ["decline", "Rejected"],
+  ] as const)("shows the correct outcome for %s", (action, label) => {
+    render(
+      <ApprovalCard
+        {...props}
+        allowAutoMode
+        status="responded"
+        response={{ action, content: { allow_auto_mode: true } }}
+      />,
+    );
+    expect(screen.getByText(label)).toBeDefined();
+    expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
   });
 });
 
@@ -392,6 +532,129 @@ describe("ApprovalCard — approve & don't ask again (persistent allow rule)", (
   });
 });
 
+describe("ApprovalCard — Codex MCP persistence choices", () => {
+  it("renders advertised persistence modes and returns the selected mode in _meta", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        elicitationId="elic_codex_mcp"
+        message={'Allow the omnigent MCP server to run tool "sys_read_inbox"?'}
+        phase="codex_mcp_elicitation"
+        policyName="codex_native_mcp_elicitation"
+        contentPreview="{}"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        codexPersistModes={["session", "always"]}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    const sessionButton = screen.getByRole("button", { name: /approve for this session/i });
+    const alwaysButton = screen.getByRole("button", { name: /always allow/i });
+    expect(sessionButton).toBeDefined();
+    expect(alwaysButton).toBeDefined();
+
+    fireEvent.click(sessionButton);
+    expect(submitSpy).toHaveBeenCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "session",
+    });
+
+    fireEvent.click(alwaysButton);
+    expect(submitSpy).toHaveBeenLastCalledWith("elic_codex_mcp", "accept", undefined, {
+      persist: "always",
+    });
+  });
+});
+
+describe("ApprovalCard — Antigravity permission prompt details", () => {
+  const baseProps = {
+    elicitationId: "elic_agy_perm",
+    message: "Antigravity wants to run: pwd",
+    phase: "agy_permission",
+    policyName: "agy_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+  } as const;
+
+  it("shows the action description and both persist choices when advertised", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    expect(screen.getByText("Running pwd command")).toBeDefined();
+    const sessionAllow = screen.getByRole("button", {
+      name: "Allow commands starting with pwd for this session",
+    });
+    expect(sessionAllow.getAttribute("title")).toBe(
+      "Ask Antigravity to allow commands starting with “pwd” for this conversation",
+    );
+    fireEvent.click(sessionAllow);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "session",
+    });
+    const alwaysAllow = screen.getByRole("button", {
+      name: "Always allow commands starting with pwd",
+    });
+    expect(alwaysAllow.getAttribute("title")).toBe(
+      "Ask Antigravity to save a rule allowing commands starting with “pwd” for this Omnigent session",
+    );
+    fireEvent.click(alwaysAllow);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "always",
+    });
+  });
+
+  it("offers no persist choice when agy's prompt advertises none", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: null }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card-agy-session-allow")).toBeNull();
+    expect(screen.queryByTestId("approval-card-agy-always-allow")).toBeNull();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+  });
+
+  it("records an always-allow request without claiming it was saved", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "always" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText("Always allow requested")).toBeDefined();
+  });
+
+  it("records a session allow request without claiming it was saved", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "session" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText("Session allow requested")).toBeDefined();
+  });
+});
+
 describe("ApprovalCard — multi-choice options", () => {
   beforeEach(() => {
     useChatStore.setState({
@@ -466,30 +729,6 @@ describe("ApprovalCard — multi-choice options", () => {
     fireEvent.click(screen.getByRole("button", { name: "Beta" }));
 
     expect(submitSpy).toHaveBeenCalledWith("elic_pick", "accept", { answer: "Beta" });
-  });
-
-  it("disables every multi-choice answer without approval authority", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared_pick"
-        message="Pick one"
-        phase="ask_user_question"
-        policyName="claude_native_ask_user_question"
-        contentPreview="Pick one"
-        requestedSchema={{
-          type: "object",
-          properties: { answer: { type: "string", enum: ["Alpha", "Beta"] } },
-        }}
-        status="pending"
-        response={null}
-        canApprove={false}
-      />,
-    );
-
-    expect((screen.getByRole("button", { name: "Alpha" }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
-    expect((screen.getByRole("button", { name: "Beta" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("renders 'Selected: <label>' on the responded card when content carries an answer", () => {
@@ -601,30 +840,6 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     fireEvent.click(screen.getByLabelText("React"));
     expect(submit.hasAttribute("disabled")).toBe(false);
-  });
-
-  it("keeps question submission disabled but cancellation enabled without authority", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared_question"
-        message="Claude wants to call AskUserQuestion"
-        phase="pre_tool_use"
-        policyName="claude_native_permission"
-        contentPreview={sampleSinglePreview}
-        requestedSchema={{}}
-        status="pending"
-        response={null}
-        canApprove={false}
-      />,
-    );
-
-    fireEvent.click(screen.getByLabelText("React"));
-    expect((screen.getByRole("button", { name: /submit/i }) as HTMLButtonElement).disabled).toBe(
-      true,
-    );
-    expect((screen.getByRole("button", { name: /cancel/i }) as HTMLButtonElement).disabled).toBe(
-      false,
-    );
   });
 
   it("submits gathered answers via submitApproval on click", () => {
@@ -1117,6 +1332,10 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     expect(screen.getByText(/Submitted/)).toBeDefined();
     expect(screen.getByText(/Vue/)).toBeDefined();
+    // The user already answered, so the pending-tense gating message
+    // ("wants to call AskUserQuestion") would read as if the prompt
+    // were still outstanding.
+    expect(screen.queryByText(/wants to call/)).toBeNull();
   });
 });
 
@@ -1185,30 +1404,6 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     expect(submitSpy).toHaveBeenCalledWith("elic_plan_auto", "accept", {
       allow_all_edits: true,
     });
-  });
-
-  it("disables plan approval but leaves rejection available without authority", () => {
-    render(
-      <ApprovalCard
-        elicitationId="elic_shared_plan"
-        status="pending"
-        response={null}
-        canApprove={false}
-        {...planProps}
-      />,
-    );
-
-    expect(
-      (screen.getByRole("button", { name: /yes, and use auto mode/i }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: /yes, manually approve edits/i }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    expect(
-      (screen.getByRole("button", { name: /reject with feedback/i }) as HTMLButtonElement).disabled,
-    ).toBe(false);
   });
 
   it("submits a plain accept for 'Yes, manually approve edits'", () => {
@@ -1310,6 +1505,9 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
       />,
     );
     expect(screen.getByText("Plan approved")).toBeDefined();
+    // Same as an answered question: the plan was already reviewed, so
+    // the verdict label stands alone without the pending-tense ask.
+    expect(screen.queryByText(/wants to call/)).toBeNull();
 
     rerender(
       <ApprovalCard
@@ -1323,5 +1521,389 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
     expect(screen.getByTestId("plan-rejection-feedback").textContent).toContain(
       "Too risky, split it up.",
     );
+  });
+});
+
+describe("ApprovalCard — resolved-elsewhere pill", () => {
+  const props = {
+    elicitationId: "elic_auto",
+    message: "Cursor wants approval to run a shell command",
+    phase: "pre_tool_use",
+    policyName: "cursor_native_permission",
+    contentPreview: "Bash({})",
+    requestedSchema: {},
+    status: "responded",
+    response: { action: "auto_resolved" },
+  } as const;
+
+  it("explains the status from the info icon's accessible label", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("Resolved elsewhere")).toBeDefined();
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger).toBeDefined();
+    expect(trigger.getAttribute("aria-label")?.toLowerCase()).not.toBe("resolved elsewhere");
+  });
+
+  it("opens the explanation when the trigger takes keyboard focus", async () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} />
+      </TooltipProvider>,
+    );
+
+    const trigger = screen.getByLabelText(/answered outside this view/i);
+    expect(trigger.getAttribute("tabindex")).toBe("0");
+    fireEvent.focus(trigger);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(/answered outside this view/i);
+  });
+});
+
+describe("ApprovalCard — cancel verdict", () => {
+  it("renders a cancel as Cancelled, not Rejected", () => {
+    // A prompt dismissed without a decision (turn aborted, prompt
+    // withdrawn on another surface) is not a rejection — labelling it
+    // "Rejected" implies a verdict the user never gave.
+    render(
+      <ApprovalCard
+        elicitationId="elic_cancel"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "cancel" }}
+      />,
+    );
+
+    expect(screen.getByText(/Cancelled/)).toBeDefined();
+    expect(screen.queryByText(/Rejected/)).toBeNull();
+  });
+});
+
+describe("ApprovalCard — prompt expired", () => {
+  it("says the prompt expired and how to resume instead of 'Resolved elsewhere'", () => {
+    // The server's deferred clear fires when the hook stopped waiting and
+    // nobody answered. "Resolved elsewhere" implied someone had, which
+    // left the session looking ambiguously stuck.
+    render(
+      <ApprovalCard
+        elicitationId="elic_expired"
+        message="Claude wants to call **Bash**"
+        phase="pre_tool_use"
+        policyName="claude_native_permission"
+        contentPreview="Bash({})"
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "auto_resolved", reason: "unanswered" }}
+      />,
+    );
+
+    expect(screen.getByText(/Prompt expired/)).toBeDefined();
+    expect(screen.getByTestId("prompt-expired-hint").textContent).toContain(
+      "Send a message to continue",
+    );
+    expect(screen.queryByText(/Resolved elsewhere/)).toBeNull();
+  });
+
+  it("keeps the neutral pill for an auto-resolve with no reason", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard
+          elicitationId="elic_neutral"
+          message="Claude wants to call **Bash**"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview="Bash({})"
+          requestedSchema={{}}
+          status="responded"
+          response={{ action: "auto_resolved" }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
+    expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
+  });
+});
+
+describe("ElicitationCard — prompts mirrored from a sub-agent", () => {
+  type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
+
+  function elicitationItem(overrides: Partial<ElicitationItem> = {}): ElicitationItem {
+    return {
+      kind: "elicitation",
+      itemId: null,
+      elicitationId: "elic_child",
+      targetSessionId: "conv_child",
+      message: "Claude wants to call **Bash**",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "Bash({})",
+      requestedSchema: {},
+      status: "pending",
+      response: null,
+      ...overrides,
+    };
+  }
+
+  function childSession(overrides: Partial<ChildSessionInfo> = {}): ChildSessionInfo {
+    return {
+      id: "conv_child",
+      title: "claude-native:review",
+      task_summary: "Review the auth change",
+      tool: "claude-native",
+      session_name: "review",
+      labels: {},
+      current_task_status: "in_progress",
+      busy: true,
+      last_message_preview: null,
+      pending_elicitations_count: 1,
+      ...overrides,
+    };
+  }
+
+  function renderCard(
+    item: ElicitationItem,
+    cache: Record<string, ChildSessionInfo[]>,
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  ) {
+    for (const [parentId, children] of Object.entries(cache)) {
+      queryClient.setQueryData(childSessionsQueryKey(parentId), children);
+    }
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <TooltipProvider>
+            <ElicitationCard item={item} />
+          </TooltipProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_parent", blocks: [] });
+  });
+
+  it("names and links the child session on pending and responded cards", () => {
+    // WHY: the parent can run a different harness than the child, so a card
+    // tagged "Claude Code" in a Codex chat must say which sub-agent asked.
+    const cache = { conv_parent: [childSession()] };
+    const { unmount } = renderCard(elicitationItem(), cache);
+    const requester = screen.getByTestId("approval-card-requester");
+    expect(requester).toHaveTextContent("Requested by sub-agent Review the auth change");
+    expect(within(requester).getByRole("link")).toHaveAttribute("href", "/c/conv_child");
+    unmount();
+
+    renderCard(
+      elicitationItem({
+        status: "responded",
+        response: { action: "accept", content: { allow_auto_mode: true } },
+      }),
+      cache,
+    );
+    expect(screen.getByText("Approved · auto mode")).toBeDefined();
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by sub-agent Review the auth change",
+    );
+  });
+
+  it("finds a deeper descendant in the cached tree", () => {
+    renderCard(elicitationItem({ targetSessionId: "conv_grandchild" }), {
+      conv_parent: [childSession()],
+      conv_child: [
+        childSession({ id: "conv_grandchild", task_summary: "Run the migration tests" }),
+      ],
+    });
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by sub-agent Run the migration tests",
+    );
+  });
+
+  it("names a deeper descendant once its parent's list is cached after mount", () => {
+    // WHY: deeper lists are only read from the cache; a card mounted before
+    // the Agents rail loads them must still pick up the label.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderCard(
+      elicitationItem({ targetSessionId: "conv_grandchild" }),
+      { conv_parent: [childSession()] },
+      queryClient,
+    );
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by a sub-agent",
+    );
+
+    act(() => {
+      queryClient.setQueryData(childSessionsQueryKey("conv_child"), [
+        childSession({ id: "conv_grandchild", task_summary: "Run the migration tests" }),
+      ]);
+    });
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by sub-agent Run the migration tests",
+    );
+  });
+
+  it("still links the sub-agent when its summary is not loaded", () => {
+    renderCard(elicitationItem(), { conv_parent: [] });
+    const requester = screen.getByTestId("approval-card-requester");
+    expect(requester).toHaveTextContent("Requested by a sub-agent");
+    expect(within(requester).getByRole("link")).toHaveAttribute("href", "/c/conv_child");
+  });
+
+  it("treats an empty label as missing", () => {
+    // WHY: label fields fall through with ``??``, so an empty summary would
+    // otherwise render an empty, invisible link.
+    renderCard(elicitationItem(), { conv_parent: [childSession({ task_summary: "" })] });
+    const requester = screen.getByTestId("approval-card-requester");
+    expect(requester).toHaveTextContent("Requested by a sub-agent");
+    expect(within(requester).getByRole("link")).toHaveTextContent("sub-agent");
+  });
+
+  it.each([
+    { name: "no target", targetSessionId: null },
+    { name: "the viewed session as target", targetSessionId: "conv_parent" },
+  ])("omits the requester line for a prompt with $name", ({ targetSessionId }) => {
+    renderCard(elicitationItem({ targetSessionId }), { conv_parent: [childSession()] });
+    expect(screen.getByTestId("approval-card")).toBeDefined();
+    expect(screen.queryByTestId("approval-card-requester")).toBeNull();
+  });
+});
+
+describe("ApprovalCard — gating message emphasis", () => {
+  const props = {
+    elicitationId: "elic_emphasis",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"touch /tmp/probe"})',
+    requestedSchema: {},
+  } as const;
+
+  it("shows the bridge's **tool name** bold without the markers, pending and responded", () => {
+    // The hook publishes "<harness> wants to call **<tool>**"; the card must
+    // not print that string verbatim, asterisks included.
+    const message = "Claude wants to call **Bash**";
+    const { rerender } = render(
+      <ApprovalCard {...props} message={message} status="pending" response={null} />,
+    );
+    let card = screen.getByTestId("approval-card");
+    expect(card.textContent).not.toContain("**");
+    expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
+    expect(within(card).getByText(/Claude wants to call/)).toBeDefined();
+
+    rerender(
+      <ApprovalCard
+        {...props}
+        message={message}
+        status="responded"
+        response={{ action: "decline" }}
+      />,
+    );
+    card = screen.getByTestId("approval-card");
+    expect(card.textContent).not.toContain("**");
+    expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
+  });
+
+  it("leaves a policy prompt's raw command text verbatim", () => {
+    // Policy ASK reasons embed the unescaped command the user is approving; the
+    // full set of non-matching shapes lives in ElicitationMessage.test.tsx.
+    const message = "Agent wants to call sys_os_shell('echo **x** y pkg/__init__.py'). Approve?";
+    render(
+      <ApprovalCard
+        {...props}
+        phase="tool_call"
+        policyName="approve_shell_commands"
+        message={message}
+        status="pending"
+        response={null}
+      />,
+    );
+    const card = screen.getByTestId("approval-card");
+    expect(within(card).getByText(message)).toBeDefined();
+    expect(card.querySelector("strong, em")).toBeNull();
+  });
+});
+
+describe("Kiro approval delivery", () => {
+  const props = {
+    elicitationId: "kiro-request",
+    message: "Kiro wants approval for Running: pwd",
+    phase: "pre_tool_use",
+    policyName: "kiro_native_permission",
+    contentPreview: "Running: pwd",
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("keeps sending distinct from delivered and retries only the current attempt", () => {
+    const submit = vi.fn();
+    const { rerender } = render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "sending", attempt: "first", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Waiting for Kiro to confirm")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    rerender(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "unconfirmed", attempt: "second", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/previous attempt may still be pending/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending approval" }));
+    expect(submit).toHaveBeenCalledExactlyOnceWith("kiro-request", "accept", undefined, {
+      native_delivery_attempt: "second",
+    });
+    rerender(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            status="responded"
+            response={{ action: "auto_resolved" }}
+            nativeDelivery={{ state: "unconfirmed", attempt: "second", action: "accept" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    expect(screen.getByText("Resolved in Kiro")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it("retries a rejection without turning it into an approval", () => {
+    const submit = vi.fn();
+    render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            onSubmit={submit}
+            nativeDelivery={{ state: "unconfirmed", attempt: "reject-attempt", action: "decline" }}
+          />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending rejection" }));
+    expect(submit).toHaveBeenCalledExactlyOnceWith("kiro-request", "decline", undefined, {
+      native_delivery_attempt: "reject-attempt",
+    });
   });
 });

@@ -14,6 +14,13 @@ import { authenticatedFetch } from "./identity";
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
 
+/**
+ * Where each firing runs. `connected_host` pins/resolves the owner's own
+ * machine; `managed_sandbox` provisions a FRESH server-managed sandbox per
+ * firing (no host/workspace), using the server's normal sandbox lifecycle.
+ */
+export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
+
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
   "scheduled" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
@@ -38,10 +45,18 @@ export interface ScheduledTask {
   updatedAt: number;
   modelOverride: string | null;
   reasoningEffort: string | null;
+  /**
+   * Native-harness permission mode (Claude Code), e.g. `acceptEdits`, or `null`
+   * to use the agent's configured default. The server derives the runner's
+   * `--permission-mode` launch arg from it at fire time.
+   */
+  permissionMode: string | null;
   /** Pinned absolute workspace, or `null` (server defaults to the host home). */
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
   hostId: string | null;
+  /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
+  executionTarget: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
   /** Epoch seconds of the last fire, or `null` if it has never fired. */
   lastRunAt: number | null;
@@ -84,10 +99,18 @@ export interface CreateScheduledTaskInput {
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
+  /** Native-harness permission mode (Claude Code); omit for the agent default. */
+  permissionMode?: string | null;
   /** Optional pinned workspace; only valid together with `hostId`. */
   workspace?: string | null;
   /** Optional pinned host. */
   hostId?: string | null;
+  /**
+   * Where firings run. Omit (or `connected_host`) for the connected-host
+   * behavior; `managed_sandbox` provisions a fresh sandbox each fire and must
+   * NOT be combined with `hostId` / `workspace`.
+   */
+  executionTarget?: ScheduledTaskExecutionTarget;
 }
 
 /**
@@ -99,11 +122,24 @@ export interface UpdateScheduledTaskInput {
   name?: string;
   prompt?: string;
   rrule?: string;
+  /**
+   * Rebind the task to a different agent, switching the harness its future
+   * firings run. The server clears `modelOverride` / `reasoningEffort` /
+   * `permissionMode` on a switch (a model id is provider-bound, permission mode
+   * is Claude-only) unless the same PATCH resends them.
+   */
+  agentId?: string;
   timezone?: string;
   modelOverride?: string | null;
   reasoningEffort?: string | null;
+  permissionMode?: string | null;
   workspace?: string;
   hostId?: string;
+  /**
+   * Switch where firings run. `managed_sandbox` clears any pinned host; do not
+   * also set `hostId` / `workspace` in the same update.
+   */
+  executionTarget?: ScheduledTaskExecutionTarget;
   state?: ScheduledTaskState;
 }
 
@@ -120,8 +156,10 @@ interface ScheduledTaskWire {
   updated_at: number;
   model_override: string | null;
   reasoning_effort: string | null;
+  permission_mode: string | null;
   workspace: string | null;
   host_id: string | null;
+  execution_target: ScheduledTaskExecutionTarget;
   state: ScheduledTaskState;
   last_run_at: number | null;
   last_run_status: ScheduledTaskRunStatus | null;
@@ -194,8 +232,10 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     updatedAt: wire.updated_at,
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
+    permissionMode: wire.permission_mode,
     workspace: wire.workspace,
     hostId: wire.host_id,
+    executionTarget: wire.execution_target,
     state: wire.state,
     lastRunAt: wire.last_run_at,
     lastRunStatus: wire.last_run_status,
@@ -253,8 +293,10 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
+  if (input.permissionMode != null) body.permission_mode = input.permissionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
+  if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   const res = await authenticatedFetch("/v1/scheduled-tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -276,11 +318,14 @@ export async function updateScheduledTask(
   if (input.name !== undefined) body.name = input.name;
   if (input.prompt !== undefined) body.prompt = input.prompt;
   if (input.rrule !== undefined) body.rrule = input.rrule;
+  if (input.agentId !== undefined) body.agent_id = input.agentId;
   if (input.timezone !== undefined) body.timezone = input.timezone;
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
+  if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
+  if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.state !== undefined) body.state = input.state;
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
     method: "PATCH",

@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import ntpath
+from functools import partialmethod
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
-from omnigent.spec.parser import discover_host_skills, parse
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner import sandbox
+from omnigent.spec import parser
+from omnigent.spec.parser import (
+    AgentImageConfigMissingError,
+    _parse_skill,
+    discover_host_skills,
+    parse,
+)
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -42,11 +53,48 @@ def test_parse_minimal(agent_dir: Path) -> None:
     assert spec.mcp_servers == []
     assert spec.local_tools == []
     assert spec.sub_agents == []
+    assert spec.model_egress is None
+
+
+def test_parse_model_egress_as_distinct_typed_grant(tmp_path: Path) -> None:
+    rule = "POST workspace.databricks.com/ai-gateway/codex/v1/responses"
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"spec_version": 1, "model_egress": [rule]})
+    )
+
+    spec = parse(tmp_path)
+
+    assert spec.model_egress == [rule]
+
+
+@pytest.mark.parametrize("value", [[], "POST workspace.databricks.com/**", [123]])
+def test_parse_model_egress_rejects_invalid_grants(tmp_path: Path, value: object) -> None:
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"spec_version": 1, "model_egress": value})
+    )
+
+    with pytest.raises(OmnigentError, match="model_egress"):
+        parse(tmp_path)
 
 
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"config.yaml not found"):
         parse(tmp_path)
+
+
+def test_parse_missing_config_yaml_is_a_coded_not_found(tmp_path: Path) -> None:
+    """A missing config.yaml must not reach the server as an unhandled 500.
+
+    Kept a ``FileNotFoundError`` as well, so the documented contract and any
+    caller already catching that still hold.
+    """
+    with pytest.raises(AgentImageConfigMissingError) as caught:
+        parse(tmp_path)
+
+    assert isinstance(caught.value, OmnigentError)
+    assert isinstance(caught.value, FileNotFoundError)
+    assert caught.value.code == ErrorCode.NOT_FOUND
+    assert caught.value.http_status == 404
 
 
 def test_parse_non_mapping_config(tmp_path: Path) -> None:
@@ -90,6 +138,7 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.llm.model == "openai/gpt-5.4"
     # executor.model is the canonical source — verify consolidation
     assert spec.executor.model == "openai/gpt-5.4"
+    assert spec.executor.reasoning_effort == "medium"
     assert spec.llm.extra == {
         "max_completion_tokens": 4096,
         "reasoning_effort": "medium",
@@ -99,6 +148,44 @@ def test_parse_full_config(tmp_path: Path) -> None:
     assert spec.interaction.modalities.output == ["text"]
     assert spec.tools.agents == ["researcher", "critic"]
     assert spec.params == {"max_results": 10, "prefer_recent": True}
+
+
+def test_parse_llm_reasoning_effort_lifted_to_executor(tmp_path: Path) -> None:
+    """The deprecated ``llm.reasoning_effort`` lifts to the canonical field.
+
+    Mirrors the model/connection consolidation: ``executor.reasoning_effort``
+    is the source of truth, populated from the ``llm:`` block for back-compat.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "eff-llm",
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "xhigh"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "xhigh"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "xhigh"
+
+
+def test_parse_executor_reasoning_effort_supersedes_llm(tmp_path: Path) -> None:
+    """When both are set, executor.reasoning_effort wins and llm is synced to it."""
+    config = {
+        "spec_version": 1,
+        "name": "eff-both",
+        "executor": {
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "openai/gpt-5.4",
+            "reasoning_effort": "high",
+        },
+        "llm": {"model": "openai/gpt-5.4", "reasoning_effort": "low"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.llm is not None
+    assert spec.llm.extra.get("reasoning_effort") == "high"
 
 
 def test_parse_llm_missing_model(tmp_path: Path) -> None:
@@ -389,6 +476,76 @@ def test_parse_instructions_file_reference(agent_dir: Path) -> None:
     assert spec.instructions == "Custom system prompt from file."
 
 
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_embedded_nul_stays_literal(
+    agent_dir: Path, instruction_key: str
+) -> None:
+    value = "invalid\0instructions.md"
+    config = {"spec_version": 1, instruction_key: value}
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    (agent_dir / "AGENTS.md").write_text("Lower-priority instructions.")
+
+    assert parse(agent_dir).instructions == value
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+def test_parse_instructions_decode_error_propagates(
+    agent_dir: Path, monkeypatch: pytest.MonkeyPatch, instruction_key: str | None
+) -> None:
+    """Decode real files as UTF-8 regardless of the test machine's locale."""
+    monkeypatch.setattr(Path, "read_text", partialmethod(Path.read_text, encoding="utf-8"))
+    config = {"spec_version": 1}
+    if instruction_key is not None:
+        config[instruction_key] = "AGENTS.md"
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    (agent_dir / "AGENTS.md").write_bytes(b"\xff")
+    (agent_dir / "CLAUDE.md").write_text("Lower-priority instructions.")
+
+    with pytest.raises(UnicodeDecodeError):
+        parse(agent_dir)
+
+
+@pytest.mark.parametrize(
+    "resolved_root",
+    [
+        pytest.param(r"\\server\share", id="unc-share"),
+        pytest.param("\\\\server\\share\\", id="unc-share-trailing-separator"),
+        pytest.param(r"\\?\UNC\server\share", id="extended-unc-share"),
+        pytest.param(r"C:\bundle", id="drive-directory"),
+    ],
+)
+@pytest.mark.parametrize("outside", [False, True], ids=["contained", "sibling"])
+def test_read_contained_file_windows_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolved_root: str, outside: bool
+) -> None:
+    """Simulate Windows canonical paths without requiring a live network share."""
+    resolved_candidate = (
+        resolved_root.rstrip(ntpath.sep) + ("-other" if outside else "") + r"\AGENTS.md"
+    )
+    realpath = Mock(side_effect=[resolved_root, resolved_candidate])
+    windows_os = SimpleNamespace(
+        path=SimpleNamespace(realpath=realpath, join=ntpath.join), sep=ntpath.sep
+    )
+    candidate = Mock(spec=Path)
+    candidate.is_file.return_value = True
+    candidate.read_text.return_value = "Instruction file contents."
+    path_factory = Mock(return_value=candidate)
+    monkeypatch.setattr(parser, "os", windows_os)
+    monkeypatch.setattr(sandbox, "os", windows_os)
+    monkeypatch.setattr(parser, "Path", path_factory)
+
+    result = parser._read_contained_file(tmp_path, "AGENTS.md")
+
+    assert realpath.call_count == 2
+    if outside:
+        assert result is None
+        path_factory.assert_not_called()
+    else:
+        assert result == "Instruction file contents."
+        path_factory.assert_called_once_with(resolved_candidate)
+        candidate.read_text.assert_called_once_with(encoding="utf-8")
+
+
 def test_parse_instructions_rejects_path_traversal(tmp_path: Path) -> None:
     """An ``instructions`` value escaping the bundle is treated as literal text.
 
@@ -421,6 +578,74 @@ def test_parse_instructions_overrides_agents_md(agent_dir: Path) -> None:
     (agent_dir / "config.yaml").write_text(yaml.dump(config))
     spec = parse(agent_dir)
     assert spec.instructions == "Inline wins."
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+@pytest.mark.parametrize("filename", ["AGENTS.md", "CLAUDE.md", ".cursorrules"])
+def test_parse_instructions_rejects_symlink_escape(
+    tmp_path: Path, instruction_key: str | None, filename: str
+) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / filename).symlink_to(secret)
+    config = {"spec_version": 1, "name": "test-agent"}
+    if instruction_key is not None:
+        config[instruction_key] = filename
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(bundle)
+
+    assert spec.instructions == (filename if instruction_key is not None else None)
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_rejects_sibling_prefix(tmp_path: Path, instruction_key: str) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sibling = tmp_path / "bundle-other"
+    sibling.mkdir()
+    secret = sibling / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    config = {"spec_version": 1, instruction_key: str(secret)}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    assert parse(bundle).instructions == str(secret)
+
+
+@pytest.mark.parametrize("root_kind", ["direct", "relative", "symlink"])
+@pytest.mark.parametrize("reference_kind", ["nested", "absolute", "symlink"])
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_reads_contained_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_kind: str,
+    reference_kind: str,
+    instruction_key: str,
+) -> None:
+    bundle = tmp_path / "bundle"
+    prompt_dir = bundle / "prompts"
+    prompt_dir.mkdir(parents=True)
+    prompt_file = prompt_dir / "system.md"
+    prompt_file.write_text("Contained instructions.")
+    reference = "prompts/system.md"
+    if reference_kind == "absolute":
+        reference = str(prompt_file)
+    elif reference_kind == "symlink":
+        (bundle / "linked.md").symlink_to(prompt_file)
+        reference = "linked.md"
+    config = {"spec_version": 1, instruction_key: reference}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+    root = bundle
+    if root_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        root = Path("bundle")
+    elif root_kind == "symlink":
+        root = tmp_path / "bundle-alias"
+        root.symlink_to(bundle, target_is_directory=True)
+
+    assert parse(root).instructions == "Contained instructions."
 
 
 def test_parse_instructions_file_overrides_agents_md(agent_dir: Path) -> None:
@@ -517,6 +742,25 @@ def test_auto_detect_none_when_no_context_files(agent_dir: Path) -> None:
     assert spec.instructions is None
 
 
+def test_auto_detect_skips_escaping_context_file(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(yaml.dump({"spec_version": 1}))
+    (bundle / "AGENTS.md").symlink_to(secret)
+    (bundle / "CLAUDE.md").write_text("Safe fallback.")
+
+    assert parse(bundle).instructions == "Safe fallback."
+
+
+def test_auto_detect_empty_context_file_keeps_priority(agent_dir: Path) -> None:
+    (agent_dir / "AGENTS.md").write_text("")
+    (agent_dir / "CLAUDE.md").write_text("Lower priority.")
+
+    assert parse(agent_dir).instructions == ""
+
+
 def test_parse_skill(agent_dir: Path) -> None:
     skill_dir = agent_dir / "skills" / "deep-search"
     skill_dir.mkdir(parents=True)
@@ -536,6 +780,68 @@ def test_parse_skill(agent_dir: Path) -> None:
     assert skill.skill_dir == skill_dir
     # Absent ``user-invocable`` frontmatter defaults to invocable.
     assert skill.user_invocable is True
+    # A frontmatter name equal to the directory carries no separate label.
+    assert skill.display_name is None
+
+
+def test_parse_skill_name_comes_from_directory(agent_dir: Path) -> None:
+    """The directory is the invocation name; the frontmatter name is a free-form label."""
+    skill_dir = agent_dir / "skills" / "asd-ste100"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Simplified Technical English (ASD-STE100)\n"
+        "description: Write in Simplified Technical English.\n"
+        "---\n"
+        "Body."
+    )
+    skill = parse(agent_dir).skills[0]
+    assert skill.name == "asd-ste100"
+    assert skill.display_name == "Simplified Technical English (ASD-STE100)"
+
+
+def _write_loadable_config(agent_dir: Path) -> None:
+    """Give *agent_dir* the executor that validated ``load()`` requires."""
+    config = {
+        "spec_version": 1,
+        "name": "test-agent",
+        "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+    }
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+
+
+def test_load_keeps_frontmatter_name_when_skill_directory_is_invalid(agent_dir: Path) -> None:
+    """A bundle that validated on its frontmatter name still loads under that name."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    for directory, name in (("Code_Review", "code-review"), ("review", "code-review")):
+        skill_dir = agent_dir / "skills" / directory
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Review code.\n---\nBody."
+        )
+
+    skills = load(agent_dir).skills
+    assert [(s.name, s.display_name) for s in skills] == [
+        ("code-review", None),
+        ("review", "code-review"),
+    ]
+
+
+def test_load_rejects_skill_without_any_valid_name(agent_dir: Path) -> None:
+    """The legacy fallback only applies when the frontmatter name is itself valid."""
+    from omnigent.spec import load
+
+    _write_loadable_config(agent_dir)
+
+    skill_dir = agent_dir / "skills" / "Code_Review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: Code Review\ndescription: x\n---\nBody.")
+
+    with pytest.raises(OmnigentError, match="skill directory name must match"):
+        load(agent_dir)
 
 
 def test_parse_skill_user_invocable_false(agent_dir: Path) -> None:
@@ -638,6 +944,133 @@ def test_parse_skill_non_utf8_raises_omnigent_error(agent_dir: Path) -> None:
 _UPSTREAM_BAD_ARGUMENT_HINT = (
     "argument-hint: [industry] [--rows N] [--catalog NAME] [--schema NAME]"
 )
+
+
+# The literal ``description:`` line from the ``dev-productivity`` plugin's
+# ``simplify`` skill. Claude Code loads it; strict YAML rejects it because a
+# plain scalar may not contain ``": "`` — so every user with that plugin
+# installed silently lost the skill from Omnigent's menus.
+_UPSTREAM_COLON_IN_DESCRIPTION = (
+    "description: Refines already-working code for clarity, consistency, and "
+    "maintainability while preserving behavior. Targets code the user wants "
+    "cleaned up, not code that was just written: finishing an implementation, "
+    "bug fix, or refactor does not call for this skill."
+)
+
+
+def test_parse_skill_accepts_unquoted_colon_in_description(
+    tmp_path: Path,
+) -> None:
+    """
+    A description carrying an unquoted ``": "`` still yields a skill.
+
+    Authors write prose in ``description:`` without quoting it, and prose
+    contains colons. Claude Code accepts that; if Omnigent insists on strict
+    YAML the skill vanishes from its menus with only a log line to say why.
+    """
+    skill_dir = tmp_path / "simplify"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(f"---\nname: simplify\n{_UPSTREAM_COLON_IN_DESCRIPTION}\n---\nContent.")
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.name == "simplify"
+    # The whole line survives verbatim — the text after the colon is part of
+    # the description, not a nested mapping.
+    assert skill.description == _UPSTREAM_COLON_IN_DESCRIPTION.removeprefix("description: ")
+    assert skill.content == "Content."
+
+
+def test_parse_skill_colon_recovery_keeps_other_yaml_errors_loud(
+    tmp_path: Path,
+) -> None:
+    """
+    Recovery is scoped to the colon case; other malformed YAML still raises.
+
+    ``argument-hint: [industry] [--rows N]`` breaks on the flow sequence, not
+    on a colon. Quoting must not paper over it, or a genuinely broken
+    frontmatter would be read as prose and its fields silently misparsed.
+    """
+    skill_dir = tmp_path / "bad-yaml"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        f"---\nname: bad-yaml\ndescription: x\n{_UPSTREAM_BAD_ARGUMENT_HINT}\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_leaves_other_keys_alone(
+    tmp_path: Path,
+) -> None:
+    """
+    A colon in a non-description key still raises, keeping the skill hidden.
+
+    ``user-invocable: false: internal only`` is invalid YAML. Quoting it would
+    make the value the truthy string ``"false: internal only"``, so a skill its
+    author marked internal would appear in the user's ``/`` menu. Recovery is
+    scoped to ``description`` precisely so that cannot happen.
+    """
+    skill_dir = tmp_path / "internal-skill"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: internal-skill\ndescription: orchestrates\n"
+        "user-invocable: false: internal only\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_does_not_absorb_indented_keys(
+    tmp_path: Path,
+) -> None:
+    """
+    A mis-indented setting is not folded into a recovered description.
+
+    Continuation lines fold into a plain scalar, but an indented
+    ``user-invocable: false`` is a mis-indented setting, not prose. Absorbing
+    it would drop the flag and publish an internal skill, so the run stops
+    there and the file is rejected instead.
+    """
+    skill_dir = tmp_path / "indented-key"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: indented-key\ndescription: orchestrates things: internally\n"
+        "  user-invocable: false\n---\nContent."
+    )
+
+    with pytest.raises(OmnigentError, match=r"invalid YAML frontmatter"):
+        _parse_skill(skill_md)
+
+
+def test_parse_skill_colon_recovery_folds_wrapped_prose(
+    tmp_path: Path,
+) -> None:
+    """
+    A wrapped description recovers, and later keys keep their own meaning.
+
+    The continuation line is prose, so it folds with a single space the way a
+    YAML plain scalar would; ``user-invocable`` is a sibling key rather than
+    part of the description and still parses as a boolean.
+    """
+    skill_dir = tmp_path / "wrapped"
+    skill_dir.mkdir()
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        "---\nname: wrapped\ndescription: Use when foo: bar\n"
+        "  and also when baz qux\nuser-invocable: false\n---\nContent."
+    )
+
+    skill = _parse_skill(skill_md)
+
+    assert skill.description == "Use when foo: bar and also when baz qux"
+    assert skill.user_invocable is False
 
 
 def test_parse_skill_invalid_yaml_frontmatter_in_bundle_raises(
@@ -771,6 +1204,41 @@ def test_discover_host_skills_skips_unreadable_skill_file(
     msg = skip_records[0].message
     assert str(bad_md) in msg
     assert "could not be read" in msg
+
+
+def _write_skill(skill_dir: Path, name: str) -> None:
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: {name}\ndescription: d\n---\nBody.")
+
+
+def test_discover_skills_in_namespace_directories(agent_dir: Path) -> None:
+    """
+    A folder under ``skills/`` without its own ``SKILL.md`` groups
+    skills one level deeper: ``skills/<ns>/<skill>/SKILL.md`` must be
+    discovered alongside flat ``skills/<skill>/SKILL.md`` entries.
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "flat", "flat")
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "rollback", "rollback")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["flat", "deploy", "rollback"]
+
+
+def test_discover_skills_namespace_depth_is_bounded(agent_dir: Path) -> None:
+    """
+    Namespace descent stops after one level and never enters dot-dirs,
+    so a cloned skill pack's ``.git`` tree or a deeply nested layout
+    cannot be walked (host skill dirs are user-managed).
+    """
+    skills = agent_dir / "skills"
+    _write_skill(skills / "ops" / "deploy", "deploy")
+    _write_skill(skills / "ops" / "too" / "deep", "deep")
+    _write_skill(skills / ".git" / "hidden", "hidden")
+    _write_skill(skills / ".direct-hidden", "direct-hidden")
+    _write_skill(skills / "ops" / ".nested-hidden", "nested-hidden")
+
+    assert [s.name for s in parse(agent_dir).skills] == ["deploy"]
 
 
 # ── top-level ``skills:`` field (host-skill filter) ──────────────
@@ -962,8 +1430,13 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """
-    Host skills whose frontmatter contains invalid YAML (e.g.
-    unquoted colons) are skipped gracefully.
+    Host skills whose frontmatter contains invalid YAML are skipped
+    gracefully.
+
+    Uses the flow-sequence case rather than an unquoted colon: prose colons
+    are recovered now (see
+    ``test_parse_skill_accepts_unquoted_colon_in_description``), so they no
+    longer exercise the skip path.
 
     :param tmp_path: Temporary directory for test fixtures.
     :param monkeypatch: Pytest monkeypatch for isolating ``Path.home()``.
@@ -978,9 +1451,8 @@ def test_discover_host_skills_skips_yaml_syntax_error(
     skills_dir = fake_home / ".claude" / "skills"
     broken = skills_dir / "broken-yaml"
     broken.mkdir(parents=True)
-    # Unquoted colon in description triggers yaml.scanner.ScannerError.
     (broken / "SKILL.md").write_text(
-        "---\nname: broken-yaml\ndescription: TRIGGER when: code imports foo\n---\nContent."
+        f"---\nname: broken-yaml\ndescription: x\n{_UPSTREAM_BAD_ARGUMENT_HINT}\n---\nContent."
     )
 
     agent_root = tmp_path / "project"
@@ -1456,6 +1928,27 @@ def test_parse_inline_mcp_headers_and_env_expanded(
     assert stdio_srv.env == {"MY_KEY": "val-456"}
 
 
+def test_parse_inline_mcp_url_expanded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inline ``type: mcp`` entries expand ``${VAR}`` in ``url``, same
+    as the directory-config path."""
+    monkeypatch.setenv("MCP_HOST", "internal.example.com")
+    config = {
+        "spec_version": 1,
+        "name": "inline-url-expand",
+        "tools": {
+            "svc": {
+                "type": "mcp",
+                "url": "https://${MCP_HOST}/mcp",
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    http_srv = next(s for s in spec.mcp_servers if s.name == "svc")
+    assert http_srv.url == "https://internal.example.com/mcp"
+
+
 def test_parse_inline_mcp_rejects_non_dict_headers(tmp_path: Path) -> None:
     """
     Non-dict ``headers`` on an inline MCP entry raises
@@ -1699,6 +2192,69 @@ def test_parse_os_env_with_sandbox(tmp_path: Path) -> None:
     assert sandbox.allow_network is False
 
 
+def test_parse_os_env_sandbox_auto_uses_platform_default(tmp_path: Path) -> None:
+    """``sandbox.type: auto`` explicitly selects the platform default."""
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    config = {
+        "spec_version": 1,
+        "name": "auto-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "auto", "write_paths": ["."]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == _default_sandbox_for_platform().type
+    assert spec.os_env.sandbox.write_paths == ["."]
+
+
+def test_parse_os_env_sandbox_omitted_type_uses_platform_default(tmp_path: Path) -> None:
+    """An omitted ``sandbox.type`` selects the platform default."""
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
+    config = {
+        "spec_version": 1,
+        "name": "default-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"write_paths": ["."]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == _default_sandbox_for_platform().type
+    assert spec.os_env.sandbox.write_paths == ["."]
+
+
+def test_parse_os_env_sandbox_null_type_disables_sandbox(tmp_path: Path) -> None:
+    """``sandbox.type: null`` explicitly disables sandboxing."""
+    config = {
+        "spec_version": 1,
+        "name": "null-sandbox",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": None},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.type == "none"
+
+
 def test_parse_os_env_non_mapping_raises(tmp_path: Path) -> None:
     """A scalar/list under ``os_env:`` raises OmnigentError —
     fail loud rather than silently dropping the malformed block.
@@ -1752,6 +2308,25 @@ def test_parse_os_env_sandbox_with_cwd_allow_hidden(tmp_path: Path) -> None:
     assert spec.os_env is not None
     assert spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_allow_hidden == [".venv", ".cache"]
+
+
+def test_parse_os_env_sandbox_cwd_allow_hidden_wildcard(tmp_path: Path) -> None:
+    """The explicit wildcard survives parsing for trusted workspaces."""
+    config = {
+        "spec_version": 1,
+        "name": "allow-all-hidden",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {"type": "linux_bwrap", "cwd_allow_hidden": ["*"]},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(tmp_path)
+
+    assert spec.os_env is not None
+    assert spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_allow_hidden == ["*"]
 
 
 def test_parse_os_env_sandbox_cwd_allow_hidden_empty_list_preserved(
@@ -1842,6 +2417,86 @@ def test_parse_os_env_sandbox_cwd_hidden_scan_defaults(tmp_path: Path) -> None:
     assert spec.os_env is not None and spec.os_env.sandbox is not None
     assert spec.os_env.sandbox.cwd_hidden_scan_max_entries == 50000
     assert spec.os_env.sandbox.cwd_hidden_scan_overflow == "warn"
+    assert spec.os_env.sandbox.cwd_hidden_scan_recursive is False
+    assert spec.os_env.sandbox.mask_paths is None
+
+
+def test_parse_os_env_sandbox_mask_and_recursive_explicit_values(tmp_path: Path) -> None:
+    """
+    Explicit ``cwd_hidden_scan_recursive`` + ``mask_paths`` values
+    pass through to the spec unchanged.
+    """
+    config = {
+        "spec_version": 1,
+        "name": "tuned-mask",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_hidden_scan_recursive": True,
+                "mask_paths": ["config/production.key", "~/secrets"],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.os_env is not None and spec.os_env.sandbox is not None
+    assert spec.os_env.sandbox.cwd_hidden_scan_recursive is True
+    assert spec.os_env.sandbox.mask_paths == ["config/production.key", "~/secrets"]
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ["yes", 1, ["true"]],
+    ids=["string", "int", "list"],
+)
+def test_parse_os_env_sandbox_cwd_hidden_scan_recursive_validation(
+    tmp_path: Path, bad_value: object
+) -> None:
+    """Non-boolean ``cwd_hidden_scan_recursive`` fails at parse time."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-recursive",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "cwd_hidden_scan_recursive": bad_value,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"must be a boolean"):
+        parse(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "bad_value,match_regex",
+    [
+        ("not-a-list", r"must be a list"),
+        ([123], r"entries must be strings"),
+        ([""], r"must not be empty strings"),
+    ],
+    ids=["not_list", "non_string_entry", "empty_entry"],
+)
+def test_parse_os_env_sandbox_mask_paths_validation(
+    tmp_path: Path, bad_value: object, match_regex: str
+) -> None:
+    """``mask_paths`` must be a list of non-empty strings."""
+    config = {
+        "spec_version": 1,
+        "name": "bad-mask",
+        "os_env": {
+            "type": "caller_process",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "mask_paths": bad_value,
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match_regex):
+        parse(tmp_path)
 
 
 def test_parse_os_env_sandbox_cwd_hidden_scan_explicit_values(tmp_path: Path) -> None:
@@ -1999,6 +2654,48 @@ def test_mcp_headers_expanded_from_environment(
     assert spec.mcp_servers[0].headers == {
         "Authorization": "Bearer key-abc",
     }
+
+
+def test_mcp_url_expanded_from_environment(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``${VAR}`` references in the MCP ``url`` field are expanded at
+    parse time, same as ``headers`` — this is what lets a directory
+    MCP config be committed to version control without hardcoding
+    the endpoint.
+    """
+    monkeypatch.setenv("MCP_HOST", "internal.example.com")
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "templated-url",
+        "transport": "http",
+        "url": "https://${MCP_HOST}/mcp",
+    }
+    (mcp_dir / "templated.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    assert spec.mcp_servers[0].url == "https://internal.example.com/mcp"
+
+
+def test_mcp_url_unresolved_var_raises(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresolved ``${VAR}`` in ``url`` raises rather than connecting
+    to a literal placeholder string."""
+    monkeypatch.delenv("MISSING_HOST", raising=False)
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "bad-url",
+        "transport": "http",
+        "url": "https://${MISSING_HOST}/mcp",
+    }
+    (mcp_dir / "bad.yaml").write_text(yaml.dump(mcp_config))
+    with pytest.raises(OmnigentError, match=r"Unresolved environment variable"):
+        parse(agent_dir)
 
 
 def test_mcp_env_expansion_mixed_set_and_unset_raises(
@@ -2634,6 +3331,87 @@ def test_parse_mcp_http_rejects_stdio_fields(agent_dir: Path) -> None:
         )
     )
     with pytest.raises(OmnigentError, match=r"wrong-transport field"):
+        parse(agent_dir)
+
+
+def test_parse_mcp_stdio_tools_whitelist(agent_dir: Path) -> None:
+    """A per-server ``tools:`` whitelist on a sidecar stdio MCP propagates to
+    ``MCPServerConfig.tools`` (regression: the sidecar parsers dropped the
+    key entirely, so a restrictive allow-list in ``tools/mcp/*.yaml`` was a
+    silent no-op — the agent got every tool despite the YAML on disk saying
+    otherwise. Same allow-list, same bug class as the inline form fixed in
+    ``test_parse_inline_mcp_tools_whitelist``.)
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "github",
+        "transport": "stdio",
+        "command": "npx",
+        "tools": ["search_issues", "get_pull_request"],
+    }
+    (mcp_dir / "github.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    mcp = spec.mcp_servers[0]
+    assert mcp.tools == ["search_issues", "get_pull_request"]
+
+
+def test_parse_mcp_http_tools_whitelist(agent_dir: Path) -> None:
+    """Same regression as ``test_parse_mcp_stdio_tools_whitelist``, for the
+    sidecar HTTP transport.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "docs",
+        "transport": "http",
+        "url": "https://mcp.example.com/sse",
+        "tools": ["search_docs"],
+    }
+    (mcp_dir / "docs.yaml").write_text(yaml.dump(mcp_config))
+    spec = parse(agent_dir)
+    mcp = spec.mcp_servers[0]
+    assert mcp.tools == ["search_docs"]
+
+
+def test_parse_mcp_sidecar_tools_absent_is_none(agent_dir: Path) -> None:
+    """Omitting ``tools:`` on a sidecar MCP leaves the allow-list as ``None``
+    (expose all) — mirrors ``test_parse_inline_mcp_tools_absent_is_none``.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "github.yaml").write_text(
+        yaml.dump({"name": "github", "transport": "stdio", "command": "npx"})
+    )
+    mcp = parse(agent_dir).mcp_servers[0]
+    assert mcp.tools is None
+
+
+def test_parse_mcp_sidecar_tools_non_list_raises(agent_dir: Path) -> None:
+    """A non-list ``tools:`` value on a sidecar MCP is a clear error, not a
+    silent type bug — mirrors ``test_parse_inline_mcp_tools_non_list_raises``.
+
+    :param agent_dir: Temporary agent directory fixture.
+    """
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "github.yaml").write_text(
+        yaml.dump(
+            {
+                "name": "github",
+                "transport": "stdio",
+                "command": "npx",
+                "tools": "search_issues",
+            }
+        )
+    )
+    with pytest.raises(OmnigentError, match=r"'tools' must be a list"):
         parse(agent_dir)
 
 
@@ -3563,7 +4341,7 @@ def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path)
                     "source": {"env": "X", "file": "/tmp/s"},
                 }
             ],
-            r"exactly one of 'env', 'file', or 'command'",
+            r"exactly one of 'env', 'file', 'command', or 'unix_socket'",
         ),
         # Malformed ``env`` injection-shim name.
         (
@@ -3773,3 +4551,86 @@ def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
     # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
     assert yaml.load("on", loader) == "on"
     assert yaml.load("false", loader) is False
+
+
+# ── Sub-agent bundle provenance (``source_rel_dir``) ──────────
+
+
+def _write_agent(directory: Path, name: str) -> Path:
+    """Create a minimal agent bundle at *directory* named *name*."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.yaml").write_text(yaml.dump({"spec_version": 1, "name": name}))
+    return directory
+
+
+def test_sub_agent_source_rel_dir_stamped_at_each_depth(tmp_path: Path) -> None:
+    """Every parsed sub-agent records the directory it came from.
+
+    The child's skills and local tools live under
+    ``<parent bundle>/agents/<dir>``; without this stamp the runner has
+    no way to walk down to them and falls back to the parent's bundle
+    root, exposing the parent's assets to the child.
+    """
+    root = _write_agent(tmp_path / "root", "root")
+    manager = _write_agent(root / "agents" / "manager", "manager")
+    _write_agent(manager / "agents" / "researcher", "researcher")
+
+    spec = parse(root)
+
+    assert spec.source_rel_dir is None  # root has no parent bundle
+    (child,) = spec.sub_agents
+    assert child.source_rel_dir == "manager"
+    (grandchild,) = child.sub_agents
+    assert grandchild.source_rel_dir == "researcher"
+
+
+def test_sub_agent_source_rel_dir_uses_directory_not_yaml_name(tmp_path: Path) -> None:
+    """The stamp is the directory name even when the YAML name differs.
+
+    Using the YAML ``name`` would build a path that does not exist on
+    disk, so the workdir gate would reject it and the child would
+    silently inherit the parent's bundle root again.
+    """
+    root = _write_agent(tmp_path / "root", "root")
+    _write_agent(root / "agents" / "web-researcher", "Deep Researcher")
+
+    spec = parse(root)
+
+    (child,) = spec.sub_agents
+    assert child.name == "Deep Researcher"
+    assert child.source_rel_dir == "web-researcher"
+
+
+def test_parse_executor_reasoning_effort(tmp_path: Path) -> None:
+    """``executor.reasoning_effort`` is lifted onto the concrete field.
+
+    It sits beside ``executor.model`` in the YAML because it is the same
+    kind of setting — a harness-level default for the agent — and a spec
+    that declares one must not have it silently dropped the way a stray
+    key under ``executor.config`` would be.
+    """
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "model": "claude-opus-5",
+            "reasoning_effort": "high",
+            "config": {"harness": "claude-native"},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.reasoning_effort == "high"
+    assert spec.executor.model == "claude-opus-5"
+    # It is a concrete field, not smuggled into the free-form config bag.
+    assert "reasoning_effort" not in spec.executor.config
+
+
+def test_parse_executor_reasoning_effort_absent(tmp_path: Path) -> None:
+    """A spec that declares no effort leaves the field ``None``."""
+    config = {"spec_version": 1, "executor": {"type": "omnigent"}}
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.reasoning_effort is None

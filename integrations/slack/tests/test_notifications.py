@@ -38,3 +38,35 @@ def test_format_policy_denied() -> None:
     text = format_policy_denied("No shell commands allowed.")
     assert "Blocked by policy" in text
     assert "No shell commands allowed." in text
+
+
+def test_session_web_link_plain_server() -> None:
+    """A plain server URL links straight to its /c/<id> conversation route."""
+    import logging
+
+    from omnigent_slack.notifications import SlackNotifier
+
+    notifier = SlackNotifier(server_url="http://localhost:6767/", logger=logging.getLogger("test"))
+    assert notifier._session_web_link("conv_abc") == "http://localhost:6767/c/conv_abc"
+
+
+def test_session_web_link_maps_workspace_api_mount_to_ui() -> None:
+    """A workspace-hosted API mount links to the /omnigent web UI, keeping ?o=.
+
+    The bot is configured with the API proxy mount
+    (``https://<ws>/api/2.0/omnigent``), but that mount answers JSON — the
+    conversation page lives on the workspace SPA mount. The ``?o=<org>``
+    selector must survive so multi-workspace hosts open the right workspace.
+    """
+    import logging
+
+    from omnigent_slack.notifications import SlackNotifier
+
+    notifier = SlackNotifier(
+        server_url="https://ws.databricks.com/api/2.0/omnigent?o=123",
+        logger=logging.getLogger("test"),
+    )
+    assert (
+        notifier._session_web_link("conv_abc")
+        == "https://ws.databricks.com/omnigent/c/conv_abc?o=123"
+    )

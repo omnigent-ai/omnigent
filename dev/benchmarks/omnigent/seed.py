@@ -341,7 +341,7 @@ def _seed_via_store(
     # see them. Created before the sessions so membership can be set inline.
     projects_store = SqlAlchemyProjectStore(conv.storage_location)
     for project_id, name in project_specs:
-        projects_store.create(project_id, name, owner_user_id=_PROJECT_OWNER)
+        projects_store.create(project_id, name, user_id=_PROJECT_OWNER)
 
     last_sid = ""
     for s in range(sessions):
@@ -459,7 +459,7 @@ def _seed_via_core(
                     "name": _AGENT_NAME,
                     "bundle_location": _AGENT_BUNDLE,
                     "version": 1,
-                    "kind": encode_agent_kind("session"),
+                    "kind": encode_agent_kind("user"),
                     "description": None,
                     "updated_at": None,
                 }
@@ -569,7 +569,7 @@ def _seed_via_core(
                         "workspace_id": ws,
                         "id": project_id,
                         "name": name,
-                        "owner_user_id": _PROJECT_OWNER,
+                        "user_id": _PROJECT_OWNER,
                         "created_at": project_now,
                         "updated_at": None,
                     }

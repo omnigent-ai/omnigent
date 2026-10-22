@@ -11,6 +11,7 @@ Usage in a policy callable::
 
     from omnigent.policies.schema import PolicyEvent, PolicyResponse
 
+
     def my_policy(event: PolicyEvent) -> PolicyResponse | None:
         if event["type"] != "tool_call":
             return None  # abstain
@@ -28,14 +29,15 @@ Two-argument form (with config)::
 Factory form (with ``factory_params``)::
 
     def create_policy(limit: int = 10) -> PolicyCallable:
-        def evaluate(event: PolicyEvent) -> PolicyResponse | None:
-            ...
+        def evaluate(event: PolicyEvent) -> PolicyResponse | None: ...
+
         return evaluate
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, cast
 
 if TYPE_CHECKING:
     from omnigent.policies.types import PolicyLLMClient
@@ -97,6 +99,15 @@ USER_DAILY_ASK_APPROVED_STATE_KEY = "_policy_user_daily_ask_approved_usd"
 # (emits it) and the engine (routes + seeds it).
 SESSION_COST_ASK_APPROVED_STATE_KEY = "_policy_cost_ask_approved_usd"
 
+# Reserved ``state_updates`` key the per-user period cost-budget policy emits
+# on an ASK to record the highest soft checkpoint approved for a period.
+# Routed by :class:`PolicyEngine.apply_state_updates` to
+# ``user_period_cost.ask_approved_usd`` (per user+period) instead of
+# the per-conversation ``session_state``. Shared by the policy (emits it) and
+# the engine (intercepts it) so a period approval persists across the user's
+# sessions, not just the one conversation.
+USER_PERIOD_ASK_APPROVED_STATE_KEY = "_policy_user_period_ask_approved_usd"
+
 # Reserved ``state_updates`` key the cost-budget policy emits when the user
 # approves continuing despite an unpriced model. Like
 # ``SESSION_COST_ASK_APPROVED_STATE_KEY``, routed to the ROOT conversation so
@@ -105,30 +116,57 @@ SESSION_COST_ASK_APPROVED_STATE_KEY = "_policy_cost_ask_approved_usd"
 SESSION_COST_UNPRICED_APPROVED_KEY = "_policy_cost_unpriced_approved"
 
 
+AUTOMATIC_RUNTIME_STATE_KEYS = frozenset(
+    {
+        "_policy_spawn_bounds_dispatches",
+        "_policy_tool_call_count",
+        "_policy_loop_recent_hashes",
+    }
+)
+
+
+def is_reserved_state_key(key: str) -> bool:
+    """Approval checkpoints require an explicit human approval before writing."""
+    return key.startswith("_policy_") or key in {
+        "subagent_cost_ask_approved_usd",
+        "subagent_cost_over_budget_approved_usd",
+    }
+
+
 class UserDailyCostContext(TypedDict, total=False):
     """The session owner's per-UTC-day LLM cost rollup.
 
-    Injected into the event context only when a policy needs it (the
-    per-user daily cost-budget policy is configured); absent / empty
-    otherwise. Read via ``event["context"]["user_daily_cost"]``.
+    Injected into the event context when a policy needs it (the per-user
+    daily cost-budget policy or period cost-budget policy is configured);
+    absent / empty otherwise. For daily budgets, read via
+    ``event["context"]["user_daily_cost"]``. For period budgets, read via
+    ``event["context"]["user_period_cost"]`` as a list of daily records.
 
     :param cost_usd: The session owner's accumulated LLM spend (USD)
-        for the current UTC day, as of this turn's start, e.g.
-        ``0.18``. ``0.0`` when nothing recorded yet / pricing
-        unavailable.
+        for this UTC day, as of this turn's start, e.g. ``0.18``. ``0.0``
+        when nothing recorded yet / pricing unavailable.
     :param ask_approved_usd: Highest soft warning checkpoint (USD) the
-        owner has already approved continuing past today, so an
+        owner has already approved continuing past this day, so an
         approved checkpoint does not re-prompt across the owner's
         sessions. ``0.0`` when none approved.
     :param user_id: The session owner the rollup belongs to, e.g.
         ``"alice@example.com"`` — surfaced so the budget policy can name
         whose spend tripped the gate. Absent in single-user mode (no
         owner grant), where messages fall back to an un-named phrasing.
+    :param day_utc: The UTC calendar day this record represents, as
+        ``"YYYY-MM-DD"``, e.g. ``"2026-08-25"``. Present when this record
+        is part of a period cost list.
+    :param harness: The harness this record is scoped to, e.g.
+        ``"codex-native"``, when the policy is configured for per-harness
+        budgets. ``None`` when the policy uses cross-harness budgets
+        (summing across all harnesses). Present when this record is part
+        of a period cost list.
     """
 
     cost_usd: float
     ask_approved_usd: float
     user_id: str
+    day_utc: str
 
 
 class EventContext(TypedDict, total=False):
@@ -136,10 +174,15 @@ class EventContext(TypedDict, total=False):
 
     :param actor: The identity of the user driving the session.
     :param usage: Cumulative LLM token usage for the session.
-    :param user_daily_cost: The session owner's per-UTC-day cost
-        rollup (``cost_usd`` / ``ask_approved_usd``). Present only when
-        the per-user daily cost-budget policy is configured; read via
-        ``event["context"]["user_daily_cost"]``.
+    :param subtree_usage: Cumulative LLM usage for this conversation and
+        its descendants. Present when subagent cost enforcement is enabled.
+    :param user_daily_cost: List of the session owner's daily cost records.
+        Each record contains ``cost_usd``, ``ask_approved_usd``, ``day_utc``,
+        and ``user_id``. For daily budgets, this contains a single record
+        (today). For period budgets (week/month/quarter/year), this contains
+        all daily records in the period, which the policy aggregates to
+        compute the period total. Present only when a cost-budget policy is
+        configured; read via ``event["context"]["user_daily_cost"]``.
     :param model: The model the session is currently using —
         the conversation's ``model_override`` when set (e.g. via a
         mid-session ``/model`` change), else the agent spec's
@@ -158,11 +201,25 @@ class EventContext(TypedDict, total=False):
         labels, e.g. ``{"cost_control.plan": "{...}"}``. Populated by
         the server-side engine; empty on paths that don't carry labels
         (the runner-local gate). Read via ``event["context"]["labels"]``.
+    :param conversation_id: The conversation this event belongs to.
+        Injected by the engine, which already owns this identity.
+        Read via ``event["context"]["conversation_id"]``.
+    :param conversation_title: The conversation's readable title
+        (``Conversation.title``). ``None`` when the conversation has no
+        title yet. Read via ``event["context"]["conversation_title"]``.
+    :param turn_final: On ``RESPONSE``, the runner relay sets ``True`` for
+        the final text segment of a successful turn and ``False`` for
+        intermediate segments or failed, cancelled, and incomplete turns.
+        ``None`` on other phases and paths that don't distinguish; response
+        policies should skip only explicit ``False`` to preserve those
+        callers. The relay skips empty and whitespace-only segments.
+        Read via ``event["context"]["turn_final"]``.
     """
 
     actor: ActorContext
     usage: UsageContext
-    user_daily_cost: UserDailyCostContext
+    subtree_usage: UsageContext
+    user_daily_cost: list[UserDailyCostContext]
     # ``str | None`` (not ``str``): the value is ``ctx.model``, which is
     # ``None`` when the engine could not determine a model — the dict carries
     # ``None``, it is not merely absent. Cost policies treat ``None`` as an
@@ -170,6 +227,15 @@ class EventContext(TypedDict, total=False):
     model: str | None
     harness: str | None
     labels: dict[str, str]
+    # ``str | None``: the value is ``ctx.conversation_id``, injected by the
+    # engine. ``None`` only in contexts with no engine.
+    conversation_id: str | None
+    # ``str | None``: the value is ``ctx.conversation_title``, ``None`` when
+    # the conversation has no title yet.
+    conversation_title: str | None
+    # RESPONSE policies skip only explicit False for completion actions;
+    # None preserves callers that do not distinguish segments.
+    turn_final: bool | None
 
 
 class PolicyEvent(TypedDict, total=False):
@@ -178,12 +244,13 @@ class PolicyEvent(TypedDict, total=False):
     Shape varies by ``type``:
 
     - ``"request"``: ``data`` is ``{"user_content": <str>,
-      "attachments": [{"filename", "content_type", "text"}, ...]}``
-      — the user's typed message plus the decoded text of any
-      uploaded text attachments (e.g. a CSV). Read it with
-      :func:`request_user_text` / :func:`request_attachments`
-      rather than assuming a bare string; those helpers also accept
-      a plain string for backward compatibility.
+      "attachments": [{"filename", "content_type", "text"}, ...]}``:
+      the user's typed message plus text attachments and files requiring
+      filesystem tools. Text files carry their decoded content; archives,
+      Office documents, and databases carry empty ``text`` so a policy can
+      inspect their names and types. Read it with :func:`request_user_text` /
+      :func:`request_attachments` rather than assuming a bare string;
+      those helpers also accept a plain string for backward compatibility.
     - ``"tool_call"``: ``data`` is ``{"name": "<tool-name>",
       "arguments": {...}}``. ``target`` is the tool name.
     - ``"tool_result"``: ``data`` is ``{"result": <tool-output>}``.
@@ -231,11 +298,11 @@ class PolicyEvent(TypedDict, total=False):
         "llm_response",
     ]
     target: str | None
-    data: Any
+    data: object
     context: EventContext
-    session_state: dict[str, Any]
+    session_state: dict[str, object]
     llm_client: PolicyLLMClient | None
-    request_data: Any
+    request_data: object
 
 
 # ── Response (output from callable) ──────────────────────────────────────────
@@ -254,7 +321,7 @@ class StateUpdateEntry(TypedDict, total=False):
 
     key: str
     action: Literal["set", "increment", "delete", "append"]
-    value: Any
+    value: object
 
 
 class PolicyResponse(TypedDict, total=False):
@@ -299,12 +366,14 @@ class PolicyResponse(TypedDict, total=False):
 
     result: Literal["ALLOW", "DENY", "ASK"]
     reason: str
-    data: Any
+    data: object
     state_updates: list[StateUpdateEntry]
     set_labels: dict[str, str]
 
 
 # ── Callable protocol ────────────────────────────────────────────────────────
+
+_PolicyCallableReturn: TypeAlias = PolicyResponse | Awaitable[PolicyResponse | None] | None
 
 
 class PolicyCallable(Protocol):
@@ -322,7 +391,8 @@ class PolicyCallable(Protocol):
             return {"result": "ALLOW"}
     """
 
-    def __call__(self, event: PolicyEvent) -> PolicyResponse | None: ...
+    def __call__(self, event: PolicyEvent) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 class PolicyCallableWithConfig(Protocol):
@@ -341,13 +411,14 @@ class PolicyCallableWithConfig(Protocol):
             ...
     """
 
-    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> PolicyResponse | None: ...
+    def __call__(self, event: PolicyEvent, config: dict[str, str]) -> _PolicyCallableReturn:
+        raise NotImplementedError
 
 
 # ── REQUEST-phase data helpers ───────────────────────────────────────────────
 
 
-def request_user_text(data: Any) -> str:
+def request_user_text(data: object) -> str:
     """Extract the user's typed text from a REQUEST-phase ``event["data"]``.
 
     Request ``data`` is a dict ``{"user_content", "attachments"}`` from the
@@ -374,7 +445,7 @@ def request_user_text(data: Any) -> str:
     return ""
 
 
-def request_attachments(data: Any) -> list[dict[str, Any]]:
+def request_attachments(data: object) -> list[dict[str, object]]:
     """Return the text attachments on a REQUEST-phase ``event["data"]``.
 
     Each entry is ``{"filename", "content_type", "text"}`` — the decoded text of
@@ -387,12 +458,17 @@ def request_attachments(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, dict):
         attachments = data.get("attachments")
         if isinstance(attachments, list):
-            return [att for att in attachments if isinstance(att, dict)]
+            return [
+                cast("dict[str, object]", attachment)
+                for attachment in attachments
+                if isinstance(attachment, dict)
+            ]
     return []
 
 
 __all__ = [
     "USER_DAILY_ASK_APPROVED_STATE_KEY",
+    "USER_PERIOD_ASK_APPROVED_STATE_KEY",
     "ActorContext",
     "EventContext",
     "PolicyCallable",

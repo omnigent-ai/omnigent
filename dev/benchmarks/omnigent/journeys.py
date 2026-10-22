@@ -29,7 +29,8 @@ new-conversation cold path: it spawns a host daemon once, then per iteration
 creates a host-bound session (which fires ``host.launch_runner``), attaches the
 SSE stream, sends the first message, and times to the first output-text delta —
 so the span includes the on-demand runner launch + reverse-tunnel handshake the
-UI's first message races, exactly as a real new chat pays it.
+UI's first message races, exactly as a real new chat pays it. Each sample's
+runner is stopped off the clock before the next, so runners don't accumulate.
 
 ``session_cold_restart`` reuses one existing host-bound session. Before every
 timed message it stops that session's runner outside the measured span; the
@@ -44,15 +45,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, cast
 
 import httpx
 
-from .environment import BenchEnvironment, ServerRequestSnapshot
+from .environment import BenchEnvironment, GatedTurn, ServerRequestSnapshot
 from .measure import RunResult
+from .project_order import project_order_journeys
 
 # Per-journey context returned by ``setup`` and threaded to ``measure``. Its
 # concrete type varies by journey (an agent id, a session id, or nothing), so
@@ -82,6 +91,8 @@ class Journey:
     :param prepare: Optional coroutine run before every measured operation,
         outside that operation's latency timer. Used when each sample needs a
         repeatable precondition, such as an offline runner.
+    :param validate: Optional correctness check after each operation, excluded
+        from latency. Failures invalidate that sample, including the final one.
     :param teardown: Optional coroutine run once after timing, given ``ctx``.
     :param concurrency_safe: Whether many ``measure`` calls may run at once
         against a shared setup (true for read-only / independent-write HTTP
@@ -93,10 +104,13 @@ class Journey:
         (``BenchEnvironment(with_host=True)``) so a host-bound session-create
         or restart can fire ``host.launch_runner``. Implies ``needs_runner``.
     :param max_iterations: Upper bound on latency iterations for this journey,
-        clamping ``--iterations`` down (never up). Full-turn journeys cost ~1s+
-        per op, so 100+ iterations would blow the CI time budget; they cap at a
-        few samples per run and lean on ``--runs`` for repeats. ``None`` (HTTP
-        journeys) means no cap.
+        clamping ``--iterations`` down (never up). Runner journeys cap so the
+        suite fits the CI time budget; the slowest (cold starts, CLI startup)
+        take a few samples per run and lean on ``--runs`` for repeats. ``None``
+        (HTTP journeys) means no cap.
+    :param max_warmup: Upper bound on warmup operations, clamping ``--warmup``
+        down (never up). ``0`` skips warmup; ``None`` means no cap. Useful for
+        expensive journeys where repeated warmups warm nothing.
     :param description: Human-readable one-liner for ``--list``.
     """
 
@@ -105,11 +119,13 @@ class Journey:
     measure: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]]
     setup: Callable[[BenchEnvironment], Awaitable[JourneyContext]] | None = None
     prepare: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
+    validate: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     teardown: Callable[[BenchEnvironment, JourneyContext], Awaitable[None]] | None = None
     concurrency_safe: bool = False
     needs_runner: bool = False
     needs_host: bool = False
     max_iterations: int | None = None
+    max_warmup: int | None = None
     description: str = ""
 
     async def run_setup(self, env: BenchEnvironment) -> JourneyContext:
@@ -118,6 +134,10 @@ class Journey:
     async def run_prepare(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
         if self.prepare is not None:
             await self.prepare(env, ctx)
+
+    async def run_validate(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
+        if self.validate is not None:
+            await self.validate(env, ctx)
 
     async def run_teardown(self, env: BenchEnvironment, ctx: JourneyContext) -> None:
         if self.teardown is not None:
@@ -131,10 +151,13 @@ def _failure_reason(exc: Exception) -> str:
     """Classify an exception into a stable failure-breakdown label.
 
     HTTP status errors key off their status code (``"HTTP 500"``) so the same
-    server error groups across ops; anything else keys off its class name.
+    server error groups across ops; RuntimeErrors include the message so CI
+    failure breakdowns show the actual cause; anything else keys off class name.
     """
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, RuntimeError):
+        return f"RuntimeError: {exc}"
     return exc.__class__.__name__
 
 
@@ -210,10 +233,12 @@ async def _timed(
     start = time.perf_counter()
     try:
         await journey.measure(env, ctx)
+        latency_ms = (time.perf_counter() - start) * 1000
+        await journey.run_validate(env, ctx)
     except Exception as exc:  # noqa: BLE001 — any failure is a recorded data point
         result.record_failure(_failure_reason(exc))
     else:
-        result.latencies_ms.append((time.perf_counter() - start) * 1000)
+        result.latencies_ms.append(latency_ms)
 
 
 # ── runners ──────────────────────────────────────────────────
@@ -235,10 +260,14 @@ async def run_latency(
     except Exception as exc:  # noqa: BLE001 — a setup failure is a recorded data point
         return _setup_failed_result(exc)
     try:
-        for _ in range(warmup):
+        effective_warmup = (
+            warmup if journey.max_warmup is None else min(warmup, journey.max_warmup)
+        )
+        for _ in range(effective_warmup):
             with contextlib.suppress(Exception):  # warmup errors are non-fatal
                 await journey.run_prepare(env, ctx)
                 await journey.measure(env, ctx)
+                await journey.run_validate(env, ctx)
         result = RunResult()
         count_start = await _count_start(env)
         wall_start = time.perf_counter()
@@ -294,6 +323,7 @@ async def run_throughput(
                     with contextlib.suppress(Exception):  # warmup errors are non-fatal
                         await journey.run_prepare(env, ctx)
                         await journey.measure(env, ctx)
+                        await journey.run_validate(env, ctx)
 
         if warmup:
             throwaway = RunResult()
@@ -337,7 +367,7 @@ async def _setup_target_session(env: BenchEnvironment) -> str:
     the journey still exercises the read path.
     """
     assert env.client is not None
-    listing = await env.client.get("/v1/sessions", params={"limit": 1})
+    listing = await env.client.get("/v1/sessions", params={"limit": 1, "visibility": "all"})
     listing.raise_for_status()
     data = listing.json().get("data", [])
     if data:
@@ -352,14 +382,14 @@ async def _setup_target_session(env: BenchEnvironment) -> str:
 
 async def _measure_list_sessions(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     assert env.client is not None
-    resp = await env.client.get("/v1/sessions", params={"limit": 20})
+    resp = await env.client.get("/v1/sessions", params={"limit": 20, "visibility": "all"})
     resp.raise_for_status()
 
 
 async def _measure_search_sessions(env: BenchEnvironment, _ctx: JourneyContext) -> None:
     assert env.client is not None
     resp = await env.client.get(
-        "/v1/sessions", params={"limit": 20, "search_query": _SEARCH_TOKEN}
+        "/v1/sessions", params={"limit": 20, "search_query": _SEARCH_TOKEN, "visibility": "all"}
     )
     resp.raise_for_status()
 
@@ -436,7 +466,9 @@ async def _measure_list_projects(env: BenchEnvironment, _ctx: JourneyContext) ->
 async def _measure_list_project_sessions(env: BenchEnvironment, ctx: JourneyContext) -> None:
     assert env.client is not None
     project = cast(str, ctx)  # _setup_project_name
-    resp = await env.client.get("/v1/sessions", params={"limit": 20, "project": project})
+    resp = await env.client.get(
+        "/v1/sessions", params={"limit": 20, "project": project, "visibility": "all"}
+    )
     resp.raise_for_status()
 
 
@@ -511,12 +543,17 @@ async def _measure_add_comment(env: BenchEnvironment, ctx: JourneyContext) -> No
 _TURN_REPLY = "Hello there, this is a mock benchmark reply."
 _TURN_PROMPT = "Say hello."
 
-# Iteration cap for full-turn journeys. At ~1s+ per turn, matching the HTTP
-# journeys' iteration count would overrun the CI time budget, so we take a few
-# samples per run and lean on --runs for repeats. Sessions accumulate across a
-# run (a cold start never deletes its session), so a small count also keeps that
-# drift negligible.
-_RUNNER_MAX_ITERATIONS = 5
+# Warm turns are cheap (~0.1–0.5s on CI) but each turn's LLM request grows with
+# history, so rotate to a fresh warmed session every _TURN_SESSION_SAMPLES ops;
+# sparingly, since a fresh session costs ~4s (init, harness spawn, warm-up turn).
+_TURN_MAX_ITERATIONS = 50
+_TURN_SESSION_SAMPLES = 25
+
+# Cold start/restart launch a fresh runner every op, so one warmup absorbs the
+# first-launch costs and further warmups warm nothing. 1 + 14 bounds a run at
+# 15 host-launched runners.
+_COLD_MAX_WARMUP = 1
+_COLD_MAX_ITERATIONS = 14
 
 # Iteration cap for the runner filesystem read. It's a proxied localhost read,
 # not a full turn, so it's far cheaper than the drive-a-turn journeys — a higher
@@ -541,15 +578,39 @@ async def _setup_turn_agent(env: BenchEnvironment, *, stream: bool = False) -> s
     return await env.agent_id(name)
 
 
-async def _setup_cold_start_agent(env: BenchEnvironment) -> str:
-    """Register a streaming-reply agent for the cold-start journey; return its id.
+@dataclass
+class _ColdStartContext:
+    """The cold-start agent and the session whose runner the last sample launched.
+
+    :param agent_id: Agent each fresh session binds to.
+    :param session_id: Session created by the last sample, until its runner stops.
+    """
+
+    agent_id: str
+    session_id: str | None = None
+
+
+async def _setup_cold_start_agent(env: BenchEnvironment) -> JourneyContext:
+    """Register a streaming-reply agent for the cold-start journey.
 
     No session and no warm-up turn — the cold-start measure creates a fresh
     host-bound session each iteration. The reply streams deltas so the measured
     op can return on the first ``response.output_text.delta`` (the UI's
     first-token signal).
     """
-    return await _setup_turn_agent(env, stream=True)
+    return _ColdStartContext(await _setup_turn_agent(env, stream=True))
+
+
+async def _stop_cold_start_runner(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the runner the last cold-start sample launched, outside the timer.
+
+    Otherwise every sample of every run keeps a runner alive until the suite
+    ends, which runs a same-runner baseline-and-candidate job out of memory.
+    """
+    cold = cast(_ColdStartContext, ctx)  # _setup_cold_start_agent
+    session_id, cold.session_id = cold.session_id, None
+    if session_id is not None:
+        await env.stop_session_runner(session_id)
 
 
 async def _setup_cold_restart_session(env: BenchEnvironment) -> str:
@@ -578,38 +639,82 @@ async def _teardown_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> 
         await env.stop_session_runner(session_id)
 
 
-async def _setup_warm_session(env: BenchEnvironment) -> str:
+@dataclass
+class _TurnSession:
+    """A warm session for the turn journeys, rotated by :func:`_rotate_turn_session`.
+
+    :param agent_id: Agent each fresh session binds to.
+    :param session_id: The current session.
+    :param samples: Ops run on the current session so far.
+    :param gated: The interrupt journey's parked turn, between prepare and validate.
+    :param markers_before: Cancellation markers on the session before that turn.
+    """
+
+    agent_id: str
+    session_id: str
+    samples: int = 0
+    gated: GatedTurn | None = None
+    markers_before: int = 0
+
+
+async def _new_warm_session(env: BenchEnvironment, agent_id: str) -> str:
     """Create+bind a session and drive one warm-up turn; return the session id.
 
     The warm-up pays the cold-start cost (runner spawn + executor construction)
     so the measured op times only steady-state per-turn overhead.
     """
-    agent_id = await _setup_turn_agent(env)
     session_id = await env.create_bound_session(agent_id)
     await env.drive_turn(session_id, _TURN_PROMPT)
     return session_id
 
 
-async def _setup_streaming_session(env: BenchEnvironment) -> str:
+async def _setup_warm_session(env: BenchEnvironment) -> JourneyContext:
+    """Warm session for ``warm_turn``."""
+    agent_id = await _setup_turn_agent(env)
+    return _TurnSession(agent_id, await _new_warm_session(env, agent_id))
+
+
+async def _setup_streaming_session(env: BenchEnvironment) -> JourneyContext:
     """Warm session whose mock reply streams deltas — for the TTFT journey."""
     agent_id = await _setup_turn_agent(env, stream=True)
-    session_id = await env.create_bound_session(agent_id)
-    await env.drive_turn(session_id, _TURN_PROMPT)
-    return session_id
+    return _TurnSession(agent_id, await _new_warm_session(env, agent_id))
 
 
-async def _setup_interrupt_session(env: BenchEnvironment) -> str:
-    """Create+bind a session for the interrupt journey; return the session id.
+async def _rotate_turn_session(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Switch to a fresh warm session every ``_TURN_SESSION_SAMPLES`` ops."""
+    turns = cast(_TurnSession, ctx)
+    if turns.samples >= _TURN_SESSION_SAMPLES:
+        turns.session_id = await _new_warm_session(env, turns.agent_id)
+        turns.samples = 0
+    turns.samples += 1
 
-    Configures a ``block=True`` mock response so each turn parks in ``running``
-    until the gate is released — giving the interrupt something to cancel
-    mid-flight, deterministically.
-    """
-    name = await env.ensure_agent()
-    agent_id = await env.agent_id(name)
-    session_id = await env.create_bound_session(agent_id)
-    await env.configure_mock([{"text": _TURN_REPLY, "block": True}])
-    return session_id
+
+async def _prepare_interrupt(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Park a fresh turn on the mock's gate so the op times only the cancel."""
+    turns = cast(_TurnSession, ctx)
+    if turns.gated is not None:  # a failed op left its turn parked
+        await _finish_gated_turn(env, turns)
+        turns.samples = _TURN_SESSION_SAMPLES  # rotate, so its late marker can't count
+    await _rotate_turn_session(env, turns)
+    turns.markers_before = await env.cancellation_markers(turns.session_id)
+    turns.gated = await env.start_gated_turn(turns.session_id)
+
+
+async def _finish_gated_turn(env: BenchEnvironment, turns: _TurnSession) -> None:
+    gated, turns.gated = turns.gated, None
+    if gated is not None:
+        await env.finish_gated_turn(gated)
+
+
+async def _validate_interrupt(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Release the gate and require this turn's cancellation marker."""
+    turns = cast(_TurnSession, ctx)
+    await _finish_gated_turn(env, turns)
+    await env.wait_cancellation_markers(turns.session_id, turns.markers_before + 1)
+
+
+async def _teardown_interrupt(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    await _finish_gated_turn(env, cast(_TurnSession, ctx))
 
 
 async def _measure_session_cold_start(env: BenchEnvironment, ctx: JourneyContext) -> None:
@@ -627,17 +732,12 @@ async def _measure_session_cold_start(env: BenchEnvironment, ctx: JourneyContext
     connect + first-token pipeline.
 
     Each iteration is its own fresh session with its own host-launched runner.
-    The server never stops an external-host runner on idle (only on an explicit
-    stop/delete, neither of which the UI first-message path does), so each
-    iteration's runner stays connected until the daemon is SIGTERM'd at env
-    teardown, which reaps them together. That is bounded — ``_RUNNER_MAX_ITERATIONS``
-    (+ warmups) runners at most, all cleaned up at the end — so we deliberately
-    skip per-iteration teardown: stopping the runner would add a
-    stop-round-trip to a journey whose whole point is to time the fresh-launch
-    cost, and would not reflect what a real first message does.
+    The server never stops an external-host runner on idle, so ``prepare``
+    stops the previous sample's runner and ``teardown`` stops the last one,
+    both off the clock.
     """
-    agent_id = cast(str, ctx)  # _setup_turn_agent (stream=True)
-    await env.cold_start_first_delta(agent_id, _TURN_PROMPT)
+    cold = cast(_ColdStartContext, ctx)  # _setup_cold_start_agent
+    cold.session_id = await env.cold_start_first_delta(cold.agent_id, _TURN_PROMPT)
 
 
 async def _measure_session_cold_restart(env: BenchEnvironment, ctx: JourneyContext) -> None:
@@ -647,18 +747,17 @@ async def _measure_session_cold_restart(env: BenchEnvironment, ctx: JourneyConte
 
 
 async def _measure_warm_turn(env: BenchEnvironment, ctx: JourneyContext) -> None:
-    session_id = cast(str, ctx)  # _setup_warm_session
-    await env.drive_turn(session_id, _TURN_PROMPT)
+    await env.drive_turn(cast(_TurnSession, ctx).session_id, _TURN_PROMPT)
 
 
 async def _measure_time_to_first_token(env: BenchEnvironment, ctx: JourneyContext) -> None:
-    session_id = cast(str, ctx)  # _setup_warm_session
-    await env.time_to_first_delta(session_id, _TURN_PROMPT)
+    await env.time_to_first_delta(cast(_TurnSession, ctx).session_id, _TURN_PROMPT)
 
 
 async def _measure_interrupt(env: BenchEnvironment, ctx: JourneyContext) -> None:
-    session_id = cast(str, ctx)  # _setup_interrupt_session
-    await env.drive_and_interrupt(session_id)
+    gated = cast(_TurnSession, ctx).gated
+    assert gated is not None  # _prepare_interrupt
+    await env.interrupt_gated_turn(gated)
 
 
 async def _setup_runner_file_session(env: BenchEnvironment) -> str:
@@ -679,11 +778,334 @@ async def _measure_read_runner_file(env: BenchEnvironment, ctx: JourneyContext) 
     await env.read_runner_file(session_id, _RUNNER_FILE_PATH)
 
 
+# ── policy evaluate ──────────────────────────────────────────
+
+
+def _bench_policy_allow(_event: dict) -> dict:  # type: ignore[type-arg]
+    """Benchmark policy function: always ALLOW. Self-contained in this module."""
+    return {"result": "allow"}
+
+
+# Loaded only by the isolated benchmark server's policy_modules config.
+POLICY_REGISTRY = [
+    {
+        "handler": "dev.benchmarks.omnigent.journeys._bench_policy_allow",
+        "kind": "callable",
+        "name": "Benchmark allow",
+    }
+]
+
+
+_POLICY_EVALUATE_PAYLOAD = {
+    "event": {
+        "type": "PHASE_TOOL_CALL",
+        "data": {"name": "Bash", "arguments": {"command": "ls"}},
+    }
+}
+
+
+async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
+    """Create an agent-bound session with a declared policy and warm the caches.
+
+    The agent must declare at least one policy so ``any_policies_apply`` is
+    true and the full engine build (single tree scan + preloaded conversation)
+    runs on every evaluate call. A zero-policy spec short-circuits before the
+    build, which would measure the wrong path.
+
+    Two warm calls are made before returning so the agent-spec and
+    session-policy caches are populated; the measured iteration then reflects
+    steady-state overhead, not cold-cache cost.
+    """
+    assert env.client is not None
+    import io
+    import tarfile
+
+    import yaml
+
+    # Build a bundle like BenchEnvironment._agent_bundle but with a policy
+    # declared so any_policies_apply is true and the full engine runs.
+    executor: dict[str, object] = {
+        "type": "omnigent",
+        "model": env.model,
+        "config": {"harness": env.harness},
+    }
+    config: dict[str, object] = {
+        "spec_version": 1,
+        "name": "bench-policy-agent",
+        "prompt": "benchmark",
+        "executor": executor,
+        "guardrails": {
+            "policies": {
+                "allow_all": {
+                    "type": "function",
+                    "on": ["tool_call"],
+                    "function": "dev.benchmarks.omnigent.journeys._bench_policy_allow",
+                }
+            }
+        },
+    }
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        payload = yaml.safe_dump(config).encode()
+        info = tarfile.TarInfo("config.yaml")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    bundle = buf.getvalue()
+
+    # Register the agent + create a session in one call via the bundle upload
+    # path (``POST /v1/sessions`` multipart). ``/v1/agents`` is GET-only.
+    resp = await env.client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    # Bundle upload returns ``session_id`` (not ``id``).
+    session_id = body.get("session_id") or body["id"]
+
+    # Warm the spec + policy caches — the measured iteration is steady-state.
+    for _ in range(2):
+        await _measure_policy_evaluate(env, session_id)
+
+    return session_id
+
+
+async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    session_id = cast(str, ctx)  # _setup_policy_evaluate_session
+    assert env.client is not None
+    resp = await env.client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_POLICY_EVALUATE_PAYLOAD,
+    )
+    resp.raise_for_status()
+    if resp.json().get("result") != "POLICY_ACTION_ALLOW":
+        raise RuntimeError(f"Benchmark policy did not allow the tool call: {resp.text}")
+
+
+# ── CLI startup (omnigent polly against the local bench server) ──────────────
+
+# The REPL paints once the runner is online and bound: its toolbar reads
+# "<model> · ready", or, where the toolbar is suppressed, the "❯ " prompt shows.
+# The earlier "Launching your agent…" spinner precedes the runner launch.
+_CLI_STARTUP_READY_SIGNALS = [r"·\s*ready", r"❯ "]
+
+# Per-attempt timeout: daemon start + session + runner launch, ~4-7s on CI.
+_CLI_STARTUP_TIMEOUT_S = 60
+# Budget for teardown's `host stop --all` to drain the last session.
+_CLI_DRAIN_TIMEOUT_S = 60.0
+
+# Pre-set theme for the journey's fresh config home, so the first-run theme
+# picker doesn't stand in for the REPL.
+_CLI_STARTUP_CONFIG = "tui:\n  theme: light\n"
+
+# ~7s per attempt on CI (incl. the untimed `omnigent stop`); cap so a large
+# --iterations stays in budget.
+_CLI_STARTUP_MAX_ITERATIONS = 6
+
+
+async def _prepare_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Stop the journey's leftover CLI daemons before each timed iteration.
+
+    A leftover host daemon from the previous iteration causes the next
+    ``omnigent polly`` to fail with "runner tunnel rejection (HTTP 401)"
+    or "host is on another replica". Runs outside the latency timer. Only
+    daemons in the journey's own data dir are stopped: ``omnigent stop``
+    would also kill the bench's host daemon and any server on the default
+    local port, such as a developer's own.
+    """
+    del env
+    await _stop_cli_daemons(ctx, drain_sessions=False)
+
+
+async def _stop_cli_daemons(ctx: JourneyContext, *, drain_sessions: bool) -> None:
+    """Run ``omnigent host stop --all`` within the journey's own data dir.
+
+    :param drain_sessions: Stop each daemon's sessions first, so their runners
+        close their REPL terminals themselves before the daemon goes. If that
+        fails or times out, the daemons are still stopped without draining.
+    """
+    omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
+    if omnigent_bin is None:
+        return
+    args = [omnigent_bin, "host", "stop", "--all"]
+    if drain_sessions:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            drained = await asyncio.to_thread(
+                subprocess.run,
+                args,
+                env=_cli_env(ctx),
+                capture_output=True,
+                timeout=_CLI_DRAIN_TIMEOUT_S,
+                check=False,
+            )
+            if drained.returncode == 0:
+                return
+    await asyncio.to_thread(
+        subprocess.run,
+        [*args, "--daemon-only"],
+        env=_cli_env(ctx),
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+
+
+async def _setup_cli_startup(env: BenchEnvironment) -> JourneyContext:
+    """Give the CLI its own data and config dirs; return the per-run holder.
+
+    Sharing the bench's data dir, ``omnigent polly`` would reuse the bench host
+    daemon's registry record for the same server and wait for its own host id,
+    which that daemon never registers. The holder also carries the spawned CLI,
+    so closing it stays off the clock.
+    """
+    root = Path(tempfile.mkdtemp(prefix="cli-", dir=env.child_env()["TMPDIR"]))
+    config_home = root / "config"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(_CLI_STARTUP_CONFIG)
+    cli_env = {
+        **env.child_env(),
+        "OMNIGENT_DATA_DIR": str(root / "data"),
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+    }
+    return {"env": cli_env}
+
+
+def _cli_env(ctx: JourneyContext) -> dict[str, str]:
+    return cast(dict[str, dict[str, str]], ctx)["env"]
+
+
+async def _measure_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Time ``omnigent polly --server`` from invocation to REPL ready.
+
+    Spawns ``omnigent polly --server <local>`` via pexpect and times until the
+    REPL toolbar reports ``ready`` (or its prompt shows). Using polly (the bundled openai-agents
+    harness) avoids any external binary dependency while exercising the same
+    startup path as ``omnigent claude``: daemon start, session create, runner
+    launch, and runner connect.
+
+    Requires ``pexpect``. No external LLM binary needed. The live process is
+    left in *ctx* for :func:`_close_cli_startup`, so shutdown is not timed.
+
+    :param env: Benchmark environment — ``env.base_url`` is the local server URL.
+    :param ctx: Holder from :func:`_setup_cli_startup`.
+    :raises RuntimeError: On timeout or process exit before the ready signal.
+    """
+    try:
+        import pexpect
+    except ImportError as exc:
+        raise RuntimeError(
+            "pexpect is required for cli_startup. Install with: pip install pexpect"
+        ) from exc
+
+    omnigent_bin = os.environ.get("OMNIGENT_BIN") or shutil.which("omnigent")
+    if omnigent_bin is None:
+        raise RuntimeError("omnigent binary not found. Set OMNIGENT_BIN or add omnigent to PATH.")
+
+    child = pexpect.spawn(
+        omnigent_bin,
+        args=["polly", "--server", env.base_url],
+        timeout=_CLI_STARTUP_TIMEOUT_S,
+        encoding="utf-8",
+        codec_errors="ignore",
+        env=_cli_env(ctx),
+    )
+    try:
+        idx = child.expect([pexpect.TIMEOUT, pexpect.EOF, *_CLI_STARTUP_READY_SIGNALS])
+        if idx == 0:
+            raise RuntimeError(
+                f"Timed out after {_CLI_STARTUP_TIMEOUT_S}s waiting for the REPL "
+                f"({_CLI_STARTUP_READY_SIGNALS!r})"
+            )
+        if idx == 1:
+            output = (child.before or "").strip()
+            raise RuntimeError(
+                f"Process exited before the REPL was ready. Last output: {output[-200:]!r}"
+            )
+    except BaseException:
+        child.terminate(force=True)
+        raise
+    cast(dict[str, object], ctx)["child"] = child
+
+
+async def _close_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Kill the CLI the last sample started; the next ``prepare`` reaps its daemon."""
+    del env
+    child = cast(dict[str, object], ctx).pop("child", None)
+    if child is not None:
+        await asyncio.to_thread(child.terminate, True)  # type: ignore[attr-defined]
+
+
+async def _teardown_cli_startup(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Close a CLI left by an interrupted sample, then stop the last session and daemon.
+
+    Between samples the next CLI's daemon reaps the previous terminal; after the
+    last one nothing would, so its session is drained instead of just killed.
+    """
+    await _close_cli_startup(env, ctx)
+    await _stop_cli_daemons(ctx, drain_sessions=True)
+
+
+# ── native hook spawn (no server involved) ───────────────────
+
+# Claude Code blocks its TUI on command hooks, so one hook subprocess's whole
+# lifetime is user-visible latency: the MessageDisplay hook runs once per
+# streamed text chunk, and the same interpreter+import cost fronts every
+# statusline refresh and per-tool-call policy hook. Spawn the per-chunk hook
+# exactly as Claude Code does — isolated interpreter, module entrypoint, JSON
+# payload on stdin — and time the full process lifetime. The import-graph side
+# of this guarantee is pinned by
+# tests/harnesses/claude_native/test_claude_native_message_display_hook.
+_HOOK_SPAWN_PAYLOAD = json.dumps(
+    {
+        "hook_event_name": "MessageDisplay",
+        "message_id": "bench-message",
+        "index": 0,
+        "final": False,
+        "delta": "benchmark chunk",
+    }
+).encode()
+
+
+async def _setup_hook_spawn(env: BenchEnvironment) -> JourneyContext:
+    """A throwaway bridge dir for the hook's appended deltas file."""
+    del env
+    return tempfile.mkdtemp(prefix="omnigent-bench-hook-")
+
+
+async def _measure_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Spawn the MessageDisplay hook once, as Claude Code does, and wait."""
+    del env
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.message_display_hook",
+        "--bridge-dir",
+        str(ctx),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate(_HOOK_SPAWN_PAYLOAD)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"hook exited {proc.returncode}: {stderr.decode('utf-8', 'replace')[:200]}"
+        )
+
+
+async def _teardown_hook_spawn(env: BenchEnvironment, ctx: JourneyContext) -> None:
+    """Remove the throwaway bridge dir."""
+    del env
+    shutil.rmtree(str(ctx), ignore_errors=True)
+
+
 # ── registry ─────────────────────────────────────────────────
 
 ALL_JOURNEYS: dict[str, Journey] = {
     j.name: j
     for j in (
+        *project_order_journeys(),
         Journey(
             name="list_sessions",
             kind="latency",
@@ -754,15 +1176,27 @@ ALL_JOURNEYS: dict[str, Journey] = {
             concurrency_safe=True,
             description="POST /v1/sessions/{id}/comments — create a review comment.",
         ),
+        Journey(
+            name="policy_evaluate",
+            kind="latency",
+            measure=_measure_policy_evaluate,
+            setup=_setup_policy_evaluate_session,
+            concurrency_safe=True,
+            description="POST /v1/sessions/{id}/policies/evaluate — PreToolUse hook "
+            "(single tree scan, preloaded conversation row, caches warm).",
+        ),
         # Runner (full-turn) journeys — with_runner=True, openai-agents, mock LLM.
         Journey(
             name="session_cold_start",
             kind="latency",
             measure=_measure_session_cold_start,
             setup=_setup_cold_start_agent,
+            prepare=_stop_cold_start_runner,
+            teardown=_stop_cold_start_runner,
             needs_runner=True,
             needs_host=True,
-            max_iterations=_RUNNER_MAX_ITERATIONS,
+            max_iterations=_COLD_MAX_ITERATIONS,
+            max_warmup=_COLD_MAX_WARMUP,
             description="Create a host-bound session (fires host.launch_runner) then "
             "time create → attach SSE → send → first token — the real UI cold path.",
         ),
@@ -775,7 +1209,8 @@ ALL_JOURNEYS: dict[str, Journey] = {
             teardown=_teardown_cold_restart,
             needs_runner=True,
             needs_host=True,
-            max_iterations=_RUNNER_MAX_ITERATIONS,
+            max_iterations=_COLD_MAX_ITERATIONS,
+            max_warmup=_COLD_MAX_WARMUP,
             description="Stop the runner for an existing host-bound session, then time "
             "POST message → automatic runner relaunch → first token.",
         ),
@@ -784,8 +1219,9 @@ ALL_JOURNEYS: dict[str, Journey] = {
             kind="latency",
             measure=_measure_warm_turn,
             setup=_setup_warm_session,
+            prepare=_rotate_turn_session,
             needs_runner=True,
-            max_iterations=_RUNNER_MAX_ITERATIONS,
+            max_iterations=_TURN_MAX_ITERATIONS,
             description="Drive a turn on an already-warm session (steady-state overhead).",
         ),
         Journey(
@@ -793,18 +1229,22 @@ ALL_JOURNEYS: dict[str, Journey] = {
             kind="latency",
             measure=_measure_time_to_first_token,
             setup=_setup_streaming_session,
+            prepare=_rotate_turn_session,
             needs_runner=True,
-            max_iterations=_RUNNER_MAX_ITERATIONS,
+            max_iterations=_TURN_MAX_ITERATIONS,
             description="Post a turn; time to the first streamed output_text delta.",
         ),
         Journey(
             name="interrupt",
             kind="latency",
             measure=_measure_interrupt,
-            setup=_setup_interrupt_session,
+            setup=_setup_warm_session,
+            prepare=_prepare_interrupt,
+            validate=_validate_interrupt,
+            teardown=_teardown_interrupt,
             needs_runner=True,
-            max_iterations=_RUNNER_MAX_ITERATIONS,
-            description="Interrupt a running (gated) turn; time to cancellation.",
+            max_iterations=_TURN_MAX_ITERATIONS,
+            description="Interrupt a running (gated) turn; time POST interrupt → turn idle.",
         ),
         Journey(
             name="read_runner_file",
@@ -815,8 +1255,35 @@ ALL_JOURNEYS: dict[str, Journey] = {
             max_iterations=_RUNNER_FS_MAX_ITERATIONS,
             description="GET .../environments/default/filesystem/{path} — runner file read proxy.",
         ),
+        Journey(
+            name="native_hook_spawn",
+            kind="latency",
+            measure=_measure_hook_spawn,
+            setup=_setup_hook_spawn,
+            teardown=_teardown_hook_spawn,
+            description="Spawn the per-chunk MessageDisplay hook exactly as Claude Code does.",
+        ),
+        Journey(
+            name="cli_startup",
+            kind="latency",
+            measure=_measure_cli_startup,
+            setup=_setup_cli_startup,
+            prepare=_prepare_cli_startup,
+            validate=_close_cli_startup,
+            teardown=_teardown_cli_startup,
+            max_iterations=_CLI_STARTUP_MAX_ITERATIONS,
+            max_warmup=0,
+            description=(
+                "Spawn `omnigent polly --server` and time invocation → REPL ready "
+                "(daemon + session + runner launch and connect). No LLM call needed. "
+                "Requires pexpect."
+            ),
+        ),
     )
 }
+
+# Registry alias — kept for callers that enumerate opt-in journeys explicitly.
+OPT_IN_JOURNEYS: dict[str, Journey] = {}
 
 
 def resolve_journeys(names: list[str] | None) -> list[Journey]:

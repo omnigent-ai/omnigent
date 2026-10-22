@@ -23,7 +23,6 @@ write-through store) and the composition loop live in
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
 
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import PolicySpec
@@ -50,7 +49,7 @@ class Policy(ABC):
     async def evaluate(
         self,
         ctx: EvaluationContext,
-        context: dict[str, Any],
+        context: dict[str, object],
     ) -> PolicyResult:
         """
         Return this policy's decision for one evaluation.

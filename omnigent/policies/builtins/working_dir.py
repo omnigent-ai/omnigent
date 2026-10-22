@@ -50,11 +50,14 @@ import re
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.policies.builtins._shell import (
     MAX_SHELL_NESTING,
+    SHELL_TOOLS,
+    is_unresolved_invocation,
     real_invocation_tokens,
+    spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
 )
@@ -72,13 +75,12 @@ _WORKTREE_SWITCH_SUBCMDS: frozenset[str] = frozenset({"add", "move", "remove"})
 # so the scanner skips both when locating the subcommand. ``-C`` additionally
 # names a directory the command runs in.
 _GIT_VALUE_OPTS: frozenset[str] = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--attr-source"}
 )
 
-# Shell tools whose command string this policy parses, by default.
-# Includes both the Omnigent built-in OS shell and Claude Code / Codex
-# native ``Bash`` tool (surfaced via the ``PreToolUse`` hook contract).
-_DEFAULT_SHELL_TOOLS: tuple[str, ...] = ("sys_os_shell", "Bash")
+# Shell tools whose command string this policy parses, by default: every
+# harness's, so the worktree confinement isn't inert on a native session.
+_DEFAULT_SHELL_TOOLS: frozenset[str] = SHELL_TOOLS
 
 
 @dataclass(frozen=True)
@@ -160,13 +162,20 @@ def _classify_git(tokens: list[str], block_cd: bool, block_worktree: bool) -> _D
     """
     rest = tokens[1:]
     c_path: str | None = None
+    work_tree_path: str | None = None
     positionals: list[str] = []
     i = 0
     while i < len(rest):
         token = rest[i]
+        if token.startswith("--work-tree="):
+            work_tree_path = token.split("=", 1)[1]
+            i += 1
+            continue
         if token in _GIT_VALUE_OPTS and i + 1 < len(rest):
             if token == "-C":
                 c_path = rest[i + 1]
+            elif token == "--work-tree":
+                work_tree_path = rest[i + 1]
             i += 2
             continue
         if token.startswith("-"):
@@ -182,6 +191,8 @@ def _classify_git(tokens: list[str], block_cd: bool, block_worktree: bool) -> _D
             return _DirOp(kind="worktree", target=None, detail=f"git worktree {action_word}")
     if block_cd and c_path is not None:
         return _DirOp(kind="cd", target=c_path, detail=f"git -C {c_path}")
+    if block_cd and work_tree_path is not None:
+        return _DirOp(kind="cd", target=work_tree_path, detail=f"git --work-tree {work_tree_path}")
     return None
 
 
@@ -270,9 +281,10 @@ def block_working_dir_changes(
     :param action: What a gated command yields — ``"deny"`` (block it) or
         ``"ask"`` (park for human approval). Defaults to ``"deny"``.
     :param shell_tools: Names of the shell tools whose ``command`` argument is
-        parsed. ``None`` uses the defaults: ``["sys_os_shell", "Bash"]``
-        (Omnigent built-in + Claude/Codex native). Commands run through
-        a tool not listed here are not inspected.
+        parsed. ``None`` uses every harness's shell tool
+        (:data:`~omnigent.policies.builtins._shell.SHELL_TOOLS` — Omnigent,
+        Claude/Codex, Cursor, Pi, Hermes, Goose). Commands run through a tool
+        not listed here are not inspected.
     :returns: A one-argument policy callable returning a :class:`PolicyResponse`
         (DENY / ASK) on a gated command, or ``None`` to abstain (ALLOW).
     :raises ValueError: If *action* is not ``"deny"`` / ``"ask"``, or if both
@@ -291,7 +303,7 @@ def block_working_dir_changes(
     shell_tool_names = (
         frozenset(shell_tools) if shell_tools is not None else frozenset(_DEFAULT_SHELL_TOOLS)
     )
-    result_kind = "DENY" if action == "deny" else "ASK"
+    result_kind: Literal["DENY", "ASK"] = "DENY" if action == "deny" else "ASK"
 
     def _violation(reason: str) -> PolicyResponse:
         """
@@ -337,7 +349,10 @@ def block_working_dir_changes(
 
         Splits the command into segments, unwraps shell-interpreter / ``eval``
         wrappers recursively, and returns the most restrictive decision across
-        all gated ops found (DENY > ASK > abstain).
+        all gated ops found (DENY > ASK > abstain). A segment whose real command
+        cannot be resolved — it does not tokenize, or a wrapper's own flags left
+        an option as the head — takes the configured action when it looks like a
+        dir op, rather than abstaining.
 
         :param command: The shell command string, e.g. ``"cd /etc && ls"``.
         :param _depth: Internal recursion guard for nested shell wrappers;
@@ -346,14 +361,33 @@ def block_working_dir_changes(
             when nothing in the command is gated.
         """
         if _depth > MAX_SHELL_NESTING:
-            return None
+            return _violation("Blocked: shell command exceeds the nesting limit.")
         worst: PolicyResponse | None = None
-        for segment in split_command_segments(command):
+        try:
+            segments = split_command_segments(command)
+        except ValueError as exc:
+            return _violation(f"Blocked: could not classify shell syntax ({exc}).")
+        for segment in segments:
+            unreadable = False
             try:
                 tokens = shlex.split(segment)
             except ValueError:
                 # Unbalanced quotes etc.: if it looks like a gated command, surface
                 # it via the configured action rather than letting it through.
+                unreadable = True
+                tokens = []
+            else:
+                tokens = real_invocation_tokens(tokens)
+                # A leading option means some wrapper's own flags were not
+                # modelled, so the real command was never reached. Same fail-safe
+                # as an un-tokenizable segment rather than a silent abstain. A
+                # process-spawning utility (find -exec, xargs, perl -e, python -c,
+                # awk, make) likewise runs the gated command as a child whose argv
+                # is not modelled here, so route it through the same fail-safe.
+                unreadable = is_unresolved_invocation(tokens) or spawns_gated_command_as_child(
+                    tokens
+                )
+            if unreadable:
                 if _looks_like_dir_op(segment, block_cd, block_worktree):
                     worst = _worse(
                         worst,
@@ -363,7 +397,6 @@ def block_working_dir_changes(
                         ),
                     )
                 continue
-            tokens = real_invocation_tokens(tokens)
             if not tokens:
                 continue
             inner = unwrap_shell_command(tokens)
@@ -427,10 +460,11 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
         "kind": "factory",
         "name": "Block Working Directory & Worktree Changes",
         "description": (
-            "Gates shell commands (sys_os_shell and Claude/Codex native Bash) "
-            "that switch the working directory (cd / chdir / pushd / popd, "
+            "Gates shell commands that switch the working directory "
+            "(cd / chdir / pushd / popd, "
             "git -C) or git worktrees (git worktree add / move / remove). "
-            "Optionally allow cd into specific directories via allowed_dirs. "
+            "Supports Omnigent, Claude/Codex, Cursor, Pi, Hermes, and Goose "
+            "shell tools. Optionally allow cd into specific directories via allowed_dirs. "
             "Chained, wrapped (bash -c), and env-prefixed commands are parsed "
             "so the gate cannot be trivially bypassed."
         ),
@@ -464,7 +498,7 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Shell tools whose command arg is parsed "
-                    "(default: sys_os_shell, Bash).",
+                    "(default: every harness's shell tool).",
                 },
             },
         },

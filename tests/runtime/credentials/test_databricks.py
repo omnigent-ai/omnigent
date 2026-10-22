@@ -460,11 +460,37 @@ def test_sdk_value_error_does_not_emit_warning(
         f"Expected one INFO record, got {len(info_records)}. "
         f"Records: {[(r.levelname, r.getMessage()) for r in module_records]}."
     )
-    # exc_info is (type, value, traceback); [2] must be real, else the
-    # frames won't render in the log.
+    # Under debug logging (this caplog context) the record keeps real
+    # frames; [2] must be a traceback, else they won't render in the log.
     exc_info = info_records[0].exc_info
     assert exc_info is not None and exc_info[2] is not None, (
         "INFO record must carry exc_info with a real traceback."
+    )
+
+
+def test_sdk_value_error_omits_frames_at_default_level(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A TTY-hosted `omnigent host` mirrors INFO records to the terminal,
+    # so at the default level this record must stay frame-free.
+    cfg = _write_cfg(
+        tmp_path,
+        "[dev]\nhost = https://cfg.example.com\ntoken = cfg-token\n",
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runtime.credentials.databricks"):
+        resolve_databricks_workspace(profile="dev")
+
+    info_records = [r for r in caplog.records if "Config(profile=" in r.getMessage()]
+    assert len(info_records) == 1, (
+        f"Expected one INFO record, got {[(r.levelname, r.getMessage()) for r in info_records]}."
+    )
+    assert not info_records[0].exc_info, (
+        "the SDK-failure INFO record must not carry frames at the default "
+        "level; host logging mirrors it to the user's terminal"
     )
 
 

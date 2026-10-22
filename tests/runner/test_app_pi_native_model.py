@@ -6,7 +6,7 @@ threaded into ``resolve_pi_native_provider(model=...)`` — which renders it
 into the runner-owned Pi ``models.json`` (and the appended ``--model``).
 
 Unlike cursor-native, a gateway-routed id (``databricks-*``) is KEPT: the
-runner-owned Pi process routes through the Databricks AI Gateway, whose
+runner-owned Pi process routes through the Databricks Unity Gateway, whose
 ``models.json`` selects the model by its gateway id.
 """
 
@@ -20,12 +20,13 @@ import httpx
 import pytest
 
 from omnigent.entities.session_resources import SessionResourceView
-from omnigent.runner.app import (
+from omnigent.runner.native.orchestration import (
     ResolvedSpec,
     _auto_create_pi_terminal,
     _pi_native_model_from_spec,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.pi_native import seed_pi_own_login_catalog
 
 
 def _spec(model: str | None) -> AgentSpec:
@@ -101,8 +102,8 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.pi_native_bridge as pi_bridge
-    import omnigent.pi_native_credentials as creds
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
 
     session_id = "conv_pi_model_e2e"
     workspace = tmp_path / "workspace"
@@ -114,7 +115,9 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     # Resolve a Pi executable without requiring the real binary on PATH.
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
 
     # ``resolve_pi_native_provider``'s default config_loader is bound at def
     # time, so inject the test config by patching the module symbol the runner
@@ -131,7 +134,9 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     class _SnapshotClient:
         """Fresh pi-native session snapshot (no launch args / external id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             del url, timeout
             return httpx.Response(
                 200,
@@ -200,7 +205,9 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     # The managed config dir env was set and its models.json selects the override.
     agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
     models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
-    assert models["providers"]["omnigent"]["models"] == [{"id": "claude-opus-4-7"}]
+    entry = models["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "claude-opus-4-7"
+    assert entry.get("reasoning") is True
 
 
 @pytest.mark.asyncio
@@ -218,8 +225,8 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.pi_native_bridge as pi_bridge
-    import omnigent.pi_native_credentials as creds
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
 
     session_id = "conv_pi_model_default"
     workspace = tmp_path / "workspace"
@@ -228,7 +235,9 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
 
     real_resolve = creds.resolve_pi_native_provider
     captured: dict[str, Any] = {}
@@ -240,7 +249,9 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
     class _SnapshotClient:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
             del url, timeout
             return httpx.Response(
                 200,
@@ -294,4 +305,217 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     assert captured["model"] is None
     agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
     models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
-    assert models["providers"]["omnigent"]["models"] == [{"id": "claude-sonnet-4-6"}]
+    entry = models["providers"]["omnigent"]["models"][0]
+    assert entry["id"] == "claude-sonnet-4-6"
+    assert entry.get("reasoning") is True
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch bakes the runner tunnel token into the extension config.
+
+    On a guest-on-shared-host runner there is no Databricks bearer, so the
+    extension authenticates its out-of-process posts with the tunnel binding
+    token. It must land in ``config.json``'s ``authHeaders`` at launch — the
+    per-turn refresh runs env-scrubbed and can only preserve it, never mint it.
+    """
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
+    from omnigent.runner.identity import (
+        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        RUNNER_TUNNEL_TOKEN_HEADER,
+    )
+
+    session_id = "conv_pi_tunnel_token"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    # No Databricks bearer (guest-on-shared-host), but a tunnel binding token.
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "tok-abc")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
+
+    real_resolve = creds.resolve_pi_native_provider
+
+    def _resolve_with_test_config(*, model: str | None = None, config_loader: Any = None):
+        return real_resolve(model=model, config_loader=_key_provider_config)
+
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
+
+    class _SnapshotClient:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
+            del url, timeout
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env, spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-tunnel-token",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_SnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    config = json.loads(
+        pi_bridge.config_path(pi_bridge.bridge_dir_for_session_id(session_id)).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["authHeaders"][RUNNER_TUNNEL_TOKEN_HEADER] == "tok-abc"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_cold_resume_keeps_persisted_pi_login_pick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold resume keeps a persisted Pi own-login pick on Pi's login: with an
+    OpenRouter ``default: pi`` provider, ``--model openai-codex/gpt-5.6-sol`` passes
+    through with no managed config dir instead of ``omnigent/...`` on the gateway."""
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
+
+    def _openrouter_pi_default_config() -> dict[str, Any]:
+        return {
+            "providers": {
+                "openrouter": {
+                    "kind": "key",
+                    "default": ["pi"],
+                    "openai": {
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "api_key": "sk-e2e-openrouter-fake",
+                        "models": {"default": "openai/gpt-4o"},
+                    },
+                }
+            }
+        }
+
+    session_id = "conv_pi_cold_resume_own_login"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    own_login_dir = tmp_path / "pi-own-login"
+    seed_pi_own_login_catalog(own_login_dir, "openai-codex", ["gpt-5.6-sol"])
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(own_login_dir))
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
+
+    real_resolve = creds.resolve_pi_native_provider
+
+    def _resolve_with_test_config(
+        *, model: str | None = None, config_loader: Any = None, auth: Any = None
+    ):
+        del config_loader, auth
+        return real_resolve(model=model, config_loader=_openrouter_pi_default_config)
+
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
+
+    class _ColdResumeSnapshotClient:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
+            del url, timeout, params
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                    "model_override": "openai-codex/gpt-5.6-sol",
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    launched: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched["args"] = list(spec.args)
+            launched["env"] = dict(spec.env)
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-cold-resume-own-login",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}, model=None),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_ColdResumeSnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    args = launched["args"]
+    assert "--provider" not in args, args
+    assert "--model" in args, args
+    assert args[args.index("--model") + 1] == "openai-codex/gpt-5.6-sol", args
+    # No managed config dir means Pi's ``/model`` picker keeps Pi's own catalog
+    # rather than collapsing to a lone gateway entry.
+    assert creds.PI_CODING_AGENT_DIR_ENV_VAR not in launched["env"], launched["env"]

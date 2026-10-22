@@ -1,3 +1,5 @@
+import type * as IdentityModule from "@/lib/identity";
+
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -9,7 +11,7 @@ import { useChatStore } from "@/store/chatStore";
 // the module's other exports real — chatStore (imported transitively)
 // pulls authenticatedFetch from the same module.
 vi.mock("@/lib/identity", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/identity")>()),
+  ...(await importOriginal<typeof IdentityModule>()),
   getCurrentAuthorId: () => "self@example.com",
 }));
 

@@ -40,10 +40,22 @@ from playwright.sync_api import Page, expect
 # initial state each test passes in.
 _UPDATE_SHELL_INIT_SCRIPT = """
 (() => {
-  const state = { calls: [], onStatus: null, current: %s, config: %s };
+  const state = {
+    calls: [],
+    onStatus: null,
+    onOverlayHeight: null,
+    overlayHeight: 0,
+    current: %s,
+    config: %s,
+  };
   window.__omniUpdate = {
     calls: state.calls,
     emit: (next) => { state.current = next; if (state.onStatus) state.onStatus(next); },
+    emitOverlayHeight: (height) => {
+      state.overlayHeight = height;
+      if (state.onOverlayHeight) state.onOverlayHeight(height);
+    },
+    hasOverlaySubscriber: () => state.onOverlayHeight !== null,
   };
   const updates = {
     getConfig: () => Promise.resolve(state.config),
@@ -57,6 +69,11 @@ _UPDATE_SHELL_INIT_SCRIPT = """
       return Promise.resolve(state.config);
     },
     onStatus: (cb) => { state.onStatus = cb; return () => { state.onStatus = null; }; },
+    getOverlayHeight: () => Promise.resolve(state.overlayHeight),
+    onOverlayHeight: (cb) => {
+      state.onOverlayHeight = cb;
+      return () => { state.onOverlayHeight = null; };
+    },
   };
   window.omnigentDesktop = {
     kind: "electron",
@@ -95,7 +112,7 @@ def _bridge_calls(page: Page) -> list[str]:
 
 def test_settings_updates_section_check_and_mode(
     page: Page,
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Settings -> Updates exposes the mode selector and a working Check button.
 
@@ -105,7 +122,7 @@ def test_settings_updates_section_check_and_mode(
     selector reflects the bridge config and ``Check for updates now`` calls the
     bridge's ``check()``.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     _install_update_stub(page, '{ state: "idle" }')
     page.goto(f"{base_url}/settings/updates")

@@ -1,57 +1,869 @@
 // Inline status indicators for non-tool, non-text, non-reasoning blocks.
 // Each is small enough to live in one file.
 //
-// - ErrorBanner: destructive Alert with `[source]` + code + message.
+// - ErrorBanner: centered destructive pill with an expandable message body;
+//   `level="info"` renders it as a neutral notice instead.
 // - RetryIndicator: muted one-liner about an in-flight retry.
 // - CompactionMarker: permanent marker shown after compaction completes.
 //   The in-progress state renders as a Shimmer in ChatPage, mirroring
 //   the "Working…" indicator.
 
 import {
-  AlertCircleIcon,
   BrainCircuitIcon,
+  CheckIcon,
   ChevronRightIcon,
+  CopyIcon,
+  ExternalLinkIcon,
+  FolderOpenIcon,
+  Loader2Icon,
   RotateCcwIcon,
+  RotateCwIcon,
   ShieldXIcon,
   ShrinkIcon,
+  SplitIcon,
+  XIcon,
+  type LucideIcon,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
+import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { useScopedConversationId } from "@/components/chat/conversationScope";
+import { copyText } from "@/lib/clipboard";
+import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
+import { useForkDialog } from "@/shell/ForkDialogContext";
+import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
+import {
+  type RoutingDecisionExtras,
+  harnessDisplayLabel,
+  subagentScopeLabel,
+} from "@/lib/routingDecision";
 import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 interface ErrorBannerProps {
+  itemId?: string | null;
   message: string;
   source: string;
   code: string;
+  /** Friendly headline for a classified failure, e.g. "Claude Code can't run as root". */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
+  /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
+  level?: "error" | "info";
+  /** Recover the existing session or continue after a retryable turn failure. */
+  onRetry?: (error: RelatedRenderError) => Promise<void>;
+  /** Later failures emitted by the same response, turn, and agent. */
+  relatedErrors?: RelatedRenderError[];
 }
 
 /**
- * Loud destructive banner for `error` blocks. Falls back to `code` when
- * `message` is empty (matches the reducer's intent — never show a blank
- * panel even when the LLM error payload omits the message).
+ * One-line English descriptions for known failure `code`s, so an
+ * unclassified failure (no `title`/`cause` from the runner) still reads as a
+ * sentence instead of a raw enum. Mirrors the server-side
+ * `describe_failure_code` table (omnigent/runner/launch_failure.py); keep the
+ * two in sync.
  */
-export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
-  const display = message || code || "Unknown error";
+const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
+  required_terminal_exited:
+    "The agent's terminal exited unexpectedly, so the session can't continue.",
+  terminal_launch_failed: "The agent's terminal couldn't be started on the host.",
+  runner_error: "Something went wrong setting up the turn on the host.",
+  runner_disconnected: "The connection to the host dropped unexpectedly.",
+  runner_unavailable: "The session's runner isn't connected to the server.",
+  connection_error:
+    "The connection to the agent dropped mid-turn; retrying usually continues the turn.",
+  context_length_exceeded: "The conversation grew past the model's context window.",
+  executor_error: "The agent runtime hit an error while running the turn.",
+  workspace_missing: "The session workspace no longer exists on the host.",
+  session_agent_missing:
+    "This agent no longer exists. Fork this session into another agent to continue.",
+  codex_thread_reset:
+    "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+  codex_turn_error: "Codex ran into an error during this turn.",
+  databricks_sign_in_pending: "The agent is waiting for a Databricks sign-in.",
+  agent_startup_pending: "The agent is still starting in the session terminal.",
+  databricks_sign_in_completed: "The Databricks sign-in completed and the agent is ready.",
+  codex_thread_not_started: "Codex stopped before it could start, so this turn never ran.",
+  native_turn_error: "The agent ran into an error during this turn.",
+  native_prompt_not_recorded: "Message not delivered. Try sending it again.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
+  transient_upstream_error:
+    "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+  budget_exhausted:
+    "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
+  codex_compaction_model_failed:
+    "Codex couldn't compact the conversation on the previous model, so this turn didn't run.",
+  client_update_required:
+    "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+};
+
+const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";
+// A spent budget, and the compaction it blocks, is an account limit rather than a failure.
+const NEUTRAL_TONE_CODES = new Set(["budget_exhausted", COMPACTION_MODEL_FAILED_CODE]);
+
+const RETRYABLE_ERROR_CODES = new Set([
+  "required_terminal_exited",
+  "terminal_launch_failed",
+  "runner_disconnected",
+  "runner_failed_to_start",
+  "runner_unavailable",
+  "rate_limit_exceeded",
+  "transient_upstream_error",
+  "connection_error",
+]);
+
+// Failed turns the runner itself survived: the session is healthy, so retry
+// continues the turn in place (posts a continuation) instead of resuming the
+// runner. Includes a dropped harness stream — the runner marks the session
+// desynced, and the continuation message triggers the rebind.
+export const CONTINUE_TURN_ERROR_CODES = new Set([
+  "rate_limit_exceeded",
+  "transient_upstream_error",
+  "connection_error",
+]);
+
+interface ParsedErrorMessage {
+  message: string;
+  terminal: string | null;
+  lastOutput: string | null;
+}
+
+const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
+const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
+const UNAVAILABLE_OUTPUT =
+  /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
+const EMPTY_RELATED_ERRORS: RelatedRenderError[] = [];
+
+function errorHeadline(error: RenderErrorDetails): string {
   return (
-    <Alert
-      variant="destructive"
-      className="min-w-0 max-w-full overflow-hidden has-[>svg]:grid-cols-[auto_minmax(0,1fr)]"
-    >
-      <AlertCircleIcon />
-      <AlertTitle className="min-w-0 break-words [overflow-wrap:anywhere]">
-        Error{source ? ` · ${source}` : ""}
-        {code && message ? ` · ${code}` : ""}
-      </AlertTitle>
-      <AlertDescription className="min-w-0 max-w-full overflow-hidden">
-        <span className="block max-w-full whitespace-pre-wrap break-words [overflow-wrap:anywhere] [text-wrap:wrap]">
-          {display}
-        </span>
-      </AlertDescription>
-    </Alert>
+    error.title ||
+    FAILURE_CODE_DESCRIPTIONS[error.code] ||
+    (error.level === "info" ? "Notice" : "Something went wrong")
+  );
+}
+
+// An address the user can open, as printed by a launcher or a harness.
+const ADDRESS_PATTERN = /https?:\/\/[^\s<>"'`)\]]+/g;
+
+// Failures whose next step is a launcher sign-in. The card offers to open the
+// live link, fetched from the host on click: the link is a one-time URL bound
+// to the launcher process, so no copy of it is kept in the transcript.
+const SIGN_IN_PENDING_CODES = new Set(["databricks_sign_in_pending"]);
+// A sign-in that completed. Its one line of body shows without a click: the
+// headline alone ("Signed in to Databricks") does not say what to do next.
+const SIGN_IN_COMPLETED_CODES = new Set(["databricks_sign_in_completed"]);
+
+/** Render text with each address as a link that opens in a new tab. */
+function linkify(text: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  let last = 0;
+  for (const match of text.matchAll(ADDRESS_PATTERN)) {
+    const start = match.index ?? 0;
+    const address = match[0].replace(/[.,;:]+$/, "");
+    if (start > last) nodes.push(text.slice(last, start));
+    nodes.push(
+      <a
+        key={`${start}:${address}`}
+        href={address}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="underline underline-offset-2 hover:text-foreground"
+      >
+        {address}
+      </a>,
+    );
+    last = start + address.length;
+  }
+  if (last < text.length) nodes.push(text.slice(last));
+  return nodes;
+}
+
+function relatedErrorText(error: RenderErrorDetails): string {
+  const parts = [
+    error.cause,
+    error.remediation ? `Try this: ${error.remediation}` : undefined,
+    error.message || error.code,
+  ].filter((part): part is string => Boolean(part));
+  return parts.filter((part, index) => parts.indexOf(part) === index).join("\n\n");
+}
+
+function trimBlankBoundaryLines(lines: string[]): string | null {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start]!.trim() === "") start += 1;
+  while (end > start && lines[end - 1]!.trim() === "") end -= 1;
+  return start < end ? lines.slice(start, end).join("\n") : null;
+}
+
+function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
+  const lines = rawMessage.replace(/\r\n?/g, "\n").split("\n");
+  const diagnosticsIndex = lines.findIndex((line) => DIAGNOSTICS_HEADING.test(line.trim()));
+  const searchStart = diagnosticsIndex >= 0 ? diagnosticsIndex + 1 : 0;
+  const lastOutputIndex = lines.findIndex(
+    (line, index) => index >= searchStart && LAST_OUTPUT_HEADING.test(line.trim()),
+  );
+
+  if (diagnosticsIndex < 0 && lastOutputIndex < 0) {
+    return { message: rawMessage.trim(), terminal: null, lastOutput: null };
+  }
+
+  const messageEnd = diagnosticsIndex >= 0 ? diagnosticsIndex : lastOutputIndex;
+  const message = lines.slice(0, messageEnd).join("\n").trim();
+  const terminal =
+    diagnosticsIndex >= 0
+      ? trimBlankBoundaryLines(
+          lines.slice(diagnosticsIndex + 1, lastOutputIndex >= 0 ? lastOutputIndex : undefined),
+        )
+      : null;
+  let lastOutput: string | null = null;
+  if (lastOutputIndex >= 0) {
+    const headingMatch = lines[lastOutputIndex]!.trim().match(LAST_OUTPUT_HEADING);
+    const headingValue = headingMatch?.[1]?.trim() ?? "";
+    lastOutput = trimBlankBoundaryLines([headingValue, ...lines.slice(lastOutputIndex + 1)]);
+    if (lastOutput && UNAVAILABLE_OUTPUT.test(lastOutput.trim())) lastOutput = null;
+  }
+  return { message, terminal, lastOutput };
+}
+
+/** An error card's fork action, shown only when this conversation can be forked. */
+function ErrorForkAction({
+  label,
+  icon: Icon,
+  workspaceRecovery = false,
+  className,
+}: {
+  label: string;
+  icon: LucideIcon;
+  workspaceRecovery?: boolean;
+  className?: string;
+}) {
+  const forkDialog = useForkDialog();
+  const conversationId = useScopedConversationId();
+  if (!forkDialog || !conversationId) return null;
+  // Side-chat sources resolve their own capabilities in the fork form.
+  const scopedForkSource =
+    forkDialog.currentSessionId != null && conversationId !== forkDialog.currentSessionId;
+  if (!scopedForkSource && !forkDialog.canFork) return null;
+  const disabledReason = scopedForkSource ? undefined : forkDialog.disabledReason;
+  return (
+    <div className={className} onClick={(event) => event.stopPropagation()}>
+      <DisabledActionTooltip reason={disabledReason} label={label} className="max-w-full">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-auto max-w-full whitespace-normal text-left"
+          disabled={!!disabledReason}
+          onClick={() =>
+            forkDialog.openForkDialog({
+              sourceSessionId: conversationId,
+              ...(workspaceRecovery ? { workspaceRecovery: true } : {}),
+            })
+          }
+        >
+          <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+          {label}
+        </Button>
+      </DisabledActionTooltip>
+    </div>
+  );
+}
+
+/**
+ * Centered destructive pill for `error` blocks: a truncated headline row over
+ * a dashed rule; the whole pill toggles the expanded message body.
+ *
+ * When the runner classified the failure it passes `title` / `cause` /
+ * `remediation`, and the expanded body shows the plain-English cause, a
+ * "Try this" remediation line, and the raw diagnostics folded into a
+ * collapsible. Otherwise it falls back to a code→sentence map (so even an
+ * unclassified failure reads as English) and finally to the raw message/code —
+ * never a blank panel.
+ */
+export function ErrorBanner({
+  itemId = null,
+  message,
+  source,
+  code,
+  title,
+  cause,
+  remediation,
+  level,
+  onRetry,
+  relatedErrors = EMPTY_RELATED_ERRORS,
+}: ErrorBannerProps) {
+  const workspaceMissing =
+    code === "workspace_missing" ||
+    relatedErrors.some((error) => error.code === "workspace_missing");
+  const notice = level === "info" && relatedErrors.every((error) => error.level === "info");
+  const neutral = [{ code, level }, ...relatedErrors].every(
+    (error) => error.level === "info" || NEUTRAL_TONE_CODES.has(error.code),
+  );
+  const tone = neutral ? "var(--muted-foreground)" : "var(--destructive)";
+  const headline = errorHeadline({ message, source: "", code, title, cause, remediation, level });
+  const relatedDetails = useMemo(
+    () =>
+      relatedErrors.map((error) => ({
+        key: error.itemId ?? `${error.code}:${error.source}:${error.message}`,
+        headline: errorHeadline(error),
+        text: relatedErrorText(error),
+      })),
+    [relatedErrors],
+  );
+  const parsed = useMemo(() => parseErrorMessage(message), [message]);
+  // Codex keeps compacting on its previous model, so only a rebuilt fork continues.
+  const compactionModelError = [{ code, cause, message: parsed.message }, ...relatedErrors].find(
+    (error) => error.code === COMPACTION_MODEL_FAILED_CODE,
+  );
+  const messageText = useMemo(() => {
+    const parts: string[] = [];
+    if (cause) parts.push(cause);
+    if (remediation) parts.push(`Try this: ${remediation}`);
+    if (!cause && parsed.message && parsed.message !== headline) parts.push(parsed.message);
+    if (parts.length === 0) parts.push(parsed.message || code || headline);
+    return parts.join("\n\n");
+  }, [cause, code, headline, parsed.message, remediation]);
+  const signIn = SIGN_IN_PENDING_CODES.has(code);
+  const signInComplete = notice && SIGN_IN_COMPLETED_CODES.has(code);
+  const diagnostics = useMemo(
+    () =>
+      [
+        parsed.terminal ? { id: "terminal", label: "Terminal", content: parsed.terminal } : null,
+        parsed.lastOutput
+          ? { id: "output", label: "Last captured output", content: parsed.lastOutput }
+          : null,
+      ].filter((item): item is { id: string; label: string; content: string } => item !== null),
+    [parsed.lastOutput, parsed.terminal],
+  );
+  // The hint already shows this card's error and cause, so its Message section would repeat them.
+  const inlineMessage = code === COMPACTION_MODEL_FAILED_CODE && Boolean(cause);
+  const expandable = !inlineMessage || relatedDetails.length > 0 || diagnostics.length > 0;
+  const [expanded, setExpanded] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [activeDiagnostics, setActiveDiagnostics] = useState(diagnostics[0]?.id ?? "terminal");
+  const [copiedTarget, setCopiedTarget] = useState<string | null>(null);
+  // The card's saved link is bound to the launcher process that printed it, so
+  // the button asks the host for the live prompt at click time.
+  const [signInCode, setSignInCode] = useState<string | null>(null);
+  const [signInNote, setSignInNote] = useState<string | null>(null);
+  const [signInBusy, setSignInBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+  const copyResetRef = useRef<number>(0);
+  const retryInFlightRef = useRef(false);
+  const dismissButtonRef = useRef<HTMLButtonElement>(null);
+  const messageId = useId();
+  const diagnosticsId = useId();
+  const actionableError = [
+    { itemId, message, source, code, level, title, cause, remediation },
+    ...relatedErrors,
+  ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
+  const retryable = !workspaceMissing && onRetry !== undefined && actionableError !== undefined;
+  const retryLabel =
+    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+      ? "Retry"
+      : "Resume session";
+
+  useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
+  useEffect(() => {
+    if (!diagnostics.some((item) => item.id === activeDiagnostics)) {
+      setActiveDiagnostics(diagnostics[0]?.id ?? "terminal");
+    }
+  }, [activeDiagnostics, diagnostics]);
+  useEffect(() => {
+    if (retryError && !retrying) dismissButtonRef.current?.focus();
+  }, [retryError, retrying]);
+
+  if (dismissed) return null;
+
+  if (retrying) {
+    return (
+      <div
+        data-testid="error-reconnecting"
+        className={cn(
+          TOOL_SURFACE_WIDTH_CLASS,
+          "relative flex min-h-14 items-center justify-center py-2",
+        )}
+      >
+        <span
+          aria-hidden="true"
+          className="absolute inset-x-0 top-1/2 border-border border-t border-dashed"
+        />
+        <Badge
+          variant="outline"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
+        >
+          <Loader2Icon aria-hidden="true" className="animate-spin" />
+          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
+        </Badge>
+      </div>
+    );
+  }
+
+  const copy = async (target: string, value: string) => {
+    await copyText(value);
+    setCopiedTarget(target);
+    window.clearTimeout(copyResetRef.current);
+    copyResetRef.current = window.setTimeout(() => setCopiedTarget(null), 2000);
+  };
+
+  const openSignIn = async () => {
+    if (signInBusy) return;
+    const sessionId = useChatStore.getState().conversationId;
+    if (!sessionId) {
+      setSignInNote("Open this session to fetch the current sign-in link.");
+      return;
+    }
+    // Pre-open the tab in the click so the navigation after the round trip is
+    // not treated as a popup. Sever the opener so the sign-in page can never
+    // navigate this tab.
+    const tab = window.open("", "_blank");
+    if (tab) tab.opener = null;
+    setSignInBusy(true);
+    setSignInNote(null);
+    try {
+      const live = await getSessionSignInLink(sessionId);
+      if (live.pending && live.url) {
+        setSignInCode(live.code);
+        if (tab) tab.location.href = live.url;
+        else window.open(live.url, "_blank", "noopener,noreferrer");
+      } else {
+        tab?.close();
+        // A code fetched earlier belongs to a prompt that is gone.
+        setSignInCode(null);
+        setSignInNote(
+          "No sign-in is pending in the terminal any more. Try sending your message again.",
+        );
+      }
+    } catch (error) {
+      tab?.close();
+      setSignInNote(
+        `Could not reach the host for a fresh link: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      setSignInBusy(false);
+    }
+  };
+
+  const retry = async () => {
+    if (!onRetry || !actionableError || retryInFlightRef.current) return;
+    retryInFlightRef.current = true;
+    setRetrying(true);
+    setRetryError(null);
+    try {
+      await onRetry(actionableError);
+      setDismissed(true);
+    } catch (error) {
+      retryInFlightRef.current = false;
+      setRetryError(
+        `${retryLabel} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      setRetrying(false);
+    }
+  };
+
+  return (
+    <div className="relative mb-[24px] flex w-full flex-col items-center px-[16px]">
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute top-[20px] right-0 left-0 h-px"
+        style={{
+          background: `repeating-linear-gradient(to right, color-mix(in srgb, ${tone} 32%, transparent) 0 2px, transparent 2px 6px)`,
+        }}
+      />
+      <div
+        data-testid="error-pill"
+        data-level={notice ? "info" : "error"}
+        onClick={() => expandable && setExpanded((value) => !value)}
+        className={cn(
+          "group/error relative z-10 w-[560px] max-w-full rounded-[12px] p-[8px] text-foreground",
+          expandable && "cursor-pointer",
+        )}
+        style={{
+          background: `color-mix(in srgb, ${tone} 4%, var(--app-shell-bg, var(--background)))`,
+          border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
+        }}
+      >
+        <div className="flex w-full min-w-0 items-start gap-[4px]">
+          <button
+            type="button"
+            aria-expanded={expandable ? expanded : undefined}
+            aria-controls={expandable && expanded ? messageId : undefined}
+            onClick={(event) => {
+              event.stopPropagation();
+              if (expandable) setExpanded((value) => !value);
+            }}
+            className={cn(
+              "flex min-w-0 flex-1 items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+              expandable ? "cursor-pointer" : "cursor-default",
+            )}
+          >
+            <span
+              data-testid="error-leading-slot"
+              className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
+            >
+              {expandable ? (
+                <ChevronRightIcon
+                  data-testid="error-disclosure-icon"
+                  className={cn(
+                    "size-4 text-muted-foreground transition-transform duration-150 group-hover/error:text-foreground",
+                    expanded && "rotate-90",
+                  )}
+                  aria-hidden="true"
+                />
+              ) : null}
+            </span>
+            <span className="mr-[4px] flex min-w-0 flex-1 flex-col">
+              <span
+                data-testid="error-headline"
+                title={headline}
+                className={cn(
+                  "min-w-0 truncate whitespace-nowrap leading-6",
+                  neutral ? "text-foreground" : "text-destructive",
+                )}
+              >
+                {headline}
+              </span>
+            </span>
+          </button>
+          {retryable ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={(event) => {
+                event.stopPropagation();
+                void retry();
+              }}
+              style={{ fontSize: "var(--text-13, 13px)" }}
+              className="h-6 shrink-0 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
+            >
+              <RotateCwIcon className="size-3.5" aria-hidden="true" />
+              {retryLabel}
+            </Button>
+          ) : null}
+          <Button
+            ref={dismissButtonRef}
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label={notice ? "Dismiss notice" : "Dismiss error message"}
+            onClick={(event) => {
+              event.stopPropagation();
+              setDismissed(true);
+            }}
+            className="size-6 shrink-0 rounded-[var(--control-radius,var(--radius-lg))] text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <XIcon className="size-4" aria-hidden="true" />
+          </Button>
+        </div>
+        {workspaceMissing ? (
+          <ErrorForkAction
+            label="Continue in another directory…"
+            icon={FolderOpenIcon}
+            workspaceRecovery
+            className="mx-[4px] mt-[8px]"
+          />
+        ) : null}
+        {compactionModelError ? (
+          <div
+            data-testid="error-compaction-model-hint"
+            className="mx-[4px] mt-[6px] flex flex-col items-start gap-[6px]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            {compactionModelError.message ? (
+              <div className="ml-[18px] flex min-w-0 items-start gap-2 self-stretch">
+                <p
+                  data-testid="error-compaction-model-original"
+                  className="min-w-0 flex-1 cursor-auto font-mono text-sm leading-6 break-words text-foreground [overflow-wrap:anywhere]"
+                >
+                  {compactionModelError.message}
+                </p>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className="size-6 shrink-0 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  aria-label={copiedTarget === "compaction" ? "Error copied" : "Copy error"}
+                  onClick={() => void copy("compaction", compactionModelError.message)}
+                  componentId="diagnostics.status.compaction_copy"
+                >
+                  {copiedTarget === "compaction" ? (
+                    <CheckIcon className="size-3.5" aria-hidden="true" />
+                  ) : (
+                    <CopyIcon className="size-3.5" aria-hidden="true" />
+                  )}
+                </Button>
+              </div>
+            ) : null}
+            {compactionModelError.cause ? (
+              <p className="ml-[18px] cursor-auto text-sm leading-6 text-muted-foreground">
+                {compactionModelError.cause}
+              </p>
+            ) : null}
+            <ErrorForkAction label="Fork session…" icon={SplitIcon} />
+          </div>
+        ) : null}
+        {signInComplete && parsed.message ? (
+          <p
+            data-testid="error-notice-body"
+            onClick={(event) => event.stopPropagation()}
+            className="mt-[2px] ml-[22px] cursor-auto text-sm leading-6 text-muted-foreground"
+          >
+            {parsed.message}
+          </p>
+        ) : null}
+        {signIn ? (
+          <div
+            data-testid="error-remediation-actions"
+            onClick={(event) => event.stopPropagation()}
+            className="mx-[4px] mt-[6px] flex flex-wrap items-center gap-[6px]"
+          >
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={signInBusy}
+              onClick={() => void openSignIn()}
+              style={{ fontSize: "var(--text-13, 13px)" }}
+              className="h-6 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5"
+            >
+              <ExternalLinkIcon className="size-3.5" aria-hidden="true" />
+              {signInBusy ? "Fetching link…" : "Open sign-in link"}
+            </Button>
+            {signInCode ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                onClick={() => void copy("code", signInCode)}
+                style={{ fontSize: "var(--text-13, 13px)" }}
+                className="h-6 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
+              >
+                {copiedTarget === "code" ? (
+                  <CheckIcon className="size-3.5" aria-hidden="true" />
+                ) : (
+                  <CopyIcon className="size-3.5" aria-hidden="true" />
+                )}
+                {copiedTarget === "code" ? "Copied" : `Copy code ${signInCode}`}
+              </Button>
+            ) : null}
+            {signInNote ? (
+              <span
+                role="status"
+                data-testid="error-sign-in-note"
+                className="basis-full text-sm leading-5 text-muted-foreground"
+              >
+                {signInNote}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        {retryError ? (
+          <div
+            role="status"
+            aria-live="assertive"
+            aria-atomic="true"
+            onClick={(event) => event.stopPropagation()}
+            className="mx-[4px] mt-[8px] text-sm leading-5 break-words text-destructive [overflow-wrap:anywhere]"
+          >
+            {retryError}
+          </div>
+        ) : null}
+        {expanded && expandable ? (
+          <div
+            id={messageId}
+            onClick={(event) => event.stopPropagation()}
+            className="mt-[12px] min-w-0 max-w-full cursor-auto overflow-hidden text-foreground [text-wrap:wrap]"
+          >
+            {inlineMessage ? null : (
+              <section aria-labelledby={`${messageId}-label`} className="min-w-0">
+                <div className="mx-[4px] flex items-center justify-between gap-2">
+                  <h4
+                    id={`${messageId}-label`}
+                    className="text-sm leading-4 font-medium text-muted-foreground"
+                  >
+                    Message
+                  </h4>
+                  <div className="flex items-center gap-1">
+                    {code === "PROVIDER_AUTH_REQUIRED" && remediation ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        className="h-6 gap-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        aria-label={
+                          copiedTarget === "recovery"
+                            ? "Recovery command copied"
+                            : "Copy recovery command"
+                        }
+                        onClick={() => void copy("recovery", remediation)}
+                        componentId="diagnostics.status.recovery_copy"
+                      >
+                        {copiedTarget === "recovery" ? (
+                          <CheckIcon className="size-3.5" aria-hidden="true" />
+                        ) : (
+                          <CopyIcon className="size-3.5" aria-hidden="true" />
+                        )}
+                        Copy command
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="size-6 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      aria-label={
+                        copiedTarget === "message" ? "Error message copied" : "Copy error message"
+                      }
+                      onClick={() => void copy("message", messageText)}
+                      componentId="diagnostics.status.copy"
+                    >
+                      {copiedTarget === "message" ? (
+                        <CheckIcon className="size-3.5" aria-hidden="true" />
+                      ) : (
+                        <CopyIcon className="size-3.5" aria-hidden="true" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+                <div
+                  data-testid="error-message-content"
+                  className="mx-[4px] mt-[4px] max-w-full min-w-0 font-mono text-sm leading-6 break-words whitespace-pre-wrap text-foreground [overflow-wrap:anywhere] [text-wrap:wrap]"
+                >
+                  {linkify(messageText)}
+                </div>
+              </section>
+            )}
+            {relatedDetails.length > 0 ? (
+              <section
+                aria-labelledby={`${messageId}-related-label`}
+                className="mx-[4px] mt-[16px] min-w-0 border-t border-border pt-[12px]"
+              >
+                <h4
+                  id={`${messageId}-related-label`}
+                  className="text-sm leading-4 font-medium text-muted-foreground"
+                >
+                  Related errors ({relatedDetails.length})
+                </h4>
+                <ol className="mt-[8px] flex min-w-0 list-decimal flex-col gap-[12px] pl-[20px] marker:text-muted-foreground">
+                  {relatedDetails.map((error) => (
+                    <li key={error.key} className="min-w-0 pl-[4px]">
+                      <h5 className="text-sm leading-5 font-medium text-destructive">
+                        {error.headline}
+                      </h5>
+                      <pre
+                        data-testid="related-error-content"
+                        className="mt-[4px] max-w-full min-w-0 whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground [overflow-wrap:anywhere]"
+                      >
+                        {error.text}
+                      </pre>
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            ) : null}
+            {diagnostics.length > 0 ? (
+              <Collapsible
+                open={diagnosticsOpen}
+                onOpenChange={setDiagnosticsOpen}
+                className="-mx-[8px] -mb-[8px] mt-[12px] w-[calc(100%+16px)] border-t"
+                style={{ borderColor: "var(--sidebar-edge-border, var(--border))" }}
+              >
+                <CollapsibleTrigger asChild>
+                  <button
+                    type="button"
+                    aria-controls={diagnosticsOpen ? diagnosticsId : undefined}
+                    className="flex w-full cursor-pointer items-center justify-between gap-3 px-[12px] py-[8px] text-left text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+                  >
+                    <span>View diagnostics</span>
+                    <ChevronRightIcon
+                      className={cn(
+                        "size-4 shrink-0 transition-transform",
+                        diagnosticsOpen && "rotate-90",
+                      )}
+                      aria-hidden="true"
+                    />
+                  </button>
+                </CollapsibleTrigger>
+                <CollapsibleContent id={diagnosticsId} className="min-w-0 px-[12px] pb-[12px]">
+                  <Tabs
+                    value={activeDiagnostics}
+                    onValueChange={setActiveDiagnostics}
+                    componentId="diagnostics.status.tabs"
+                  >
+                    {diagnostics.length > 1 ? (
+                      <TabsList
+                        variant="line"
+                        aria-label="Diagnostic sections"
+                        className="h-auto gap-5 p-0"
+                      >
+                        {diagnostics.map((item) => (
+                          <TabsTrigger
+                            key={item.id}
+                            value={item.id}
+                            className="h-auto flex-none rounded-none px-0 pt-0 pb-2 text-sm after:bottom-0"
+                          >
+                            {item.label}
+                          </TabsTrigger>
+                        ))}
+                      </TabsList>
+                    ) : null}
+                    {diagnostics.map((item) => (
+                      <TabsContent key={item.id} value={item.id} className="min-w-0">
+                        <div className="relative mt-1 min-w-0 rounded-xl bg-zinc-950 p-4 pr-12 text-zinc-100 shadow-inner">
+                          <pre
+                            data-testid="error-diagnostics-content"
+                            className="max-h-64 min-w-0 overflow-auto whitespace-pre-wrap break-words font-mono text-sm leading-6 text-zinc-100 [overflow-wrap:anywhere]"
+                          >
+                            {item.content}
+                          </pre>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon-xs"
+                            className="absolute top-3 right-3 text-zinc-300 hover:bg-white/10 hover:text-white"
+                            aria-label={
+                              copiedTarget === item.id
+                                ? `${item.label} copied`
+                                : `Copy ${item.label.toLowerCase()}`
+                            }
+                            onClick={() => void copy(item.id, item.content)}
+                            componentId="diagnostics.status.diagnostic_copy"
+                          >
+                            {copiedTarget === item.id ? (
+                              <CheckIcon aria-hidden="true" />
+                            ) : (
+                              <CopyIcon aria-hidden="true" />
+                            )}
+                          </Button>
+                        </div>
+                      </TabsContent>
+                    ))}
+                  </Tabs>
+                </CollapsibleContent>
+              </Collapsible>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -92,7 +904,7 @@ export function RetryIndicator({
   delaySeconds,
 }: RetryIndicatorProps) {
   return (
-    <div className="flex items-center gap-2 text-muted-foreground text-xs">
+    <div className="flex items-center gap-2 text-muted-foreground text-sm">
       <RotateCcwIcon className="size-3" />
       <span>
         Retrying {source} · attempt {attempt}/{maxAttempts}
@@ -110,45 +922,36 @@ export function RetryIndicator({
  */
 export function CompactionMarker() {
   return (
-    <div className="flex items-center gap-2 text-muted-foreground text-xs italic">
+    <div className="flex items-center gap-2 text-muted-foreground text-sm italic">
       <ShrinkIcon className="size-3" />
       <span>Conversation compacted</span>
     </div>
   );
 }
 
-interface RoutingDecisionChipProps {
-  model: string;
-  applied: boolean;
-  rationale: string;
+/**
+ * Short raw-pick name when the router's own vocabulary pick differs from the
+ * model actually applied (an unservable arm mapped to a servable id), else
+ * `null` — the common case where both names collapse to the same tier.
+ */
+function rawPickName(model: string, rawModel: string | null | undefined): string | null {
+  if (!rawModel) return null;
+  const raw = shortModelName(rawModel);
+  return raw === shortModelName(model) ? null : raw;
 }
 
 /**
- * Muted inline chip announcing the intelligent model router's pick at
- * the start of a turn.
+ * Short name of the model the spawn asked for, when Smart Routing picked a
+ * different one. `null` when nothing was attempted or both names collapse to
+ * the same tier — a struck-through name identical to the pill reads as a bug.
  */
-export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisionChipProps) {
-  const short = shortModelName(model);
-  const lead = applied ? short : `would have picked ${short}`;
-  const summary = `Intelligent model router · ${lead}`;
-  return (
-    <div
-      className="my-1 flex flex-col items-center gap-0.5 text-muted-foreground text-xs"
-      data-testid="routing-decision-chip"
-      data-applied={applied ? "true" : "false"}
-      title={rationale || summary}
-    >
-      <span className="flex items-center gap-1.5">
-        <BrainCircuitIcon className="size-3 shrink-0" />
-        <span>
-          Intelligent model router{" · "}
-          {!applied && <span>would have picked </span>}
-          <span className="font-medium text-foreground">{short}</span>
-        </span>
-      </span>
-      {rationale ? <span className="text-muted-foreground/70">{rationale}</span> : null}
-    </div>
-  );
+function attemptedPickName(
+  model: string,
+  attemptedOverride: string | null | undefined,
+): string | null {
+  if (!attemptedOverride) return null;
+  const attempted = shortModelName(attemptedOverride);
+  return attempted === shortModelName(model) ? null : attempted;
 }
 
 interface RoutingDecisionCardProps {
@@ -157,10 +960,12 @@ interface RoutingDecisionCardProps {
   rationale: string;
   /** Sub-agent name when this card is shown in the parent session. */
   agent?: string;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
 }
 
 /**
- * Collapsible card announcing the intelligent model router's session-level
+ * Collapsible card announcing smart routing's session-level
  * pick. Mirrors the SmartRoutingCard style: same container, model pill,
  * rationale, and expandable raw verdict JSON.
  *
@@ -174,12 +979,48 @@ export function RoutingDecisionCard({
   applied,
   rationale,
   agent,
+  routing,
 }: RoutingDecisionCardProps) {
+  const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const taskDescription = routing?.taskDescription?.trim();
   const short = shortModelName(model);
+  const rawShort = rawPickName(model, rawModel);
+  const attemptedShort = attemptedPickName(model, attemptedOverride);
+  const scopeLabel = subagentScopeLabel(scope, agent);
+  const harnessLabel = harnessDisplayLabel(harness);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
-    () => JSON.stringify({ model, applied, rationale, ...(agent ? { agent } : {}) }, null, 2),
-    [model, applied, rationale, agent],
+    () =>
+      JSON.stringify(
+        {
+          model,
+          applied,
+          rationale,
+          ...(agent ? { agent } : {}),
+          ...(taskDescription ? { task_description: taskDescription } : {}),
+          ...(harness ? { harness } : {}),
+          ...(scope ? { scope } : {}),
+          ...(decisionId ? { decision_id: decisionId } : {}),
+          ...(rawModel ? { raw_model: rawModel } : {}),
+          ...(attemptedOverride ? { attempted_override: attemptedOverride } : {}),
+          ...(routerSource ? { router_source: routerSource } : {}),
+        },
+        null,
+        2,
+      ),
+    [
+      model,
+      applied,
+      rationale,
+      agent,
+      taskDescription,
+      harness,
+      scope,
+      decisionId,
+      rawModel,
+      attemptedOverride,
+      routerSource,
+    ],
   );
   return (
     <Collapsible
@@ -191,10 +1032,31 @@ export function RoutingDecisionCard({
       data-testid="routing-decision-card"
       data-applied={applied ? "true" : "false"}
     >
-      <div className="flex items-center gap-1.5 text-xs">
+      <div className="flex items-center gap-1.5 text-sm">
         <BrainCircuitIcon className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="font-medium">Intelligent routing</span>
+        <span className="font-medium">Smart routing</span>
+        {routerSource === "databricks-aigw" ? (
+          <span
+            className="text-muted-foreground"
+            title="Routed by the Databricks Unity Gateway"
+            aria-label="Routed by the Databricks Unity Gateway"
+            role="img"
+            data-testid="routing-decision-source-databricks"
+          >
+            <DatabricksIcon className="size-3 shrink-0" />
+          </span>
+        ) : null}
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
+        {harnessLabel ? (
+          <span className="text-muted-foreground" data-testid="routing-decision-harness">
+            · {harnessLabel}
+          </span>
+        ) : null}
+        {scopeLabel ? (
+          <span className="text-muted-foreground" data-testid="routing-decision-scope">
+            · {scopeLabel}
+          </span>
+        ) : null}
         <CollapsibleTrigger
           className="ml-auto cursor-pointer rounded p-0.5 text-muted-foreground hover:text-foreground"
           aria-label="Show raw routing verdict"
@@ -203,14 +1065,54 @@ export function RoutingDecisionCard({
           <ChevronRightIcon className="size-3 transition-transform group-data-[state=open]:rotate-90" />
         </CollapsibleTrigger>
       </div>
-      <div className="flex items-center gap-2 text-xs">
-        <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
-        <span className="ml-auto shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground">
+      <div className="flex items-center gap-2 text-sm">
+        {taskDescription ? (
+          // Name the work even when sibling spawns share a type and rationale.
+          <span
+            className="min-w-0 truncate text-foreground"
+            data-testid="routing-decision-task"
+            title={taskDescription}
+          >
+            {taskDescription}
+          </span>
+        ) : (
+          <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        )}
+        {attemptedShort ? (
+          // The spawn named its own model and the router picked another — the
+          // substitution is the whole point of the row, so it shows at a glance.
+          <span
+            className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground line-through"
+            data-testid="routing-decision-attempted-override"
+            title="The spawn asked for this model; Smart Routing picked the one on the right."
+          >
+            {attemptedShort}
+          </span>
+        ) : null}
+        {rawShort ? (
+          // Router vocabulary pick that had to be mapped to a servable id —
+          // show what the router said next to what actually ran.
+          <span
+            className={cn(
+              "shrink-0 whitespace-nowrap font-mono text-[10px] text-muted-foreground",
+              !attemptedShort && "ml-auto",
+            )}
+            data-testid="routing-decision-raw-model"
+          >
+            {rawShort} →
+          </span>
+        ) : null}
+        <span
+          className={cn(
+            "shrink-0 inline-flex items-center whitespace-nowrap rounded-full border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] font-medium leading-none text-foreground",
+            !rawShort && !attemptedShort && "ml-auto",
+          )}
+        >
           {short}
         </span>
       </div>
       {rationale.length > 0 && (
-        <p className="text-xs leading-snug text-muted-foreground">{rationale}</p>
+        <p className="text-sm leading-snug text-muted-foreground">{rationale}</p>
       )}
       <CollapsibleContent className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         <CodeBlock code={prettyOutput} language="json">

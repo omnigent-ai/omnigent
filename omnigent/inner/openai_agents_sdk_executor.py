@@ -17,20 +17,25 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+import traceback
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
-from omnigent import model_catalog
+from omnigent._platform import IS_WINDOWS
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
-from omnigent.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
+from omnigent.models import model_catalog
+from omnigent.process_logging import redact_log_text
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
 
 from .async_utils import run_sync_on_thread
 from .executor import (
@@ -46,6 +51,7 @@ from .executor import (
     ToolSpec,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
     split_transient_tail,
 )
 from .open_responses_sdk import (
@@ -72,6 +78,7 @@ _EMPTY_TURN_MAX_ATTEMPTS = 2
 # retried.
 _NON_OUTPUT_ITEM_TYPES: frozenset[str] = frozenset({"reasoning_item", "compaction_item"})
 
+
 # Replay items persisted to the SDK Session — heterogeneous Responses-API
 # input items (function_call / function_call_output / message / etc.).
 # The SDK declares this as ``TResponseInputItem``, which is a TypedDict
@@ -90,6 +97,7 @@ RawToolItem: TypeAlias = Any  # type: ignore[explicit-any]
 # an optional import at type-check time — the executor only constructs
 # one when instantiated.
 AsyncOpenAIClient: TypeAlias = Any  # type: ignore[explicit-any]
+ReasoningItemIdPolicy: TypeAlias = Literal["preserve", "omit"]
 
 # Tool executor callable wired in by ``omnigent.Session``. The result
 # is JSON-ish (dict[str, Any]) but the static type leaks ``Any`` through
@@ -110,8 +118,8 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 
 def _normalize_responses_items_for_chat(
-    items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    items: list[_JsonObject],
+) -> list[_JsonObject]:
     """Apply :func:`_normalize_content_blocks_for_chat` to every message item.
 
     Walks the full Responses-API item list produced by
@@ -124,11 +132,18 @@ def _normalize_responses_items_for_chat(
     :returns: New list with normalised ``input_file`` blocks in message
         content.  Items without ``input_file`` blocks are returned as-is.
     """
-    result: list[dict[str, Any]] = []
-    for item in items:
-        if item.get("type") == "message":
+    from omnigent.inner.native_attachments import expand_framework_notices
+
+    result: list[_JsonObject] = []
+    for item in expand_framework_notices(items):
+        if item.get("type") == "message" or "role" in item:
             raw_content = item.get("content")
-            if isinstance(raw_content, list):
+            if item.get("role") == "assistant" and isinstance(raw_content, str):
+                # The chat converter iterates assistant content expecting
+                # blocks, so a plain string is walked character by character and
+                # each one indexed. User strings take a different branch there.
+                item = {**item, "content": [{"type": "output_text", "text": raw_content}]}
+            elif isinstance(raw_content, list):
                 normalized_content = _normalize_content_blocks_for_chat(raw_content)
                 if normalized_content is not raw_content:
                     item = {**item, "content": normalized_content}
@@ -137,8 +152,8 @@ def _normalize_responses_items_for_chat(
 
 
 def _normalize_content_blocks_for_chat(
-    content: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+    content: list[_JsonObject],
+) -> list[_JsonObject]:
     """Normalize content blocks before handing them to the openai-agents Runner.
 
     Converts ``input_file`` blocks whose ``file_data`` is a ``data:`` URI into
@@ -170,13 +185,14 @@ def _normalize_content_blocks_for_chat(
         (non-``text/*``) file blocks, undecodable, or empty file blocks are
         silently dropped.  Unknown block types pass through unchanged.
     """
-    result: list[dict[str, Any]] = []
+    result: list[_JsonObject] = []
     changed = False
     for block in content:
         block_type = block.get("type")
         if block_type == "input_file":
             changed = True
-            file_data: str = block.get("file_data", "")
+            raw_file_data = block.get("file_data", "")
+            file_data = raw_file_data if isinstance(raw_file_data, str) else ""
             if file_data.startswith("data:"):
                 try:
                     meta, b64 = file_data.split(",", 1)
@@ -207,7 +223,7 @@ def _normalize_content_blocks_for_chat(
     return result if changed else content
 
 
-def _copy_known_keys(block: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+def _copy_known_keys(block: _JsonObject, keys: tuple[str, ...]) -> _JsonObject:
     """Return *block* with only keys accepted by provider content schemas.
 
     Omnigent content blocks can carry UI/history metadata such as
@@ -370,7 +386,7 @@ def _patch_openai_sse_keepalive_tolerance() -> None:
 
     _orig_decode = decoder.decode
 
-    def decode(self: Any, line: str) -> Any:  # type: ignore[explicit-any]
+    def decode(self: object, line: str) -> object:
         sse = _orig_decode(self, line)
         if sse is not None and not (getattr(sse, "data", None) or "").strip():
             # Empty-data keepalive frame: drop it so the client never calls
@@ -378,8 +394,8 @@ def _patch_openai_sse_keepalive_tolerance() -> None:
             return None
         return sse
 
-    decoder.decode = decode  # type: ignore[method-assign]
-    decoder._omnigent_keepalive_patch = True  # type: ignore[attr-defined]
+    decoder.decode = decode
+    decoder._omnigent_keepalive_patch = True
 
 
 def _ensure_agents_sdk() -> ModuleType:
@@ -393,6 +409,20 @@ def _ensure_agents_sdk() -> ModuleType:
             "OpenAIAgentsSDKExecutor requires the 'openai-agents' package. "
             "Install it with: pip install openai-agents"
         ) from exc
+
+
+def _normalize_databricks_host(host: str) -> str:
+    """Normalize a Databricks workspace host URL for equality comparison.
+
+    Strips scheme, trailing slash, and case so hosts from different
+    sources (env override vs. profile config) compare correctly.
+    """
+    normalized = host.strip().lower()
+    for prefix in ("https://", "http://"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized.rstrip("/")
 
 
 def _get_openai_async_client(
@@ -466,10 +496,30 @@ def _get_openai_async_client(
                 "HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND."
             )
         host = host_override.rstrip("/")
+        gateway_auth: httpx.Auth
+        if IS_WINDOWS:
+            # The generated auth command is a POSIX sh script and Windows has no
+            # ``sh``; mint the profile's token in-process with the Databricks SDK.
+            if not profile:
+                raise OSError(
+                    "OpenAIAgentsSDKExecutor gateway auth on Windows requires a "
+                    "Databricks profile (no 'sh' available to run the auth command)."
+                )
+            from .databricks_executor import _resolve_databricks_auth
+
+            gateway_auth, resolved_host = _resolve_databricks_auth(profile)
+            if _normalize_databricks_host(resolved_host) != _normalize_databricks_host(host):
+                raise OSError(
+                    f"Databricks profile {profile!r} resolves to workspace host "
+                    f"{resolved_host!r}, which does not match the gateway host "
+                    f"{host_override!r}. Use a profile for the gateway's workspace."
+                )
+        else:
+            gateway_auth = _ShellCommandBearerAuth(databricks_auth_command)
         return AsyncOpenAI(
             base_url=base_url_override,
             api_key=_OPENAI_KEY_PLACEHOLDER,
-            http_client=httpx.AsyncClient(auth=_ShellCommandBearerAuth(databricks_auth_command)),
+            http_client=httpx.AsyncClient(auth=gateway_auth),
             **retry_kwargs,
         )
 
@@ -496,7 +546,12 @@ def _get_openai_async_client(
             **retry_kwargs,
         )
 
-    allow_ambient_databricks = model is None or model.startswith("databricks-")
+    # An unpinned model is not a Databricks signal: it means "use the
+    # provider's default", which run_turn resolves from the model catalog.
+    # Treating it as Databricks-hosted sent credential-less OpenAI agents into
+    # ambient Databricks auth, surfacing an "install databricks-sdk" error at
+    # users who never configured Databricks.
+    allow_ambient_databricks = model is not None and model.startswith("databricks-")
 
     # An explicit Databricks profile is authoritative; model-service names
     # are opaque Unity Catalog identifiers such as catalog.schema.service.
@@ -548,8 +603,9 @@ def _get_openai_async_client(
     # Without an explicit profile, only legacy Databricks model names opt in
     # to ambient Databricks credentials.
     if not profile and not allow_ambient_databricks:
+        target = f"for model {model!r}" if model is not None else "and no model is pinned"
         raise ValueError(
-            f"No provider credentials were configured for model {model!r}. "
+            f"No provider credentials were configured {target}. "
             "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
             "Databricks profile, or use a 'databricks-' prefixed model name "
             "for legacy automatic Databricks routing."
@@ -598,17 +654,35 @@ class _ShellCommandBearerAuth(httpx.Auth):
 
         :param request: The outgoing httpx request.
         :yields: The request with the auth header set.
-        :raises RuntimeError: When the command fails or prints no token.
+        :raises DatabricksAuthError: When ``sh`` is not on PATH or the command
+            fails or prints no token. Any other exception raised here is
+            collapsed by the OpenAI SDK into an opaque ``APIConnectionError``.
         """
+        from .databricks_executor import DatabricksAuthError
+
+        sh = shutil.which("sh")
+        if sh is None:
+            raise DatabricksAuthError(
+                "Databricks gateway auth command needs `sh` on PATH to mint a gateway "
+                "token, but no `sh` was found. Install a POSIX shell or add it to PATH."
+            )
         result = subprocess.run(
-            ["sh", "-c", self._command],
+            [sh, "-c", self._command],
             check=False,
             capture_output=True,
             text=True,
         )
         token = result.stdout.strip()
         if result.returncode != 0 or not token:
-            raise RuntimeError("Databricks auth command failed to return a bearer token.")
+            logger.error(
+                "Databricks gateway auth command failed (exit %d): %s",
+                result.returncode,
+                redact_log_text(result.stderr.strip()) or "<no stderr>",
+            )
+            raise DatabricksAuthError(
+                "Databricks gateway auth command failed to return a gateway token "
+                f"(exit {result.returncode}); its error output is in the harness log."
+            )
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
@@ -666,11 +740,11 @@ class _AgentsSessionState:
         before starting. Set by :meth:`interrupt_session`.
     """
 
-    sdk_session: Any  # type: ignore[explicit-any]  # _SanitizingSession or OpenAIResponsesCompactionSession
+    sdk_session: _SDKSession
     started: bool = False
     # agents.Agent[Any] instance; cached for reuse across turns.
     agent: SDKAgent = None
-    agent_signature: tuple[str, str, str, str, str] | None = None
+    agent_signature: tuple[str, str, str, str, str, str] | None = None
     resume_state: _RunState | None = None
     active_result: _RunResult | None = None
     interrupt_requested: bool = False
@@ -811,7 +885,7 @@ def _build_reasoning_model_settings(effort: str | None) -> dict[str, object]:
 
 
 def _is_databricks_openai_client(client: AsyncOpenAIClient) -> bool:
-    """Return whether *client* targets a Databricks AI Gateway base URL."""
+    """Return whether *client* targets a Databricks Unity Gateway base URL."""
     return "/ai-gateway/" in str(getattr(client, "base_url", ""))
 
 
@@ -938,7 +1012,82 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     return client
 
 
-def _count_output_items(new_items: list[Any]) -> int:  # type: ignore[explicit-any]
+def _is_plain_json(value: object) -> bool:
+    """Return whether *value* is acyclic JSON: scalars, lists, and str-keyed dicts.
+
+    A cycle returns ``False``, so the caller falls back to the client's normal
+    path; a node shared by two parents is fine, as it is for ``json.dumps``.
+    """
+    on_path: set[int] = set()
+    stack: list[tuple[object, bool]] = [(value, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
+        if isinstance(node, (dict, list)):
+            if id(node) in on_path:
+                return False
+            on_path.add(id(node))
+            stack.append((node, True))
+            if isinstance(node, dict):
+                if not all(isinstance(key, str) for key in node):
+                    return False
+                stack.extend((item, False) for item in node.values())
+            else:
+                stack.extend((item, False) for item in node)
+        elif node is not None and not isinstance(node, (str, int, float, bool)):
+            return False
+    return True
+
+
+def _history_via_extra_body(kwargs: dict[str, Any], field: str) -> dict[str, Any]:
+    """Move the plain-JSON history list *field* into ``extra_body``.
+
+    The client merges ``extra_body`` into the request body as-is, after its
+    type-driven param transform, so the request JSON is unchanged.
+
+    :param kwargs: Keyword arguments for a ``create`` call.
+    :param field: History parameter, ``"input"`` or ``"messages"``.
+    :returns: Rewritten kwargs, or *kwargs* itself when the value is not a
+        plain-JSON list or ``extra_body`` already sets *field*.
+    """
+    value = kwargs.get(field)
+    extra = kwargs.get("extra_body")
+    if not isinstance(value, list) or not value:
+        return kwargs
+    if extra is not None and (not isinstance(extra, dict) or field in extra):
+        return kwargs
+    if not _is_plain_json(value):
+        return kwargs
+    return {**kwargs, field: [], "extra_body": {**(extra or {}), field: value}}
+
+
+def _skip_history_transform(resource: object, field: str) -> None:
+    """Route *resource*'s ``create`` history list around the client's param transform.
+
+    The openai client walks every request param through ``transform`` on each
+    call, ~0.2 ms per history item, so a 400-item session spends ~85 ms per
+    turn before the request is sent. The Responses and Chat Completions param
+    types declare no aliases or formats, so for the plain JSON the Agents SDK
+    builds that walk changes nothing. Shadowing ``create`` on the instance also
+    covers ``with_streaming_response`` / ``with_raw_response``, which wrap it.
+
+    :param resource: ``client.responses`` or ``client.chat.completions``.
+    :param field: History parameter, ``"input"`` or ``"messages"``.
+    """
+    create = getattr(resource, "create", None)
+    if not callable(create) or getattr(create, "_skips_history_transform", False):
+        return
+
+    def _create(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        return create(*args, **_history_via_extra_body(kwargs, field))
+
+    _create._skips_history_transform = True  # type: ignore[attr-defined]
+    object.__setattr__(resource, "create", _create)
+
+
+def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
     Excludes bookkeeping items (reasoning, compaction) per
@@ -954,7 +1103,7 @@ def _count_output_items(new_items: list[Any]) -> int:  # type: ignore[explicit-a
     )
 
 
-def _sum_output_tokens(raw_responses: list[Any] | None) -> int:  # type: ignore[explicit-any]
+def _sum_output_tokens(raw_responses: Sequence[object] | None) -> int:
     """Sum ``output_tokens`` across a run's raw model responses.
 
     :param raw_responses: ``RunResult.raw_responses``; each element has a
@@ -963,13 +1112,16 @@ def _sum_output_tokens(raw_responses: list[Any] | None) -> int:  # type: ignore[
     """
     if not raw_responses:
         return 0
-    return sum(getattr(r.usage, "output_tokens", 0) or 0 for r in raw_responses)
+    return sum(
+        getattr(getattr(response, "usage", None), "output_tokens", 0) or 0
+        for response in raw_responses
+    )
 
 
 def _is_empty_turn(
     final_text: str,
     saw_tool_activity: bool,
-    new_items: list[Any],  # type: ignore[explicit-any]
+    new_items: Sequence[object],
 ) -> bool:
     """Whether a completed run produced literally nothing worth surfacing.
 
@@ -1008,11 +1160,14 @@ class OpenAIAgentsSDKExecutor(Executor):
         base_url_override: str | None = None,
         gateway_host: str | None = None,
         gateway_auth_command: str | None = None,
+        reasoning_item_id_policy: ReasoningItemIdPolicy | None = None,
     ) -> None:
         """Create an OpenAIAgentsSDKExecutor.
 
         :param client: A preconfigured ``openai.AsyncOpenAI`` client.  When
-            ``None`` the executor calls :func:`_get_openai_async_client`.
+            ``None`` the executor calls :func:`_get_openai_async_client` and
+            closes the resulting client when the executor is closed. An
+            injected client remains owned by the caller.
         :param profile: Optional ``~/.databrickscfg`` profile name for the
             Databricks fallback path, e.g. ``"<your-profile>"``.
         :param api_key: Direct OpenAI-compatible API key, e.g.
@@ -1051,7 +1206,15 @@ class OpenAIAgentsSDKExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND``.
+        :param reasoning_item_id_policy: Optional Responses API replay policy.
+            ``"preserve"`` retains reasoning item IDs; ``"omit"`` is available
+            for legacy providers that reject orphaned reasoning items. ``None``
+            leaves the setting unspecified and uses the SDK default.
+        :raises ValueError: If *reasoning_item_id_policy* is not ``"preserve"``
+            or ``"omit"``.
         """
+        if reasoning_item_id_policy not in (None, "preserve", "omit"):
+            raise ValueError("reasoning_item_id_policy must be 'preserve', 'omit', or unset")
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         raw_client = (
             client
@@ -1066,6 +1229,11 @@ class OpenAIAgentsSDKExecutor(Executor):
                 model=model,
             )
         )
+        if client is None:
+            # An injected client stays as the caller built it.
+            _skip_history_transform(getattr(raw_client, "responses", None), "input")
+            _chat = getattr(raw_client, "chat", None)
+            _skip_history_transform(getattr(_chat, "completions", None), "messages")
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises
@@ -1076,9 +1244,11 @@ class OpenAIAgentsSDKExecutor(Executor):
         self._client = (
             _wrap_client_for_reasoning_models(raw_client) if not use_responses else raw_client
         )
+        self._owns_client = client is None
         self._profile = profile
         self._use_responses = use_responses
         self._model_override = model
+        self._reasoning_item_id_policy = reasoning_item_id_policy
         self._databricks = _is_databricks_openai_client(self._client)
         self._tool_executor: ToolExecutor | None = None
         self._session_states: dict[str, _AgentsSessionState] = {}
@@ -1115,14 +1285,17 @@ class OpenAIAgentsSDKExecutor(Executor):
             return state
 
         underlying = _SanitizingSession(agents_sdk.SQLiteSession(session_key))
-        sdk_session: Any = underlying  # type: ignore[explicit-any]
+        sdk_session: _SDKSession = underlying
         # Wrap with compaction session when the client targets a real
         # HTTP endpoint. Skip for bare object() clients in unit tests
         # that lack base_url.
         _base = str(getattr(self._client, "base_url", ""))
         if _base.startswith("http"):
             try:
-                from agents.memory import OpenAIResponsesCompactionSession
+                from agents.memory import (
+                    OpenAIResponsesCompactionArgs,
+                    OpenAIResponsesCompactionSession,
+                )
 
                 class _SafeCompactionSession(OpenAIResponsesCompactionSession):
                     """Compaction session that treats compaction failures as non-fatal.
@@ -1133,20 +1306,26 @@ class OpenAIAgentsSDKExecutor(Executor):
                     without compaction.
                     """
 
-                    async def run_compaction(self, args=None):  # type: ignore[override]
+                    async def run_compaction(
+                        self,
+                        args: OpenAIResponsesCompactionArgs | None = None,
+                    ) -> None:
                         try:
                             await super().run_compaction(args)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             logger.debug(
                                 "Compaction call failed (endpoint may not support "
                                 "responses.compact), continuing without compaction",
                                 exc_info=True,
                             )
 
-                sdk_session = _SafeCompactionSession(
-                    session_id=session_key,
-                    underlying_session=underlying,  # type: ignore[arg-type]
-                    client=self._client,
+                sdk_session = cast(
+                    _SDKSession,
+                    _SafeCompactionSession(
+                        session_id=session_key,
+                        underlying_session=underlying,  # type: ignore[arg-type]
+                        client=self._client,
+                    ),
                 )
             except (ImportError, AttributeError, ValueError) as exc:
                 logger.debug(
@@ -1159,6 +1338,12 @@ class OpenAIAgentsSDKExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         self._session_states.pop(session_key, None)
+
+    async def close(self) -> None:
+        """Release session state and the client created by this executor."""
+        self._session_states.clear()
+        if self._owns_client:
+            await self._client.close()
 
     async def interrupt_session(self, session_key: str) -> bool:
         """
@@ -1274,8 +1459,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 # endpoint may not support ``file`` content blocks at all.
                 # Converting to ``input_text`` is the universally compatible
                 # path: the model sees the file content as plain text.
-                normalized = _normalize_content_blocks_for_chat(content)
-                return [{"type": "message", "role": "user", "content": normalized}]
+                return _normalize_responses_items_for_chat(
+                    [{"type": "message", "role": "user", "content": content}]
+                )
             return json.dumps(content)
         return _normalize_responses_items_for_chat(_convert_messages_to_responses(delta_messages))
 
@@ -1457,7 +1643,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                 cfg.extra.get("reasoning_effort"), "OpenAI Agents SDK", OPENAI_AGENTS_EFFORTS
             )
         except ValueError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
 
         state = self._get_or_create_session_state(agents_sdk, session_key)
@@ -1489,13 +1675,15 @@ class OpenAIAgentsSDKExecutor(Executor):
             max_tokens=max_tokens,
         )
         current_item_count = len(await state.sdk_session.get_items())
-        run_config = agents_sdk.RunConfig(
-            model=model,
-            model_provider=provider,
-            tracing_disabled=True,
-            reasoning_item_id_policy="omit",
-            call_model_input_filter=self._filter_model_input,
-        )
+        run_config_kwargs: dict[str, object] = {
+            "model": model,
+            "model_provider": provider,
+            "tracing_disabled": True,
+            "call_model_input_filter": self._filter_model_input,
+        }
+        if self._reasoning_item_id_policy is not None:
+            run_config_kwargs["reasoning_item_id_policy"] = self._reasoning_item_id_policy
+        run_config = agents_sdk.RunConfig(**run_config_kwargs)
         max_turns = 1 if stepwise_internal_turns else int(cfg.extra.get("max_turns", 1000))
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
@@ -1520,7 +1708,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                         ]
                         _last_user_msg = " ".join(_parts)[:500]
                     break
-            _req_data: dict[str, Any] = {
+            _req_data: _JsonObject = {
                 "model": model,
                 "messages_count": len(messages),
                 "tools_count": len(tools),
@@ -1703,8 +1891,19 @@ class OpenAIAgentsSDKExecutor(Executor):
                     logger.error("OpenAIAgentsSDKExecutor: auth failed: %s", auth_msg)
                     yield ExecutorError(message=auth_msg)
                 else:
-                    logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
-                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}")
+                    # The OpenAI SDK collapses any transport or auth-hook failure
+                    # into a bare "Connection error."; surface what caused it.
+                    # Cause type is safe for users; full (redacted) detail and
+                    # traceback go to the log only — never via raw exc_info.
+                    cause = exc.__cause__ or exc.__context__
+                    safe_detail = f"{exc} ({type(cause).__name__})" if cause else str(exc)
+                    log_detail = f"{exc} ({type(cause).__name__}: {cause})" if cause else str(exc)
+                    logger.error(
+                        "OpenAIAgentsSDKExecutor: run failed: %s\n%s",
+                        redact_log_text(log_detail),
+                        redact_log_text(traceback.format_exc()),
+                    )
+                    yield ExecutorError(message=f"OpenAI Agents SDK error: {safe_detail}")
                 return
             finally:
                 # If the outer generator was aclose'd before the
@@ -1796,27 +1995,25 @@ class OpenAIAgentsSDKExecutor(Executor):
         # re-sends the full history); the last sub-turn's total is
         # stable. Always set so the REPL and compaction don't fall
         # back to total_tokens (which sums across ALL sub-turns).
-        turn_usage: dict[str, Any] | None = None
+        turn_usage: _JsonObject | None = None
         raw_responses = getattr(result, "raw_responses", None)
         if raw_responses:
             in_tok = sum(getattr(r.usage, "input_tokens", 0) or 0 for r in raw_responses)
             out_tok = sum(getattr(r.usage, "output_tokens", 0) or 0 for r in raw_responses)
             total_tok = sum(getattr(r.usage, "total_tokens", 0) or 0 for r in raw_responses)
-            # OpenAI's ``input_tokens`` (aka ``prompt_tokens``) is the
-            # TOTAL input count *including* cached tokens, whereas
-            # ``compute_llm_cost`` expects Anthropic semantics where
-            # ``input_tokens`` is the non-cached portion and
-            # ``cache_read_input_tokens`` is additive. Extract cached
-            # tokens from ``prompt_tokens_details.cached_tokens`` and
-            # subtract so downstream billing uses the cheaper cache rate.
+            # SDK ``input_tokens`` INCLUDES cached tokens; ``compute_llm_cost`` expects
+            # Anthropic semantics (non-cached input + additive cache_read), so subtract
+            # ``Usage.input_tokens_details.cached_tokens`` (its only cache field).
             cached_tok = 0
             for r in raw_responses:
-                details = getattr(r.usage, "prompt_tokens_details", None)
+                details = getattr(r.usage, "input_tokens_details", None)
                 if details is not None:
                     cached = getattr(details, "cached_tokens", None)
                     if cached is None and isinstance(details, dict):
                         cached = details.get("cached_tokens")
-                    cached_tok += cached or 0
+                    # Clamp per response to [0, input] so malformed counts never go negative.
+                    r_in = getattr(r.usage, "input_tokens", 0) or 0
+                    cached_tok += min(max(cached or 0, 0), r_in)
             last_r = raw_responses[-1]
             last_in = getattr(last_r.usage, "input_tokens", 0) or 0
             last_out = getattr(last_r.usage, "output_tokens", 0) or 0
@@ -1843,11 +2040,13 @@ class OpenAIAgentsSDKExecutor(Executor):
 
                     _compaction_tokens = 0
                     if turn_usage is not None:
-                        _compaction_tokens = turn_usage.get("context_tokens", 0) or 0
-                    _compacted: list[dict[str, Any]] | None = None
+                        context_tokens = turn_usage.get("context_tokens")
+                        if isinstance(context_tokens, int):
+                            _compaction_tokens = context_tokens
+                    _compacted: list[ReplayItem] | None = None
                     try:
                         _compacted = await state.sdk_session.get_items()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             "Failed to read compacted session items",
                             exc_info=True,

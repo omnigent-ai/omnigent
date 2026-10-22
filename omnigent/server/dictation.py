@@ -190,6 +190,7 @@ class _EngineEntry:
     available: AvailabilityProbe
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- static engine-name registry
 _ENGINE_REGISTRY: dict[str, _EngineEntry] = {}
 
 
@@ -345,7 +346,7 @@ class SherpaDictationEngine:
             model; silently skipped when absent or incomplete.
         :raises RuntimeError: If the ASR file set is incomplete.
         """
-        import sherpa_onnx
+        import sherpa_onnx  # type: ignore[import-not-found]
 
         files = _asr_files(asr_dir)
         if files is None:
@@ -380,7 +381,7 @@ class SherpaDictationEngine:
                         )
                     )
                 )
-            except Exception:  # noqa: BLE001 - punctuation is best-effort
+            except Exception:  # punctuation is best-effort
                 _logger.warning(
                     "dictation punctuation model failed to load from %s; "
                     "emitting raw recognizer output",
@@ -404,7 +405,8 @@ class SherpaDictationEngine:
         cleaned = _PUNCT_STRIP_RE.sub("", text.lower())
         try:
             with self._lock:
-                return self._punct.add_punctuation_with_case(cleaned)
+                result = self._punct.add_punctuation_with_case(cleaned)
+            return result if isinstance(result, str) else text
         except Exception:  # noqa: BLE001 - never fail a take over cosmetics
             return text
 
@@ -423,7 +425,7 @@ class _SherpaStream:
 
     def feed_pcm16(self, data: bytes) -> DictationUpdate:
         """Decode one PCM chunk; fold an endpoint into ``finalized``."""
-        import numpy as np
+        import numpy as np  # type: ignore[import-not-found]
 
         # Drop a trailing odd byte rather than crash the take; the next
         # frame realigns (client frames are always whole samples).

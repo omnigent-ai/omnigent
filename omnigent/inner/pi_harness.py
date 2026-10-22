@@ -21,7 +21,7 @@ Env vars read at startup:
   else to Pi's own default.
 - ``HARNESS_PI_GATEWAY``: ``"1"`` / ``"true"`` to write a
   ``models.json`` pointing Pi at a vendor-neutral gateway (base
-  URLs + bearer-token command + model). The Databricks AI gateway
+  URLs + bearer-token command + model). The Databricks Unity Gateway
   is one producer of this transport; generic ``key`` / ``gateway``
   providers are another. Otherwise the executor uses Pi's built-in
   API path.
@@ -33,6 +33,8 @@ Env vars read at startup:
 - ``HARNESS_PI_GATEWAY_BASE_URLS``: JSON object of gateway base
   URLs keyed by model family, e.g.
   ``{"claude": "https://example.databricks.com/ai-gateway/anthropic"}``.
+- ``HARNESS_PI_GATEWAY_OPENAI_WIRE_API``: ``"responses"`` or ``"chat"``
+  for a configured generic OpenAI-compatible provider.
 - ``HARNESS_PI_CWD``: working directory the executor launches
   the Pi CLI in. ``None`` falls back to ``OMNIGENT_RUNNER_WORKSPACE`` if set,
   then to the subprocess's inherited cwd.
@@ -56,9 +58,16 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<name>/`` for the
-  ``"all"`` and named-list cases. Unset for agents without a
-  bundled-skill directory.
+  bundled skills from ``<bundle>/skills/<dir>/`` and
+  ``<bundle>/.pi/skills/<dir>/`` for the ``"all"`` and named-list
+  cases, loads ``<bundle>/.pi/extensions`` via ``--extension``, and
+  appends a bundle-root context file (``AGENTS.md`` et al.) to the
+  system prompt. Unset for agents without a bundle directory.
+- ``HARNESS_PI_CONTEXT_FILES``: Whether Pi automatically loads context files
+  such as ``AGENTS.md`` and ``CLAUDE.md``, including the bundle-root one.
+  Defaults to true.
+- ``HARNESS_PI_SYSTEM_PROMPT_MODE``: ``append`` (default) or ``replace`` Pi's
+  base prompt with Omnigent's composed instructions.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
   future use; currently unused by Pi.
 """
@@ -75,6 +84,7 @@ from fastapi import FastAPI
 from omnigent.harness_startup_config import resolve_harness_path
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.inner.pi_executor import PiExecutor
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
@@ -84,6 +94,7 @@ _logger = logging.getLogger(__name__)
 # the module docstring for semantics. Centralizing as constants
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_PI_MODEL"
+_ENV_PRESERVE_MODEL_IDS = "HARNESS_PI_PRESERVE_MODEL_IDS"
 _ENV_GATEWAY = "HARNESS_PI_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_PI_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_PI_GATEWAY_HOST"
@@ -94,10 +105,13 @@ _ENV_PI_PATH = "OMNIGENT_PI_PATH"
 _LEGACY_ENV_PI_PATH = "HARNESS_PI_PATH"
 _ENV_OS_ENV = "HARNESS_PI_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_PI_SKILLS_FILTER"
+_ENV_CONTEXT_FILES = "HARNESS_PI_CONTEXT_FILES"
+_ENV_SYSTEM_PROMPT_MODE = "HARNESS_PI_SYSTEM_PROMPT_MODE"
 _ENV_BUNDLE_DIR = "HARNESS_PI_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
+_ENV_GATEWAY_OPENAI_WIRE_API = "HARNESS_PI_GATEWAY_OPENAI_WIRE_API"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_PI_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
 
@@ -175,7 +189,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),
@@ -199,8 +213,8 @@ def _build_pi_executor() -> Executor:
     Construct a :class:`PiExecutor` from env-var config.
 
     Called lazily by the :class:`ExecutorAdapter` on the first
-    turn. Heavyweight init (CLI discovery, eager Databricks
-    credential resolution) happens at this point — operators
+    turn. CLI discovery happens at this point; credentials resolve
+    asynchronously before the first request. Operators
     see the failure surface as a startup error on the first
     request, not at FastAPI app boot.
 
@@ -208,15 +222,14 @@ def _build_pi_executor() -> Executor:
     :raises ImportError: If the ``pi`` CLI isn't on PATH and
         ``OMNIGENT_PI_PATH`` (legacy ``HARNESS_PI_PATH``) isn't set — the inner executor's
         constructor surfaces this as a clear ImportError.
-    :raises OSError: If ``HARNESS_PI_GATEWAY`` is set but
-        credentials are missing — the inner executor's
-        constructor fails loud.
+    :raises OSError: If a gateway host is configured without an auth command.
     """
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return PiExecutor(
+        preserve_model_ids=os.environ.get(_ENV_PRESERVE_MODEL_IDS) == "true",
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE"),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
@@ -226,10 +239,15 @@ def _build_pi_executor() -> Executor:
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
         base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
         base_urls_override=_resolve_gateway_base_urls(),
+        openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
+        gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
+        or None,
         bundle_dir=bundle_dir,
         agent_name=agent_name,
         skills_filter=_resolve_skills_filter(),
+        context_files=_parse_truthy(_ENV_CONTEXT_FILES, default=True),
+        system_prompt_mode=os.environ.get(_ENV_SYSTEM_PROMPT_MODE, "append"),
     )
 
 

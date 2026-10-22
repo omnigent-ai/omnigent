@@ -1,7 +1,7 @@
 """WebSocket tunnel frame schema (Phase 4).
 
-Eight frame kinds, all JSON, per ``designs/RUNNER.md`` §3 "Frame
-wire format". Frames carrying request/response correlation use an
+Typed JSON frames on the existing runner tunnel, per the runner frame
+wire format. Frames carrying request/response correlation use an
 ``id`` field; ``hello`` / ``ping`` / ``pong`` don't.
 
 Body-bearing frames (``request``, ``response.body``) carry an
@@ -23,7 +23,9 @@ import base64
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import cast
+
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 
 class FrameKind(str, Enum):
@@ -43,6 +45,9 @@ class FrameKind(str, Enum):
     WS_OPEN = "ws.open"
     WS_FRAME = "ws.frame"
     WS_CLOSE = "ws.close"
+    EVENT_READY = "event.ready"
+    EVENT_BATCH = "event.batch"
+    EVENT_ACK = "event.ack"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -62,6 +67,17 @@ class HelloFrame:
         ``DISABLE_TELEMETRY=true``, or ``telemetry: false`` in
         config.yaml).  The server honours this on a best-effort basis
         by skipping telemetry events for sessions on this runner.
+    :param direct_attach_port: Loopback TCP port of the runner's
+        direct terminal-attach listener, or ``None`` when the runner
+        does not run one. Lets a browser on the same machine attach
+        without the server relay.
+    :param direct_attach_token: Per-process bearer token guarding the
+        direct-attach listener. Only meaningful alongside
+        *direct_attach_port*; both travel together or not at all.
+    :param capabilities: Optional build features; omitted by older runners.
+    :param connection_id: Runner-minted identifier for this connection
+        attempt, stamped on both ends' tunnel debug-log rows. ``None``
+        from runners that predate it.
     """
 
     runner_version: str
@@ -69,6 +85,10 @@ class HelloFrame:
     harnesses: list[str] = field(default_factory=list)
     envs: list[str] = field(default_factory=list)
     telemetry_opt_out: bool = False
+    direct_attach_port: int | None = None
+    direct_attach_token: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -105,9 +125,16 @@ class ResponseBodyFrame:
 
 @dataclass
 class ResponseEndFrame:
-    """Runner → server: end of response."""
+    """Runner → server: end of response.
+
+    :param error: When set, the stream ended abnormally (e.g. a
+        mid-stream generator raise).  The server routes this as an
+        abort so the consumer receives an exception rather than a
+        clean EOF after partial body.
+    """
 
     id: str
+    error: str | None = None
 
 
 @dataclass
@@ -175,6 +202,39 @@ class WSCloseFrame:
     reason: str = ""
 
 
+# Additive extension of the runner tunnel, negotiated after hello. These are
+# not tunneled HTTP responses or terminal WebSocket channel frames.
+EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
+
+# Close reason (with code 1000) a runner sends when its idle watchdog found no
+# active work, so the server settles the runner's sessions instead of failing them.
+RUNNER_IDLE_SHUTDOWN_CLOSE_REASON = "runner idle shutdown"
+
+
+@dataclass
+class EventReadyFrame:
+    """Server → runner: event ingestion is available on this tunnel generation."""
+
+
+@dataclass
+class EventBatchFrame:
+    """Runner → server: one ordered batch for a single bound session."""
+
+    id: str
+    session_id: str
+    events: list[dict[str, object]]
+
+
+@dataclass
+class EventAckFrame:
+    """Server → runner: entries [0, applied) completed; retry or reject the rest."""
+
+    id: str
+    applied: int
+    error: str | None = None
+    retryable: bool = False
+
+
 Frame = (
     HelloFrame
     | RequestFrame
@@ -187,6 +247,9 @@ Frame = (
     | WSOpenFrame
     | WSFrame
     | WSCloseFrame
+    | EventReadyFrame
+    | EventBatchFrame
+    | EventAckFrame
 )
 
 
@@ -199,16 +262,25 @@ def encode_frame(frame: Frame) -> str:
     The output is what goes onto the WebSocket as a text message.
     """
     if isinstance(frame, HelloFrame):
-        return json.dumps(
-            {
-                "kind": FrameKind.HELLO.value,
-                "runner_version": frame.runner_version,
-                "frame_protocol_version": frame.frame_protocol_version,
-                "harnesses": list(frame.harnesses),
-                "envs": list(frame.envs),
-                "telemetry_opt_out": frame.telemetry_opt_out,
-            }
-        )
+        payload: dict[str, object] = {
+            "kind": FrameKind.HELLO.value,
+            "runner_version": frame.runner_version,
+            "frame_protocol_version": frame.frame_protocol_version,
+            "harnesses": list(frame.harnesses),
+            "envs": list(frame.envs),
+            "telemetry_opt_out": frame.telemetry_opt_out,
+        }
+        if frame.capabilities:
+            payload["capabilities"] = list(frame.capabilities)
+        if frame.connection_id:
+            payload["connection_id"] = frame.connection_id
+        # Emitted only when the listener is actually up, so old servers
+        # (which ignore unknown keys) and advert-less runners share one
+        # wire shape.
+        if frame.direct_attach_port is not None and frame.direct_attach_token:
+            payload["direct_attach_port"] = frame.direct_attach_port
+            payload["direct_attach_token"] = frame.direct_attach_token
+        return json.dumps(payload)
     if isinstance(frame, RequestFrame):
         return json.dumps(
             {
@@ -242,7 +314,10 @@ def encode_frame(frame: Frame) -> str:
             }
         )
     if isinstance(frame, ResponseEndFrame):
-        return json.dumps({"kind": FrameKind.RESPONSE_END.value, "id": frame.id})
+        d: dict[str, object] = {"kind": FrameKind.RESPONSE_END.value, "id": frame.id}
+        if frame.error is not None:
+            d["error"] = frame.error
+        return json.dumps(d)
     if isinstance(frame, RequestCancelFrame):
         return json.dumps(
             {
@@ -282,6 +357,27 @@ def encode_frame(frame: Frame) -> str:
                 "reason": frame.reason,
             }
         )
+    if isinstance(frame, EventReadyFrame):
+        return json.dumps({"kind": FrameKind.EVENT_READY.value})
+    if isinstance(frame, EventBatchFrame):
+        return json.dumps(
+            {
+                "kind": FrameKind.EVENT_BATCH.value,
+                "id": frame.id,
+                "session_id": frame.session_id,
+                "events": _validated_batch_events(frame.events),
+            }
+        )
+    if isinstance(frame, EventAckFrame):
+        return json.dumps(
+            {
+                "kind": FrameKind.EVENT_ACK.value,
+                "id": frame.id,
+                "applied": frame.applied,
+                "error": frame.error,
+                "retryable": frame.retryable,
+            }
+        )
     raise TypeError(f"unknown frame type: {type(frame).__name__}")
 
 
@@ -296,7 +392,7 @@ def decode_frame(text: str) -> Frame:
     return _decode_known_frame(kind, msg)
 
 
-def _parse_frame_object(text: str) -> dict[str, Any]:
+def _parse_frame_object(text: str) -> _JsonObject:
     """Parse a JSON frame object.
 
     :param text: Raw JSON frame text.
@@ -304,15 +400,17 @@ def _parse_frame_object(text: str) -> dict[str, Any]:
     :raises ValueError: If the payload is not a JSON object.
     """
     try:
-        msg = json.loads(text)
+        value: object = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError(f"frame is not valid JSON: {exc}") from exc
-    if not isinstance(msg, dict):
-        raise ValueError(f"frame must be a JSON object, got {type(msg).__name__}")
-    return msg
+    if not isinstance(value, dict):
+        raise ValueError(f"frame must be a JSON object, got {type(value).__name__}")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError("frame object keys must be strings")
+    return cast("_JsonObject", value)
 
 
-def _parse_frame_kind(msg: dict[str, Any]) -> FrameKind:
+def _parse_frame_kind(msg: _JsonObject) -> FrameKind:
     """Parse the frame kind discriminator.
 
     :param msg: Decoded frame object.
@@ -328,7 +426,7 @@ def _parse_frame_kind(msg: dict[str, Any]) -> FrameKind:
         raise ValueError(f"unknown frame kind: {kind!r}") from exc
 
 
-def _decode_known_frame(kind: FrameKind, msg: dict[str, Any]) -> Frame:
+def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
     """Decode a frame with a validated kind.
 
     :param kind: Parsed frame kind.
@@ -346,7 +444,10 @@ def _decode_known_frame(kind: FrameKind, msg: dict[str, Any]) -> Frame:
         case FrameKind.RESPONSE_BODY:
             return _decode_response_body(msg)
         case FrameKind.RESPONSE_END:
-            return ResponseEndFrame(id=_required_str(msg, "id"))
+            return ResponseEndFrame(
+                id=_required_str(msg, "id"),
+                error=msg.get("error") if isinstance(msg.get("error"), str) else None,
+            )
         case FrameKind.REQUEST_CANCEL:
             return _decode_request_cancel(msg)
         case FrameKind.PING:
@@ -359,26 +460,71 @@ def _decode_known_frame(kind: FrameKind, msg: dict[str, Any]) -> Frame:
             return _decode_ws_frame(msg)
         case FrameKind.WS_CLOSE:
             return _decode_ws_close(msg)
+        case FrameKind.EVENT_READY:
+            return EventReadyFrame()
+        case FrameKind.EVENT_BATCH:
+            return EventBatchFrame(
+                id=_required_str(msg, "id"),
+                session_id=_required_str(msg, "session_id"),
+                events=_validated_batch_events(msg.get("events")),
+            )
+        case FrameKind.EVENT_ACK:
+            applied = _required_int(msg, "applied")
+            if applied < 0:
+                raise ValueError("event.ack applied must be nonnegative")
+            return EventAckFrame(
+                id=_required_str(msg, "id"),
+                applied=applied,
+                error=_optional_nullable_str(msg, "error"),
+                retryable=_optional_bool(msg, "retryable", False),
+            )
     # Unreachable — all enum members handled above.
     raise ValueError(f"unhandled frame kind: {kind.value!r}")  # pragma: no cover
 
 
-def _decode_hello(msg: dict[str, Any]) -> HelloFrame:
+def _validated_batch_events(events: object) -> list[dict[str, object]]:
+    if (
+        not isinstance(events, list)
+        or not events
+        or not all(
+            isinstance(event, dict) and isinstance(event.get("type"), str) for event in events
+        )
+    ):
+        raise ValueError("event.batch requires a nonempty event array with string types")
+    return cast("list[dict[str, object]]", events)
+
+
+def _decode_hello(msg: _JsonObject) -> HelloFrame:
     """Decode a hello frame.
 
     :param msg: Decoded frame object.
     :returns: Typed hello frame.
     """
+    # The direct-attach advert is optional and its two fields only mean
+    # anything together — a half-present pair decodes as absent.
+    raw_port = msg.get("direct_attach_port")
+    raw_token = msg.get("direct_attach_token")
+    direct_port = (
+        raw_port if isinstance(raw_port, int) and not isinstance(raw_port, bool) else None
+    )
+    direct_token = raw_token if isinstance(raw_token, str) and raw_token else None
+    if direct_port is None or direct_token is None:
+        direct_port = None
+        direct_token = None
     return HelloFrame(
         runner_version=_required_str(msg, "runner_version"),
         frame_protocol_version=_required_int(msg, "frame_protocol_version"),
         harnesses=_optional_str_list(msg, "harnesses"),
         envs=_optional_str_list(msg, "envs"),
         telemetry_opt_out=_optional_bool(msg, "telemetry_opt_out", False),
+        direct_attach_port=direct_port,
+        direct_attach_token=direct_token,
+        capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_str(msg, "connection_id", "") or None,
     )
 
 
-def _decode_request(msg: dict[str, Any]) -> RequestFrame:
+def _decode_request(msg: _JsonObject) -> RequestFrame:
     """Decode a request frame.
 
     :param msg: Decoded frame object.
@@ -396,7 +542,7 @@ def _decode_request(msg: dict[str, Any]) -> RequestFrame:
     )
 
 
-def _decode_response_head(msg: dict[str, Any]) -> ResponseHeadFrame:
+def _decode_response_head(msg: _JsonObject) -> ResponseHeadFrame:
     """Decode a response-head frame.
 
     :param msg: Decoded frame object.
@@ -409,7 +555,7 @@ def _decode_response_head(msg: dict[str, Any]) -> ResponseHeadFrame:
     )
 
 
-def _decode_response_body(msg: dict[str, Any]) -> ResponseBodyFrame:
+def _decode_response_body(msg: _JsonObject) -> ResponseBodyFrame:
     """Decode a response-body frame.
 
     :param msg: Decoded frame object.
@@ -422,7 +568,7 @@ def _decode_response_body(msg: dict[str, Any]) -> ResponseBodyFrame:
     )
 
 
-def _decode_request_cancel(msg: dict[str, Any]) -> RequestCancelFrame:
+def _decode_request_cancel(msg: _JsonObject) -> RequestCancelFrame:
     """Decode a request-cancel frame.
 
     :param msg: Decoded frame object.
@@ -434,7 +580,7 @@ def _decode_request_cancel(msg: dict[str, Any]) -> RequestCancelFrame:
     )
 
 
-def _decode_ws_open(msg: dict[str, Any]) -> WSOpenFrame:
+def _decode_ws_open(msg: _JsonObject) -> WSOpenFrame:
     """Decode a WebSocket-open frame.
 
     :param msg: Decoded frame object.
@@ -447,7 +593,7 @@ def _decode_ws_open(msg: dict[str, Any]) -> WSOpenFrame:
     )
 
 
-def _decode_ws_frame(msg: dict[str, Any]) -> WSFrame:
+def _decode_ws_frame(msg: _JsonObject) -> WSFrame:
     """Decode a WebSocket data frame.
 
     :param msg: Decoded frame object.
@@ -460,7 +606,7 @@ def _decode_ws_frame(msg: dict[str, Any]) -> WSFrame:
     )
 
 
-def _decode_ws_close(msg: dict[str, Any]) -> WSCloseFrame:
+def _decode_ws_close(msg: _JsonObject) -> WSCloseFrame:
     """Decode a WebSocket-close frame.
 
     :param msg: Decoded frame object.
@@ -473,21 +619,28 @@ def _decode_ws_close(msg: dict[str, Any]) -> WSCloseFrame:
     )
 
 
-def _required_str(msg: dict[str, Any], key: str) -> str:
+def _required_str(msg: _JsonObject, key: str) -> str:
     val = msg.get(key)
     if not isinstance(val, str):
         raise ValueError(f"frame missing required string field: {key!r}")
     return val
 
 
-def _required_int(msg: dict[str, Any], key: str) -> int:
+def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
+    val = msg.get(key)
+    if val is not None and not isinstance(val, str):
+        raise ValueError(f"frame field must be a string or null: {key!r}")
+    return val
+
+
+def _required_int(msg: _JsonObject, key: str) -> int:
     val = msg.get(key)
     if not isinstance(val, int) or isinstance(val, bool):
         raise ValueError(f"frame missing required int field: {key!r}")
     return val
 
 
-def _optional_str(msg: dict[str, Any], key: str, default: str) -> str:
+def _optional_str(msg: _JsonObject, key: str, default: str) -> str:
     """Return an optional string field.
 
     :param msg: Decoded frame object.
@@ -502,7 +655,7 @@ def _optional_str(msg: dict[str, Any], key: str, default: str) -> str:
     return val
 
 
-def _optional_bool(msg: dict[str, Any], key: str, default: bool) -> bool:
+def _optional_bool(msg: _JsonObject, key: str, default: bool) -> bool:
     """Return an optional boolean field.
 
     :param msg: Decoded frame object.
@@ -517,7 +670,7 @@ def _optional_bool(msg: dict[str, Any], key: str, default: bool) -> bool:
     return val
 
 
-def _optional_int(msg: dict[str, Any], key: str, default: int) -> int:
+def _optional_int(msg: _JsonObject, key: str, default: int) -> int:
     """Return an optional integer field.
 
     :param msg: Decoded frame object.
@@ -532,7 +685,7 @@ def _optional_int(msg: dict[str, Any], key: str, default: int) -> int:
     return val
 
 
-def _optional_body(msg: dict[str, Any]) -> str | None:
+def _optional_body(msg: _JsonObject) -> str | None:
     """Return an optional request body field.
 
     :param msg: Decoded request frame object.
@@ -545,7 +698,7 @@ def _optional_body(msg: dict[str, Any]) -> str | None:
     return val
 
 
-def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
+def _optional_str_list(msg: _JsonObject, key: str) -> list[str]:
     """Return an optional list of strings.
 
     :param msg: Decoded frame object.
@@ -559,7 +712,7 @@ def _optional_str_list(msg: dict[str, Any], key: str) -> list[str]:
     return list(val)
 
 
-def _optional_headers(msg: dict[str, Any]) -> list[list[str]]:
+def _optional_headers(msg: _JsonObject) -> list[list[str]]:
     """Return optional HTTP headers.
 
     :param msg: Decoded request or response-head frame object.

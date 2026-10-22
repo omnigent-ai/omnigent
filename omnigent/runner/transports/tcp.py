@@ -47,6 +47,8 @@ def _pick_free_port() -> int:
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
+    if not isinstance(port, int):
+        raise RuntimeError(f"expected an integer TCP port, got {port!r}")
     return port
 
 
@@ -86,6 +88,7 @@ class RunnerTCPSubprocess:
             self.port = _pick_free_port()
         cmd = [
             sys.executable,
+            "-P",
             "-m",
             "uvicorn",
             "--factory",

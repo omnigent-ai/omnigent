@@ -8,7 +8,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { createRef } from "react";
 import type { RefObject } from "react";
 import { MarkdownSearchBar } from "./MarkdownSearchBar";

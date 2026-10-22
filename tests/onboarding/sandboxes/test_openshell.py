@@ -12,10 +12,12 @@ from typing import Any
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE, SandboxGoneError
 from omnigent.onboarding.sandboxes.openshell import (
+    _PUT_CHUNK_BYTES,
     HOST_IMAGE_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
+    WORKSPACE_ENV_VAR,
     OpenShellSandboxLauncher,
     _OpenShellClient,
 )
@@ -53,6 +55,7 @@ class _FakeOpenShellAPI:
     create_kwargs: list[dict[str, Any]] = field(default_factory=list)
     exec_calls: list[tuple[str, list[str], bytes | None]] = field(default_factory=list)
     statuses: list[str] = field(default_factory=list)
+    resumed: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     closed: bool = False
     exec_result: _FakeExecResult = field(default_factory=_FakeExecResult)
@@ -88,6 +91,9 @@ class _FakeOpenShellAPI:
 
     def get_status(self, name: str) -> None:
         self.statuses.append(name)
+
+    def resume_sandbox(self, name: str) -> None:
+        self.resumed.append(name)
 
     def delete_sandbox(self, name: str) -> None:
         self.deleted.append(name)
@@ -231,7 +237,7 @@ def test_run_background_uses_exec_background(monkeypatch: pytest.MonkeyPatch) ->
     assert name == "sb-1"
     assert command[:2] == ["bash", "-lc"]
     assert "omnigent host --server https://s" in command[2]
-    assert "> /tmp/host.log 2>&1 < /dev/null" in command[2]
+    assert ">> /tmp/host.log 2>&1 < /dev/null" in command[2]
     assert fake.exec_calls == []
 
 
@@ -254,6 +260,88 @@ def test_put_uploads_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     assert stdin == b"fake-tarball"
 
 
+@pytest.mark.parametrize(
+    "chunk_sizes",
+    [
+        (_PUT_CHUNK_BYTES,),
+        (_PUT_CHUNK_BYTES, _PUT_CHUNK_BYTES),
+        (_PUT_CHUNK_BYTES, _PUT_CHUNK_BYTES, 17),
+    ],
+    ids=["single-chunk", "exact-multiple", "partial-final-chunk"],
+)
+def test_put_chunks_large_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, chunk_sizes: tuple[int, ...]
+) -> None:
+    """``put`` splits a file that would exceed the gateway's 1 MiB message cap."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    chunks = [
+        bytes((offset + index) % 256 for offset in range(size))
+        for index, size in enumerate(chunk_sizes)
+    ]
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(b"".join(chunks))
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert [stdin for _, _, stdin in fake.exec_calls] == chunks
+    for index, (name, command, _) in enumerate(fake.exec_calls):
+        redirect = ">" if index == 0 else ">>"
+        assert name == "sb-1"
+        assert command == [
+            "bash",
+            "-c",
+            f"mkdir -p /tmp/oa && cat {redirect} /tmp/oa/wheels.tgz",
+        ]
+
+
+def test_put_snapshots_source_before_upload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A source rewritten during the upload cannot change the remaining chunks."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    payload = bytes(range(256)) * (_PUT_CHUNK_BYTES // 256 + 1)
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(payload)
+    record_execute = fake.execute
+
+    def rewrite_source(*args: Any, **kwargs: Any) -> _FakeExecResult:
+        result = record_execute(*args, **kwargs)
+        if len(fake.exec_calls) == 1:
+            local_file.write_bytes(b"rewritten")
+        return result
+
+    monkeypatch.setattr(fake, "execute", rewrite_source)
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert [stdin for _, _, stdin in fake.exec_calls] == [
+        payload[:_PUT_CHUNK_BYTES],
+        payload[_PUT_CHUNK_BYTES:],
+    ]
+
+
+def test_put_creates_empty_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``put`` still creates a zero-byte file rather than skipping it."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    local_file = tmp_path / "empty"
+    local_file.write_bytes(b"")
+
+    launcher.put("sb-1", local_file, "/tmp/oa/empty")
+
+    [(_, command, stdin)] = fake.exec_calls
+    assert "cat > /tmp/oa/empty" in command[2]
+    assert stdin == b""
+
+
 def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``put`` raises when the remote ``cat`` exits non-zero."""
     fake = _FakeOpenShellAPI(exec_result=_FakeExecResult(exit_code=1, stderr="denied"))
@@ -265,6 +353,84 @@ def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
 
     with pytest.raises(click.ClickException, match="File upload"):
         launcher.put("sb-1", local_file, "/tmp/wheels.tgz")
+
+
+def test_put_stops_on_chunk_failure_and_restarts_on_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed append stops the upload; a whole-call retry truncates first."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    chunks = [b"\x00" * _PUT_CHUNK_BYTES, b"\xff" * _PUT_CHUNK_BYTES, b"tail"]
+    local_file = tmp_path / "wheels.tgz"
+    local_file.write_bytes(b"".join(chunks))
+    record_execute = fake.execute
+
+    def fail_second_chunk(*args: Any, **kwargs: Any) -> _FakeExecResult:
+        result = record_execute(*args, **kwargs)
+        if len(fake.exec_calls) == 2:
+            return _FakeExecResult(exit_code=1, stderr="quota exceeded")
+        return result
+
+    monkeypatch.setattr(fake, "execute", fail_second_chunk)
+
+    with pytest.raises(click.ClickException, match="quota exceeded"):
+        launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+    assert [stdin for _, _, stdin in fake.exec_calls] == chunks[:2]
+
+    launcher.put("sb-1", local_file, "/tmp/oa/wheels.tgz")
+
+    assert [stdin for _, _, stdin in fake.exec_calls[2:]] == chunks
+    assert "cat > /tmp/oa/wheels.tgz" in fake.exec_calls[2][1][2]
+
+
+def test_launcher_capabilities_join_resume_framework(sdk: _SDKState) -> None:
+    """With a resume-capable SDK, the launcher advertises in-place resume.
+
+    This is the gate the server's managed-host wake path
+    (``host_resume_supported`` / ``resume_managed_host``) consults, so a
+    dormant OpenShell host renders as a wakeable \"asleep\" state instead of
+    the terminal ``host_offline`` dead-end. The warm (snapshot) restore stays
+    off until the gateway's snapshot restore is consumable through the SDK.
+    """
+    caps = OpenShellSandboxLauncher().capabilities
+    assert caps.resume_stopped is True
+    assert caps.snapshot_restore is False
+
+
+def test_launcher_capabilities_gate_resume_on_sdk_primitive(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An SDK predating ``SandboxClient.start`` must not advertise resume.
+
+    Advertised-but-unusable resume would render every dormant host as
+    wakeable while each wake fails; the gate keeps the honest offline state.
+    """
+    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "start")
+    assert OpenShellSandboxLauncher().capabilities.resume_stopped is False
+
+
+def test_launcher_capabilities_without_sdk_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no openshell SDK importable, resume is not advertised."""
+    # An empty stand-in module has no SandboxClient, so the probe's
+    # ``from openshell import SandboxClient`` raises ImportError.
+    monkeypatch.setitem(sys.modules, "openshell", types.ModuleType("openshell"))
+    assert OpenShellSandboxLauncher().capabilities.resume_stopped is False
+
+
+def test_resume_delegates_to_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resume wakes the named sandbox through the gateway client."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.resume("petname-dormant")
+
+    assert fake.resumed == ["petname-dormant"]
 
 
 def test_attach_validates_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -355,9 +521,12 @@ class _SDKState:
     connect_error: bool = False
     delete_not_found: bool = False
     delete_not_found_via_sandbox_error: bool = False
+    resume_not_found: bool = False
+    resume_sandbox_error: str | None = None
     created_spec: Any = None
     waited: tuple[str, int | None] | None = None
     got: list[str] = field(default_factory=list)
+    resumed: list[tuple[str, str]] = field(default_factory=list)
     execs: list[tuple[str, list[str], bytes | None]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     closed: bool = False
@@ -367,6 +536,8 @@ class _SDKState:
     stream_exit_code: int = 0
     last_workdir: str | None = None
     last_env: dict[str, str] | None = None
+    last_workspace: str | None = None
+    created_workspace: str | None = None
 
 
 @pytest.fixture
@@ -404,50 +575,64 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
                 raise _SandboxError("no active gateway configured")
             return cls()
 
-        def create(self, *, spec: Any) -> _SandboxRef:
+        def create(self, *, workspace: str, spec: Any) -> _SandboxRef:
             state.created_spec = spec
+            state.created_workspace = workspace
             return _SandboxRef(id="id-1", name="petname-new")
 
-        def wait_ready(self, name: str, *, timeout_seconds: int | None = None) -> _SandboxRef:
+        def wait_ready(
+            self, name: str, *, workspace: str, timeout_seconds: int | None = None
+        ) -> _SandboxRef:
             state.waited = (name, timeout_seconds)
             return _SandboxRef(id="id-1", name=name)
 
-        def get(self, name: str) -> _SandboxRef:
+        def get(self, name: str, *, workspace: str) -> _SandboxRef:
             state.got.append(name)
             return _SandboxRef(id=f"id-for-{name}", name=name)
 
+        def start(self, name: str, *, workspace: str) -> None:
+            if state.resume_not_found:
+                raise _NotFound(_StatusCode.NOT_FOUND)
+            if state.resume_sandbox_error is not None:
+                raise _SandboxError(state.resume_sandbox_error)
+            state.resumed.append((name, workspace))
+
         def exec(
             self,
-            sandbox_id: str,
+            sandbox: str,
             command: Any,
             *,
+            workspace: str,
             stdin: bytes | None = None,
             timeout_seconds: int | None = None,
             workdir: str | None = None,
             env: dict[str, str] | None = None,
         ) -> _FakeExecResult:
-            state.execs.append((sandbox_id, list(command), stdin))
+            state.execs.append((sandbox, list(command), stdin))
             state.last_workdir = workdir
             state.last_env = env
+            state.last_workspace = workspace
             return state.exec_result
 
         def exec_stream(
             self,
-            sandbox_id: str,
+            sandbox: str,
             command: Any,
             *,
+            workspace: str,
             timeout_seconds: int | None = None,
             workdir: str | None = None,
             env: dict[str, str] | None = None,
         ) -> Any:
-            state.stream_calls.append((sandbox_id, list(command)))
+            state.stream_calls.append((sandbox, list(command)))
             state.last_workdir = workdir
             state.last_env = env
+            state.last_workspace = workspace
             for stream, data in state.stream_chunks:
                 yield _FakeExecChunk(stream=stream, data=data)
             yield _FakeExecResult(exit_code=state.stream_exit_code)
 
-        def delete(self, name: str) -> None:
+        def delete(self, name: str, *, workspace: str) -> None:
             state.deleted.append(name)
             if state.delete_not_found:
                 raise _NotFound(_StatusCode.NOT_FOUND)
@@ -504,29 +689,37 @@ def test_client_create_sandbox(sdk: _SDKState) -> None:
     assert name == "petname-new"
     assert sdk.created_spec.template.image == "ghcr.io/x/host:1"
     assert sdk.created_spec.environment == {"A": "1"}
+    assert sdk.created_workspace == "default"
     assert sdk.waited == ("petname-new", 300)
 
 
-def test_client_execute_maps_name_to_id(sdk: _SDKState) -> None:
-    """exec uses the opaque sandbox id, resolved from the petname."""
-    client = _OpenShellClient()
+def test_client_create_sandbox_custom_workspace(sdk: _SDKState) -> None:
+    """A custom workspace reaches the SDK create call."""
+    client = _OpenShellClient(workspace="team-beta")
     client.create_sandbox(image="img", env={})
 
-    client.execute("petname-new", ["echo", "hi"])
+    assert sdk.created_workspace == "team-beta"
 
-    # Cached from create — no extra get() needed; exec keyed by id.
-    assert sdk.execs[-1][0] == "id-1"
+
+@pytest.mark.parametrize("exec_path", ["execute", "run_foreground", "exec_background"])
+def test_client_execs_address_the_sandbox_by_name_in_its_workspace(
+    sdk: _SDKState, exec_path: str
+) -> None:
+    """Every exec path reaches the sandbox by name in the client's workspace, with no lookup."""
+    client = _OpenShellClient(workspace="team-beta")
+
+    if exec_path == "execute":
+        client.execute("other-box", ["ls"])
+    elif exec_path == "run_foreground":
+        client.run_foreground("other-box", ["ls"], timeout=60)
+    else:
+        client.exec_background("other-box", ["ls"], timeout=60)
+        client._bg_threads[-1].join(timeout=5)
+
+    calls = sdk.execs if exec_path == "execute" else sdk.stream_calls
+    assert calls[-1][0] == "other-box"
+    assert sdk.last_workspace == "team-beta"
     assert sdk.got == []
-
-
-def test_client_execute_resolves_unknown_name(sdk: _SDKState) -> None:
-    """An un-cached name is resolved to its id via get() before exec."""
-    client = _OpenShellClient()
-
-    client.execute("other-box", ["ls"])
-
-    assert sdk.got == ["other-box"]
-    assert sdk.execs[-1][0] == "id-for-other-box"
 
 
 def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
@@ -542,6 +735,50 @@ def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
 
     assert sdk.last_workdir == "/sandbox"
     assert sdk.last_env == {"HOME": "/sandbox"}
+
+
+def test_client_resume_waits_ready(sdk: _SDKState) -> None:
+    """resume_sandbox drives the SDK start primitive and waits until the sandbox is ready.
+
+    The resumed sandbox keeps its name, which is all a later exec needs.
+    """
+    client = _OpenShellClient()
+
+    client.resume_sandbox("box")
+
+    assert sdk.resumed == [("box", "default")]
+    assert sdk.waited == ("box", 300)
+    client.execute("box", ["ls"])
+    assert sdk.execs[-1][0] == "box"
+
+
+def test_client_resume_missing_sandbox_raises_gone(sdk: _SDKState) -> None:
+    """A definitive gateway not-found lets the server recreate the sandbox."""
+    sdk.resume_not_found = True
+
+    with pytest.raises(SandboxGoneError, match="no longer exists"):
+        _OpenShellClient().resume_sandbox("box")
+
+
+def test_client_resume_transient_failure_stays_click_error(sdk: _SDKState) -> None:
+    """A provider outage must not trigger a workspace-destroying recreate."""
+    sdk.resume_sandbox_error = "gateway unavailable"
+
+    with pytest.raises(click.ClickException, match="gateway unavailable") as exc:
+        _OpenShellClient().resume_sandbox("box")
+
+    assert not isinstance(exc.value, SandboxGoneError)
+
+
+def test_client_resume_requires_sdk_support(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An SDK predating ``SandboxClient.start`` surfaces an actionable upgrade hint."""
+    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "start")
+    client = _OpenShellClient()
+
+    with pytest.raises(click.ClickException, match="no sandbox resume primitive"):
+        client.resume_sandbox("box")
 
 
 def test_client_delete_ignores_not_found(sdk: _SDKState) -> None:
@@ -571,6 +808,28 @@ def test_client_connect_error_raises(sdk: _SDKState) -> None:
         _OpenShellClient()
 
 
+def test_launcher_workspace_from_env(sdk: _SDKState, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Workspace resolves from ``OMNIGENT_OPENSHELL_WORKSPACE`` when not explicit."""
+    monkeypatch.setenv(WORKSPACE_ENV_VAR, "team-alpha")
+    launcher = OpenShellSandboxLauncher()
+    assert launcher._workspace == "team-alpha"
+
+
+def test_launcher_workspace_defaults_to_default(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without explicit workspace or env var, workspace is ``"default"``."""
+    monkeypatch.delenv(WORKSPACE_ENV_VAR, raising=False)
+    launcher = OpenShellSandboxLauncher()
+    assert launcher._workspace == "default"
+
+
+def test_launcher_workspace_explicit(sdk: _SDKState) -> None:
+    """An explicit workspace kwarg takes precedence over the env var."""
+    launcher = OpenShellSandboxLauncher(workspace="my-ws")
+    assert launcher._workspace == "my-ws"
+
+
 def test_client_run_foreground_streams_and_returns_exit(
     sdk: _SDKState, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -582,7 +841,7 @@ def test_client_run_foreground_streams_and_returns_exit(
     code = client.run_foreground("other-box", ["bash", "-lc", "echo hi"], timeout=60)
 
     assert code == 3
-    assert sdk.stream_calls[-1] == ("id-for-other-box", ["bash", "-lc", "echo hi"])
+    assert sdk.stream_calls[-1] == ("other-box", ["bash", "-lc", "echo hi"])
     out, err = capsys.readouterr()
     assert "hello" in out
     assert "warn" in err

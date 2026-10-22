@@ -10,6 +10,7 @@ leak or mutate out-of-root content.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -18,7 +19,7 @@ from fastapi import FastAPI
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.os_env import create_os_environment
+from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from tests.runner.helpers import NullServerClient
@@ -125,19 +126,66 @@ async def test_traversal_rejected_on_mutating_methods(
     ],
     ids=["read", "write", "delete"],
 )
-async def test_absolute_path_rejected(
-    client: httpx.AsyncClient,
+async def test_absolute_path_refused_when_the_environment_is_confined(
+    planted: Path,
     method: str,
     json_body: dict | None,
 ) -> None:
-    """An absolute path (encoded leading slash) is rejected on read/write/delete."""
-    resp = await client.request(
-        method,
-        f"{_BASE}/filesystem/" + "%2Fetc%2Fpasswd",
-        json=json_body,
+    """A CONFINED environment refuses an absolute path on read/write/delete.
+
+    This is the runner's own check, made without knowing who is asking: the
+    sandbox policy declares no grant covering ``/etc/passwd``, so the request
+    is refused whatever the caller's identity. (The unconfined case is the
+    next test -- there the runner defers, and the SERVER decides, gating
+    absolute paths on session ownership. See
+    ``tests/server/routes/test_shell_permission_gate.py``.)
+    """
+    workspace = planted / "workspace"
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        ),
     )
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["error"]["code"] == "invalid_path"
+    assert os_env is not None
+    # Declare the environment confined. The routing decision under test reads
+    # the policy, so this exercises the confined branch without needing a
+    # platform sandbox backend (bwrap is Linux-only).
+    os_env.sandbox = replace(os_env.sandbox, active=True)
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_iso"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as confined:
+        resp = await confined.request(
+            method,
+            f"{_BASE}/filesystem/" + "%2Fetc%2Fpasswd",
+            json=json_body,
+        )
+
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "path_unreachable"
+
+
+@pytest.mark.asyncio
+async def test_absolute_path_served_when_the_environment_is_unconfined(
+    client: httpx.AsyncClient,
+) -> None:
+    """An UNCONFINED environment serves an absolute path.
+
+    The runner cannot see the caller, so it does not decide who may browse
+    outside the workspace -- the server does, and requires session ownership.
+    Pinned here so the split is explicit: this endpoint is NOT the identity
+    boundary, and reading it as one would be a mistake.
+    """
+    resp = await client.get(f"{_BASE}/filesystem/" + "%2Fetc%2Fhosts")
+
+    assert resp.status_code == 200, resp.text
 
 
 @pytest.mark.asyncio
@@ -153,14 +201,20 @@ async def test_symlink_read_escape_blocked_via_http(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, {"scope": "reach"}], ids=["unmarked", "scope-reach"])
 async def test_symlink_write_escape_blocked_via_http(
     client: httpx.AsyncClient,
     planted: Path,
+    params: dict[str, str] | None,
 ) -> None:
-    """Writing through an in-workspace symlink must not mutate the out-of-root file."""
+    """Writing through an in-workspace symlink must not mutate the out-of-root file.
+
+    Only reads take ``scope=reach``, so the mark changes nothing here.
+    """
     outside = planted / "outside_secret.txt"
     resp = await client.put(
         f"{_BASE}/filesystem/escape.txt",
+        params=params,
         json={"content": "OVERWRITTEN-BY-ATTACKER", "encoding": "utf-8"},
     )
     assert resp.status_code != 200, resp.text
@@ -172,12 +226,107 @@ async def test_symlink_write_escape_blocked_via_http(
 async def test_read_through_symlinked_directory_blocked(
     client: httpx.AsyncClient,
 ) -> None:
-    """A read into a symlinked out-of-root directory is blocked."""
+    """A read into, or a listing of, a symlinked out-of-root directory is blocked
+    unless the request carries ``scope=reach``."""
     # ``vendor`` -> out-of-root ``personal/``; ``vendor/id_rsa`` has no ``..`` so
     # string validation passes and only the resolved-path guard can refuse it.
     resp = await client.get(f"{_BASE}/filesystem/vendor/id_rsa")
     assert resp.status_code != 200, resp.text
     assert _SECRET not in resp.text
+
+    listed = await client.get(f"{_BASE}/filesystem/vendor")
+    assert listed.status_code == 400, listed.text
+    assert listed.json()["error"]["code"] == "invalid_path"
+
+
+@pytest.mark.asyncio
+async def test_reach_scope_follows_a_symlinked_directory_out_of_the_workspace(
+    client: httpx.AsyncClient,
+) -> None:
+    """``scope=reach`` is the server vouching for the owner, who may already
+    browse the link's target by absolute path. The link then lists and reads
+    like any folder; entries keep their workspace-relative paths so the tree
+    can keep requesting them the same way.
+    """
+    listed = await client.get(f"{_BASE}/filesystem/vendor", params={"scope": "reach"})
+    assert listed.status_code == 200, listed.text
+    assert [e["path"] for e in listed.json()["data"]] == ["vendor/id_rsa"]
+
+    read = await client.get(f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach"})
+    assert read.status_code == 200, read.text
+    assert read.json()["content"] == _SECRET
+
+    download = await client.get(
+        f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach", "download": "true"}
+    )
+    assert download.status_code == 200, download.text
+    assert download.content == _SECRET.encode()
+
+
+def _confined_app(
+    workspace: Path, *, read_paths: list[str] | None = None
+) -> tuple[FastAPI, OSEnvironment]:
+    """Runner app over *workspace* whose environment declares itself confined.
+
+    ``sandbox=none`` with ``active=True`` exercises the confined policy branch
+    without a platform sandbox backend (bwrap is Linux-only); *read_paths* are
+    the policy's declared read grants. The caller closes the environment.
+    """
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=read_paths),
+        ),
+    )
+    assert os_env is not None
+    os_env.sandbox = replace(os_env.sandbox, active=True)
+    reg = SessionResourceRegistry()
+    reg._primary_envs["conv_iso"] = os_env
+    app = create_runner_app(
+        resource_registry=reg,
+        runner_workspace=workspace,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return app, os_env
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [True, False], ids=["read-grant", "no-grant"])
+async def test_reach_scope_under_a_confined_policy_needs_a_grant(
+    planted: Path,
+    granted: bool,
+) -> None:
+    """Under a confined policy the mark admits a link's target exactly as its
+    absolute path would be: listed, read and downloaded when a read grant covers
+    it, refused as ``path_unreachable`` otherwise."""
+    read_paths = [str((planted / "personal").resolve())] if granted else None
+    app, os_env = _confined_app(planted / "workspace", read_paths=read_paths)
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as confined:
+            listed = await confined.get(f"{_BASE}/filesystem/vendor", params={"scope": "reach"})
+            read = await confined.get(
+                f"{_BASE}/filesystem/vendor/id_rsa", params={"scope": "reach"}
+            )
+            download = await confined.get(
+                f"{_BASE}/filesystem/vendor/id_rsa",
+                params={"scope": "reach", "download": "true"},
+            )
+    finally:
+        os_env.close()
+
+    if granted:
+        assert listed.status_code == 200, listed.text
+        assert [e["path"] for e in listed.json()["data"]] == ["vendor/id_rsa"]
+        assert read.status_code == 200, read.text
+        assert read.json()["content"] == _SECRET
+        assert download.status_code == 200, download.text
+        assert download.content == _SECRET.encode()
+    else:
+        for resp in (listed, read, download):
+            assert resp.status_code == 403, resp.text
+            assert resp.json()["error"]["code"] == "path_unreachable"
 
 
 @pytest.mark.asyncio

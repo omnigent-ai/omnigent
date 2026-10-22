@@ -10,18 +10,14 @@ The work splits into two halves:
 
 - **This repo** builds a SHA256-verified `.vsix` and attaches it to a GitHub
 release. No marketplace tokens live here.
-- **The secure-release repo**
-([`databricks/secure-public-registry-releases-eng`](https://github.com/databricks/secure-public-registry-releases-eng))
-downloads that `.vsix`, verifies the checksum, scans it (`databricks/gh-action-scan`),
-and publishes to the VS Code Marketplace and Open VSX. It holds the tokens and
-the approval gate.
+- **A Databricks-internal secure-release repo** downloads that `.vsix`, verifies
+the checksum, scans it, and publishes to the VS Code Marketplace and Open VSX.
+It holds the tokens and the approval gate.
 
-Two existing workflows in the secure repo are the reference:
-[`databricks-vscode.yml`](https://github.com/databricks/secure-public-registry-releases-eng/blob/main/.github/workflows/databricks-vscode.yml)
-(the extension publish flow to adapt) and
-[`omnigent.yml`](https://github.com/databricks/secure-public-registry-releases-eng/blob/main/.github/workflows/omnigent.yml)
-(omnigent's PyPI release, which already checks out `omnigent-ai/omnigent`
-cross-org). Both require SAML SSO to view.
+Two existing workflows in the secure repo are the reference: the Databricks VS
+Code extension publish flow (the one to adapt) and omnigent's PyPI release
+(which already checks out `omnigent-ai/omnigent` cross-org). Maintainers: the
+repo name and workflow paths are in the maintainer release runbook.
 
 ## Steps to release
 
@@ -83,7 +79,7 @@ The one-time setup that makes this possible is tracked below.
 | 3   | Verify the build: `pnpm install --frozen-lockfile && pnpm run build && pnpm run package` → valid `.vsix`                                                                                                                                                                                                                                                                 | local / CI                                                                                                                                                                  | — (done)            |
 | 4   | Release-PR workflow bumps version + CHANGELOG; a manually-dispatched release workflow builds the `.vsix` and attaches it (+`.sha256`) to a draft GitHub release                                                                                                                                                                                | `.github/workflows/vscode-release-pr.yml`, `vscode-extension-release.yml`                                                                                                   | — (done)            |
 | 5   | Ask DECO to register `omnigent-vscode` under the `databricks` publisher + add dedicated `OMNI_VSCE_TOKEN` / `OMNI_OVSX_PAT` secrets (and an `omnigent-vscode-marketplace` environment for the reviewer gate)                                                                                                                                    | Slack `#dev-ecosystem-discuss` ([https://databricks.slack.com/archives/C01KSAWFXG8/p1782971196701749](https://databricks.slack.com/archives/C01KSAWFXG8/p1782971196701749)) | human approval      |
-| 6   | Add an `omnigent-vscode.yml` publish workflow in the secure repo, adapting the existing [`databricks-vscode.yml`](https://github.com/databricks/secure-public-registry-releases-eng/blob/main/.github/workflows/databricks-vscode.yml) (SAML SSO required) — it already does download → scan → `vsce publish` + `ovsx publish` in one workflow | `secure-public-registry-releases-eng`                                                                                                                                       | DECO grant (step 5) |
+| 6   | Add an `omnigent-vscode.yml` publish workflow in the secure repo, adapting the existing Databricks VS Code extension workflow — it already does download → scan → `vsce publish` + `ovsx publish` in one workflow | the internal secure-release repo                                                                                                                                            | DECO grant (step 5) |
 | 7   | Populate the dedicated `OMNI_VSCE_TOKEN` + `OMNI_OVSX_PAT` secrets; register rows in `go/npp-release-status`; get sign-off in `#unblock-releases-public`                                                                                                                                                                                       | secure repo + Slack                                                                                                                                                         | steps 5–6           |
 
 

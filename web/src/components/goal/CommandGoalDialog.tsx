@@ -50,7 +50,7 @@ export function CommandGoalDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[85dvh] grid-rows-[auto_1fr_auto]">
         <form className="contents" onSubmit={submit}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -63,8 +63,8 @@ export function CommandGoalDialog({
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground" htmlFor="goal-condition">
+          <div className="min-h-0 space-y-1.5 overflow-y-auto">
+            <label className="text-sm font-medium text-muted-foreground" htmlFor="goal-condition">
               Completion condition
             </label>
             <Textarea
@@ -80,7 +80,7 @@ export function CommandGoalDialog({
               placeholder="All tests pass and the implementation is complete"
               data-testid="goal-condition"
             />
-            {error && <p className="text-sm text-destructive">{error}</p>}
+            {error && <p className="text-ui text-destructive">{error}</p>}
           </div>
 
           <DialogFooter>

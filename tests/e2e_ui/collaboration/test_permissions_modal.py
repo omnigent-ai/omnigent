@@ -4,41 +4,47 @@ The sharing-journey test (``test_sharing_journey.py``) issues every grant
 through the REST API and only asserts what each identity *sees*; its
 docstring calls out the share-modal UI interaction as "a separate
 follow-up test". This is that test: it drives the modal's own controls
-(``PermissionsModal.tsx``) — the public-access switch, the copy-link
+(``PermissionsModal.tsx``) — the general-access select, the copy-link
 button, the add-user grant form, the per-row level select, and revoke —
 and pins each one against the server's ``/permissions`` state so a
 silently-broken control can't pass.
 
-The modal-control test uses one owner identity and REST read-backs. The
-approval-control test opens the same session as a shared editor and parks a
-real permission hook, proving the editor can reject but cannot approve until
-the owner delegates that capability. No agent run is needed.
+Multi-user fixtures drive the admin's controls and cross-check stored grants.
+The public Edit journey adds a second identity and a real runner with a mock
+model to verify follow-ups, live delivery, ceiling downgrade and revocation.
 """
 
 from __future__ import annotations
 
+import os
 import re
-import threading
+import secrets
+import subprocess
+import sys
 import time
-import uuid
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import httpx
 import pytest
 from playwright.sync_api import Browser, Page, expect
 
+from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.browser import user_page
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
+    _terminate,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.conftest import _REPO_ROOT, _build_hello_world_bundle
 
 # ``__public__`` is the synthetic user id the server stores for a public
 # grant (mirrors ``PUBLIC_USER`` in PermissionsModal.tsx).
 _PUBLIC_USER = "__public__"
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
-_APPROVAL_CARD = '[data-testid="approval-card"]'
 
 
 @pytest.fixture(scope="module")
@@ -52,124 +58,97 @@ def multi_user_server(
     yield from spawn_multi_user_server(mock_llm_server_url, server_tmp)
 
 
+@pytest.fixture
+def multi_user_runner_server(
+    built_spa: None,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> Iterator[tuple[MultiUserServer, str]]:
+    """Use a trusted bearer header so both browsers and the real runner authenticate."""
+    server_fixture = spawn_multi_user_server(
+        mock_llm_server_url,
+        tmp_path,
+        extra_server_env={
+            "OMNIGENT_AUTH_HEADER": "Authorization",
+            "OMNIGENT_AUTH_HEADER_STRIP_PREFIX": "Bearer ",
+        },
+        admin_headers={"Authorization": f"Bearer {ADMIN_EMAIL}"},
+    )
+    server = next(server_fixture)
+    binding_token = secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+    runner_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("OMNIGENT_RUNNER_")
+        and key not in ("RUNNER_SERVER_URL", "OMNIGENT_PROCESS_LOG_FILE")
+    }
+    runner_env.update(
+        {
+            "PYTHONPATH": str(_REPO_ROOT),
+            "HOME": str(tmp_path),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "runner-data"),
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "runner-config"),
+            "OMNIGENT_RUNNER_ID": runner_id,
+            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+            "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN": ADMIN_EMAIL,
+            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+            "RUNNER_SERVER_URL": server.base_url,
+            "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
+            "OPENAI_API_KEY": "mock-key",
+            "ANTHROPIC_API_KEY": "",
+        }
+    )
+    try:
+        with (tmp_path / "runner.log").open("w") as log:
+            runner = subprocess.Popen(
+                [sys.executable, "-m", "omnigent.runner._entry"],
+                env=runner_env,
+                cwd=tmp_path,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+
+                def online() -> bool:
+                    if runner.poll() is not None:
+                        raise AssertionError((tmp_path / "runner.log").read_text())
+                    response = httpx.get(
+                        f"{server.base_url}/v1/runners/{runner_id}/status",
+                        headers={"Authorization": f"Bearer {ADMIN_EMAIL}"},
+                        timeout=2,
+                    )
+                    return response.status_code == 200 and response.json()["online"]
+
+                _wait_for(online, timeout_s=60)
+                yield server, runner_id
+            finally:
+                _terminate(runner)
+    finally:
+        server_fixture.close()
+
+
 def _admin_page(browser: Browser) -> Page:
     """A page whose requests carry the admin identity header."""
     context = browser.new_context(extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL})
     return context.new_page()
 
 
-def _permission(base_url: str, session_id: str, user_id: str) -> tuple[int, bool] | None:
-    """Read one session grant as ``(level, can_approve)`` (admin view).
+def _permissions(
+    base_url: str, session_id: str, *, headers: dict[str, str] | None = None
+) -> dict[str, int]:
+    """Read the session's grants as a ``{user_id: level}`` map (admin view).
 
     The multi-user server 401s headerless reads, so this authenticates as the
     admin identity the browser also uses.
     """
     resp = httpx.get(
         f"{base_url}/v1/sessions/{session_id}/permissions",
-        headers={"X-Forwarded-Email": ADMIN_EMAIL},
+        headers=headers or {"X-Forwarded-Email": ADMIN_EMAIL},
         timeout=10.0,
     )
     resp.raise_for_status()
-    for permission in resp.json()["permissions"]:
-        if permission["user_id"] == user_id:
-            return permission["level"], permission["can_approve"]
-    return None
-
-
-def _grant_editor(
-    server: MultiUserServer,
-    user_id: str,
-    *,
-    can_approve: bool,
-) -> None:
-    """Grant edit access, optionally with delegated approval authority."""
-    resp = httpx.put(
-        f"{server.base_url}/v1/sessions/{server.session_id}/permissions",
-        json={"user_id": user_id, "level": _LEVEL_EDIT, "can_approve": can_approve},
-        headers={"X-Forwarded-Email": ADMIN_EMAIL},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-
-
-def _pending_elicitation_ids(server: MultiUserServer) -> set[str]:
-    """Return pending elicitation ids from the admin-visible snapshot."""
-    resp = httpx.get(
-        f"{server.base_url}/v1/sessions/{server.session_id}",
-        headers={"X-Forwarded-Email": ADMIN_EMAIL},
-        timeout=10.0,
-    )
-    resp.raise_for_status()
-    return {
-        item["elicitation_id"]
-        for item in resp.json().get("pending_elicitations") or []
-        if isinstance(item.get("elicitation_id"), str)
-    }
-
-
-def _park_permission_hook(
-    server: MultiUserServer,
-    elicitation_id: str,
-    sink: dict,
-) -> None:
-    """Park a real Claude permission hook and record its eventual verdict."""
-    try:
-        sink["response"] = httpx.post(
-            f"{server.base_url}/v1/sessions/{server.session_id}/hooks/permission-request",
-            json={
-                "session_id": "claude_e2e_shared",
-                "transcript_path": "/tmp/transcript.jsonl",
-                "cwd": "/tmp",
-                "permission_mode": "default",
-                "hook_event_name": "PermissionRequest",
-                "tool_name": "Bash",
-                "tool_input": {"command": "git push origin main"},
-                "tool_use_id": "tool_use_shared_e2e",
-                "_omnigent_elicitation_id": elicitation_id,
-            },
-            headers={"X-Forwarded-Email": ADMIN_EMAIL},
-            timeout=120.0,
-        )
-    except Exception as exc:
-        sink["error"] = exc
-
-
-def _start_permission_hook(
-    server: MultiUserServer,
-    elicitation_id: str,
-) -> dict:
-    """Start a hook worker and wait until its approval card is parked."""
-    sink: dict = {}
-    worker = threading.Thread(
-        target=_park_permission_hook,
-        args=(server, elicitation_id, sink),
-        daemon=True,
-    )
-    sink["worker"] = worker
-    worker.start()
-    _wait_for(lambda: elicitation_id in _pending_elicitation_ids(server))
-    return sink
-
-
-def _assert_hook_verdict(sink: dict, expected: str) -> None:
-    """Wait for a parked hook and assert its Claude allow/deny verdict."""
-    sink["worker"].join(timeout=30.0)
-    assert not sink["worker"].is_alive(), "permission hook did not receive the UI verdict"
-    assert "error" not in sink, f"permission hook failed: {sink.get('error')!r}"
-    response = sink["response"]
-    assert response.status_code == 200, response.text
-    decision = response.json()["hookSpecificOutput"]["decision"]
-    assert decision["behavior"] == expected
-
-
-def _resolve_for_cleanup(server: MultiUserServer, elicitation_id: str) -> None:
-    """Best-effort decline so a failed assertion cannot strand a hook worker."""
-    httpx.post(
-        f"{server.base_url}/v1/sessions/{server.session_id}/elicitations/{elicitation_id}/resolve",
-        json={"action": "decline"},
-        headers={"X-Forwarded-Email": ADMIN_EMAIL},
-        timeout=10.0,
-    )
+    return {p["user_id"]: p["level"] for p in resp.json()["permissions"]}
 
 
 def _wait_for(
@@ -263,7 +242,7 @@ def test_permissions_modal_controls_drive_server_state(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """Public toggle, copy-link, grant, approval delegation and revoke all work.
+    """General access, copy-link, grant, level-change and revoke all work.
 
     Walks the whole modal surface in one session so each control is
     pinned against the ``/permissions`` REST state it mutates. Runs on a
@@ -281,15 +260,15 @@ def test_permissions_modal_controls_drive_server_state(
     _open_share_modal(page)
     dialog = page.get_by_role("dialog")
 
-    # ── Public access switch: off → on creates a __public__ grant ────
-    public_switch = dialog.get_by_role("switch")
-    expect(public_switch).not_to_be_checked()
-    assert _permission(base_url, session_id, _PUBLIC_USER) is None
-    public_switch.click()
-    expect(public_switch).to_be_checked()
-    # The grant lands server-side (poll briefly: the toggle fires an async
-    # mutation, so the REST read can race the optimistic UI flip).
-    _wait_for(lambda: _permission(base_url, session_id, _PUBLIC_USER) == (_LEVEL_READ, False))
+    # General access: No access -> Read creates a __public__ grant.
+    public_level = dialog.get_by_role("combobox", name="General access")
+    expect(public_level).to_have_text("No access")
+    assert _PUBLIC_USER not in _permissions(base_url, session_id)
+    public_level.click()
+    page.get_by_role("option", name="Read", exact=True).click()
+    expect(public_level).to_have_text("Read")
+    # Wait for the mutation before cross-checking the grant through the API.
+    _wait_for(lambda: _permissions(base_url, session_id).get(_PUBLIC_USER) == _LEVEL_READ)
 
     # ── Copy link: writes a shareable, session-scoped URL ────────────
     dialog.get_by_role("button", name="Copy link").click()
@@ -305,84 +284,18 @@ def test_permissions_modal_controls_drive_server_state(
     dialog.get_by_role("button", name="Grant").click()
     # The new row renders the grantee and the REST state agrees at Read.
     expect(dialog.get_by_title(grantee)).to_be_visible()
-    _wait_for(lambda: _permission(base_url, session_id, grantee) == (_LEVEL_READ, False))
+    _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_READ)
 
-    # ── Delegate approval: Read → Edit + approve ─────────────────────
-    expect(
-        dialog.get_by_text("Approvers can authorize actions that use your session credentials.")
-    ).to_be_visible()
+    # ── Change that user's level Read → Edit via the row select ──────
     level_select = dialog.get_by_role("combobox", name=f"Permission level for {grantee}")
     level_select.click()
-    page.get_by_role("option", name="Edit + approve", exact=True).click()
-    expect(level_select).to_contain_text("Edit + approve")
-    _wait_for(lambda: _permission(base_url, session_id, grantee) == (_LEVEL_EDIT, True))
-
-    # ── Remove approval authority while retaining Edit access ────────
-    level_select.click()
-    page.get_by_role("option", name="Edit", exact=True).click()
-    expect(level_select).to_contain_text("Edit")
-    _wait_for(lambda: _permission(base_url, session_id, grantee) == (_LEVEL_EDIT, False))
+    page.get_by_role("option", name="Edit").click()
+    _wait_for(lambda: _permissions(base_url, session_id).get(grantee) == _LEVEL_EDIT)
 
     # ── Revoke the user: row disappears, grant is gone server-side ───
     dialog.get_by_role("button", name="Revoke").click()
     expect(dialog.get_by_title(grantee)).to_have_count(0)
-    _wait_for(lambda: _permission(base_url, session_id, grantee) is None)
-
-
-def test_shared_editor_can_reject_but_needs_delegation_to_approve(
-    browser: Browser,
-    multi_user_server: MultiUserServer,
-) -> None:
-    """Approval controls follow the viewer's effective delegated capability."""
-    server = multi_user_server
-    editor = f"editor-{uuid.uuid4().hex[:8]}@ui.test"
-    _grant_editor(server, editor, can_approve=False)
-
-    context = browser.new_context(extra_http_headers={"X-Forwarded-Email": editor})
-    page = context.new_page()
-    elicitation_ids: list[str] = []
-    sinks: list[dict] = []
-    try:
-        # A plain editor may stop the owner's pending action, but cannot
-        # authorize it to run with the owner's session credentials.
-        editor_elicitation = f"elicit_claude_{uuid.uuid4().hex}"
-        elicitation_ids.append(editor_elicitation)
-        sinks.append(_start_permission_hook(server, editor_elicitation))
-        page.goto(f"{server.public_url}/c/{server.session_id}")
-
-        card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
-        expect(card).to_be_visible(timeout=30_000)
-        expect(card.get_by_role("note")).to_contain_text("delegated approver")
-        expect(card.get_by_role("button", name="Approve", exact=True)).to_be_disabled()
-        reject = card.get_by_role("button", name="Reject", exact=True)
-        expect(reject).to_be_enabled()
-        reject.click()
-        _assert_hook_verdict(sinks[-1], "deny")
-        _wait_for(lambda: editor_elicitation not in _pending_elicitation_ids(server))
-
-        # Once the owner delegates approval authority, a fresh snapshot makes
-        # the same editor's Approve control actionable for the next prompt.
-        _grant_editor(server, editor, can_approve=True)
-        delegated_elicitation = f"elicit_claude_{uuid.uuid4().hex}"
-        elicitation_ids.append(delegated_elicitation)
-        sinks.append(_start_permission_hook(server, delegated_elicitation))
-        page.reload()
-
-        delegated_card = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]').first
-        expect(delegated_card).to_be_visible(timeout=30_000)
-        expect(delegated_card.get_by_role("note")).to_have_count(0)
-        approve = delegated_card.get_by_role("button", name="Approve", exact=True)
-        expect(approve).to_be_enabled()
-        expect(delegated_card.get_by_role("button", name="Reject", exact=True)).to_be_enabled()
-        approve.click()
-        _assert_hook_verdict(sinks[-1], "allow")
-        _wait_for(lambda: delegated_elicitation not in _pending_elicitation_ids(server))
-    finally:
-        for elicitation_id in elicitation_ids:
-            _resolve_for_cleanup(server, elicitation_id)
-        for sink in sinks:
-            sink["worker"].join(timeout=10.0)
-        context.close()
+    _wait_for(lambda: grantee not in _permissions(base_url, session_id))
 
 
 def test_share_modal_qr_code_opens_mobile_deep_link(
@@ -424,6 +337,135 @@ def test_share_modal_qr_code_opens_mobile_deep_link(
     # the Radix Dialog's built-in close (X) on the share dialog underneath.
     qr_dialog.get_by_role("button", name="Close").first.click()
     expect(page.get_by_text("Share this session")).to_be_visible()
+
+
+def test_public_edit_ceiling_grant_downgrade_revoke(
+    browser: Browser,
+    multi_user_runner_server: tuple[MultiUserServer, str],
+    tmp_path: Path,
+) -> None:
+    """Admin opt-in, public Edit, ceiling downgrade and revoke across two identities."""
+    multi_user_server, runner_id = multi_user_runner_server
+    base_url = multi_user_server.base_url
+    admin_headers = {"Authorization": f"Bearer {ADMIN_EMAIL}"}
+    member_headers = {"Authorization": "Bearer new-member@ui.test"}
+    created = post_session_bundle(
+        httpx.post,
+        f"{base_url}/v1/sessions",
+        _build_hello_world_bundle(),
+        headers=admin_headers,
+        timeout=30,
+    )
+    created.raise_for_status()
+    session_id = created.json()["session_id"]
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        headers=admin_headers,
+        json={"runner_id": runner_id},
+        timeout=30,
+    ).raise_for_status()
+    with (
+        user_page(
+            browser,
+            headers=admin_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as page,
+        user_page(
+            browser,
+            headers=member_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as member,
+    ):
+        page.goto(f"{multi_user_server.public_url}/settings/sharing")
+        ceiling = page.get_by_role("combobox", name="Maximum public permission")
+        expect(ceiling).to_have_text("Read", timeout=30_000)
+        ceiling.click()
+        page.get_by_role("option", name="Edit", exact=True).click()
+        expect(ceiling).to_have_text("Edit")
+        page.screenshot(path=str(tmp_path / "public-ceiling-settings.png"))
+
+        page.goto(f"{multi_user_server.public_url}/c/{session_id}")
+        _open_share_modal(page)
+        dialog = page.get_by_role("dialog")
+        general = dialog.get_by_role("combobox", name="General access")
+        expect(general).to_have_text("No access")
+        general.click()
+        page.get_by_role("option", name="Edit", exact=True).click()
+        expect(general).to_have_text("Edit")
+        _wait_for(
+            lambda: (
+                _permissions(base_url, session_id, headers=admin_headers).get(_PUBLIC_USER) == 2
+            )
+        )
+        page.screenshot(path=str(tmp_path / "public-sharing-desktop.png"))
+
+        member.goto(f"{multi_user_server.public_url}/c/{session_id}")
+        composer = member.get_by_placeholder("Send a message…")
+        expect(composer).to_be_enabled(timeout=30_000)
+        page.screenshot(path=str(tmp_path / "public-sharing-owner.png"))
+        page.get_by_role("button", name="Done", exact=True).click()
+        marker = f"public-edit-{secrets.token_hex(4)}"
+        composer.fill(f"Reply with exactly this token and nothing else: {marker}")
+        member.get_by_role("button", name="Send", exact=True).click()
+        expect(
+            member.locator('[data-testid="message-bubble"][data-role="assistant"]').first
+        ).to_be_visible(timeout=60_000)
+        expect(
+            page.locator('[data-testid="message-bubble"]', has_text=marker).first
+        ).to_be_visible(timeout=30_000)
+        member.screenshot(path=str(tmp_path / "public-sharing-collaborator.png"))
+        assert httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10).status_code == 401
+
+        page.goto(f"{multi_user_server.public_url}/settings/sharing")
+        ceiling = page.get_by_role("combobox", name="Maximum public permission")
+        expect(ceiling).to_have_text("Edit", timeout=30_000)
+        ceiling.click()
+        page.get_by_role("option", name="Read", exact=True).click()
+        expect(ceiling).to_have_text("Read")
+        member.reload()
+        expect(
+            member.get_by_placeholder("You have read-only access to this session")
+        ).to_be_disabled(timeout=30_000)
+        assert _permissions(base_url, session_id, headers=admin_headers)[_PUBLIC_USER] == 2
+        assert (
+            httpx.post(
+                f"{base_url}/v1/sessions/{session_id}/events",
+                headers=member_headers,
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                },
+                timeout=10,
+            ).status_code
+            == 403
+        )
+        member.screenshot(path=str(tmp_path / "public-sharing-read-only.png"))
+
+        page.goto(f"{multi_user_server.public_url}/c/{session_id}")
+        _open_share_modal(page)
+        page.set_viewport_size({"width": 390, "height": 844})
+        dialog = page.get_by_role("dialog")
+        general = dialog.get_by_role("combobox", name="General access")
+        expect(general).to_have_text("Read")
+        page.screenshot(path=str(tmp_path / "public-sharing-mobile.png"))
+        assert dialog.evaluate("(el) => el.scrollWidth <= el.clientWidth")
+        general.click()
+        page.get_by_role("option", name="No access", exact=True).click()
+        _wait_for(
+            lambda: _PUBLIC_USER not in _permissions(base_url, session_id, headers=admin_headers)
+        )
+        with member.expect_response(
+            lambda response: (
+                response.url.split("?")[0].endswith(f"/v1/sessions/{session_id}")
+                and response.request.method == "GET"
+            )
+        ) as snapshot:
+            member.reload()
+        assert snapshot.value.status == 404
 
 
 def test_multi_user_shows_enabled_share_button(

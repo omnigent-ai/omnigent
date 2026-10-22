@@ -1,9 +1,10 @@
 name: Lint
 
-# Runs the project's pre-commit hooks (ruff, mypy, custom anti-pattern grep
-# hooks, etc.) on every non-draft PR and on push to main. Surfaces as the
-# `Pre-commit checks` check, a REQUIRED gate entry in merge-ready.yml. Draft PRs
-# are skipped; `ready_for_review` refires so the check doesn't strand pending.
+# Runs the project's pre-commit hooks (ruff, Pyrefly, TypeScript lint/type-check, custom
+# anti-pattern grep hooks, etc.) on every non-draft PR and on push to main.
+# Surfaces as the `Pre-commit checks` check, a REQUIRED gate entry in
+# merge-ready.yml. Draft PRs are skipped; `ready_for_review` refires so the
+# check doesn't strand pending.
 
 on:
   pull_request:
@@ -36,6 +37,9 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   pre-commit:
     name: Pre-commit checks
@@ -46,10 +50,10 @@ jobs:
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -60,12 +64,12 @@ jobs:
         run: python scripts/normalize_uv_lock_registry.py --check uv.lock
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -74,19 +78,27 @@ jobs:
         # `--locked` is the hard gate: fails if uv.lock is out of sync with
         # pyproject.toml (a bare `uv run pre-commit` would re-lock first and mask
         # a stale lockfile). Fix locally with `uv lock`.
-        run: uv sync --locked --extra dev
+        # Pyrefly checks optional integrations against their real packages.
+        # Compose capability extras with lint tooling instead of duplicating
+        # runtime dependencies in the repository-only lint group.
+        run: |
+          uv sync --locked --group lint --group test \
+            --extra hindsight \
+            --extra nimble \
+            --extra s3 \
+            --extra tracing
 
       # Sets up Node 20 + pnpm, with pnpm dependency caching keyed on the
       # workspace lockfile. pnpm is pinned in .github/actions/setup-pnpm.
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
-      - name: Install web dependencies
-        # Pin the npm registry to the npmjs default; limit to the web package
-        # so the Electron package's large native devDependencies are not fetched.
+      - name: Install TypeScript dependencies
+        # Pin the npm registry to the npmjs default; limit installs to packages
+        # checked here so Electron's large native devDependencies are not fetched.
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: pnpm install --frozen-lockfile --filter web
+        run: pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
 
       # The pnpm equivalent of the `uv sync --locked` gate above.
       # `pnpm install --frozen-lockfile` only checks the lockfile is CONSISTENT
@@ -102,6 +114,13 @@ jobs:
             echo "::error::pnpm-lock.yaml is out of date. Run 'pnpm install --lockfile-only' at the repo root and commit the result."
             exit 1
           }
+
+      # A `--frozen-lockfile` / lockfile-regen gate can't catch an override that
+      # pins a version outside a package.json range: overrides outrank
+      # package.json, so the declared version is silently ignored and the lock
+      # stays internally consistent for the pin. Check overrides directly.
+      - name: Check pnpm overrides satisfy declared ranges
+        run: .venv/bin/python dev/lint/lint_pnpm_override_consistency.py
 
       # ktlint is invoked by the android-ktlint-* pre-commit hooks. The wrapper
       # script (web/android/bin/ktlint.sh) exits 0 if ktlint is absent, so we
@@ -120,13 +139,11 @@ jobs:
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
 
-      - name: Run formatting, lint, and typing checks
-        run: uv run pre-commit run --all-files --show-diff-on-failure
+      - name: Check locked dependency regression guards
+        run: uv run --no-sync pytest tests/e2e/test_lockfile_vulnerable_pins.py -q --reruns 0 -p tests._helpers.required_tests
 
-      # Type-checking is temporarily skipped in CI while the pnpm lockfile
-      # settles; `pnpm --filter web run type-check` still works locally.
-      # - name: Type-check web
-      #   run: pnpm --filter web run type-check
+      - name: Run formatting, lint, and type checks
+        run: uv run pre-commit run --all-files --show-diff-on-failure
 
   # The four packages release in lockstep (identical versions + `==` sibling
   # pins). Assert agreement on every change so drift from a bad merge or
@@ -139,10 +156,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 

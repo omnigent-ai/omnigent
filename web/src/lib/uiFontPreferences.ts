@@ -1,30 +1,34 @@
 // Persisted, app-global preferences for the UI font — size and family.
 //
-// The web UI is Tailwind v4, which sizes typography AND spacing in `rem`, so
-// scaling the root `<html>` font-size reflows the entire UI uniformly. Rather
-// than write an inline `html { font-size }` — which would override the mobile
-// `@media` bump in index.css — this stores an absolute px choice and applies it
-// as a scale multiplier (`--ui-font-scale`) that the root font-size rules
-// multiply into. The base rule uses `calc(1em * var(--ui-font-scale))`, so the
-// user's browser-default size is preserved and the displayed px maps 1:1 for
-// the default-16px case.
+// The preference is stored as a discrete px choice and exposed to CSS through
+// `--desktop-ui-font-size`. index.css maps that value directly into Tailwind's
+// typography tokens while keeping the root rem grid fixed at 16px, so text
+// changes without resizing icons, controls, or spacing. With no saved choice,
+// CSS supplies a 13px desktop default and a 14px mobile default.
 //
 // Font family works the analogous way with `--ui-font-family`. Note it can't
 // reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
 // stack into the `font-sans` utility instead of a `var()` reference, so setting
 // `--font-sans` at runtime is a no-op. The `html` rule reads
 // `var(--ui-font-family, var(--font-sans))`, so an unset family falls back to
-// the system stack and any value we set on documentElement wins.
+// the system stack and any value we set on the style root wins.
+//
+// The DOM mutations target `getStyleRoot()`, not `document.documentElement`
+// directly: embedded, the scoped `.omnigent-app` redefines the font tokens
+// locally, so a value set on the real document root is shadowed for the subtree
+// and must be set on the scope root instead. Standalone `getStyleRoot()` IS the
+// document root, so behavior is unchanged.
+
+import { getStyleRoot } from "./host";
 
 const STORAGE_KEY = "omnigent:ui-font-size";
 
-/** Reference size that a scale of 1 corresponds to (Tailwind/browser default). */
-const BASE_FONT_SIZE_PX = 16;
-
-export const UI_FONT_SIZE_DEFAULT = 16;
-export const UI_FONT_SIZE_MIN = 12;
-export const UI_FONT_SIZE_MAX = 20;
+export const UI_FONT_SIZE_DEFAULT = 13;
+export const UI_FONT_SIZE_MOBILE_DEFAULT = 14;
+export const UI_FONT_SIZE_MIN = 11;
+export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
+export const UI_FONT_SIZE_MOBILE_QUERY = "(max-width: 767.98px)";
 
 /** Clamp an arbitrary number into the supported px range. */
 export function clampUiFontSizePx(px: number): number {
@@ -35,24 +39,38 @@ function isValidPx(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function defaultUiFontSizePx(): number {
+  if (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY).matches
+  ) {
+    return UI_FONT_SIZE_MOBILE_DEFAULT;
+  }
+  return UI_FONT_SIZE_DEFAULT;
+}
+
+function readStoredUiFontSizePx(): number | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isValidPx(parsed)) return null;
+    return clampUiFontSizePx(parsed);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Read the persisted UI font size in px.
  *
- * Returns the default when nothing is stored, on a server render (no `window`),
- * or when the stored value is missing/malformed — never throws, so a corrupt
- * entry can't break app boot. A stored value outside the range is clamped.
+ * Returns the viewport default when nothing valid is stored: 13px on desktop
+ * and 14px on mobile. A stored value applies directly on either viewport.
  */
 export function readUiFontSizePx(): number {
-  if (typeof window === "undefined") return UI_FONT_SIZE_DEFAULT;
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return UI_FONT_SIZE_DEFAULT;
-    const parsed: unknown = JSON.parse(raw);
-    if (!isValidPx(parsed)) return UI_FONT_SIZE_DEFAULT;
-    return clampUiFontSizePx(parsed);
-  } catch {
-    return UI_FONT_SIZE_DEFAULT;
-  }
+  return readStoredUiFontSizePx() ?? defaultUiFontSizePx();
 }
 
 /**
@@ -70,15 +88,24 @@ export function writeUiFontSizePx(px: number): void {
 }
 
 /**
- * Apply the given px size to the DOM by setting the `--ui-font-scale` variable
- * on the document root. The root font-size rules in index.css multiply this in,
- * so the whole rem-based UI (text + spacing) scales, and the mobile bump still
- * composes on top. This is the single source of the DOM side-effect.
+ * Apply an explicit user-selected size to the typography tokens.
  */
-export function applyUiFontScale(px: number): void {
-  if (typeof document === "undefined") return;
-  const scale = clampUiFontSizePx(px) / BASE_FONT_SIZE_PX;
-  document.documentElement.style.setProperty("--ui-font-scale", String(scale));
+export function applyDesktopUiFontSize(px: number): void {
+  const root = getStyleRoot();
+  if (!root) return;
+  root.style.setProperty("--desktop-ui-font-size", `${clampUiFontSizePx(px)}px`);
+}
+
+/** Apply a saved choice, or let CSS choose the viewport-specific default. */
+export function applyStoredUiFontSize(): void {
+  const root = getStyleRoot();
+  if (!root) return;
+  const stored = readStoredUiFontSizePx();
+  if (stored === null) {
+    root.style.removeProperty("--desktop-ui-font-size");
+  } else {
+    root.style.setProperty("--desktop-ui-font-size", `${stored}px`);
+  }
 }
 
 // ---- Font family ---------------------------------------------------------
@@ -160,11 +187,12 @@ export function writeUiFontFamily(name: string): void {
  * DOM side-effect.
  */
 export function applyUiFontFamily(name: string): void {
-  if (typeof document === "undefined") return;
+  const root = getStyleRoot();
+  if (!root) return;
   const normalized = normalizeUiFontFamily(name);
   if (!normalized) {
-    document.documentElement.style.removeProperty("--ui-font-family");
+    root.style.removeProperty("--ui-font-family");
     return;
   }
-  document.documentElement.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
+  root.style.setProperty("--ui-font-family", `${normalized}, var(--font-sans)`);
 }

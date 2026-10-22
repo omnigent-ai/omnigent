@@ -25,6 +25,7 @@ import {
   useStoreCredential,
   type DetectedCredential,
   type Host,
+  type StoreCredentialResult,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
 import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
@@ -45,7 +46,7 @@ export function HarnessCredentialForm({
   /** The server's subscription-login command (e.g. `codex login`), shown as a
    *  copy signpost — the UI can't drive browser OAuth. `null` for Pi. */
   command: string | null;
-  onDone: () => void;
+  onDone: (result: StoreCredentialResult) => void;
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
   const display = label ?? harness;
@@ -86,7 +87,7 @@ export function HarnessCredentialForm({
         setGatewayKey("");
         if (ready) {
           showToast(`${display} is ready on ${host.name}.`);
-          onDone();
+          onDone(result);
         } else {
           showToast(
             `Saved, but ${display} still needs setup on ${host.name}. Try another option.`,
@@ -125,7 +126,7 @@ export function HarnessCredentialForm({
       id: "subscription",
       node: (
         <CredentialOption icon={<UserRound />} label="Sign in with your subscription">
-          <p className="text-xs text-muted-foreground">
+          <p className="text-sm text-muted-foreground">
             Use your existing plan — run{" "}
             <button
               type="button"
@@ -167,7 +168,7 @@ export function HarnessCredentialForm({
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
             data-testid="harness-credential-key"
-            className="h-8 font-mono text-xs"
+            className="h-8 font-mono text-sm"
           />
           <SaveButton busy={busy} disabled={!apiKey.trim()} testId="harness-credential-save" />
         </form>
@@ -178,7 +179,7 @@ export function HarnessCredentialForm({
     id: "gateway",
     node: (
       <CredentialOption icon={<Waypoints />} label="Connect a gateway">
-        <p className="text-xs text-muted-foreground">
+        <p className="text-sm text-muted-foreground">
           Route through an OpenAI-compatible proxy (e.g. OpenRouter).
         </p>
         <form
@@ -202,7 +203,7 @@ export function HarnessCredentialForm({
             placeholder="Gateway base URL (e.g. https://openrouter.ai/api/v1)"
             value={gatewayUrl}
             onChange={(e) => setGatewayUrl(e.target.value)}
-            className="h-8 text-xs"
+            className="h-8 text-sm"
           />
           <div className="flex items-center gap-2">
             <Input
@@ -211,7 +212,7 @@ export function HarnessCredentialForm({
               placeholder="Gateway API key"
               value={gatewayKey}
               onChange={(e) => setGatewayKey(e.target.value)}
-              className="h-8 font-mono text-xs"
+              className="h-8 font-mono text-sm"
             />
             <SaveButton busy={busy} disabled={!gatewayUrl.trim() || !gatewayKey.trim()} />
           </div>
@@ -245,7 +246,7 @@ function CredentialOption({
 }) {
   return (
     <div className="flex flex-col gap-1.5">
-      <span className="flex items-center gap-1.5 text-xs font-medium">
+      <span className="flex items-center gap-1.5 text-sm font-medium">
         <span className="text-muted-foreground [&_svg]:size-3.5">{icon}</span>
         {label}
       </span>
@@ -309,7 +310,7 @@ function AdoptRow({
       className="flex items-center gap-2 rounded bg-emerald-50 px-2 py-1.5 dark:bg-emerald-500/10"
       data-testid="harness-credential-adopt"
     >
-      <span className="flex-1 text-xs">
+      <span className="flex-1 text-sm">
         Found <code className="font-mono">{detected.source}</code> on this host.
       </span>
       <Button type="button" size="sm" loading={busy} onClick={onUse}>

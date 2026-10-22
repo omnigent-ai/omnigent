@@ -124,6 +124,100 @@ class _ReturnsTextClient:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "openai-agents-sdk"])
+async def test_downscaled_images_preserve_compaction_boundaries(
+    monkeypatch: pytest.MonkeyPatch, harness: str
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
+    from omnigent.runtime import workflow
+    from omnigent.runtime.compaction import _CompactionState
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import ExecutorSpec
+
+    stored = StoredFile(
+        id="file_image",
+        created_at=1000,
+        filename="photo.png",
+        bytes=3,
+        content_type="image/png",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    monkeypatch.setattr(
+        workflow, "get_file_store", lambda: SimpleNamespace(get=lambda file_id: stored)
+    )
+    monkeypatch.setattr(
+        workflow, "get_artifact_store", lambda: SimpleNamespace(get=lambda file_id: b"png")
+    )
+    older = _user_msg("older", "older image")
+    older.data.content.extend(
+        [
+            {"type": "input_image", "file_id": stored.id},
+            {"type": "input_image", "file_id": stored.id},
+        ]
+    )
+    history = [
+        older,
+        _assistant_msg("reply1"),
+        _user_msg("middle", "middle message"),
+        _assistant_msg("reply2"),
+        _user_msg("recent", "recent message"),
+        _assistant_msg("reply3"),
+    ]
+    config = LLMConfig(model="test-model")
+    _, messages, _ = workflow._prepare_messages(
+        AgentSpec(
+            spec_version=1,
+            name="test",
+            skills_filter="none",
+            executor=ExecutorSpec(config={"harness": harness}),
+        ),
+        config,
+        history,
+        None,
+        [],
+        _CompactionState(context_window=None, last_summary=None, config=None, model=config.model),
+        {},
+    )
+    assert len(messages) == len(history)
+    assert len(older.data.content) == 3
+
+    async def create(**kwargs: Any) -> Response:
+        blocks = [
+            block
+            for message in kwargs["input"]
+            if isinstance(message.get("content"), list)
+            for block in message["content"]
+        ]
+        assert all(block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE for block in blocks)
+        texts = [block.get("text", "") for block in blocks]
+        assert "older image" in texts
+        assert "middle message" in texts
+        assert "recent message" not in texts
+        assert sum("6000×4000" in text for text in texts) == 2
+        return Response(
+            output=[MessageOutput(content=[OutputText(text="summary")])], model="test-model"
+        )
+
+    result = await compact(
+        messages,
+        history,
+        config=CompactionConfig(recent_window=2),
+        context_window=10000,
+        system_token_budget=0,
+        model=config.model,
+        task_id=f"resize-{harness}",
+        llm_client=SimpleNamespace(responses=SimpleNamespace(create=create)),
+        force=True,
+        fail_on_summary_error=True,
+    )
+    assert result.summary_metadata is not None
+    assert result.summary_metadata.last_item_id == "middle"
+    assert result.messages[2:] == messages[3:]
+
+
 def _make_conv_item(
     item_id: str,
     item_type: str,
@@ -522,7 +616,7 @@ def test_resolver_parameterized_image_is_cleared_before_token_counting() -> None
             assert file_id == stored.id
             return payload
 
-    resolved = _resolve_file_id_block(
+    resolved, _ = _resolve_file_id_block(
         {"type": "input_image", "file_id": stored.id, "filename": stored.filename},
         _FileStore(),  # type: ignore[arg-type]
         _ArtifactStore(),  # type: ignore[arg-type]
@@ -548,7 +642,7 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
             "content": [
                 {
                     "type": "input_image",
-                    "image_url": {"url": "data:image/png;base64,QUJD"},
+                    "image_url": {"url": "data:image/png;base64," + "Q" * 200},
                     "filename": "chat-completions.png",
                 },
                 {
@@ -556,7 +650,7 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
                     "source": {
                         "type": "base64",
                         "media_type": "image/png",
-                        "data": "data:image/png;base64,REVG",
+                        "data": "data:image/png;base64," + "R" * 200,
                     },
                     "filename": "anthropic.png",
                 },
@@ -571,6 +665,73 @@ def test_clear_binary_content_recurses_into_nested_provider_shapes() -> None:
     assert anthropic["source"]["data"] == _BINARY_CONTENT_CLEARED
     assert chat_completions["filename"] == "chat-completions.png"
     assert anthropic["filename"] == "anthropic.png"
+
+
+def test_clear_binary_content_redacts_bare_source_data_and_documents() -> None:
+    """Bare base64 under ``source.data``, and ``document`` blocks, are cleared.
+
+    The previous hand-rolled walk only matched ``image``/``file`` with a bare
+    top-level ``data``, so an Anthropic-shaped block — whose payload lives at
+    ``source.data`` without a ``data:`` prefix — survived compaction.
+    """
+    bare = "iVBORw0KGgoAAAANSUhEUg" * 3
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "data": bare, "file_id": "file_img"},
+                {"type": "file", "data": bare, "file_id": "file_file"},
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": bare},
+                    "filename": "anthropic.png",
+                },
+                {"type": "document", "data": bare, "file_id": "file_doc"},
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": bare,
+                    },
+                },
+                {"type": "text", "text": "keep me"},
+            ],
+        }
+    ]
+
+    _clear_binary_content(messages, protect_from=len(messages))
+
+    image, file_block, anthropic, document, pdf, text = messages[0]["content"]
+    # Shapes the old walk already handled.
+    assert image["data"] == _BINARY_CONTENT_CLEARED
+    assert file_block["data"] == _BINARY_CONTENT_CLEARED
+    # Shapes it missed.
+    assert anthropic["source"]["data"] == _BINARY_CONTENT_CLEARED
+    assert document["data"] == _BINARY_CONTENT_CLEARED
+    assert pdf["source"]["data"] == _BINARY_CONTENT_CLEARED
+    # Everything that is not a payload survives.
+    assert image["file_id"] == "file_img"
+    assert file_block["file_id"] == "file_file"
+    assert document["file_id"] == "file_doc"
+    assert anthropic["filename"] == "anthropic.png"
+    assert anthropic["source"]["media_type"] == "image/png"
+    assert text == {"type": "text", "text": "keep me"}
+
+
+@pytest.mark.parametrize("payload", ["", None, 123])
+def test_clear_binary_content_leaves_an_absent_payload_alone(payload: object) -> None:
+    """A block with no actual payload string keeps whatever it had.
+
+    The old walk overwrote any ``data`` key it found, so an empty or non-string
+    value became the clearing marker — claiming content had been removed when
+    there was none.
+    """
+    messages = [{"role": "user", "content": [{"type": "image", "data": payload}]}]
+
+    _clear_binary_content(messages, protect_from=len(messages))
+
+    assert messages[0]["content"][0]["data"] == payload
 
 
 def test_clear_binary_content_preserves_recent_nested_content_byte_identical() -> None:
@@ -912,6 +1073,65 @@ async def test_summarize_history_returns_text_and_token_count() -> None:
         f"Expected 1 LLM call, got {stub_llm.call_count}. "
         "Failure means summarize_history called the LLM more than once or not at all."
     )
+
+
+@pytest.mark.asyncio
+async def test_summarize_history_validates_runner_response() -> None:
+    """Runner summarization accepts the documented object shape only."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> object:
+            return {"text": "Runner summary", "token_count": 3}
+
+    class _RunnerClient:
+        async def post(self, *_args: object, **_kwargs: object) -> _Response:
+            return _Response()
+
+    result = await summarize_history(
+        [{"role": "user", "content": "prior conversation"}],
+        _RaisesIfCalled(),
+        "openai/gpt-4o",
+        runner_client=_RunnerClient(),
+    )
+
+    assert result == {"text": "Runner summary", "token_count": 3}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"text": 12, "token_count": 3},
+        {"text": "Runner summary", "token_count": "three"},
+        {"text": "Runner summary", "token_count": True},
+    ],
+)
+async def test_summarize_history_rejects_malformed_runner_response(
+    payload: object,
+) -> None:
+    """Runner summarization fails clearly when required fields are malformed."""
+
+    class _Response:
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> object:
+            return payload
+
+    class _RunnerClient:
+        async def post(self, *_args: object, **_kwargs: object) -> _Response:
+            return _Response()
+
+    with pytest.raises(RuntimeError, match="invalid summary fields"):
+        await summarize_history(
+            [{"role": "user", "content": "prior conversation"}],
+            _RaisesIfCalled(),
+            "openai/gpt-4o",
+            runner_client=_RunnerClient(),
+        )
 
 
 @pytest.mark.asyncio

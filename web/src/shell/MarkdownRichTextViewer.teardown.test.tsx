@@ -16,6 +16,7 @@
 // did / didn't fire after unmount. Only the write is a controllable deferred.
 
 import { StrictMode } from "react";
+import { Schema, type Node } from "@tiptap/pm/model";
 import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,7 +28,7 @@ interface FakeEditor {
   off: (evt: string, h: () => void) => void;
   commands: { setContent: (c: string) => void };
   setEditable: () => void;
-  state: { selection: { empty: boolean; from: number; to: number } };
+  state: { doc: Node; selection: { empty: boolean; from: number; to: number } };
   emit: (evt: string) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
@@ -38,9 +39,14 @@ interface FakeEditor {
   latestOnUpdate: ((p: { editor: FakeEditor }) => void) | null;
 }
 
+const schema = new Schema({ nodes: { doc: { content: "text*" }, text: {} } });
+const documentFor = (text: string) =>
+  schema.node("doc", null, text ? schema.text(text) : undefined);
+
 function makeFakeEditor(initial: string): FakeEditor {
   const handlers: Record<string, Set<() => void>> = {};
   let markdown = initial;
+  const state = { doc: documentFor(initial), selection: { empty: true, from: 0, to: 0 } };
   return {
     isDestroyed: false,
     getMarkdown: () => markdown,
@@ -53,15 +59,17 @@ function makeFakeEditor(initial: string): FakeEditor {
     commands: {
       setContent: (c: string) => {
         markdown = c;
+        state.doc = documentFor(c);
       },
     },
     setEditable: () => {},
-    state: { selection: { empty: true, from: 0, to: 0 } },
+    state,
     emit: (evt) => {
       handlers[evt]?.forEach((h) => h());
     },
     setMarkdown: (m) => {
       markdown = m;
+      state.doc = documentFor(m);
     },
     // Default focused: these tests simulate USER edits, which only fire 'update'
     // while the editor has focus (a pre-focus normalisation update re-baselines).
@@ -103,12 +111,16 @@ vi.mock("@tiptap/react", () => ({
 }));
 
 vi.mock("@tiptap/markdown", () => ({ Markdown: { configure: vi.fn().mockReturnValue({}) } }));
-vi.mock("@tiptap/starter-kit", () => ({ default: { configure: vi.fn().mockReturnValue({}) } }));
+vi.mock("@tiptap/starter-kit", () => ({ StarterKit: { configure: vi.fn().mockReturnValue({}) } }));
 vi.mock("@tiptap/extension-table", () => ({
   Table: { configure: vi.fn().mockReturnValue({}) },
   TableRow: {},
   TableCell: {},
   TableHeader: {},
+}));
+vi.mock("./tiptapBoundedTokenizers", () => ({
+  BoundedTaskList: {},
+  BoundedTable: { configure: vi.fn().mockReturnValue({}) },
 }));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
@@ -128,7 +140,10 @@ vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null })
 vi.mock("./MarkdownEditorToolbar", () => ({ ToolbarPlugin: () => null }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 // Sync hook is mocked here (unlike the integration suite) so its setters are spies.
 vi.mock("./useMarkdownEditorSync", () => ({ useMarkdownEditorSync: vi.fn() }));
 

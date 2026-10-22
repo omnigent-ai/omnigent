@@ -1,13 +1,21 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
-import { CodeViewer } from "./CodeViewer";
+import type * as fileContentModule from "@/hooks/useFileContent";
+import type { Comment } from "@/hooks/useComments";
+import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
+import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof fileContentModule>()),
+  useFileContent: vi.fn(() => ({ data: undefined })),
+}));
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
 vi.mock("@/components/ai-elements/code-block", () => ({
@@ -19,13 +27,17 @@ vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null 
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: () => <div data-testid="monaco-editor-stub" />,
+  MonacoCodeEditor: ({ largeMarkdown }: { largeMarkdown?: boolean }) => (
+    <div data-testid="monaco-editor-stub" data-large-markdown={String(!!largeMarkdown)} />
+  ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
 vi.mock("./PdfViewer", () => ({
-  PdfViewer: () => <div data-testid="pdf-viewer-stub" />,
+  PdfViewer: ({ comments }: { comments: Comment[] }) => (
+    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+  ),
 }));
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
 // (which has no WebGL); its presence in the DOM is the signal that a model file
@@ -85,11 +97,23 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
+const MINIMAL_NB = JSON.stringify({
+  nbformat: 4,
+  cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
+});
+
 function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: { viewMode?: "editor" | "preview" | "source" | "diff"; truncated?: boolean } = {},
+  opts: {
+    viewMode?: "editor" | "preview" | "source" | "diff";
+    truncated?: boolean;
+    markdownSourceFallback?: boolean;
+    mediaActive?: boolean;
+    position?: { line: number };
+    onRequestEditMode?: () => void;
+  } = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
@@ -97,6 +121,8 @@ function renderViewer(
   // a .md path to exercise the remaining Shiki path.
   return render(
     <CodeViewer
+      markdownSourceFallback={opts.markdownSourceFallback ?? false}
+      position={opts.position}
       conversationId="conv_1"
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
@@ -104,13 +130,29 @@ function renderViewer(
       activeSelection={null}
       onSetActiveSelection={() => {}}
       panelOpen={panelOpen}
+      mediaActive={opts.mediaActive}
       searchOpen={false}
       setSearchOpen={() => {}}
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
+      onRequestEditMode={opts.onRequestEditMode}
     />,
   );
 }
+
+describe("video previews", () => {
+  it("does not mount a player when the editor remains open in a hidden rail", () => {
+    renderViewer("", true, "demo.webm", { mediaActive: false });
+    expect(screen.queryByRole("button", { name: "Play video: demo.webm" })).toBeNull();
+  });
+
+  it("opens a recording player rather than a source editor or binary notice", () => {
+    renderViewer("", true, "demo.webm");
+    expect(screen.getByRole("button", { name: "Play video: demo.webm" })).toBeVisible();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+  });
+});
 
 /**
  * Dispatches a `copy` event to `document` with a mock clipboardData.
@@ -138,9 +180,128 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
 });
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("CodeViewer find-in-file shortcut", () => {
+  function renderMarkdownViewer(
+    viewMode: "editor" | "source",
+    setSearchOpen: (open: boolean) => void,
+  ) {
+    render(
+      <>
+        <textarea aria-label="Prompt" />
+        <CodeViewer
+          markdownSourceFallback={false}
+          conversationId="conv_1"
+          path="notes.md"
+          fileQuery={makeFileQuery("hello")}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen={true}
+          searchOpen={false}
+          setSearchOpen={setSearchOpen}
+          searchInputRef={noopRef}
+          viewMode={viewMode}
+        />
+      </>,
+    );
+  }
+
+  it("leaves Ctrl+F to a focused composer on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("editor", setSearchOpen);
+    const composer = screen.getByRole("textbox", { name: "Prompt" });
+    composer.focus();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(setSearchOpen).not.toHaveBeenCalled();
+    expect(composer).toHaveFocus();
+  });
+
+  it("opens Markdown find-in-file with Cmd+F on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("editor", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("leaves Ctrl+F to a focused composer beside Markdown source on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+    const composer = screen.getByRole("textbox", { name: "Prompt" });
+    composer.focus();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(setSearchOpen).not.toHaveBeenCalled();
+    expect(composer).toHaveFocus();
+  });
+
+  it("opens Markdown source find-in-file with Cmd+F on macOS", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("opens Markdown source find-in-file with Ctrl+F on Windows/Linux", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
+    const setSearchOpen = vi.fn();
+    renderMarkdownViewer("source", setSearchOpen);
+
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+});
 
 describe("CodeViewer Cmd+A select-all and copy interception", () => {
   it("copy after Cmd+A writes raw file content to clipboardData", () => {
@@ -245,10 +406,14 @@ describe("CodeViewer editor routing", () => {
   });
 
   it("keeps markdown source on the Shiki path (not Monaco)", () => {
+    vi.mocked(highlightCode).mockClear();
     renderViewer("# heading", true, "notes.md");
     // Markdown source must NOT route to Monaco — it stays on the Shiki render
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    // The preview-only highlight skip must not reach here: markdown source still
+    // tokenizes through Shiki.
+    expect(highlightCode).toHaveBeenCalled();
   });
 });
 
@@ -267,12 +432,170 @@ describe("CodeViewer truncated preview", () => {
   });
 });
 
+const previewOpenFile = vi.fn();
+const PREVIEW_FILE_VIEWER = {
+  openFile: previewOpenFile,
+  openGithubTab: () => {},
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/ws",
+  workspaceHome: null,
+};
+
+describe("CodeViewer markdown preview links", () => {
+  const renderPreview = (content: string, path: string) => {
+    previewOpenFile.mockClear();
+    render(
+      <FileViewerContext.Provider value={PREVIEW_FILE_VIEWER}>
+        <CodeViewer
+          markdownSourceFallback={false}
+          conversationId="conv_1"
+          path={path}
+          fileQuery={makeFileQuery(content)}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen
+          searchOpen={false}
+          setSearchOpen={() => {}}
+          searchInputRef={noopRef}
+          viewMode="preview"
+        />
+      </FileViewerContext.Provider>,
+    );
+    return previewOpenFile;
+  };
+
+  it("opens a relative link in the FileViewer instead of navigating the app", () => {
+    // As an anchor, `../notes/plan.md` would resolve against `/c/<id>` and load
+    // a session named after the file.
+    const openFile = renderPreview("See [the plan](../notes/plan.md#steps).", "docs/guide.md");
+
+    const link = screen.getByText("the plan");
+    expect(link.getAttribute("href")).toBeNull();
+    fireEvent.click(link);
+
+    expect(openFile).toHaveBeenCalledWith("notes/plan.md");
+  });
+
+  it("opens URLs outside the app window and keeps in-page anchors in place", () => {
+    // A same-window URL navigates the app off its server; the desktop app's
+    // Databricks browser sign-in treats that as a lost session.
+    const openFile = renderPreview(
+      "[docs](https://example.com/docs), [cdn](//cdn.example.com/docs), " +
+        "[mail](mailto:docs@example.com) and [below](#usage)\n\n## Usage",
+      "docs/guide.md",
+    );
+
+    for (const [text, href] of [
+      ["docs", "https://example.com/docs"],
+      ["cdn", "//cdn.example.com/docs"],
+      ["mail", "mailto:docs@example.com"],
+    ]) {
+      const link = screen.getByText(text);
+      expect(link.getAttribute("href")).toBe(href);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    const anchor = screen.getByText("below");
+    expect(anchor.getAttribute("href")).toBe("#usage");
+    expect(anchor.getAttribute("target")).toBeNull();
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("follows a URL click the way chat links do", () => {
+    const followed: HTMLAnchorElement[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      followed.push(this);
+    });
+    const popupDocument = document.implementation.createHTMLDocument();
+    const openSpy = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ opener: window, document: popupDocument } as Window);
+
+    renderPreview("[docs](https://example.com/docs)", "docs/guide.md");
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    screen.getByText("docs").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(followed.map((link) => [link.ownerDocument, link.href])).toEqual([
+      [popupDocument, "https://example.com/docs"],
+    ]);
+  });
+});
+
+describe("CodeViewer markdown preview comment hint", () => {
+  // The rendered preview can't anchor text-selection comments, so it points the
+  // user at the editor instead of offering a second, fuzzier comment surface.
+  it("shows the switch-to-edit hint in markdown preview", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
+  });
+
+  it("switches to the editor when the hint is clicked", () => {
+    const onRequestEditMode = vi.fn();
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode });
+    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
+    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  });
+
+  it("hides the hint for read-only viewers", () => {
+    vi.mocked(permissions.useCanEdit).mockReturnValue(false);
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint when the editor isn't reachable (no callback)", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "preview" });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint in the editor surface", () => {
+    renderViewer("# doc", true, "notes.md", { viewMode: "editor", onRequestEditMode: () => {} });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+
+  it("shows no hint for a truncated file (the editor can't comment on it either)", () => {
+    renderViewer("# big", true, "notes.md", {
+      viewMode: "preview",
+      truncated: true,
+      onRequestEditMode: () => {},
+    });
+    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
+  });
+});
+
+// Streamdown renders a diagram only once an IntersectionObserver reports it
+// visible; report every observed element visible so diagrams render in jsdom.
+class VisibleIntersectionObserver {
+  private readonly callback: IntersectionObserverCallback;
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback;
+  }
+  observe(target: Element) {
+    this.callback(
+      [{ isIntersecting: true, target } as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+  unobserve() {}
+  disconnect() {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+
 describe("CodeViewer markdown preview rendering (issue #970)", () => {
   // The read-only markdown preview is now the default surface for .md files, so
   // it must faithfully render the GFM feature set the issue calls out:
   // headings, lists, tables, code blocks, blockquotes, task lists, emoji.
   const renderMd = (content: string) =>
     renderViewer(content, true, "doc.md", { viewMode: "preview" });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it("renders headings", () => {
     const { container } = renderMd("# Title\n\n## Subtitle");
@@ -298,6 +621,61 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.querySelector("pre code")?.textContent).toContain("const x = 1;");
   });
 
+  it("renders raw HTML pre blocks without treating them as Mermaid fences", () => {
+    const { container } = renderMd("<pre>literal raw pre</pre>");
+    expect(container.querySelector("pre")?.textContent).toBe("literal raw pre");
+    expect(screen.queryByTestId("mermaid-preview")).toBeNull();
+  });
+
+  it("explains an invalid Mermaid fence instead of dumping the parser error", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: proceed once; do not call Save\n    A=>B: again\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 3");
+    expect(card.querySelector("code")?.textContent).toBe(
+      "Note over A,B: proceed once; do not call Save",
+    );
+    expect(card.textContent).toContain("#59;");
+    // The raw parser dump is still there, folded away.
+    expect(card.querySelector("details pre")?.textContent).toContain("got 'NEWLINE'");
+  }, 15_000);
+
+  it("reports the author's line number past front matter and comments Mermaid strips", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: Flow\n---\n\n%% comment\nsequenceDiagram\n    A->>B: hi\n    Note over A,B once twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 8");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
+  }, 15_000);
+
+  it("maps the line by position when front matter repeats the diagram text", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: |\n  sequenceDiagram\n  Note over A,B once twice\n---\nsequenceDiagram\n  Note over A,B once twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 7");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
+  }, 15_000);
+
+  it("renders Mermaid fences as diagrams instead of plain code", async () => {
+    const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");
+    expect(screen.getByTestId("mermaid-preview")).toBeDefined();
+    expect(container.querySelector("pre > code.language-mermaid")).toBeNull();
+    await waitFor(() =>
+      expect(container.querySelector("[data-testid='mermaid-preview'] svg")).not.toBeNull(),
+    );
+  });
+
+  it("renders a cased Mermaid fence as a diagram (matches the editor)", () => {
+    renderMd("```Mermaid\nflowchart LR\n  A --> B\n```");
+    expect(screen.getByTestId("mermaid-preview")).toBeDefined();
+  });
+
   it("renders blockquotes", () => {
     const { container } = renderMd("> quoted text");
     expect(container.querySelector("blockquote")?.textContent).toContain("quoted text");
@@ -317,6 +695,32 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     const { container } = renderMd("Ship it :tada: :rocket:");
     expect(container.textContent).toContain("🎉");
     expect(container.textContent).toContain("🚀");
+  });
+
+  it("renders $$…$$ math as KaTeX, not literal TeX (issue #7503)", () => {
+    // Math rendered fine in chat but showed raw `$$…$$`/`\frac` in the file
+    // preview; the preview now runs the same remark-math + rehype-katex the
+    // chat surface does. A `.katex` node proves the formula rendered.
+    const { container } = renderMd("$$\\text{Speedup} = \\frac{1}{(1-P) + \\frac{P}{N}}$$");
+    expect(container.querySelector(".katex")).not.toBeNull();
+    // The rendered MathML carries the formula's text (the `\text{Speedup}` run).
+    expect(container.textContent).toContain("Speedup");
+  });
+
+  it("renders explicit \\(…\\) TeX delimiters, matching chat", () => {
+    // Agents emit `\(…\)` / `\[…\]`; normalizeExplicitMathDelimiters rewrites
+    // them to `$$…$$` so the preview renders them like the chat surface.
+    const { container } = renderMd("Euler's identity: \\(e^{i\\pi} + 1 = 0\\).");
+    expect(container.querySelector(".katex")).not.toBeNull();
+  });
+
+  it("leaves single-$ prose (currency) as text, not math", () => {
+    // Single `$` is prose far more often than math (currency, shell vars), so
+    // it must not pair up and render the span between as math (chat parity).
+    const { container } = renderMd("It costs $5 to make and $10 to ship.");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("$5");
+    expect(container.textContent).toContain("$10");
   });
 
   it("renders embedded raw HTML that GitHub supports", () => {
@@ -416,6 +820,86 @@ describe("CodeViewer HTML preview sandbox", () => {
   });
 });
 
+describe("CodeViewer rendered previews skip Shiki highlighting", () => {
+  // Rendered previews use their own surfaces and never consume Shiki tokens, so
+  // tokenizing the whole file is wasted work that can freeze a large file.
+
+  it("does not tokenize the file when rendering the HTML preview", () => {
+    vi.mocked(highlightCode).mockClear();
+    const { container } = renderViewer(
+      "<!doctype html><html><body><p>hello</p></body></html>",
+      true,
+      "report.html",
+      { viewMode: "preview" },
+    );
+    expect(container.querySelector('iframe[title="HTML preview"]')).not.toBeNull();
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  it("tokenizes markdown only on entering source view, not across preview transitions", () => {
+    const fileQuery = makeFileQuery("# heading");
+    const build = (viewMode: "preview" | "source") => (
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path="notes.md"
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("source"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  // `.ipynb` and `.txt` both detect as "text", so only the notebook path makes
+  // this a rendered preview; toggling it must start and stop highlighting even
+  // though the language never changes.
+  it("toggles highlighting when notebook eligibility changes with the language unchanged", () => {
+    const fileQuery = makeFileQuery(MINIMAL_NB);
+    const build = (path: string) => (
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path={path}
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="preview"
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("analysis.txt"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+});
+
 describe("CodeViewer image rendering", () => {
   // jsdom implements neither URL.createObjectURL nor revokeObjectURL; ImageViewer
   // calls both, so stub them and capture the blob it encodes.
@@ -439,6 +923,7 @@ describe("CodeViewer image rendering", () => {
   function renderImage(contentType: string, path = "logo.png", truncated = false) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makeImageQuery(contentType, truncated)}
@@ -484,6 +969,7 @@ describe("CodeViewer image rendering", () => {
     render(
       <ImageLightboxProvider>
         <CodeViewer
+          markdownSourceFallback={false}
           conversationId="conv_1"
           path="assets/logo.png"
           fileQuery={makeImageQuery("image/png")}
@@ -517,14 +1003,19 @@ describe("CodeViewer PDF routing", () => {
     contentType: string | null = "application/pdf",
     path = "report.pdf",
     truncated = false,
+    comments: Comment[] = [],
+    addressedComments: Comment[] = [],
+    activeSelection: CodeViewerProps["activeSelection"] = null,
   ) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makePdfQuery(contentType, truncated)}
-        comments={[]}
-        activeSelection={null}
+        comments={comments}
+        addressedComments={addressedComments}
+        activeSelection={activeSelection}
         onSetActiveSelection={() => {}}
         panelOpen={true}
         searchOpen={false}
@@ -551,6 +1042,29 @@ describe("CodeViewer PDF routing", () => {
     renderPdf(null, "report.pdf");
     expect(await screen.findByTestId("pdf-viewer-stub")).toBeDefined();
   });
+
+  it("renders an addressed anchor only while that comment is active", async () => {
+    const open = { id: "open", status: "draft" } as Comment;
+    const addressed = { id: "addressed", status: "addressed" } as Comment;
+
+    renderPdf("application/pdf", "report.pdf", false, [open], [addressed]);
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute(
+      "data-comment-ids",
+      "open",
+    );
+
+    cleanup();
+    renderPdf("application/pdf", "report.pdf", false, [open], [addressed], {
+      start_index: 0,
+      end_index: 1,
+      anchor_content: "anchor",
+      comment_id: "addressed",
+    });
+    expect(await screen.findByTestId("pdf-viewer-stub")).toHaveAttribute(
+      "data-comment-ids",
+      "open,addressed",
+    );
+  });
 });
 
 describe("CodeViewer 3D model routing", () => {
@@ -573,6 +1087,7 @@ describe("CodeViewer 3D model routing", () => {
   function renderModel(path: string, encoding: "base64" | "utf-8", contentType: string | null) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makeModelQuery(encoding, contentType)}
@@ -624,11 +1139,6 @@ describe("CodeViewer 3D model routing", () => {
 });
 
 describe("CodeViewer .ipynb routing", () => {
-  const MINIMAL_NB = JSON.stringify({
-    nbformat: 4,
-    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
-  });
-
   it("renders the notebook preview in preview mode", () => {
     renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();
@@ -649,5 +1159,53 @@ describe("CodeViewer .ipynb routing", () => {
     expect(screen.getByText(/Cannot render notebook/)).toBeDefined();
     // …and the shared truncation banner is stacked above it.
     expect(screen.getByText(/truncated/i)).toBeDefined();
+  });
+});
+
+describe("source line navigation", () => {
+  it("centers and highlights the requested Markdown source line", () => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nsecond\nthird", true, "notes.md", { position: { line: 2 } });
+      const line = screen.getByText("second").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll).toHaveBeenCalledWith({ block: "center" });
+      expect(scroll.mock.instances.at(-1)).toBe(line);
+      expect(line).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
+});
+
+it.each([true, false])(
+  "clamps Markdown citations to the last loaded line (truncated=%s)",
+  (truncated) => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nlast", true, "notes.md", { truncated, position: { line: 5000 } });
+      const last = screen.getByText("last").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll.mock.instances.at(-1)).toBe(last);
+      expect(last).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  },
+);
+
+describe("large Markdown source fallback", () => {
+  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+    vi.mocked(highlightCode).mockClear();
+    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", {
+      viewMode,
+      markdownSourceFallback: true,
+    });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
+    expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
   });
 });

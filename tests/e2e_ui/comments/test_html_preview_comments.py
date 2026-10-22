@@ -27,6 +27,7 @@ parent offset resolution → ``onSetActiveSelection`` → add-comment POST.
 
 from __future__ import annotations
 
+import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -145,6 +146,8 @@ def test_html_preview_add_comment(
 
     # CommentsPanel opens alongside the preview.
     expect(file_viewer.locator("span.font-semibold", has_text="Comments")).to_be_visible()
+    selection_text = preview.locator("body").evaluate("() => window.getSelection().toString()")
+    assert selection_text == _ANCHOR_SENTENCE, "fresh draft selection should remain visible"
 
     comment_body = "This sentence needs a citation."
     comment_textarea = file_viewer.locator("textarea[placeholder='Add a comment…']")
@@ -177,6 +180,92 @@ def test_html_preview_add_comment(
         f"source position {raw_idx} of the anchor sentence"
     )
     assert comment["end_index"] == raw_idx + len(_ANCHOR_SENTENCE)
+
+
+def test_html_comment_external_runtime_connects_under_strict_csp(
+    page: Page,
+    built_spa: None,
+) -> None:
+    """The emitted external bridge connects when inherited CSP blocks inline JS."""
+    del built_spa
+    assets = list(
+        (_REPO_ROOT / "omnigent/server/static/web-ui/assets").glob("htmlCommentBridgeRuntime-*.js")
+    )
+    assert len(assets) == 1, f"expected one emitted bridge asset, found {assets}"
+
+    probe_url = "https://app.example/probe"
+    asset_url = f"https://app.example/assets/{assets[0].name}"
+    page.route(
+        probe_url,
+        lambda route: route.fulfill(
+            body="<!doctype html><html><body></body></html>",
+            content_type="text/html",
+            headers={"content-security-policy": "default-src 'self'; script-src 'self'"},
+        ),
+    )
+    page.route(
+        asset_url,
+        lambda route: route.fulfill(path=assets[0], content_type="application/javascript"),
+    )
+    page.goto(probe_url)
+
+    nonce = "external-bridge-e2e"
+    page.evaluate(
+        r"""
+        ({ assetUrl, nonce }) => {
+          const protocol = JSON.stringify({
+            source: "omni-html-comment",
+            types: {
+              init: "omni:init",
+              ready: "omni:ready",
+              setComments: "omni:setComments",
+              setActive: "omni:setActive",
+              selection: "omni:selection",
+              commentClick: "omni:commentClick",
+              selectionCleared: "omni:selectionCleared",
+            },
+          }).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+          const iframe = document.createElement("iframe");
+          iframe.id = "external-bridge-probe";
+          iframe.dataset.ready = "false";
+          iframe.setAttribute("sandbox", "allow-scripts");
+          iframe.addEventListener("load", () => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = (event) => {
+              const message = event.data;
+              if (
+                message?.source === "omni-html-comment" &&
+                message?.nonce === nonce &&
+                message?.type === "omni:ready"
+              ) {
+                iframe.dataset.ready = "true";
+              }
+            };
+            iframe.contentWindow.postMessage(
+              { source: "omni-html-comment", nonce, type: "omni:init" },
+              "*",
+              [channel.port2],
+            );
+          });
+          iframe.srcdoc = `<!doctype html><html><body>
+            <script>window.__omniCspInlineCanary = true;<\/script>
+            <script src="${assetUrl}" data-omni-nonce="${nonce}"
+              data-omni-protocol="${protocol}"><\/script>
+          </body></html>`;
+          document.body.append(iframe);
+        }
+        """,
+        {"assetUrl": asset_url, "nonce": nonce},
+    )
+
+    iframe_el = page.locator("#external-bridge-probe")
+    expect(iframe_el).to_have_attribute("data-ready", "true", timeout=10_000)
+    preview = page.frame_locator("#external-bridge-probe")
+    expect(preview.locator(f'script[src="{asset_url}"][data-omni-nonce="{nonce}"]')).to_have_count(
+        1
+    )
+    canary_ran = preview.locator("body").evaluate("() => window.__omniCspInlineCanary === true")
+    assert not canary_ran, "inline canary ran; CSP did not reach the srcdoc frame"
 
 
 def _open_preview(page: Page, base_url: str, session_id: str):
@@ -329,7 +418,7 @@ def test_clicking_comment_scrolls_highlight_into_view(
     # behavior under test is driven by clicking the card, not by how it was made.
     raw_idx = _HTML_CONTENT.find(_DEEP_SENTENCE)
     assert raw_idx != -1, "fixture bug: deep sentence missing from file content"
-    httpx.post(
+    comment = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/comments",
         json={
             "path": file_path,
@@ -338,6 +427,13 @@ def test_clicking_comment_scrolls_highlight_into_view(
             "end_index": raw_idx + len(_DEEP_SENTENCE),
             "anchor_content": _DEEP_SENTENCE,
         },
+        timeout=10.0,
+    )
+    comment.raise_for_status()
+    comment_id = comment.json()["id"]
+    httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}/comments/{comment_id}",
+        json={"status": "addressed"},
         timeout=10.0,
     ).raise_for_status()
 
@@ -348,8 +444,12 @@ def test_clicking_comment_scrolls_highlight_into_view(
     # Open the comments panel via the toolbar (the seeded comment isn't shown
     # until the panel is open).
     file_viewer.get_by_role("button", name="Show comments").click()
+    file_viewer.get_by_role("button", name=re.compile("Sent")).click()
+    expect(file_viewer.get_by_text("deep comment")).to_be_visible()
+    page.wait_for_timeout(200)
+    assert _highlight_count(preview) == 0, "addressed anchors stay hidden until activated"
 
-    # Clicking the comment card in the panel activates it → the bridge scrolls.
+    # Clicking the addressed card activates it → the bridge scrolls.
     file_viewer.get_by_text("deep comment").click()
     page.wait_for_timeout(800)  # smooth scroll settle
     scrolled = preview.locator("body").evaluate("() => window.pageYOffset")

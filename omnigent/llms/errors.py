@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase, OmnigentError
 
 # Provider ``exc.code`` / ``exc.body.error.code`` values that signal
 # a context-window overflow.  Currently OpenAI-origin codes; add
@@ -54,6 +55,101 @@ def is_context_length_exceeded(exc: BaseException) -> bool:
     return False
 
 
+# Databricks front-door rejection of an oversized request body; sizes are
+# bytes, not tokens. The request/limit pair is matched directly as one adjacent
+# group (no nested ``.*?`` wildcards) to stay linear-time on hostile input.
+_CONTENT_LENGTH_PHRASE = re.compile(r"exceeds maximum allowed content length", re.IGNORECASE)
+_REQUEST_LIMIT_PAIR = re.compile(
+    r"RequestSize\(bytes\):\s*(\d+),\s*Limit\(bytes\):\s*(\d+)", re.IGNORECASE
+)
+
+# Rough bytes-per-token ratio for expressing a byte-cap rejection in the
+# token units the context-overflow plumbing carries.
+_APPROX_BYTES_PER_TOKEN = 4
+
+
+@dataclass(frozen=True)
+class RequestSizeOverflow:
+    """
+    A request rejected for exceeding a byte-size content-length cap.
+
+    :param request_bytes: Size of the rejected request, e.g. ``33967957``.
+    :param limit_bytes: The deployment's content-length cap, e.g.
+        ``33554432`` (the 32 MiB Databricks Apps front-door limit).
+    """
+
+    request_bytes: int
+    limit_bytes: int
+
+    @property
+    def approx_request_tokens(self) -> int:
+        """The request size expressed as an approximate token count."""
+        return max(self.request_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+
+    @property
+    def approx_limit_tokens(self) -> int:
+        """The byte cap expressed as an approximate token count."""
+        return max(self.limit_bytes // _APPROX_BYTES_PER_TOKEN, 1)
+
+
+def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
+    """Parse a content-length cap rejection from an error *message*.
+
+    Recognizes the Databricks front-door shape above. The byte cap and the
+    model's token context window are independent limits; callers still map
+    this rejection to ``context_length_exceeded`` because compaction shrinks
+    the request body, making it recoverable rather than permanent.
+
+    :param message: Error text that may embed the rejection, e.g. a raw
+        response body or a harness-reported failure string.
+    :returns: The parsed sizes, or ``None`` when *message* does not match.
+    """
+    phrase = _CONTENT_LENGTH_PHRASE.search(message)
+    if phrase is None:
+        return None
+    pair = _REQUEST_LIMIT_PAIR.search(message, phrase.end())
+    if pair is None:
+        return None
+    try:
+        return RequestSizeOverflow(
+            request_bytes=int(pair.group(1)),
+            limit_bytes=int(pair.group(2)),
+        )
+    except ValueError:
+        # Python caps int(str) at 4300 digits; a malformed oversized field must
+        # not crash classification, so treat it as an unrecognized message.
+        return None
+
+
+def llm_error_category(code: str) -> ErrorCategory:
+    """Fault attribution for an LLM adapter error code.
+
+    LLM codes are a separate namespace from :class:`~omnigent.errors.ErrorCode`
+    (HTTP-status strings plus sentinel words), so they resolve here rather than
+    through ``category_for_code``.
+
+    :param code: The ``code`` on a :class:`RetryableLLMError` /
+        :class:`PermanentLLMError`, e.g. ``"429"``, ``"timeout"``,
+        ``"context_length_exceeded"``.
+    :returns: The mapped :class:`~omnigent.errors.ErrorCategory`.
+    """
+    if code in CONTEXT_EXCEEDED_CODES:
+        return ErrorCategory.USER
+    if code in ("timeout", "connection_error"):
+        # Transport failure. A provider-side network error/timeout is upstream; a
+        # runner tunnel disconnect is really ours, but the code alone can't tell
+        # them apart, so bias away from over-booking SERVER.
+        return ErrorCategory.UPSTREAM
+    if code.isdigit():
+        status = int(code)
+        if status in (401, 403):
+            return ErrorCategory.CONFIG  # bad provider key / gateway
+        if status == 429 or 500 <= status <= 599:
+            return ErrorCategory.UPSTREAM
+        return ErrorCategory.UNKNOWN  # other 4xx: our bad request vs provider policy
+    return ErrorCategory.UNKNOWN
+
+
 @dataclass
 class LLMErrorDetail:
     """
@@ -101,6 +197,22 @@ class RetryableLLMError(OmnigentError):
         super().__init__(message, code=code)
         self.detail = detail
 
+    @property
+    def category(self) -> ErrorCategory:
+        """Resolve attribution from the LLM code namespace, not ``ErrorCode``."""
+        return llm_error_category(self.code)
+
+    @property
+    def impact(self) -> ErrorImpact:
+        """Retryable by definition: transient unless retries exhaust and the turn
+        fails, which the turn's terminal outcome records as blocking."""
+        return ErrorImpact.TRANSIENT
+
+    @property
+    def phase(self) -> ErrorPhase:
+        """LLM calls happen while a turn is running."""
+        return ErrorPhase.TURN
+
 
 class PermanentLLMError(OmnigentError):
     """
@@ -125,6 +237,27 @@ class PermanentLLMError(OmnigentError):
     ) -> None:
         super().__init__(message, code=code)
         self.detail = detail
+
+    @property
+    def category(self) -> ErrorCategory:
+        """Resolve attribution from the LLM code namespace, not ``ErrorCode``.
+
+        ``ContextWindowExceededError`` inherits this; its
+        ``context_length_exceeded`` code resolves to ``USER``.
+        """
+        return llm_error_category(self.code)
+
+    @property
+    def impact(self) -> ErrorImpact:
+        """Not retried, so blocking by default. ``ContextWindowExceededError``
+        overrides this back to transient (it recovers via compaction)."""
+        return ErrorImpact.BLOCKING
+
+    @property
+    def phase(self) -> ErrorPhase:
+        """LLM calls happen while a turn is running (inherited by the context
+        overflow subclass)."""
+        return ErrorPhase.TURN
 
 
 class ContextWindowExceededError(PermanentLLMError):
@@ -163,3 +296,10 @@ class ContextWindowExceededError(PermanentLLMError):
         super().__init__(message, code=code, detail=detail)
         self.max_context_tokens = max_context_tokens
         self.actual_tokens = actual_tokens
+
+    @property
+    def impact(self) -> ErrorImpact:
+        """Recoverable by compacting the history and retrying, so transient. The
+        turn's terminal outcome still records blocking if the workflow does not
+        catch it and the turn fails."""
+        return ErrorImpact.TRANSIENT

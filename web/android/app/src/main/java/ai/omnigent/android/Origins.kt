@@ -1,6 +1,7 @@
 package ai.omnigent.android
 
 import android.net.Uri
+import java.net.URI
 
 /**
  * Normalizes a URL to its origin (`scheme://host[:port]`), the unit of trust
@@ -34,6 +35,89 @@ fun originOf(url: String?): String? {
 fun isHttpScheme(scheme: String?): Boolean {
     val normalized = scheme?.lowercase() ?: return false
     return normalized == "http" || normalized == "https"
+}
+
+/**
+ * [routePath] (absolute, e.g. `/auth/login`) under [serverUrl]'s mount, without its query or
+ * fragment: `https://h/omnigent/` + `/v1/me` is `https://h/omnigent/v1/me`.
+ */
+internal fun serverEndpoint(
+    serverUrl: String,
+    routePath: String,
+): URI? {
+    if (!routePath.startsWith("/")) return null
+    val uri = runCatching { URI(serverUrl) }.getOrNull() ?: return null
+    if (!isHttpScheme(uri.scheme) || uri.rawUserInfo != null) return null
+    val authority = uri.rawAuthority?.takeIf(String::isNotEmpty) ?: return null
+    val mount = uri.rawPath.orEmpty().trimEnd('/')
+    return runCatching { URI("${uri.scheme.lowercase()}://$authority$mount$routePath") }.getOrNull()
+}
+
+/** Authentication strategy for a pinned Omnigent server. */
+enum class ServerAuthentication {
+    /** A Databricks workspace, where Omnigent is mounted at `/omnigent`. */
+    DATABRICKS_WORKSPACE,
+
+    /** A Databricks App, which serves the app at its own root. */
+    DATABRICKS_APP,
+
+    /** Omnigent's generic OIDC flow for every other server. */
+    OIDC,
+    ;
+
+    /** Only Databricks Apps retain embedded platform SSO. */
+    val usesInWebViewAuth: Boolean
+        get() = this == DATABRICKS_APP
+}
+
+/** Path the Omnigent SPA is mounted at inside a Databricks workspace. */
+const val WORKSPACE_UI_PATH = "/omnigent"
+
+private val WORKSPACE_DOMAINS = listOf("databricks.com", "azuredatabricks.net")
+private const val DATABRICKS_APP_DOMAIN = "databricksapps.com"
+
+/** Classify [origin] without treating lookalike suffixes as Databricks hosts. */
+fun serverAuthentication(origin: String?): ServerAuthentication {
+    val host = origin?.let(Uri::parse)?.host?.lowercase()
+    return when {
+        matchesDomain(host, WORKSPACE_DOMAINS) -> ServerAuthentication.DATABRICKS_WORKSPACE
+        matchesDomain(host, listOf(DATABRICKS_APP_DOMAIN)) -> ServerAuthentication.DATABRICKS_APP
+        else -> ServerAuthentication.OIDC
+    }
+}
+
+/** True when [host] is, or sits under, a Databricks workspace domain. */
+fun isDatabricksWorkspaceHost(host: String?): Boolean = matchesDomain(host, WORKSPACE_DOMAINS)
+
+private fun matchesDomain(
+    host: String?,
+    domains: List<String>,
+): Boolean {
+    val normalized = host?.lowercase() ?: return false
+    return domains.any { normalized == it || normalized.endsWith(".$it") }
+}
+
+/**
+ * The workspace-UI URL for a bare Databricks workspace root, or null when [url]
+ * is anything else — a non-workspace host, or a URL that already carries a path
+ * (a deliberate deep link we must not override).
+ *
+ * A bare workspace root shows the Databricks landing page, not Omnigent, so the
+ * shell rewrites it to [WORKSPACE_UI_PATH]. Query and fragment survive because
+ * `?o=<org>` selects which workspace the request lands in.
+ */
+fun databricksWorkspaceUiUrl(url: String?): String? {
+    val uri = url?.let(Uri::parse) ?: return null
+    if (!isHttpScheme(uri.scheme)) return null
+    if (!isDatabricksWorkspaceHost(uri.host)) return null
+    val path = uri.path.orEmpty()
+    if (path.isNotEmpty() && path != "/") return null
+    val origin = originOf(url) ?: return null
+    return buildString {
+        append(origin).append(WORKSPACE_UI_PATH)
+        uri.encodedQuery?.let { append('?').append(it) }
+        uri.encodedFragment?.let { append('#').append(it) }
+    }
 }
 
 /**

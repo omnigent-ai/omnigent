@@ -53,6 +53,142 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("CommandPalette — sessions", () => {
+  it.each([false, true])(
+    "requests active sessions and keeps owned and shared results (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      const sessions = [
+        { ...conv("owned", "Owned session"), owner: "current-user", permission_level: 4 },
+        { ...conv("shared", "Shared session"), owner: "other-user", permission_level: 2 },
+        { ...conv("archived", "Archived session"), archived: true },
+      ];
+      setSessions(sessions);
+      renderPalette({ sessionsOnly });
+
+      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+      expect(screen.getByText("Owned session")).toBeTruthy();
+      expect(screen.getByText("Shared session")).toBeTruthy();
+      expect(screen.queryByText("Archived session")).toBeNull();
+    },
+  );
+
+  it("fuzzy-matches session names without showing unrelated actions", () => {
+    setSessions([
+      conv("parser", "Fix the parser"),
+      conv("deploy", "Deploy API"),
+      conv("content", "Unrelated", null, "Fix the parser"),
+    ]);
+    const { onOpenChange } = renderPalette({ sessionsOnly: true });
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "fxprs" } });
+    expect(screen.getByText("Fix the parser")).toBeTruthy();
+    expect(screen.queryByText("Deploy API")).toBeNull();
+    expect(screen.queryByText("Unrelated")).toBeNull();
+    expect(screen.queryByText("Go to Inbox")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/parser");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("loads later pages for fuzzy matching and stops loading while closed", () => {
+    const fetchNextPage = vi.fn();
+    useConversations.mockReturnValue({
+      data: { pages: [{ data: [] }] },
+      isFetching: false,
+      hasNextPage: true,
+      fetchNextPage,
+    });
+    const props = {
+      open: true,
+      sessionsOnly: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+    useConversations.mockReturnValue({
+      data: { pages: [{ data: [] }, { data: [conv("older", "Older session")] }] },
+      isFetching: false,
+      hasNextPage: false,
+      fetchNextPage,
+    });
+    rerender(<CommandPalette {...props} />);
+    expect(screen.getByText("Older session")).toBeTruthy();
+    rerender(<CommandPalette {...props} open={false} />);
+    expect(useConversations).toHaveBeenLastCalledWith("", false, { enabled: false });
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("does not retry a failed pagination request indefinitely", () => {
+    const fetchNextPage = vi.fn();
+    useConversations.mockReturnValue({
+      data: { pages: [] },
+      isFetching: false,
+      hasNextPage: true,
+      isFetchNextPageError: true,
+      fetchNextPage,
+    });
+    renderPalette({ sessionsOnly: true });
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toContain("Couldn't load");
+    expect(screen.queryByText("No results found")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])(
+    "shows initial fetch errors with a retry (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      const refetch = vi.fn();
+      useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
+      renderPalette({ sessionsOnly });
+      expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+      expect(screen.queryByText("No results found")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      expect(refetch).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("shows only one loading message during the initial session fetch", () => {
+    setSessions([], true);
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
+    expect(screen.queryByText("Searching…")).toBeNull();
+    expect(screen.queryByText("No results found")).toBeNull();
+  });
+
+  it("bounds automatic pagination and lets the user search older sessions", () => {
+    const fetchNextPage = vi.fn();
+    useConversations.mockReturnValue({
+      data: {
+        pages: Array.from({ length: 10 }, () => ({ data: [conv("repeated", "Repeated page")] })),
+      },
+      hasNextPage: true,
+      isFetching: false,
+      fetchNextPage,
+    });
+    renderPalette({ sessionsOnly: true });
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    expect(screen.getAllByText("Repeated page")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Search older sessions" }));
+    expect(fetchNextPage).toHaveBeenCalledOnce();
+  });
+
+  it("bounds rendered rows while searching every loaded session", () => {
+    setSessions(Array.from({ length: 100 }, (_, i) => conv(`c${i}`, `Session ${i}`)));
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getAllByRole("option")).toHaveLength(50);
+    expect(screen.getByRole("status").textContent).toContain("Showing 50 of 100 matches.");
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "Session" } });
+    expect(screen.getAllByRole("option")).toHaveLength(50);
+    expect(document.querySelector("mark")?.textContent).toBe("Session");
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "Session 99" },
+    });
+    expect(labelRow("Session 99")).toBeTruthy();
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c99");
+  });
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
     renderPalette();
@@ -80,22 +216,19 @@ describe("CommandPalette — sessions", () => {
       setSessions([conv("c1", "Fix the parser")]);
       renderPalette();
 
-      // Empty query on mount → shares AppShell's `["conversations","",true]` entry.
-      expect(useConversations).toHaveBeenCalledWith("", true);
+      expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
 
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
       });
       // Before the debounce elapses the query has NOT yet reached the hook.
-      expect(useConversations).not.toHaveBeenCalledWith("deploy", true);
+      expect(useConversations).not.toHaveBeenCalledWith("deploy", false, { enabled: true });
 
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      // After the 300ms debounce, the typed query drives a server search with
-      // archived rows included (filtered client-side) — proving the palette
-      // searches the server, not a page.
-      expect(useConversations).toHaveBeenCalledWith("deploy", true);
+      // The debounced query searches active sessions on the server.
+      expect(useConversations).toHaveBeenCalledWith("deploy", false, { enabled: true });
     } finally {
       vi.useRealTimers();
     }
@@ -214,6 +347,80 @@ describe("CommandPalette — input", () => {
     renderPalette();
 
     expect(screen.getByPlaceholderText("Search sessions or run a command")).toBeTruthy();
+  });
+});
+
+describe("CommandPalette — mobile full-screen sheet", () => {
+  // useIsMobileViewport reads window.matchMedia("(max-width: 767.98px)").matches.
+  // The global test-setup stubs matchMedia to always report false (desktop);
+  // flip it here so the palette renders its keyboard-safe mobile layout.
+  function setMobile(isMobile: boolean) {
+    window.matchMedia = ((query: string) => ({
+      matches: isMobile,
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+  }
+
+  function dialogContent() {
+    return document.querySelector("[data-slot=dialog-content]");
+  }
+
+  afterEach(() => setMobile(false));
+
+  it("renders a top-anchored full-screen sheet with a close button on mobile", () => {
+    setMobile(true);
+    renderPalette();
+
+    // The sheet drops the centered-card geometry (top-1/4 → top-0, rounded → none)
+    // so it fills the keyboard-aware viewport instead of hiding behind the keyboard.
+    const content = dialogContent();
+    expect(content?.className).toContain("rounded-none");
+    expect(content?.className).not.toContain("top-1/4");
+    // …and offers an explicit close affordance (no ⌘K/Esc hint on touch).
+    expect(screen.getByLabelText("Close search")).toBeTruthy();
+  });
+
+  it("keeps the centered dialog and shows no close button on desktop", () => {
+    setMobile(false);
+    renderPalette();
+
+    expect(dialogContent()?.className).toContain("top-1/4");
+    expect(screen.queryByLabelText("Close search")).toBeNull();
+  });
+
+  it("closes the palette when the mobile close button is tapped", () => {
+    setMobile(true);
+    const onOpenChange = vi.fn();
+    renderPalette({ onOpenChange });
+
+    fireEvent.click(screen.getByLabelText("Close search"));
+
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("still searches from the mobile input", () => {
+    vi.useFakeTimers();
+    try {
+      setMobile(true);
+      setSessions([conv("c1", "Fix the parser")]);
+      renderPalette();
+
+      fireEvent.change(screen.getByTestId("command-palette-input"), {
+        target: { value: "deploy" },
+      });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(useConversations).toHaveBeenCalledWith("deploy", false, { enabled: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -1,0 +1,88 @@
+# Slack app manifest for the Omnigent bot.
+#
+# Create the app from this rather than clicking through the settings:
+# api.slack.com/apps -> Create New App -> From an app manifest -> pick the
+# workspace -> paste this file. It configures Socket Mode, interactivity, every
+# scope and event the bot needs, and the /omnigent command.
+#
+# Two things a manifest cannot do, so do them after creating the app:
+#   1. Basic Information -> App-Level Tokens -> Generate, with scope
+#      connections:write. That token (xapp-...) is OMNIGENT_SLACK_APP_TOKEN.
+#   2. Install to Workspace, then copy the Bot User OAuth Token (xoxb-...)
+#      into OMNIGENT_SLACK_BOT_TOKEN.
+#
+# Keep this in step with the scope table in ../README.md.
+
+display_information:
+  name: Omnigent
+  description: Run Omnigent agent sessions from Slack threads and DMs.
+  background_color: "#1f2933"
+
+features:
+  bot_user:
+    display_name: Omnigent
+    always_online: false
+  app_home:
+    # The messages tab is what lets a user DM the bot at all, and it defaults
+    # to OFF. Without it the bot holds im:history and im:write yet nobody can
+    # send it anything — and DMs are a first-class entry point, so the setup
+    # prompt and logout confirmation would arrive in a conversation the user
+    # cannot reply in.
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+    # The bot publishes no Home view.
+    home_tab_enabled: false
+  slash_commands:
+    - command: /omnigent
+      # Socket Mode delivers the payload over the websocket and ignores this
+      # URL, but the field is required, so it points somewhere unroutable.
+      url: https://example.invalid/slack/commands
+      description: Configure Omnigent, or sign out
+      usage_hint: "config | logout"
+      should_escape: false
+
+oauth_config:
+  scopes:
+    bot:
+      # Receive app_mention — the only way the bot joins a channel thread.
+      - app_mentions:read
+      # Post, stream, edit, and delete replies, including ephemeral notices.
+      - chat:write
+      # Open a DM (conversations.open) for the setup button and logout note.
+      - im:write
+      # DMs are a first-class entry point and fire no app_mention, so without
+      # this the bot cannot answer in a DM at all.
+      - im:history
+      # Register and receive /omnigent.
+      - commands
+      # Read the workspace name (team.info) to label the delegated-login
+      # request, so an operator can tell which workspace obtained a grant.
+      - team:read
+      # Channel history, one per channel type the bot runs in. Remove the ones
+      # you do not use — im:history alone covers a DM-only deployment, and a
+      # DM + channel-@mention deployment needs none of these three.
+      - channels:history
+      - groups:history
+      - mpim:history
+      # Databricks web-auth mode ONLY (OMNIGENT_SLACK_SERVER_AUTH=databricks),
+      # where the user's email is signed into the enrollment link and matched
+      # against the OAuth-authenticated one. Omit for accounts/oidc servers.
+      # - users:read
+      # - users:read.email
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      # Match these to the history scopes above; drop the ones you removed.
+      - message.im
+      - message.channels
+      - message.groups
+      - message.mpim
+  interactivity:
+    # Required: approval and AskUserQuestion cards are interactive, and Socket
+    # Mode delivers their payloads over the same websocket.
+    is_enabled: true
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

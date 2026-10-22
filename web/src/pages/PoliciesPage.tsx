@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon, XIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { ModelValueCombobox } from "@/components/ModelValueCombobox";
+import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -171,8 +172,7 @@ function AddDefaultPolicyDialog({
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                     placeholder="Filter policies..."
-                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
-                    // eslint-disable-next-line jsx-a11y/no-autofocus
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-ui placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
                   <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
@@ -183,16 +183,16 @@ function AddDefaultPolicyDialog({
                         onClick={() => handleSelect(r.handler)}
                         className="flex flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-muted"
                       >
-                        <span className="text-sm">{r.name}</span>
+                        <span className="text-ui">{r.name}</span>
                         {r.description && (
-                          <span className="line-clamp-2 text-[11px] text-muted-foreground">
+                          <span className="line-clamp-2 text-sm text-muted-foreground">
                             {r.description}
                           </span>
                         )}
                       </button>
                     ))}
                     {filtered.length === 0 && (
-                      <p className="py-2 text-center text-xs text-muted-foreground">
+                      <p className="py-2 text-center text-sm text-muted-foreground">
                         No policies match your filter.
                       </p>
                     )}
@@ -203,7 +203,7 @@ function AddDefaultPolicyDialog({
           {entry && (
             <div className="flex flex-col gap-1 rounded border border-border bg-muted/50 px-2.5 py-2">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">{entry.name}</span>
+                <span className="text-ui font-medium">{entry.name}</span>
                 <button
                   type="button"
                   onClick={() => {
@@ -212,26 +212,26 @@ function AddDefaultPolicyDialog({
                     setFactoryParams({});
                     setParamError(null);
                   }}
-                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                  className="text-sm text-muted-foreground hover:text-foreground"
                 >
                   Change
                 </button>
               </div>
               {entry.description && (
-                <p className="text-xs text-muted-foreground">{entry.description}</p>
+                <p className="text-sm text-muted-foreground">{entry.description}</p>
               )}
             </div>
           )}
           {entry && (
             <div>
-              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+              <label className="flex items-center gap-1 text-sm text-muted-foreground">
                 <span className="font-medium text-foreground">name</span>
               </label>
               <input
                 type="text"
                 value={policyName}
                 onChange={(e) => setPolicyName(e.target.value)}
-                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
               />
             </div>
           )}
@@ -239,26 +239,26 @@ function AddDefaultPolicyDialog({
             <div className="space-y-2">
               {paramKeys.map((key) => {
                 const prop = properties[key];
+                const typeLabel =
+                  prop?.type === "array" && prop.items?.enum
+                    ? "multi-select"
+                    : prop?.type === "array"
+                      ? "comma-separated"
+                      : prop?.type;
+                const fieldLabel = typeLabel ? `${key} (${typeLabel})` : key;
                 return (
                   <div key={key}>
-                    <label className="flex items-center gap-1 text-xs text-muted-foreground">
-                      <span className="font-medium text-foreground">{key}</span>
-                      {prop?.type && (
-                        <span>
-                          (
-                          {prop.type === "array" && prop.items?.enum
-                            ? "multi-select"
-                            : prop.type === "array"
-                              ? "comma-separated"
-                              : prop.type}
-                          )
-                        </span>
-                      )}
-                    </label>
-                    {prop?.description && (
-                      <p className="break-words text-[11px] text-muted-foreground">
-                        {prop.description}
-                      </p>
+                    {prop?.description ? (
+                      <SettingsLabel
+                        label={fieldLabel}
+                        labelClassName="text-sm text-foreground"
+                        description={prop.description}
+                        descriptionClassName="break-words"
+                      />
+                    ) : (
+                      <label className="flex items-center gap-1 text-sm text-muted-foreground">
+                        <span className="font-medium text-foreground">{fieldLabel}</span>
+                      </label>
                     )}
                     {prop?.type === "boolean" ? (
                       <select
@@ -272,7 +272,7 @@ function AddDefaultPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         <option value="true">true</option>
                         <option value="false">false</option>
@@ -291,7 +291,7 @@ function AddDefaultPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       >
                         {prop.enum.map((v) => (
                           <option key={v} value={v}>
@@ -313,7 +313,7 @@ function AddDefaultPolicyDialog({
                                 {current.map((v) => (
                                   <span
                                     key={v}
-                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-xs"
+                                    className="inline-flex items-center gap-0.5 rounded-md bg-muted px-1.5 py-0.5 text-sm"
                                   >
                                     {v}
                                     <button
@@ -370,7 +370,7 @@ function AddDefaultPolicyDialog({
                             [key]: e.target.value,
                           }))
                         }
-                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-sm"
+                        className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
                       />
                     )}
                   </div>
@@ -381,14 +381,15 @@ function AddDefaultPolicyDialog({
           {(paramError || addPolicy.isError) && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {paramError ?? addPolicy.error?.message}
             </div>
           )}
           <div className="flex justify-end gap-2 pt-1">
-            <button
+            <Button
               type="button"
+              variant="outline"
               onClick={() => {
                 // With a policy selected, Cancel steps back to the list so the
                 // user can pick another; only close the dialog from the list.
@@ -400,18 +401,17 @@ function AddDefaultPolicyDialog({
                   onOpenChange(false);
                 }
               }}
-              className="rounded px-3 py-1.5 text-xs hover:bg-muted"
             >
               Cancel
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={handleAdd}
-              disabled={!selected || addPolicy.isPending}
-              className="rounded bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
+              loading={addPolicy.isPending}
+              disabled={!selected}
             >
-              {addPolicy.isPending ? "Adding..." : "Add"}
-            </button>
+              Add
+            </Button>
           </div>
         </div>
       </DialogContent>
@@ -459,7 +459,7 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === null) {
     return (
-      <div className="flex min-h-full items-center justify-center text-sm text-muted-foreground">
+      <div className="flex min-h-full items-center justify-center text-ui text-muted-foreground">
         Loading...
       </div>
     );
@@ -467,9 +467,9 @@ export function PoliciesPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-8" extraBottom="2.5rem">
-        <h1 className="mb-2 text-2xl font-semibold">Global Policies</h1>
-        <p className="text-sm text-muted-foreground">
+      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Global Policies</h1>
+        <p className="text-ui text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
       </PageScroll>
@@ -493,11 +493,11 @@ export function PoliciesPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-8" extraBottom="2.5rem">
+    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold">Global Policies</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
+          <h1 className="settings-page-title text-2xl font-semibold">Global Policies</h1>
+          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
             Global policies applied to all sessions.
           </p>
         </div>
@@ -522,7 +522,7 @@ export function PoliciesPage() {
                     <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium">{p.name}</span>
+                        <span className="text-ui font-medium">{p.name}</span>
                         {p.source === "config" && (
                           <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
                             Config
@@ -535,11 +535,11 @@ export function PoliciesPage() {
                         )}
                       </div>
                       {registryEntry?.description && (
-                        <p className="mt-0.5 text-xs text-muted-foreground">
+                        <p className="mt-0.5 text-sm text-muted-foreground">
                           {registryEntry.description}
                         </p>
                       )}
-                      <code className="mt-1 block text-[11px] text-muted-foreground/70">
+                      <code className="mt-1 block text-sm text-muted-foreground/70">
                         {p.handler}
                       </code>
                     </div>
@@ -556,6 +556,7 @@ export function PoliciesPage() {
                             })
                           }
                           aria-label={`Toggle ${p.name}`}
+                          componentId="settings.policies.toggle_enabled"
                         />
                         <Button
                           variant="ghost"
@@ -578,7 +579,7 @@ export function PoliciesPage() {
                     </span>
                     <div className="mt-1 flex flex-col gap-0.5">
                       {Object.entries(params).map(([key, value]) => (
-                        <div key={key} className="flex items-baseline gap-1.5 text-xs">
+                        <div key={key} className="flex items-baseline gap-1.5 text-sm">
                           <span className="font-medium text-foreground/80">{key}:</span>
                           <span className="text-muted-foreground">
                             {Array.isArray(value) ? value.join(", ") : String(value)}
@@ -595,7 +596,7 @@ export function PoliciesPage() {
       )}
 
       {policies.length === 0 && (
-        <p className="text-sm text-muted-foreground">
+        <p className="text-ui text-muted-foreground">
           No global policies configured. Add one to apply it to all sessions.
         </p>
       )}
@@ -630,7 +631,7 @@ export function PoliciesPage() {
           {actionError !== null && (
             <div
               role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
             >
               {actionError}
             </div>
@@ -646,9 +647,9 @@ export function PoliciesPage() {
             <Button
               variant="destructive"
               onClick={() => void onConfirmDelete()}
-              disabled={pendingAction}
+              loading={pendingAction}
             >
-              {pendingAction ? "Removing..." : "Remove"}
+              Remove
             </Button>
           </DialogFooter>
         </DialogContent>

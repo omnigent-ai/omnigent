@@ -1,0 +1,802 @@
+"""Tests for :mod:`omnigent.server.managed_sandbox_reaper`."""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import threading
+from collections.abc import Callable, Iterator
+from dataclasses import replace
+
+import pytest
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
+from omnigent.db.db_models import SqlHost, current_workspace_id
+from omnigent.db.enum_codecs import encode_host_status
+from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    ManagedSandboxReaperConfig,
+)
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+from omnigent.stores.host_store import (
+    Host,
+    HostStore,
+    ManagedSandboxScanCursor,
+    ManagedSandboxScanRow,
+)
+
+pytestmark = pytest.mark.asyncio
+
+_DAY_S = 24 * 60 * 60
+
+
+class _RecordingLauncher:
+    def __init__(
+        self,
+        provider: str,
+        *,
+        fail: bool = False,
+        identity_fail: bool = False,
+        on_terminate: Callable[[str], None] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.fail = fail
+        self.identity_fail = identity_fail
+        self.on_terminate = on_terminate
+        self.factory_calls = 0
+        self.identity_entries: list[int] = []
+        self.identity_threads: list[int] = []
+        self.terminated: list[str] = []
+        self.termination_threads: list[int] = []
+
+    @contextlib.contextmanager
+    def reaper_identity(self, workspace_id: int) -> Iterator[None]:
+        self.identity_entries.append(workspace_id)
+        self.identity_threads.append(threading.get_ident())
+        if self.identity_fail:
+            raise RuntimeError(f"{self.provider} identity unavailable")
+        yield
+
+    def terminate(self, sandbox_id: str) -> None:
+        self.termination_threads.append(threading.get_ident())
+        if self.on_terminate is not None:
+            self.on_terminate(sandbox_id)
+        if self.fail:
+            raise RuntimeError(f"{self.provider} unavailable")
+        self.terminated.append(sandbox_id)
+
+
+class _FakeHostStore:
+    def __init__(self, hosts: dict[int, list[Host]]) -> None:
+        self.hosts = {
+            workspace_id: {host.host_id: host for host in workspace_hosts}
+            for workspace_id, workspace_hosts in hosts.items()
+        }
+        self.detached: list[tuple[int, str, str]] = []
+        self.cleared: list[tuple[int, str, str]] = []
+        self.refresh_on_detach: set[str] = set()
+        self.current_page_queries: list[tuple[ManagedSandboxScanCursor | None, int]] = []
+        self.terminating_page_queries: list[tuple[ManagedSandboxScanCursor | None, int]] = []
+
+    def list_current_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        self.current_page_queries.append((after, limit))
+        rows = sorted(
+            (
+                (host.sandbox_id, workspace_id, host.host_id, host)
+                for workspace_id, hosts in self.hosts.items()
+                for host in hosts.values()
+                if host.sandbox_id is not None
+            ),
+            key=lambda row: row[:3],
+        )
+        if after is not None:
+            rows = [row for row in rows if row[:3] > after]
+        return [(workspace_id, host) for _, workspace_id, _, host in rows[:limit]]
+
+    def list_terminating_managed_sandbox_hosts_page(
+        self,
+        *,
+        after: ManagedSandboxScanCursor | None,
+        limit: int,
+    ) -> list[ManagedSandboxScanRow]:
+        self.terminating_page_queries.append((after, limit))
+        rows = sorted(
+            (
+                (host.terminating_sandbox_id, workspace_id, host.host_id, host)
+                for workspace_id, hosts in self.hosts.items()
+                for host in hosts.values()
+                if host.terminating_sandbox_id is not None
+            ),
+            key=lambda row: row[:3],
+        )
+        if after is not None:
+            rows = [row for row in rows if row[:3] > after]
+        return [(workspace_id, host) for _, workspace_id, _, host in rows[:limit]]
+
+    def detach_stale_managed_sandbox(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+        expected_updated_at: int,
+    ) -> bool:
+        workspace_id = current_workspace_id()
+        workspace_hosts = self.hosts[current_workspace_id()]
+        host = workspace_hosts.get(host_id)
+        if host is not None and host_id in self.refresh_on_detach:
+            host = replace(host, status="online", updated_at=4_000_000)
+            workspace_hosts[host_id] = host
+            self.refresh_on_detach.remove(host_id)
+        if (
+            host is None
+            or host.deleted_at is not None
+            or host.sandbox_id != sandbox_id
+            or host.updated_at != expected_updated_at
+            or host.terminating_sandbox_id is not None
+        ):
+            return False
+        workspace_hosts[host_id] = replace(
+            host,
+            status="offline",
+            sandbox_id=None,
+            terminating_sandbox_id=sandbox_id,
+        )
+        self.detached.append((workspace_id, host_id, sandbox_id))
+        return True
+
+    def mark_sandbox_terminated(
+        self,
+        host_id: str,
+        *,
+        sandbox_id: str,
+    ) -> bool:
+        workspace_id = current_workspace_id()
+        host = self.hosts[workspace_id].get(host_id)
+        if host is None:
+            return False
+        if host.deleted_at is None:
+            if host.terminating_sandbox_id != sandbox_id:
+                return False
+            self.hosts[workspace_id][host_id] = replace(
+                host,
+                terminating_sandbox_id=None,
+            )
+            self.cleared.append((workspace_id, host_id, sandbox_id))
+            return True
+        if sandbox_id not in {host.sandbox_id, host.terminating_sandbox_id}:
+            return False
+        updated = replace(
+            host,
+            sandbox_id=None if host.sandbox_id == sandbox_id else host.sandbox_id,
+            terminating_sandbox_id=(
+                None if host.terminating_sandbox_id == sandbox_id else host.terminating_sandbox_id
+            ),
+        )
+        if updated.sandbox_id is None and updated.terminating_sandbox_id is None:
+            del self.hosts[workspace_id][host_id]
+        else:
+            self.hosts[workspace_id][host_id] = updated
+        self.cleared.append((workspace_id, host_id, sandbox_id))
+        return True
+
+
+def _host(
+    host_id: str,
+    *,
+    provider: str,
+    sandbox_id: str | None,
+    updated_at: int,
+    status: str = "offline",
+    terminating_sandbox_id: str | None = None,
+    deleted_at: int | None = None,
+) -> Host:
+    return Host(
+        host_id=host_id,
+        name=host_id,
+        user_id="alice@example.com",
+        status=status,
+        created_at=updated_at - 100,
+        updated_at=updated_at,
+        sandbox_provider=provider,
+        sandbox_id=sandbox_id,
+        terminating_sandbox_id=terminating_sandbox_id,
+        deleted_at=deleted_at,
+    )
+
+
+def _deployment(
+    launchers: list[_RecordingLauncher],
+    *,
+    terminate_after_offline_days: int = 1,
+    sweep_interval_s: int = 86400,
+) -> ManagedSandboxDeployment:
+    configs = []
+    for launcher in launchers:
+
+        def launcher_factory(launcher: _RecordingLauncher = launcher) -> _RecordingLauncher:
+            launcher.factory_calls += 1
+            return launcher
+
+        configs.append(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=launcher_factory,
+                token_ttl_s=3600,
+                provider=launcher.provider,
+            )
+        )
+    return ManagedSandboxDeployment(
+        configs=tuple(configs),
+        reaper=ManagedSandboxReaperConfig(
+            enabled=True,
+            terminate_after_offline_days=terminate_after_offline_days,
+            sweep_interval_s=sweep_interval_s,
+        ),
+    )
+
+
+async def test_sweep_reaps_stale_host_rows_without_scanning_sessions() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal")
+    e2b = _RecordingLauncher("e2b")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_recent",
+                    provider="modal",
+                    sandbox_id="sb-recent",
+                    updated_at=now - _DAY_S + 1,
+                ),
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal",
+                    updated_at=now - _DAY_S - 1,
+                ),
+                _host(
+                    "host_modal_2",
+                    provider="modal",
+                    sandbox_id="sb-modal-2",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+            ],
+            9: [
+                _host(
+                    "host_e2b",
+                    provider="e2b",
+                    sandbox_id="sb-e2b",
+                    updated_at=now - 2 * _DAY_S,
+                    status="online",
+                )
+            ],
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal, e2b]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 3
+
+    assert modal.terminated == ["sb-modal-2", "sb-modal"]
+    assert e2b.terminated == ["sb-e2b"]
+    assert hosts.detached == [
+        (7, "host_modal_2", "sb-modal-2"),
+        (7, "host_modal", "sb-modal"),
+        (9, "host_e2b", "sb-e2b"),
+    ]
+    assert hosts.cleared == hosts.detached
+    assert modal.factory_calls == 1
+    assert modal.identity_entries == [7]
+    assert e2b.factory_calls == 1
+    assert e2b.identity_entries == [9]
+    assert hosts.hosts[7]["host_modal"].sandbox_id is None
+    assert hosts.hosts[7]["host_modal"].terminating_sandbox_id is None
+    assert hosts.hosts[7]["host_recent"].sandbox_id == "sb-recent"
+    assert hosts.terminating_page_queries == [(None, 500)]
+    assert hosts.current_page_queries == [(None, 500)]
+
+
+async def test_sweep_completely_traverses_bounded_slot_pages() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_current_a",
+                    provider="modal",
+                    sandbox_id="sb-current-a",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+                _host(
+                    "host_current_b",
+                    provider="modal",
+                    sandbox_id="sb-current-b",
+                    updated_at=now - 3 * _DAY_S,
+                ),
+                _host(
+                    "host_current_c",
+                    provider="modal",
+                    sandbox_id="sb-current-c",
+                    updated_at=now - 4 * _DAY_S,
+                ),
+                _host(
+                    "host_pending_a",
+                    provider="modal",
+                    sandbox_id=None,
+                    terminating_sandbox_id="sb-pending-a",
+                    updated_at=now,
+                ),
+                _host(
+                    "host_pending_b",
+                    provider="modal",
+                    sandbox_id=None,
+                    terminating_sandbox_id="sb-pending-b",
+                    updated_at=now,
+                ),
+                _host(
+                    "host_pending_c",
+                    provider="modal",
+                    sandbox_id=None,
+                    terminating_sandbox_id="sb-pending-c",
+                    updated_at=now,
+                ),
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+        scan_batch_size=2,
+    )
+
+    assert await reaper.sweep_once(now=now) == 6
+    assert set(modal.terminated) == {
+        "sb-current-a",
+        "sb-current-b",
+        "sb-current-c",
+        "sb-pending-a",
+        "sb-pending-b",
+        "sb-pending-c",
+    }
+    assert hosts.terminating_page_queries == [
+        (None, 2),
+        (("sb-pending-b", 7, "host_pending_b"), 2),
+    ]
+    assert hosts.current_page_queries == [
+        (None, 2),
+        (("sb-current-b", 7, "host_current_b"), 2),
+    ]
+
+
+async def test_provider_failure_does_not_stop_other_sandboxes() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal", fail=True)
+    e2b = _RecordingLauncher("e2b")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+                _host(
+                    "host_e2b",
+                    provider="e2b",
+                    sandbox_id="sb-e2b",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal, e2b]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 1
+    assert hosts.hosts[7]["host_modal"].sandbox_id is None
+    assert hosts.hosts[7]["host_modal"].terminating_sandbox_id == "sb-modal"
+    assert hosts.hosts[7]["host_e2b"].sandbox_id is None
+    assert e2b.terminated == ["sb-e2b"]
+
+
+async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal", fail=True)
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_deleted",
+                    provider="modal",
+                    sandbox_id="sb-deleted",
+                    updated_at=now,
+                    status="online",
+                    deleted_at=now,
+                )
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 0
+    assert hosts.hosts[7]["host_deleted"].sandbox_id == "sb-deleted"
+
+    modal.fail = False
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["sb-deleted"]
+    assert "host_deleted" not in hosts.hosts[7]
+
+
+async def test_provider_identity_failure_does_not_stop_other_sandboxes() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal", identity_fail=True)
+    e2b = _RecordingLauncher("e2b")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+                _host(
+                    "host_e2b",
+                    provider="e2b",
+                    sandbox_id="sb-e2b",
+                    updated_at=now - 2 * _DAY_S,
+                ),
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal, e2b]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == []
+    assert e2b.terminated == ["sb-e2b"]
+    assert hosts.hosts[7]["host_modal"].sandbox_id == "sb-modal"
+    assert hosts.hosts[7]["host_e2b"].sandbox_id is None
+
+
+async def test_reaper_rereads_liveness_before_termination() -> None:
+    now = 4_000_000
+    modal = _RecordingLauncher("modal")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal",
+                    updated_at=now - 2 * _DAY_S,
+                )
+            ]
+        }
+    )
+    hosts.refresh_on_detach.add("host_modal")
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 0
+    assert modal.terminated == []
+    assert hosts.hosts[7]["host_modal"].sandbox_id == "sb-modal"
+
+
+async def test_successful_termination_preserves_new_active_generation() -> None:
+    now = 4_000_000
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal",
+                    updated_at=now - 2 * _DAY_S,
+                )
+            ]
+        }
+    )
+
+    def _launch_new_generation(sandbox_id: str) -> None:
+        assert sandbox_id == "sb-modal"
+        current = hosts.hosts[7]["host_modal"]
+        assert current.sandbox_id is None
+        assert current.terminating_sandbox_id == "sb-modal"
+        hosts.hosts[7]["host_modal"] = replace(
+            current,
+            sandbox_id="sb-modal-new",
+            status="online",
+            updated_at=now,
+        )
+
+    modal = _RecordingLauncher("modal", on_terminate=_launch_new_generation)
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["sb-modal"]
+    assert hosts.hosts[7]["host_modal"].sandbox_id == "sb-modal-new"
+    assert hosts.hosts[7]["host_modal"].terminating_sandbox_id is None
+
+
+@pytest.mark.parametrize("stale_status", ["offline", "online"])
+async def test_new_binding_gets_reaping_grace_without_reviving_host(
+    db_uri: str, stale_status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hosts = HostStore(db_uri)
+    host_id = "ab" * 16
+    modal = _RecordingLauncher("modal")
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=_deployment([modal]))
+    now = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
+    hosts.reserve_sandbox_host(
+        host_id=host_id, name="managed-host", user_id="alice@example.com", provider="modal"
+    )
+    hosts.bind_sandbox(host_id, provider="modal", sandbox_id="old")
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+            .values(updated_at=now - 2 * _DAY_S)
+        )
+        session.commit()
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["old"]
+
+    # A durable row may retain online status after an unclean host disconnect.
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+            .values(status=encode_host_status(stale_status))
+        )
+        session.commit()
+    hosts.reserve_sandbox_host(
+        host_id=host_id, name="managed-host", user_id="alice@example.com", provider="modal"
+    )
+    bound = hosts.bind_sandbox(host_id, provider="modal", sandbox_id="replacement")
+    assert bound is not None
+    assert not hosts.is_online(host_id)
+    assert await reaper.sweep_once(now=now) == 0
+    assert modal.terminated == ["old"]
+    assert hosts.get_host(host_id) == bound
+    # Rebinding the same generation must not extend its lifetime indefinitely.
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now + 3600)
+    assert hosts.bind_sandbox(host_id, provider="modal", sandbox_id="replacement") == bound
+    assert await reaper.sweep_once(now=now + _DAY_S) == 1
+    assert modal.terminated == ["old", "replacement"]
+
+
+async def test_pending_termination_retries_without_detaching_active_generation() -> None:
+    now = 4_000_000
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal-new",
+                    terminating_sandbox_id="sb-modal-old",
+                    updated_at=now,
+                    status="online",
+                )
+            ]
+        }
+    )
+    modal = _RecordingLauncher("modal")
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["sb-modal-old"]
+    assert hosts.detached == []
+    assert hosts.hosts[7]["host_modal"].sandbox_id == "sb-modal-new"
+    assert hosts.hosts[7]["host_modal"].terminating_sandbox_id is None
+
+
+async def test_pending_id_equal_to_active_id_is_not_terminated() -> None:
+    now = 4_000_000
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_blaxel",
+                    provider="blaxel",
+                    sandbox_id="managed-host_blaxel",
+                    terminating_sandbox_id="managed-host_blaxel",
+                    updated_at=now,
+                    status="online",
+                )
+            ]
+        }
+    )
+    blaxel = _RecordingLauncher("blaxel")
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([blaxel]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 0
+    assert blaxel.terminated == []
+    current = hosts.hosts[7]["host_blaxel"]
+    assert current.sandbox_id == "managed-host_blaxel"
+    assert current.terminating_sandbox_id == "managed-host_blaxel"
+
+
+async def test_identity_and_termination_run_off_event_loop_thread() -> None:
+    now = 4_000_000
+    event_loop_thread = threading.get_ident()
+    modal = _RecordingLauncher("modal")
+    hosts = _FakeHostStore(
+        {
+            7: [
+                _host(
+                    "host_modal",
+                    provider="modal",
+                    sandbox_id="sb-modal",
+                    updated_at=now - 2 * _DAY_S,
+                )
+            ]
+        }
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=hosts,  # type: ignore[arg-type]
+        sandbox_config=_deployment([modal]),
+    )
+
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.identity_threads == modal.termination_threads
+    assert modal.identity_threads[0] != event_loop_thread
+
+
+class _OwnerLauncher(_RecordingLauncher):
+    """An owner-identity launcher: each instance acts as whoever it is bound to."""
+
+    owner_credential_provider = "databricks"
+
+    def __init__(self, built: list[_OwnerLauncher], connected: set[str] | None = None) -> None:
+        super().__init__("databricks")
+        self.owner: str | None = None
+        self.connected = connected
+        built.append(self)
+
+    def bind_owner_credential(self, resolve: Callable[[], object]) -> None:
+        resolve()
+
+    def terminate(self, sandbox_id: str) -> None:
+        # Like the real launcher, an unconnected owner is refused at first use.
+        if self.connected is not None and self.owner not in self.connected:
+            raise OwnerCredentialMissingError("Connect Databricks first")
+        self.terminated.append(f"{self.owner}:{sandbox_id}")
+
+
+def _alice_and_bob_stale_hosts(now: int) -> _FakeHostStore:
+    return _FakeHostStore(
+        {
+            7: [
+                replace(
+                    _host(
+                        "h_a",
+                        provider="databricks",
+                        sandbox_id="sb-a",
+                        updated_at=now - 2 * _DAY_S,
+                    ),
+                    user_id="alice",
+                ),
+                replace(
+                    _host(
+                        "h_b",
+                        provider="databricks",
+                        sandbox_id="sb-b",
+                        updated_at=now - 3 * _DAY_S,
+                    ),
+                    user_id="bob",
+                ),
+            ]
+        }
+    )
+
+
+def _owner_reaper(
+    hosts: _FakeHostStore,
+    *,
+    connected: set[str] | None = None,
+    broken: str | None = None,
+) -> tuple[ManagedSandboxReaper, dict[str, _OwnerLauncher]]:
+    """Build a reaper whose launchers record, per owner, the last one bound to them."""
+    built: list[_OwnerLauncher] = []
+    current: dict[str, _OwnerLauncher] = {}
+
+    def resolve(user: str) -> None:
+        if user == broken:
+            raise RuntimeError("connection store unavailable")
+        built[-1].owner = user
+        current[user] = built[-1]
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=lambda: _OwnerLauncher(built, connected),  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+        owner_credentials={"databricks": resolve},
+    )
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=deployment)  # type: ignore[arg-type]
+    return reaper, current
+
+
+async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now))
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert current["bob"].terminated == ["bob:sb-b"]
+
+
+async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    now = 4_000_000
+    connected = {"bob"}
+    hosts = _alice_and_bob_stale_hosts(now)
+    reaper, current = _owner_reaper(hosts, connected=connected)
+
+    with caplog.at_level(logging.WARNING):
+        assert await reaper.sweep_once(now=now) == 1
+    # An expected wait for the owner, logged once per sweep without a traceback.
+    (record,) = [r for r in caplog.records if "h_a" in r.getMessage()]
+    assert record.levelno == logging.WARNING and record.exc_info is None
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert current["alice"].terminated == []
+    # Detached but not cleared: the terminating id keeps alice's sandbox queued.
+    assert hosts.hosts[7]["h_a"].terminating_sandbox_id == "sb-a"
+
+    connected.add("alice")
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["alice"].terminated == ["alice:sb-a"]
+    assert hosts.hosts[7]["h_a"].terminating_sandbox_id is None
+
+
+async def test_one_owner_launcher_failing_to_build_does_not_stop_the_sweep() -> None:
+    now = 4_000_000
+    reaper, current = _owner_reaper(_alice_and_bob_stale_hosts(now), broken="alice")
+
+    assert await reaper.sweep_once(now=now) == 1
+
+    assert current["bob"].terminated == ["bob:sb-b"]
+    assert "alice" not in current

@@ -2,35 +2,31 @@
 // `item.kind`. Compaction renders as a standalone `Bubble` in
 // `ChatPage`, not as an inline render item — no case for it here.
 //
-// Tool-call collapsing: within a contiguous run of tool / native_tool
-// items, tools fold into a single summary line describing what's
-// hidden ("Read 2 files", rendered by `ToolGroupSummary`). While the
-// run is the live activity — the session is running and the run is
-// the last thing in the transcript — the trailing `STREAMING_TAIL`
-// tools stay visible as individual rows so the user can watch recent
-// steps; once the agent emits anything after the run (or the session
-// goes idle), the whole run folds into the one expandable line, like
-// the terminal's collapsed past turns. Still-in-progress spinners and
-// durable routing/fan-out cards never fold regardless of position.
+// Two levels of collapsing keep a turn readable:
+//
+// 1. Tool-run folding: within a contiguous run of tool / native_tool
+//    items, tools fold into a single summary line describing what's
+//    hidden ("Read 2 files", rendered by `ToolGroupSummary`). While
+//    the run is the live activity, the trailing `STREAMING_TAIL`
+//    tools stay visible as individual rows so the user can watch
+//    recent steps. Still-in-progress spinners and durable
+//    routing/fan-out cards never fold regardless of position.
+//
+// 2. Turn folding: once settled, each work run collapses behind a
+//    "Worked" row. Assistant messages remain visible in order;
+//    pending elicitations and routing cards stay visible too.
 
 import type { ReactNode } from "react";
-import { useMemo } from "react";
-import type React from "react";
-import { defaultRemarkPlugins } from "streamdown";
-import remarkBreaks from "remark-breaks";
-import { MessageResponse } from "@/components/ai-elements/message";
-import { ZoomableImage } from "@/components/ImageLightbox";
-import { useThrottledValue } from "@/hooks/useThrottledValue";
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChevronRightIcon } from "lucide-react";
+import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
+import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
-import {
-  useFileViewer,
-  useFileViewerConversationId,
-  useIsChangedPath,
-  useWorkspacePaths,
-} from "@/shell/FileViewerContext";
-import { toWorkspaceRelativePath, useWorkspaceFileExists } from "@/hooks/useWorkspaceChangedFiles";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -39,260 +35,153 @@ import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
 
-/**
- * Inline-`code` renderer that turns workspace file paths (e.g.
- * `` `src/components/App.tsx` ``) into clickable links opening the FileViewer.
- *
- * The span's text is first collapsed to a workspace-relative path: an
- * absolute (`/home/u/ws/foo.md`) or home-relative (`~/ws/foo.md`) path under
- * the workspace root is stripped down to its relative form so it matches the
- * changed-files list and the filesystem API (both speak relative paths);
- * absolute/`~` paths outside the root resolve to null and never linkify.
- *
- * That relative path is then linkified when it is either (a) a known
- * agent-changed file — resolved synchronously, the fast path, and the only
- * path that may be an uncommitted/deleted file — or (b) a path-shaped string
- * that the filesystem API confirms points at a real file in the workspace.
- * Everything else (prose-y inline code, non-existent paths) falls back to a
- * styled `<code>` matching Streamdown's default inline appearance. The span
- * always *displays* the original text the agent wrote; only the link target
- * uses the resolved relative path.
- *
- * Rendered by Streamdown as a real component (via the `inlineCode` slot), so
- * it may call hooks: the existence query re-renders this span when it settles,
- * independent of whether `MessageResponse` re-renders its parent.
- */
-function WorkspacePathInlineCode({
-  children: codeChildren,
-  className,
-  ...codeProps
-}: React.ComponentPropsWithoutRef<"code">) {
-  const openFile = useFileViewer();
-  const isChangedPath = useIsChangedPath();
-  const conversationId = useFileViewerConversationId();
-  const { root, home } = useWorkspacePaths();
-  const text = typeof codeChildren === "string" ? codeChildren : "";
-
-  // Collapse absolute / "~"-relative forms onto a workspace-relative path so
-  // they match the changed-files list and the filesystem API. null = absolute
-  // or "~" path outside the workspace (or the root itself) → never a link.
-  const linkPath = text ? toWorkspaceRelativePath(text, root, home) : null;
-  // "Trusted" means we resolved an absolute/"~" form against the root, so the
-  // result is known workspace-relative even if it's a bare basename (no
-  // interior slash) that the existence check's path-shape heuristic rejects.
-  const trusted = linkPath !== null && linkPath !== text;
-
-  const isChanged = !!linkPath && isChangedPath(linkPath);
-  // Only hit the filesystem for path-shaped spans that aren't already known
-  // changes; passing null disables the query (keeps hook order stable).
-  const existsOnDisk = useWorkspaceFileExists(
-    conversationId,
-    openFile && linkPath && !isChanged ? linkPath : null,
-    trusted,
-  );
-
-  if (openFile && linkPath && (isChanged || existsOnDisk)) {
-    // Rendered as an inline <code> (not a <button>): a button is laid out as
-    // an atomic inline-block, so a long path can't break across lines and
-    // drops below the list marker as a whole unit. An inline <code> flows and
-    // wraps like the surrounding text; role/tabIndex/keydown restore the
-    // button semantics.
-    return (
-      <code
-        role="button"
-        tabIndex={0}
-        data-streamdown="inline-code"
-        // Keep the base inline-code class/props (merge, don't replace) so the
-        // link only adds the underline affordance on top of Streamdown's
-        // styling and any caller-provided attributes survive.
-        className={cn(
-          "font-mono text-sm underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
-          className,
-        )}
-        onClick={() => openFile(linkPath)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            openFile(linkPath);
-          }
-        }}
-        {...codeProps}
-      >
-        {codeChildren}
-      </code>
-    );
-  }
-  // Match Streamdown's default inline-code styling so non-path inline code
-  // looks unchanged.
-  return (
-    <code
-      className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-sm", className)}
-      data-streamdown="inline-code"
-      {...codeProps}
-    >
-      {codeChildren}
-    </code>
-  );
-}
-
-// Markdown images open in the shared lightbox on click, matching uploaded and
-// generated images. (Remote `src`s are still gated by Streamdown's image
-// security; this only adds the zoom affordance to whatever does render.)
-function ZoomableMarkdownImage({ src, alt, ...props }: React.ComponentProps<"img">) {
-  const resolvedSrc = typeof src === "string" ? src : undefined;
-  return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
-}
-
-// Stable module-level override map so MessageResponse's memo (which ignores
-// `components` changes) never sees a new identity.
-const FILE_PATH_AWARE_COMPONENTS = {
-  inlineCode: WorkspacePathInlineCode,
-  img: ZoomableMarkdownImage,
-};
-
-// How often the live (growing) assistant bubble re-parses its markdown. The
-// store pump commits a new, longer text up to once per animation frame (~60/s);
-// without this the whole accumulated message is re-parsed on every commit. ~10/s
-// is smooth to read and cuts the per-frame parse cost. Trailing-edge, so the
-// final text still appears within this window of the last token.
-const STREAM_MARKDOWN_THROTTLE_MS = 100;
-
-// Defense-in-depth against a pathological text block locking the tab.
-// A user message whose text is a ~50KB unbroken base64 data URL
-// — e.g. an image block accidentally serialized into the text stream — both
-// jams the full markdown pipeline (Shiki/KaTeX/mermaid + rehype) on the main
-// thread AND forces the browser to lay out one ~50K-char line with no break
-// opportunities. Either heuristic below routes such a block to plain,
-// break-anywhere rendering that bypasses markdown entirely.
-//
-// `MAX_MARKDOWN_TEXT_LENGTH`: total size above which we never run markdown.
-// `MAX_UNBROKEN_TOKEN_LENGTH`: longest run of non-whitespace chars above which
-//   layout becomes pathological regardless of total size (base64, long URLs).
-// `MAX_PLAINTEXT_DISPLAY_LENGTH`: hard cap on what we paint even as plain text,
-//   so a multi-MB payload can't blow up the DOM; the rest is elided.
-const MAX_MARKDOWN_TEXT_LENGTH = 50_000;
-const MAX_UNBROKEN_TOKEN_LENGTH = 5_000;
-const MAX_PLAINTEXT_DISPLAY_LENGTH = 200_000;
-
-/**
- * Longest run of consecutive non-whitespace characters in `text`. ASCII
- * whitespace (space, tab, CR, LF, FF, VT) resets the run — those are the
- * break opportunities the layout engine can use. O(n), single pass.
- */
-function longestUnbrokenRun(text: string): number {
-  let max = 0;
-  let current = 0;
-  for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
-    // 32 = space; 9..13 = tab, LF, VT, FF, CR.
-    if (code === 32 || (code >= 9 && code <= 13)) {
-      current = 0;
-    } else {
-      current += 1;
-      if (current > max) max = current;
-    }
-  }
-  return max;
-}
-
-/**
- * Whether `text` should bypass the markdown pipeline because rendering it
- * there would risk locking the tab. See the constants above for the why.
- */
-function isPathologicalText(text: string): boolean {
-  return (
-    text.length > MAX_MARKDOWN_TEXT_LENGTH || longestUnbrokenRun(text) > MAX_UNBROKEN_TOKEN_LENGTH
-  );
-}
-
-/**
- * Plain, break-anywhere fallback for a pathological text block — no markdown.
- * `whitespace-pre-wrap` keeps newlines; `break-all` gives the layout engine a
- * break opportunity inside an otherwise unbreakable token. Over-long payloads
- * are elided so the DOM node itself can't grow without bound.
- */
-function PlainTextFallback({ text }: { text: string }) {
-  const truncated = text.length > MAX_PLAINTEXT_DISPLAY_LENGTH;
-  const shown = truncated ? text.slice(0, MAX_PLAINTEXT_DISPLAY_LENGTH) : text;
-  return (
-    <div className="whitespace-pre-wrap break-all font-mono text-xs">
-      {shown}
-      {truncated && (
-        <span className="text-muted-foreground">
-          {`\n… [${text.length - MAX_PLAINTEXT_DISPLAY_LENGTH} more characters not shown]`}
-        </span>
-      )}
-    </div>
-  );
-}
-
-/**
- * Wraps `MessageResponse` with {@link WorkspacePathInlineCode} via Streamdown's
- * `inlineCode` slot — NOT `code` — so fenced code blocks keep their default
- * `<pre>` wrapper and Shiki highlighting. Overriding `code` here would replace
- * block rendering too, stripping `<pre>` and collapsing whitespace.
- *
- * When `breaks` is set, single newlines render as `<br>` (remark-breaks)
- * instead of collapsing to spaces per CommonMark. Used for user bubbles,
- * where people type multi-line messages without blank-line paragraph
- * separators and expect their line breaks preserved. NOTE: Streamdown's
- * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
- * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
- * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
- */
-export function FilePathAwareMessageResponse({
-  children,
-  breaks = false,
-  ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean }) {
-  const components = FILE_PATH_AWARE_COMPONENTS;
-
-  // Extend (don't replace) Streamdown's defaults so remark-gfm survives;
-  // append remark-breaks only when `breaks` is requested. When `breaks` is
-  // false we pass `undefined` so Streamdown uses its own defaults unchanged.
-  const remarkPlugins = useMemo(
-    () => (breaks ? [...Object.values(defaultRemarkPlugins), remarkBreaks] : undefined),
-    [breaks],
-  );
-
-  // Throttle the markdown so the live (still-growing) bubble re-parses a few
-  // times per second instead of on every store commit. `children` is a string
-  // at both call sites (a text RenderItem and the user bubble); finalized/static
-  // text changes once, which emits immediately, so this is a no-op off the
-  // streaming path. The hook must be called unconditionally (rules of hooks), so
-  // non-string children (none today) pass an inert "" and bypass the result.
-  const isString = typeof children === "string";
-  const throttledText = useThrottledValue(
-    isString ? (children as string) : "",
-    STREAM_MARKDOWN_THROTTLE_MS,
-  );
-
-  // Defense-in-depth: a string child that is huge or carries a
-  // giant unbroken token (e.g. a base64 data URL serialized into the text
-  // stream) would lock the tab in the markdown pipeline + layout. Render it as
-  // plain break-anywhere text instead. Both call sites (assistant text blocks
-  // and the user bubble) flow through here, so this one guard covers both.
-  const pathological = useMemo(
-    () => isString && isPathologicalText(children as string),
-    [isString, children],
-  );
-  if (pathological) {
-    return <PlainTextFallback text={children as string} />;
-  }
-
-  return (
-    <MessageResponse {...props} components={components} remarkPlugins={remarkPlugins}>
-      {isString ? throttledText : children}
-    </MessageResponse>
-  );
-}
+// Re-exported for the existing import sites; it lives in ./ChatMarkdown so
+// surfaces rendered *by* this module can use it without an import cycle.
+export { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 const STREAMING_TAIL = 3;
+
+// How long fold eligibility must hold before the "Worked for" fold
+// appears on a live bubble. Long enough to absorb transient settled
+// reads (a step-wise turn's between-step idle, a stray idle before its
+// revive), short enough to feel immediate at a real turn end.
+const FOLD_SETTLE_DEBOUNCE_MS = 500;
+
+// A trace whose newest item is at most this old counts as "just
+// active": a page load over it may have landed inside a step-wise
+// turn's between-step gap, where the snapshot reads settled although
+// the turn continues. The last bubble's fold then waits
+// `FOLD_RECENT_MOUNT_DEBOUNCE_MS` instead of appearing instantly, so
+// the next step's running edge can cancel it — no fold flash. Genuinely
+// old history still mounts folded with no delay.
+const RECENT_ACTIVITY_WINDOW_S = 15;
+const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
+
+// How long a user-initiated fold expand parks the scroller's scroll
+// anchoring. Covers the 200ms `turn-fold-expand` height animation (see
+// index.css) with slack — anchoring would otherwise pin the answer
+// below the fold and glide the growing trace off the top.
+const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
-  canApprove?: boolean;
+  onRetryError?: (item: Extract<RenderItem, { kind: "error" }>) => Promise<void>;
+  /**
+   * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
+   * `"streaming"` keeps work expanded; settled states can fold it.
+   * When omitted, liveness falls back to `sessionStatus`.
+   */
+  turnLifecycle?: ActiveResponse["state"];
+  /** Wall-clock seconds the turn worked (`Bubble.workedForS`). */
+  workedForS?: number;
+  /**
+   * The turn continues in a later bubble (`Bubble.continued`). Its
+   * tool work can fold even when the answer lands elsewhere.
+   */
+  continued?: boolean;
+  /**
+   * This bubble is the LAST assistant bubble in the transcript. While
+   * the session is running, the last bubble never folds even when its
+   * lifecycle reads settled: on a mid-turn (re)connect the client can
+   * miss the edge that names the turn, misreading the live turn as
+   * "completed" — folding it then made the trace collapse and reopen
+   * as its tail alternated between text and tools (the codex flicker).
+   * The fold forms when the session's own terminal status edge lands,
+   * which is the natural moment anyway.
+   */
+  isLastAssistant?: boolean;
+  /**
+   * The session has a pending elicitation (approval/question card
+   * awaiting the user). The turn is parked, not over — a reload while
+   * parked can read BOTH the lifecycle and the session status as
+   * settled (a step-wise turn's snapshot names the STEP id, not the
+   * items' thread id) — so the last bubble's fold stays suppressed
+   * until the card is answered.
+   */
+  hasPendingElicitation?: boolean;
+  /** Server epoch seconds of the turn's newest item (`Bubble.lastActivityAtS`). */
+  lastActivityAtS?: number;
+  /** Whether this final bubble is still part of a visible active turn. */
+  showsWorking?: boolean;
+  /** Start a fold containing a mid-turn user interjection open. */
+  defaultExpanded?: boolean;
+}
+
+/** The subset of {@link BlockRendererProps} the fold decision reads. */
+type FoldInputs = Pick<
+  BlockRendererProps,
+  | "items"
+  | "sessionStatus"
+  | "turnLifecycle"
+  | "continued"
+  | "isLastAssistant"
+  | "hasPendingElicitation"
+  | "showsWorking"
+  | "defaultExpanded"
+>;
+
+/**
+ * How live a turn is, from the bubble's own lifecycle and the session's.
+ *
+ * `isOwnTurnLive` — streaming into THIS bubble; only this clears the
+ * shown-fold latch. `possiblyLive` — the last assistant bubble while the
+ * session works or parks on an elicitation MAY be the live turn even when
+ * its lifecycle reads settled (a mid-turn (re)connect can miss the edge
+ * that names the turn).
+ */
+function turnLiveness({
+  sessionStatus,
+  turnLifecycle,
+  isLastAssistant = false,
+  hasPendingElicitation = false,
+  showsWorking = false,
+}: Omit<FoldInputs, "items" | "continued">): {
+  isOwnTurnLive: boolean;
+  possiblyLive: boolean;
+  isTurnLive: boolean;
+} {
+  const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
+  const isOwnTurnLive = turnLifecycle !== undefined ? turnLifecycle === "streaming" : isAgentActive;
+  const possiblyLive =
+    isLastAssistant && (showsWorking || sessionStatus === "running" || hasPendingElicitation);
+  return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
+}
+
+/** Work folds after an assistant message or in a tool-bearing continuation. */
+function hasFoldableShape(
+  items: RenderItem[],
+  { segments }: TurnPartition,
+  continued = false,
+): boolean {
+  const lastItem = items.findLast((item) => !isTrailingWrapup(item));
+  // A terminal failure or denial must stay visible beside the assistant text.
+  if (
+    lastItem?.kind === "error" ||
+    lastItem?.kind === "retry" ||
+    lastItem?.kind === "policy_denied"
+  ) {
+    return false;
+  }
+  return (
+    !isProvisionalTrace(items) &&
+    segments.some((segment) => segment.kind === "work") &&
+    (segments.some((segment) => segment.kind === "text") ||
+      (continued &&
+        segments.some((segment) => segment.kind === "work" && segment.items.some(isToolItem))))
+  );
+}
+
+/** Hide bubble actions only when settled work is its sole visible content. */
+export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
+  if (inputs.defaultExpanded) return false;
+  const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
+  if (isOwnTurnLive || possiblyLive) return false;
+  const partition = partitionTurn(inputs.items);
+  return (
+    hasFoldableShape(inputs.items, partition, inputs.continued) &&
+    partition.segments.every((segment) => segment.kind === "work")
+  );
 }
 
 type ToolRunFragment =
@@ -306,18 +195,159 @@ type ToolRunFragment =
       index: number;
     };
 
-export function BlockRenderer({ items, sessionStatus, canApprove = true }: BlockRendererProps) {
+export function BlockRenderer({
+  items,
+  sessionStatus,
+  turnLifecycle,
+  workedForS,
+  continued = false,
+  isLastAssistant = false,
+  hasPendingElicitation = false,
+  lastActivityAtS,
+  showsWorking = false,
+  defaultExpanded = false,
+  onRetryError,
+}: BlockRendererProps) {
+  const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
+    sessionStatus,
+    turnLifecycle,
+    isLastAssistant,
+    hasPendingElicitation,
+    showsWorking,
+  });
+
+  // A native assistant message has no reliable final-answer marker.
+  // Keep each message visible even when a later tool call follows it.
+  const partition = partitionTurn(items);
+  const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
+  // Once the fold has SHOWN on a settled bubble, possibly-live no
+  // longer reopens it. A scheduled wake (a /loop cron or wakeup
+  // firing) flips the session to running — Working shimmer included —
+  // while the settled bubble is still the last one and the new turn
+  // has no items yet; without the latch that item-less gap popped the
+  // fold open every iteration. Only this bubble's OWN turn going live
+  // again (a revive) clears the latch and re-expands the trace.
+  const foldLatchedRef = useRef(false);
+  const foldEligible =
+    !isOwnTurnLive &&
+    // Never fold a possibly-live bubble whose fold hasn't shown yet:
+    // the terminal status edge is what folds it (see possiblyLive).
+    (!possiblyLive || foldLatchedRef.current) &&
+    hasFoldableShape(items, partition, continued);
+
+  // Debounce fold APPEARANCE on a live bubble: transient settled reads —
+  // a step-wise turn's idle edge between steps, a stray bare idle before
+  // its revive — would otherwise fold and unfold the trace. Eligibility
+  // must hold for a beat before the fold shows; losing eligibility hides
+  // it immediately. A bubble MOUNTED eligible (settled history) folds
+  // with no delay — UNLESS it is the last bubble over a just-active
+  // trace, where the page may have loaded inside a step-wise turn's
+  // between-step gap: that mount waits the longer recent-mount debounce
+  // so the next step's running edge can cancel the fold instead of
+  // flashing it.
+  const mountedOverRecentActivity =
+    isLastAssistant &&
+    lastActivityAtS !== undefined &&
+    Date.now() / 1000 - lastActivityAtS < RECENT_ACTIVITY_WINDOW_S;
+  const [showFold, setShowFold] = useState(foldEligible && !mountedOverRecentActivity);
+  const debounceMsRef = useRef(
+    mountedOverRecentActivity ? FOLD_RECENT_MOUNT_DEBOUNCE_MS : FOLD_SETTLE_DEBOUNCE_MS,
+  );
+  useEffect(() => {
+    if (foldEligible === showFold) {
+      // Once the fold has shown (or the mount window resolved), later
+      // transitions use the ordinary settle debounce.
+      if (showFold) debounceMsRef.current = FOLD_SETTLE_DEBOUNCE_MS;
+      return undefined;
+    }
+    if (!foldEligible) {
+      debounceMsRef.current = FOLD_SETTLE_DEBOUNCE_MS;
+      setShowFold(false);
+      return undefined;
+    }
+    const timer = setTimeout(() => setShowFold(true), debounceMsRef.current);
+    return () => clearTimeout(timer);
+  }, [foldEligible, showFold]);
+
+  // Animate only when the fold APPEARS on an already-mounted bubble —
+  // the turn settled, or its continuation landed, while the user was
+  // looking. Mounting settled history shows it closed with no motion.
+  const mountedRef = useRef(false);
+  const foldShownRef = useRef(showFold);
+  const animateCollapse = showFold && mountedRef.current && !foldShownRef.current;
+  useEffect(() => {
+    mountedRef.current = true;
+    foldShownRef.current = showFold;
+    if (isOwnTurnLive) foldLatchedRef.current = false;
+    else if (showFold) foldLatchedRef.current = true;
+  });
+
+  if (showFold) {
+    const rendered: ReactNode[] = [];
+    for (const segment of partition.segments) {
+      if (segment.kind === "text") {
+        rendered.push(
+          ...renderSequence(segment.items, {
+            liveEdge: false,
+            indexBase: segment.startIndex,
+            onRetryError,
+          }),
+        );
+        continue;
+      }
+      if (segment.kind === "exempt") {
+        rendered.push(
+          renderItem(segment.item, segment.index, false, false, false, false, onRetryError),
+        );
+        continue;
+      }
+      // The available duration spans the entire turn, not each work run.
+      rendered.push(
+        <TurnWorkedFold
+          key={`worked:${segment.startIndex}`}
+          workedForS={workRunCount === 1 ? workedForS : undefined}
+          animateCollapse={animateCollapse}
+          defaultOpen={defaultExpanded}
+        >
+          {renderSequence(segment.items, {
+            liveEdge: false,
+            indexBase: segment.startIndex,
+            onRetryError,
+          })}
+        </TurnWorkedFold>,
+      );
+    }
+    return rendered;
+  }
+
+  return renderSequence(items, {
+    liveEdge: isTurnLive,
+    suppressReasoningDuration: showsWorking,
+    onRetryError,
+  });
+}
+
+/**
+ * Render a flat item sequence with tool-run folding. `liveEdge` marks
+ * the sequence as the live activity: the trailing tool run keeps its
+ * visible `STREAMING_TAIL` and a trailing reasoning item shows the
+ * streaming shimmer. `indexBase` offsets positional fallback keys so a
+ * partitioned slice keys consistently with its position in the turn.
+ */
+function renderSequence(
+  items: RenderItem[],
+  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
+): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
-  const isAgentActive = sessionStatus === "running" || sessionStatus === "waiting";
-  const streamingRunStart = isAgentActive ? findStreamingRunStart(items) : -1;
-  // Reasoning is "currently streaming" iff the agent is live AND this
+  const streamingRunStart = liveEdge ? findStreamingRunStart(items) : -1;
+  // Reasoning is "currently streaming" iff the turn is live AND this
   // reasoning is the very last item in the bubble. Mirrors the
   // `streamingRunStart` rule for tool runs: the trailing live edge stays
   // expanded; once anything else lands after it, it collapses.
   const lastIdx = items.length - 1;
   const reasoningStreamingIdx =
-    isAgentActive && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
+    liveEdge && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
 
   for (let i = 0; i < items.length; i += 1) {
     const item = items[i]!;
@@ -344,14 +374,16 @@ export function BlockRenderer({ items, sessionStatus, canApprove = true }: Block
         // the terminal's step list; only the fold's expanded contents
         // are nested (inside `ToolGroupSummary`).
         rendered.push(
-          <div key={`tool-group-with-tail:${runStart}`} className="space-y-1">
+          <div key={`tool-group-with-tail:${indexBase + runStart}`} className="space-y-1">
             <ToolGroupSummary tools={group.tools} />
-            {tail.map((fragment, idx) => renderToolRunFragment(fragment, runStart, idx))}
+            {tail.map((fragment, idx) =>
+              renderToolRunFragment(fragment, indexBase + runStart, idx),
+            )}
           </div>,
         );
       } else {
         for (let idx = 0; idx < fragments.length; idx += 1) {
-          rendered.push(renderToolRunFragment(fragments[idx]!, runStart, idx));
+          rendered.push(renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx));
         }
       }
       previousRenderedItemWasText = false;
@@ -359,11 +391,258 @@ export function BlockRenderer({ items, sessionStatus, canApprove = true }: Block
     }
 
     const followsText = item.kind === "text" && previousRenderedItemWasText;
-    rendered.push(renderItem(item, i, i === reasoningStreamingIdx, followsText, canApprove));
+    const isTextStreaming = liveEdge && i === lastIdx && item.kind === "text";
+    rendered.push(
+      renderItem(
+        item,
+        indexBase + i,
+        i === reasoningStreamingIdx,
+        isTextStreaming,
+        suppressReasoningDuration,
+        followsText,
+        onRetryError,
+      ),
+    );
     previousRenderedItemWasText = item.kind === "text";
   }
 
-  return <>{rendered}</>;
+  return rendered;
+}
+
+interface TurnSequenceOptions {
+  liveEdge: boolean;
+  suppressReasoningDuration?: boolean;
+  indexBase?: number;
+  onRetryError?: BlockRendererProps["onRetryError"];
+}
+
+interface TurnPartition {
+  segments: TurnSegment[];
+}
+
+type TurnSegment =
+  | { kind: "work" | "text"; items: RenderItem[]; startIndex: number }
+  | { kind: "exempt"; item: RenderItem; index: number };
+
+// A trailing `turn_diff` belongs with earlier work, after the last message.
+const TRAILING_WRAPUP_TOOLS = new Set(["turn_diff"]);
+
+/** Trailing reasoning joins earlier work so live and reloaded views agree. */
+function isTrailingWrapup(item: RenderItem): boolean {
+  if (item.kind === "reasoning") return true;
+  return item.kind === "tool" && TRAILING_WRAPUP_TOOLS.has(item.execution.name);
+}
+
+/**
+ * Split work from assistant text while preserving order. Text lacks a
+ * reliable final-answer marker, so every completed message stays visible.
+ */
+function partitionTurn(items: RenderItem[]): TurnPartition {
+  let end = items.length;
+  const wrapup: RenderItem[] = [];
+  while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
+    wrapup.unshift(items[end - 1]!);
+    end -= 1;
+  }
+  const segments: TurnSegment[] = [];
+  for (let i = 0; i < end; i += 1) {
+    const item = items[i]!;
+    if (
+      isPendingElicitation(item) ||
+      isPersistentToolCard(item) ||
+      isInProgressTool(item) ||
+      isSlashCommandCard(item)
+    ) {
+      segments.push({ kind: "exempt", item, index: i });
+      continue;
+    }
+    const kind = item.kind === "text" ? "text" : "work";
+    const previous = segments[segments.length - 1];
+    if (previous?.kind === kind) previous.items.push(item);
+    else segments.push({ kind, items: [item], startIndex: i });
+  }
+  if (wrapup.length > 0) {
+    const lastWork = segments.findLast((segment) => segment.kind === "work");
+    if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
+    else segments.push({ kind: "work", items: wrapup, startIndex: end });
+  }
+  return { segments };
+}
+
+function isPendingElicitation(item: RenderItem): boolean {
+  return item.kind === "elicitation" && item.status === "pending";
+}
+
+/** A slash-command receipt is a durable record of the user's invocation. */
+function isSlashCommandCard(item: RenderItem): boolean {
+  return item.kind === "slash_command";
+}
+
+/**
+ * Whether a bubble is made ONLY of streaming artifacts: reasoning
+ * chunks (no item id until their item is finalized) and `live:` text
+ * previews (replaced in place when the authoritative item lands). Such
+ * a bubble is a fragment of the turn still arriving, not a finished
+ * turn — but its synthetic response id never matches `activeResponse`,
+ * so the walker labels it "completed" and it would otherwise fold.
+ *
+ * That is what made the fold flicker on codex: a reasoning burst plus a
+ * narration preview folded mid-turn, then the fold vanished when the
+ * preview merged into the real bubble. A genuine turn always carries at
+ * least one server-assigned item id.
+ */
+function isProvisionalTrace(items: RenderItem[]): boolean {
+  return items.every((item) => item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX));
+}
+
+/**
+ * Disclosure for one work run between visible assistant messages.
+ *
+ * `animateCollapse` marks the render where the fold appeared while the
+ * user was watching. The fold then MOUNTS OPEN — showing exactly the
+ * trace that was already on screen — and closes on the next frame, so
+ * the steps visibly fold into the summary row. Swapping straight to the
+ * collapsed row instead made a tall block vanish in one frame, which
+ * read as a partial page reload. Settled history mounts closed: there
+ * was never an expanded trace to animate away.
+ *
+ * The summary row grows in over the same beat rather than being
+ * inserted at full height, because inserting it jolted the bubble ~40px
+ * TALLER before the collapse started — read as two separate motions.
+ * Row expanding + trace shrinking nets a single monotonic shrink.
+ */
+function TurnWorkedFold({
+  workedForS,
+  animateCollapse,
+  defaultOpen,
+  children,
+}: {
+  workedForS?: number;
+  animateCollapse: boolean;
+  defaultOpen: boolean;
+  children: ReactNode;
+}) {
+  const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
+  const [open, setOpen] = useState(animateCollapse || defaultOpen);
+  const userChangedOpenRef = useRef(false);
+  useLayoutEffect(() => {
+    // History hydration can identify an interjection after this fold mounted.
+    // Honor that late default unless the user has already made their own choice.
+    if (defaultOpen && !userChangedOpenRef.current) setOpen(true);
+  }, [defaultOpen]);
+  useEffect(() => {
+    if (!animateCollapse || defaultOpen) return;
+    const frame = requestAnimationFrame(() => setOpen(false));
+    return () => cancelAnimationFrame(frame);
+  }, [animateCollapse, defaultOpen]);
+
+  // A USER-initiated expand (never the animateCollapse mount-close)
+  // opens INSTANTLY — no height animation — and snaps the fold row to
+  // the top of the scroller so the trace reads from its beginning. The
+  // animation is what defeated the snap: it opens at height 0, so at
+  // snap time the scroller has no room yet (the snap clamps at the old
+  // max-scroll), and the 200ms of growth then plays out against the
+  // stick-to-bottom pin (which rides the bottom on the last turn) or
+  // native scroll anchoring (which pins the answer below) — either way
+  // the row glides off the top and the click appears to do nothing.
+  // Instant height means the first layout already has the full trace:
+  // the snap lands, and there is no growth window left to fight over.
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const [userOpened, setUserOpened] = useState(false);
+  const scrollOnOpenRef = useRef(false);
+  const scrollLock = useContext(ConversationScrollLockContext);
+  const handleOpenChange = (next: boolean) => {
+    userChangedOpenRef.current = true;
+    scrollOnOpenRef.current = next;
+    setUserOpened(next);
+    setOpen(next);
+  };
+  useLayoutEffect(() => {
+    if (!open || !scrollOnOpenRef.current) return;
+    scrollOnOpenRef.current = false;
+    const row = rowRef.current;
+    if (!row) return;
+    // Release StickToBottom's bottom-lock first (same recipe as
+    // JumpToTopButton): viewing the last turn the view is pinned, and
+    // the expand's resize otherwise fires the library's scrollToBottom
+    // (isAtBottom is still true from the pre-click view), overriding
+    // the snap and riding the bottom — the click appears to do nothing.
+    if (scrollLock) {
+      scrollLock.stopScroll();
+      scrollLock.state.isAtBottom = false;
+      scrollLock.state.escapedFromLock = true;
+    }
+    const scroller = nearestScrollContainer(row);
+    // Park native scroll anchoring across the expand commit. The
+    // restore deliberately outlives the effect (no cleanup): the timer
+    // must fire even if the fold re-renders or unmounts mid-hold.
+    if (scroller) {
+      scroller.style.overflowAnchor = "none";
+      window.setTimeout(() => {
+        scroller.style.overflowAnchor = "";
+      }, FOLD_EXPAND_ANCHOR_HOLD_MS);
+    }
+    row.scrollIntoView?.({ block: "start" });
+  }, [open, scrollLock]);
+
+  return (
+    // Named `group/turn-fold` so only this collapsible's own chevron
+    // rotates (inner tool cards carry unnamed `.group` rotations that a
+    // bare `group` class here would incorrectly trigger).
+    <Collapsible
+      key="turn-worked-fold"
+      open={open}
+      onOpenChange={handleOpenChange}
+      className="group/turn-fold not-prose w-full"
+      data-testid="turn-worked-fold"
+    >
+      <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-chat outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+          <span className="shrink-0">{label}</span>
+          <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
+        </CollapsibleTrigger>
+      </div>
+      {/* Height animation lives in index.css (it needs Radix's measured
+          --radix-collapsible-content-height) and is disabled under
+          prefers-reduced-motion. */}
+      {/* Keep pt-2/pl-4 and the vertical pin inside the collapsible
+          content so the spacing and guide shrink with its existing
+          height animation. */}
+      <CollapsibleContent
+        className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
+      >
+        <div className="relative flex flex-col gap-1 pt-2 pl-4">
+          <span
+            aria-hidden
+            className="absolute top-2 bottom-0 left-1 w-px bg-border"
+            data-testid="turn-worked-fold-pin-line"
+          />
+          {children}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+/** Nearest ancestor that actually scrolls vertically (overflow-y auto/scroll). */
+function nearestScrollContainer(el: HTMLElement): HTMLElement | null {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const overflowY = getComputedStyle(p).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") return p;
+  }
+  return null;
+}
+
+/** "8s", "1m 46s", "1h 2m" — matches the native CLIs' worked-for stamps. */
+function formatWorkedFor(seconds: number): string {
+  const s = Math.max(1, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  if (m < 60) return rem > 0 ? `${m}m ${rem}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm > 0 ? `${h}h ${mm}m` : `${h}h`;
 }
 
 /**
@@ -409,16 +688,16 @@ function renderToolRunFragment(
       <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
     );
   }
-  return renderItem(fragment.tool, runStart + fragment.index, false);
+  return renderItem(fragment.tool, runStart + fragment.index, false, false);
 }
 
-const _ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
-const _SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
+const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
 
 function isPersistentToolCard(item: RenderItem): boolean {
   return (
     item.kind === "tool" &&
-    (_ADVISE_MODELS_NAMES.has(item.execution.name) || _SESSION_SEND_NAMES.has(item.execution.name))
+    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
   );
 }
 
@@ -454,8 +733,10 @@ function renderItem(
   item: RenderItem,
   index: number,
   isReasoningStreaming: boolean,
+  isTextStreaming: boolean,
+  suppressReasoningDuration = false,
   followsText = false,
-  canApprove = true,
+  onRetryError?: BlockRendererProps["onRetryError"],
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -466,7 +747,22 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse>{item.text}</FilePathAwareMessageResponse>
+          <FilePathAwareMessageResponse
+            className="chat-markdown"
+            mode={isTextStreaming ? "streaming" : "static"}
+          >
+            {item.text}
+          </FilePathAwareMessageResponse>
+          {item.previewInterrupted && item.itemId?.startsWith("live:") && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="stream-interruption-notice"
+              className="mt-1 select-none text-xs text-muted-foreground"
+            >
+              Live output interrupted. Full response will appear when complete.
+            </div>
+          )}
         </div>
       );
     case "reasoning":
@@ -475,13 +771,13 @@ function renderItem(
           key={key}
           text={item.text}
           isStreaming={isReasoningStreaming}
-          duration={item.duration}
+          duration={suppressReasoningDuration ? undefined : item.duration}
         />
       );
     case "tool":
       // Intelligent routing's fan-out sizing gets a structured plan card
       // instead of the generic name(json) row + raw-JSON expansion.
-      if (_ADVISE_MODELS_NAMES.has(item.execution.name)) {
+      if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
             key={key}
@@ -538,7 +834,30 @@ function renderItem(
         />
       );
     case "error":
-      return <ErrorBanner key={key} message={item.message} source={item.source} code={item.code} />;
+      return (
+        <ErrorBanner
+          key={key}
+          itemId={item.itemId}
+          message={item.message}
+          source={item.source}
+          code={item.code}
+          title={item.title}
+          cause={item.cause}
+          remediation={item.remediation}
+          level={item.level}
+          relatedErrors={item.relatedErrors}
+          onRetry={
+            onRetryError
+              ? (actionableError) =>
+                  onRetryError(
+                    actionableError.itemId === item.itemId && actionableError.code === item.code
+                      ? item
+                      : { kind: "error", ...actionableError },
+                  )
+              : undefined
+          }
+        />
+      );
     case "policy_denied":
       return <PolicyDeniedBanner key={key} reason={item.reason} phase={item.phase} />;
     case "retry":
@@ -552,7 +871,7 @@ function renderItem(
         />
       );
     case "elicitation":
-      return <ElicitationCard key={key} item={item} canApprove={canApprove} />;
+      return <ElicitationCard key={key} item={item} />;
   }
 }
 

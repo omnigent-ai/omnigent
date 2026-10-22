@@ -29,11 +29,13 @@ import logging
 import re
 import secrets
 import time
+from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
+from omnigent.db.account_authority import bind_account_authority, target_account_scope
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import _RESERVED_USERS, RESERVED_USER_LOCAL, UnifiedAuthProvider
@@ -45,6 +47,10 @@ from omnigent.server.passwords import (
     verify_password,
 )
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.device_grant_store import DeviceGrantStore
+    from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 
@@ -70,10 +76,18 @@ class LoginRequest(BaseModel):
         before lookup.
     :param password: Plaintext password, length-validated against
         :data:`_MIN_PASSWORD_LENGTH` but otherwise opaque.
+    :param issue_refresh: When ``True`` and a grant store is wired, also
+        issue a login-scoped refresh grant and include ``refresh_token``
+        in the response. Intended for CLI / unattended-host callers only
+        (``omnigent login``); the web form never sends this field, so
+        browser sessions never receive long-lived refresh material. Pydantic
+        coerces non-bool values to bool, so only the literal JSON booleans
+        ``true``/``false`` are accepted.
     """
 
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
+    issue_refresh: bool = False
 
 
 class RegisterRequest(BaseModel):
@@ -206,6 +220,8 @@ def create_accounts_auth_router(
     account_store: SqlAlchemyAccountStore,
     admin_list: AdminList,
     permission_store: PermissionStore | None = None,
+    device_grant_store: DeviceGrantStore | None = None,
+    scheduled_task_store: ScheduledTaskStore | None = None,
 ) -> APIRouter:
     """Build the ``/auth/*`` router for the accounts provider.
 
@@ -228,16 +244,45 @@ def create_accounts_auth_router(
         deploys) leaves session permissions untouched, preserving the
         accounts-routes-don't-touch-PermissionStore boundary for the
         hosted product.
+    :param device_grant_store: When set, ``POST /auth/login`` issues a
+        login-scoped refresh grant alongside the session JWT when the
+        request body includes ``"issue_refresh": true``. The CLI sets
+        this flag; the web browser form never does, so long-lived
+        unattended credentials never reach a browser session. See
+        :func:`omnigent.server.routes.device_auth.issue_login_grant`.
+    :param scheduled_task_store: When set, ``DELETE /auth/users/{id}``
+        disarms the scheduler timers of the deleted user's tasks (the
+        rows themselves are disabled by ``AccountStore.delete_user``).
     :returns: APIRouter to mount at ``/auth``.
     """
     if auth_provider._source != "accounts":
         raise RuntimeError("create_accounts_auth_router called with non-accounts provider")
     config = auth_provider._accounts_config
+    if config is None:
+        raise RuntimeError("accounts auth provider has no accounts configuration")
     router = APIRouter()
 
     _secure = config.secure_cookies
     _session_cookie = config.session_cookie_name
     _session_max_age = config.session_ttl_hours * 3600
+
+    def _reissue_session_cookie(response: Response, user_id: str, generation: str) -> None:
+        """Keep the caller signed in after rotating their own account generation."""
+        bind_account_authority(user_id, generation)
+        session_jwt = mint_session_cookie(
+            user_id=user_id,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider="accounts",
+            account_generation=generation,
+        )
+        _set_session_cookie(
+            response,
+            session_jwt,
+            cookie_name=_session_cookie,
+            secure=_secure,
+            max_age_seconds=_session_max_age,
+        )
 
     # ── Login / logout / me ───────────────────────────────────────
 
@@ -254,7 +299,9 @@ def create_accounts_auth_router(
         OWASP authentication cheat-sheet guidance.
         """
         username = body.username.strip().lower()
-        password_hash = account_store.get_password_hash(username)
+        password_hash, generation = account_store.login_snapshot(username)
+        if generation is not None:
+            bind_account_authority(username, generation)
         # Always run a verify even on missing user — keeps the
         # response time roughly constant regardless of whether
         # the username exists. The dummy hash is the argon2
@@ -274,7 +321,8 @@ def create_accounts_auth_router(
 
         # Opportunistic rehash if argon2 parameters were upgraded.
         # Cheap and self-healing; failure is non-fatal (the user
-        # still gets logged in with the old hash).
+        # still gets logged in with the old hash). Same password, so
+        # the generation and the user's other sessions are kept.
         if needs_rehash(password_hash):
             try:
                 account_store.update_password(username, hash_password(body.password))
@@ -297,18 +345,38 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            account_generation=generation,
         )
 
         user = account_store.get_user(username)
-        # `user` cannot be None here — we just verified the password
-        # against a row that exists. Defensive-coding the dereference
-        # would only mask a SqlAlchemy bug, which we want to surface.
-        assert user is not None
-        body_payload = {
+        if user is None or user.account_generation != generation:
+            return JSONResponse(status_code=401, content={"error": "invalid username or password"})
+        body_payload: dict[str, object] = {
             "token": session_jwt,
             "expires_in": _session_max_age,
             "user": {"id": user.id, "is_admin": user.is_admin},
         }
+        # Browser login must never receive refresh material — only CLI/device
+        # flows do (via issue_refresh=True or the device-grant callback).
+        # Gated on body.issue_refresh so the web form, which never sends
+        # the field, cannot obtain long-lived unattended credentials even
+        # under XSS or form-hijack (the browser has no way to set it True).
+        if body.issue_refresh is True and device_grant_store is not None:
+            from omnigent.server.routes.device_auth import issue_login_grant
+
+            try:
+                body_payload["refresh_token"] = issue_login_grant(
+                    device_grant_store,
+                    user_id=username,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:  # grant failure must never break login
+                _logger.exception(
+                    "auth/login: refresh grant issuance failed for %s",
+                    _redact_for_log(username),
+                )
+        if generation is None or not account_store.accepts_generation(username, generation):
+            return JSONResponse(status_code=401, content={"error": "invalid username or password"})
         resp = JSONResponse(status_code=200, content=body_payload)
         _set_session_cookie(
             resp,
@@ -433,6 +501,8 @@ def create_accounts_auth_router(
             # invite — invite is now consumed, no recovery here.
             return JSONResponse(status_code=409, content={"error": "username already taken"})
 
+        if user.account_generation is not None:
+            bind_account_authority(username, user.account_generation)
         account_store.mark_logged_in(username, now)
         # Admin list applies to invite-registered users too (additive).
         # Re-fetch so the response reflects a promotion; the invite's
@@ -444,6 +514,7 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            account_generation=user.account_generation,
         )
         resp = JSONResponse(
             status_code=200,
@@ -506,6 +577,8 @@ def create_accounts_auth_router(
             # is now done — surface the same terminal 409.
             return JSONResponse(status_code=409, content={"error": "setup already completed"})
 
+        if user.account_generation is not None:
+            bind_account_authority(username, user.account_generation)
         account_store.mark_logged_in(username, now)
         # Admin list applies (additive); the setup admin is already admin.
         if promote_if_listed(admin_list, account_store, username):
@@ -528,6 +601,7 @@ def create_accounts_auth_router(
                 base_url=config.base_url,
                 cookie_secret=config.cookie_secret,
                 session_ttl_hours=config.session_ttl_hours,
+                account_generation=user.account_generation,
             )
             # Single-user continuity: a loopback server flipping into accounts
             # mode is the same human's laptop. The pre-accounts chats are owned
@@ -543,6 +617,7 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            account_generation=user.account_generation,
         )
         resp = JSONResponse(
             status_code=200,
@@ -608,18 +683,20 @@ def create_accounts_auth_router(
         """
         token_id = request.query_params.get("t", "").strip()
         if not token_id:
-            return RedirectResponse(url="/login?magic=missing", status_code=302)
+            return RedirectResponse(url=f"{config.base_url}/login?magic=missing", status_code=302)
 
         now = int(time.time())
         token = account_store.redeem_token(token_id, kind="magic", now_epoch_seconds=now)
         if token is None or token.user_id is None:
-            return RedirectResponse(url="/login?magic=expired", status_code=302)
+            return RedirectResponse(url=f"{config.base_url}/login?magic=expired", status_code=302)
 
         # Confirm the underlying user still exists (admin may have
         # deleted them after the token was minted).
         user = account_store.get_user(token.user_id)
-        if user is None:
-            return RedirectResponse(url="/login?magic=expired", status_code=302)
+        if user is None or user.account_generation != token.account_generation:
+            return RedirectResponse(url=f"{config.base_url}/login?magic=expired", status_code=302)
+        if token.account_generation is not None:
+            bind_account_authority(token.user_id, token.account_generation)
 
         account_store.mark_logged_in(token.user_id, now)
         # Admin list applies on magic-link sign-in too (additive).
@@ -629,8 +706,9 @@ def create_accounts_auth_router(
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider="accounts",
+            account_generation=user.account_generation,
         )
-        resp = RedirectResponse(url="/", status_code=302)
+        resp = RedirectResponse(url=f"{config.base_url}/", status_code=302)
         _set_session_cookie(
             resp,
             session_jwt,
@@ -692,6 +770,10 @@ def create_accounts_auth_router(
         if user_id == admin_id:
             return JSONResponse(status_code=400, content={"error": "cannot delete self"})
 
+        owned_task_ids: list[str] = []
+        if scheduled_task_store is not None:
+            owned_task_ids = [t.id for t in scheduled_task_store.list(owner_user_id=user_id)]
+
         result = account_store.delete_user(user_id)
         if result is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
@@ -703,6 +785,13 @@ def create_accounts_auth_router(
                     "user first or the deploy would have no recovery path"
                 },
             )
+        # The store already disabled the rows; drop the in-memory timers so
+        # the scheduler stops re-arming them.
+        scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
+        if scheduler is not None:
+            for task_id in owned_task_ids:
+                scheduler.remove(task_id)
+        auth_provider.revoke_user_sessions(user_id)
         return Response(status_code=204)
 
     @router.post("/users/{user_id}/reset")
@@ -712,6 +801,7 @@ def create_accounts_auth_router(
         Mints a fresh random password, stores its hash, returns
         the plaintext exactly once to the calling admin who
         then DMs it to the user out-of-band. No SMTP needed.
+        Also revokes the user's existing sessions and CLI logins.
         """
         admin_id = auth_provider.get_user_id(request)
         if admin_id is None or not account_store.is_admin(admin_id):
@@ -722,20 +812,34 @@ def create_accounts_auth_router(
             return JSONResponse(status_code=404, content={"error": "not found"})
 
         new_password = secrets.token_urlsafe(16)
-        account_store.update_password(user_id, hash_password(new_password))
+        with target_account_scope(user_id, user.account_generation):
+            generation = account_store.update_password(
+                user_id, hash_password(new_password), revoke_sessions=True
+            )
+        auth_provider.revoke_user_sessions(user_id)
         _logger.info(
             "auth/users/reset: %s reset by %s",
             _redact_for_log(user_id),
             _redact_for_log(admin_id),
         )
-        return JSONResponse(
+        resp = JSONResponse(
             status_code=200,
             content={"id": user_id, "new_password": new_password},
         )
+        # An admin resetting their own account keeps this session, so the
+        # next request cannot sign them out before they save the password.
+        if user_id == admin_id and generation is not None:
+            _reissue_session_cookie(resp, admin_id, generation)
+        return resp
 
     @router.post("/users/me/password")
     async def change_own_password(request: Request, body: ChangePasswordRequest) -> Response:
-        """Self-serve password change (requires old password)."""
+        """Self-serve password change (requires old password).
+
+        Revokes every other session and CLI login of the account. The
+        caller gets a fresh session cookie; a bearer-token caller must
+        log in again.
+        """
         user_id = auth_provider.get_user_id(request)
         if user_id is None:
             return JSONResponse(status_code=401, content={"error": "not authenticated"})
@@ -754,9 +858,15 @@ def create_accounts_auth_router(
         except InvalidPasswordError:
             return JSONResponse(status_code=401, content={"error": "old password incorrect"})
 
-        account_store.update_password(user_id, hash_password(body.new_password))
+        generation = account_store.update_password(
+            user_id, hash_password(body.new_password), revoke_sessions=True
+        )
+        auth_provider.revoke_user_sessions(user_id)
         _logger.info("auth/users/me/password: changed for %s", _redact_for_log(user_id))
-        return Response(status_code=204)
+        resp = Response(status_code=204)
+        if generation is not None:
+            _reissue_session_cookie(resp, user_id, generation)
+        return resp
 
     return router
 

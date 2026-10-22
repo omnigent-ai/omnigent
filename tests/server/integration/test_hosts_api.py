@@ -9,11 +9,14 @@ from pathlib import Path
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -23,40 +26,27 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "33296f9b15e02671c34e013dd711407e"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build an ASGI WebSocket scope.
-
-    :param path: WebSocket path.
-    :returns: Minimal ASGI WebSocket scope.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
+# Binding persistence can exceed two seconds under parallel CI load.
+# A receive timeout cancels the ASGI app and disconnects the fake host.
+_LAUNCH_FRAME_TIMEOUT_S = 10.0
 
 
 def _make_hello(
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -64,6 +54,9 @@ def _make_hello(
     :param configured_harnesses: Per-harness readiness map to report,
         e.g. ``{"claude-sdk": True}``; ``None`` mimics an older host
         that doesn't report it.
+    :param gateway_inference: Per-harness AI-Gateway-backed inference map to
+        report, e.g. ``{"claude-native": True}``; ``None`` mimics a host that
+        doesn't report it.
     :returns: JSON-encoded hello frame.
     """
     return encode_host_frame(
@@ -72,6 +65,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             configured_harnesses=configured_harnesses,
+            gateway_inference=gateway_inference,
         )
     )
 
@@ -85,8 +79,24 @@ def host_api_app(
     :param db_uri: SQLite URI from the shared fixture.
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
+    return _build_host_api_app(db_uri)
+
+
+def _build_host_api_app(
+    db_uri: str,
+) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
+    """Build one replica's app over *db_uri*.
+
+    Separate from the fixture so a test can stand up a SECOND replica on the
+    same database — a server restart, which keeps every host row but starts with
+    an empty registry.
+
+    :param db_uri: SQLite URI from the shared fixture.
+    :returns: Tuple of (app, registry, host_store, conv_store).
+    """
     registry = HostRegistry()
     host_store = HostStore(db_uri)
+    registry.launch_authorizer = host_store.admit_launch
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(
@@ -97,6 +107,18 @@ def host_api_app(
         create_hosts_router(registry, host_store, conv_store),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle_omnigent_error(
+        request: Request,
+        exc: OmnigentError,
+    ) -> JSONResponse:
+        """Convert application errors to structured JSON responses."""
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
     return app, registry, host_store, conv_store
 
 
@@ -106,6 +128,7 @@ async def _connect_host(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     configured_harnesses: dict[str, bool | str] | None = None,
+    gateway_inference: dict[str, bool] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -115,16 +138,21 @@ async def _connect_host(
     :param name: Host name for the hello frame.
     :param configured_harnesses: Readiness map for the hello frame,
         e.g. ``{"codex": False}``; ``None`` mimics an older host.
+    :param gateway_inference: Gateway-inference map for the hello frame,
+        e.g. ``{"codex": True}``; ``None`` mimics a host that doesn't report it.
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, configured_harnesses)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, configured_harnesses, gateway_inference),
+        },
     )
     while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
@@ -298,6 +326,123 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
 
 
+async def test_hosts_api_surfaces_gateway_inference(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify the gateway-inference map a host reports in its hello is held in
+    memory and surfaced by both GET /v1/hosts and GET /v1/hosts/{id}.
+
+    This is the signal the web UI gates Smart Routing on. If it is dropped
+    anywhere along hello → host registry → hosts route, the UI would offer
+    Smart Routing on a host whose apply layer cannot work.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(
+        app,
+        registry,
+        configured_harnesses={"claude-native": True, "codex": True},
+        gateway_inference={"claude-native": True, "codex": False},
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] == {
+        "claude-native": True,
+        "codex": False,
+    }
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] == {"claude-native": True, "codex": False}
+
+
+async def test_hosts_api_gateway_inference_null_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """
+    Verify a host that never reported gateway inference lists with
+    ``gateway_inference`` null — unknown, never ``{}``.
+
+    ``{}`` would gate Smart Routing away from every old host; ``null`` is the
+    contract the web helper keys on to leave it enabled.
+    """
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.status_code == 200
+    assert listing.json()["hosts"][0]["gateway_inference"] is None
+    assert single.status_code == 200
+    assert single.json()["gateway_inference"] is None
+
+
+async def test_gateway_inference_reconverges_after_a_server_restart(
+    db_uri: str,
+) -> None:
+    """
+    Verify a restarted server re-learns gateway backing from the reconnect, with
+    no database state behind it, and that router selection follows.
+
+    The restart→unknown window is the cost of holding the map in memory, so it
+    has to be bounded by the handshake: while the fresh replica has no report,
+    the unknown-is-backed rule keeps the external router in play; the moment the
+    host reconnects and re-reports "claude is off-gateway", selection drops back
+    to the built-in judge — permanently, with nothing to migrate or backfill.
+    """
+    from omnigent.server.routes._sessions.common import set_server_host_registry
+    from omnigent.server.routing_backend import RoutingBackends, gateway_backs_all, select_router
+
+    external = object()
+    local = object()
+    backends = RoutingBackends(external=external, local=local)  # type: ignore[arg-type]
+
+    def _source(host: object) -> str | None:
+        choice = select_router(
+            backends, gateway_backed=gateway_backs_all(host, ("claude-native",))
+        )
+        return choice.source if choice is not None else None
+
+    app, registry, host_store, _cs = _build_host_api_app(db_uri)
+    set_server_host_registry(registry)
+    try:
+        comm = await _connect_host(app, registry, gateway_inference={"claude-native": False})
+        host = host_store.get_host(_HOST_ID)
+        assert host is not None
+        assert _source(host) == "oss-llm"
+
+        # Restart: the hosts row survives, every in-memory report is gone.
+        with contextlib.suppress(Exception):
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        restarted_app, restarted_registry, restarted_store, _cs2 = _build_host_api_app(db_uri)
+        set_server_host_registry(restarted_registry)
+        restarted_host = restarted_store.get_host(_HOST_ID)
+        assert restarted_host is not None
+        assert restarted_registry.gateway_inference(_HOST_ID) is None
+        assert _source(restarted_host) == "databricks-aigw"
+
+        # The host reconnects and re-reports; the replica converges.
+        _recomm = await _connect_host(
+            restarted_app,
+            restarted_registry,
+            gateway_inference={"claude-native": False},
+        )
+        assert restarted_registry.gateway_inference(_HOST_ID) == {"claude-native": False}
+        assert _source(restarted_host) == "oss-llm"
+
+        async with AsyncClient(
+            transport=ASGITransport(app=restarted_app), base_url="http://test"
+        ) as client:
+            single = await client.get(f"/v1/hosts/{_HOST_ID}")
+        assert single.json()["gateway_inference"] == {"claude-native": False}
+    finally:
+        set_server_host_registry(None)
+
+
 async def test_get_host_404(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
@@ -424,7 +569,7 @@ async def test_launch_runner_happy_path(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -470,18 +615,54 @@ async def test_launch_runner_happy_path(
     assert updated_conv.host_id == _HOST_ID, "host_id should be written to the session row"
 
 
-async def test_launch_runner_harness_not_configured_returns_412(
+@pytest.mark.parametrize(
+    (
+        "wire_error_code",
+        "launch_error",
+        "expected_status",
+        "expected_error_code",
+        "expected_fragment",
+    ),
+    [
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "harness 'codex' is not configured — run `omnigent setup`",
+            412,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "omnigent setup",
+        ),
+        (
+            WORKSPACE_MISSING_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nforged workspace failure",
+            410,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /tmp/test-workspace",
+        ),
+        (
+            None,
+            "workspace path does not exist: /tmp/test-workspace",
+            410,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /tmp/test-workspace",
+        ),
+    ],
+)
+async def test_launch_runner_categorical_failure_returns_specific_status(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    wire_error_code: str | None,
+    launch_error: str,
+    expected_status: int,
+    expected_error_code: str,
+    expected_fragment: str,
 ) -> None:
     """
-    Verify the dedicated launch endpoint maps a host refusal carrying
-    error_code='harness_not_configured' to a 412 with the specific
-    error code (parity with POST /v1/sessions), after rolling back
-    the runner bind.
+    Verify the dedicated endpoint maps safe categorical host refusals
+    to a specific status and code, after rolling back the runner bind.
 
     If this degrades to the generic 502, the client loses the
-    machine-readable code (and the `omnigent setup` hint) on the
-    fork-resume relaunch path.
+    machine-readable cause on the fork-resume relaunch path. For a
+    missing workspace, the message must be rebuilt from the authorized
+    request path rather than reflecting arbitrary host output.
     """
     from omnigent.errors import OmnigentError
 
@@ -508,11 +689,11 @@ async def test_launch_runner_harness_not_configured_returns_412(
     conv = conv_store.create_conversation(agent_id=None)
 
     async def _refuse_launch() -> None:
-        """Reply 'failed' with the structured harness error code."""
+        """Reply ``failed`` with the parameterized structured code."""
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -524,8 +705,8 @@ async def test_launch_runner_harness_not_configured_returns_412(
                             HostLaunchRunnerResultFrame(
                                 request_id=frame.request_id,
                                 status="failed",
-                                error=("harness 'codex' is not configured — run `omnigent setup`"),
-                                error_code="harness_not_configured",
+                                error=launch_error,
+                                error_code=wire_error_code,
                             )
                         ),
                     },
@@ -541,11 +722,19 @@ async def test_launch_runner_harness_not_configured_returns_412(
         )
     await responder
 
-    # 412 with the machine-readable code — not the generic 502.
-    assert resp.status_code == 412, f"Expected 412, got {resp.status_code}: {resp.text}"
+    # A specific client status with the machine-readable code, not the generic 502.
+    assert resp.status_code == expected_status, (
+        f"Expected {expected_status}, got {resp.status_code}: {resp.text}"
+    )
     body = resp.json()
-    assert body["error"]["code"] == "harness_not_configured"
-    assert "omnigent setup" in body["error"]["message"]
+    assert body["error"]["code"] == expected_error_code
+    assert expected_fragment in body["error"]["message"]
+    if expected_error_code == WORKSPACE_MISSING_ERROR_CODE:
+        assert body["error"]["message"] == (
+            "host failed to launch runner: workspace path does not exist: /tmp/test-workspace"
+        )
+        assert "SECRET_TOKEN" not in body["error"]["message"]
+        assert "forged workspace failure" not in body["error"]["message"]
 
     # _rollback_failed_launch ran: the session is fully unbound so a
     # retry after `omnigent setup` starts clean.
@@ -578,8 +767,10 @@ async def test_launch_runner_409_host_offline(
     assert resp.status_code == 409
 
 
+@pytest.mark.parametrize("cross_host", [False, True])
 async def test_launch_runner_400_already_bound(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    cross_host: bool,
 ) -> None:
     """
     Verify launch returns 400 when the session already has a runner.
@@ -594,6 +785,8 @@ async def test_launch_runner_400_already_bound(
         agent_id=None,
         runner_id="runner_existing",
     )
+    if cross_host:
+        conv_store.set_host_id(conv.id, "3" * 32, workspace="/tmp/source")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
@@ -601,6 +794,9 @@ async def test_launch_runner_400_already_bound(
             json={"session_id": conv.id, "workspace": "/tmp"},
         )
     assert resp.status_code == 400
+    unchanged = conv_store.get_conversation(conv.id)
+    assert unchanged.runner_id == "runner_existing"
+    assert unchanged.host_id == ("3" * 32 if cross_host else None)
 
 
 async def test_launch_runner_404_unknown_host(
@@ -686,6 +882,16 @@ def multi_user_app(
         ),
         prefix="/v1",
     )
+    app.include_router(
+        create_skills_router(
+            registry,
+            host_store,
+            conv_store,
+            auth_provider=auth,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+    )
     return app, registry, host_store, conv_store
 
 
@@ -753,6 +959,38 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+@pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
+async def test_host_skills_requires_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    user: str | None,
+    status: int,
+) -> None:
+    from fastapi.responses import JSONResponse
+
+    from omnigent.errors import OmnigentError
+
+    app, registry, host_store, _cs = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"host_id": host_id, "harness": "claude-native", "path": "~"},
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status, response.text
+    assert conn.outbound_queue.empty()
+    assert conn.pending_skills == {}
 
 
 async def test_launch_runner_403_wrong_owner(
@@ -911,7 +1149,7 @@ async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
 
     # Unauthenticated peers are refused BEFORE the WS upgrade, so the
     # first (and only) output is the close — no accept, no frame exchange.
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close", (
         f"expected the tunnel to close on missing identity before accept, got {closed!r}"
     )
@@ -939,7 +1177,7 @@ async def test_tunnel_accepts_authenticated_owner(
     scope["headers"] = [(b"x-test-user", b"alice@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
     await comm.send_input(
         {"type": "websocket.receive", "text": _make_hello()},
@@ -1051,14 +1289,15 @@ async def test_resolve_host_launch_enforces_host_and_session_ownership(
 
     # Host known but offline (in the store, no live connection) → 409.
     host_store.upsert_on_connect("3d9665477127e41f42de3f4109418173", "alice-old", "alice@test.com")
-    with pytest.raises(HTTPException) as exc:
+    host_store.set_offline("3d9665477127e41f42de3f4109418173")
+    with pytest.raises(OmnigentError) as exc:
         resolve_host_launch(
             user_id="alice@test.com",
             host_id="3d9665477127e41f42de3f4109418173",
             session_id=conv.id,
             **stores,
         )
-    assert exc.value.status_code == 409
+    assert exc.value.code == ErrorCode.CONFLICT
 
 
 async def test_launch_runner_rejects_other_users_session(
@@ -1128,11 +1367,11 @@ async def test_failed_connect_does_not_offline_another_users_host(
     await comm.send_input({"type": "websocket.connect"})
     # Refused before accept(); no denial extension in this scope, so the
     # server falls back to a pre-accept close (code 4009).
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     with contextlib.suppress(Exception):
-        await comm.wait(timeout=2.0)
+        await comm.wait(timeout=budget(2.0))
 
     after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None
@@ -1148,6 +1387,7 @@ async def test_failed_connect_does_not_offline_another_users_host(
 
 async def test_runner_exited_report_surfaces_in_runner_status(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame from the daemon reaches the runner
@@ -1183,6 +1423,7 @@ async def test_runner_exited_report_surfaces_in_runner_status(
         "runner process exited with code 1 (log on host: ~/x.log)\n"
         "--- runner log tail ---\nModuleNotFoundError: No module named 'claude_agent_sdk'"
     )
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _connect_host(app, registry)
     await _comm.send_input(
         {
@@ -1210,13 +1451,21 @@ async def test_runner_exited_report_surfaces_in_runner_status(
     # the actual failure — is surfaced verbatim for the waiting client.
     assert body["error"] == daemon_error
 
+    # No callback wired, so the tunnel itself logs the session-less event.
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+    assert len(events) == 1
+    assert getattr(events[0], "session_id", None) is None
+    assert events[0].attributes["host_id"] == _HOST_ID
+    assert events[0].attributes["runner_id"] == "runner_dead"
+
 
 async def test_runner_exited_invokes_callback_with_runner_and_error(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame fires the ``on_runner_exited``
-    callback with ``(runner_id, error)``.
+    callback with ``(host_id, runner_id, error)``.
 
     This callback is how the server marks the crashed runner's
     session(s) failed and pushes the cause to the open view (the
@@ -1229,12 +1478,13 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     registry = HostRegistry()
     host_store = HostStore(db_uri)
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, str]] = []
 
-    async def _record(runner_id: str, error: str) -> None:
-        received.append((runner_id, error))
+    async def _record(host_id: str, runner_id: str, error: str) -> None:
+        received.append((host_id, runner_id, error))
 
     app = FastAPI()
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     app.include_router(
         create_host_tunnel_router(registry, host_store, on_runner_exited=_record),
         prefix="/v1",
@@ -1253,5 +1503,7 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
         while not received:
             await asyncio.sleep(0.01)
 
-    # The callback got the exact runner id and error string off the frame.
-    assert received == [("runner_x", "exited with code 1")]
+    # The callback got the reporting host plus the exact runner id and error.
+    assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
+    # The callback owns the event; the tunnel must not log a session-less duplicate.
+    assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]

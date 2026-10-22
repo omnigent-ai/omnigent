@@ -1,17 +1,21 @@
 // Persisted, app-global preference for whether a brand-new chat's right
 // Workspace rail (Files / Agents / Shells) starts open or collapsed.
 //
+// Set from Appearance settings, and re-written whenever the user collapses or
+// expands the rail — so the state the rail was last left in carries into the
+// next chat instead of springing back open.
+//
 // This only seeds sessions that have no saved per-chat `open` state. Once a
 // user toggles the rail in a session, that session's own
-// `SessionWorkspaceState.open` wins on restore. Set from Appearance settings.
+// `SessionWorkspaceState.open` wins on restore.
 
 const STORAGE_KEY = "omnigent:default-workspace-panel";
 
 export const workspacePanelDefaults = ["open", "collapsed"] as const;
 export type WorkspacePanelDefault = (typeof workspacePanelDefaults)[number];
 
-/** Match today's product default: new chats open the Workspace rail. */
-export const WORKSPACE_PANEL_DEFAULT: WorkspacePanelDefault = "open";
+/** Keep new chats visually stable while their runner and workspace hydrate. */
+export const WORKSPACE_PANEL_DEFAULT: WorkspacePanelDefault = "collapsed";
 
 /** Return whether a string is one of the selectable Workspace panel defaults. */
 export function isWorkspacePanelDefault(
@@ -24,8 +28,7 @@ export function isWorkspacePanelDefault(
  * Normalize a stored Workspace panel default to the product default.
  *
  * Unknown values can only come from localStorage drift or manual edits.
- * Falling back to `open` preserves backwards-compatible "rail starts open"
- * behavior for sessions with no saved open-state.
+ * Falling back to the product default keeps unknown values deterministic.
  */
 export function normalizeWorkspacePanelDefault(
   value: string | null | undefined,
@@ -36,7 +39,7 @@ export function normalizeWorkspacePanelDefault(
 /**
  * Read the persisted default for new-chat Workspace rail visibility.
  *
- * Returns "open" when nothing is stored, on a server render (no `window`),
+ * Returns the product default when nothing is stored, on a server render (no `window`),
  * or when the stored value is missing/unknown — never throws, so a corrupt
  * entry can't break app boot.
  */
@@ -52,8 +55,8 @@ export function readWorkspacePanelDefault(): WorkspacePanelDefault {
 }
 
 /**
- * Persist the default Workspace panel visibility for new chats. "open" clears
- * the key (the product default). Swallows quota/access errors so a failed
+ * Persist the default Workspace panel visibility for new chats. The product
+ * default clears the key. Swallows quota/access errors so a failed
  * write can't break settings.
  */
 export function writeWorkspacePanelDefault(value: WorkspacePanelDefault): void {
@@ -76,4 +79,14 @@ export function writeWorkspacePanelDefault(value: WorkspacePanelDefault): void {
  */
 export function readDefaultWorkspacePanelOpen(): boolean {
   return readWorkspacePanelDefault() === "open";
+}
+
+/**
+ * Record the rail's visibility as the app-global default.
+ *
+ * Called from AppShell's collapse/expand toggle so the state the user left the
+ * rail in becomes the starting state for chats they haven't opened yet.
+ */
+export function writeDefaultWorkspacePanelOpen(open: boolean): void {
+  writeWorkspacePanelDefault(open ? "open" : "collapsed");
 }

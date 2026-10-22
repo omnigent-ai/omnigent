@@ -64,10 +64,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up uv (clean public resolution, no proxy cache)
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: false
 
@@ -127,8 +127,8 @@ jobs:
       - name: Build sdists + wheels
         run: |
           uv build --out-dir dist
-          uv build sdks/python-client --out-dir dist
-          uv build sdks/ui --out-dir dist
+          uv run --no-project --with build python scripts/build_subpackages.py \
+            --out-dir dist omnigent-client omnigent-ui-sdk
           ls -la dist/
 
       # 4. Metadata sanity check (long-description renders, fields valid).
@@ -166,7 +166,7 @@ jobs:
 
       # 7. Persist the built artifacts for inspection.
       - name: Upload built distributions
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-omnigent
           path: dist/

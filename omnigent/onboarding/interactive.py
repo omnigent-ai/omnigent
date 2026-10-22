@@ -46,6 +46,34 @@ MUTED = "#6a6a6a"
 # singleton so all callers render through one surface.
 console = Console()
 
+# Text encodings that cover every codepoint, so the probe below can
+# short-circuit instead of round-tripping the string.
+_UNIVERSAL_ENCODINGS = frozenset({"utf-8", "utf8", "utf-16", "utf16", "utf-32", "utf32"})
+
+
+def encodable(text: str, target: Console | None = None) -> bool:
+    """Report whether *text* can be written to a console without blowing up.
+
+    A Windows shell on a legacy ANSI codepage (e.g. cp1252) hands Python a
+    stdio stream that cannot encode emoji, and the write raises
+    ``UnicodeEncodeError`` mid-render, aborting the command. Callers probe
+    with this first and substitute an ASCII stand-in when it returns False.
+
+    :param text: The string about to be printed.
+    :param target: The console to probe; defaults to the module singleton.
+    :returns: True when the console's encoding covers *text* — including when
+        the encoding is unknown, since there is nothing to check against.
+    """
+    file = (target if target is not None else console).file
+    encoding = getattr(file, "encoding", None)
+    if not encoding or encoding.lower().replace("_", "-") in _UNIVERSAL_ENCODINGS:
+        return True
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
 
 class _TermUIWithHiddenPrompt(Protocol):
     hidden_prompt_func: Callable[[str], str]
@@ -212,6 +240,43 @@ def _render_menu(
     render_console.print(Text.from_markup(f"  [{MUTED}]{hint}[/]"))
 
     return buf.getvalue()
+
+
+def _count_terminal_lines(rendered: str, width: int) -> int:
+    """Count the visual terminal lines that *rendered* occupies.
+
+    ``rendered.count("\\n")`` undercounts when Rich wraps a logical line
+    across multiple terminal rows (e.g. a long status label near the edge).
+    Each logical line's display-cell width, divided by *width* (with ceiling),
+    gives the real number of rows it occupies — which is what the cursor-up
+    escape needs to erase the full frame.
+
+    :param rendered: ANSI-escaped string as produced by :func:`_render_menu`.
+    :param width: Terminal column count used when rendering.
+    :returns: Total visual rows the string occupies.
+    """
+    import re
+
+    if not rendered:
+        return 0
+    # Strip ANSI escape sequences to measure plain display width.
+    ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    total = 0
+    for line in rendered.split("\n"):
+        plain = ansi_re.sub("", line)
+        line_cells = cell_len(plain)
+        # A zero-width line still occupies one row — except the empty segment
+        # that split() produces after the very last newline (a phantom row).
+        if line_cells == 0:
+            total += 1
+        else:
+            total += max(1, -(-line_cells // width))  # ceiling division
+    # split() yields one extra empty segment after the final newline; the
+    # trailing newline itself is the line separator, not a new line, so
+    # subtract that phantom row.
+    if rendered.endswith("\n"):
+        total -= 1
+    return max(total, 0)
 
 
 def _normalize_selectable(options: list[str], selectable: list[bool] | None) -> list[bool]:
@@ -448,7 +513,7 @@ def select(
         sys.stdout.write("\033[J")  # Clear from cursor to end of screen.
         sys.stdout.write(rendered)
         sys.stdout.flush()
-        prev_lines[0] = rendered.count("\n")
+        prev_lines[0] = _count_terminal_lines(rendered, width)
 
     try:
         old_attrs = termios.tcgetattr(fd)
@@ -473,7 +538,9 @@ def select(
 
                 if _select.select([fd], [], [], 0.05)[0]:
                     nxt = os.read(fd, 1)
-                    if nxt == b"[":
+                    # b"[" is normal cursor mode, b"O" application cursor
+                    # mode (DECCKM) — terminals send either for ↑/↓.
+                    if nxt in (b"[", b"O"):
                         arrow = os.read(fd, 1)
                         if arrow == b"A":  # Up
                             selected = _step_selectable(mask, selected, -1)

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import logging
 
 import httpx
 import pytest
@@ -10,13 +11,25 @@ import pytest
 from omnigent.llms.adapters.anthropic import (
     _anthropic_to_chat,
     _chat_to_anthropic,
+    _clear_model_metadata_cache,
     _convert_tool_choice,
     _convert_tools,
+    _get_anthropic_model_metadata,
     _stream_request,
     _translate_part_to_anthropic,
 )
-from omnigent.llms.errors import ContextWindowExceededError
+from omnigent.llms.errors import ContextWindowExceededError, PermanentLLMError
+from omnigent.models.model_metadata import (
+    ModelMetadata,
+    ModelReasoningMetadata,
+    ModelReasoningMode,
+)
 from omnigent.runtime.llm_retry import classify_llm_error
+
+
+@pytest.fixture(autouse=True)
+def _fresh_model_metadata_cache() -> None:
+    _clear_model_metadata_cache()
 
 
 def test_system_messages_extracted() -> None:
@@ -420,11 +433,247 @@ def test_effort_to_budget_low_clamped_to_max_tokens() -> None:
 
 
 def test_reasoning_effort_adds_thinking_to_payload() -> None:
-    """reasoning_effort in extra adds thinking config to the payload."""
+    """Unknown model metadata preserves fixed-budget thinking."""
     messages = [{"role": "user", "content": "Hi"}]
-    payload = _chat_to_anthropic(messages, "claude-test", None, {"reasoning_effort": "high"})
+    payload = _chat_to_anthropic(
+        messages,
+        "claude-test",
+        None,
+        {"reasoning_effort": "high", "temperature": 0.4, "top_p": 0.9},
+    )
     assert payload["thinking"]["type"] == "enabled"
     assert payload["thinking"]["budget_tokens"] == 8192
+    assert "temperature" not in payload
+    assert "top_p" not in payload
+
+
+def test_adaptive_reasoning_uses_effort_and_removes_sampling_controls() -> None:
+    """Live adaptive metadata selects the modern Anthropic payload."""
+    metadata = ModelMetadata(
+        reasoning=ModelReasoningMetadata(
+            modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+            efforts=frozenset({"low", "medium", "high", "xhigh", "max"}),
+        )
+    )
+
+    payload = _chat_to_anthropic(
+        [{"role": "user", "content": "Hi"}],
+        "claude-opus-4-8",
+        None,
+        {"reasoning_effort": "high", "temperature": 0.4, "top_p": 0.9},
+        model_metadata=metadata,
+    )
+
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"] == {"effort": "high"}
+    assert "temperature" not in payload
+    assert "top_p" not in payload
+
+
+def test_fixed_budget_metadata_keeps_budget_tokens() -> None:
+    """Extended-thinking-only models retain the legacy budget payload."""
+    metadata = ModelMetadata(
+        reasoning=ModelReasoningMetadata(
+            modes=frozenset({ModelReasoningMode.FIXED_BUDGET}),
+        )
+    )
+
+    payload = _chat_to_anthropic(
+        [{"role": "user", "content": "Hi"}],
+        "claude-haiku-4-5",
+        None,
+        {"reasoning_effort": "medium", "temperature": 0.4, "top_p": 0.9},
+        model_metadata=metadata,
+    )
+
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    assert "output_config" not in payload
+    assert "temperature" not in payload
+    assert "top_p" not in payload
+
+
+def test_adaptive_reasoning_rejects_unsupported_model_effort() -> None:
+    """The live model effort ladder narrows generic Anthropic validation."""
+    metadata = ModelMetadata(
+        reasoning=ModelReasoningMetadata(
+            modes=frozenset({ModelReasoningMode.ADAPTIVE}),
+            efforts=frozenset({"low", "medium", "high", "max"}),
+        )
+    )
+
+    with pytest.raises(PermanentLLMError, match=r"xhigh.*not supported"):
+        _chat_to_anthropic(
+            [{"role": "user", "content": "Hi"}],
+            "claude-sonnet-4-6",
+            None,
+            {"reasoning_effort": "xhigh"},
+            model_metadata=metadata,
+        )
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_uses_models_api_and_caches() -> None:
+    """Per-model capability metadata is fetched once per cache window."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "claude-opus-4-8",
+                "max_input_tokens": 1_000_000,
+                "capabilities": {
+                    "thinking": {
+                        "supported": True,
+                        "types": {
+                            "enabled": {"supported": False},
+                            "adaptive": {"supported": True},
+                        },
+                    },
+                    "effort": {
+                        "supported": True,
+                        "low": {"supported": True},
+                        "high": {"supported": True},
+                    },
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+    first = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+    second = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+
+    assert len(requests_seen) == 1
+    assert str(requests_seen[0].url) == ("https://api.anthropic.com/v1/models/claude-opus-4-8")
+    assert first == second
+    assert first is not None
+    assert first.reasoning is not None
+    assert first.reasoning.modes == frozenset({ModelReasoningMode.ADAPTIVE})
+    assert first.reasoning.efforts == frozenset({"low", "high"})
+    assert first.context_window == 1_000_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_base", "models_url"),
+    [
+        (
+            "https://gateway.example.com/anthropic/v4",
+            "https://gateway.example.com/anthropic/v4/models",
+        ),
+        ("https://gateway.example.com/v4/", "https://gateway.example.com/v4/models"),
+        ("https://gateway.example.com/v10", "https://gateway.example.com/v10/models"),
+        ("https://gateway.example.com/v1beta", "https://gateway.example.com/v1beta/v1/models"),
+        ("https://gateway.example.com/v4/proxy", "https://gateway.example.com/v4/proxy/v1/models"),
+        ("https://gateway.example.com/v٤", "https://gateway.example.com/v%D9%A4/v1/models"),
+        ("https://v4", "https://v4/v1/models"),
+    ],
+)
+async def test_model_metadata_lookup_keeps_a_versioned_base(
+    provider_base: str, models_url: str
+) -> None:
+    """Only a final ASCII version path segment suppresses the default ``/v1``."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        if str(request.url) != f"{models_url}/claude-opus-4-8":
+            return httpx.Response(404, json={"error": {"type": "not_found_error"}})
+        return httpx.Response(200, json={"id": "claude-opus-4-8", "max_input_tokens": 200_000})
+
+    metadata = await _get_anthropic_model_metadata(
+        {"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+        provider_base,
+        "claude-opus-4-8",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert [str(request.url) for request in requests_seen] == [f"{models_url}/claude-opus-4-8"]
+    assert metadata is not None
+    assert metadata.context_window == 200_000
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_does_not_cache_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transient lookup failure is retried on the next request."""
+    requests_seen = 0
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        if requests_seen == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"id": "claude-opus-4-8"})
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.llms.adapters.anthropic"):
+        first = await _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        )
+    second = await _get_anthropic_model_metadata(
+        headers,
+        "https://api.anthropic.com/v1",
+        "claude-opus-4-8",
+        transport=transport,
+    )
+
+    assert first is None
+    assert second is not None
+    assert requests_seen == 2
+    assert "fixed-budget fallback may be unsupported" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_model_metadata_lookup_deduplicates_concurrent_fetches() -> None:
+    """Concurrent cold lookups share one Models API request."""
+    requests_seen = 0
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        await asyncio.sleep(0)
+        return httpx.Response(200, json={"id": "claude-opus-4-8"})
+
+    transport = httpx.MockTransport(_handler)
+    headers = {"x-api-key": "sk-test", "anthropic-version": "2023-06-01"}
+
+    first, second = await asyncio.gather(
+        _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        ),
+        _get_anthropic_model_metadata(
+            headers,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-8",
+            transport=transport,
+        ),
+    )
+
+    assert first == second
+    assert first is not None
+    assert requests_seen == 1
 
 
 # ── Stop sequences ───────────────────────────────────────

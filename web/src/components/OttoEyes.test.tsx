@@ -7,7 +7,10 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-const nextFrame = () => new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+const nextFrame = () =>
+  new Promise((resolve) => {
+    requestAnimationFrame(() => resolve(undefined));
+  });
 
 // Reads a pupil's live translate() transform, or null before the rAF
 // pipeline has written one.

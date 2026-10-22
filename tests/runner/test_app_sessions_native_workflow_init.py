@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import uuid
@@ -14,10 +15,15 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import native_dispatch
-from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.debug_logging import record_to_row
+from omnigent.entities.session_resources import SessionResourceView
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.inner.databricks_executor import DatabricksAuthError
+from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
+from omnigent.runner._entry import _RunnerDatabricksAuth
 from omnigent.runner.app import (
     _RUNNER_DISPATCHED_FIELD,
     ResolvedSpec,
@@ -30,6 +36,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
 from tests.runner.conftest import (
+    _build_app_for_spec,
     _build_app_with_mcp_tool,
     _build_interrupt_app,
     _build_lifecycle_app,
@@ -133,6 +140,58 @@ async def test_session_labels_for_runner_spawn_empty_200_body_recovers(
 
 
 @pytest.mark.asyncio
+async def test_session_labels_for_runner_spawn_auth_failure_recovers(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A token the runner's auth can't mint returns the fallback, not a failed turn.
+
+    A token factory that raises ``DatabricksAuthError`` (an ``OSError``, not an
+    ``httpx`` error), as a host credential service's does when it has no token,
+    escapes the runner's auth flow. Codex-native turns fetch labels before
+    anything else, so that failed the whole turn ("turn setup failed: Host
+    credential service could not supply workspace credentials").
+
+    :param caplog: Pytest log capture fixture.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    sent: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"labels": {}})
+
+    def _unmintable_token() -> str | None:
+        raise DatabricksAuthError("Host credential service could not supply workspace credentials")
+
+    transport = httpx.MockTransport(_handler)
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://ap",
+        auth=_RunnerDatabricksAuth(_unmintable_token),
+    ) as client:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            labels = await _session_labels_for_runner_spawn(
+                server_client=client,
+                session_id="5b8e6f0a2c4d4e1f9a7b3c2d1e0f9a8b",
+            )
+
+    assert labels == {}
+    assert sent == []
+    failure_records = [
+        record
+        for record in caplog.records
+        if "Failed to resolve session labels" in record.getMessage()
+    ]
+    assert len(failure_records) == 1
+    assert failure_records[0].levelno == logging.WARNING
+    assert "DatabricksAuthError" in failure_records[0].getMessage()
+
+
+@pytest.mark.asyncio
 async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> None:
     """A bare-shape harness (pi) calls its builder with just the session id."""
     captured: dict[str, Any] = {}
@@ -142,7 +201,7 @@ async def test_resolve_native_spawn_env_bare_builder_takes_session_id_only() -> 
         return {"PI_BRIDGE": conversation_id}
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.pi_native_bridge.build_pi_native_spawn_env", _fake_build)
+        mp.setattr("omnigent.harnesses.pi_native.bridge.build_pi_native_spawn_env", _fake_build)
         async with httpx.AsyncClient(base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "pi-native",
@@ -172,7 +231,9 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     transport = httpx.MockTransport(_labels_handler)
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.codex_native_bridge.build_codex_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.harnesses.codex_native.bridge.build_codex_native_spawn_env", _fake_build
+        )
         async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "codex-native",
@@ -183,6 +244,50 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     assert env == {"CODEX_BRIDGE": "bridge_xyz"}
     assert captured == {"session_id": "conv_codex", "bridge_id": "bridge_xyz"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launched_into_label_dir", [True, False])
+async def test_resolve_native_spawn_env_codex_failed_label_read_keeps_the_launch_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launched_into_label_dir: bool,
+) -> None:
+    """A Codex spawn whose label read fails reads bridge state where the terminal was launched.
+
+    A rotated session's terminal is launched into its bridge-id label's
+    directory. If the spawn-time label read then fails, the executor must still
+    get that directory, not the session id's; with no launch on this runner it
+    keeps the session id's directory.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
+
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    label_dir = codex_bridge.bridge_dir_for_bridge_id("bridge_rotated_from")
+    if launched_into_label_dir:
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, "conv_codex", label_dir)
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        env = await _resolve_native_spawn_env(
+            "codex-native",
+            "conv_codex",
+            server_client=client,
+            optional_labels=None,
+        )
+
+    expected = (
+        label_dir
+        if launched_into_label_dir
+        else codex_bridge.bridge_dir_for_bridge_id("conv_codex")
+    )
+    assert env is not None
+    assert env[codex_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] == str(expected)
+    assert env[codex_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] == "conv_codex"
 
 
 @pytest.mark.asyncio
@@ -200,7 +305,9 @@ async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
         return "claude_bridge_1"
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.claude_native_bridge.build_claude_native_spawn_env", _fake_build)
+        mp.setattr(
+            "omnigent.harnesses.claude_native.bridge.build_claude_native_spawn_env", _fake_build
+        )
         mp.setattr(
             "omnigent.runner.native.orchestration._claude_native_bridge_id_with_optional_labels",
             _fake_bridge_id,
@@ -233,8 +340,10 @@ async def test_resolve_native_spawn_env_hermes_writes_policy_hook_before_build()
         return {"HERMES_BRIDGE": session_id}
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("omnigent.hermes_native_bridge.write_policy_hook_config", _fake_write)
-        mp.setattr("omnigent.hermes_native_bridge.build_hermes_native_spawn_env", _fake_build)
+        mp.setattr("omnigent.harnesses.hermes_native.bridge.write_policy_hook_config", _fake_write)
+        mp.setattr(
+            "omnigent.harnesses.hermes_native.bridge.build_hermes_native_spawn_env", _fake_build
+        )
         async with httpx.AsyncClient(base_url="http://ap") as client:
             env = await _resolve_native_spawn_env(
                 "hermes-native",
@@ -312,7 +421,27 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "kiro-native",
             "_auto_create_kiro_terminal",
-            {"server_client", "ensure_comment_relay"},
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "goose-native",
+            "_auto_create_goose_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "hermes-native",
+            "_auto_create_hermes_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "qwen-native",
+            "_auto_create_qwen_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "devin-native",
+            "_auto_create_devin_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
         ),
         (
             "kimi-native",
@@ -322,7 +451,14 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "codex-native",
             "_auto_create_codex_terminal",
-            {"bundle_dir", "skills_filter", "agent_spec", "server_client", "ensure_comment_relay"},
+            {
+                "bundle_dir",
+                "skills_filter",
+                "agent_spec",
+                "server_client",
+                "session_init",
+                "ensure_comment_relay",
+            },
         ),
     ],
 )
@@ -416,16 +552,53 @@ async def test_launch_native_terminal_force_recreate_tears_down_existing(
 
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
     registry = _FakeTerminalRegistry(existing=True)
+
+    async def _pre_launch(_has_terminal: bool) -> PreLaunchResult:
+        return PreLaunchResult(force_recreate=True)
+
     result = await _launch_native_terminal(
         "pi-native",
         _launch_ctx(resource_registry=_FakeResourceRegistry(registry)),
         ensure_locks={},
-        pre_launch=PreLaunchResult(force_recreate=True),
+        pre_launch=_pre_launch,
     )
 
     assert result is True
     assert registry.cleaned == ["conv_x"]
     assert created == ["conv_x"]
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_force_recreate_and_skip_tears_down_without_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """force_recreate + skip together = teardown but NO create.
+
+    Preserves the claude rebuild+transfer-inbound case: the stale terminal is
+    torn down, but because a sibling session's terminal is rotating in (skip),
+    creation is left to the transfer instead of racing it with a fresh launch.
+    """
+    from omnigent.runner.native import PreLaunchResult, _launch_native_terminal
+
+    async def _must_not_call(ctx: NativeLaunchContext) -> object:
+        raise AssertionError("adapter must not run when the transfer will deliver")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
+    registry = _FakeTerminalRegistry(existing=True)
+
+    async def _pre_launch(_has_terminal: bool) -> PreLaunchResult:
+        return PreLaunchResult(force_recreate=True, skip=True)
+
+    result = await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(resource_registry=_FakeResourceRegistry(registry)),
+        ensure_locks={},
+        pre_launch=_pre_launch,
+    )
+
+    assert result is False
+    # Torn down (rebuild) but not recreated (skip → the transfer delivers).
+    assert registry.cleaned == ["conv_x"]
 
 
 @pytest.mark.asyncio
@@ -441,8 +614,14 @@ async def test_launch_native_terminal_skip_and_needs_terminal_return_false(
     monkeypatch.setattr("omnigent.runner.native._launch_pi", _must_not_call)
 
     for decision in (PreLaunchResult(skip=True), PreLaunchResult(needs_terminal=False)):
+
+        async def _pre_launch(
+            _has_terminal: bool, _d: PreLaunchResult = decision
+        ) -> PreLaunchResult:
+            return _d
+
         result = await _launch_native_terminal(
-            "pi-native", _launch_ctx(), ensure_locks={}, pre_launch=decision
+            "pi-native", _launch_ctx(), ensure_locks={}, pre_launch=_pre_launch
         )
         assert result is False
 
@@ -450,6 +629,7 @@ async def test_launch_native_terminal_skip_and_needs_terminal_return_false(
 @pytest.mark.asyncio
 async def test_launch_native_terminal_publishes_start_error_on_failure(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A builder failure returns False and publishes a terminal-start error."""
     from omnigent.runner.native import _launch_native_terminal
@@ -466,6 +646,16 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
     )
 
     assert result is False
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_start_failed"
+    )
+    assert failure.session_id == "conv_x"
+    assert failure.attributes["stage"] == "terminal_start"
+    assert not any(
+        getattr(record, "event_name", None) == "terminal_started" for record in caplog.records
+    )
     # pending True/False bracket the attempt, and a start-error event is published.
     assert any("error" in name.lower() or "error" in event for name, event in events)
 
@@ -514,6 +704,331 @@ async def test_launch_native_terminal_non_native_returns_none() -> None:
 
     result = await _launch_native_terminal("claude-sdk", _launch_ctx(), ensure_locks={})
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_build_context_enriches_only_on_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """build_context runs inside the create block and feeds the adapter's ctx."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    seen: dict[str, Any] = {}
+    build_calls = {"n": 0}
+
+    async def _fake_launch_pi(ctx: NativeLaunchContext) -> object:
+        seen["bundle_dir"] = ctx.bundle_dir
+        return object()
+
+    async def _build(ctx: NativeLaunchContext) -> NativeLaunchContext:
+        build_calls["n"] += 1
+        return dataclasses.replace(ctx, bundle_dir=Path("/tmp/enriched"))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _fake_launch_pi)
+
+    await _launch_native_terminal(
+        "pi-native", _launch_ctx(), ensure_locks={}, build_context=_build
+    )
+    assert build_calls["n"] == 1
+    assert seen["bundle_dir"] == Path("/tmp/enriched")
+
+    # Existing terminal: build_context must NOT run.
+    await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(resource_registry=_FakeResourceRegistry(_FakeTerminalRegistry(existing=True))),
+        ensure_locks={},
+        build_context=_build,
+    )
+    assert build_calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_reraise_propagates_without_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reraise=True re-raises the builder failure instead of publishing an event."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    async def _boom(ctx: NativeLaunchContext) -> object:
+        raise RuntimeError("cold-boot blew up")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _boom)
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    with pytest.raises(RuntimeError, match="cold-boot blew up"):
+        await _launch_native_terminal(
+            "pi-native",
+            _launch_ctx(publish_event=lambda name, event: events.append((name, event))),
+            ensure_locks={},
+            reraise=True,
+        )
+
+    # No start-error event was published (the caller converts the raise to a 503);
+    # only the pending on/off bracket events, none of which carry an error.
+    assert not any("error" in name.lower() or "error" in event for name, event in events)
+
+
+class _FakeEnsureRegistry:
+    """Resource registry stub for the ensure-shell (attach path) tests.
+
+    The ensure shell is view-based: it reads the existing terminal via
+    ``get_terminal_resource`` and replaces a non-owned one via
+    ``close_terminal``. ``terminal_registry`` is unused by the ensure shell
+    but present for interface parity.
+    """
+
+    terminal_registry = None
+
+    def __init__(self, existing: SessionResourceView | None = None, close_ok: bool = True) -> None:
+        self._existing = existing
+        self._close_ok = close_ok
+        self.closed: list[tuple[str, str]] = []
+
+    async def get_terminal_resource(
+        self, session_id: str, terminal_id: str
+    ) -> SessionResourceView | None:
+        return self._existing
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        self.closed.append((session_id, terminal_id))
+        return self._close_ok
+
+
+def _ensure_ctx(registry: _FakeEnsureRegistry, session_id: str = "conv_e") -> NativeLaunchContext:
+    """Build a launch context whose registry drives the ensure-shell tests."""
+    return NativeLaunchContext(
+        session_id=session_id,
+        resource_registry=registry,  # type: ignore[arg-type]
+        publish_event=lambda _name, _event: None,
+    )
+
+
+def _terminal_view(name: str, terminal_id: str = "terminal_goose_main") -> SessionResourceView:
+    return SessionResourceView(id=terminal_id, type="terminal", session_id="conv_e", name=name)
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_returns_existing_without_creating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing terminal is returned as-is; the adapter never runs."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    created = False
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> object:
+        nonlocal created
+        created = True
+        return object()
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    registry = _FakeEnsureRegistry(existing=_terminal_view("existing"))
+    resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks={})
+
+    assert resp is not None and resp.status_code == 200
+    assert json.loads(bytes(resp.body))["name"] == "existing"
+    assert created is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_creates_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no existing terminal, the shell resolves the adapter and creates one."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return _terminal_view("auto-created")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+    registry = _FakeEnsureRegistry(existing=None)
+    locks: dict[str, Any] = {}
+    resp = await _ensure_native_terminal("goose", _ensure_ctx(registry), ensure_locks=locks)
+
+    assert resp is not None and resp.status_code == 200
+    assert json.loads(bytes(resp.body))["name"] == "auto-created"
+    assert "conv_e" in locks
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_builder_error_returns_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A builder failure becomes a structured 500 JSON, not a live-published error."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _boom(ctx: NativeLaunchContext) -> object:
+        raise ImportError("Native goose requires the 'goose' CLI on PATH.")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _boom)
+    resp = await _ensure_native_terminal(
+        "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+    )
+
+    assert resp is not None and resp.status_code == 500
+    body = json.loads(bytes(resp.body))
+    # The raw ImportError text must not leak; a fixed client-safe message is used
+    # (the display name "Goose" identifies the runtime, not the raw cause).
+    assert "requires the 'goose' CLI" not in body["error"]["message"]
+    assert "Goose" in body["error"]["message"]
+    # The structured, non-sensitive cause (exception type only, here) still
+    # names the failure kind without the free-form message.
+    assert "(ImportError)" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_missing_workspace_returns_410_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A removed workspace is an expected lifecycle failure, not a startup defect."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _workspace_missing(ctx: NativeLaunchContext) -> object:
+        raise OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING)
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _workspace_missing)
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        resp = await _ensure_native_terminal(
+            "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+        )
+
+    assert resp is not None and resp.status_code == 410
+    assert json.loads(bytes(resp.body))["error"]["code"] == ErrorCode.WORKSPACE_MISSING
+    failure_records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "terminal_start_failed"
+    ]
+    assert failure_records == []
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "resource unavailable" in caplog.text
+    assert "agent unavailable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_non_native_returns_none() -> None:
+    """A non-native terminal name returns None so the caller uses the generic path."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    resp = await _ensure_native_terminal(
+        "bash", _ensure_ctx(_FakeEnsureRegistry()), ensure_locks={}
+    )
+    assert resp is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_owned_existing_uses_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An owned existing terminal is returned through ``finalize`` (codex notice wrap)."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    existing = _terminal_view("owned-existing", terminal_id="terminal_codex_main")
+    registry = _FakeEnsureRegistry(existing=existing)
+
+    def _finalize(view: SessionResourceView) -> Any:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(status_code=200, content={"name": view.name, "wrapped": True})
+
+    resp = await _ensure_native_terminal(
+        "codex",
+        _ensure_ctx(registry),
+        ensure_locks={},
+        is_owned=lambda _reg, _view: True,
+        finalize=_finalize,
+    )
+
+    assert resp is not None and resp.status_code == 200
+    body = json.loads(bytes(resp.body))
+    assert body == {"name": "owned-existing", "wrapped": True}
+    assert registry.closed == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_non_owned_closes_and_recreates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-owned existing terminal is closed, then the native one is created."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return _terminal_view("recreated", terminal_id="terminal_codex_main")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_codex", _fake_launch)
+    existing = _terminal_view("foreign", terminal_id="terminal_codex_main")
+    registry = _FakeEnsureRegistry(existing=existing, close_ok=True)
+
+    resp = await _ensure_native_terminal(
+        "codex",
+        _ensure_ctx(registry),
+        ensure_locks={},
+        is_owned=lambda _reg, _view: False,
+        conflict_message="conflict",
+    )
+
+    assert resp is not None and resp.status_code == 200
+    assert json.loads(bytes(resp.body))["name"] == "recreated"
+    assert registry.closed == [("conv_e", "terminal_codex_main")]
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_non_owned_close_fails_returns_409() -> None:
+    """When a non-owned terminal cannot be closed, the shell returns a 409 conflict."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    existing = _terminal_view("foreign", terminal_id="terminal_antigravity_main")
+    registry = _FakeEnsureRegistry(existing=existing, close_ok=False)
+
+    resp = await _ensure_native_terminal(
+        "antigravity",
+        _ensure_ctx(registry),
+        ensure_locks={},
+        is_owned=lambda _reg, _view: False,
+        conflict_message="Existing antigravity terminal is not runner-owned.",
+    )
+
+    assert resp is not None and resp.status_code == 409
+    body = json.loads(bytes(resp.body))
+    assert body["error"]["code"] == "terminal_conflict"
+    assert body["error"]["message"] == "Existing antigravity terminal is not runner-owned."
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_build_context_runs_only_on_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``build_context`` runs on create but is skipped when a terminal already exists."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    calls: list[str] = []
+
+    async def _fake_launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return _terminal_view("created")
+
+    async def _build(ctx: NativeLaunchContext) -> NativeLaunchContext:
+        calls.append("build")
+        return dataclasses.replace(ctx, agent_name="resolved")
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _fake_launch)
+
+    # Create path: build_context runs.
+    await _ensure_native_terminal(
+        "goose",
+        _ensure_ctx(_FakeEnsureRegistry(existing=None)),
+        ensure_locks={},
+        build_context=_build,
+    )
+    # Existing path: build_context skipped.
+    await _ensure_native_terminal(
+        "goose",
+        _ensure_ctx(_FakeEnsureRegistry(existing=_terminal_view("existing"))),
+        ensure_locks={},
+        build_context=_build,
+    )
+
+    assert calls == ["build"]
 
 
 @pytest.mark.asyncio
@@ -754,7 +1269,7 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
     )
 
     async with _runner_client(app) as client:
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        with caplog.at_level(logging.WARNING, logger="omnigent.inner.native_attachments"):
             resp = await client.post(
                 "/v1/sessions/conv_hist_fail/events",
                 json={
@@ -767,7 +1282,15 @@ async def test_sessions_native_history_file_id_fetch_failure_is_nonfatal(
             )
 
     assert resp.status_code == 202
-    assert "failed to resolve file_id" in caplog.text
+    failures = [
+        record_to_row(record, source="runner")
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_attachment_read_failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["session_id"] == "conv_hist_fail"
+    assert failures[0]["attributes"]["stage"] == "metadata"
+    assert failures[0]["attributes"]["exception_type"] == "ConnectError"
     for _ in range(20):
         if harness_client.posted_bodies:
             break
@@ -876,20 +1399,23 @@ def test_resolved_workdir_for_spec_prefers_bundle_workdir(tmp_path: Path) -> Non
 
 
 def test_resolved_workdir_for_spec_falls_back_without_bundle(tmp_path: Path) -> None:
-    """Non-bundle specs fall back to ``runner_workspace`` (prior behavior).
+    """Only an UNWRAPPED spec falls back to ``runner_workspace``.
 
-    A bare ``AgentSpec`` (no ResolvedSpec wrapper) or a ``ResolvedSpec``
-    with ``workdir=None`` carries no bundle dir, so dispatch must keep
-    using the CLI launch workspace exactly as base did.
+    A bare ``AgentSpec`` carries no bundle information at all, so dispatch
+    keeps using the CLI launch workspace exactly as base did. A
+    ``ResolvedSpec`` with ``workdir=None`` is different: resolution ran and
+    concluded there is no bundle dir for this agent. Falling back there is
+    what leaked a parent bundle into a sub-agent, so the ``None`` is
+    returned verbatim.
     """
     runner_workspace = tmp_path / "workspace"
     bare_spec = AgentSpec(spec_version=1, name="plain-agent")
 
     # Unwrapped spec → no workdir → fallback.
     assert _resolved_workdir_for_spec(bare_spec, runner_workspace) == runner_workspace
-    # ResolvedSpec with no workdir → fallback.
+    # Wrapped with no workdir → an answered "no bundle", not a fallback.
     wrapped_no_workdir = ResolvedSpec(spec=bare_spec, workdir=None)
-    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) == runner_workspace
+    assert _resolved_workdir_for_spec(wrapped_no_workdir, runner_workspace) is None
     # Missing fallback stays None (don't fabricate a path).
     assert _resolved_workdir_for_spec(bare_spec, None) is None
 
@@ -902,9 +1428,8 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
 
     End-to-end through ``POST /v1/sessions/{conv}/events`` (no live LLM):
     the scripted harness emits an ``action_required`` for a spec-declared
-    python tool, and the runner must dispatch it locally with
-    ``runner_workspace`` set to the resolved ``ResolvedSpec.workdir`` (the
-    bundle dir), not the generic CLI ``runner_workspace``. This is the
+    python tool, and the runner must dispatch it locally with the session
+    workspace kept separate from the resolved ``ResolvedSpec.workdir``. This is the
     dispatch-time counterpart to
     :func:`test_runner_session_tool_schemas_use_resolved_bundle_workdir`,
     which only proved schema generation used the bundle workdir.
@@ -920,6 +1445,8 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
     )
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    session_workspace = tmp_path / "session-worktree"
+    session_workspace.mkdir()
     spec = AgentSpec(
         spec_version=1,
         name="bundle-agent",
@@ -932,10 +1459,15 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
         ],
     )
 
-    captured_workspaces: list[Path | None] = []
+    captured_workspaces: list[tuple[Path | None, Path | None]] = []
 
-    async def _fake_dispatch(*, runner_workspace: Path | None = None, **kwargs: Any) -> str:
-        captured_workspaces.append(runner_workspace)
+    async def _fake_dispatch(
+        *,
+        runner_workspace: Path | None = None,
+        local_tool_workdir: Path | None = None,
+        **kwargs: Any,
+    ) -> str:
+        captured_workspaces.append((runner_workspace, local_tool_workdir))
         return "ok"
 
     monkeypatch.setattr(_tool_dispatch, "dispatch_tool_locally", _fake_dispatch)
@@ -963,10 +1495,23 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
         del agent_id, session_id
         return ResolvedSpec(spec=spec, workdir=bundle_dir)
 
+    class _WorkspaceServerClient(NullServerClient):
+        class _WorkspaceResponse(NullServerClient._Response):
+            def json(self) -> dict[str, Any]:
+                return {
+                    "workspace": str(session_workspace),
+                    "agent_id": "31ebfedf721b44dabd76f662cb70a400",
+                }
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            if url.startswith("/v1/sessions/"):
+                return self._WorkspaceResponse()
+            return await super().get(url, **kwargs)
+
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=_WorkspaceServerClient(),  # type: ignore[arg-type]
         runner_workspace=workspace,
     )
     async with _runner_client(app) as client:
@@ -988,10 +1533,7 @@ async def test_sessions_native_dispatches_native_tool_with_bundle_workdir(
             await asyncio.sleep(0.05)
 
     assert captured_workspaces, "native tool must be dispatched locally"
-    assert captured_workspaces[0] == bundle_dir, (
-        "dispatch must use the resolved bundle workdir, not runner_workspace "
-        f"({workspace!r}); got {captured_workspaces[0]!r}"
-    )
+    assert captured_workspaces[0] == (session_workspace.resolve(), bundle_dir)
 
 
 @pytest.mark.asyncio
@@ -1361,14 +1903,19 @@ async def test_sessions_native_clears_in_flight_on_lazy_spec_error() -> None:
     pm = _FakeProcessManager(harness_client)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> Any:
-        # Before the harness streams response.created the two setup-phase
-        # resolutions run: return None (uncached spec → default harness) so the
-        # turn streams without populating _session_spec_cache. Once streaming
-        # has started the only caller is the lazy dispatch resolution — fail it.
+        # Setup-phase call: return a real spec so _resolve_harness_config picks
+        # the test harness and the turn can start. _resolve_harness_config does
+        # NOT populate _session_spec_cache, so _resolve_turn_spec_lazy still
+        # calls us after response.created — and we raise there to exercise the
+        # error path.
         del agent_id, session_id
         if created.is_set():
             raise RuntimeError("transient lazy spec resolution failure")
-        return None
+        return AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+        )
 
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
@@ -1676,8 +2223,8 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
         name="codex-bundle-agent",
         skills_filter=["codex_e2e_xyz_greet_a3f9c2"],
         executor=ExecutorSpec(
-            config={"harness": "codex", "profile": "test-profile"},
-            model="databricks-gpt-5-4-mini",
+            config={"harness": "codex"},
+            model="gpt-5.4-mini",
         ),
     )
     harness_client = _ScriptedHarnessClient([])
@@ -1713,6 +2260,130 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
 
 
 @pytest.mark.asyncio
+async def test_create_session_spawns_the_snapshot_harness_override() -> None:
+    """Session init must spawn the session's overridden harness, not the spec's.
+
+    ``get_client`` entries are keyed by conversation, so resolving the spawn
+    from the spec made init request a harness the turns never asked for: the
+    mismatch tears down the override subprocess the kickoff turn is streaming
+    through and replaces it with the spec's
+    (``omnigent/runtime/harnesses/process_manager.py:749-770``). When the
+    spec's harness is a native one, init also launches its terminal on top of
+    that spawn, leaving two live processes for the one session.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="override-agent",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
+
+    app, pm = await _build_app_for_spec(spec)
+    session_id = "5b0c1f7a4d2e4c8fa1b3d6e9c0f2a4b6"
+    agent_id = "9d3e2b1c7a504f6e8c2d1b0a3f5e7c9d"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+                "harness_override": "pi",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        resp = await client.post("/v1/sessions", json=payload)
+
+    assert resp.status_code == 201, resp.text
+    # Whole list, not just the last call: spawning the spec's harness *as well*
+    # is the defect, and a trailing-call assertion cannot see it.
+    spawned = [(conv_id, harness) for conv_id, harness, _env in pm.get_client_calls]
+    assert spawned == [(session_id, "pi")], (
+        f"Session init must spawn the snapshot's harness_override 'pi' and "
+        f"nothing else; got {spawned}. Spawning the spec's 'claude-sdk' evicts "
+        f"the override harness the session's turns run on."
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_turn_resolves_the_recorded_harness_override() -> None:
+    """A turn whose body has no ``harness_override`` still runs the override.
+
+    The native terminal forward carries the override as session state, not
+    per-event state, so a turn body can arrive without it. Resolving that
+    turn from the body alone dropped it back onto the spec's harness —
+    process-manager entries are keyed by conversation, so the respawn
+    evicted the override harness mid-session (the split-brain on the turn
+    after the kickoff).
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="override-agent",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
+
+    app, pm = await _build_app_for_spec(spec)
+    session_id = "6c1d2e8b5f3a4d9eb2c4e7fad1a3b5c7"
+    agent_id = "8e4f3c2d1b6a05f79d3e2c1b4a6f8dae"
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "0.6.0.dev0",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "sub_agent_name": None,
+            "snapshot": {
+                "created_at": 1234,
+                "updated_at": 1234,
+                "workspace": None,
+                "labels": {},
+                "harness_override": "pi",
+            },
+        },
+    }
+
+    async with _runner_client(app) as client:
+        resp = await client.post("/v1/sessions", json=payload)
+        assert resp.status_code == 201, resp.text
+        turn = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "turn two"}],
+                "agent_id": agent_id,
+            },
+        )
+        assert turn.status_code == 202, turn.text
+        # The turn runs as a background task; wait for its harness request.
+        for _ in range(200):
+            if len(pm.get_client_calls) >= 2:
+                break
+            await asyncio.sleep(0.05)
+
+    harnesses = [harness for _conv, harness, _env in pm.get_client_calls]
+    assert "claude-sdk" not in harnesses, (
+        f"A turn without a body harness_override ran the spec's harness, "
+        f"evicting the session's recorded override; got {harnesses}."
+    )
+    assert harnesses[-1] == "pi", (
+        f"The turn must run the session's recorded override 'pi'; got {harnesses}."
+    )
+
+
+@pytest.mark.asyncio
 async def test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks() -> None:
     """Concurrent v2 initialization resolves once and uses supplied metadata."""
 
@@ -1727,6 +2398,17 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                     "Response",
                     (),
                     {"status_code": 200, "json": lambda self: {"data": []}},
+                )()
+            if path.endswith("/child_sessions"):
+                # Restart recovery lists the session's children; an empty
+                # list ends the scan after this single read.
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "status_code": 200,
+                        "json": lambda self: {"data": [], "has_more": False},
+                    },
                 )()
             raise AssertionError(f"unexpected metadata callback: {path}")
 
@@ -1785,7 +2467,13 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert first_response.json()["session_init_protocol_version"] == 2
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
-    assert server_client.get_paths == [f"/v1/sessions/{session_id}/items"]
+    # The envelope supplies session metadata, so the only snapshot-style
+    # callback is the history read; restart recovery adds one read of the
+    # durable child-session list, which is empty here.
+    assert server_client.get_paths == [
+        f"/v1/sessions/{session_id}/child_sessions",
+        f"/v1/sessions/{session_id}/items",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1960,6 +2648,47 @@ async def test_delete_session_with_active_turn() -> None:
     assert resp.status_code == 200
     assert "8e32600337d08f59ad381caf96a90659" in pm.cancelled
     assert "8e32600337d08f59ad381caf96a90659" in pm.released
+
+
+@pytest.mark.asyncio
+async def test_stop_then_release_side_chat_preserves_other_runner_sessions() -> None:
+    """Closing one shared-runner chat leaves the parent and sibling turns alive."""
+    app, pm, _hc = _build_lifecycle_app()
+    parent_id, side_id, sibling_id = (uuid.uuid4().hex for _ in range(3))
+    tasks: dict[str, asyncio.Task[bool]] = {}
+    async with _runner_client(app) as client:
+        try:
+            for session_id in (parent_id, side_id, sibling_id):
+                created = await client.post(
+                    "/v1/sessions",
+                    json={
+                        "session_id": session_id,
+                        "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                    },
+                )
+                assert created.status_code == 201, created.text
+                pm._sessions.add(session_id)
+                tasks[session_id] = asyncio.create_task(asyncio.Event().wait())
+                app.state.active_turns[session_id] = tasks[session_id]
+            await asyncio.sleep(0)
+
+            stopped = await client.post(
+                f"/v1/sessions/{side_id}/events", json={"type": "stop_session"}
+            )
+            assert stopped.status_code == 204, stopped.text
+            released = await client.delete(f"/v1/sessions/{side_id}")
+            assert released.status_code == 200, released.text
+            assert tasks[side_id].cancelled()
+            assert pm.released == [side_id]
+            assert not pm.has_session(side_id)
+            for session_id in (parent_id, sibling_id):
+                assert not tasks[session_id].done()
+                assert pm.has_session(session_id)
+                assert session_id not in pm.cancelled
+                assert app.state.active_turns[session_id] is tasks[session_id]
+        finally:
+            for session_id in (parent_id, side_id, sibling_id):
+                await client.delete(f"/v1/sessions/{session_id}")
 
 
 @pytest.mark.asyncio
@@ -2148,7 +2877,7 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
     # No bridge dir exists in this test; keep the lazy comment-relay start
     # from parking on the cold-bridge tools/list_changed wait.
     monkeypatch.setattr(
-        "omnigent.claude_native_bridge.post_tools_changed",
+        "omnigent.harnesses.claude_native.bridge.post_tools_changed",
         lambda *args, **kwargs: None,
     )
 
@@ -2214,3 +2943,23 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
 
     assert compactions, "harness compaction was never persisted to the server"
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
+
+
+def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
+    """Every kimi forwarder start must be preceded by a bridge-state clear.
+
+    This is the invariant that lets the forwarder discard a state file it
+    cannot parse (e.g. one written by an older build): the only path that
+    starts ``supervise_kimi_forwarder`` is ``_auto_create_kimi_terminal``,
+    which always unlinks the state file (and stamps a fresh launch epoch)
+    first, so a stale state file is never read by a new forwarder.
+    """
+    import inspect
+
+    from omnigent.runner.native import orchestration as orch
+
+    src = inspect.getsource(orch._auto_create_kimi_terminal)
+    assert "clear_kimi_bridge_state(bridge_dir)" in src
+    assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
+        "supervise_kimi_forwarder("
+    )

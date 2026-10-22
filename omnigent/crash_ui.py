@@ -23,6 +23,7 @@ import shutil
 import sys
 import traceback as _tb
 from pathlib import Path
+from types import TracebackType
 from typing import TextIO
 
 # --------------------------------------------------------------------------- #
@@ -220,7 +221,7 @@ def _full_traceback_env() -> bool:
 
 def format_traceback(
     exc: BaseException,
-    tb,
+    tb: TracebackType | None,
     *,
     colored: bool,
     unicode_ok: bool,
@@ -328,7 +329,7 @@ def render_crash_screen(
     app_name: str,
     report_path: str,
     exc: BaseException,
-    tb=None,
+    tb: TracebackType | None = None,
     stream: TextIO | None = None,
     first_party_prefixes: tuple[str, ...] = _DEFAULT_FIRST_PARTY_PREFIXES,
 ) -> None:
@@ -370,7 +371,7 @@ def render_crash_screen(
     if not on_tty:
         # Piped / CI / log file: plain text, no box, no emoji, no color.
         # Path at the top here since there's no interactive prompt after.
-        lines = [
+        plain_lines = [
             "",
             f"{display} ran into an issue.",
             "",
@@ -381,7 +382,7 @@ def render_crash_screen(
             tb_text,
             "",
         ]
-        stream.write("\n".join(lines) + "\n")
+        stream.write("\n".join(plain_lines) + "\n")
         stream.flush()
         return
 

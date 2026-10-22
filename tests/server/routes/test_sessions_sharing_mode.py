@@ -68,6 +68,8 @@ def _isolate_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sharing overrides are isolated, and reset the module cache so no value
     leaks across tests."""
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "")
+    monkeypatch.delenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", raising=False)
     sharing_settings._cache = {}
 
 
@@ -77,6 +79,7 @@ def _build_app(
     *,
     sharing_mode: SharingMode | object | None = None,
     public_sharing: bool | object | None = None,
+    public_sharing_max_level: str | None = None,
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
 ) -> FastAPI:
@@ -92,6 +95,7 @@ def _build_app(
         auth_provider=auth_provider,
         sharing_mode=sharing_mode,
         public_sharing=public_sharing,
+        public_sharing_max_level=public_sharing_max_level,
     )
 
 
@@ -112,6 +116,7 @@ def _seed_owned_session(
     sharing_mode: SharingMode = SharingMode.ON,
     public_sharing: bool | object | None = None,
     workspace: str | None = None,
+    public_sharing_max_level: str | None = None,
 ) -> tuple[FastAPI, str]:
     """Build an app whose ``_OWNER`` identity manages a real session.
 
@@ -132,10 +137,180 @@ def _seed_owned_session(
         tmp_path,
         sharing_mode=sharing_mode,
         public_sharing=public_sharing,
+        public_sharing_max_level=public_sharing_max_level,
         permission_store=permission_store,
         auth_provider=UnifiedAuthProvider(source="header"),
     )
     return app, conv.id
+
+
+@pytest.mark.asyncio
+async def test_public_permission_ceiling_defaults_to_read(db_uri: str, tmp_path: Path) -> None:
+    app, session_id = _seed_owned_session(db_uri, tmp_path)
+    async with _client(app, _OWNER) as owner:
+        info = (await owner.get("/v1/info")).json()
+        assert info["public_sharing_max_level"] == "read"
+        response = await owner.put(
+            f"/v1/sessions/{session_id}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_EDIT},
+        )
+        assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_public_edit_grant_obeys_live_ceiling_and_authentication(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    from tests.server.helpers import create_test_agent
+
+    app, session_id = _seed_owned_session(db_uri, tmp_path)
+    async with _client(app, _OWNER) as bootstrap:
+        created = await create_test_agent(bootstrap, user=_OWNER)
+        session_id = created["_session_id"]
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user(_ADMIN, is_admin=True)
+    store.ensure_user(_GRANTEE)
+    store.grant(_GRANTEE, session_id, LEVEL_READ)
+    async with (
+        _client(app, _ADMIN) as admin,
+        _client(app, _OWNER) as owner,
+        _client(app, _GRANTEE) as member,
+        _client(app) as anonymous,
+    ):
+        permissions_url = f"/v1/sessions/{session_id}/permissions"
+        read_grant = await owner.put(
+            permissions_url, json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_READ}
+        )
+        assert read_grant.status_code == 200
+        enabled = await admin.put("/v1/sharing", json={"public_sharing_max_level": "edit"})
+        assert enabled.status_code == 200
+        assert enabled.json()["public_sharing_max_level"] == "edit"
+        assert (await member.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 1
+        edit_grant = await owner.put(
+            permissions_url, json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_EDIT}
+        )
+        assert edit_grant.status_code == 200
+        assert (await member.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 2
+        assert (await anonymous.get(f"/v1/sessions/{session_id}")).status_code == 401
+        assert (
+            await member.put(
+                permissions_url, json={"user_id": "third@sharing.test", "level": LEVEL_READ}
+            )
+        ).status_code == 403
+        for level in (LEVEL_MANAGE, LEVEL_OWNER):
+            assert (
+                await owner.put(
+                    permissions_url, json={"user_id": RESERVED_USER_PUBLIC, "level": level}
+                )
+            ).status_code == (400 if level == LEVEL_MANAGE else 422)
+        assert (
+            await member.post(
+                f"/v1/sessions/{session_id}/agent-title", json={"title": "Shared session"}
+            )
+        ).status_code == 200
+        lowered = await admin.put("/v1/sharing", json={"public_sharing_max_level": "read"})
+        assert lowered.status_code == 200
+        # The snapshot's raw grant cache is already warm; the cap must still apply.
+        assert (await member.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 1
+        assert (
+            await member.post(
+                f"/v1/sessions/{session_id}/agent-title", json={"title": "Denied rename"}
+            )
+        ).status_code == 403
+        assert store.get(RESERVED_USER_PUBLIC, session_id).level == LEVEL_EDIT
+        assert (await owner.get(f"/v1/sessions/{session_id}")).json()["permission_level"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [SharingMode.READ_ONLY, SharingMode.OFF])
+async def test_public_edit_ceiling_cannot_bypass_sharing_mode(
+    db_uri: str, tmp_path: Path, mode: SharingMode
+) -> None:
+    app, session_id = _seed_owned_session(
+        db_uri, tmp_path, sharing_mode=mode, public_sharing_max_level="edit"
+    )
+    async with _client(app, _OWNER) as owner:
+        response = await owner.put(
+            f"/v1/sessions/{session_id}/permissions",
+            json={"user_id": RESERVED_USER_PUBLIC, "level": LEVEL_EDIT},
+        )
+        assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_public_ceiling_requires_auth_and_validates_before_writes(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _build_app(db_uri, tmp_path)
+    async with _client(app) as client:
+        for invalid in ("edit", "manage", ""):
+            response = await client.put(
+                "/v1/sharing",
+                json={"public_sharing": False, "public_sharing_max_level": invalid},
+            )
+            assert response.status_code in (400, 403)
+            assert (await client.get("/v1/sharing")).json()["public_sharing_enabled"] is True
+        assert (await client.get("/v1/sharing")).json()["public_sharing_max_level_options"] == [
+            "read"
+        ]
+    monkeypatch.setenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", "edit")
+    app = _build_app(db_uri, tmp_path)
+    async with _client(app) as client:
+        assert (await client.get("/v1/info")).json()["public_sharing_max_level"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_deployment_managed_public_ceiling_is_not_writable(
+    db_uri: str, tmp_path: Path
+) -> None:
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user(_ADMIN, is_admin=True)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        auth_provider=UnifiedAuthProvider(source="header"),
+        permission_store=store,
+        public_sharing_max_level="edit",
+    )
+    async with _client(app, _ADMIN) as admin:
+        state = (await admin.get("/v1/sharing")).json()
+        assert state["public_sharing_max_level"] == "edit"
+        assert state["public_sharing_max_level_editable"] is False
+        assert (
+            await admin.put("/v1/sharing", json={"public_sharing_max_level": "read"})
+        ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_identity_provider_cannot_enable_public_edit(
+    db_uri: str, tmp_path: Path
+) -> None:
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user(_ADMIN, is_admin=True)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=True),
+        permission_store=store,
+    )
+    async with _client(app, _ADMIN) as admin:
+        assert (
+            await admin.put("/v1/sharing", json={"public_sharing_max_level": "edit"})
+        ).status_code == 403
+        assert (await admin.get("/v1/info")).json()["public_sharing_max_level"] == "read"
+
+
+@pytest.mark.asyncio
+async def test_invalid_public_ceiling_override_fails_closed(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", "edit")
+    app, _ = _seed_owned_session(db_uri, tmp_path)
+    path = sharing_settings.resolve_data_dir() / "public_sharing_max_level"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("manage\n")
+    async with _client(app, _OWNER) as owner:
+        assert (await owner.get("/v1/info")).json()["public_sharing_max_level"] == "read"
 
 
 def _admin_app(

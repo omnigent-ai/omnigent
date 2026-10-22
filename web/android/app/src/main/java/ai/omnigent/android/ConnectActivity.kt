@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -13,8 +14,9 @@ import androidx.activity.ComponentActivity
 
 /**
  * Native server-entry screen, the Android counterpart to the iOS `ConnectView`:
- * a URL field plus a tappable recent-servers list. On connect it persists the
- * server via [ServerStore] and hands off to [MainActivity].
+ * a URL field plus a tappable server list (organization presets, then recents).
+ * On connect it persists the server via [ServerStore] and hands off to
+ * [MainActivity].
  *
  * [MainActivity] routes here on launch when no server has been configured yet.
  */
@@ -26,7 +28,27 @@ class ConnectActivity : ComponentActivity() {
         setContentView(R.layout.activity_connect)
 
         val field = findViewById<EditText>(R.id.server_url)
+        intent.getStringExtra(EXTRA_SERVER_URL)?.let(field::setText)
+        intent.getStringExtra(EXTRA_ERROR)?.let { message ->
+            findViewById<TextView>(R.id.error_text).apply {
+                text = message
+                visibility = View.VISIBLE
+            }
+        }
         findViewById<Button>(R.id.connect).setOnClickListener { connect(field.text.toString()) }
+        findViewById<Button>(R.id.about).setOnClickListener {
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.about_title)
+                .setMessage(
+                    getString(
+                        R.string.about_version,
+                        BuildConfig.VERSION_NAME,
+                        BuildConfig.VERSION_CODE,
+                    ),
+                ).setPositiveButton(android.R.string.ok, null)
+                .show()
+        }
         field.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO) {
                 connect(field.text.toString())
@@ -52,23 +74,29 @@ class ConnectActivity : ComponentActivity() {
         startActivity(
             Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(MainActivity.EXTRA_CONNECT_REQUEST, UserConnectRequests.issue())
             },
         )
         finish()
     }
 
     private fun renderRecents() {
-        val recents = store.recentServers()
+        val servers = store.offeredServers()
         val container = findViewById<LinearLayout>(R.id.recents)
         findViewById<TextView>(R.id.recents_label).visibility =
-            if (recents.isEmpty()) View.GONE else View.VISIBLE
+            if (servers.isEmpty()) View.GONE else View.VISIBLE
 
         val inflater = LayoutInflater.from(this)
-        for (url in recents) {
+        for (url in servers) {
             val row = inflater.inflate(R.layout.item_recent, container, false) as TextView
             row.text = url
             row.setOnClickListener { connect(url) }
             container.addView(row)
         }
+    }
+
+    companion object {
+        const val EXTRA_SERVER_URL = "ai.omnigent.android.SERVER_URL"
+        const val EXTRA_ERROR = "ai.omnigent.android.CONNECT_ERROR"
     }
 }

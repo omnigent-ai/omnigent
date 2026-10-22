@@ -154,9 +154,10 @@ def test_comment_surfaces_in_inbox_until_opened_in_file_browser(
     item = page.locator('[data-testid="inbox-comment"]').filter(has_text=_COMMENT_BODY)
     expect(item).to_be_visible(timeout=15_000)
 
-    # Deep-link into the file browser. The viewer opens the file, the
-    # linked comment auto-opens the comments panel, and the panel
-    # being open is what marks it seen.
+    # Expand the row, then deep-link into the file browser. The viewer
+    # opens the file, the linked comment auto-opens the comments panel,
+    # and the panel being open is what marks it seen.
+    item.locator("button[aria-expanded]").click()
     item.get_by_role("link", name="Open file").click()
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible(timeout=30_000)

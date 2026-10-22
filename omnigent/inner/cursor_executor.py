@@ -47,12 +47,13 @@ import json
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Protocol, TypeAlias, TypedDict
 
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.util.json_types import JsonObject as _JsonObject
 
 from .datamodel import OSEnvSpec
 from .executor import (
@@ -77,7 +78,41 @@ logger = logging.getLogger(__name__)
 # Omnigent's bridged-tool callback: (tool_name, args) -> awaitable result.
 # Installed by the runtime adapter (see ``_executor_adapter``); mirrors the
 # claude-sdk executor's ``ToolExecutor``.
-ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # type: ignore[explicit-any]
+ToolExecutor: TypeAlias = Callable[[str, _JsonObject], Awaitable[object]]
+PolicyEvaluator: TypeAlias = Callable[[str, _JsonObject], Awaitable[object]]
+ElicitationHandler: TypeAlias = Callable[[str, _JsonObject], Awaitable[bool]]
+
+
+class _PolicyGate(TypedDict):
+    block: bool
+    reason: str
+
+
+class _CursorStreamEvent(Protocol):
+    @property
+    def sdk_message(self) -> object | None:
+        raise NotImplementedError
+
+    @property
+    def interaction_update(self) -> object | None:
+        raise NotImplementedError
+
+
+class _CursorRun(Protocol):
+    def events(self) -> AsyncIterator[_CursorStreamEvent]:
+        raise NotImplementedError
+
+    async def wait(self) -> object:
+        raise NotImplementedError
+
+    async def cancel(self) -> object:
+        raise NotImplementedError
+
+
+class _CursorAgent(Protocol):
+    async def send(self, prompt: str, *, options: object) -> _CursorRun:
+        raise NotImplementedError
+
 
 # Cursor's auto model-select, used when a spec pins no cursor model (the SDK
 # requires a model for local agents, so unlike the old ACP path we can't pass
@@ -85,6 +120,11 @@ ToolExecutor: TypeAlias = Callable[[str, dict[str, Any]], Awaitable[Any]]  # typ
 # mapping the legacy id for specs/env that still say ``auto``.
 _DEFAULT_CURSOR_MODEL = "auto-smart"
 _LEGACY_AUTO_MODEL = "auto"
+
+
+class UnresolvableCursorModelError(ValueError):
+    """A requested model id cannot be resolved to a Cursor model id."""
+
 
 # Upper bound (seconds) on one bridged-tool call: generous (sub-agent dispatches
 # can run for minutes) but finite, so a wedged tool surfaces a timeout error
@@ -123,21 +163,74 @@ def _resolve_model(model: str | None) -> str:
     return model
 
 
-def _first_of(d: dict[str, Any], *keys: str, default: int = 0) -> int:
-    """Return the value of the first key present (and not None) in *d*."""
-    for k in keys:
-        v = d.get(k)
-        if v is not None:
-            return int(v)
+async def _resolve_model_against_catalog(
+    client: object, requested: str, api_key: str | None
+) -> str:
+    """Resolve *requested* against the account's live model catalog."""
+    if requested == _DEFAULT_CURSOR_MODEL:
+        return requested
+    list_models = getattr(client, "list_models", None)
+    if not callable(list_models):
+        logger.warning(
+            "CursorExecutor: SDK client exposes no list_models(); dispatching %r unverified.",
+            requested,
+        )
+        return requested
+    try:
+        listing = list_models(api_key=api_key)
+        raw = await listing if isinstance(listing, Awaitable) else listing
+        catalog: list[object] = list(raw) if isinstance(raw, Iterable) else []
+    except Exception:  # any listing failure degrades to backend-side validation
+        logger.warning(
+            "CursorExecutor: model listing failed; dispatching %r unverified.",
+            requested,
+            exc_info=True,
+        )
+        return requested
+    requested_cf = requested.casefold()
+    ids = [mid for entry in catalog if (mid := str(getattr(entry, "id", "") or ""))]
+    for mid in ids:
+        if mid.casefold() == requested_cf:
+            return mid
+    label_matches = sorted(
+        {
+            mid
+            for entry in catalog
+            if (mid := str(getattr(entry, "id", "") or ""))
+            and (name_cf := str(getattr(entry, "display_name", "") or "").casefold())
+            and (name_cf == requested_cf or name_cf.startswith(requested_cf + " "))
+        }
+    )
+    if len(label_matches) == 1:
+        logger.warning(
+            "CursorExecutor: resolved display label %r to model id %r.",
+            requested,
+            label_matches[0],
+        )
+        return label_matches[0]
+    ambiguous = f" (ambiguous label: matches {', '.join(label_matches)})" if label_matches else ""
+    raise UnresolvableCursorModelError(
+        f"{requested!r} is not a model id this Cursor account serves{ambiguous}. "
+        f"Available models: {', '.join(sorted(ids))}. Pick a model from the "
+        "model picker (or `cursor-agent models`)."
+    )
+
+
+def _first_of(data: Mapping[str, object], *keys: str, default: int = 0) -> int:
+    """Return the value of the first numeric key present in *data*."""
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (int, float, str)):
+            return int(value)
     return default
 
 
-def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
+def _normalize_cursor_usage(raw: Mapping[str, object], model: str) -> _JsonObject:
     """Map Cursor SDK usage fields to the standard Omnigent usage dict."""
     in_tok = _first_of(raw, "inputTokens", "input_tokens")
     out_tok = _first_of(raw, "outputTokens", "output_tokens")
     total = _first_of(raw, "totalTokens", "total_tokens", default=in_tok + out_tok)
-    usage: dict[str, Any] = {
+    usage: _JsonObject = {
         "input_tokens": in_tok,
         "output_tokens": out_tok,
         "total_tokens": total,
@@ -162,9 +255,9 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
         ),
     ):
         for src in sources:
-            val = raw.get(src)
-            if val is not None:
-                usage[dst] = val
+            value = raw.get(src)
+            if isinstance(value, (int, float, str)):
+                usage[dst] = int(value)
                 break
     # cursor's inputTokens is INCLUSIVE of cache read + write. compute_llm_cost
     # expects input_tokens to be the NON-cached portion and prices the cache
@@ -172,8 +265,8 @@ def _normalize_cursor_usage(raw: dict[str, Any], model: str) -> dict[str, Any]:
     # are billed twice (once at the full input rate, once at their cache rate).
     # Mirrors the qwen / antigravity executors. Clamp so a malformed cached >
     # input never goes negative. total_tokens keeps the reported inclusive total.
-    cached = (usage.get("cache_read_input_tokens") or 0) + (
-        usage.get("cache_creation_input_tokens") or 0
+    cached = _first_of(usage, "cache_read_input_tokens") + _first_of(
+        usage, "cache_creation_input_tokens"
     )
     usage["input_tokens"] = max(0, in_tok - cached)
     return usage
@@ -267,7 +360,7 @@ def _build_cursor_prompt(
 # ---------------------------------------------------------------------------
 
 
-def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore[explicit-any]
+def _sdk_message_to_events(message: object) -> list[ExecutorEvent]:
     """Map one ``cursor_sdk`` ``SDKMessage`` to zero or more ExecutorEvents.
 
     Handles the message types the harness surfaces; everything else (status,
@@ -295,7 +388,7 @@ def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore
         status = getattr(message, "status", "")
         name = str(getattr(message, "name", "") or "tool")
         raw_args = getattr(message, "args", None)
-        args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+        args: _JsonObject = raw_args if isinstance(raw_args, dict) else {}
         # Cursor surfaces host custom tools under an envelope: name == "mcp",
         # args == {providerIdentifier, toolName, args}. Unwrap to the real
         # Omnigent tool name + args so the observed events (and any name-keyed
@@ -341,7 +434,7 @@ def _sdk_message_to_events(message: Any) -> list[ExecutorEvent]:  # type: ignore
 # ---------------------------------------------------------------------------
 
 
-def _tool_error_payload(text: str) -> dict[str, Any]:  # type: ignore[explicit-any]
+def _tool_error_payload(text: str) -> _JsonObject:
     """An SDK custom-tool *error* result.
 
     A mapping with a ``content`` list and ``isError`` is passed through unchanged
@@ -351,7 +444,7 @@ def _tool_error_payload(text: str) -> dict[str, Any]:  # type: ignore[explicit-a
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
-def _encode_tool_result(result: Any) -> Any:  # type: ignore[explicit-any]
+def _encode_tool_result(result: object) -> object:
     """Encode a bridged-tool result for the SDK custom-tool return.
 
     A result that :func:`classify_tool_result` flags as anything other than
@@ -424,7 +517,7 @@ def _write_cursor_hooks(cwd: str, hook_script_path: str, server_url: str, sessio
     # Write a wrapper script that sets env vars and execs the hook. It bakes a
     # one-shot auth token + workspace-routing header, so it is owner-only
     # (0o700) — the secret is never world-readable.
-    from omnigent.native_policy_hook import policy_hook_wrapper_script
+    from omnigent.native.native_policy_hook import policy_hook_wrapper_script
 
     wrapper = hooks_dir / "omnigent-hook.sh"
     wrapper.write_text(policy_hook_wrapper_script(server_url, session_id, hook_script_path))
@@ -485,9 +578,10 @@ async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
 class _CursorSessionState:
     """Per-Omnigent-conversation SDK session state."""
 
-    client: Any = None  # cursor_sdk.AsyncClient
-    agent: Any = None  # cursor_sdk.AsyncAgent
+    client: object | None = None  # cursor_sdk.AsyncClient
+    agent: _CursorAgent | None = None  # cursor_sdk.AsyncAgent
     system_prompt: str | None = None
+    requested_model: str | None = None
     model: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
@@ -544,11 +638,11 @@ class CursorExecutor(Executor):
         # PHASE_LLM_RESPONSE, and PHASE_TOOL_CALL policies (the same round-trip
         # pi / claude-sdk use). ``None`` on single-process / pre-turn paths
         # (then policy is a no-op).
-        self._policy_evaluator: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None
+        self._policy_evaluator: PolicyEvaluator | None = None
         # Installed by the runtime adapter; surfaces ASK verdicts to the
         # user via the elicitation UI (approval prompt). ``None`` when no
         # handler is wired (single-process / test paths → fail closed).
-        self._elicitation_handler: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
+        self._elicitation_handler: ElicitationHandler | None = None
 
     def supports_streaming(self) -> bool:
         return True
@@ -579,9 +673,7 @@ class CursorExecutor(Executor):
 
     # -- native-tool policy gate --------------------------------------------
 
-    async def _evaluate_native_tool_policy(
-        self, name: str, args: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def _evaluate_native_tool_policy(self, name: str, args: _JsonObject) -> _PolicyGate:
         """Gate a Cursor native tool call via policy check + user elicitation.
 
         Returns ``{"block": bool, "reason": str}``.
@@ -636,16 +728,17 @@ class CursorExecutor(Executor):
 
     def _make_custom_tools(
         self, tools: list[ToolSpec], loop: asyncio.AbstractEventLoop
-    ) -> dict[str, Any]:  # type: ignore[explicit-any]
+    ) -> dict[str, object]:
         """Build the SDK ``custom_tools`` mapping from Omnigent ToolSpecs.
 
         Each tool's ``execute`` runs on the SDK callback server's daemon thread,
         so it hops back to *loop* (the main event loop) to await
         ``_tool_executor`` — the bridge into Omnigent's tool dispatch.
         """
-        from cursor_sdk import CustomTool  # lazy: optional dependency
+        # cursor-sdk is an optional dependency imported only by this harness.
+        from cursor_sdk import CustomTool  # type: ignore[import-not-found]
 
-        custom: dict[str, Any] = {}  # type: ignore[explicit-any]
+        custom: dict[str, object] = {}
         for spec in tools:
             name = spec.get("name")
             if not isinstance(name, str) or not name:
@@ -662,7 +755,7 @@ class CursorExecutor(Executor):
 
     def _make_execute(
         self, tool_name: str, loop: asyncio.AbstractEventLoop
-    ) -> Callable[[dict[str, Any], Any], Any]:  # type: ignore[explicit-any]
+    ) -> Callable[[_JsonObject, object], object]:
         """Build a sync ``execute`` that bridges a cursor tool call to Omnigent.
 
         Runs on the SDK callback server's daemon thread and blocks it on the
@@ -674,12 +767,15 @@ class CursorExecutor(Executor):
         than propagating raw onto the daemon thread.
         """
 
-        def execute(args: dict[str, Any], _ctx: Any) -> Any:  # type: ignore[explicit-any]
+        async def await_result(result: Awaitable[object]) -> object:
+            return await result
+
+        def execute(args: _JsonObject, _ctx: object) -> object:
             if self._tool_executor is None:
                 return _tool_error_payload(
                     f"Tool {tool_name!r} is unavailable: no tool executor wired."
                 )
-            coro = self._tool_executor(tool_name, dict(args or {}))
+            coro = await_result(self._tool_executor(tool_name, dict(args or {})))
             future = asyncio.run_coroutine_threadsafe(coro, loop)
             try:
                 result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
@@ -753,7 +849,8 @@ class CursorExecutor(Executor):
         async with _bridge_spawn_in_cwd(cwd):
             client = await AsyncClient.launch_bridge(workspace=cwd)
         try:
-            local_kwargs: dict[str, Any] = {
+            model = await _resolve_model_against_catalog(client, model, self._api_key)
+            local_kwargs: _JsonObject = {
                 "cwd": cwd,
                 "custom_tools": self._make_custom_tools(tools, loop) or None,
                 # Bypass cursor's own TUI approval prompts so native tool calls
@@ -779,6 +876,7 @@ class CursorExecutor(Executor):
             raise
         state.client = client
         state.agent = agent
+        state.model = model
 
     async def run_turn(
         self,
@@ -788,32 +886,39 @@ class CursorExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         session_key = self._session_key(messages)
-        model = _resolve_model((config.model if config else None) or self._model_override)
+        requested_model = _resolve_model(
+            (config.model if config else None) or self._model_override
+        )
+        model = requested_model
         tools_fp = _tools_fingerprint(tools)
         state = self._session_states.setdefault(session_key, _CursorSessionState())
 
-        # System prompt, model, and tool set are all fixed at agent creation, so
-        # a change to any of them means a fresh agent (otherwise a changed tool
-        # set would leave the initial custom_tools stale for the conversation).
-        if state.agent is not None and (
-            state.system_prompt != system_prompt
-            or state.model != model
-            or state.tools_fingerprint != tools_fp
-        ):
-            await self._close_state(state)
-            state = _CursorSessionState()
-            self._session_states[session_key] = state
-        is_first_turn = not state.has_sent_prompt
-        state.system_prompt = system_prompt
-        state.model = model
-        state.tools_fingerprint = tools_fp
-
         try:
+            if state.agent is not None and model not in (state.requested_model, state.model):
+                model = await _resolve_model_against_catalog(state.client, model, self._api_key)
+            if state.agent is not None and (
+                state.system_prompt != system_prompt
+                or model not in (state.requested_model, state.model)
+                or state.tools_fingerprint != tools_fp
+            ):
+                await self._close_state(state)
+                state = _CursorSessionState()
+                self._session_states[session_key] = state
+            is_first_turn = not state.has_sent_prompt
+            state.system_prompt = system_prompt
+            state.tools_fingerprint = tools_fp
             await self._ensure_session(state, model, tools)
+            state.requested_model = requested_model
+        except UnresolvableCursorModelError as exc:
+            await self.close_session(session_key)
+            yield ExecutorError(message=str(exc))
+            return
         except Exception as exc:  # noqa: BLE001 — surfaced as ExecutorError (CancelledError propagates)
             await self.close_session(session_key)
             yield ExecutorError(message=f"Failed to start cursor-sdk agent: {exc}")
             return
+
+        model = state.model or model
 
         prompt = _build_cursor_prompt(
             messages, is_first_turn=is_first_turn, system_prompt=system_prompt
@@ -850,21 +955,23 @@ class CursorExecutor(Executor):
         # Streamed deltas of a single response (no tool between) still
         # concatenate seamlessly, so this never splits one sentence.
         separate_next_text = False
-        turn_usage: dict[str, Any] | None = None
+        turn_usage: _JsonObject | None = None
         try:
             # Pass SendOptions with on_delta so the backend sends
             # interaction updates (including TurnEndedUpdate with usage).
             # Without enableDeltas the backend omits them entirely.
             from cursor_sdk import SendOptions as _SendOptions  # lazy: optional dep
 
-            def _capture_delta(update: Any) -> None:  # type: ignore[explicit-any]
+            def _capture_delta(update: object) -> None:
                 nonlocal turn_usage
                 if getattr(update, "type", None) == "turn-ended":
                     raw = getattr(update, "usage", None)
                     if isinstance(raw, dict) and raw:
                         turn_usage = _normalize_cursor_usage(raw, model)
 
-            run = await state.agent.send(prompt, options=_SendOptions(on_delta=_capture_delta))
+            agent = state.agent
+            assert agent is not None
+            run = await agent.send(prompt, options=_SendOptions(on_delta=_capture_delta))
             async for stream_event in run.events():
                 if stream_event.sdk_message is not None:
                     for event in _sdk_message_to_events(stream_event.sdk_message):
@@ -1019,7 +1126,7 @@ class CursorExecutor(Executor):
             await self.close_session(key)
 
 
-async def _safe_close(obj: Any) -> None:  # type: ignore[explicit-any]
+async def _safe_close(obj: object) -> None:
     """Best-effort async close of a ``cursor_sdk`` object, preferring ``aclose()``.
 
     The SDK's :class:`cursor_sdk.AsyncClient` exposes only ``aclose()`` — and

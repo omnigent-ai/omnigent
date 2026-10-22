@@ -34,6 +34,7 @@ p1a2b3c4d5e6.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 import sqlalchemy as sa
 from alembic import op
@@ -57,7 +58,7 @@ def upgrade() -> None:
     not-yet-renamed column). So drop the dependent object first, rename in its
     own batch, then create the renamed object.
     """
-    recreate = "always" if _is_sqlite() else "auto"
+    recreate: Literal["always", "auto"] = "always" if _is_sqlite() else "auto"
 
     # hosts.owner → user_id, VARCHAR(256) → VARCHAR(128). The unique constraint
     # sits on the renamed column, and SQLite can only drop a constraint via a
@@ -95,7 +96,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Restore owner / owner_user_id column names (and hosts width to 256)."""
-    recreate = "always" if _is_sqlite() else "auto"
+    recreate: Literal["always", "auto"] = "always" if _is_sqlite() else "auto"
 
     op.drop_index("ix_scheduled_tasks_user_id", table_name="scheduled_tasks")
     with op.batch_alter_table("scheduled_tasks", recreate=recreate) as batch_op:

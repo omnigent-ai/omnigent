@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'self'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>About Omnigent</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --background: #ffffff;
+        --surface: #ffffff;
+        --surface-muted: #f6f6f7;
+        --text: #171719;
+        --muted: #6f7077;
+        --border: #dedee3;
+        --button: #171719;
+        --button-text: #ffffff;
+        --button-hover: #303034;
+        --focus: #1376d1;
+        --success: #1f9d67;
+        --danger: #c43b3b;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --background: #151515;
+          --surface: #1c1c1e;
+          --surface-muted: #252527;
+          --text: #f4f4f5;
+          --muted: #a1a1a7;
+          --border: #38383d;
+          --button: #f4f4f5;
+          --button-text: #171719;
+          --button-hover: #d9d9dd;
+          --focus: #62a9e8;
+          --success: #46c78d;
+          --danger: #ff7777;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      [hidden] {
+        display: none !important;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: var(--background);
+        color: var(--text);
+      }
+
+      body {
+        display: flex;
+        align-items: stretch;
+      }
+
+      main {
+        display: grid;
+        grid-template-columns: 220px minmax(0, 1fr);
+        width: 100%;
+        min-height: 100%;
+      }
+
+      .brand {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 32px 24px;
+        background: var(--surface-muted);
+        border-right: 1px solid var(--border);
+        text-align: center;
+      }
+
+      .brand img {
+        width: 132px;
+        height: 132px;
+        border-radius: 28px;
+        box-shadow: 0 10px 30px rgb(0 0 0 / 18%);
+      }
+
+      h1 {
+        margin: 20px 0 0;
+        font-size: 22px;
+        line-height: 1.2;
+        letter-spacing: -0.02em;
+      }
+
+      .product-kind {
+        margin-top: 5px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .content {
+        display: flex;
+        min-width: 0;
+        flex-direction: column;
+        justify-content: center;
+        padding: 28px 32px;
+      }
+
+      .component {
+        padding: 23px 0;
+      }
+
+      .component + .component {
+        border-top: 1px solid var(--border);
+      }
+
+      .component-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      h2 {
+        margin: 0;
+        font-size: 17px;
+        line-height: 1.3;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .badge::before {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: var(--success);
+        content: "";
+      }
+
+      .badge[data-installed="false"]::before {
+        background: var(--muted);
+        opacity: 0.6;
+      }
+
+      dl {
+        display: grid;
+        grid-template-columns: 72px minmax(0, 1fr);
+        gap: 8px 14px;
+        margin: 16px 0 0;
+        font-size: 13px;
+        line-height: 1.4;
+      }
+
+      dt {
+        color: var(--muted);
+      }
+
+      dd {
+        min-width: 0;
+        margin: 0;
+        font-weight: 550;
+      }
+
+      code {
+        display: block;
+        overflow: hidden;
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font-size: 11px;
+        font-weight: 400;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .actions {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-height: 32px;
+        margin-top: 18px;
+      }
+
+      .cli-update {
+        margin: 18px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .cli-update code {
+        display: inline;
+        padding: 2px 5px;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: var(--surface-muted);
+        color: var(--text);
+        font-size: 11px;
+      }
+
+      .progress {
+        margin-top: 12px;
+      }
+
+      .progress-label {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 7px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .progress-track {
+        width: 100%;
+        height: 6px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: var(--surface-muted);
+      }
+
+      .progress-bar {
+        width: 100%;
+        height: 100%;
+        border-radius: inherit;
+        background: var(--button);
+        transform: scaleX(0);
+        transform-origin: left;
+        transition: transform 180ms ease;
+      }
+
+      .footer {
+        display: flex;
+        justify-content: flex-end;
+        padding-top: 18px;
+        border-top: 1px solid var(--border);
+      }
+
+      button {
+        min-height: 32px;
+        padding: 6px 13px;
+        border: 0;
+        border-radius: 7px;
+        background: var(--button);
+        color: var(--button-text);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition:
+          background 120ms ease,
+          opacity 120ms ease;
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--button-hover);
+      }
+
+      button:focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 2px;
+      }
+
+      button:disabled {
+        cursor: default;
+        opacity: 0.45;
+      }
+
+      .result {
+        min-width: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.35;
+      }
+
+      .result[data-state="available"] {
+        color: var(--success);
+      }
+
+      .result[data-state="error"] {
+        color: var(--danger);
+      }
+
+      @media (max-width: 660px) {
+        html,
+        body {
+          overflow: auto;
+        }
+
+        main {
+          grid-template-columns: 1fr;
+        }
+
+        .brand {
+          flex-direction: row;
+          justify-content: flex-start;
+          gap: 18px;
+          padding: 22px 28px;
+          border-right: 0;
+          border-bottom: 1px solid var(--border);
+          text-align: left;
+        }
+
+        .brand img {
+          width: 72px;
+          height: 72px;
+          border-radius: 17px;
+        }
+
+        h1 {
+          margin-top: 0;
+        }
+
+        .content {
+          justify-content: flex-start;
+          padding: 8px 28px 24px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <aside class="brand">
+        <img id="app-icon" src="../icons/icon.png" alt="" />
+        <div>
+          <h1>Omnigent</h1>
+          <div id="product-kind" class="product-kind">Desktop</div>
+        </div>
+      </aside>
+
+      <div class="content">
+        <section class="component" aria-labelledby="desktop-heading">
+          <div class="component-header">
+            <h2 id="desktop-heading">Omnigent Desktop app</h2>
+          </div>
+          <dl>
+            <dt>Version</dt>
+            <dd id="desktop-version">Loading…</dd>
+          </dl>
+          <div id="desktop-actions" class="actions">
+            <button id="desktop-check" type="button">Check for updates</button>
+            <button id="desktop-update-now" type="button" hidden>Update now</button>
+            <button id="desktop-restart" type="button" hidden>Restart to update</button>
+            <span id="desktop-result" class="result" role="status" aria-live="polite"></span>
+          </div>
+          <div
+            id="desktop-progress"
+            class="progress"
+            role="progressbar"
+            aria-label="Update download progress"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+            hidden
+          >
+            <div class="progress-label">
+              <span>Downloading update…</span>
+              <span id="desktop-progress-percent">0%</span>
+            </div>
+            <div class="progress-track">
+              <div id="desktop-progress-bar" class="progress-bar"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="component" aria-labelledby="cli-heading">
+          <div class="component-header">
+            <h2 id="cli-heading">Omnigent CLI</h2>
+            <span id="cli-badge" class="badge" data-installed="false">Detecting…</span>
+          </div>
+          <dl>
+            <dt>Version</dt>
+            <dd id="cli-version">Loading…</dd>
+            <dt>Path</dt>
+            <dd><code id="cli-path">Loading…</code></dd>
+          </dl>
+          <p class="cli-update">Run <code>omni update</code> to update.</p>
+        </section>
+
+        <footer class="footer">
+          <button id="close" type="button" autofocus>Close</button>
+        </footer>
+      </div>
+    </main>
+
+    <script src="./index.js"></script>
+  </body>
+</html>

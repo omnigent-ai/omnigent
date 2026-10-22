@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RunnerStartingIndicator } from "./ChatPage";
+import { RunnerStartingIndicator } from "./ChatIndicators";
 import { useChatStore } from "@/store/chatStore";
 import {
   TerminalFirstContextProvider,
@@ -51,31 +51,14 @@ afterEach(() => {
 });
 
 describe("RunnerStartingIndicator", () => {
-  it("hero: shows a spinner + Starting up… copy while a terminal-first session is spinning up", () => {
-    renderWithContext("hero", makeCtx({ terminalStartingUp: true }));
-    const indicator = screen.getByTestId("runner-starting-indicator");
-    expect(indicator).toBeInTheDocument();
-    // The exact copy is the user-facing contract — assert the value, not just
-    // that *something* rendered (a null/empty state would also pass length>=1).
-    expect(indicator).toHaveTextContent(/starting up/i);
-    // The animated spinner is what makes "work is happening" obvious.
-    expect(indicator.querySelector(".animate-spin")).not.toBeNull();
-    // Announced to assistive tech as a transient status, not a static region.
-    expect(indicator).toHaveAttribute("role", "status");
-    expect(indicator).toHaveAttribute("aria-live", "polite");
-  });
-
-  it("row: shows the in-thread spinner + Starting up… copy while spinning up", () => {
-    // The create-then-send path renders the user bubble immediately, so the
-    // cue has to sit *in* the thread beneath it rather than as an empty state.
-    renderWithContext("row", makeCtx({ terminalStartingUp: true }));
-    const indicator = screen.getByTestId("runner-starting-indicator");
-    expect(indicator).toBeInTheDocument();
-    expect(indicator).toHaveTextContent(/starting up/i);
-    expect(indicator.querySelector(".animate-spin")).not.toBeNull();
-    expect(indicator).toHaveAttribute("role", "status");
-    expect(indicator).toHaveAttribute("aria-live", "polite");
-  });
+  it.each(["hero", "row"] as const)(
+    "%s: renders nothing for ordinary terminal startup",
+    (variant) => {
+      const { container } = renderWithContext(variant, makeCtx({ terminalStartingUp: true }));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+      expect(container).toBeEmptyDOMElement();
+    },
+  );
 
   it.each(["hero", "row"] as const)(
     "%s: renders nothing once the terminal is available (spin-up finished)",
@@ -135,10 +118,7 @@ describe("RunnerStartingIndicator", () => {
     },
   );
 
-  it("row: sandbox stage label wins over the terminal Starting up… copy", () => {
-    // Both launch shapes active at once (terminal-first session in a
-    // sandbox): the stage is strictly more specific, so it must show
-    // INSTEAD of the generic terminal copy — not alongside it.
+  it("row: sandbox stage still renders during terminal startup", () => {
     useChatStore.setState({ sandboxStatus: { stage: "cloning", error: null } });
     renderWithContext("row", makeCtx({ terminalStartingUp: true }));
     const indicator = screen.getByTestId("runner-starting-indicator");

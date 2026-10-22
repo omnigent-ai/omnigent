@@ -15,8 +15,9 @@ import base64
 import os
 import re
 import stat
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec, cast
 
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
@@ -26,16 +27,41 @@ from omnigent.entities.environment_filesystem import (
     FilesystemEntry,
     FilesystemPathNotFound,
     InvalidPath,
+    PathUnreachable,
+    PermissionDenied,
+    ResourceError,
     TextEditRequest,
     WriteFileResult,
 )
 from omnigent.entities.pagination import PagedList
-from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
+from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
+from omnigent.inner.async_utils import run_sync_on_thread
+from omnigent.inner.os_env import (
+    _edit_impl,
+    _read_impl,
+    _write_impl,
+)
+from omnigent.inner.sandbox import (
+    ReachableRoot,
+    contained_realpath,
+    containment_prefix,
+    is_unconfined,
+    reachable_roots,
+)
 
 if TYPE_CHECKING:
-    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.os_env import OpResult, OSEnvironment
+    from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Cap on entries a single search may examine. Distinct from the result
+# cap: a query matching little or nothing never fills the results, so
+# without this a search from a large directory would walk it entirely.
+# Deterministic (count, not wall clock) so the same tree always yields
+# the same answer, and sized to match the sandbox cwd scan budget.
+_SEARCH_SCAN_BUDGET = 50000
+_Params = ParamSpec("_Params")
+_DELETED_ENTRY_TYPES = ("file", "directory", "symlink", "other")
 
 
 def _shell_quote(s: str) -> str:
@@ -45,6 +71,20 @@ def _shell_quote(s: str) -> str:
     :returns: Single-quoted shell-safe string.
     """
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _python_script_command(script: str) -> str:
+    """Shell command that runs a stdlib-only *script* with ``python3``.
+
+    The helper runs it with the workspace as cwd. Isolated mode (``-I``) keeps
+    that directory off ``sys.path`` and ignores ``PYTHON*`` variables, so
+    workspace files never stand in for the modules the script imports. ``-P``
+    would need Python 3.11, which the environment's ``python3`` may predate.
+
+    :param script: Python source that imports only the standard library.
+    :returns: Shell-quoted command for ``os_env.shell``.
+    """
+    return f"python3 -I -c {_shell_quote(script)}"
 
 
 def _glob_to_regex(pattern: str) -> str:
@@ -156,11 +196,233 @@ def split_glob_list(raw: str | None) -> list[str]:
     return [p.strip() for p in patterns if p.strip()]
 
 
+_BENEATH_SUPPORTED = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+
+
+def _lstat_beneath(root: Path, rel: str) -> os.stat_result | None:
+    """``lstat`` *root*/*rel* without letting any component be a symlink.
+
+    Every parent is opened with ``O_NOFOLLOW`` relative to the previous one,
+    so a directory swapped for a symlink cannot route the read outside
+    *root*, even between the check and the read. The leaf is never
+    followed. Platforms without ``dir_fd`` support fall back to a plain
+    ``lstat`` after checking the parent's resolved location.
+
+    :param root: Absolute directory the path is relative to.
+    :param rel: ``/``-separated path relative to *root*.
+    :returns: The leaf's own ``stat`` result, or ``None`` when any component
+        is missing, is a symlink, or cannot be opened.
+    """
+    parts = rel.split("/")
+    if not _BENEATH_SUPPORTED:
+        full = root / rel
+        real_root = os.path.realpath(root)
+        parent = os.path.realpath(full.parent)
+        if parent != real_root and not parent.startswith(real_root.rstrip(os.sep) + os.sep):
+            return None
+        try:
+            return full.lstat()
+        except OSError:
+            return None
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    try:
+        for name in parts[:-1]:
+            nfd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def search_indexed_paths(
+    root: Path,
+    paths: Iterable[str],
+    query: str,
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    limit: int = 500,
+) -> list[FilesystemEntry]:
+    """Match already-enumerated *paths* the way the directory walk would.
+
+    Applies the same filters as :meth:`CallerProcessFilesystem.search_files`
+    — case-insensitive substring on the path, include/exclude globs — and
+    reports a matching path's ancestor directories as directory entries, so
+    a query like ``"src"`` still surfaces the ``src`` folder. Only the
+    entries returned are stat'ed, and never through a symlink: parents are
+    opened without following links and the leaf is ``lstat``-ed, so nothing
+    outside *root* is ever described, even if a link is swapped mid-search.
+    A leaf that is itself a symlink is left out — the sandboxed walk, which
+    can follow links safely, describes those — and so is a path that no
+    longer exists (indexed but deleted from the working tree).
+
+    :param root: Absolute directory the paths are relative to.
+    :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
+    :param query: Case-insensitive substring; whitespace-only matches nothing.
+    :param include: Pre-split include globs (see :func:`_glob_to_regex`).
+    :param exclude: Pre-split exclude globs; an excluded directory takes its
+        whole subtree with it, as the walk's pruning does.
+    :param limit: Maximum number of entries to return.
+    :returns: Matching entries sorted by path.
+    """
+    q = query.strip().lower()
+    if not q:
+        return []
+    inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
+    exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
+
+    def kept(rel: str) -> bool:
+        parts = rel.split("/")
+        ancestors = ("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+        if any(r.match(a) for a in ancestors for r in exc):
+            return False
+        return not inc or any(r.match(rel) for r in inc)
+
+    # A directory whose path contains q is a prefix of every file under it,
+    # so only files that match can contribute matching directories.
+    candidates: dict[str, bool] = {}  # path -> is a directory
+    seen_dirs: set[str] = set()
+    for p in paths:
+        if q not in p.lower():
+            continue
+        candidates.setdefault(p, False)
+        cut = p.rfind("/")
+        while cut != -1:
+            ancestor = p[:cut]
+            if ancestor in seen_dirs:
+                break
+            seen_dirs.add(ancestor)
+            if q in ancestor.lower():
+                candidates[ancestor] = True
+            cut = p.rfind("/", 0, cut)
+
+    # Metadata is read outside the sandbox, so nothing here follows a symlink.
+    entries: list[FilesystemEntry] = []
+    for rel in sorted(candidates):
+        if not kept(rel):
+            continue
+        st = _lstat_beneath(root, rel)
+        if st is None or stat.S_ISLNK(st.st_mode):
+            continue
+        # A submodule is one index entry but a directory on disk.
+        is_dir = candidates[rel] or stat.S_ISDIR(st.st_mode)
+        entries.append(
+            FilesystemEntry(
+                id=rel,
+                name=rel.rsplit("/", 1)[-1],
+                path=rel,
+                type="directory" if is_dir else "file",
+                bytes=None if is_dir else st.st_size,
+                modified_at=int(st.st_mtime),
+            )
+        )
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def merge_entries(
+    primary: Sequence[FilesystemEntry], secondary: Sequence[FilesystemEntry], limit: int
+) -> list[FilesystemEntry]:
+    """Union two result sets by path, sorted by path and capped at *limit*.
+
+    :param primary: Entries that win on a duplicate path, e.g. index matches.
+    :param secondary: Entries filling in the rest, e.g. from a walk.
+    :param limit: Maximum number of entries to return.
+    :returns: Deduplicated entries sorted by path.
+    """
+    by_path = {e.path: e for e in secondary}
+    by_path.update((e.path, e) for e in primary)
+    return sorted(by_path.values(), key=lambda e: e.path)[:limit]
+
+
+def paths_under(paths: Iterable[str], subdir: str) -> list[str]:
+    """Narrow workspace-relative *paths* to those below *subdir*, re-rooted there.
+
+    :param paths: Paths relative to the workspace root.
+    :param subdir: Directory relative to the workspace root; ``""`` keeps all.
+    :returns: The paths under *subdir*, relative to it.
+    """
+    if not subdir:
+        return list(paths)
+    prefix = subdir.rstrip("/") + "/"
+    return [p[len(prefix) :] for p in paths if p.startswith(prefix)]
+
+
+def index_search(
+    registry: FilesystemRegistry,
+    root: Path,
+    subdir: str,
+    query: str,
+    *,
+    include: Sequence[str] = (),
+    exclude: Sequence[str] = (),
+    limit: int = 500,
+) -> list[FilesystemEntry] | None:
+    """Match the workspace's index plus its latest change snapshot, if any.
+
+    Covers every tracked file in one index read, however large the repo, and
+    the untracked files the Changed tab's most recent ``git status`` listed.
+    Ignored files are in neither, so callers still union in a walk.
+
+    :param registry: The workspace's change registry.
+    :param root: Absolute directory the results are relative to.
+    :param subdir: Directory relative to the workspace root being searched;
+        ``""`` for the whole workspace.
+    :param query: Case-insensitive substring.
+    :param include: Pre-split include globs.
+    :param exclude: Pre-split exclude globs.
+    :param limit: Maximum number of entries to return.
+    :returns: Matching entries, or ``None`` when the workspace has no index.
+    """
+    tracked = registry.list_tracked_files(subdir)
+    if tracked is None:
+        return None
+    snapshot = registry.last_changed_files()
+    if snapshot is not None:
+        # Snapshot paths come from pathlib and carry native separators;
+        # everything here (and git's index output) speaks '/'.
+        if os.sep != "/":
+            snapshot = [p.replace(os.sep, "/") for p in snapshot]
+        tracked += paths_under(snapshot, subdir.replace(os.sep, "/"))
+    return search_indexed_paths(
+        root, tracked, query, include=include, exclude=exclude, limit=limit
+    )
+
+
+def entry_payload(entry: FilesystemEntry) -> dict[str, object]:
+    """Serialize *entry* in the shape the filesystem endpoints return.
+
+    :param entry: Entry to serialize.
+    :returns: JSON-ready dict.
+    """
+    return {
+        "id": entry.id,
+        "object": "session.environment.filesystem.entry",
+        "name": entry.name,
+        "path": entry.path,
+        "type": entry.type,
+        "bytes": entry.bytes,
+        "modified_at": entry.modified_at,
+    }
+
+
 async def _run_os_env_async(
-    method: Any,
-    *args: Any,
-    **kwargs: Any,
-) -> dict[str, Any]:
+    method: Callable[_Params, Awaitable[OpResult]],
+    *args: _Params.args,
+    **kwargs: _Params.kwargs,
+) -> OpResult:
     """Call an OSEnvironment async method.
 
     The OSEnvironment protocol uses ``OpResult = dict[str, Any]``
@@ -173,7 +435,30 @@ async def _run_os_env_async(
     :param kwargs: Keyword arguments.
     :returns: The OpResult dict.
     """
-    return await method(*args, **kwargs)  # type: ignore[no-any-return]
+    return await method(*args, **kwargs)
+
+
+async def _run_impl_direct(
+    fn: Callable[..., OpResult],  # type: ignore[explicit-any]
+    *args: object,
+) -> OpResult:
+    """Run an ``os_env`` implementation in-process, in the helper's shape.
+
+    Used for paths admitted only because the environment is unconfined, where
+    there is no sandbox to route around. The helper subprocess reports
+    failures as ``{"error": ...}``; calling the implementation directly would
+    instead raise, turning an ordinary permission denial (writing under
+    ``/etc`` as a non-root user) into a 500. Mapping it here keeps both
+    routes indistinguishable to callers.
+
+    :param fn: The implementation to run.
+    :param args: Positional arguments for it.
+    :returns: The result dict, or ``{"error": ...}`` on an OS-level failure.
+    """
+    try:
+        return await run_sync_on_thread(fn, *args)
+    except OSError as exc:
+        return {"error": str(exc)}
 
 
 def _validate_path(relative_path: str) -> str:
@@ -195,6 +480,83 @@ def _validate_path(relative_path: str) -> str:
     if normalized == ".":
         return ""
     return normalized
+
+
+def is_absolute_request(path: str) -> bool:
+    """Whether a client-supplied path names an absolute location.
+
+    The filesystem routes accept either a workspace-relative path (the
+    historical contract) or an absolute one. A path is absolute exactly
+    when it starts with ``/`` — the same rule the filesystem itself uses.
+    ``~`` is deliberately NOT expanded here: the environment metadata
+    already reports ``home``, so the caller expands it and sends a real
+    path rather than relying on whose home the runner would guess.
+
+    :param path: Client-supplied path string, e.g. ``"src/app.py"`` or
+        ``"/etc/hosts"``.
+    :returns: ``True`` for absolute paths.
+    """
+    return path.startswith("/")
+
+
+def resolve_browse_target(
+    absolute_path: str,
+    roots: Sequence[ReachableRoot],
+    *,
+    unconfined: bool,
+    need_write: bool = False,
+) -> Path:
+    """Resolve an absolute browse target and authorize it.
+
+    Authorization has two tiers, mirroring what the environment can
+    actually do:
+
+    - A path inside one of *roots* is reachable by the environment's own
+      file tools, so browsing it is exactly as permitted as the agent
+      reading it.
+    - When *unconfined* (``sandbox.type: none``), no OS-level sandbox is
+      applied and the environment's shell already reads *and writes*
+      anything the runner can, so neither browsing nor editing there grants
+      reach that was being withheld. The caller has additionally cleared the
+      same permission level that grants shell access. Confined environments
+      get no such widening — their grants are the whole story, and a read
+      grant still never admits a write.
+
+    :param absolute_path: Absolute path supplied by the caller.
+    :param roots: Grants from :func:`omnigent.inner.sandbox.reachable_roots`.
+    :param unconfined: Result of :func:`omnigent.inner.sandbox.is_unconfined`.
+    :param need_write: ``True`` for mutating operations, which read grants
+        do not admit.
+    :returns: The resolved absolute path.
+    :raises InvalidPath: On a malformed path.
+    :raises PathUnreachable: When no grant covers it and the environment
+        is confined.
+    """
+    if "\x00" in absolute_path:
+        raise InvalidPath("Path contains NUL bytes")
+    # An unconfined environment's reach IS the filesystem root — stating it as
+    # a root keeps every return below a containment check, rather than having
+    # one branch hand back an unchecked path.
+    allowed = (
+        [*roots, ReachableRoot(path=Path("/"), access="write", origin="unconfined", kind="tree")]
+        if unconfined
+        else roots
+    )
+    for root in allowed:
+        if need_write and root.access != "write":
+            continue
+        # Resolution happens inside the check, so a ".." segment or symlink
+        # cannot aim the final path out of the grant that admitted it.
+        contained = contained_realpath(absolute_path, root.prefix)
+        if contained is None:
+            continue
+        # A file grant covers exactly one path, not a subtree beneath it.
+        if root.kind == "tree" or contained == str(root.path):
+            return Path(contained)
+    raise PathUnreachable(
+        f"Path {absolute_path!r} is outside this session's reach",
+        [str(root.path) for root in roots],
+    )
 
 
 def _entry_from_stat(
@@ -220,7 +582,7 @@ def _entry_from_stat(
         )
 
     if stat.S_ISDIR(st.st_mode):
-        entry_type = "directory"
+        entry_type: Literal["file", "directory", "symlink", "other"] = "directory"
         size = None
     elif stat.S_ISLNK(st.st_mode):
         entry_type = "symlink"
@@ -252,28 +614,167 @@ class CallerProcessFilesystem:
     path validation (traversal checks), not for direct I/O.
 
     :param os_env: The backing OSEnvironment instance.
+    :param follow_outward_links: Admit a relative path whose real target
+        lies outside the root when the environment's reach covers it,
+        exactly as an absolute browse of that target would. Off by
+        default: the server enables it only for a caller who may browse
+        the target by absolute path, since this process cannot see who
+        is asking.
     """
 
-    def __init__(self, os_env: OSEnvironment) -> None:
+    def __init__(self, os_env: OSEnvironment, *, follow_outward_links: bool = False) -> None:
         self._os_env = os_env
+        self._follow_outward_links = follow_outward_links
         self._root = Path(os_env.cwd).resolve()
+        self._root_prefix = containment_prefix(self._root)
+        policy = getattr(os_env, "sandbox", None)
+        if policy is None:
+            # Backends that carry no resolved policy keep the historical
+            # cwd-only confinement rather than inheriting a wider default.
+            self._roots: list[ReachableRoot] = [
+                ReachableRoot(path=self._root, access="write", origin="cwd", kind="tree")
+            ]
+            self._unconfined = False
+        else:
+            self._roots = reachable_roots(self._root, policy)
+            self._unconfined = is_unconfined(policy)
 
-    def _resolve(self, path: str) -> Path:
-        """Resolve a relative path to an absolute path under root.
+    @property
+    def reach(self) -> tuple[list[ReachableRoot], bool]:
+        """The grants this environment can reach, and whether it is unconfined.
 
-        :param path: Relative path within the environment.
-        :returns: Resolved absolute path.
-        :raises InvalidPath: If path escapes the root.
+        :returns: ``(roots, unconfined)`` for advertising reach to callers.
         """
+        return self._roots, self._unconfined
+
+    def _resolve(self, path: str, *, need_write: bool = False) -> Path:
+        """Resolve a client-supplied path to an absolute path.
+
+        Relative paths keep the historical contract: normalized, traversal
+        rejected, and confined under the environment root. Absolute paths
+        take the browse-authorization route instead, and so does the target
+        of a symlink leading out of the root when outward links are admitted.
+
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem.
+        :param need_write: ``True`` for mutating operations.
+        :returns: Resolved absolute path.
+        :raises InvalidPath: If a relative path escapes the root and outward
+            links are not admitted.
+        :raises PathUnreachable: If an absolute path, or an admitted outward
+            link's target, is out of reach.
+        """
+        if self._absolute(path):
+            return resolve_browse_target(
+                path, self._roots, unconfined=self._unconfined, need_write=need_write
+            )
         validated = _validate_path(path)
         if not validated:
             return self._root
-        full = (self._root / validated).resolve()
+        # `_validate_path` rejects absolute paths and "..", but that is a check
+        # on the string; this re-checks the RESOLVED path, which is what stops
+        # an in-workspace symlink pointing outward.
+        full = os.path.join(str(self._root), validated)
+        contained = contained_realpath(full, self._root_prefix)
+        if contained is not None:
+            return Path(contained)
+        if not self._follow_outward_links:
+            raise InvalidPath(f"Path {path!r} escapes the environment root")
+        # The link's target is authorized like the absolute path it is, so a
+        # confined environment still needs a grant covering it.
+        return resolve_browse_target(
+            os.path.realpath(full), self._roots, unconfined=self._unconfined, need_write=need_write
+        )
+
+    def _absolute(self, path: str) -> bool:
+        """Whether this request should be handled as an absolute path.
+
+        Absolute paths take the browse-authorization route, which admits
+        them only when a declared grant covers them or the environment is
+        unconfined. WHO may ask is the server's decision, not this
+        process's: it gates absolute paths on session ownership before
+        proxying (see ``_browse_level`` in the resources routes). The
+        runner cannot see the caller's identity, so it does not try to.
+
+        :param path: Client-supplied path.
+        :returns: ``True`` to take the absolute-path route.
+        """
+        return is_absolute_request(path)
+
+    def _within_grants(self, resolved: Path, *, need_write: bool = False) -> bool:
+        """Whether a grant covers this path *for the access being requested*.
+
+        Grants are what the environment's own file tools can reach, so a
+        path a grant covers can be served through the helper. A path no
+        grant covers was admitted only because the environment is
+        unconfined, and must not be routed through the helper's guard.
+
+        *need_write* matters because the two are not the same set: a write
+        landing inside a READ grant is not something the helper will do, so
+        routing it there would deny a write that an unconfined environment
+        is otherwise allowed to make (its shell can already do it).
+
+        :param resolved: Fully-resolved absolute path.
+        :param need_write: ``True`` when the caller intends to mutate.
+        :returns: ``True`` when a grant admits that access.
+        """
+        return any(
+            root.contains(resolved)
+            for root in self._roots
+            if not need_write or root.access == "write"
+        )
+
+    def _entry_path(self, full: Path) -> str:
+        """Path to report on a returned entry.
+
+        Relative to the environment root for anything inside it (the
+        historical shape), absolute otherwise — a path outside the root has
+        no meaningful relative form, and ``relative_to`` would raise.
+
+        :param full: Resolved absolute path.
+        :returns: The entry's reported path.
+        """
         try:
-            full.relative_to(self._root)
-        except ValueError as exc:
-            raise InvalidPath(f"Path {path!r} escapes the environment root") from exc
-        return full
+            return str(full.relative_to(self._root))
+        except ValueError:
+            return str(full)
+
+    def _write_route(self, path: str) -> tuple[str, Path | None]:
+        """Resolve a mutating op's target and decide how to reach it.
+
+        :param path: Client-supplied path.
+        :returns: ``(target, direct)``. ``target`` is the string to hand the
+            sandboxed helper; ``direct`` is set instead when the path was
+            admitted only because the environment is unconfined, in which
+            case there is no sandbox to route around and the op runs
+            in-process against that resolved path.
+        :raises InvalidPath: On a malformed relative path.
+        :raises PathUnreachable: When no grant covers an absolute path and
+            the environment is confined.
+        """
+        if not self._absolute(path):
+            return _validate_path(path), None
+        resolved = self._resolve(path, need_write=True)
+        if self._within_grants(resolved, need_write=True):
+            return str(resolved), None
+        return str(resolved), resolved
+
+    def _target(self, path: str) -> tuple[str, str]:
+        """Path to hand the helper, plus the prefix for returned entry paths.
+
+        For a relative request the helper is given the validated relative
+        path (it runs with cwd at the environment root) and entries are
+        reported under that same prefix, unchanged. For an absolute request
+        the helper is given the resolved absolute path and entries are
+        reported relative to it — the response envelope carries the base.
+
+        :param path: Client-supplied path.
+        :returns: ``(target, prefix)``.
+        """
+        if self._absolute(path):
+            return str(self._resolve(path)), ""
+        validated = _validate_path(path) if path else ""
+        return validated or ".", validated
 
     async def list_dir(
         self,
@@ -306,50 +807,79 @@ class CallerProcessFilesystem:
         """
         import json as _json
 
-        from omnigent.entities.pagination import paginate_in_memory
+        target, prefix = self._target(path)
 
-        validated = _validate_path(path) if path else ""
-        target = validated or "."
-
-        # Shell-quote the generated script; target is embedded via json.dumps.
-        # Per-entry try/except handles broken symlinks.
+        # Keep the helper's response below os_env.shell's 100,000-character
+        # stdout cap, even when names are unusually long or need JSON escaping.
         _script = "\n".join(
             [
                 "import os, json",
                 f"d = {_json.dumps(target)}",
+                f"prefix = {_json.dumps(prefix)}",
+                f"after = {after!r}",
+                f"before = {before!r}",
+                f"order = {_json.dumps(order)}",
+                f"limit = {limit}",
+                "names = sorted(os.listdir(d), reverse=order == 'desc')",
+                "def cursor_index(cursor):",
+                "    if cursor is None: return None",
+                "    if prefix:",
+                "        start = prefix + os.sep",
+                "        if not cursor.startswith(start): return None",
+                "        cursor = cursor[len(start):]",
+                "    try: return names.index(cursor)",
+                "    except ValueError: return None",
+                "after_index = cursor_index(after)",
+                "before_index = cursor_index(before)",
+                "start = after_index + 1 if after_index is not None else 0",
+                "end = before_index if before_index is not None else len(names)",
+                "positions = (range(end - 1, start - 1, -1) if before_index is not None",
+                "             else range(start, end))",
                 "es = []",
-                "for e in sorted(os.listdir(d)):",
+                "size = 0",
+                "has_more = False",
+                "for i in positions:",
+                "    e = names[i]",
                 "    p = os.path.join(d, e)",
                 "    try:",
                 "        st = os.stat(p)",
                 "        t = 'd' if os.path.isdir(p) else 'f'",
-                "        es.append({'n': e, 's': st.st_size if t == 'f' else None,",
-                "            'm': int(st.st_mtime), 't': t})",
+                "        item = {'n': e, 's': st.st_size if t == 'f' else None,",
+                "                'm': int(st.st_mtime), 't': t}",
                 "    except OSError:",
                 "        try:",
                 "            ls = os.lstat(p)",
-                "            es.append({'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'})",
+                "            item = {'n': e, 's': None, 'm': int(ls.st_mtime), 't': 'f'}",
                 "        except OSError:",
-                "            pass",
-                "print(json.dumps(es))",
+                "            continue",
+                "    item_size = len(json.dumps(item)) + 1",
+                "    if len(es) >= limit or size + item_size > 90000:",
+                "        has_more = True",
+                "        break",
+                "    es.append(item)",
+                "    size += item_size",
+                "if before_index is not None: es.reverse()",
+                "print(json.dumps({'es': es, 'has_more': has_more}))",
             ]
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
-        if "error" in result:
+        if "error" in result or result.get("exit_code") != 0:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
 
         entries: list[FilesystemEntry] = []
         try:
-            raw = _json.loads(result.get("stdout", "[]"))
-        except _json.JSONDecodeError:
-            raw = []
-        for item in raw:
+            raw = _json.loads(result["stdout"])
+            if not isinstance(raw["es"], list) or not isinstance(raw["has_more"], bool):
+                raise ValueError("Invalid directory listing")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid directory listing for {path!r}") from exc
+        for item in raw["es"]:
             name = item["n"]
-            rel = os.path.join(validated, name) if validated else name
-            entry_type = "directory" if item["t"] == "d" else "file"
+            rel = os.path.join(prefix, name) if prefix else name
+            entry_type: Literal["file", "directory"] = "directory" if item["t"] == "d" else "file"
             entries.append(
                 FilesystemEntry(
                     id=rel,
@@ -361,40 +891,43 @@ class CallerProcessFilesystem:
                 )
             )
 
-        return paginate_in_memory(
-            entries,
-            id_fn=lambda e: e.id,
-            limit=limit,
-            after=after,
-            before=before,
-            order=order,
+        return PagedList(
+            data=entries,
+            first_id=entries[0].id if entries else None,
+            last_id=entries[-1].id if entries else None,
+            has_more=raw["has_more"],
         )
 
     async def search_files(
         self,
         query: str,
         *,
+        path: str = "",
         include: list[str] | None = None,
         exclude: list[str] | None = None,
         limit: int = 500,
-    ) -> list[FilesystemEntry]:
-        """Search for files recursively by name/path substring and glob filters.
+    ) -> tuple[list[FilesystemEntry], bool]:
+        """Search recursively by name/path substring and glob filters.
 
-        Walks the full directory tree via ``os.walk()`` inside the sandbox and
-        returns files that satisfy all of the supplied filters:
+        Walks the full directory tree via ``os.walk()`` inside the sandbox
+        (never entering ``.git``) and returns entries — both files and
+        directories — that satisfy all of the supplied filters:
 
-        - ``exclude`` (highest priority): the file is dropped if its path
+        - ``exclude`` (highest priority): the entry is dropped if its path
           matches any exclude glob. Excluded subtrees are pruned from the
           walk where possible, so a pattern like ``"**/node_modules"`` avoids
           descending into those directories.
-        - ``include``: when non-empty, the file is kept only if its path
+        - ``include``: when non-empty, the entry is kept only if its path
           matches at least one include glob.
-        - ``query``: when non-empty, the file's name or relative path must
+        - ``query``: when non-empty, the entry's name or relative path must
           contain ``query`` (case-insensitive substring match).
 
+        Directory matches let the UI reveal a folder from a search, so a query
+        like ``"src"`` surfaces the ``src`` directory alongside files under it.
+
         Glob patterns use the VSCode/Cursor subset documented on
-        :func:`_glob_to_regex` and are matched case-insensitively. Only files
-        (not directories) are returned, capped at ``limit`` entries.
+        :func:`_glob_to_regex` and are matched case-insensitively. Files and
+        directories are both returned, capped at ``limit`` entries.
 
         A non-empty ``query`` is required: a whitespace-only query would match
         every file, so the method returns an empty list instead of walking the
@@ -420,7 +953,9 @@ class CallerProcessFilesystem:
         if not q:
             # A query is required; a whitespace-only query would match every
             # file, so return nothing instead of walking the whole tree.
-            return []
+            return [], False
+
+        start, _prefix = self._target(path)
 
         include_regexes = [_glob_to_regex(p) for p in (include or [])]
         exclude_regexes = [_glob_to_regex(p) for p in (exclude or [])]
@@ -428,47 +963,132 @@ class CallerProcessFilesystem:
         # All caller-derived values (q and the pre-translated regexes) are
         # embedded via json.dumps so they become valid Python literals and
         # cannot inject code; the whole script is shell-quoted below.
-        _script = "\n".join(
+        _header = "\n".join(
             [
                 "import os, json, re",
+                "from collections import deque",
                 f"q = {_json.dumps(q)}",
                 f"limit = {limit}",
+                f"start = {_json.dumps(start)}",
+                f"budget = {_SEARCH_SCAN_BUDGET}",
+                f"depri = set({_json.dumps(list(_DEFAULT_DEPRIORITIZED_DIRS))})",
                 f"inc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(include_regexes)}]",
                 f"exc = [re.compile(p, re.IGNORECASE) for p in {_json.dumps(exclude_regexes)}]",
-                "results = []",
-                "for dirpath, dirnames, filenames in os.walk('.'):",
-                "    # Prune excluded subtrees (e.g. node_modules) from the walk.",
-                "    kept = []",
-                "    for d in sorted(dirnames):",
-                "        dp = os.path.normpath(os.path.join(dirpath, d))",
-                "        if any(r.match(dp) for r in exc):",
-                "            continue",
-                "        kept.append(d)",
-                "    dirnames[:] = kept",
-                "    for fname in sorted(filenames):",
-                "        p = os.path.normpath(os.path.join(dirpath, fname))",
-                "        if exc and any(r.match(p) for r in exc):",
-                "            continue",
-                "        if inc and not any(r.match(p) for r in inc):",
-                "            continue",
-                "        if q not in fname.lower() and q not in p.lower():",
-                "            continue",
-                "        try:",
-                "            st = os.stat(p)",
-                "            results.append({'n': fname, 'p': p, 's': st.st_size,",
-                "                'm': int(st.st_mtime)})",
-                "        except OSError:",
-                "            results.append({'n': fname, 'p': p, 's': None, 'm': None})",
-                "        if len(results) >= limit:",
-                "            break",
-                "    if len(results) >= limit:",
-                "        break",
-                "print(json.dumps(results))",
             ]
         )
+        # Two-pass walk. Reordering depri siblings within one directory isn't
+        # enough: a deep ``node_modules`` nested under an earlier-sorted real
+        # dir (``ap-web/node_modules/...``) would swallow the whole scan budget
+        # before the walk ever reaches a later top-level dir like ``examples``.
+        # So pass 1 walks the real tree and DEFERS every depri subtree (records
+        # its root, does not descend); pass 2 drains those deferred roots only
+        # if budget remains. A query's own tree is scanned first, whole.
+        _body = r"""
+results = []
+deferred = deque()
+scanned = 0
+truncated = False
+stop = False
+# os.walk is handed absolute roots, so an entry's path relative to `start` is
+# a slice of dirpath -- no per-entry relpath(), whose getcwd() calls used to
+# dominate the walk's runtime.
+root = os.path.abspath(start)
+# A bare root ('/', 'C:\') already ends in the separator the slice skips.
+cut = len(root.rstrip(os.sep)) + 1
+
+
+def rel(dirpath, name):
+    # Entries always use '/', like the git-index paths they merge with.
+    dp = dirpath[cut:]
+    if os.sep != '/':
+        dp = dp.replace(os.sep, '/')
+    return dp + '/' + name if dp else name
+
+
+def match(dirpath, name, is_dir):
+    # A directory carries no byte size; a file stats for size + mtime. Every
+    # dir reaching here already passed the exc filter in scan()'s kept loop;
+    # re-checking keeps the two entry kinds symmetric so a future refactor of
+    # that pre-filter can't silently leak excluded dirs.
+    p = rel(dirpath, name)
+    if exc and any(r.match(p) for r in exc):
+        return
+    if inc and not any(r.match(p) for r in inc):
+        return
+    if q not in p.lower():
+        return
+    try:
+        st = os.stat(os.path.join(dirpath, name))
+        results.append({'n': name, 'p': p, 's': None if is_dir else st.st_size,
+                        'm': int(st.st_mtime), 'd': is_dir})
+    except OSError:
+        results.append({'n': name, 'p': p, 's': None, 'm': None, 'd': is_dir})
+
+
+def scan(walk_root, defer):
+    # A query matching little or nothing never trips the result cap, so the walk
+    # needs its own bound. Counted per entry: per-directory would let one huge
+    # directory overshoot it.
+    global scanned, truncated, stop
+    for dirpath, dirnames, filenames in os.walk(walk_root):
+        kept = []
+        for d in sorted(dirnames):
+            if d == '.git':
+                # Git's own store is never a search target, and in a plain
+                # clone its reflogs alone can outnumber the source tree.
+                continue
+            if any(r.match(rel(dirpath, d)) for r in exc):
+                continue
+            if defer and d in depri:
+                # Match the dir itself now, but walk its subtree later (pass 2)
+                # so it can't starve the real tree of scan budget. Never defer a
+                # symlinked dir: os.walk(root) follows a top-level symlink, so a
+                # committed 'node_modules -> ..' would let pass 2 escape the
+                # workspace. os.walk(followlinks=False) never crosses symlinks
+                # mid-tree; deferring only real dirs keeps that boundary intact.
+                full = os.path.join(dirpath, d)
+                if not os.path.islink(full):
+                    deferred.append(full)
+            kept.append(d)
+        dirnames[:] = [d for d in kept if not (defer and d in depri)]
+        for dname in kept:
+            # Count then check `> budget`, not `>= budget`: a tree of exactly
+            # `budget` entries is fully enumerable and must not report truncated.
+            scanned += 1
+            if scanned > budget:
+                truncated = True
+                stop = True
+                return
+            match(dirpath, dname, True)
+            if len(results) >= limit:
+                stop = True
+                return
+        for fname in sorted(filenames):
+            scanned += 1
+            if scanned > budget:
+                truncated = True
+                stop = True
+                return
+            match(dirpath, fname, False)
+            if len(results) >= limit:
+                stop = True
+                return
+
+
+scan(root, True)
+while deferred and not stop:
+    scan(deferred.popleft(), False)
+# When the walk stops early it is always because scan() tripped the budget
+# (which sets truncated) or the result limit (signaled by has_more upstream);
+# the loop exits only once deferred is drained or stop is set, so no extra
+# truncation flag is needed here.
+
+print(json.dumps({'r': results, 't': truncated}))
+"""
+        _script = _header + "\n" + _body
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Root directory not accessible: {result['error']}")
@@ -476,63 +1096,94 @@ class CallerProcessFilesystem:
         entries: list[FilesystemEntry] = []
         stdout = result.get("stdout", "")
         try:
-            raw = _json.loads(stdout)
+            payload = _json.loads(stdout)
         except _json.JSONDecodeError as exc:
             raise RuntimeError(
                 f"search_files: unexpected output from sandbox script: {stdout!r}"
             ) from exc
-        for item in raw:
+        truncated = bool(payload.get("t"))
+        for item in payload.get("r", []):
             entries.append(
                 FilesystemEntry(
                     id=item["p"],
                     name=item["n"],
                     path=item["p"],
-                    type="file",
+                    type="directory" if item.get("d") else "file",
                     bytes=item["s"],
                     modified_at=item["m"],
                 )
             )
         entries.sort(key=lambda e: e.path)
-        return entries
+        return entries, truncated
 
     async def read(
         self,
         path: str,
         *,
         max_bytes: int | None = None,
-        limit: int | None = _DEFAULT_READ_LIMIT,
+        limit: int | None = None,
     ) -> FileContent:
         """Read file content via the sandboxed helper.
 
-        Uses ``os_env.read()`` so the sandbox enforces read access.
+        Uses ``os_env.read()`` so the sandbox enforces read access. A path
+        admitted only because the environment is unconfined is read
+        in-process instead.
 
-        :param path: Relative file path.
+        :param path: Relative file path, or an absolute path elsewhere on
+            the filesystem.
         :param max_bytes: Maximum bytes to read. Defaults to
             ``_MAX_READ_BYTES`` (10 MiB).
-        :param limit: Maximum number of lines to return.  Defaults to
-            ``_DEFAULT_READ_LIMIT`` (2 000 lines) — appropriate for agent
-            tool calls.  Pass ``None`` for no line cap (e.g. the diff
-            endpoint needs the full file to render a correct before/after
-            view).
+        :param limit: Optional line cap within the byte-limited prefix.
+            Defaults to all lines within the byte cap for file previews
+            and diffs.
         :returns: The file content.
         :raises FilesystemPathNotFound: If the file does not exist.
-        :raises FileTooLarge: If the file exceeds the size limit.
         """
-        validated = _validate_path(path) if path else ""
-        if not validated:
-            raise InvalidPath("Cannot read the environment root")
-
         byte_cap = max_bytes or _MAX_READ_BYTES
+
+        absolute = self._absolute(path)
+        validated = "" if absolute else _validate_path(path)
+        if not absolute and not validated:
+            raise InvalidPath("Cannot read the environment root")
+        # A workspace path keeps its relative form: the helper runs with cwd at
+        # the root and enforces the environment's reach itself, so a symlink
+        # into a declared grant reads as it always has.
+        target = validated
+        if absolute or self._follow_outward_links:
+            resolved = self._resolve(path)
+            if not self._within_grants(resolved):
+                # Only reachable when the environment is unconfined —
+                # ``_resolve`` rejects out-of-grant paths otherwise — so there
+                # is no sandbox to route around. Runs the same implementation
+                # the helper would, minus the file-tool cwd guard, which is an
+                # agent-tool policy rather than a browsing boundary.
+                direct = await _run_impl_direct(_read_impl, resolved, 1, limit, byte_cap)
+                return self._file_content(path, direct, byte_cap)
+            if absolute:
+                target = str(resolved)
 
         result = await _run_os_env_async(
             self._os_env.read,
-            validated,
+            target,
             limit=limit,
-            # Inline binary content up to the byte cap so it can be served to
-            # the viewer / download. (The agent read path omits this and gets a
-            # descriptor only — see ``_read_impl``.)
-            max_binary_bytes=byte_cap,
+            # Bound text and binary reads before content crosses the helper IPC.
+            max_bytes=byte_cap,
         )
+        return self._file_content(path, result, byte_cap)
+
+    def _file_content(self, path: str, result: OpResult, byte_cap: int) -> FileContent:
+        """Convert a read result into typed content.
+
+        Shared by both read routes — through the helper for paths the
+        environment's file tools can reach, and in-process for unconfined
+        browsing — so encoding and truncation behave identically either way.
+
+        :param path: Path as requested, echoed onto the result.
+        :param result: Raw result from the read implementation.
+        :param byte_cap: Maximum bytes to return.
+        :returns: The file content.
+        :raises FilesystemPathNotFound: If the read reported an error.
+        """
         if "error" in result:
             raise FilesystemPathNotFound(f"Path {path!r} not found")
 
@@ -572,7 +1223,7 @@ class CallerProcessFilesystem:
             data=data,
             bytes=len(data),
             encoding="utf-8",
-            truncated=byte_truncated or line_truncated,
+            truncated=bool(result.get("truncated")) or byte_truncated or line_truncated,
         )
 
     async def write(
@@ -594,26 +1245,21 @@ class CallerProcessFilesystem:
             always creates parents.
         :returns: Write result with change tracking.
         """
-        validated = _validate_path(path)
+        target, direct = self._write_route(path)
         content_str = content.decode("utf-8")
 
-        result = await _run_os_env_async(
-            self._os_env.write,
-            validated,
-            content_str,
-        )
+        if direct is not None:
+            result = await _run_impl_direct(_write_impl, direct, content_str)
+        else:
+            result = await _run_os_env_async(self._os_env.write, target, content_str)
         if "error" in result:
             raise FilesystemPathNotFound(result.get("error", f"Write failed for {path!r}"))
 
         created = result.get("created", False)
         bytes_written = result.get("bytes_written", len(content))
 
-        full = self._resolve(path)
-        entry = _entry_from_stat(
-            self._root,
-            full,
-            str(full.relative_to(self._root)),
-        )
+        full = self._resolve(path, need_write=True)
+        entry = _entry_from_stat(self._root, full, self._entry_path(full))
         return WriteFileResult(
             operation="write",
             path=path,
@@ -622,17 +1268,29 @@ class CallerProcessFilesystem:
             entry=entry,
         )
 
-    async def stat(self, path: str) -> FilesystemEntry:
-        """Return metadata for a single path via the sandboxed helper.
+    async def _helper_stat(
+        self, target: str, *, probe_read: bool = False
+    ) -> dict[str, Any] | None:
+        """Stat *target* through the sandboxed helper.
 
-        :param path: Relative path within the environment.
-        :returns: The filesystem entry.
-        :raises FilesystemPathNotFound: If the path does not exist.
+        The helper sees the workspace as the sandbox presents it. Each
+        backend masks differently: bwrap binds ``/dev/null`` over a masked
+        file, so it stats as a character device on another inode, while
+        Seatbelt leaves ``stat`` working and fails the read. ``probe_read``
+        opens the file inside the helper, takes the identity from that
+        descriptor, and reads a byte from it, so ``"r"`` means "a regular
+        file the helper can actually read" under either, and the reported
+        inode is the one that was read rather than one stat'ed separately.
+
+        :param target: Path as the helper should see it: workspace-relative,
+            or absolute for a path under a declared grant.
+        :param probe_read: Also open and read one byte of a regular file.
+        :returns: ``{"s": size, "m": mtime, "d": is_dir, "l": is_symlink,
+            "r": readable_regular_file, "dev": st_dev, "ino": st_ino}``, or
+            ``None`` when the helper cannot stat the path.
         """
         import json as _json
 
-        validated = _validate_path(path) if path else ""
-        target = validated or "."
         # Embed the path as a Python literal via json.dumps and shell-quote
         # the entire script (matching list_dir/search_files). This keeps the
         # caller-controlled path out of any shell-interpreted context: it never
@@ -643,22 +1301,44 @@ class CallerProcessFilesystem:
                 "import os, json, stat as S",
                 f"p = {_json.dumps(target)}",
                 "s = os.stat(p)",
+                "r = S.S_ISREG(s.st_mode)",
+                f"if r and {probe_read!r}:",
+                "    try:",
+                "        with open(p, 'rb') as f:",
+                "            s = os.fstat(f.fileno())",
+                "            r = S.S_ISREG(s.st_mode)",
+                "            f.read(1)",
+                "    except OSError:",
+                "        r = False",
                 "print(json.dumps({'s': s.st_size, 'm': int(s.st_mtime),",
-                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode)}))",
+                "    'd': S.S_ISDIR(s.st_mode), 'l': S.S_ISLNK(s.st_mode),",
+                "    'r': r, 'dev': s.st_dev, 'ino': s.st_ino}))",
             ]
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
-            raise FilesystemPathNotFound(f"Path {path!r} not found")
+            return None
         try:
-            info = _json.loads(result.get("stdout", "{}"))
-        except _json.JSONDecodeError as exc:
-            raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
+            return _json.loads(result.get("stdout", "{}"))
+        except _json.JSONDecodeError:
+            return None
+
+    async def stat(self, path: str) -> FilesystemEntry:
+        """Return metadata for a single path via the sandboxed helper.
+
+        :param path: Relative path within the environment.
+        :returns: The filesystem entry.
+        :raises FilesystemPathNotFound: If the path does not exist.
+        """
+        validated = _validate_path(path) if path else ""
+        info = await self._helper_stat(validated or ".")
+        if info is None:
+            raise FilesystemPathNotFound(f"Path {path!r} not found")
         name = os.path.basename(validated) if validated else ""
-        entry_type = "file"
+        entry_type: Literal["file", "directory", "symlink"] = "file"
         if info.get("d"):
             entry_type = "directory"
         elif info.get("l"):
@@ -671,6 +1351,58 @@ class CallerProcessFilesystem:
             bytes=info["s"] if entry_type == "file" else None,
             modified_at=info["m"],
         )
+
+    async def open_download(self, path: str) -> tuple[BinaryIO, Path, int]:
+        """Open *path* for a raw download, bound to what the sandbox can read.
+
+        The bytes are served from this process, since the helper's
+        single-message protocol cannot stream, so the file is opened here
+        first and the sandboxed helper is then asked to stat and read the
+        same path. The helper must report a readable regular file on the
+        very inode this process opened: a bwrap ``/dev/null`` mask is a
+        character device on another inode, a Seatbelt mask stats fine but
+        fails the read, and a path swapped between the two steps no longer
+        matches. A path admitted only because the environment is unconfined
+        has no sandbox to consult.
+
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem.
+        :returns: The open file at byte 0, its resolved path, and its size.
+        :raises InvalidPath: If the path names a directory.
+        :raises FilesystemPathNotFound: If the path is missing, not a
+            regular file, or hidden from the helper.
+        :raises PathUnreachable: If an absolute path is out of reach.
+        """
+        resolved = self._resolve(path)
+        if resolved.is_dir():
+            raise InvalidPath(f"Path {path!r} is a directory")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(resolved, flags)
+        except OSError as exc:
+            raise FilesystemPathNotFound(f"Path {path!r} not found") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise FilesystemPathNotFound(f"Path {path!r} not found")
+            if not self._absolute(path):
+                target: str | None = _validate_path(path) or "."
+            elif self._within_grants(resolved):
+                target = str(resolved)
+            else:
+                target = None
+            if target is not None:
+                info = await self._helper_stat(target, probe_read=True)
+                if (
+                    info is None
+                    or not info.get("r")
+                    or (info.get("dev"), info.get("ino")) != (st.st_dev, st.st_ino)
+                ):
+                    raise FilesystemPathNotFound(f"Path {path!r} not found")
+        except BaseException:
+            os.close(fd)
+            raise
+        return os.fdopen(fd, "rb"), resolved, st.st_size
 
     async def edit_text(
         self,
@@ -693,7 +1425,7 @@ class CallerProcessFilesystem:
             TextReplacement,
         )
 
-        validated = _validate_path(path)
+        target, direct = self._write_route(path)
 
         replacements: list[TextReplacement] = []
         if edit.edits is not None:
@@ -708,18 +1440,27 @@ class CallerProcessFilesystem:
         else:
             raise InvalidPath("old_text/new_text or edits list is required")
 
-        if len(replacements) == 1:
+        edits_list = [{"oldText": r.old_text, "newText": r.new_text} for r in replacements]
+        single = len(replacements) == 1
+        if direct is not None:
+            result = await _run_impl_direct(
+                _edit_impl,
+                direct,
+                replacements[0].old_text if single else None,
+                replacements[0].new_text if single else None,
+                None if single else edits_list,
+            )
+        elif single:
             result = await _run_os_env_async(
                 self._os_env.edit,
-                validated,
+                target,
                 old_text=replacements[0].old_text,
                 new_text=replacements[0].new_text,
             )
         else:
-            edits_list = [{"oldText": r.old_text, "newText": r.new_text} for r in replacements]
             result = await _run_os_env_async(
                 self._os_env.edit,
-                validated,
+                target,
                 edits=edits_list,
             )
 
@@ -729,12 +1470,8 @@ class CallerProcessFilesystem:
         total_count = result.get("replacements", len(replacements))
         bytes_written = result.get("bytes_written", 0)
 
-        full = self._resolve(path)
-        entry = _entry_from_stat(
-            self._root,
-            full,
-            str(full.relative_to(self._root)),
-        )
+        full = self._resolve(path, need_write=True)
+        entry = _entry_from_stat(self._root, full, self._entry_path(full))
         return EditFileResult(
             operation="edit",
             path=path,
@@ -747,7 +1484,7 @@ class CallerProcessFilesystem:
     async def _stat_via_shell(self, validated: str) -> tuple[int, bool]:
         """Stat a path via the sandboxed helper.
 
-        :param validated: Validated relative path.
+        :param validated: Resolved absolute path to hand the helper.
         :returns: Tuple of (size_bytes, is_directory).
         :raises FilesystemPathNotFound: If the path does not exist.
         """
@@ -766,7 +1503,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {validated!r} not found")
@@ -781,8 +1518,9 @@ class CallerProcessFilesystem:
     async def _check_dir_empty(self, validated: str) -> bool:
         """Check if a directory is empty via the sandboxed helper.
 
-        :param validated: Validated relative path.
-        :returns: ``True`` if the directory has children.
+        :param validated: Resolved absolute path to hand the helper.
+        :returns: ``True`` if the directory has children, or if it could not
+            be listed: an unreadable directory must not pass as empty.
         """
         import json as _json
 
@@ -798,10 +1536,57 @@ class CallerProcessFilesystem:
         )
         check = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
-        count = int(check.get("stdout", "0").strip() or "0")
-        return count > 0
+        if "error" in check or check.get("exit_code") != 0:
+            return True
+        try:
+            return int(check.get("stdout", "").strip()) > 0
+        except ValueError:
+            return True
+
+    async def _delete_in_workspace(self, path: str, *, recursive: bool) -> DeleteFilesystemResult:
+        """Delete a workspace-relative entry through the helper's ``delete`` op.
+
+        The helper confines the entry's resolved parent to write reach, as
+        for ``write``, and removes the entry itself without following it.
+
+        :param path: Client-supplied relative path.
+        :param recursive: Allow recursive directory deletion.
+        :returns: Delete result.
+        :raises InvalidPath: For the root, or a parent leading out of reach.
+        :raises FilesystemPathNotFound: If the path does not exist.
+        :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises PermissionDenied: If the OS or sandbox refuses the removal.
+        :raises ResourceError: If the delete failed or was not confirmed.
+        """
+        validated = _validate_path(path)
+        if not validated:
+            raise InvalidPath("Cannot delete the environment root")
+        result = await _run_os_env_async(self._os_env.delete, validated, recursive=recursive)
+        if "error" in result:
+            error, code = str(result["error"]), result.get("code")
+            if code == "invalid_path":
+                raise InvalidPath(error)
+            if code == "not_found":
+                raise FilesystemPathNotFound(f"Path {path!r} not found")
+            if code == "directory_not_empty":
+                raise DirectoryNotEmpty(
+                    f"Directory {path!r} is not empty; use recursive=true to delete"
+                )
+            if code == "permission_denied":
+                raise PermissionDenied(f"Delete of {path!r} was refused: {error}")
+            raise ResourceError(f"Delete of {path!r} did not complete: {error}")
+        entry_type = result.get("type")
+        if result.get("deleted") is not True or entry_type not in _DELETED_ENTRY_TYPES:
+            raise ResourceError(f"Delete of {path!r} was not confirmed")
+        bytes_deleted = result.get("bytes_deleted")
+        return DeleteFilesystemResult(
+            path=path,
+            deleted=True,
+            type=cast("Literal['file', 'directory', 'symlink', 'other']", entry_type),
+            bytes_deleted=bytes_deleted if isinstance(bytes_deleted, int) else None,
+        )
 
     async def delete(
         self,
@@ -811,16 +1596,19 @@ class CallerProcessFilesystem:
     ) -> DeleteFilesystemResult:
         """Delete a file or directory via the sandboxed helper.
 
-        :param path: Relative path. Root deletion is rejected.
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem. Root deletion is rejected.
         :param recursive: Allow recursive directory deletion.
         :returns: Delete result.
-        :raises InvalidPath: If attempting to delete the root.
+        :raises InvalidPath: If attempting to delete the root, or a relative
+            path's parent leads out of reach.
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises ResourceError: If the delete did not complete.
         """
-        validated = _validate_path(path)
-        if not validated:
-            raise InvalidPath("Cannot delete the environment root")
+        if not self._absolute(path):
+            return await self._delete_in_workspace(path, recursive=recursive)
+        validated, _direct = self._write_route(path)
 
         size, is_dir = await self._stat_via_shell(validated)
 
@@ -831,10 +1619,12 @@ class CallerProcessFilesystem:
 
         cmd = f"rm -rf {_shell_quote(validated)}" if is_dir else f"rm -f {_shell_quote(validated)}"
         result = await _run_os_env_async(self._os_env.shell, cmd)
-        if "error" in result and result.get("exit_code", 0) != 0:
-            raise FilesystemPathNotFound(
-                result.get("error", f"Delete failed for {path!r}"),
-            )
+        exit_code = result.get("exit_code")
+        if "error" in result or exit_code != 0:
+            if isinstance(exit_code, int):
+                raise FilesystemPathNotFound(result.get("error") or f"Delete failed for {path!r}")
+            # No exit status: the command never ran, or timed out mid-delete.
+            raise ResourceError(f"Delete of {path!r} did not complete: {result.get('error')}")
 
         return DeleteFilesystemResult(
             path=path,

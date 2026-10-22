@@ -1,5 +1,10 @@
 # Omnigent on Kubernetes
 
+To try multiple server replicas, see the [NGINX example](multi_replica/README.md).
+It explains how browser requests reach the server connected to each host and
+includes a local test that replaces the server pods during an active session.
+The manifests below deploy a single server replica.
+
 Deploy Omnigent to any Kubernetes cluster using Kustomize. The manifests pull
 the prebuilt image and set up a persistent volume and health checks. They also
 include an Ingress so you can serve the app over HTTPS at a public web address,
@@ -90,6 +95,25 @@ spec:
 Apply your chosen issuer with `kubectl apply -f <file>`. Without it, cert-manager
 logs `IssuerNotFound` and no certificate is issued (the server still runs — only
 TLS is affected).
+
+## Release features
+
+Override feature defaults with comma-separated names in `OMNIGENT_FEATURES`:
+a name enables, `-name` disables, and empty uses defaults. Set the value in
+`base/configmap.yaml`, apply your
+Kustomize target, and restart the Deployment so every pod receives one fresh
+startup snapshot:
+
+```bash
+kubectl kustomize deploy/kubernetes/base/ | kubectl apply -f -
+kubectl rollout restart deployment/omnigent
+kubectl rollout status deployment/omnigent
+```
+
+Use the same restart after adding `-feature_name` for rollback. Runner
+overrides such as `-claude_osc_status` also need to be set on separately
+running hosts; restart their host/runners and launch fresh terminals. See
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known keys.
 
 ## Deploy with an external database
 
@@ -269,6 +293,38 @@ kubectl apply -k deploy/kubernetes/overlays/sandbox-runners
 
 Both are detailed in
 [`overlays/sandbox-runners/README.md`](overlays/sandbox-runners/README.md#server-auth-managed-hosts).
+
+## Deploy with ArgoCD
+
+The `overlays/argocd/` overlay adds ArgoCD safety annotations (`Prune=false` on
+stateful resources, `ignoreDifferences` for operator-managed Secrets) onto
+`sandbox-runners`. ArgoCD renders Kustomize natively — no plugin needed.
+
+**Prerequisites:** fork the repo and replace the placeholder values in
+`base/secret.yaml` in your fork (ArgoCD reads from Git, not your disk). The
+default `accounts` auth provider refuses the managed runner dial-back — use
+header/OIDC auth or single-user (see
+[sandbox-runners README § Server auth](overlays/sandbox-runners/README.md#server-auth-managed-hosts)).
+
+```bash
+# 1. Edit application.yaml — set repoURL to your fork, targetRevision to your
+#    branch — then apply:
+kubectl apply -f deploy/kubernetes/overlays/argocd/application.yaml
+
+# 2. Wait for ArgoCD to create the runner namespace (up to 3 min without a webhook):
+kubectl wait --for=jsonpath='{.status.phase}'=Active \
+  namespace/omnigent-sandboxes --timeout=300s
+
+# 3. Create the harness-credentials Secret (see sandbox-runners README):
+kubectl create secret generic omnigent-creds -n omnigent-sandboxes \
+  --from-literal=ANTHROPIC_API_KEY=sk-ant-... \
+  --from-literal=OPENAI_API_KEY=sk-...
+```
+
+For production, manage `omnigent-creds` with
+[sealed-secrets](https://github.com/bitnami-labs/sealed-secrets) or
+[external-secrets](https://external-secrets.io/). See
+[`overlays/argocd/README.md`](overlays/argocd/README.md) for the full guide.
 
 ## Verify the deployment
 

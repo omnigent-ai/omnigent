@@ -9,8 +9,21 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { useEffect, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useState } from "react";
 
+import {
+  ALT_KEY,
+  composerNewLineShortcutKeys,
+  composerSendShortcutKeys,
+  composerSteerAllShortcutKeys,
+  CTRL_KEY,
+  ENTER_KEY,
+  Kbd,
+  MOD_KEY,
+  newSessionShortcutKeys,
+  SHIFT_KEY,
+  VIEW_MODE_TOGGLE_KEYS,
+} from "@/components/KeyboardShortcut";
 import {
   Dialog,
   DialogContent,
@@ -18,7 +31,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { hasCommandModifier } from "@/lib/hotkeys";
+import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -30,27 +49,20 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Platform-aware modifier glyphs. macOS shows ⌘/⌥; elsewhere Ctrl/Alt — the
-// same split the underlying handlers use (`metaKey || ctrlKey`).
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || "");
-
-/** Modifier label shown in menu hints (⌘ on macOS, Ctrl elsewhere). */
-export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
-
 // Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const ENTER = "↵";
-const SHIFT = "⇧";
-const ALT = IS_MAC ? "⌥" : "Alt";
 const UP = "↑";
 const DOWN = "↓";
+const BRACKET_LEFT = "[";
+const BRACKET_RIGHT = "]";
 
 interface Shortcut {
   label: string;
   /** Keys rendered left→right as chips. A chord (held together) or, for the
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
+  lastKeySeparator?: string;
+  /** Another chord for the same action, shown after "or". */
+  alternateKeys?: string[];
 }
 
 interface ShortcutGroup {
@@ -67,33 +79,45 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     title: "General",
     items: [
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
+      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
+      { label: "Rename current session", keys: [MOD_KEY, ALT_KEY, "R"] },
+      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
   {
     title: "In chats",
     items: [
-      { label: "Send message", keys: [ENTER] },
-      { label: "New line in message", keys: [SHIFT, ENTER] },
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER] },
-      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT, "V"] },
+      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
+      { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
+      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
       { label: "Stop response", keys: ["Esc"] },
     ],
   },
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, UP] },
-      { label: "Next session", keys: [MOD_KEY, DOWN] },
+      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
+      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
     ],
   },
   {
     title: "View",
     items: [
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT, "["] },
-      { label: "Toggle workspace sidebar", keys: [MOD_KEY, ALT, "]"] },
+      { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
+      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
+      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Search workspace contents", keys: [MOD_KEY, SHIFT_KEY, "F"] },
+      {
+        label: "Select a workspace tab",
+        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
+        lastKeySeparator: "+",
+      },
+      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
+      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
     ],
   },
   {
@@ -114,63 +138,155 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
 function pinnedSessionShortcut(native: boolean): Shortcut {
   return {
     label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT, "1…0"],
+    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
   };
 }
 
-/** Shortcut groups for the current runtime — the pinned-jump chord differs by shell. */
-function shortcutGroupsFor(native: boolean): ShortcutGroup[] {
-  return SHORTCUT_GROUPS.map((group) =>
-    group.title === "Navigation"
-      ? { ...group, items: [...group.items, pinnedSessionShortcut(native)] }
-      : group,
-  );
-}
-
-function Kbd({ children }: { children: ReactNode }) {
-  return (
-    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-border bg-muted px-1.5 font-sans text-xs font-medium text-muted-foreground">
-      {children}
-    </kbd>
-  );
+/** Shortcut groups for the current runtime and composer preference. */
+function shortcutGroupsFor(
+  native: boolean,
+  electron: boolean,
+  browser: boolean,
+  submitWithModEnter: boolean,
+  preventsKeyboardSubmit: boolean,
+  contentSearch: boolean,
+): ShortcutGroup[] {
+  return SHORTCUT_GROUPS.map((group) => {
+    if (group.title === "General") {
+      return {
+        ...group,
+        items: [
+          { label: "Start a new session", keys: newSessionShortcutKeys(native) },
+          ...group.items,
+        ],
+      };
+    }
+    if (group.title === "In chats" && !preventsKeyboardSubmit) {
+      return {
+        ...group,
+        items: [
+          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+          {
+            label: "Send now, with all queued messages",
+            keys: composerSteerAllShortcutKeys(submitWithModEnter),
+          },
+          {
+            label: "New line in message",
+            keys: composerNewLineShortcutKeys(submitWithModEnter),
+            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
+            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
+          },
+          ...group.items,
+        ],
+      };
+    }
+    if (group.title === "Navigation") {
+      return {
+        ...group,
+        items: [
+          ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
+          ...group.items,
+          pinnedSessionShortcut(native),
+        ],
+      };
+    }
+    if (group.title === "View") {
+      return {
+        ...group,
+        items: group.items
+          .filter(
+            (item) =>
+              (browser || item.label !== "Open a new browser tab") &&
+              (contentSearch || item.label !== "Search workspace contents"),
+          )
+          .map((item) =>
+            contentSearch && item.label === "Select a workspace tab"
+              ? { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] }
+              : item,
+          ),
+      };
+    }
+    return group;
+  });
 }
 
 /**
- * The shortcut reference, grouped, as plain inline content (no dialog
- * chrome). Shared by the {@link KeyboardShortcutsDialog} overlay and the
- * Settings page, which embeds it directly instead of behind a trigger.
+ * The shortcut reference shared by the dialog and Settings page. The dialog
+ * keeps the compact inline list; Settings uses section headings with bordered
+ * list cards to match the rest of its content.
  */
-export function KeyboardShortcutsList() {
+export function KeyboardShortcutsList({
+  variant = "compact",
+}: {
+  variant?: "compact" | "settings";
+}) {
   // Feature-based, stable per session; computed at render so tests can vary it.
-  const groups = shortcutGroupsFor(isNativeShell());
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const serverInfo = useServerInfo();
+  const groups = shortcutGroupsFor(
+    isNativeShell(),
+    isElectronShell(),
+    supportsBrowser(),
+    readSubmitWithModEnter(),
+    preventsKeyboardSubmit,
+    !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
+  );
+  const settings = variant === "settings";
   return (
-    <>
+    <div className={settings ? "flex flex-col gap-6" : undefined}>
       {groups.map((group) => (
-        <section key={group.title} className="mb-4 last:mb-0">
-          <h3 className="mb-1 text-xs font-medium text-muted-foreground">
+        <section key={group.title} className={settings ? "" : "mb-4 last:mb-0"}>
+          <h3
+            className={
+              settings
+                ? "mb-3 text-ui font-medium text-foreground"
+                : "mb-1 text-sm font-medium text-muted-foreground"
+            }
+          >
             {group.title}
             {group.note ? (
               <span className="ml-1.5 font-normal text-muted-foreground/70">· {group.note}</span>
             ) : null}
           </h3>
-          <ul>
+          <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
             {group.items.map((item) => (
               <li
                 key={item.label}
-                className="flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+                className={
+                  settings
+                    ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
+                    : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
+                }
               >
-                <span className="text-sm text-foreground">{item.label}</span>
+                <span className="text-ui text-foreground">{item.label}</span>
                 <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key) => (
-                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
+                  {item.keys.map((key, index) => (
+                    <Fragment key={`${item.label}-${key}`}>
+                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
+                        <span aria-hidden="true" className="text-muted-foreground/70">
+                          {item.lastKeySeparator}
+                        </span>
+                      ) : null}
+                      <Kbd>{key}</Kbd>
+                    </Fragment>
                   ))}
+                  {item.alternateKeys ? (
+                    <>
+                      <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
+                      {item.alternateKeys.map((key) => (
+                        <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
+                      ))}
+                    </>
+                  ) : null}
                 </span>
               </li>
             ))}
           </ul>
         </section>
       ))}
-    </>
+    </div>
   );
 }
 
@@ -180,8 +296,9 @@ export function KeyboardShortcutsDialog() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
-      // trigger, so require the modifier and no Shift/Alt to avoid clashing.
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key === "/") {
+      // trigger, so require the platform command modifier and no Shift/Alt to
+      // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
+      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

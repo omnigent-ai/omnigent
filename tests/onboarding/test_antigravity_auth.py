@@ -151,8 +151,16 @@ def test_antigravity_install_command_prefers_uv(monkeypatch: pytest.MonkeyPatch)
     """With ``uv`` on PATH, the install runs ``uv pip install`` — no index URL."""
     monkeypatch.setattr(extra_install, "_is_uv_tool_install", lambda: False)
     monkeypatch.setattr(extra_install.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(extra_install.sys, "executable", "/opt/venv/bin/python")
     cmd = antigravity_install_command()
-    assert cmd == ["uv", "pip", "install", "omnigent[antigravity]"]
+    assert cmd == [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        "/opt/venv/bin/python",
+        "omnigent[antigravity]",
+    ]
     assert not any("index" in part or "://" in part for part in cmd)
 
 
@@ -163,6 +171,7 @@ def test_antigravity_install_command_falls_back_to_pip(monkeypatch: pytest.Monke
     cmd = antigravity_install_command()
     assert cmd == [
         extra_install.sys.executable,
+        "-P",
         "-m",
         "pip",
         "install",
@@ -212,7 +221,7 @@ def test_install_antigravity_sdk_runs_command_then_rechecks(
 
     assert install_antigravity_sdk() is True
     assert calls == [
-        [extra_install.sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]
+        [extra_install.sys.executable, "-P", "-m", "pip", "install", "omnigent[antigravity]"]
     ]
 
 

@@ -8,27 +8,44 @@
 // the write endpoint (useWriteFileContent) is mocked, to assert the PUT fires
 // with the edited content.
 
+import { Schema, type Node } from "@tiptap/pm/model";
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // --- Thin fake TipTap editor: an event emitter over a mutable markdown string ---
+// Mirrors TipTap's "update" event carrying a transaction, so tests can emit a
+// no-op (docChanged:false) or flagged transaction.
+interface FakeTr {
+  docChanged: boolean;
+  getMeta: (key: string) => unknown;
+}
+interface UpdatePayload {
+  transaction?: FakeTr;
+}
+type UpdateHandler = (payload?: UpdatePayload) => void;
+
 interface FakeEditor {
   isDestroyed: boolean;
   getMarkdown: () => string;
-  on: (evt: string, h: () => void) => void;
-  off: (evt: string, h: () => void) => void;
+  on: (evt: string, h: UpdateHandler) => void;
+  off: (evt: string, h: UpdateHandler) => void;
   commands: { setContent: (c: string) => void };
   setEditable: () => void;
-  state: { selection: { empty: boolean; from: number; to: number } };
-  emit: (evt: string) => void;
+  state: { doc: Node; selection: { empty: boolean; from: number; to: number } };
+  emit: (evt: string, payload?: UpdatePayload) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
   wired: boolean;
 }
 
+const schema = new Schema({ nodes: { doc: { content: "text*" }, text: {} } });
+const documentFor = (text: string) =>
+  schema.node("doc", null, text ? schema.text(text) : undefined);
+
 function makeFakeEditor(initial: string): FakeEditor {
-  const handlers: Record<string, Set<() => void>> = {};
+  const handlers: Record<string, Set<UpdateHandler>> = {};
   let markdown = initial;
+  const state = { doc: documentFor(initial), selection: { empty: true, from: 0, to: 0 } };
   return {
     isDestroyed: false,
     getMarkdown: () => markdown,
@@ -41,15 +58,17 @@ function makeFakeEditor(initial: string): FakeEditor {
     commands: {
       setContent: (c: string) => {
         markdown = c;
+        state.doc = documentFor(c);
       },
     },
     setEditable: () => {},
-    state: { selection: { empty: true, from: 0, to: 0 } },
-    emit: (evt) => {
-      handlers[evt]?.forEach((h) => h());
+    state,
+    emit: (evt, payload) => {
+      handlers[evt]?.forEach((h) => h(payload));
     },
     setMarkdown: (m) => {
       markdown = m;
+      state.doc = documentFor(m);
     },
     // Default focused: these tests simulate USER edits, which only happen while
     // the editor has focus. The load-normalisation test flips this to false.
@@ -63,15 +82,17 @@ let fakeEditor: FakeEditor | null = null;
 vi.mock("@tiptap/react", () => ({
   useEditor: (config: {
     onCreate?: (p: { editor: FakeEditor }) => void;
-    onUpdate?: (p: { editor: FakeEditor }) => void;
+    onUpdate?: (p: { editor: FakeEditor; transaction?: FakeTr }) => void;
   }) => {
     const f = fakeEditor;
     if (f && !f.wired) {
       f.wired = true;
       // onCreate sets the editor's baseline; real TipTap also registers the
-      // onUpdate option as an "update" listener, so mirror that.
+      // onUpdate option as an "update" listener carrying the transaction.
       config.onCreate?.({ editor: f });
-      if (config.onUpdate) f.on("update", () => config.onUpdate!({ editor: f }));
+      if (config.onUpdate) {
+        f.on("update", (p) => config.onUpdate!({ editor: f, transaction: p?.transaction }));
+      }
     }
     return f;
   },
@@ -80,12 +101,16 @@ vi.mock("@tiptap/react", () => ({
 
 // Extensions / sibling components the viewer imports — irrelevant to the wiring.
 vi.mock("@tiptap/markdown", () => ({ Markdown: { configure: vi.fn().mockReturnValue({}) } }));
-vi.mock("@tiptap/starter-kit", () => ({ default: { configure: vi.fn().mockReturnValue({}) } }));
+vi.mock("@tiptap/starter-kit", () => ({ StarterKit: { configure: vi.fn().mockReturnValue({}) } }));
 vi.mock("@tiptap/extension-table", () => ({
   Table: { configure: vi.fn().mockReturnValue({}) },
   TableRow: {},
   TableCell: {},
   TableHeader: {},
+}));
+vi.mock("./tiptapBoundedTokenizers", () => ({
+  BoundedTaskList: {},
+  BoundedTable: { configure: vi.fn().mockReturnValue({}) },
 }));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
@@ -112,9 +137,13 @@ vi.mock("./MarkdownEditorToolbar", () => ({
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
+import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
 
@@ -169,6 +198,111 @@ afterEach(() => {
 });
 
 describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
+  it("serializes once at save time, never for each keystroke or a clean blur", async () => {
+    render(makeViewer());
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      for (const suffix of ["a", "ab", "abc"]) {
+        fakeEditor!.setMarkdown(INITIAL + suffix);
+        fakeEditor!.emit("update");
+      }
+    });
+    expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();
+    expect(serialize).not.toHaveBeenCalled();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(serialize).toHaveBeenCalledTimes(1);
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: INITIAL + "abc" });
+    await act(async () => fakeEditor!.emit("blur"));
+    expect(serialize).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+  });
+
+  it("undo to an equivalent baseline document clears dirty without serializing or writing", async () => {
+    render(makeViewer());
+    const original = fakeEditor!.state.doc;
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+    });
+    expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();
+    await act(async () => {
+      fakeEditor!.setMarkdown(INITIAL);
+      fakeEditor!.emit("update");
+    });
+    expect(fakeEditor!.state.doc).not.toBe(original);
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      fakeEditor!.emit("blur");
+    });
+    expect(serialize).not.toHaveBeenCalled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("re-baselines a changed document that serializes to the same Markdown without writing", async () => {
+    render(makeViewer());
+    fakeEditor!.setMarkdown(EDITED);
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown").mockReturnValue(INITIAL);
+    await act(async () => fakeEditor!.emit("update"));
+    await act(async () => vi.advanceTimersByTime(1000));
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    await act(async () => fakeEditor!.emit("blur"));
+    expect(serialize).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves edits made during a pending write and baselines the saved snapshot", async () => {
+    let resolveWrite!: () => void;
+    mutateAsync.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveWrite = resolve;
+        }),
+    );
+    render(makeViewer());
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED + "newer");
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledTimes(1);
+    expect(serialize).toHaveBeenCalledTimes(1);
+    await act(async () => resolveWrite());
+    expect(mutateAsync).toHaveBeenNthCalledWith(2, { path: PATH, content: EDITED + "newer" });
+    expect(serialize).toHaveBeenCalledTimes(2);
+    await act(async () => fakeEditor!.emit("blur"));
+    expect(mutateAsync).toHaveBeenCalledTimes(2);
+    expect(serialize).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses an external replacement as the new undo baseline", async () => {
+    const { rerender } = render(makeViewer());
+    await act(async () => rerender(makeViewer(EDITED)));
+    expect(fakeEditor!.getMarkdown()).toBe(EDITED);
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED + "newer");
+      fakeEditor!.emit("update");
+    });
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    expect(serialize).not.toHaveBeenCalled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
   it("debounced save fires after an edit (update → schedule → write)", async () => {
     render(makeViewer());
     // Edit: content diverges from the onCreate baseline, then emit 'update'.
@@ -232,6 +366,32 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     expect(mutateAsync).not.toHaveBeenCalled();
   });
 
+  it("keeps a blurred language change when a no-op update (setEditable) fires mid-debounce", async () => {
+    // The picker dispatches a flagged, doc-changing update while blurred (the
+    // <select> holds focus). If canEdit then flips within the debounce window,
+    // editor.setEditable emits an empty (docChanged:false) update — which must
+    // NOT re-baseline over the pending change, or the queued save no-ops and the
+    // language change is silently lost on reload.
+    render(makeViewer());
+    fakeEditor!.isFocused = false;
+    fakeEditor!.setMarkdown(EDITED);
+    await act(async () => {
+      fakeEditor!.emit("update", {
+        transaction: { docChanged: true, getMeta: (k) => k === CODE_BLOCK_LANGUAGE_EDIT_META },
+      });
+    });
+    // Synthetic no-op update from setEditable — the bug re-baselined here.
+    await act(async () => {
+      fakeEditor!.emit("update", {
+        transaction: { docChanged: false, getMeta: () => undefined },
+      });
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledWith({ path: PATH, content: EDITED });
+  });
+
   it("marks the editor clean after a save even if getMarkdown() drifts (no stuck 'Unsaved')", async () => {
     // Regression guard: TipTap's markdown round-trip is NOT byte-stable, so
     // re-deriving dirtiness from a live getMarkdown()-vs-baseline string
@@ -246,7 +406,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
       reset: vi.fn(),
       mutateAsync: vi.fn(async ({ content }: { content: string }) => {
         saved.push(content);
-        fakeEditor!.setMarkdown(content + "\n"); // round-trip drift, not a user edit
+        vi.spyOn(fakeEditor!, "getMarkdown").mockReturnValue(content + "\n");
       }),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 
@@ -335,8 +495,9 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
   });
 
   it("flushes accumulated edits when the runner reconnects", async () => {
-    // Offline → auto-save suppressed.
+    // Runner down, no host to serve the workspace → auto-save suppressed.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
+    vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(null);
     const { rerender } = render(makeViewer());
     fakeEditor!.setMarkdown(EDITED);
     await act(async () => {

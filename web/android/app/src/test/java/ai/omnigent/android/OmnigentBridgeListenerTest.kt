@@ -6,8 +6,10 @@ import android.content.Context
 import androidx.appcompat.app.AppCompatDelegate
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -131,5 +133,79 @@ class OmnigentBridgeListenerTest {
         listener.handle("""{"method":"unknownThing","count":5}""")
         listener.handle("""{"count":5}""")
         assertEquals(0, shadow.allNotifications.size)
+    }
+
+    private fun serverSelectionListener(
+        pickerRequests: MutableList<Unit> = mutableListOf(),
+        switchCalls: MutableList<String> = mutableListOf(),
+        setupCalls: MutableList<Unit> = mutableListOf(),
+    ) = OmnigentBridgeListener(
+        notifications = NativeNotificationManager(context),
+        blobSaver = BlobSaver(context),
+        onServerPickerRequested = { pickerRequests.add(Unit) },
+        onSwitchServer = { switchCalls.add(it) },
+        onOpenServerSetup = { setupCalls.add(Unit) },
+    )
+
+    @Test
+    fun `requestServerPicker and openServerSetup dispatch to their callbacks`() {
+        val pickerRequests = mutableListOf<Unit>()
+        val setupCalls = mutableListOf<Unit>()
+        val wired =
+            serverSelectionListener(pickerRequests = pickerRequests, setupCalls = setupCalls)
+
+        wired.handle("""{"method":"requestServerPicker"}""")
+        wired.handle("""{"method":"openServerSetup"}""")
+
+        assertEquals(1, pickerRequests.size)
+        assertEquals(1, setupCalls.size)
+    }
+
+    @Test
+    fun `workspace bridge alone exposes and dispatches local sign out`() {
+        var signOuts = 0
+        val workspace =
+            OmnigentBridgeListener(
+                notifications = NativeNotificationManager(context),
+                blobSaver = BlobSaver(context),
+                onSignOut = { signOuts++ },
+            )
+
+        workspace.handle("""{"method":"signOut"}""")
+        listener.handle("""{"method":"signOut"}""")
+
+        assertEquals(1, signOuts)
+        assertTrue(NativeBridgeScript.source(managesWorkspace = true).contains("signOut()"))
+        assertFalse(NativeBridgeScript.source.contains("signOut()"))
+    }
+
+    @Test
+    fun `every bridge forwards signOutOfServer for the shell to answer`() {
+        var requests = 0
+        val wired =
+            OmnigentBridgeListener(
+                notifications = NativeNotificationManager(context),
+                blobSaver = BlobSaver(context),
+                onSignOutOfServer = { requests++ },
+            )
+
+        wired.handle("""{"method":"signOutOfServer"}""")
+
+        assertEquals(1, requests)
+        assertTrue(NativeBridgeScript.source.contains("signOutOfServer()"))
+        assertTrue(NativeBridgeScript.source.contains("__omnigentNativeEmitSignOutResult"))
+        assertTrue(NativeBridgeScript.source.contains("canSignOut: payload.canSignOut === true"))
+    }
+
+    @Test
+    fun `switchServer forwards the URL and drops an empty or missing one`() {
+        val switchCalls = mutableListOf<String>()
+        val wired = serverSelectionListener(switchCalls = switchCalls)
+
+        wired.handle("""{"method":"switchServer","url":"https://other.example.test"}""")
+        wired.handle("""{"method":"switchServer","url":""}""")
+        wired.handle("""{"method":"switchServer"}""")
+
+        assertEquals(listOf("https://other.example.test"), switchCalls)
     }
 }

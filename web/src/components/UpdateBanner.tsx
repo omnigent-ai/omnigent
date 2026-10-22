@@ -129,7 +129,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
       role={isError ? "status" : "region"}
       aria-label="Desktop update"
       className={cn(
-        "rounded-xl border border-border bg-background p-3.5 text-sm shadow-lg",
+        "rounded-xl border border-border bg-background p-3.5 text-ui shadow-lg",
         // `floating`: pin bottom-right for the in-page web build. `bare`: fill
         // the shell's overlay window, which supplies position + size itself.
         variant === "floating"
@@ -151,14 +151,24 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
 
         <div className="min-w-0 flex-1">
           {visibleStatus.state === "available" && (
-            <p className="font-medium text-foreground">
-              Omnigent {visibleStatus.info?.version ?? "update"} is available
-            </p>
+            <>
+              <p className="font-medium text-foreground">
+                Omnigent Desktop {visibleStatus.info?.version ?? "update"} is available
+              </p>
+              {visibleStatus.currentVersion && (
+                <p className="mt-0.5 text-sm text-muted-foreground">
+                  Current version: {visibleStatus.currentVersion}.
+                </p>
+              )}
+              <p className="mt-0.5 text-sm text-muted-foreground">
+                Updating won’t interrupt existing sessions.
+              </p>
+            </>
           )}
           {visibleStatus.state === "downloading" && (
             <>
               <p className="font-medium text-foreground">
-                Downloading Omnigent update… {progress}%
+                Downloading Omnigent Desktop update… {progress}%
               </p>
               <Progress
                 value={progress}
@@ -170,10 +180,18 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
           {visibleStatus.state === "downloaded" && (
             <>
               <p className="font-medium text-foreground">
-                Omnigent {visibleStatus.info?.version ?? "update"} is ready to install
+                Omnigent Desktop {visibleStatus.info?.version ?? "update"} is ready to install
+              </p>
+              {visibleStatus.currentVersion && (
+                <p className="mt-0.5 text-sm text-muted-foreground">
+                  Current version: {visibleStatus.currentVersion}.
+                </p>
+              )}
+              <p className="mt-0.5 text-sm text-muted-foreground">
+                Updating won’t interrupt existing sessions.
               </p>
               {autoInstall && (
-                <p className="mt-0.5 text-xs text-muted-foreground">
+                <p className="mt-0.5 text-sm text-muted-foreground">
                   Installs automatically on next quit.
                 </p>
               )}
@@ -183,7 +201,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
             <>
               <p className="font-medium text-foreground">Update check failed</p>
               {visibleStatus.lastError && (
-                <p className="mt-0.5 line-clamp-3 text-xs text-muted-foreground">
+                <p className="mt-0.5 line-clamp-3 text-sm text-muted-foreground">
                   {visibleStatus.lastError}
                 </p>
               )}
@@ -191,7 +209,7 @@ export function UpdateBanner({ variant = "floating" }: { variant?: "floating" | 
           )}
 
           {releaseNotes && visibleStatus.state !== "downloading" && (
-            <details className="mt-1.5 text-xs text-muted-foreground">
+            <details className="mt-1.5 text-sm text-muted-foreground">
               <summary className="cursor-pointer select-none text-foreground hover:underline">
                 Release notes
               </summary>

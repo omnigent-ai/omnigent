@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Decides whether a PR's diff should be put through the Security Scan.
-# Called by .github/workflows/security-gate.yml.
+# Called by security-gate.yml for CI access and security-scan.yml for scanning.
 #
 # We scan UNTRUSTED authors and skip trusted ones. "Trusted" is GitHub's
 # native author_association: OWNER / MEMBER / COLLABORATOR -- people with a
@@ -38,11 +38,16 @@
 #
 # Env in:  EVENT_NAME          (github.event_name)
 #          AUTHOR_ASSOCIATION  (github.event.pull_request.author_association)
+#          PR_AUTHOR           (github.event.pull_request.user.login; trusted-CI-bot
+#                               allowlist, checked without an API call so the gate
+#                               pollers short-circuit too)
 #          MAINTAINERS         (space-separated, from merge-ready/load-maintainers.sh;
 #                               optional -- used only to trust private-membership
 #                               maintainer AUTHORS, not for the label waiver)
 #          GH_TOKEN, REPO, PR  (for the label lookup + author check)
-# Out:     `scan=true|false` and `reason=<text>` on $GITHUB_OUTPUT.
+#          PR_AUTHOR_TYPE, PR_HEAD_REPO, REPO (GitHub event identity)
+#          CI_ACCESS_ONLY      (true only for the compatibility CI gate)
+# Out:     `scan=true|false`, `dependabot=true|false`, and `reason` on $GITHUB_OUTPUT.
 
 set -euo pipefail
 
@@ -82,6 +87,28 @@ case "${EVENT_NAME:-}" in
     ;;
 esac
 
+# Dependabot CI access does not waive the merge-blocking diff scan. Require
+# GitHub's bot type and same-repository head, including when association is trusted.
+if [[ "${PR_AUTHOR:-}" == 'dependabot[bot]' ]]; then
+  if has_skip_label; then
+    echo "dependabot=false" >> "$GITHUB_OUTPUT"
+    emit false "'$SKIP_LABEL' waiver (label requires a Triage+ collaborator to apply)"
+    exit 0
+  fi
+  if [[ "${PR_AUTHOR_TYPE:-}" == 'Bot' && -n "${REPO:-}" && "${PR_HEAD_REPO:-}" == "$REPO" ]]; then
+    echo "dependabot=true" >> "$GITHUB_OUTPUT"
+    if [[ "${CI_ACCESS_ONLY:-false}" == 'true' ]]; then
+      emit false "verified same-repository Dependabot; validate action pins before CI"
+    else
+      emit true "verified Dependabot still requires Security Scan"
+    fi
+  else
+    echo "dependabot=false" >> "$GITHUB_OUTPUT"
+    emit true "unverified Dependabot identity or fork; requires Security Scan"
+  fi
+  exit 0
+fi
+
 # Author is a known maintainer? `author_association` only reports MEMBER when
 # the org membership is PUBLIC, so a maintainer with private membership shows up
 # as CONTRIBUTOR in the event payload and would otherwise be scanned. The
@@ -102,6 +129,22 @@ author_is_maintainer() {
   done
   return 1
 }
+
+# Trusted CI bots (omni-resolve-agent, omnigent-ci) open SAME-REPO PRs from a
+# trusted internal pipeline via their GitHub App, and every such PR is still
+# gated by Maintainer Approval + human review before merge. The PR author login
+# is set by GitHub and is not settable from PR contents, and a fork PR's author
+# is never one of these bots. Checked from PR_AUTHOR with NO API call, so this
+# short-circuits the per-workflow gate pollers too (they pass no token) -- not
+# just the scan -- sparing the shared GITHUB_TOKEN budget their high PR volume
+# was exhausting. Add a login here only for a bot whose PRs are trusted to skip
+# the diff scan.
+TRUSTED_BOTS="omni-resolve-agent[bot] omnigent-ci[bot]"
+if [[ -n "${PR_AUTHOR:-}" ]]; then
+  for bot in $TRUSTED_BOTS; do
+    [[ "$PR_AUTHOR" == "$bot" ]] && { emit false "trusted CI bot ($PR_AUTHOR)"; exit 0; }
+  done
+fi
 
 case "${AUTHOR_ASSOCIATION:-}" in
   OWNER | MEMBER | COLLABORATOR)

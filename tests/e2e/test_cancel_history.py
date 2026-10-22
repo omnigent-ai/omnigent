@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests._helpers.messages import all_message_text as _extract_all_text
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -72,24 +73,6 @@ def _wait_for_session_running(
             raise AssertionError(f"Session reached state {status!r} before running: {body}")
         time.sleep(_POLL_INTERVAL_SECONDS)
     raise AssertionError(f"Session {session_id} didn't reach running within {timeout}s")
-
-
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """
-    Concatenate all output_text blocks from a response body.
-
-    :param body: The terminal response body from
-        GET /v1/responses/{id}.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
 
 
 def _wait_for_cancellation_marker(
@@ -190,6 +173,7 @@ def _wait_for_gate_pending(mock_llm_server_url: str, timeout: float = 30) -> Non
     raise AssertionError(f"No gate pending within {timeout}s")
 
 
+@pytest.mark.compat_smoke
 def test_cancel_appends_history_marker_and_followup_sees_it(
     http_client: httpx.Client,
     live_runner_id: str,
@@ -283,6 +267,7 @@ def test_cancel_appends_history_marker_and_followup_sees_it(
     )
 
 
+@pytest.mark.compat_smoke
 def test_cancel_mid_response_followup_succeeds(
     http_client: httpx.Client,
     live_runner_id: str,

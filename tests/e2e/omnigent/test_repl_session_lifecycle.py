@@ -13,7 +13,6 @@ import contextlib
 import os
 import re
 import signal
-import socket
 import subprocess
 import threading
 import time
@@ -26,6 +25,7 @@ import pexpect
 import pytest
 from omnigent_client import OmnigentClient, SessionsChat
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.omnigent._pexpect_harness import (
     PROMPT_READY,
     STATE_SLEEPING,
@@ -33,7 +33,7 @@ from tests.e2e.omnigent._pexpect_harness import (
     ensure_repl_test_theme_env,
     submit_prompt,
 )
-from tests.e2e.omnigent.conftest import configure_mock_llm
+from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _MODEL = "mock-session-lifecycle"
 _HARNESS = "openai-agents"
@@ -132,17 +132,6 @@ class _ServerHandle:
     log_path: Path
 
 
-def _free_port() -> int:
-    """
-    Reserve and release a localhost TCP port.
-
-    :returns: A currently free port number.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def _write_marker_agent(tmp_path: Path, name: str, marker: str) -> Path:
     """
     Write a minimal agent YAML that replies with a fixed marker.
@@ -178,6 +167,8 @@ def _repl_env(
     :returns: Environment dict for ``pexpect.spawn``.
     """
     env = dict(base_env)
+    # This process uses its per-test HOME for daemon state and logs.
+    env.pop("OMNIGENT_DATA_DIR", None)
     env["HOME"] = str(home)
     env["TERM"] = "xterm-256color"
     env["LINES"] = "40"
@@ -326,7 +317,7 @@ def _newest_session_id(base_url: str, agent_name: str) -> str:
     """
     resp = httpx.get(
         f"{base_url}/v1/sessions",
-        params={"agent_name": agent_name, "limit": 1},
+        params={"visibility": "all", "agent_name": agent_name, "limit": 1},
         timeout=5.0,
     )
     resp.raise_for_status()
@@ -389,7 +380,7 @@ def _drive_turn(
     # Local flow: parse the lifecycle markers rendered during the turn.
     lifecycle_branch = child.expect(
         [
-            r"POST /v1/sessions multipart bundle",
+            r"POST /v1/sessions json agent_id",
             r"resuming existing session id='([^']+)'",
         ],
         timeout=60,
@@ -562,7 +553,7 @@ def _running_server(
     :param tmp_path: Per-test temp directory.
     :yields: The server handle.
     """
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "server.db"
     artifacts = tmp_path / "artifacts"
@@ -885,6 +876,7 @@ async def test_repl_reasoning_effort_threads_through(
         [{"text": "SESSION_REASONING_OK"}],
         key=_MODEL,
     )
+    set_fallback_mock_llm(mock_llm_server_url, _MODEL, "SESSION_REASONING_OK")
     with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
         from omnigent.cli import _bundle
 
@@ -894,7 +886,10 @@ async def test_repl_reasoning_effort_threads_through(
             omnigent_repo_root,
             yaml_path,
             tmp_path,
-            extra_env={k: env[k] for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY") if k in env},
+            extra_env={
+                key: env[key]
+                for key in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OMNIGENT_CONFIG_HOME")
+            },
         ) as runner_id:
             async with OmnigentClient(base_url=server.base_url) as client:
                 created = await client.sessions.create(bundle, reasoning_effort="high")

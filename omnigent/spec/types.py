@@ -83,6 +83,18 @@ class RetryPolicy:
         Used only by the in-process LLM path and the tool-retry
         classifier — L0 SDKs ignore this and L2 receives
         already-classified errors.
+
+    .. note::
+        MCP tool-call reconnect-retries are at-least-once: a call
+        whose connection died — or whose response was lost to a
+        transient network failure after the server accepted the
+        request — is retried on a fresh connection even though the
+        server may have fully executed it. Non-idempotent MCP tools
+        (writes, payments, message sends) can therefore run more
+        than once under transient network failures; tools that need
+        exactly-once semantics must implement their own idempotency
+        (e.g. idempotency keys), or the server should be configured
+        with ``max_retries=0``.
     """
 
     max_retries: int = 7
@@ -420,7 +432,7 @@ class DatabricksAuth:
     ``~/.databrickscfg``.
 
     Use this to route LLM calls through Databricks model serving
-    (Unity AI Gateway or another Databricks-hosted endpoint) using
+    (Unity Gateway or another Databricks-hosted endpoint) using
     a named credential profile.
 
     Example YAML::
@@ -518,6 +530,16 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         the literal string ``"inherit"`` on inline-AgentTool
         sub-specs. Empty dict for other executor types.
 
+        Native-harness autonomy pass-through: for server-spawned
+        sub-agents the session-create path reads ``"yolo"`` (bool or a
+        ``"true"``/``"false"`` string matched case-insensitively, with
+        no whitespace tolerance on the enabling value; enables
+        codex/cursor/kimi bypass flags, opt-out for codex/cursor and
+        opt-in for kimi) and ``"permission_mode"`` (exact-match string;
+        ``bypassPermissions`` maps to the claude-native /
+        antigravity-native skip flags) into the session's
+        ``terminal_launch_args``.
+
         🚨 **TECH DEBT — REMOVE WHEN OMNIGENT COMPAT ENDS.**
         This field exists *solely* to carry harness / profile /
         os_env data for the Omnigent integration (see
@@ -544,6 +566,17 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         key. Used by harness spawn-env builders, context-window
         auto-detection, telemetry, and tool-provider inference.
         ``None`` only when no model is declared anywhere in the spec.
+    :param reasoning_effort: Default reasoning level for this agent,
+        e.g. ``"high"``. Populated by the parser from either the
+        ``executor.reasoning_effort`` YAML key or (for backward
+        compatibility) ``llm.reasoning_effort``. Applies when nothing more
+        specific asks for one: a per-dispatch
+        ``sys_session_send``/``sys_session_create`` argument wins over
+        it, and it in turn wins over whatever default the harness CLI
+        carries on the host. Validated against the harness's effort
+        family where it is applied, so a value the harness cannot
+        accept is reported rather than silently dropped. ``None`` =
+        no spec-level default.
     :param connection: Per-provider connection overrides (credentials,
         endpoint URLs), e.g.
         ``{"api_key": "sk-...", "base_url": "https://..."}``.
@@ -586,6 +619,10 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # Primary model identifier for all executor types. Populated by
     # the parser from executor.model or (backward compat) llm.model.
     model: str | None = None
+    # Spec-level default reasoning effort, applied when no per-dispatch
+    # value asks for one. Populated from executor.reasoning_effort or
+    # (backward compat) llm.reasoning_effort.
+    reasoning_effort: str | None = None
     # Per-provider connection overrides (api_key, base_url, etc.).
     # Populated from executor.connection or (backward compat) llm.connection.
     # None means rely on environment variable / profile defaults.
@@ -628,9 +665,8 @@ class CompactionConfig:
     truncation as emergency fallback.
 
     :param trigger_threshold: Fraction of the model's context window
-        at which proactive compaction fires (after the first overflow
-        has been observed and the window size is known), e.g. ``0.8``
-        means fire at 80% of the window.
+        at which proactive compaction fires, e.g. ``0.8`` means fire
+        at 80% of the window.
     :param recent_window: Number of recent LLM iterations to protect
         from compaction. Items within this window are never cleared or
         summarized — the agent always has verbatim access to its most
@@ -810,8 +846,10 @@ class ToolsConfig:
     Declared tool references from config.yaml.
 
     :param agents: Names of sub-agents this agent can delegate to,
-        e.g. ``["summarizer", "code-reviewer"]``. Each name must
-        match a directory under ``agents/``.
+        e.g. ``["summarizer", "code-reviewer"]``. Each name must be
+        the declared ``name`` of a sub-agent under ``agents/``; the
+        directory it was parsed from may differ (see
+        :attr:`AgentSpec.source_rel_dir`).
     :param builtins: Built-in tools to enable, e.g.
         ``[BuiltinToolConfig(name="web_search")]``. Each
         entry carries the tool name and optional config fields
@@ -838,10 +876,15 @@ class ToolsConfig:
 @dataclass
 class SkillSpec:
     """
-    A parsed skill from ``skills/<name>/SKILL.md``.
+    A parsed skill from ``skills/<dir>/SKILL.md``.
 
-    :param name: Lowercase kebab-case skill identifier, e.g.
-        ``"code-review"``. Must match ``[a-z0-9-]+``.
+    Like Claude Code, the directory name is the invocation identifier
+    and the frontmatter ``name`` is only a human-facing label.
+
+    :param name: Invocation identifier, taken from the skill's
+        directory name, e.g. ``"asd-ste100"`` (typed as
+        ``/asd-ste100``). Bundled skills must match ``[a-z0-9-]+``.
+        Providers may namespace it, e.g. ``"plugin:asd-ste100"``.
     :param description: Human-readable summary of what the skill
         does (max 1024 characters).
     :param content: The body of the SKILL.md file after the YAML
@@ -855,6 +898,10 @@ class SkillSpec:
         orchestration skills (frontmatter ``user-invocable: false``);
         such skills are excluded from the composer's ``/`` menu.
         Defaults to ``True`` (absent frontmatter field = invocable).
+    :param display_name: Human-facing label from the frontmatter
+        ``name``, e.g. ``"Simplified Technical English (ASD-STE100)"``.
+        May contain spaces. ``None`` when it equals :attr:`name` or the
+        source supplies no label (in-memory or CLI-listed skills).
     """
 
     name: str
@@ -862,6 +909,7 @@ class SkillSpec:
     content: str
     skill_dir: Path | None = None
     user_invocable: bool = True
+    display_name: str | None = None
 
 
 @dataclass
@@ -935,7 +983,7 @@ class MCPServerConfig:
     """
 
     name: str
-    transport: Literal["http", "stdio"] = "http"
+    transport: Literal["http", "stdio", "registry"] = "http"
     # HTTP-only fields.
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict, repr=False)
@@ -1012,9 +1060,9 @@ class SharePolicy(str, Enum):
     - :attr:`NONE`: sharing disabled — ``sys_session_share`` is not
       registered at all (default).
     - :attr:`NON_PUBLIC`: the agent may grant access to named users
-      (emails), but NOT to ``__public__`` — no anonymous-read exposure.
+      (emails), but NOT to ``__public__``.
     - :attr:`PUBLIC`: the agent may additionally grant ``__public__``
-      (anonymous read of the full transcript).
+      (link access subject to server authentication and its public permission ceiling).
     """
 
     NONE = "none"
@@ -1102,12 +1150,16 @@ class Phase(str, Enum):
     (``Phase("tool_call")``) and preserves the string form in
     logs / JSON serialization.
 
-    Session-level phases (fire once per turn):
+    Session-level phases:
 
     - ``REQUEST``: after a new user message arrives, before
       the LLM turn.
-    - ``RESPONSE``: after the LLM's final assistant message,
-      before persistence.
+    - ``RESPONSE``: before assistant text is persisted. The runner relay
+      evaluates each nonempty segment, including text before tool calls.
+      ``EvaluationContext.turn_final`` identifies the final segment of a
+      successful turn; response policies should skip only explicit
+      ``False`` for completion actions, preserving callers that supply
+      ``None``. Content checks should evaluate every segment.
 
     Tool phases (fire per tool invocation):
 
@@ -1327,12 +1379,18 @@ class PolicySpec:
         ``GuardrailsSpec.ask_timeout``. Useful when some ASKs
         are cheap (yes/no) and some expensive (review a 50 KB
         document).
+    :param workspace_id: Databricks workspace id that owns a
+        DB-stored policy row (populated when the spec is built
+        from a stored policy). ``None`` for YAML / agent-spec
+        policies, which are not workspace-scoped rows. Surfaced
+        so a denial can be attributed to the owning workspace.
     """
 
     name: str
     on: list[PhaseSelector] | None
     condition: dict[str, str | list[str]] | None = None
     ask_timeout: int | None = None
+    workspace_id: int | None = None
 
 
 @dataclass
@@ -1407,13 +1465,19 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``{"max_retries": 3, "style": "concise"}``.
     :param instructions: Agent system prompt, typically from
         ``AGENTS.md``. ``None`` if no instructions file is present.
-    :param skills: Parsed skills from ``skills/<name>/SKILL.md``.
+    :param skills: Parsed skills from ``skills/<dir>/SKILL.md``.
     :param mcp_servers: MCP server declarations from
         ``tools/mcp/<name>.yaml``.
     :param local_tools: Discovered local tool files from
         ``tools/python/`` and ``tools/typescript/``.
     :param sub_agents: Recursively parsed child agents from
-        ``agents/<name>/``.
+        ``agents/<dir>/``.
+    :param pass_history: Whether a parent session passes its current
+        history when launching this agent as a sub-agent tool.
+    :param pass_histories: Named parent histories passed when launching
+        this agent as a sub-agent tool.
+    :param max_sessions: Maximum concurrent sessions when this agent is
+        exposed as a sub-agent tool. ``None`` means unlimited.
     :param executor: Executor configuration (type, task timeout,
         max iterations). ``executor.type`` is the
         discriminator for the entire spec's validity.
@@ -1502,7 +1566,7 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         session through the server API or CLI. One of
         :class:`SharePolicy`: ``none`` (default — tool not registered),
         ``non-public`` (grant named users only), or ``public`` (also
-        allow ``__public__`` anonymous read). **Defaults to
+        allow ``__public__`` link access). **Defaults to
         ``SharePolicy.NONE``.**
     """
 
@@ -1541,12 +1605,19 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     mcp_servers: list[MCPServerConfig] = field(default_factory=list)
     local_tools: list[LocalToolInfo] = field(default_factory=list)
     sub_agents: list[AgentSpec] = field(default_factory=list)
+    pass_history: bool = False
+    pass_histories: list[str] | None = None
+    max_sessions: int | None = None
     executor: ExecutorSpec = field(default_factory=ExecutorSpec)
     compaction: CompactionConfig | None = None
     guardrails: GuardrailsSpec | None = None
     async_enabled: bool = True
     os_env: OSEnvSpec | None = None
+    # Operator-approved model-signing authority. Separate from sandbox
+    # egress_rules so generic network access cannot authorize credentials.
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] | None = None
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    source_rel_dir: str | None = field(default=None, compare=False)

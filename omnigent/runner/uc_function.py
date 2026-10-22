@@ -36,6 +36,8 @@ import re
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
+from omnigent.debug_logging import runner_primary_session_id
+
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
@@ -192,6 +194,7 @@ async def execute_uc_function(
         "Executing UC function %s on warehouse %s",
         catalog_path,
         warehouse_id,
+        extra={"session_id": runner_primary_session_id()},
     )
 
     # Statement execution is a blocking HTTP call — run in a thread
@@ -231,11 +234,20 @@ async def execute_uc_function(
     # Extract result data.
     result = response.result
     if result is None or result.data_array is None:
-        _logger.debug("UC function %s returned no result data", catalog_path)
+        _logger.debug(
+            "UC function %s returned no result data",
+            catalog_path,
+            extra={"session_id": runner_primary_session_id()},
+        )
         return json.dumps(None)
 
     data = result.data_array
-    _logger.debug("UC function %s result: %s", catalog_path, data)
+    _logger.debug(
+        "UC function %s result: %s",
+        catalog_path,
+        data,
+        extra={"session_id": runner_primary_session_id()},
+    )
     # Single-row, single-column result (common for scalar functions).
     if len(data) == 1 and len(data[0]) == 1:
         return data[0][0] if data[0][0] is not None else json.dumps(None)

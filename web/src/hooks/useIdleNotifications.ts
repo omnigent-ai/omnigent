@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 // Surfaces "a session needs your attention" as OS notifications and a
 // dock/taskbar badge. Rides the existing conversations poll (no new backend
 // signal).
@@ -36,7 +37,6 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   getNotificationPermission,
@@ -121,7 +121,7 @@ function isWindowFocused(): boolean {
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
-  const { data } = useConversations("", true);
+  const { data } = useLoadedConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
   // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.
@@ -181,17 +181,13 @@ export function useIdleNotifications(activeConversationId?: string): void {
   useEffect(() => {
     return onNativeNotificationActivated((path) => navigateRef.current(path));
     // navigateRef is stable; the listener is mounted once for the app's life.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Desktop shell only: clicking an `omnigent://.../c/<id>` deep link for a
-  // server this window is already on sends the in-app path here (no reload —
-  // the main process only forwards it for a window currently on its pinned
-  // server), so we route to it with the same navigate the notification path
-  // uses. basename-less `/c/<id>` is rebased under the mount by the router.
+  // Desktop shell only: native menu actions and same-server deep links send a
+  // basename-less in-app path here, so route it with the same navigate used for
+  // notification clicks. The router rebases it under the current mount.
   useEffect(() => {
     return onOpenPath((path) => navigateRef.current(path));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Clear any deferred turn-end timers on unmount so a pending cue can't fire
@@ -252,7 +248,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
       window.removeEventListener("keydown", onInteract);
     };
     // pushBadge only touches refs, so the once-mounted listener stays fresh.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Marking a row read/unread in the sidebar rewrites the last-seen map;
@@ -270,7 +265,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
     );
     pushBadge(next, convs);
     // pushBadge and the focus state are refs; rerun only when the map changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unseenTick]);
 
   useEffect(() => {
@@ -291,8 +285,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
     );
     pushBadge(unread, conversations);
 
-    if (conversations.length === 0) return;
-
     const idle = detectIdleTransitions(prevStatus.current, conversations);
     const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
     prevStatus.current = buildStatusMap(conversations);
@@ -301,6 +293,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
     const windowFocused = windowFocusedRef.current;
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
     const timers = idleNotifyTimers.current;
+    const presentIds = new Set(conversations.map((c) => c.id));
+    // An inactive scope must not deliver a previously queued notification.
+    for (const [id, timer] of timers) {
+      if (!presentIds.has(id)) {
+        clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
 
     // Resume cancels a pending turn-end: any session back to `running` was just
     // between steps, not finished — drop its deferred cue before it fires.
@@ -316,7 +316,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
     // Clear the "already beeped" mark for a session the user is now viewing
     // (they've dealt with it) or that dropped off the list, so a later finish
     // is allowed to beep again.
-    const presentIds = new Set(conversations.map((c) => c.id));
     for (const id of notifiedSessions.current) {
       if (!presentIds.has(id) || (windowFocused && id === activeConversationId)) {
         notifiedSessions.current.delete(id);

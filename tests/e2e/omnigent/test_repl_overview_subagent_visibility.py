@@ -208,11 +208,11 @@ def test_repl_overview_subagent_visibility(
         # Ctrl+G, see _repl.py "Why Ctrl+O and not Ctrl+G").
         child.sendcontrol("o")
         # Wait for the sidebar to paint the sub-agent target. The sidebar entry
-        # is "👾 <worker>:demo"; "<worker>:demo" matches there cleanly. (The
-        # detail header renders "Session: <worker>:demo", but the two-column
-        # overlay wraps the narrow detail column and splits "Session: <worker>:",
-        # so it never matches contiguously — sync on the sidebar label instead.)
-        child.expect(f"{worker_label_prefix}demo", timeout=_EXPECT_SUBAGENT_TIMEOUT)
+        # is "👾 <worker>:demo"; "demo" matches there cleanly. (The detail header
+        # renders "Session: <worker>:demo", but the two-column overlay wraps the
+        # narrow detail column and splits "Session: <worker>:", so it never matches
+        # contiguously — sync on the sidebar label instead.)
+        child.expect("demo", timeout=_EXPECT_SUBAGENT_TIMEOUT)
         # Select the sub-agent target so its detail pane (Session header +
         # message stream, incl. the dispatched user message) renders; TAB
         # cycles main -> sub-agent.

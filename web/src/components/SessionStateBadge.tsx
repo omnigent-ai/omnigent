@@ -1,5 +1,5 @@
 // Sidebar status indicator. Approval surfaces as a "Needs response" tag so
-// it reads at a glance; running/unseen stay as compact dots. Verbose copy
+// it reads at a glance; other states stay compact. Verbose copy
 // (incl. the approval count) lives in the tooltip.
 
 import { RunningDot } from "@/components/RunningDot";
@@ -8,6 +8,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { SessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
+import { CircleAlertIcon } from "lucide-react";
 
 export interface SessionStateBadgeProps {
   state: SessionState;
@@ -30,7 +31,9 @@ function describe(state: SessionState): Visual {
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-warning/25 text-warning">Needs response</Badge>
+          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">
+            Needs response
+          </Badge>
         ),
       };
     }
@@ -39,7 +42,7 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session running",
         tooltip: "Session running",
-        render: () => <RunningDot className="size-2.5" />,
+        render: () => <RunningDot className="size-3" />,
       };
     case "starting":
       // Same spinner as running — the session is coming up, not yet working.
@@ -47,7 +50,28 @@ function describe(state: SessionState): Visual {
         kind: state.kind,
         ariaLabel: "Session starting up",
         tooltip: "Session starting up",
-        render: () => <RunningDot className="size-2.5" />,
+        render: () => <RunningDot className="size-3" />,
+      };
+    case "error":
+      return {
+        kind: state.kind,
+        ariaLabel: "Latest message is an error",
+        tooltip: "Latest message is an error",
+        render: () => (
+          <CircleAlertIcon aria-hidden className="size-3.5 shrink-0 text-destructive" />
+        ),
+      };
+    case "disconnected":
+      return {
+        kind: state.kind,
+        ariaLabel: "Host disconnected",
+        tooltip: "Host disconnected",
+        render: () => (
+          <span
+            aria-hidden
+            className="size-2 shrink-0 rounded-full border border-muted-foreground"
+          />
+        ),
       };
     case "unseen":
       // Solid brand-pink dot — distinguished from the running indicator,

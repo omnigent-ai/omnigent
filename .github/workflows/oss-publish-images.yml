@@ -1,6 +1,8 @@
-# Builds + pushes two images to GHCR via GITHUB_TOKEN: the server image
-# (ghcr.io/omnigent-ai/omnigent-server, referenced by every deploy template)
-# and the host image (the `host` target of the same Dockerfile,
+# Builds + pushes server image variants and the host image to GHCR via
+# GITHUB_TOKEN. The base server image
+# (ghcr.io/omnigent-ai/omnigent-server) is referenced by every deploy template,
+# while provider variants include their optional SDK. The host image (the
+# `host` target of the same Dockerfile,
 # ghcr.io/omnigent-ai/omnigent-host — default for `sandbox create --provider
 # modal` and server-launched managed hosts). Dockerfile ARGs default to public
 # registries, so no build-args needed.
@@ -69,31 +71,31 @@ jobs:
     runs-on: ubuntu-latest
     # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
     # amd64 runner, which roughly doubles the host-image build time (emulated
-    # npm/pip native steps). A cold-cache four-variant (server+host × amd64+
-    # arm64) build can exceed 60m, and hitting the timeout loses the release's
-    # images silently — give it real headroom.
+    # npm/pip native steps). Cold-cache server, host, and provider image builds
+    # can exceed 60m, and hitting the timeout loses the release's images
+    # silently — give them real headroom.
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Register binfmt handlers so Buildx can cross-build the linux/arm64
       # variant on this amd64 runner (emulated). Without it the arm64 leg of
       # the multi-arch builds below fails with "exec format error".
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1  # v4.4.0
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       # Needed only for the PEP 440 max() on tag pushes; cheap on other events.
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: false
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -115,6 +117,7 @@ jobs:
           HOST_IMAGE="ghcr.io/omnigent-ai/omnigent-host"
           OPENSHELL_IMAGE="ghcr.io/omnigent-ai/omnigent-server-openshell"
           KUBERNETES_IMAGE="ghcr.io/omnigent-ai/omnigent-server-kubernetes"
+          MODAL_IMAGE="ghcr.io/omnigent-ai/omnigent-server-modal"
           SHORT_SHA=$(git rev-parse --short HEAD)
 
           # Immutable per-commit pin, always.
@@ -122,6 +125,7 @@ jobs:
           HOST_TAGS="${HOST_IMAGE}:sha-${SHORT_SHA}"
           OPENSHELL_TAGS="${OPENSHELL_IMAGE}:sha-${SHORT_SHA}"
           KUBERNETES_TAGS="${KUBERNETES_IMAGE}:sha-${SHORT_SHA}"
+          MODAL_TAGS="${MODAL_IMAGE}:sha-${SHORT_SHA}"
 
           # Append a floating/version tag to all images.
           add_tag() {
@@ -129,6 +133,7 @@ jobs:
             HOST_TAGS="${HOST_TAGS},${HOST_IMAGE}:$1"
             OPENSHELL_TAGS="${OPENSHELL_TAGS},${OPENSHELL_IMAGE}:$1"
             KUBERNETES_TAGS="${KUBERNETES_TAGS},${KUBERNETES_IMAGE}:$1"
+            MODAL_TAGS="${MODAL_TAGS},${MODAL_IMAGE}:$1"
           }
 
           # The nightly rebuild of main moves :latest-nightly (bleeding edge).
@@ -169,6 +174,7 @@ jobs:
           echo "host_tags=${HOST_TAGS}" >> "$GITHUB_OUTPUT"
           echo "openshell_tags=${OPENSHELL_TAGS}" >> "$GITHUB_OUTPUT"
           echo "kubernetes_tags=${KUBERNETES_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "modal_tags=${MODAL_TAGS}" >> "$GITHUB_OUTPUT"
 
       # No build-args: the Dockerfile ARGs default to public registries.
       # Multi-arch: each tag publishes as a manifest list spanning amd64 + arm64,
@@ -177,7 +183,7 @@ jobs:
       # the list is a superset, so nothing changes for them.
       - name: Build and push
         id: build-server
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -196,7 +202,7 @@ jobs:
       # cache (cached per platform).
       - name: Build and push host image
         id: build-host
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -215,7 +221,7 @@ jobs:
       # the shared builder-stage layers from the gha cache.
       - name: Build and push openshell server image
         id: build-openshell
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -236,7 +242,7 @@ jobs:
       # the shared builder-stage layers from the gha cache.
       - name: Build and push kubernetes server image
         id: build-kubernetes
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -249,11 +255,32 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: true
+
+      # Modal server variant: the default server image plus the modal SDK
+      # extra (OMNIGENT_EXTRAS=modal), so a server running outside Modal can
+      # provision managed Modal sandboxes. Reuses the shared builder-stage
+      # layers from the gha cache.
+      - name: Build and push modal server image
+        id: build-modal
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.modal_tags }}
+          build-args: |
+            OMNIGENT_EXTRAS=modal
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: true
     outputs:
       server-digest: ${{ steps.build-server.outputs.digest }}
       host-digest: ${{ steps.build-host.outputs.digest }}
       openshell-digest: ${{ steps.build-openshell.outputs.digest }}
       kubernetes-digest: ${{ steps.build-kubernetes.outputs.digest }}
+      modal-digest: ${{ steps.build-modal.outputs.digest }}
 
   generate-sbom:
     # Runs in a separate job with read-only permissions so the Syft
@@ -267,14 +294,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Log in to GHCR (read-only)
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Syft
-        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610  # v0.24.0
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c  # v0.24.3
 
       - name: Generate server SBOM
         run: |
@@ -304,8 +331,15 @@ jobs:
             -o cyclonedx-json=kubernetes-sbom.cdx.json \
             -o spdx-json=kubernetes-sbom.spdx.json
 
+      - name: Generate modal server SBOM
+        run: |
+          set -euo pipefail
+          syft "ghcr.io/omnigent-ai/omnigent-server-modal@${{ needs.build-and-push.outputs.modal-digest }}" \
+            -o cyclonedx-json=modal-sbom.cdx.json \
+            -o spdx-json=modal-sbom.spdx.json
+
       - name: Upload SBOMs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: sbom
           path: |
@@ -317,6 +351,8 @@ jobs:
             openshell-sbom.spdx.json
             kubernetes-sbom.cdx.json
             kubernetes-sbom.spdx.json
+            modal-sbom.cdx.json
+            modal-sbom.spdx.json
           retention-days: 90
 
   reconcile-floating:
@@ -333,20 +369,20 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up crane
-        uses: imjasonh/setup-crane@59c71e96a00b28651f10369ba3359a6d730740a0  # v0.6
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b  # v0.7
         with:
           version: v0.21.6
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: false
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -381,7 +417,7 @@ jobs:
             fi
           }
 
-          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes; do
+          for img in ghcr.io/omnigent-ai/omnigent-server ghcr.io/omnigent-ai/omnigent-host ghcr.io/omnigent-ai/omnigent-server-openshell ghcr.io/omnigent-ai/omnigent-server-kubernetes ghcr.io/omnigent-ai/omnigent-server-modal; do
             retag "${img}" "latest-rc" "${RC_TAG}"
             retag "${img}" "latest" "${LATEST_TAG}"
           done

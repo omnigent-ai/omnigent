@@ -92,12 +92,11 @@ def test_delete_pinned_session_clears_it_from_pinned_section(
 
     # This was the only pinned session, so once the delete patches the pinned
     # cache the whole "Pinned" section unmounts. Assert on the SECTION, not the
-    # row's href: while the delete is in flight the row swaps to a "Deleting…"
-    # status row that has no href, so an href-count assertion flickers to 0
-    # during that transient and would pass even against the buggy build (the
-    # href reappears a beat later when the stale pinned cache re-renders the
-    # row). The section only disappears when the pinned cache is truly empty —
-    # the DeletingRow keeps it mounted — so it can't be fooled by the transient.
+    # row's href: the optimistic splice drops the row from the list caches
+    # immediately, so an href-count assertion goes to 0 even against a build
+    # that forgets the pinned cache (the href reappears a beat later when the
+    # stale pinned cache re-renders the row). The section only disappears when
+    # the pinned cache is truly empty, so it can't be fooled by that window.
     #
     # In place, no reload: a reload refetches ?pinned=true and converges the
     # section on its own, hiding the bug. A tight 3s timeout (vs the suite's

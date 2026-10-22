@@ -48,7 +48,7 @@ Apple finishes processing.
   via an xcodebuild `CURRENT_PROJECT_VERSION=…` override. Nothing in the repo is
   modified, so every `beta`/`release` upload gets a unique, monotonic build
   number with no version churn in git. Don't bump it by hand.
-- **Marketing version** (`CFBundleShortVersionString`, currently `0.1.0`) is set
+- **Marketing version** (`CFBundleShortVersionString`, currently `0.3.2`) is set
   manually. Bump `MARKETING_VERSION` for both the Debug and Release
   configurations of the **Omnigent** target in Xcode (or via `fastlane
 increment_version_number`) when shipping a new user-facing version.
@@ -70,10 +70,11 @@ the latest uploaded TestFlight build and uploads `fastlane/metadata` plus
 ## Other commands
 
 - `bundle exec fastlane tests` — run the `OmnigentTests` unit suite.
-- `bundle exec fastlane screenshots` — build and capture App Store screenshots
-  into `fastlane/screenshots` using the `OmnigentUITests` snapshot target. The
-  lane rebuilds the web UI, starts an isolated local Omnigent server via `uv` on
-  a non-6767 port, and connects the simulator to that server automatically.
+- `bundle exec fastlane screenshots` — build and capture iPhone and iPad App
+  Store screenshots into `fastlane/screenshots` using the `OmnigentUITests`
+  snapshot target. The lane rebuilds the web UI, starts an isolated local
+  Omnigent server via `uv` on a non-6767 port, and connects each simulator to
+  that server automatically.
 - `bundle exec fastlane release` — upload a new binary to App Store Connect
   without submitting it for review. Prefer `prod` after a TestFlight build is
   already uploaded.

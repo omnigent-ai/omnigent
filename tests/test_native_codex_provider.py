@@ -1,7 +1,7 @@
 """Tests for native-Codex provider routing (configure harnesses parity).
 
 Covers :func:`omnigent.inner.codex_executor._provider_codex_config_overrides`
-and :func:`omnigent.codex_native_app_server.resolve_native_codex_launch` —
+and :func:`omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch` —
 the path that makes a native Codex terminal route through a ``configure
 harness`` provider just like the in-process codex harness, instead of only
 the Databricks ucode profile. Providers are constructed via the real config
@@ -10,13 +10,22 @@ parser; config + ambient are isolated so resolution is deterministic.
 
 from __future__ import annotations
 
+import shlex
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 import yaml
 
-from omnigent.codex_native_app_server import resolve_native_codex_launch
+from omnigent.errors import OmnigentError
+from omnigent.harnesses.codex_native.app_server import (
+    build_codex_native_server,
+    codex_session_meta_model_provider,
+    resolve_native_codex_launch,
+)
 from omnigent.inner.codex_executor import _provider_codex_config_overrides
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec, ProviderAuth
 
 
 @pytest.fixture()
@@ -28,6 +37,7 @@ def _isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "CODEX_HOME"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
     return tmp_path
 
 
@@ -52,6 +62,82 @@ def _write_codex_login(home: Path, *, logged_in: bool) -> None:
     codex_dir.mkdir(parents=True, exist_ok=True)
     content = '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-login"}' if logged_in else "{}"
     (codex_dir / "auth.json").write_text(content, encoding="utf-8")
+
+
+@pytest.mark.parametrize("auth_source", ["spec", "global"])
+@pytest.mark.parametrize("endpoint_url", [None, "https://openrouter.ai/api/v1"])
+def test_native_codex_inline_api_key_routes_to_declared_endpoint(
+    _isolated: Path,
+    auth_source: str,
+    endpoint_url: str | None,
+) -> None:
+    """Native Codex uses inline credentials even without a Codex CLI login."""
+    api_key = "test-key with ' quotes"
+    if auth_source == "spec":
+        _seed(
+            _isolated,
+            {
+                "other": {
+                    "kind": "key",
+                    "default": True,
+                    "openai": {"base_url": "https://other.example.com/v1", "api_key": "other-key"},
+                }
+            },
+        )
+        spec = AgentSpec(
+            spec_version=1,
+            name="inline-auth",
+            instructions="Test inline credentials.",
+            executor=ExecutorSpec(
+                type="omnigent", auth=ApiKeyAuth(api_key=api_key, base_url=endpoint_url)
+            ),
+        )
+    else:
+        (_isolated / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"auth": {"type": "api_key", "api_key": api_key, "base_url": endpoint_url}}
+            )
+        )
+        spec = None
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert provider["base_url"] == (endpoint_url or "https://api.openai.com/v1")
+    assert provider["wire_api"] == "responses"
+    assert launch.model == "test-model"
+    assert launch.profile is None
+    assert not launch.login_required
+    assert api_key not in launch.summary
+    assert provider["auth"]["command"] == "sh"
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+
+
+@pytest.mark.parametrize("fragment", [None, "wrong-key"])
+def test_native_codex_resolved_api_key_preserves_literal_dollars(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch, fragment: str | None
+) -> None:
+    """Literal dollars must neither change the bearer nor trigger login fallback."""
+    monkeypatch.delenv("OMNIGENT_KEY_FRAGMENT", raising=False)
+    if fragment is None:
+        monkeypatch.delenv("KEY_FRAGMENT", raising=False)
+    else:
+        monkeypatch.setenv("KEY_FRAGMENT", fragment)
+    api_key = "test-$KEY_FRAGMENT-'quoted'"
+    spec = AgentSpec(
+        spec_version=1,
+        name="literal-key",
+        instructions="Test literal credentials.",
+        executor=ExecutorSpec(type="omnigent", auth=ApiKeyAuth(api_key=api_key)),
+    )
+
+    launch = resolve_native_codex_launch(model="test-model", spec=spec)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert shlex.split(provider["auth"]["args"][-1]) == ["printf", "%s", api_key]
+    assert not launch.login_required
 
 
 def test_provider_codex_overrides_coerce_chat_wire_to_responses() -> None:
@@ -175,7 +261,7 @@ def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     When Codex actually has a stored login, deferring to its own auth is
     correct — the bridged ``auth.json`` authenticates it. The launch still
     pins the built-in ``openai`` provider: the bridged config.toml may set a
-    custom default ``model_provider`` (e.g. isaac's Databricks AI Gateway),
+    custom default ``model_provider`` (e.g. isaac's Databricks Unity Gateway),
     which would otherwise silently hijack the Subscription selection. Failure
     with extra overrides means we synthesized a provider route over a working
     subscription; failure with NO overrides means the pin regressed and a
@@ -365,7 +451,7 @@ def test_resolve_native_codex_launch_cli_config_default_pins_provider(
                 "kind": "cli-config",
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
                 "default": True,
             }
         },
@@ -382,7 +468,7 @@ _DISMISSIBLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]
@@ -436,3 +522,566 @@ def test_resolve_native_codex_launch_undismissed_config_provider_routes_via_pin(
 
     assert launch.config_overrides == ['model_provider="Databricks"']
     assert launch.profile is None
+
+
+def test_config_provider_shadowed_by_nondefault_explicit_entry_still_pins(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A nondefault adopted entry cannot hide Codex's active config provider.
+
+    The explicit entry shadows ambient synthesis by name, but Codex itself
+    still selects the provider from config.toml. An empty launch would make a
+    synthesized resume rollout record OpenAI and lose this provider's auth.
+    """
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    codex_dir = _isolated / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(_DISMISSIBLE_CODEX_CONFIG)
+    _seed(
+        _isolated,
+        {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks Unity Gateway",
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model="test-model")
+
+    assert launch.config_overrides == ['model_provider="Databricks"']
+    assert launch.model == "test-model"
+    assert launch.profile is None
+
+
+def test_shadowed_config_detection_uses_active_profile_provider(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback pins the provider selected by Codex's active profile."""
+    monkeypatch.setattr("omnigent.onboarding.ambient._ollama_reachable", lambda: False)
+    codex_dir = _isolated / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        'profile = "work"\n'
+        'model_provider = "UnusedTopLevel"\n'
+        "[profiles.work]\n"
+        'model_provider = "Databricks"\n'
+        "[model_providers.Databricks]\n"
+        'name = "Databricks Unity Gateway"\n'
+        'base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"\n'
+        "[model_providers.Databricks.auth]\n"
+        'command = "jq"\n'
+    )
+    _seed(
+        _isolated,
+        {
+            "codex-databricks": {
+                "kind": "cli-config",
+                "cli": "codex",
+                "model_provider": "Databricks",
+                "display_name": "Databricks Unity Gateway",
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == ['model_provider="Databricks"']
+    assert launch.profile is None
+
+
+# ── Spec-level credentials (issue #2744) ────────────────────────────────────
+
+
+def _spec(*, auth: ProviderAuth | None = None, profile: str | None = None) -> AgentSpec:
+    """Build a minimal codex-native agent spec carrying spec-level credentials."""
+    config: dict[str, object] = {"harness": "codex-native"}
+    if profile is not None:
+        config["profile"] = profile
+    return AgentSpec(
+        spec_version=1,
+        name="test-codex-native",
+        instructions="You are a test agent.",
+        executor=ExecutorSpec(type="omnigent", config=config, model=None, auth=auth),
+        llm=None,
+        os_env=None,
+    )
+
+
+def test_spec_provider_auth_routes_when_machine_has_nothing(_isolated: Path) -> None:
+    """A spec naming a provider routes natively with zero machine-level config.
+
+    The #2744 repro: no machine provider, no global auth, codex not logged in.
+    Pre-fix the launch fell through to "Codex CLI login" and the TUI parked on
+    the sign-in screen; the spec's named provider must route instead.
+    """
+    _seed(
+        _isolated,
+        {
+            "vendor-spec": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://spec.example.com/v1",
+                    "api_key": "sk-spec",
+                    "models": {"default": "spec-model"},
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="vendor-spec"))
+    )
+
+    joined = "\n".join(launch.config_overrides)
+    assert 'base_url="https://spec.example.com/v1"' in joined
+    assert "printf %s sk-spec" in joined
+    assert launch.model == "spec-model"
+    assert "Codex CLI login" not in launch.summary
+
+
+def test_spec_provider_auth_beats_machine_default(_isolated: Path) -> None:
+    """A spec-named provider wins over the machine-level default provider."""
+    _seed(
+        _isolated,
+        {
+            "machine-default": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://default.example.com/v1",
+                    "api_key": "sk-default",
+                },
+            },
+            "vendor-spec": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://spec.example.com/v1",
+                    "api_key": "sk-spec",
+                },
+            },
+        },
+    )
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="vendor-spec"))
+    )
+
+    joined = "\n".join(launch.config_overrides)
+    assert 'base_url="https://spec.example.com/v1"' in joined
+    assert "default.example.com" not in joined
+
+
+def test_spec_legacy_profile_routes_ucode(_isolated: Path) -> None:
+    """A legacy ``executor.config.profile`` resolves to the ucode profile path."""
+    launch = resolve_native_codex_launch(model=None, spec=_spec(profile="spec-prof"))
+
+    assert launch.profile == "spec-prof"
+
+
+def test_spec_without_auth_keeps_machine_resolution(_isolated: Path) -> None:
+    """A spec with no spec-level credential leaves machine flows untouched."""
+    _seed(
+        _isolated,
+        {
+            "openai": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-oai-default",
+                },
+            }
+        },
+    )
+
+    with_spec = resolve_native_codex_launch(model=None, spec=_spec())
+    without_spec = resolve_native_codex_launch(model=None)
+
+    assert with_spec == without_spec
+    assert 'base_url="https://api.openai.com/v1"' in "\n".join(with_spec.config_overrides)
+
+
+def test_spec_provider_auth_undeclared_fails_loud(_isolated: Path) -> None:
+    """A spec naming an undeclared provider raises instead of a silent timeout."""
+    with pytest.raises(OmnigentError, match="does-not-exist"):
+        resolve_native_codex_launch(
+            model=None, spec=_spec(auth=ProviderAuth(name="does-not-exist"))
+        )
+
+
+def _write_codex_home_login(root: Path, *, logged_in: bool) -> Path:
+    """Write an explicit ``CODEX_HOME`` with a logged-in/out ``auth.json``."""
+    codex_home = root / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    content = '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-codex-login"}' if logged_in else "{}"
+    (codex_home / "auth.json").write_text(content, encoding="utf-8")
+    return codex_home
+
+
+def test_spec_subscription_logged_out_does_not_substitute(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription never silently routes a different provider.
+
+    The machine-DEFAULT subscription path falls through to the first other
+    routable provider when Codex is logged out (a safety net for defaults).
+    For an explicit spec declaration that substitution would run the agent
+    against a credential its author never named, so the launch must surface
+    Codex's own login instead.
+    """
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    _seed(
+        _isolated,
+        {
+            "codex-sub": {"kind": "subscription", "cli": "codex"},
+            "other": {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://other.example.com/v1",
+                    "api_key": "sk-other",
+                },
+            },
+        },
+    )
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert "codex-sub" in launch.summary
+    assert "other.example.com" not in "\n".join(launch.config_overrides)
+
+
+def test_spec_subscription_logged_in_uses_cli_login(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription with a live Codex login defers to it."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.config_overrides == ['model_provider="openai"']
+    assert launch.profile is None
+    assert "codex-sub" in launch.summary
+    assert "Codex is logged in" in launch.summary
+
+
+# ── login_required: headless fail-fast marker ──────────────────────────────
+
+
+def test_no_provider_and_no_codex_login_marks_login_required(_isolated: Path) -> None:
+    """No provider + no Codex login → the launch is marked ``login_required``.
+
+    This is the routing state in which a headless launch parks the TUI on the
+    sign-in screen forever; the flag lets the runner fail chat turns fast
+    instead of burning the thread-start timeout.
+    """
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.profile is None
+    assert "no provider configured" in launch.summary
+    assert launch.login_required is True
+
+
+def test_no_provider_but_codex_logged_in_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No provider but a live Codex login → the TUI starts fine, no fail-fast."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "Codex CLI login" in launch.summary
+    assert launch.login_required is False
+
+
+def test_routable_provider_is_not_login_required(_isolated: Path) -> None:
+    """A provider that routes Codex never sets ``login_required``."""
+    _seed(
+        _isolated,
+        {
+            "vendor": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://vendor.example.com/v1",
+                    "api_key": "sk-vendor",
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides
+    assert launch.login_required is False
+
+
+def test_subscription_default_logged_out_no_fallback_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A logged-out subscription default with nothing to fall through to is doomed headlessly."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "has no usable Codex login" in launch.summary
+    assert launch.login_required is True
+
+
+def test_subscription_default_logged_in_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subscription default with a live Codex login starts fine — no fail-fast."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}})
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "Codex is logged in" in launch.summary
+    assert launch.login_required is False
+
+
+def test_spec_subscription_logged_out_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription on a logged-out Codex is doomed headlessly."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.login_required is True
+
+
+def test_spec_subscription_logged_in_is_not_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec-named subscription with a live Codex login needs no fail-fast."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=True)))
+    _seed(_isolated, {"codex-sub": {"kind": "subscription", "cli": "codex"}})
+
+    launch = resolve_native_codex_launch(
+        model=None, spec=_spec(auth=ProviderAuth(name="codex-sub"))
+    )
+
+    assert launch.login_required is False
+
+
+def test_default_provider_without_credential_logged_out_marks_login_required(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default provider with no usable openai credential falls to a doomed login."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    monkeypatch.delenv("MISSING_CODEX_TEST_KEY", raising=False)
+    _seed(
+        _isolated,
+        {
+            "broken": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://broken.example.com/v1",
+                    # A credential reference that cannot resolve in this
+                    # process: the provider parses but cannot route.
+                    "api_key_ref": "env:MISSING_CODEX_TEST_KEY",
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "no usable openai credential" in launch.summary
+    assert launch.login_required is True
+
+
+# ── ambient built-in provider: config.toml routes without any login ─────────
+
+
+def _write_ambient_codex_config(home: Path, content: str) -> None:
+    """Write ``~/.codex/config.toml`` under the isolated HOME (no auth.json)."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(content, encoding="utf-8")
+
+
+def _write_ambient_codex_profile(home: Path, name: str, content: str) -> None:
+    """Write the ``~/.codex/<name>.config.toml`` file profile ``--profile`` selects."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / f"{name}.config.toml").write_text(content, encoding="utf-8")
+
+
+_AMBIENT_BEDROCK_CONFIG = (
+    'model = "openai.gpt-5.6-terra"\nmodel_provider = "amazon-bedrock"\n\n'
+    '[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n'
+)
+
+
+@pytest.mark.parametrize("provider_id", ["amazon-bedrock", "ollama"])
+def test_ambient_builtin_provider_routes_without_login(_isolated: Path, provider_id: str) -> None:
+    """A config.toml selecting a self-sufficient built-in provider routes like plain ``codex``."""
+    _write_ambient_codex_config(
+        _isolated,
+        f'model = "openai.gpt-5.6-terra"\nmodel_provider = "{provider_id}"\n\n'
+        f'[model_providers.{provider_id}.aws]\nregion = "us-east-1"\n',
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert launch.config_overrides == [f'model_provider="{provider_id}"']
+    assert launch.profile is None
+    assert launch.login_required is False
+    assert provider_id in launch.summary
+    assert "no provider configured" not in launch.summary
+
+
+def test_ambient_openai_selection_still_marks_login_required(_isolated: Path) -> None:
+    """An explicit built-in ``openai`` selection still defers to Codex's own login."""
+    _write_ambient_codex_config(_isolated, 'model_provider = "openai"\nmodel = "gpt-5.4"\n')
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "no provider configured" in launch.summary
+    assert launch.login_required is True
+
+
+def test_configured_provider_wins_over_ambient_builtin(_isolated: Path) -> None:
+    """An Omnigent provider default still routes ahead of the ambient built-in."""
+    _write_ambient_codex_config(_isolated, 'model_provider = "amazon-bedrock"\n')
+    _seed(
+        _isolated,
+        {
+            "vendor": {
+                "kind": "key",
+                "default": True,
+                "openai": {"base_url": "https://vendor.example.com/v1", "api_key": "test-key"},
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    assert "vendor" in launch.summary
+    assert launch.login_required is False
+
+
+@pytest.mark.parametrize("logged_in", [False, True])
+def test_explicit_profile_selecting_openai_overrides_ambient_builtin(
+    _isolated: Path, logged_in: bool
+) -> None:
+    """``--profile`` selecting ``openai`` keeps Codex's own login over an ambient Bedrock base."""
+    _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
+    _write_ambient_codex_profile(
+        _isolated, "openai", 'model_provider = "openai"\nmodel = "gpt-5.4"\n'
+    )
+    _write_codex_login(_isolated, logged_in=logged_in)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "openai"])
+
+    assert "Codex CLI login" in launch.summary
+    assert "amazon-bedrock" not in launch.summary
+    assert codex_session_meta_model_provider(launch) == "openai"
+    assert launch.login_required is (not logged_in)
+
+
+@pytest.mark.parametrize("base_config", ['model = "gpt-5.4"\n', None])
+def test_explicit_profile_selecting_builtin_routes_without_login(
+    _isolated: Path, base_config: str | None
+) -> None:
+    """``--profile`` selecting Bedrock routes the launch whether or not a base config exists."""
+    if base_config is not None:
+        _write_ambient_codex_config(_isolated, base_config)
+    _write_ambient_codex_profile(_isolated, "bedrock", _AMBIENT_BEDROCK_CONFIG)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["-p", "bedrock"])
+
+    assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    assert codex_session_meta_model_provider(launch) == "amazon-bedrock"
+    assert launch.login_required is False
+
+
+def test_explicit_legacy_profile_table_routes_without_login(_isolated: Path) -> None:
+    """The legacy inline ``[profiles.<name>]`` table is layered when no file profile exists."""
+    _write_ambient_codex_config(
+        _isolated, 'model = "gpt-5.4"\n\n[profiles.bedrock]\nmodel_provider = "amazon-bedrock"\n'
+    )
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "bedrock"])
+
+    assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    assert launch.login_required is False
+
+
+def test_unknown_profile_does_not_pin_ambient_builtin(_isolated: Path) -> None:
+    """A profile that exists nowhere leaves the ambient tier alone; start-up reports it."""
+    _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=["--profile", "nope"])
+
+    assert launch.config_overrides == []
+    assert "no provider configured" in launch.summary
+    assert launch.login_required is True
+
+
+@pytest.mark.parametrize(
+    ("args", "error"),
+    [
+        (("--profile",), "Codex requires exactly one value for --profile"),
+        (("--profile", "../invalid"), "Invalid Codex config profile name"),
+        (
+            ("--profile", "one", "--profile", "two"),
+            "Codex requires exactly one value for --profile",
+        ),
+    ],
+)
+def test_malformed_profile_selector_defers_to_launch_arg_validation(
+    _isolated: Path, args: tuple[str, ...], error: str
+) -> None:
+    """A malformed ``--profile`` does not abort routing; start-up validation reports it."""
+    _write_ambient_codex_config(_isolated, _AMBIENT_BEDROCK_CONFIG)
+
+    launch = resolve_native_codex_launch(model=None, terminal_launch_args=args)
+
+    assert launch.config_overrides == ['model_provider="amazon-bedrock"']
+    with pytest.raises(ValueError, match=error):
+        build_codex_native_server(
+            socket_path=_isolated / "codex.sock",
+            codex_home=_isolated / "private-codex-home",
+            cwd=_isolated,
+            model=launch.model,
+            profile=launch.profile,
+            bridge_dir=_isolated / "bridge",
+            codex_path=sys.executable,
+            extra_config_overrides=launch.config_overrides,
+            terminal_launch_args=args,
+        )
+
+
+def test_global_api_key_routes_without_model_or_cli_login(
+    _isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inline key authenticates headlessly while Codex chooses its own model."""
+    monkeypatch.setenv("CODEX_HOME", str(_write_codex_home_login(_isolated, logged_in=False)))
+    (_isolated / "config.yaml").write_text(
+        yaml.safe_dump({"auth": {"type": "api_key", "api_key": "test-global-key"}})
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    assert config["model_provider"] == "omnigent_provider"
+    assert "model" not in config
+    assert launch.model is None
+    assert launch.login_required is False

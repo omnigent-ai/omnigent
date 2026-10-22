@@ -10,18 +10,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
+import traceback
 from pathlib import Path
 from typing import ClassVar
 
+import click
 import pytest
 import yaml
 
+from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
+    SandboxGoneError,
     SandboxLauncher,
     render_host_config_write_command,
+    supervise_host_command,
 )
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
+
+_HOST_LAUNCH = "FOO=bar omnigent host --server https://srv"
 
 
 class _RecordingLauncher(SandboxLauncher):
@@ -67,13 +77,106 @@ def test_run_background_wraps_command_in_sh_c() -> None:
     """
     launcher = _RecordingLauncher()
 
-    launcher.run_background("sb-1", "FOO=bar omnigent host --server https://srv")
+    launcher.run_background("sb-1", _HOST_LAUNCH)
 
     [cmd] = launcher.commands
     assert cmd == (
-        "setsid nohup sh -c 'FOO=bar omnigent host --server https://srv' "
-        "> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
+        f"setsid nohup sh -c {shlex.quote(supervise_host_command(_HOST_LAUNCH))} "
+        ">> /tmp/omnigent-host.log 2>&1 < /dev/null & echo launched"
     )
+    # The env prefix stays attached to the launch inside the quoted script, so
+    # the inner shell re-applies it on every supervised restart attempt.
+    assert _HOST_LAUNCH in cmd
+
+
+@pytest.mark.parametrize(
+    ("exit_codes", "expected_attempts", "expected_rc"),
+    [
+        ([0], 1, 0),
+        ([HOST_FATAL_EXIT_CODE], 1, HOST_FATAL_EXIT_CODE),
+        ([143], 1, 143),
+        ([1, 9, 0], 3, 0),
+        ([1, HOST_FATAL_EXIT_CODE], 2, HOST_FATAL_EXIT_CODE),
+    ],
+)
+def test_supervise_host_command_restarts_only_on_crash(
+    tmp_path: Path,
+    exit_codes: list[int],
+    expected_attempts: int,
+    expected_rc: int,
+) -> None:
+    """
+    The supervisor restarts a crashed host and stands down on a deliberate exit.
+
+    A dead host leaves a healthy, still-billing sandbox with nothing running in
+    it, and the only recovery is re-provisioning a fresh one — which discards
+    the workspace. So a crash (any unexpected code) must restart in place. But a
+    clean exit, the fatal credential/version code, and SIGTERM are all
+    deliberate: retrying those would spin forever on a failure that can never
+    succeed, unwatched, inside a remote sandbox.
+
+    Runs the real generated script through ``sh`` against a fake host that exits
+    with a scripted sequence of codes, with ``sleep`` stubbed out so the backoff
+    doesn't slow the test.
+    """
+    proc, launches = _run_supervisor(tmp_path, exit_codes)
+
+    assert proc.returncode == expected_rc
+    assert launches == expected_attempts
+
+
+def test_supervise_host_command_clamps_the_restart_backoff(tmp_path: Path) -> None:
+    """
+    The restart delay doubles but never exceeds the cap.
+
+    Without the clamp a long-running crash loop would back off unboundedly and
+    stop retrying in any useful timeframe; with it, a persistently failing host
+    settles into a steady slow retry instead of a hot loop.
+    """
+    proc, _ = _run_supervisor(tmp_path, [1] * 8 + [0])
+
+    delays = [int(m) for m in re.findall(r"restarting in (\d+)s", proc.stderr)]
+    assert delays == [1, 2, 4, 8, 16, 30, 30, 30]
+    # The attempt counter makes a wedged box observable in the log.
+    assert "attempt 8;" in proc.stderr
+
+
+def _run_supervisor(
+    tmp_path: Path, exit_codes: list[int]
+) -> tuple[subprocess.CompletedProcess[str], int]:
+    """
+    Run the real supervisor script against a fake host with scripted exit codes.
+
+    :param tmp_path: Per-test scratch dir.
+    :param exit_codes: Exit code for each successive host launch, in order.
+    :returns: ``(completed_process, launch_count)``.
+    """
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    # Stub `sleep` so the backoff is exercised without actually waiting.
+    sleep_stub = stub_bin / "sleep"
+    sleep_stub.write_text("#!/bin/sh\nexit 0\n")
+    sleep_stub.chmod(0o755)
+
+    plan = tmp_path / "plan"
+    plan.write_text("".join(f"{code}\n" for code in exit_codes))
+    attempts = tmp_path / "attempts"
+    attempts.write_text("0\n")
+    fake_host = tmp_path / "fake-host"
+    fake_host.write_text(
+        "#!/bin/sh\n"
+        f'n=$(cat {attempts}); n=$((n + 1)); echo "$n" > {attempts}\n'
+        f'exit "$(sed -n "${{n}}p" {plan})"\n'
+    )
+    fake_host.chmod(0o755)
+
+    proc = subprocess.run(
+        ["sh", "-c", supervise_host_command(str(fake_host))],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}"},
+    )
+    return proc, int(attempts.read_text().strip())
 
 
 def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
@@ -111,6 +214,38 @@ def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
     assert out == "tok-123:host_abc:managed-abc"
 
 
+@pytest.mark.parametrize("error_type", [click.ClickException, SandboxGoneError])
+def test_start_host_launch_failure_redacts_the_token(
+    error_type: type[click.ClickException],
+) -> None:
+    """
+    Providers echo a failed command in their error, the server shows that error
+    to the user as the session failure, and the host launch command carries the
+    launch token. The type must survive: a wake recreates on SandboxGoneError.
+    """
+
+    class _FailingLaunchLauncher(_RecordingLauncher):
+        def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
+            if "omnigent host --server" in command:
+                raise error_type(
+                    f"Remote command failed on sandbox '{sandbox_id}' (exit 1): {command}"
+                ) from RuntimeError(command)
+            return super().run(sandbox_id, command, check=check)
+
+    with pytest.raises(error_type) as caught:
+        _FailingLaunchLauncher().start_host(
+            "sb-1",
+            token="tok-secret-123",
+            host_id="host_abc",
+            host_name="managed-abc",
+            server_url="https://srv",
+        )
+
+    assert "OMNIGENT_HOST_TOKEN=[redacted]" in caught.value.message
+    rendered = "".join(traceback.format_exception(caught.value)) + repr(caught.value)
+    assert "tok-secret-123" not in rendered
+
+
 def test_start_host_default_materialize_clones_repo() -> None:
     """
     With a ``repo_url``, the default :meth:`materialize_workspace` clones into
@@ -126,15 +261,44 @@ def test_start_host_default_materialize_clones_repo() -> None:
         host_id="host_abc",
         host_name="managed-abc",
         server_url="https://srv",
-        repo_url="https://github.com/org/repo",
-        repo_branch="release-1.2",
-        repo_name="repo",
+        repos=[
+            RepoWorkspace(
+                url="https://github.com/org/repo", branch="release-1.2", repo_name="repo"
+            )
+        ],
     )
 
     assert workspace == "/root/workspace/repo"
     assert (
         "git clone --branch release-1.2 --single-branch -- "
         "https://github.com/org/repo /root/workspace/repo"
+    ) in launcher.commands
+
+
+def test_start_host_clones_multiple_repos_into_sibling_dirs() -> None:
+    """
+    Several repos → the exec-model default clones each into
+    ``<workspace>/<repo_name>`` and returns the parent workspace (the working
+    directory that holds them all), matching the entrypoint (k8s) rule.
+    """
+    launcher = _RecordingLauncher()
+
+    workspace = launcher.start_host(
+        "sb-1",
+        token="tok-123",
+        host_id="host_abc",
+        host_name="managed-abc",
+        server_url="https://srv",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/api", branch=None, repo_name="api"),
+            RepoWorkspace(url="https://github.com/org/web", branch="dev", repo_name="web"),
+        ],
+    )
+
+    assert workspace == "/root/workspace"
+    assert "git clone -- https://github.com/org/api /root/workspace/api" in launcher.commands
+    assert (
+        "git clone --branch dev --single-branch -- https://github.com/org/web /root/workspace/web"
     ) in launcher.commands
 
 
@@ -173,9 +337,7 @@ def test_materialize_workspace_override_resolves_local_checkout_without_cloning(
         host_id="host_abc",
         host_name="managed-abc",
         server_url="https://srv",
-        repo_url="https://github.com/org/repo",
-        repo_branch="main",
-        repo_name="repo",
+        repos=[RepoWorkspace(url="https://github.com/org/repo", branch="main", repo_name="repo")],
     )
 
     assert workspace == "/checkouts/repo"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,6 +67,8 @@ def test_plugin_state_loads_builtins() -> None:
     state = plugin_state()
     assert isinstance(state, SandboxProviderPluginState)
     assert "modal" in state
+    assert "blaxel" in state
+    assert "gensee" in state
     assert "kubernetes" in state
 
 
@@ -93,6 +94,8 @@ def test_available_providers_returns_builtins() -> None:
     reset_plugin_state_for_tests()
     names = available_providers()
     assert "modal" in names
+    assert "blaxel" in names
+    assert "gensee" in names
     assert "kubernetes" in names
 
 
@@ -116,6 +119,28 @@ def test_instantiate_loads_built_in_provider() -> None:
     reset_plugin_state_for_tests()
     launcher = instantiate("modal")
     assert launcher.provider == "modal"
+
+
+def test_instantiate_loads_blaxel_without_optional_sdk() -> None:
+    """The lazy Blaxel module imports before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("blaxel")
+    assert launcher.provider == "blaxel"
+
+
+def test_instantiate_loads_microsandbox_without_optional_sdk() -> None:
+    """The lazy microsandbox module imports before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("microsandbox")
+    assert launcher.provider == "microsandbox"
+
+
+def test_instantiate_loads_gensee_from_core() -> None:
+    """Gensee resolves to the built-in launcher without a plugin package."""
+    reset_plugin_state_for_tests()
+    launcher = instantiate("gensee")
+    assert launcher.provider == "gensee"
+    assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.gensee"
 
 
 def test_instantiate_unknown_raises() -> None:
@@ -271,21 +296,30 @@ def test_get_launcher_uses_registry() -> None:
     assert launcher.provider == "modal"
 
 
+def test_get_launcher_passes_server_url_to_microsandbox() -> None:
+    """CLI server context reaches the microsandbox network configuration."""
+    reset_plugin_state_for_tests()
+    launcher = get_launcher(
+        "microsandbox",
+        server_url="http://host.microsandbox.internal:8799",
+    )
+    assert launcher._host_ports == (8799,)
+
+
 def test_get_launcher_unknown_raises_click_exception() -> None:
     """An unknown provider still surfaces as a click.ClickException."""
     reset_plugin_state_for_tests()
-    with contextlib.suppress(DeprecationWarning):
-        with pytest.raises(
-            click.ClickException,
-            match="Unknown or unavailable sandbox provider",
-        ):
-            get_launcher("definitely-not-real")
+    with pytest.raises(
+        click.ClickException,
+        match="Unknown or unavailable sandbox provider",
+    ):
+        get_launcher("definitely-not-real")
 
 
 def test_instantiate_rejects_non_launcher_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A contribution whose launcher class is not a SandboxLauncher is rejected."""
+    """A contribution without the host-launch contract is rejected."""
     reset_plugin_state_for_tests()
     contribution = SandboxProviderContribution(
         name="not-a-launcher",
@@ -309,5 +343,13 @@ def test_instantiate_rejects_non_launcher_class(
         lambda _: _NotALauncher,
     )
 
-    with pytest.raises(SandboxRegistryError, match="not a SandboxLifecycle subclass"):
+    with pytest.raises(SandboxRegistryError, match="not a SandboxHostLauncher subclass"):
         instantiate("not-a-launcher")
+
+
+def test_databricks_provider_is_builtin_and_instantiates_without_extras() -> None:
+    """Instantiating the launcher touches no SDK; it is imported on first use."""
+    reset_plugin_state_for_tests()
+    assert "databricks" in available_providers()
+    launcher = instantiate("databricks")
+    assert launcher.provider == "databricks"

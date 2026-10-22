@@ -1,5 +1,17 @@
-import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
+import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseHostsModule from "@/hooks/useHosts";
+import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as FileViewerContextModule from "@/shell/FileViewerContext";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
 
@@ -7,7 +19,7 @@ import { useChatStore } from "@/store/chatStore";
 // mentions); these status-line tests don't exercise it, so stub the hook to
 // avoid wrapping every render in a QueryClientProvider.
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useWorkspaceChangedFiles")>();
+  const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
@@ -15,30 +27,79 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   };
 });
 
+// ComposerStatusLine's PR link reads GitHub info via a TanStack query; stub it
+// (default: no PR) so these tests don't need a QueryClientProvider, matching
+// the workspace-files stub above.
+vi.mock("@/hooks/usePullRequests", () => ({
+  usePullRequestInfo: () => usePullRequestInfoMock(),
+}));
+vi.mock("@/shell/FileViewerContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileViewerContextModule>()),
+  useOpenGithubTab: () => openGithubTabMock,
+}));
+// PR/context/branch now render in the workspace bar via these shared hooks
+// (their own component + hook tests cover the variations); stub them so the
+// composer renders in isolation with a neutral empty status.
+const { useComposerGitStatusMock } = vi.hoisted(() => ({
+  useComposerGitStatusMock: vi.fn(),
+}));
+vi.mock("@/hooks/useComposerGitStatus", () => ({
+  useComposerGitStatus: () => useComposerGitStatusMock(),
+}));
+
+function composerGitStatus(overrides: Record<string, unknown> = {}) {
+  return {
+    branch: null,
+    branchState: "unknown",
+    isWorktree: null,
+    worktreePath: null,
+    creationBranch: null,
+    repoNameWithOwner: "omnigent-ai/omnigent",
+    githubState: "ready",
+    prCount: 0,
+    prNumber: null,
+    refresh: () => {},
+    refreshing: false,
+    ...overrides,
+  };
+}
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: () => ({ children: [] }),
+}));
+
 // HostBadge now lives in the status-line tray (left of the worktree branch).
 // It reads the session's host binding via these hooks; stub them so the badge
 // renders deterministically without a QueryClient / RunnerHealth provider. The
 // default is "not host-bound", so the badge self-hides and the existing branch/
 // ring/harness assertions are unchanged; host-aware tests override per case.
-const { useSessionMock, useHostsMock, useSessionHostOnlineMock } = vi.hoisted(() => ({
+const {
+  useSessionMock,
+  useHostsMock,
+  useSessionHostOnlineMock,
+  usePullRequestInfoMock,
+  openGithubTabMock,
+} = vi.hoisted(() => ({
   useSessionMock: vi.fn(),
   useHostsMock: vi.fn(),
   useSessionHostOnlineMock: vi.fn(),
+  usePullRequestInfoMock: vi.fn(),
+  openGithubTabMock: vi.fn(),
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useSession")>()),
+  ...(await importOriginal<typeof UseSessionModule>()),
   useSession: (id: string | null | undefined) => useSessionMock(id),
 }));
 vi.mock("@/hooks/useHosts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useHosts")>()),
+  ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: (opts: unknown) => useHostsMock(opts),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/RunnerHealthProvider")>()),
+  ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/agentLabels")>()),
+  ...(await importOriginal<typeof AgentLabelsModule>()),
   useBrainHarnessLabels: () => ({
     "claude-sdk": "Claude SDK",
     codex: "Codex",
@@ -49,6 +110,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   }),
 }));
 
+import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
 import { Composer, composerHarnessLabel, formatModelEffortStatusLabel } from "./ChatPage";
 
 // Pins the visibility rules for the status-line tray under the composer:
@@ -65,14 +127,12 @@ function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) 
     isWorking: false,
     disabled: false,
     onSend: vi.fn(),
+    onNewSession: vi.fn(),
     onStop: vi.fn(),
     agents: undefined,
     selectedAgentId: null,
     permissionLevel: null,
     readOnlyReason: null,
-    replyQuotes: [],
-    onRemoveQuote: vi.fn(),
-    onClearAllQuotes: vi.fn(),
     effortLevels: ["low", "medium", "high"] as const,
     showEffort: true,
     showModels: false,
@@ -121,16 +181,18 @@ describe("Composer status line (branch + context ring)", () => {
     });
     useHostsMock.mockReset().mockReturnValue({ data: [] });
     useSessionHostOnlineMock.mockReset().mockReturnValue(undefined);
+    usePullRequestInfoMock.mockReset().mockReturnValue({ data: undefined });
+    useComposerGitStatusMock.mockReset().mockReturnValue(composerGitStatus());
+    openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
-      skills: [],
       contextWindow: null,
       tokensUsed: null,
       sessionCostUsd: null,
       gitBranch: null,
       llmModel: null,
-      selectedModel: null,
-      selectedEffort: null,
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
@@ -161,12 +223,15 @@ describe("Composer status line (branch + context ring)", () => {
     expect(statusLine()).toBeNull();
   });
 
+  // The PR link moved from the status line into the workspace bar's shared
+  // ComposerPrLink (fed by useComposerGitStatus); its PR-count variations and
+  // click-through are covered by ComposerPrLink.test + useComposerGitStatus.test.
+
   it("shows the context ring with the correct used percentage", () => {
     useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000 });
     renderComposer();
-    expect(statusLine()).not.toBeNull();
-    // 25k of 100k → 25% used; a wrong value means the ring wired the
-    // wrong store fields through its props.
+    // The ring moved to the workspace bar (ComposerContextRing); assert it
+    // renders the used percentage wherever it now lives — 25k of 100k → 25%.
     expect(screen.getByLabelText("25% of context used")).toBeInTheDocument();
   });
 
@@ -190,7 +255,7 @@ describe("Composer status line (branch + context ring)", () => {
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
-      selectedEffort: "medium",
+      sessionReasoningEffort: "medium",
       nativeVendorOwnsModel: true,
       contextWindow: 100_000,
       tokensUsed: 25_000,
@@ -237,33 +302,11 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.queryByLabelText(/context used/)).toBeNull();
   });
 
-  it("shows the worktree branch on the left and truncates it", () => {
-    useChatStore.setState({
-      gitBranch: "feature/a-very-long-worktree-branch-name-that-would-wrap",
-    });
-    renderComposer();
-    const branch = screen.getByTestId("composer-git-branch");
-    expect(branch).toHaveTextContent("feature/a-very-long-worktree-branch-name-that-would-wrap");
-    // `truncate` (overflow-hidden + ellipsis + nowrap) is the guard that
-    // keeps a long branch from wrapping the tray onto a second line.
-    expect(branch).toHaveClass("truncate");
-  });
-
-  it("renders the tray with a branch even when the ring is absent", () => {
-    // The branch alone is enough to surface the tray — the visibility
-    // guard must not key off the ring only.
-    useChatStore.setState({ gitBranch: "main" });
-    renderComposer();
-    expect(statusLine()).not.toBeNull();
-    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("main");
-  });
-
-  it("shows no branch when the session uses no worktree", () => {
-    useChatStore.setState({ contextWindow: 100_000, tokensUsed: 25_000, gitBranch: null });
-    renderComposer();
-    expect(statusLine()).not.toBeNull();
-    expect(screen.queryByTestId("composer-git-branch")).toBeNull();
-  });
+  // The worktree branch (live text, truncation, honest placeholder) moved into
+  // the shared ComposerWorkspaceStatus, fed by useComposerGitStatus's
+  // host-derived branch state — covered by ComposerWorkspaceStatus.test +
+  // useComposerGitStatus.test. The composer parity test asserts the bar still
+  // renders the shared branch control.
 
   it("shows a persistent Plan mode badge when Codex Plan mode is active", () => {
     useChatStore.setState({ codexPlanMode: true });
@@ -273,18 +316,11 @@ describe("Composer status line (branch + context ring)", () => {
     expect(screen.getByTestId("composer-plan-mode")).toHaveTextContent("Plan mode");
   });
 
-  it("places Plan mode to the left of the context ring", () => {
-    useChatStore.setState({ codexPlanMode: true, contextWindow: 100_000, tokensUsed: 25_000 });
-    renderComposer({ modelPickerKind: "codex" });
+  // "Plan mode left of the context ring" retired: the ring moved to the
+  // workspace bar (above the status line), so their in-line ordering no longer
+  // applies. The plan-mode badge itself is covered by the test above.
 
-    const plan = screen.getByTestId("composer-plan-mode");
-    const ring = screen.getByLabelText("25% of context used");
-    expect(plan.compareDocumentPosition(ring) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
-  });
-
-  it("renders the tray for a host-bound session with no branch or ring", () => {
+  it("keeps a bound host visible in the shared toolbar without an empty footer", () => {
     // Regression: removing the harness label from the tray must not take the
     // host badge + context footer with it. A host-bound session (e.g. a codex
     // session with no worktree branch, before the ring populates) still shows
@@ -293,40 +329,60 @@ describe("Composer status line (branch + context ring)", () => {
     useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     renderComposer();
 
-    expect(statusLine()).not.toBeNull();
-    expect(screen.getByTestId("host-badge")).toHaveTextContent("mac-laptop");
+    expect(statusLine()).toBeNull();
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName(
+      "Host mac-laptop, online",
+    );
   });
 
-  it("shows the host badge to the left of the worktree branch", () => {
+  it("places the host in the action row below the shared workspace bar", () => {
     // The host indicator moved out of the chat header into this tray; it
     // sits immediately left of the worktree branch.
     bindHost("mac-laptop");
-    useChatStore.setState({ gitBranch: "geist" });
+    useComposerGitStatusMock.mockReturnValue(
+      composerGitStatus({
+        branch: "geist",
+        branchState: "ready",
+        isWorktree: true,
+        worktreePath: "/workspace/geist",
+      }),
+    );
     renderComposer();
 
-    const host = screen.getByTestId("host-badge");
+    const host = screen.getByTestId("composer-host-select");
     const branch = screen.getByTestId("composer-git-branch");
-    expect(host).toHaveTextContent("mac-laptop");
-    expect(host.compareDocumentPosition(branch) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+    expect(host).toHaveAccessibleName("Host mac-laptop, online");
+    expect(branch.compareDocumentPosition(host) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
   });
 
-  it("turns the host badge into a clickable reconnect prompt for an offline host", () => {
-    // host_offline surfaces the reconnect affordance in the host badge (in
-    // place of the old banner below the composer): the tray shows even with
-    // no branch/ring, and clicking the badge opens the reconnect help.
+  it("keeps reconnect help available from the shared host menu", () => {
+    // An offline host surfaces the reconnect affordance in the host badge (in
+    // place of the old banner below the composer) while keeping the host name:
+    // the tray shows even with no branch/ring, and clicking opens the help.
     bindHost("mac-laptop");
     useSessionHostOnlineMock.mockReturnValue(false);
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
     const onShowReconnectHelp = vi.fn();
-    renderComposer({ hostOffline: true, onShowReconnectHelp });
+    renderComposer({ onShowReconnectHelp });
 
-    expect(statusLine()).not.toBeNull();
-    const badge = screen.getByTestId("host-badge");
+    expect(statusLine()).toBeNull();
+    const badge = screen.getByTestId("composer-host-select");
     expect(badge.tagName).toBe("BUTTON");
-    expect(badge).toHaveTextContent(/Host is offline/);
-    badge.click();
+    expect(badge).toHaveAccessibleName("Host mac-laptop, offline");
+    fireEvent.keyDown(badge, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the tray hidden for a session with no host and nothing else to show", () => {
+    // onShowReconnectHelp is now passed for every session, so it must not
+    // resurrect an empty tray on a session with no host badge to hang it on.
+    useChatStore.setState({ gitBranch: null, contextWindow: null, tokensUsed: null });
+    renderComposer({ onShowReconnectHelp: vi.fn() });
+
+    expect(statusLine()).toBeNull();
   });
 
   it("hides the host badge on a sub-agent session", () => {
@@ -336,10 +392,17 @@ describe("Composer status line (branch + context ring)", () => {
     // host_offline anyway — a stranded child is local_stranded, handled by the
     // banner elsewhere.
     bindHost("mac-laptop");
-    useChatStore.setState({ gitBranch: "geist" });
+    useComposerGitStatusMock.mockReturnValue(
+      composerGitStatus({
+        branch: "geist",
+        branchState: "ready",
+        isWorktree: true,
+        worktreePath: "/workspace/geist",
+      }),
+    );
     renderComposer({ subAgentLabel: "check-eligibility" });
 
-    expect(screen.queryByTestId("host-badge")).toBeNull();
+    expect(screen.queryByTestId("composer-host-select")).toBeNull();
     expect(screen.getByTestId("composer-git-branch")).toBeInTheDocument();
   });
 });
@@ -354,6 +417,31 @@ describe("composerHarnessLabel", () => {
     expect(composerHarnessLabel(null, "polly", "pi")).toBe("Polly (Pi)");
   });
 
+  // A Claude Code sub-agent's sub_agent_name is the Task tool's
+  // `subagent_type` ("general-purpose"), and the child reuses the parent's
+  // claude-native agent row — so without the wrapper the label reads
+  // "General-purpose" instead of naming the product running it.
+  it("reads a native sub-agent child as its vendor, not the vendor-side agent type", () => {
+    expect(
+      composerHarnessLabel(
+        null,
+        "general-purpose",
+        "claude-native",
+        BRAIN_HARNESS_LABELS,
+        "claude-code-native-ui-subagent",
+      ),
+    ).toBe("Claude Code");
+    expect(
+      composerHarnessLabel(
+        null,
+        "reviewer",
+        null,
+        BRAIN_HARNESS_LABELS,
+        "codex-native-ui-subagent",
+      ),
+    ).toBe("Codex");
+  });
+
   it("falls back to the agent name alone when the harness is unmapped", () => {
     expect(composerHarnessLabel(null, "polly", "some-unknown-harness")).toBe("Polly");
     expect(composerHarnessLabel(null, "polly", null)).toBe("Polly");
@@ -365,7 +453,7 @@ describe("composerHarnessLabel", () => {
 });
 
 describe("formatModelEffortStatusLabel", () => {
-  it("uses Codex display names exactly as returned in model metadata", () => {
+  it("uses the Codex display name from model metadata", () => {
     expect(
       formatModelEffortStatusLabel("gpt-5.5", "xhigh", [
         {
@@ -382,7 +470,7 @@ describe("formatModelEffortStatusLabel", () => {
           isDefault: true,
         },
       ]),
-    ).toBe("codex says GPT-5.5 xhigh");
+    ).toBe("codex says GPT-5.5 xHigh");
   });
 
   it("leaves unknown model ids raw", () => {
@@ -392,8 +480,27 @@ describe("formatModelEffortStatusLabel", () => {
     );
   });
 
+  it("resolves an exact Claude alias to its catalog display name", () => {
+    expect(
+      formatModelEffortStatusLabel("sonnet[1m]", "high", [
+        { id: "sonnet[1m]", model: "claude-sonnet-5[1m]", displayName: "Sonnet 5 (1M context)" },
+      ]),
+    ).toBe("Sonnet 5 (1M context) High");
+  });
+
+  it("preserves a catalog-less Claude alias without claiming a version", () => {
+    expect(formatModelEffortStatusLabel("sonnet[1m]", "high")).toBe("sonnet[1m] High");
+    expect(formatModelEffortStatusLabel("opus[1m]", null)).toBe("opus[1m]");
+  });
+
+  it("preserves catalog-less IDs verbatim", () => {
+    expect(formatModelEffortStatusLabel("sonnet", null)).toBe("sonnet");
+    expect(formatModelEffortStatusLabel("sonnet_5", null)).toBe("sonnet_5");
+    expect(formatModelEffortStatusLabel("fable", null)).toBe("fable");
+  });
+
   it("omits missing pieces", () => {
-    expect(formatModelEffortStatusLabel("opus", null)).toBe("Opus");
+    expect(formatModelEffortStatusLabel("opus", null)).toBe("opus");
     expect(formatModelEffortStatusLabel(null, "low")).toBe("Low");
     expect(formatModelEffortStatusLabel(null, null)).toBeNull();
   });

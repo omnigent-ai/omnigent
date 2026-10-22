@@ -1,20 +1,42 @@
 name: Windows (native)
 
-# Smoke + unit check that omnigent imports, the CLI loads, and the
-# cross-platform process/sandbox primitives work on native Windows. This is a
-# NON-BLOCKING signal while native Windows support stabilizes: it is not wired
-# into merge-ready.yml, and the broader unit sweep runs with continue-on-error
-# so POSIX-only gaps don't gate merges. The hard checks (import, --help, the
-# Windows-support unit tests) must pass.
+# Dependabot Python/Actions merges require the smoke + unit job.
+# The broader unit sweep remains nonblocking while Windows support stabilizes.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore:
+      - 'web/**'
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
+      - 'tests/e2e/**'
+      - 'tests/integration/**'
   push:
     branches:
       - main
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore:
+      - 'web/**'
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
+      - 'tests/e2e/**'
+      - 'tests/integration/**'
 
 permissions:
   contents: read
@@ -30,27 +52,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  scope:
+    name: Windows scope
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.scope.outputs.windows }}
+      dependency: ${{ steps.scope.outputs.dependency }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
+
   windows-smoke:
     name: Windows smoke + unit
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.windows == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --locked --extra dev
+        # tests/inner includes tracing tests that import the OpenTelemetry SDK.
+        run: uv sync --locked --group test --extra tracing
 
       - name: Import + CLI smoke
         run: |
@@ -62,6 +107,16 @@ jobs:
           uv run pytest
           tests/inner/test_proc_and_platform.py
           tests/runtime/test_process_manager.py
+          -p no:cacheprovider -q
+
+      - name: Codex skill junction regressions (hard)
+        run: >-
+          uv run pytest
+          tests/inner/test_codex_executor.py::test_populate_codex_skills_preserves_linked_junctions_without_symlink_privilege
+          tests/inner/test_codex_executor.py::test_populate_codex_skills_copy_mode_skips_nested_junctions
+          tests/inner/test_codex_staging.py::test_skills_link_junction_resolves_into_the_granted_directory
+          tests/inner/test_codex_staging.py::test_skills_refresh_does_not_follow_junctions
+          tests/inner/test_codex_staging.py::test_skills_refresh_rejects_junction_root
           -p no:cacheprovider -q
 
       - name: Broader unit sweep (non-blocking)

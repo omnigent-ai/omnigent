@@ -8,7 +8,10 @@ on:
     paths:
       - .github/scripts/waiting_on_author.py
       - .github/scripts/waiting_on_author_test.py
+      - .github/areas.json
       - .github/workflows/waiting-on-author.yml
+      - .github/workflows/waiting-on-author-review.yml
+      - .github/workflows/waiting-on-author-review-run.yml
       - .github/workflows/waiting-on-author-test.yml
   workflow_dispatch:
 
@@ -24,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Run waiting-on-author unit test

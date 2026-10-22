@@ -7,6 +7,15 @@ import pytest
 pytest.importorskip("celpy", reason="cel-python not installed")
 
 from omnigent.policies.builtins.cel import cel_policy
+from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.types import EvaluationContext
+from omnigent.spec.types import (
+    FunctionPolicySpec,
+    Phase,
+    PhaseSelector,
+    PolicyAction,
+    StateUpdateAction,
+)
 
 # ── Map return: DENY ────────────────────────────────────────────
 
@@ -101,6 +110,101 @@ def test_allow_explicit() -> None:
     evaluate = cel_policy(expression='{"result": "ALLOW"}')
     result = evaluate({"type": "request"})
     assert result == {"result": "ALLOW"}
+
+
+@pytest.mark.parametrize("action", ["set", "increment", "delete", "append"])
+@pytest.mark.parametrize(
+    "key",
+    ["_policy_test", "subagent_cost_ask_approved_usd", "subagent_cost_over_budget_approved_usd"],
+)
+def test_state_updates_reject_runtime_namespace(action: str, key: str) -> None:
+    evaluate = cel_policy(
+        expression=(
+            '{"result": "ALLOW", "state_updates": ['
+            '{"key": "counter", "action": "increment", "value": 1},'
+            '{"key": event.data.key, "action": "' + action + '", "value": 1}]}'
+        )
+    )
+    with pytest.raises(ValueError, match="reserved keys"):
+        evaluate({"type": "tool_call", "data": {"key": key}})
+
+
+def test_state_updates_pass_through_as_plain_python_values() -> None:
+    """CEL maps may return canonical state_updates for conversation state."""
+    evaluate = cel_policy(
+        expression=(
+            "{"
+            '"result": "ALLOW",'
+            '"state_updates": ['
+            '{"key": "risk", "action": "increment", "value": 2},'
+            '{"key": "last_tool", "action": "set", "value": event.data.name},'
+            '{"key": "weight", "action": "set", "value": 1.5},'
+            '{"key": "seen_tools", "action": "append", "value": ["shell", true, null]},'
+            '{"key": "raw", "action": "set", "value": b"abc"}'
+            "]"
+            "}"
+        )
+    )
+
+    result = evaluate({"type": "tool_call", "data": {"name": "sys_os_shell"}})
+
+    assert result == {
+        "result": "ALLOW",
+        "state_updates": [
+            {"key": "risk", "action": "increment", "value": 2},
+            {"key": "last_tool", "action": "set", "value": "sys_os_shell"},
+            {"key": "weight", "action": "set", "value": 1.5},
+            {"key": "seen_tools", "action": "append", "value": ["shell", True, None]},
+            {"key": "raw", "action": "set", "value": b"abc"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_state_updates_coerce_through_function_policy() -> None:
+    """The policy engine sees CEL state_updates as typed state mutations."""
+    spec = FunctionPolicySpec(
+        name="cel_state",
+        on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+    )
+    policy = FunctionPolicy(
+        spec,
+        cel_policy(
+            expression=(
+                "{"
+                '"result": "ALLOW",'
+                '"state_updates": ['
+                '{"key": "call_count", "action": "increment", "value": 1},'
+                '{"key": "last_decision", "action": "set", "value": "allowed"}'
+                "]"
+                "}"
+            )
+        ),
+    )
+
+    result = await policy.evaluate(
+        EvaluationContext(
+            phase=Phase.TOOL_CALL,
+            tool_name="sys_os_shell",
+            content={"name": "sys_os_shell"},
+        ),
+        {},
+    )
+
+    assert result.action is PolicyAction.ALLOW
+    assert result.state_updates is not None
+    assert [(u.key, u.action, u.value) for u in result.state_updates] == [
+        ("call_count", StateUpdateAction.INCREMENT, 1),
+        ("last_decision", StateUpdateAction.SET, "allowed"),
+    ]
+
+
+def test_state_updates_must_be_a_list() -> None:
+    """Malformed CEL state_updates reports the authoring error."""
+    evaluate = cel_policy(expression='{"result": "ALLOW", "state_updates": "bad"}')
+
+    with pytest.raises(TypeError, match="state_updates must be a list"):
+        evaluate({"type": "request"})
 
 
 # ── Abstain (non-map returns) ───────────────────────────────────

@@ -19,6 +19,9 @@ export interface BaseItem {
   type: string;
   response_id: string;
   status: string;
+  /** Server-side creation time (unix epoch seconds). Drives the
+   *  completed-turn "Worked for" duration for reloaded history. */
+  created_at?: number;
 }
 
 export interface MessageItem extends BaseItem {
@@ -29,10 +32,14 @@ export interface MessageItem extends BaseItem {
   model?: string;
   /** Human author email; omitted for agent/tool/system items. */
   created_by?: string;
+  /** Human submission confirmed by the server, including anonymous input. */
+  user_authored?: boolean;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */
   interrupted?: boolean;
+  /** Native live-preview stream finalized by this persisted assistant message. */
+  stream_message_id?: string;
 }
 
 export interface FunctionCallItem extends BaseItem {
@@ -59,13 +66,21 @@ export interface ErrorItem extends BaseItem {
   source: string;
   code: string;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
+  /** Friendly headline for a classified failure. Present when the runner classified it. */
+  title?: string;
+  /** One/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
 
 export interface ReasoningItem extends BaseItem {
   type: "reasoning";
   model: string;
-  summary: Array<{ type: string; text: string }>;
-  content?: Array<{ type: string; text: string }>;
+  summary: { type: string; text: string }[];
+  content?: { type: string; text: string }[];
 }
 
 /** The provider-native tool item types the runtime persists today. */

@@ -21,7 +21,7 @@ module importable for testing / tooling without a live database.
 Configuration is via environment variables:
 
   DATABASE_URL          Required. SQLAlchemy URL. Both PaaS-style URLs
-                        (``postgresql://user:pw@host:5432/db``,
+                        (``postgresql://<user>:<password>@host:5432/db``,
                         ``postgres://...``) and the explicit psycopg3
                         form (``postgresql+psycopg://...``) are accepted;
                         the prefix is normalized automatically.
@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
     from omnigent.stores.artifact_store import ArtifactStore
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
@@ -94,19 +95,23 @@ class _BuiltApp:
 
 
 def run_migrations(database_url: str) -> None:
-    """Run the Alembic upgrade against ``database_url``.
+    """Initialize or upgrade the schema at ``database_url``.
 
     The SQLAlchemy stores refuse to start on a stale schema, so this
-    runs before any store boots. Creates a throwaway engine, upgrades,
-    and disposes it.
+    runs before any store boots. The central initializer preserves the
+    normal Alembic path for existing backends and uses the safe fresh-schema
+    bootstrap for CockroachDB.
     """
-    import sqlalchemy
+    from omnigent.db.utils import (
+        _create_engine,
+        _initialize_or_verify_schema,
+        normalize_database_url,
+    )
 
-    from omnigent.db.utils import _run_migrations as _run_alembic_upgrade
-
-    migration_engine = sqlalchemy.create_engine(database_url)
+    database_url = normalize_database_url(database_url)
+    migration_engine = _create_engine(database_url)
     try:
-        _run_alembic_upgrade(migration_engine, database_url)
+        _initialize_or_verify_schema(migration_engine, database_url)
     finally:
         migration_engine.dispose()
 
@@ -188,7 +193,11 @@ def _resolve_config() -> _ResolvedConfig:
     # kill-switch path gets the marker: an EXPLICIT
     # OMNIGENT_AUTH_PROVIDER=header deploy declared a header-injecting
     # proxy and must stay strict.
-    from omnigent.server.auth import env_var_is_truthy
+    from omnigent.server.auth import (
+        env_var_is_truthy,
+        resolve_auth_source,
+        warn_if_single_user_exposed,
+    )
 
     # Compose passes OMNIGENT_AUTH_PROVIDER as "" when unset
     # ("${VAR:-}"): empty and missing both mean "not explicitly pinned".
@@ -202,8 +211,6 @@ def _resolve_config() -> _ResolvedConfig:
     # compose up` deploy works with zero config. Gate on the *resolved*
     # selection so an explicit header/oidc deploy (or AUTH_ENABLED=0)
     # doesn't mint accounts secrets it never reads.
-    from omnigent.server.auth import resolve_auth_source
-
     if resolve_auth_source() == "accounts":
         from omnigent.server.accounts_secret import load_or_generate_cookie_secret
 
@@ -220,6 +227,11 @@ def _resolve_config() -> _ResolvedConfig:
             os.environ["OMNIGENT_ACCOUNTS_BASE_URL"] = detect_base_url(
                 os.environ, host=host, port=port
             )
+
+    # Logged, not printed: container stderr is buried in a platform log viewer.
+    _exposure = warn_if_single_user_exposed(host)
+    if _exposure:
+        logger.warning("%s", _exposure)
 
     return _ResolvedConfig(
         cfg=cfg,
@@ -273,6 +285,64 @@ def _build_local_llm_routing_client(
     return LLMRoutingClient(policy_client)
 
 
+def _build_routing(
+    cfg: dict[str, Any],
+    server_llm: Any,  # type: ignore[explicit-any]  # LLMConfig | None
+) -> tuple[Any, Any]:  # type: ignore[explicit-any]  # (RoutingClient | None, RoutingSettings)
+    """Build the routing client and settings from the ``routing:`` block.
+
+    Reuses the CLI's parser and builder so a Docker deployment honours the
+    same ``routing.*`` keys (router name, selection model, model prefixes) a
+    local server does.
+
+    :param cfg: The parsed server config mapping.
+    :param server_llm: The parsed server-level ``LLMConfig``, used for the
+        built-in judge when no external router is configured.
+    :returns: ``(routing_client, routing_settings)`` for ``RuntimeCaps``.
+    """
+    from omnigent.cli import _build_external_routing_client, parse_routing_settings
+
+    routing_cfg = cfg.get("routing")
+    settings = parse_routing_settings(routing_cfg)
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        return _build_external_routing_client(routing_cfg, settings), settings
+    return _build_local_llm_routing_client(server_llm), settings
+
+
+def _resolve_execution_timeout(cfg: dict[str, Any]) -> int:
+    """Return the configured execution limit or the RuntimeCaps default."""
+    return int(cfg.get("execution_timeout") or 7200)
+
+
+def log_capabilities(
+    sandbox_config: ManagedSandboxDeployment | None,
+    github_config: object | None,
+    github_store: object | None,
+) -> None:
+    """
+    Log the same flags ``/v1/info`` exposes, so a missing ``sandbox:``
+    block or GitHub App env shows up in pod logs without curling.
+
+    Reads ``sandbox_config.default.provider``, not ``.provider``:
+    :class:`ManagedSandboxDeployment` wraps one config PER PROVIDER and has
+    no ``provider`` of its own, so the bare attribute raises
+    ``AttributeError`` and kills the server at boot. Split out of
+    :func:`build_app` so the expression is reachable from a test without
+    standing up a database.
+
+    :param sandbox_config: The resolved sandbox deployment, or ``None``.
+    :param github_config: The GitHub App config, or ``None``.
+    :param github_store: The GitHub connection store, or ``None``.
+    """
+    managed = sandbox_config is not None and sandbox_config.managed_launch_supported
+    logger.info(
+        "Capabilities: managed_sandboxes=%s provider=%s github_app=%s",
+        managed,
+        sandbox_config.default.provider if managed and sandbox_config else None,
+        github_config is not None and github_store is not None,
+    )
+
+
 def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     """Resolve config if needed, wire the stores, and build the app.
 
@@ -309,6 +379,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         SqlAlchemyPermissionStore,
     )
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -323,6 +394,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     host_store = HostStore(database_url)
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
+    project_store = SqlAlchemyProjectStore(database_url)
     # Fail startup loud on a malformed `sandbox:` section (an operator
     # typo should not surface as a runtime 502 on the first managed
     # session); the startup catch-all below logs it.
@@ -338,47 +410,14 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    routing_cfg = cfg.get("routing")
-    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
-        from omnigent.server.smart_routing import ExternalRoutingClient, _bearer_auth
-
-        base_url = (routing_cfg.get("base_url") or "").strip()
-        router_name = (routing_cfg.get("router_name") or "").strip()
-        api_key_raw = (routing_cfg.get("api_key") or "").strip()
-        profile = (routing_cfg.get("profile") or "").strip()
-        raw_prefixes = routing_cfg.get("model_prefix")
-        if isinstance(raw_prefixes, str):
-            raw_prefixes = [raw_prefixes]
-        model_prefixes = (
-            [p.strip() for p in raw_prefixes if isinstance(p, str) and p.strip()]
-            if isinstance(raw_prefixes, list)
-            else []
-        )
-        if base_url and router_name:
-            auth = None
-            databricks_profile: str | None = None
-            if api_key_raw:
-                from omnigent.spec import expand_env_vars
-
-                auth = _bearer_auth(expand_env_vars({"api_key": api_key_raw})["api_key"])
-            elif profile:
-                databricks_profile = profile
-            routing_client = ExternalRoutingClient(
-                base_url=base_url,
-                router_name=router_name,
-                auth=auth,
-                databricks_profile=databricks_profile,
-                model_prefixes=model_prefixes,
-            )
-        else:
-            routing_client = None
-    else:
-        routing_client = _build_local_llm_routing_client(server_llm)
+    routing_client, routing_settings = _build_routing(cfg, server_llm)
 
     caps = RuntimeCaps(
+        execution_timeout=_resolve_execution_timeout(cfg),
         default_policies=parse_default_policies(cfg.get("policies")),
         llm=server_llm,
         routing_client=routing_client,
+        routing_settings=routing_settings,
     )
 
     init_runtime(
@@ -408,6 +447,46 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
         account_store = SqlAlchemyAccountStore(database_url)
 
+    # GitHub App: same env-driven wiring as `omnigent server`
+    # (omnigent/cli.py). Without these kwargs the Docker image silently
+    # leaves Connect GitHub disabled even when the OMNIGENT_GITHUB_APP_*
+    # env vars are set.
+    from omnigent.server.github_app import GitHubAppConfig
+
+    github_config = GitHubAppConfig.from_env()
+    github_store = None
+    if github_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        cipher = build_secret_cipher()
+        if cipher is None:
+            logger.error(
+                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
+                "(the credential store's encryption key) to enable it."
+            )
+        else:
+            from omnigent.connections.github import GithubConnectionStore
+
+            github_store = GithubConnectionStore(database_url, cipher)
+
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks Connect is configured but disabled: set the credential "
+                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
+
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -419,6 +498,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         policy_store=policy_store,
         host_store=host_store,
         scheduled_task_store=scheduled_task_store,
+        project_store=project_store,
         auth_provider=auth_provider,
         account_store=account_store,
         # Non-secret auth settings from the config file (admins are the
@@ -427,7 +507,14 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
+        server_config=cfg,
+        github_config=github_config,
+        github_store=github_store,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
     )
+
+    log_capabilities(sandbox_config, github_config, github_store)
 
     return _BuiltApp(app=app, host=resolved_config.host, port=resolved_config.port)
 
@@ -452,17 +539,24 @@ def main() -> None:
 
         import uvicorn
 
-        from omnigent.runner.transports.ws_tunnel.limits import (
-            RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
-        )
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
+        from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
         logger.info("Starting omnigent server on %s:%d", resolved.host, resolved.port)
-        uvicorn.run(
+        config = uvicorn.Config(
             resolved.app,
             host=resolved.host,
             port=resolved.port,
-            ws_max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+            # This image serves external runners only, so every session rides a
+            # tunnel: without the keepalive budget uvicorn's 20 s default closes
+            # a busy-but-healthy one with 1011 after a client-path stall.
+            **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the container alive until the orchestrator
+            # SIGKILLs it. Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         )
+        serve(config)
     except Exception:  # noqa: BLE001 — startup catch-all so failures land in logs
         logger.error("FATAL: omnigent server failed to start:\n%s", traceback.format_exc())
         # Keep the process alive briefly so the container log capture has time

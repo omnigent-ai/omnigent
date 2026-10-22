@@ -11,7 +11,7 @@ via [Databricks Asset Bundles](https://docs.databricks.com/aws/en/dev-tools/bund
 > **Most Databricks users want the managed offering instead.**
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) runs the server for you, wired to workspace identity,
-> Foundation Models, AI Gateway, and MLflow Tracing out of the box.
+> Foundation Models, Unity Gateway, and MLflow Tracing out of the box.
 > Enable the **Omnigent** preview in your workspace settings and follow
 > the quickstart there. Use this directory only when you need to
 > self-manage the deployment: the managed service is not in your region
@@ -134,22 +134,57 @@ uv run python deploy/databricks/deploy.py \
     --volume-name main.omnigent.artifacts
 ```
 
-The script builds wheels, classifies them by size, copies wheels into
-`src/`, regenerates `src/pyproject.toml` and `src/uv.lock`, runs
-`databricks bundle deploy --target prod`, runs
+The script builds wheels, archives the SPA as `dist/web-ui.tar.gz`, copies the
+wheels and the single UI archive into `src/`, regenerates `src/pyproject.toml`
+and `src/uv.lock`, runs `databricks bundle deploy --target prod`, runs
 `databricks bundle run omnigent --target prod`, and polls `/health`
-with backoff until 200.
+with backoff until 200. Use repeatable `--extension-wheel` arguments to install
+prebuilt Omnigent extension wheels alongside the server; `--skip-web-ui`
+remains API-only.
 
-All Omnigent wheels must fit under the Databricks Apps source
-snapshot limit (10 MB). If a wheel exceeds it, rebuild with
-`--skip-web-ui` or reduce the wheel size; uv lockfiles cannot point at
-UC Volume wheel paths because `uv lock` validates path sources locally.
+Databricks Apps rejects any single source file over 10 MB. The SPA is
+therefore shipped as one `src/web-ui.tar.gz` archive instead of inside the
+main wheel; `src/app.py` extracts it at startup and points the server at the
+extracted directory via `OMNIGENT_WEB_UI_DIST`. The archive is checked against
+the same 10 MB limit before upload. If a Python wheel still exceeds it, reduce
+the Python payload or use `--skip-web-ui`; uv lockfiles cannot point at UC
+Volume wheel paths because `uv lock` validates path sources locally.
 
 Re-running is safe — every step is idempotent.
 
+Override release-feature defaults using the comma-separated deploy argument:
+names enable, `-name` disables, and empty uses defaults. Reload the web app
+after the redeploy:
+
+```bash
+--features usage_page,harness_install
+```
+
+The Canvas page is off by default; include `canvas` in `--features` for the
+apps that should show it.
+
+See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
+inventory and rollback procedure. Runner overrides such as `-claude_osc_status`
+also need to be set on separately running hosts; restart their host/runners
+and launch fresh terminals.
+
 > [!TIP]
-> To lock against a private PyPI mirror or proxy instead of public
-> PyPI, set `UV_INDEX_URL` before running `deploy.py`.
+> The generated app lock defaults to public PyPI. To use a private index or
+> proxy, set `UV_INDEX_URL` before running `deploy.py`. Databricks Apps
+> [supports private repositories](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/dependencies#install-from-private-repositories);
+> configure the matching index in the app build environment (for example,
+> `UV_INDEX_URL` in `src/app.yaml`, using `valueFrom` for secret-backed values).
+> The index and artifact URLs must be reachable there, with any required
+> credentials provided through Databricks secrets. The local setting only
+> controls lock generation; it does not configure the app's build environment.
+>
+> Lock generation ignores uv config files and competing index variables
+> (`UV_INDEX`, `UV_DEFAULT_INDEX`, `UV_EXTRA_INDEX_URL`, `UV_FIND_LINKS`,
+> `UV_CONFIG_FILE`, `UV_NO_CONFIG`) so a machine-only mirror cannot override
+> the selected index. If your shell exports `UV_INDEX_URL` for local use only,
+> unset it for deployment to use public PyPI. Non-index settings in config
+> files are also ignored; supply TLS/timeout settings through environment
+> variables such as `UV_NATIVE_TLS`, `SSL_CERT_FILE`, or `UV_HTTP_TIMEOUT`.
 
 ## Smoke check
 
@@ -225,6 +260,7 @@ Environment variables read by `src/app.py`:
 | `AP_ARTIFACT_VOLUME_PATH` | app resource `valueFrom: artifact_volume` | UC Volume path for artifacts |
 | `DATABRICKS_APP_PORT` | Databricks runtime | App port (default 8000) |
 | `AP_POOL_RECYCLE_SECONDS` | Optional | Connection pool recycle interval (default 300) |
+| `OMNIGENT_CONFIG` | Optional | Path to a server config YAML. Its `sandbox:` section enables managed sandbox hosts (`host_type: "managed"`), parsed exactly as `omnigent server` parses it; a malformed section fails startup. Branding and title keys are read from the same file. |
 
 ## Multi-app safety — one bundle, many apps
 
@@ -258,7 +294,78 @@ uv run python deploy/databricks/deploy.py --skip-build --allow-dirty ...
 
 # API-only deploy (drops the SPA from the main wheel).
 uv run python deploy/databricks/deploy.py --skip-web-ui ...
+
+# No-OpenTelemetry deploy: runs `python app.py` instead of under
+# opentelemetry-instrument, drops OTEL_TRACES_SAMPLER, and drops the platform
+# telemetry_export_destinations. Use for workspaces with no OTel collector /
+# UC OTel tables -- otherwise every span export fails DEADLINE_EXCEEDED to
+# localhost:4317. Selects the `prod-no-otel` DAB target (same workspace/state
+# as `prod`).
+uv run python deploy/databricks/deploy.py --no-otel ...
 ```
+
+> [!NOTE]
+> `--no-otel` auto-switches the default `--target prod` to `prod-no-otel`.
+> If you deploy to a custom `--target`, add the OTel-off variable overrides
+> (`app_command`, `app_env`, `otel_export_destinations`) to that target too
+> — see the `prod-no-otel` block in `databricks.yml` for the template. The
+> deploy warns when `--no-otel` is paired with a target that lacks those
+> overrides, since OTel then stays on.
+
+## Server-managed Databricks Sandboxes
+
+The `databricks` sandbox provider runs managed sessions (`host_type: "managed"`, or
+the Web UI's New Sandbox option) in [Databricks
+Sandbox](https://docs.databricks.com/aws/en/compute/serverless/sandbox) over the
+workspace REST API. The Sandbox preview must be enabled in the workspace.
+
+Each Sandbox is created and driven by the user who started the session, with the
+token they connected under **Settings → Connections → Databricks** (a Databricks
+account connection). The token inside the Sandbox and its proxy bearer are that
+user's, and the server's own identity is never used: a user who has not connected
+is refused with a "Connect Databricks first" message and no Sandbox is created.
+Code running in a Sandbox, including the agent, can read that token and act in
+the workspace as its owner.
+
+```yaml
+sandbox:
+  provider: databricks
+  server_url: https://your-host        # public URL the Sandbox host dials back to
+  databricks:
+    workspace_host: https://<workspace>.cloud.databricks.com   # required
+    proxy_bearer: true                 # only behind the Databricks Apps OAuth proxy
+    inactivity_timeout_s: 3600         # optional idle stop; resumed on the next turn
+    sandbox_id_prefix: omnigent        # optional
+```
+
+`workspace_host` is the workspace Sandboxes run in; a user connected to any other
+workspace is refused, so their existing Sandboxes are never lost track of. With `proxy_bearer: true`,
+the Sandbox's `omnigent` must include proxy-bearer support, so pin it with a
+`bootstrap_command` (e.g. `uv tool install omnigent==<server version>`) if the
+image's built-in copy is older than the server.
+
+**Databricks account connection.** The server needs an account-level [custom OAuth
+app integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
+with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
+scopes `all-apis offline_access` (see
+[DATABRICKS_CONNECT.md](../../designs/DATABRICKS_CONNECT.md)). Set its client id and
+secret in `OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`,
+and a credential-store key (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
+`OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The Apps entry
+point (`src/app.py`), `omnigent server`, and the Docker entry point all read these.
+
+**Stop and resume.** A Sandbox stopped by its idle timeout is started in place on
+the session's next turn, and its host is re-bootstrapped. While a runner is
+connected, the keepalive runs a command in the Sandbox so it does not idle-stop,
+and refreshes the proxy bearer.
+
+**Cleanup after a user disconnects.** Teardown also acts as the owner, so if the
+owner has disconnected, their Sandbox stays after the session is deleted. With
+the managed-sandbox reaper enabled (`sandbox.reaper.enabled: true`; it is off by
+default), each sweep retries the delete and finishes it once the owner
+reconnects. Otherwise, or to remove it sooner, a workspace admin deletes it by id
+(logged as `Creating Databricks Sandbox '<id>'`):
+`databricks api delete /api/2.0/sandboxes/<id>`.
 
 ## Troubleshooting
 
@@ -272,7 +379,9 @@ uv run python deploy/databricks/deploy.py --skip-web-ui ...
 | `schema "dbos" already exists` | Same for the DBOS schema | `DROP SCHEMA dbos CASCADE` and redeploy |
 | `permission denied for schema public` | App SP missing schema grants | Run `grant_sp_perms.py` (one-time) |
 | `Field 'spec.role' cannot be empty` | Lakebase requires explicit role for extra databases | Use the project's default database; don't create extras |
-| Deploy refuses because a wheel is over 10 MB | uv app payload requires local wheel path sources | Rebuild with `--skip-web-ui` or reduce wheel size |
+| Deploy refuses because a wheel is over 10 MB | Workspace files cap at 10 MB and uv needs local wheel path sources | Rebuild with `--skip-web-ui` or reduce wheel size |
+| Deploy refuses because the SPA archive is over 10 MB | The compressed UI archive crossed the Workspace file cap | Split the chunk in `web/`, or use `--skip-web-ui` |
+| App serves the API-only landing page | `src/web-ui.tar.gz` was not included, or deploy used `--skip-web-ui` | Redeploy without `--skip-web-ui` and without `--skip-build` |
 | App starts cleanly but the first agent request 403s on the artifact volume | App SP has `WRITE_VOLUME` on the leaf but no `USE_CATALOG` / `USE_SCHEMA` on the parents | `deploy.py` grants both automatically — for a fresh catalog, redeploy or grant manually via `databricks grants update` |
 
 ## Files in this directory

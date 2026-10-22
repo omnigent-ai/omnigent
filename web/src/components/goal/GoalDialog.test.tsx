@@ -1,11 +1,13 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type * as GoalApiModule from "@/lib/goalApi";
+
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GoalDialog, parseGoalBudget } from "./GoalDialog";
 import type { Goal } from "@/lib/goalApi";
 import { clearGoal, getGoal, setGoal, updateGoalStatus } from "@/lib/goalApi";
 
 vi.mock("@/lib/goalApi", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/goalApi")>();
+  const actual = await importOriginal<typeof GoalApiModule>();
   return {
     ...actual,
     clearGoal: vi.fn(),
@@ -84,6 +86,14 @@ describe("GoalDialog", () => {
     await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_codex"));
     expect(screen.getByTestId("goal-current")).toHaveTextContent("Ship goal mode");
     expect(screen.getByTestId("goal-current")).toHaveTextContent("1,200 / 40,000 tokens / 2 min");
+  });
+
+  it("lets an unbreakable objective wrap inside the summary card", async () => {
+    renderDialog();
+
+    await waitFor(() => expect(mockGetGoal).toHaveBeenCalledWith("conv_codex"));
+    const objective = within(screen.getByTestId("goal-current")).getByText("Ship goal mode");
+    expect(objective).toHaveClass("wrap-anywhere");
   });
 
   it("saves a trimmed objective, token budget, and selected status", async () => {

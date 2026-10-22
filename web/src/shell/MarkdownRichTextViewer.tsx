@@ -19,13 +19,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
-import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
-import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
+import type { Transaction } from "@tiptap/pm/state";
+import type { Node } from "@tiptap/pm/model";
+import { StarterKit } from "@tiptap/starter-kit";
+import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
+import { ListItem, TaskItem } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -33,6 +36,7 @@ import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useScrollRestore } from "./useScrollRestore";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
+import { MarkdownLinkBubble } from "./MarkdownLinkBubble";
 import { MarkdownSearchBar } from "./MarkdownSearchBar";
 import {
   createCommentDecorationExtension,
@@ -43,8 +47,12 @@ import {
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
 import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
+import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
+import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
+import { SoftBreak } from "./TipTapSoftBreak";
+import { BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -121,6 +129,10 @@ export function MarkdownRichTextViewer({
   // A truncated buffer must never be editable, regardless of permission.
   const canEdit = useCanEdit(conversationId) && !truncated;
 
+  // True while the owning session's agent turn is in flight — used to warn
+  // before edits that would be overwritten by the agent's next write.
+  const sessionActive = useSessionActive(conversationId);
+
   // Callback registered by the inner component once its TipTap editor is ready.
   // The sync hook calls this instead of remounting (setEditorKey) when an
   // external content update arrives on a clean editor — scroll and cursor are
@@ -160,6 +172,7 @@ export function MarkdownRichTextViewer({
       conversationId={conversationId}
       path={path}
       canEdit={canEdit}
+      sessionActive={sessionActive}
       truncated={truncated}
       isDirty={isDirty}
       setDirty={setDirty}
@@ -191,6 +204,8 @@ interface InnerProps {
   conversationId: string;
   path: string;
   canEdit: boolean;
+  /** True while the owning session's agent turn is in flight. */
+  sessionActive: boolean;
   truncated: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
@@ -216,6 +231,7 @@ function MarkdownRichTextViewerInner({
   conversationId,
   path,
   canEdit,
+  sessionActive,
   truncated,
   isDirty,
   setDirty,
@@ -279,6 +295,10 @@ function MarkdownRichTextViewerInner({
 
   // Baseline used to detect actual edits vs TipTap normalisation.
   const baselineRef = useRef<string | null>(null);
+  // Immutable snapshots share unchanged subtrees, so dirty checks need no
+  // Markdown serialization and undo can still restore a clean document.
+  const baselineDocRef = useRef<Node | null>(null);
+  const savingDocRef = useRef<Node | null>(null);
 
   // Gates every save path: true only after a focused editor update (a real user
   // edit). TipTap's markdown round-trip isn't byte-stable, so getMarkdown() can
@@ -300,9 +320,31 @@ function MarkdownRichTextViewerInner({
       hasUserEditedRef.current &&
       ed != null &&
       !ed.isDestroyed &&
-      ed.getMarkdown() !== baselineRef.current
+      baselineDocRef.current !== null &&
+      !ed.state.doc.eq(baselineDocRef.current)
     );
   }, []);
+
+  const getContent = useCallback(() => {
+    const ed = editorRef.current;
+    if (!ed) return "";
+    savingDocRef.current = ed.state.doc;
+    const markdown = ed.getMarkdown();
+    // Document attributes can change without changing the saved Markdown.
+    // The shared save hook skips the write (and markSaved) in that case.
+    if (markdown === baselineRef.current) baselineDocRef.current = savingDocRef.current;
+    return markdown;
+  }, []);
+
+  const markDocumentSaved = useCallback(
+    (markdown: string) => {
+      // Single-flight saves capture one snapshot; newer typing must not become
+      // the baseline when an older write finishes.
+      baselineDocRef.current = savingDocRef.current;
+      markSaved(markdown);
+    },
+    [markSaved],
+  );
 
   // All save orchestration — write mutation, mid-turn conflict check, teardown
   // guard, and debounce/flush wiring — lives in the shared hook, identical to
@@ -314,11 +356,11 @@ function MarkdownRichTextViewerInner({
     isDirty,
     setDirty,
     hasExternalUpdate,
-    markSaved,
+    markSaved: markDocumentSaved,
     reconcileServerContent,
     dismissExternalUpdate,
     baselineRef,
-    getContent: () => editorRef.current?.getMarkdown() ?? "",
+    getContent,
     isEditorDirty,
   });
 
@@ -331,8 +373,16 @@ function MarkdownRichTextViewerInner({
       // listItem: false — replaced by SafeListItem (content: block+) so a list
       // item whose first child is a non-paragraph block doesn't build a
       // schema-invalid doc that crashes the panel. See SafeListItem above.
-      StarterKit.configure({ link: false, blockquote: false, listItem: false }),
+      // codeBlock: false — replaced by CodeBlockWithLanguage, which adds a
+      // language picker and a live mermaid preview via a React node view.
+      StarterKit.configure({
+        link: false,
+        blockquote: false,
+        listItem: false,
+        codeBlock: false,
+      }),
       SafeListItem,
+      CodeBlockWithLanguage,
       // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
       // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
       // these two the markdown parser drops the checkbox and renders a plain
@@ -340,15 +390,18 @@ function MarkdownRichTextViewerInner({
       // built-in `- [ ]` marked tokenizer so the syntax parses into checkbox
       // items, and (b) round-trips back to identical markdown via their
       // built-in renderMarkdown. nested:true lets Tab indent sub-checklists.
-      TaskList,
+      BoundedTaskList,
       TaskItem.configure({ nested: true }),
-      Table.configure({ resizable: true }),
+      BoundedTable.configure({ resizable: true }),
       TableRow,
       TableCell,
       TableHeader,
       ImageAwareLink.configure({ openOnClick: false, autolink: false }),
       GitHubAlertBlockquote,
       HtmlPassthrough,
+      // Soft line breaks in hard-wrapped source render as spaces so Edit mode
+      // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
+      SoftBreak,
       Markdown,
       createWorkspaceImageExtension(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
@@ -368,25 +421,32 @@ function MarkdownRichTextViewerInner({
     content,
     contentType: "markdown",
     editable: canEdit,
-    onUpdate: ({ editor: ed }) => {
-      const markdown = ed.getMarkdown();
-      // Only a focused editor reflects a user edit. The first update, or any
+    onUpdate: ({ editor: ed, transaction }) => {
+      // A transaction that changed no document is a no-op for our purposes (e.g.
+      // setEditable's synthetic update). It can't have altered the markdown, so
+      // re-baselining on it would only clobber an unsaved edit — skip entirely.
+      if (transaction && !transaction.docChanged) return;
+      // Only a genuine user edit should flag dirty. The first update, or any
       // update before the user focuses, is TipTap re-serialising the freshly
       // loaded doc — its markdown round-trip isn't byte-stable, so getMarkdown()
       // drifts from the on-disk bytes. Re-baseline instead of flagging dirty so
-      // merely opening a file never autosaves a normalised rewrite.
-      if (baselineRef.current === null || !ed.isFocused) {
-        baselineRef.current = markdown;
+      // merely opening a file never autosaves a normalised rewrite. A code-block
+      // language change is a user edit even though it arrives blurred (the
+      // picker holds focus), so isUserEditUpdate also honours its flag.
+      if (baselineDocRef.current === null || !isUserEditUpdate(ed.isFocused, transaction)) {
+        baselineRef.current = ed.getMarkdown();
+        baselineDocRef.current = ed.state.doc;
         setDirty(false);
         return;
       }
       // A focused update is a real user edit — from here a save may write.
       hasUserEditedRef.current = true;
-      setDirty(markdown !== baselineRef.current);
+      setDirty(!ed.state.doc.eq(baselineDocRef.current));
     },
     onCreate: ({ editor: ed }) => {
       // Capture baseline after the initial content has been parsed.
       baselineRef.current = ed.getMarkdown();
+      baselineDocRef.current = ed.state.doc;
     },
   });
   editorRef.current = editor;
@@ -396,10 +456,15 @@ function MarkdownRichTextViewerInner({
   // our own injected content.
   useEffect(() => {
     if (!editor) return;
-    // Schedule only on focused (user) edits; a pre-focus normalisation update
-    // re-baselines in onUpdate above and must not trigger a write.
-    const onUpdate = () => {
-      if (editor.isFocused) autoSave.schedule();
+    // Schedule only on user edits; a pre-focus normalisation update re-baselines
+    // in onUpdate above and must not trigger a write. A blurred code-block
+    // language change is a user edit (flagged on its transaction), so schedule
+    // it too — otherwise the picker's change never persists.
+    const onUpdate = (props?: { transaction?: Transaction }) => {
+      // Mirror the onUpdate-config guard: a no-op transaction changed no markdown,
+      // so there is nothing to save — never schedule a write for it.
+      if (props?.transaction && !props.transaction.docChanged) return;
+      if (isUserEditUpdate(editor.isFocused, props?.transaction)) autoSave.schedule();
     };
     const onBlur = () => autoSave.flush();
     editor.on("update", onUpdate);
@@ -426,6 +491,7 @@ function MarkdownRichTextViewerInner({
       const savedScroll = scrollContainerRef.current?.scrollTop ?? 0;
       editor.commands.setContent(newContent, { emitUpdate: false, contentType: "markdown" });
       baselineRef.current = editor.getMarkdown();
+      baselineDocRef.current = editor.state.doc;
       // Programmatic replace establishes a fresh baseline — no user edits relative to it.
       hasUserEditedRef.current = false;
       setDirty(false);
@@ -440,9 +506,11 @@ function MarkdownRichTextViewerInner({
     };
   }, [editor, setContentRef, setDirty, path]);
 
-  // Keep editor editable flag in sync with canEdit changes.
+  // Keep editor editable flag in sync with canEdit changes. Pass emitUpdate:
+  // false so toggling editability doesn't fire a doc-less "update" (which the
+  // onUpdate guard also ignores, but there's no reason to emit it at all).
   useEffect(() => {
-    editor?.setEditable(canEdit);
+    editor?.setEditable(canEdit, false);
   }, [editor, canEdit]);
 
   return (
@@ -476,9 +544,9 @@ function MarkdownRichTextViewerInner({
         className="relative flex-1 overflow-auto px-8 py-6"
         // Link following. The Link extension runs with openOnClick:false so a
         // plain click in edit mode positions the cursor instead of navigating.
-        // Read-only: any click on a link opens it. Edit mode: only a
-        // modifier-click (⌘/Ctrl) opens it, so plain-click-to-edit is preserved
-        // while still giving an escape hatch to follow links (incl. in tables).
+        // Read-only: any click on a link opens it. Edit mode: a modifier-click
+        // (⌘/Ctrl) opens it, and the caret in a link shows MarkdownLinkBubble's
+        // Open action, so plain-click-to-edit is preserved (incl. in tables).
         onClick={(e) => {
           if (canEdit && !e.metaKey && !e.ctrlKey) return;
           const anchor = (e.target as Element).closest("a[href]");
@@ -493,7 +561,7 @@ function MarkdownRichTextViewerInner({
             type="button"
             title="Copy"
             onClick={handleCopyContent}
-            className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            className="absolute top-3 right-3 z-10 flex items-center gap-1 rounded px-2 py-1 text-sm text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
           >
             {isCopied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
             {isCopied ? "Copied!" : "Copy"}
@@ -501,14 +569,24 @@ function MarkdownRichTextViewerInner({
         )}
         <EditorContent
           editor={editor}
-          className="outline-none max-w-none text-sm text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
+          className="outline-none max-w-none text-ui text-foreground [&_*::selection]:bg-blue-300/40 [&_*::selection]:text-foreground [&::selection]:bg-blue-300/40 [&::selection]:text-foreground tiptap-md-content"
         />
       </div>
       {canEdit && editor && (
         <TableHandles editor={editor} scrollContainerRef={scrollContainerRef} />
       )}
+      {canEdit && editor && (
+        <MarkdownLinkBubble editor={editor} path={path} scrollContainerRef={scrollContainerRef} />
+      )}
+      {canEdit && sessionActive && !isDirty && !hasExternalUpdate && (
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          Omnigent is still working — edits you make now may be overwritten when it saves this file.
+          Wait for it to finish, or copy your changes first.
+        </div>
+      )}
       {canEdit && isDirty && hasExternalUpdate && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-2 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
           <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
           <span className="flex-1">This file was modified externally while you were editing.</span>
           <button
@@ -528,13 +606,13 @@ function MarkdownRichTextViewerInner({
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && saveDisabled && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-xs text-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0 text-warning" />
           Runner offline — changes save and commenting resumes once it reconnects.
         </div>
       )}
       {canEdit && isDirty && !hasExternalUpdate && !saveDisabled && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-xs text-muted-foreground backdrop-blur-sm">
+        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 border-t border-border bg-muted/50 px-4 py-1.5 text-sm text-muted-foreground backdrop-blur-sm">
           <MessageSquareOffIcon className="size-3.5 shrink-0" />
           {writeFile.isPending ? "Saving…" : "Unsaved changes —"} commenting is available once
           saved.

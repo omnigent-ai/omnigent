@@ -149,6 +149,7 @@ class _FakeBoxOptions:
         image: str | None = None,
         cpus: int | None = None,
         memory_mib: int | None = None,
+        disk_size_gb: int | None = None,
         env: object = None,
         auto_remove: bool | None = None,
         detach: bool | None = None,
@@ -157,6 +158,7 @@ class _FakeBoxOptions:
         self.image = image
         self.cpus = cpus
         self.memory_mib = memory_mib
+        self.disk_size_gb = disk_size_gb
         self.env = env if env is not None else []
         self.auto_remove = auto_remove
         self.detach = detach
@@ -372,9 +374,20 @@ def test_provision_defaults_official_image_and_persists(
     assert create.options.detach is True
     assert create.options.cpus == 2
     assert create.options.memory_mib == 4096
+    assert create.options.disk_size_gb is None
     assert create.options.env == []
     assert create.name == "managed-abc"
     assert fake_boxlite.mode == "local"
+
+
+def test_provision_disk_size_gb_reaches_box_options(
+    fake_boxlite: _FakeBoxliteState,
+) -> None:
+    """``disk_size_gb`` passed to the launcher reaches ``BoxOptions`` verbatim."""
+    BoxliteSandboxLauncher(disk_size_gb=100).provision("managed-abc")
+
+    [create] = fake_boxlite.create_calls
+    assert create.options.disk_size_gb == 100
 
 
 def test_provision_image_resolution_order(

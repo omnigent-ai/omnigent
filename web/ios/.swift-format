@@ -27,7 +27,8 @@
     "allowedFunctions": ["XCTAssertNoThrow"]
   },
   "orderedImports": {
-    "includeConditionalImports": false
+    "includeConditionalImports": false,
+    "shouldGroupImports": true
   },
   "rules": {
     "AllPublicDeclarationsHaveDocumentation": false,

@@ -1,66 +1,1049 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
-import { RoutingDecisionCard, RoutingDecisionChip } from "./StatusBlocks";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { copyText } from "@/lib/clipboard";
+import { getSessionSignInLink } from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
+import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
+
+vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
+vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
 
 afterEach(cleanup);
 
-describe("RoutingDecisionChip — intelligent model router", () => {
-  it("applied verdict: names the active model with its tier, plus the rationale line", () => {
+const TERMINAL_ERROR = [
+  "Required terminal exited unexpectedly; the session runtime is no longer available.",
+  "",
+  "Terminal diagnostics:",
+  "terminal: claude:main",
+  "command: claude (8 args; argv omitted because terminal args may contain secrets)",
+  "cwd: /Users/corey.zumar",
+  "shell: /bin/zsh",
+  "pid: 48291",
+  "runtime: claude-code 1.0.83",
+  "session_id: sess_8f4a2c19",
+  "started_at: Tue Aug 11 16:42:18 2026",
+  "last_heartbeat: Tue Aug 11 17:00:44 2026",
+  "exit_code: 0",
+  "signal: none",
+  "pty_status: detached",
+  "reconnect_attempts: 3",
+  "termination_reason: terminal pane no longer available",
+  "",
+  "Last captured terminal output:",
+  "Pane is dead (status 0, Tue Aug 11 17:00:46 2026)",
+].join("\n");
+
+const RATE_LIMIT_ERROR = [
+  "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded workspace",
+  "input tokens per minute rate limit for databricks-test-model. Work with your",
+  "Databricks account team to request a higher FMAPI rate limit tier.",
+].join(" ");
+
+describe("ErrorBanner", () => {
+  beforeEach(() => vi.mocked(copyText).mockClear());
+
+  it("renders compact by default and expands labeled message content", () => {
     render(
-      <RoutingDecisionChip
-        model="databricks-claude-opus-4-8"
-        applied
-        rationale="multi-file refactor needs deep reasoning"
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    expect(messageToggle).toHaveAttribute("aria-expanded", "false");
+    expect(messageToggle).not.toHaveAttribute("aria-controls");
+    expect(screen.getByTestId("error-headline")).toHaveClass("truncate");
+    expect(screen.getByTestId("error-headline")).not.toHaveTextContent("execution");
+    expect(screen.queryByText("Message")).toBeNull();
+    fireEvent.click(messageToggle);
+    expect(messageToggle).toHaveAttribute("aria-expanded", "true");
+    expect(messageToggle).toHaveAttribute("aria-controls");
+    expect(screen.getByTestId("error-headline")).toHaveClass("truncate");
+    expect(screen.getByText("Message")).toBeInTheDocument();
+    const message = screen.getByTestId("error-message-content");
+    expect(message).toHaveClass("whitespace-pre-wrap");
+    expect(message).toHaveClass("break-words");
+    expect(message).toHaveTextContent(/Required terminal exited unexpectedly/);
+    expect(message).not.toHaveTextContent("terminal: claude:main");
+  });
+
+  it("disclosure chevron is always visible and rotates when expanded", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    expect(screen.getByTestId("error-leading-slot")).toHaveClass("h-[18px]", "w-[18px]");
+    // Chevron is present in rest state — no status icon.
+    expect(screen.queryByTestId("error-status-icon")).toBeNull();
+    expect(screen.getByTestId("error-disclosure-icon")).toHaveClass(
+      "text-muted-foreground",
+      "group-hover/error:text-foreground",
+    );
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+
+    // Expand: chevron rotates without adding redundant helper copy.
+    fireEvent.click(messageToggle);
+    expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+
+    // Collapse: chevron resets and the helper stays absent.
+    fireEvent.click(messageToggle);
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+  });
+
+  it("expand and collapse toggle correctly via pointer clicks", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const messageToggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    // Expand.
+    fireEvent.click(messageToggle);
+    expect(screen.getByTestId("error-disclosure-icon")).toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+    // Collapse.
+    fireEvent.click(messageToggle);
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("rotate-90");
+    expect(screen.queryByText("Expand for details")).toBeNull();
+  });
+
+  it("replaces the full banner during recovery and restores it after failure", async () => {
+    let rejectRetry: ((error: Error) => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectRetry = reject;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // Visible without hovering: the short model name + tier render in the
-    // chip text. A missing model/tier would mean the verdict didn't thread
-    // through the block pipeline.
-    expect(chip).toHaveTextContent("Intelligent model router");
-    expect(chip).toHaveTextContent("opus");
-    expect(chip.textContent).not.toContain("(expensive)");
-    // The rationale shows as a muted second line (not hover-only).
-    expect(chip).toHaveTextContent("multi-file refactor needs deep reasoning");
-    expect(chip.getAttribute("data-applied")).toBe("true");
-    // No hover required: the rationale is in the rendered DOM, not just title.
-    expect(chip.querySelector("[data-testid]")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    const reconnecting = screen.getByTestId("error-reconnecting");
+    const status = screen.getByRole("status");
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+    expect(reconnecting).toHaveClass("justify-center", "min-h-14");
+    expect(status).toHaveTextContent(/^Reconnecting$/);
+    // The badge pairs the label with an animated spinner so the in-flight
+    // attempt reads as active work; the text stays the accessible label.
+    const spinner = reconnecting.querySelector(".animate-spin");
+    expect(spinner).not.toBeNull();
+    expect(spinner).toHaveAttribute("aria-hidden", "true");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveAttribute("aria-atomic", "true");
+    expect(status).toHaveClass("rounded-xl", "border-border", "bg-background");
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss error message" })).toBeNull();
+    expect(screen.queryByText("Message")).toBeNull();
+    expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+
+    await act(async () => rejectRetry?.(new Error("Host is still offline")));
+    expect(screen.getByTestId("error-headline")).toBeInTheDocument();
+    expect(screen.queryByTestId("error-reconnecting")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Resume session failed: Host is still offline",
+    );
+    expect(screen.getByTestId("error-disclosure-icon")).toBeInTheDocument();
   });
 
-  it("shadow verdict: reads 'would have picked' instead of naming the active model", () => {
+  it("matches the prototype pill structure and diagnostics treatment", () => {
     render(
-      <RoutingDecisionChip
-        model="databricks-claude-haiku-4-5"
-        applied={false}
-        rationale="trivial question"
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    // The expand/collapse control is a real button wrapping icon + headline;
+    // the pill container is a plain div so no interactive elements nest.
+    expect(toggle.tagName).toBe("BUTTON");
+    expect(toggle).toHaveAttribute("type", "button");
+    expect(toggle).toHaveClass("min-w-0", "flex-1", "bg-transparent", "text-left");
+    const pill = toggle.parentElement!.parentElement as HTMLElement;
+    expect(pill).toHaveAttribute("data-testid", "error-pill");
+    expect(pill).not.toHaveAttribute("role");
+    expect(pill).not.toHaveAttribute("tabindex");
+    expect(pill).toHaveClass("rounded-[12px]", "p-[8px]", "w-[560px]", "group/error");
+    expect(pill.style.background).toContain("color-mix");
+    expect(pill.style.border).toContain("color-mix");
+    expect(pill.parentElement).toHaveClass("items-center", "px-[16px]", "mb-[24px]");
+    const dashedRule = pill.parentElement!.querySelector('[aria-hidden="true"]');
+    expect(dashedRule).toHaveClass("pointer-events-none", "top-[20px]", "h-px");
+    expect((dashedRule as HTMLElement).style.background).toContain("repeating-linear-gradient");
+    expect(screen.getByTestId("error-headline")).toHaveClass(
+      "truncate",
+      "whitespace-nowrap",
+      "leading-6",
+      "text-destructive",
+    );
+    expect(screen.getByTestId("error-headline")).toHaveAttribute(
+      "title",
+      "The agent's terminal exited unexpectedly, so the session can't continue.",
+    );
+    expect(screen.getByRole("button", { name: "Dismiss error message" })).toHaveClass(
+      "hover:text-foreground",
+    );
+
+    fireEvent.click(toggle);
+    const message = screen.getByTestId("error-message-content");
+    expect(message.closest("section")!.parentElement).toHaveClass("cursor-auto");
+    const copyMessage = screen.getByRole("button", { name: "Copy error message" });
+    expect(message).toHaveClass("font-mono", "text-sm", "whitespace-pre-wrap");
+    expect(copyMessage).toHaveClass("size-6");
+    expect(screen.getByText("Message")).toHaveClass(
+      "text-sm",
+      "font-medium",
+      "leading-4",
+      "text-muted-foreground",
+    );
+
+    const diagnosticsToggle = screen.getByRole("button", { name: "View diagnostics" });
+    expect(diagnosticsToggle).toHaveClass("justify-between", "px-[12px]", "py-[8px]");
+    expect(diagnosticsToggle.closest('[data-slot="collapsible"]')).toHaveClass(
+      "border-t",
+      "-mx-[8px]",
+      "-mb-[8px]",
+      "w-[calc(100%+16px)]",
+    );
+    fireEvent.click(diagnosticsToggle);
+
+    expect(screen.getByRole("tablist", { name: "Diagnostic sections" })).toHaveAttribute(
+      "data-variant",
+      "line",
+    );
+    const diagnostics = screen.getByTestId("error-diagnostics-content");
+    expect(diagnostics).toHaveClass("max-h-64", "text-zinc-100");
+    expect(diagnostics.parentElement).toHaveClass("rounded-xl", "bg-zinc-950");
+    expect(screen.getByRole("button", { name: "Copy terminal" })).toHaveClass(
+      "absolute",
+      "top-3",
+      "right-3",
+    );
+  });
+
+  it("preserves classified title, cause, and remediation semantics", () => {
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        title="Claude Code can't run as root"
+        cause="Claude Code refuses this launch mode when the host runs as root."
+        remediation="Run the host as a non-root user (uid != 0)."
       />,
     );
-    const chip = screen.getByTestId("routing-decision-chip");
-    // applied=false → "would have picked" framing; a flip to the applied
-    // copy would falsely claim the brain ran on the router's pick.
-    expect(chip).toHaveTextContent("would have picked");
-    expect(chip).toHaveTextContent("haiku");
-    expect(chip.getAttribute("data-applied")).toBe("false");
+    expect(screen.getByText("Claude Code can't run as root")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code can't run as root/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "Claude Code refuses this launch mode when the host runs as root.",
+    );
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(
+      "Try this: Run the host as a non-root user (uid != 0).",
+    );
+    expect(screen.queryByRole("button", { name: "Copy recovery command" })).toBeNull();
   });
 
-  it("renders nothing for the rationale line when rationale is empty", () => {
-    render(<RoutingDecisionChip model="databricks-claude-sonnet-4-6" applied rationale="" />);
-    const chip = screen.getByTestId("routing-decision-chip");
-    // Empty rationale still renders the primary line, just no second line —
-    // a stray empty <span> would add visual noise to the transcript.
-    expect(chip).toHaveTextContent("sonnet");
-    expect(chip.textContent).not.toContain("(medium)");
+  it("copies structured provider recovery commands without diagnostics", async () => {
+    const remediation = "ucode configure";
+    render(
+      <ErrorBanner
+        message="Provider authentication required."
+        source="harness"
+        code="PROVIDER_AUTH_REQUIRED"
+        title="Databricks authentication required"
+        cause="Databricks authentication is missing or expired."
+        remediation={remediation}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /Databricks authentication required/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy recovery command" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Recovery command copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenLastCalledWith(remediation);
   });
 
-  it("never uses the old 'model control' vocabulary (rename sweep)", () => {
-    render(<RoutingDecisionChip model="databricks-claude-opus-4-8" applied rationale="x" />);
-    const chip = screen.getByTestId("routing-decision-chip");
-    // The feature was renamed from "Intelligent model control"; the chip
-    // must carry the new name and never the retired one.
-    expect(chip.textContent).toContain("Intelligent model router");
-    expect(chip.textContent).not.toContain("model control");
-    expect(chip.textContent).not.toContain("Model Control");
+  it.each([
+    ["databricks_sign_in_pending", "The agent is waiting for a Databricks sign-in."],
+    ["agent_startup_pending", "The agent is still starting in the session terminal."],
+    ["codex_thread_not_started", "Codex stopped before it could start, so this turn never ran."],
+    [
+      "transient_upstream_error",
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    ],
+    [
+      "client_update_required",
+      "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
+  ])("describes a %s failure in plain English", (code, sentence) => {
+    render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
+    expect(screen.getByText(sentence)).toBeInTheDocument();
   });
+
+  it("names both versions and the update command on a client_update_required card", () => {
+    render(
+      <ErrorBanner
+        message={`API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required."}`}
+        source="execution"
+        code="client_update_required"
+        title="Claude Code needs an update"
+        cause="Claude Code 2.1.217 on the host doesn't support this model; version 2.1.280 or newer is required."
+        remediation="Run `claude update` on the host, then start a new session."
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Claude Code needs an update")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code needs an update/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(content).toHaveTextContent("Claude Code 2.1.217 on the host");
+    expect(content).toHaveTextContent("version 2.1.280 or newer is required");
+    expect(content).toHaveTextContent("Try this: Run `claude update` on the host");
+    // The running CLI keeps its old version, so neither turn retry nor resume applies.
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+  });
+
+  const SIGN_IN_REMEDIATION =
+    "Open the sign-in link and sign in. " +
+    "Codex continues on its own once the sign-in completes; then send your message again.";
+
+  function renderSignInCard() {
+    render(
+      <ErrorBanner
+        message="Codex is waiting for a sign-in in this session's terminal."
+        source="harness"
+        code="databricks_sign_in_pending"
+        title="Codex can't start until you sign in to Databricks"
+        remediation={SIGN_IN_REMEDIATION}
+      />,
+    );
+  }
+
+  it("offers the sign-in action by failure code, with no stored link or code", () => {
+    // The card text carries no address: the link is a one-time URL bound to the
+    // launcher process, so the button fetches the live one from the host.
+    useChatStore.setState({ conversationId: null });
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderSignInCard();
+    expect(screen.getByRole("button", { name: "Open sign-in link" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Copy code/ })).not.toBeInTheDocument();
+    // Without a live session there is nothing to fetch, and nothing to open.
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    expect(open).not.toHaveBeenCalled();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "Open this session to fetch the current sign-in link.",
+    );
+    // The actions sit on the collapsed face and must not toggle the pill open.
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    open.mockRestore();
+  });
+
+  it("asks the host for the live sign-in link before opening it", async () => {
+    // The saved link belongs to the launcher process that printed it and goes
+    // stale once that process moves on, so the click fetches the current one.
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn(), opener: window as Window | null };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    vi.mocked(getSessionSignInLink).mockResolvedValue({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() =>
+      expect(tab.location.href).toBe("https://signin.example.com/device?fresh=1"),
+    );
+    // The sign-in page must not be able to navigate this tab.
+    expect(tab.opener).toBeNull();
+    expect(getSessionSignInLink).toHaveBeenCalledWith("conv_live");
+    // The tab was pre-opened in the click, so the navigation is not a popup.
+    expect(open).toHaveBeenCalledWith("", "_blank");
+    expect(screen.getByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeInTheDocument();
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("shows a completed sign-in notice's line without expanding it", () => {
+    render(
+      <ErrorBanner
+        message="Codex is ready. Send your message again."
+        source="harness"
+        code="databricks_sign_in_completed"
+        title="Signed in to Databricks"
+        level="info"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent("Signed in to Databricks");
+    expect(screen.getByTestId("error-notice-body")).toHaveTextContent(
+      "Codex is ready. Send your message again.",
+    );
+    expect(screen.queryByRole("button", { name: "Open sign-in link" })).toBeNull();
+  });
+
+  it("explains when no sign-in is pending any more instead of opening a dead link", async () => {
+    useChatStore.setState({ conversationId: "conv_live" });
+    const tab = { location: { href: "" }, close: vi.fn() };
+    const open = vi.spyOn(window, "open").mockReturnValue(tab as unknown as Window);
+    // A first click found a prompt with a code; the sign-in then completed.
+    vi.mocked(getSessionSignInLink).mockResolvedValueOnce({
+      pending: true,
+      url: "https://signin.example.com/device?fresh=1",
+      code: "ZZ99-FRSH",
+    });
+    renderSignInCard();
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await screen.findByRole("button", { name: "Copy code ZZ99-FRSH" });
+    tab.location.href = "";
+    vi.mocked(getSessionSignInLink).mockResolvedValue({ pending: false, url: null, code: null });
+    fireEvent.click(screen.getByRole("button", { name: "Open sign-in link" }));
+    await waitFor(() => expect(tab.close).toHaveBeenCalled());
+    // The obsolete code is gone along with the prompt.
+    expect(screen.queryByRole("button", { name: "Copy code ZZ99-FRSH" })).toBeNull();
+    expect(screen.getByTestId("error-sign-in-note")).toHaveTextContent(
+      "No sign-in is pending in the terminal any more. Try sending your message again.",
+    );
+    expect(tab.location.href).toBe("");
+    open.mockRestore();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  it("links addresses inside the expanded remediation text", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="databricks_sign_in_pending"
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD."
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /waiting for a Databricks sign-in/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(within(content).getByRole("link")).toHaveAttribute(
+      "href",
+      "https://signin.example.com/device",
+    );
+  });
+
+  it("shows no sign-in actions for failures that are not a pending sign-in", () => {
+    render(
+      <ErrorBanner
+        message="raw diagnostics"
+        source="harness"
+        code="agent_startup_pending"
+        remediation="Finish any sign-in shown in the session terminal, then send your message again."
+      />,
+    );
+    expect(screen.queryByTestId("error-remediation-actions")).not.toBeInTheDocument();
+  });
+
+  it("separates terminal diagnostics and last output into tabs", () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.getByRole("tab", { name: "Terminal" })).toHaveAttribute("aria-selected", "true");
+    // Clicks inside the expanded body must not collapse the pill.
+    fireEvent.click(screen.getByTestId("error-message-content"));
+    expect(screen.getByText("Message")).toBeInTheDocument();
+    const terminal = screen.getByTestId("error-diagnostics-content");
+    expect(terminal).toHaveTextContent("terminal: claude:main");
+    expect(terminal).toHaveTextContent("termination_reason: terminal pane no longer available");
+    expect(terminal).not.toHaveTextContent("Pane is dead");
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    expect(screen.getByRole("tab", { name: "Last captured output" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getAllByTestId("error-diagnostics-content").at(-1)).toHaveTextContent(
+      "Pane is dead",
+    );
+  });
+
+  it("copies message and active diagnostics with accessible confirmation", async () => {
+    render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy error message" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Error message copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenCalledWith(
+      "Required terminal exited unexpectedly; the session runtime is no longer available.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy last captured output" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Last captured output copied" })).toBeTruthy(),
+    );
+    expect(copyText).toHaveBeenLastCalledWith("Pane is dead (status 0, Tue Aug 11 17:00:46 2026)");
+  });
+
+  it("falls back to a non-empty message without diagnostics controls", () => {
+    render(<ErrorBanner message="" source="" code="mystery_failure" />);
+    fireEvent.click(screen.getByRole("button", { name: /Something went wrong/ }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent("mystery_failure");
+    expect(screen.queryByRole("button", { name: "View diagnostics" })).toBeNull();
+  });
+
+  it("names an undelivered native web message in the headline", () => {
+    render(
+      <ErrorBanner
+        message="Claude Code never recorded this message in its transcript before accepting a later one, so it was not delivered."
+        source="execution"
+        code="native_prompt_not_recorded"
+      />,
+    );
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Message not delivered. Try sending it again.",
+    );
+  });
+
+  it("dismisses only the visible banner", () => {
+    render(
+      <div>
+        <span>Unrelated transcript content</span>
+        <ErrorBanner message="boom" source="execution" code="executor_error" />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss error message" }));
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+    expect(screen.getByText("Unrelated transcript content")).toBeInTheDocument();
+  });
+
+  it("toggles from the pill body but not from nested action buttons", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: /terminal exited unexpectedly/i });
+    const pill = toggle.parentElement!.parentElement as HTMLElement;
+    // Clicks on pill padding (outside the headline button) toggle expansion.
+    fireEvent.click(pill);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(pill);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+
+    // Resume starts recovery instead of toggling; dismiss removes the banner.
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("error-reconnecting")).toBeInTheDocument();
+    await act(async () => resolveRetry?.());
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+  });
+
+  it("prevents duplicate retries and removes the replacement pill on success", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByText("Message")).toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: "Resume session" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
+    expect(screen.queryByText("Message")).toBeNull();
+    resolveRetry?.();
+    await waitFor(() => {
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.queryByTestId("error-headline")).toBeNull();
+    });
+  });
+
+  it("restores the actionable error and diagnostics when retry fails", async () => {
+    const onRetry = vi.fn().mockRejectedValue(new Error("Host is still offline"));
+    render(
+      <ErrorBanner
+        message={TERMINAL_ERROR}
+        source="execution"
+        code="required_terminal_exited"
+        onRetry={onRetry}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Resume session failed: Host is still offline",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Dismiss error message" })).toHaveFocus();
+    // The retry-error status row must not toggle the pill when clicked.
+    fireEvent.click(screen.getByRole("status"));
+    expect(screen.queryByText("Message")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByRole("button", { name: "View diagnostics" })).toBeInTheDocument();
+  });
+
+  it("does not invent retry for non-retryable variants", () => {
+    render(
+      <ErrorBanner
+        message="The conversation is too long."
+        source="llm"
+        code="context_length_exceeded"
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("keeps causally related error messages in order inside one expanded banner", () => {
+    render(
+      <ErrorBanner
+        message="The session runner stopped."
+        source="execution"
+        code="required_terminal_exited"
+        relatedErrors={[
+          {
+            itemId: "related-1",
+            message: "Harness cleanup failed.\n\nLifecycle diagnostics:\ncleanup: exit 1",
+            source: "execution",
+            code: "runner_error",
+          },
+          {
+            itemId: "related-2",
+            message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+            source: "execution",
+            code: "runner_disconnected",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getAllByTestId("error-pill")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    expect(screen.getByText("Related errors (2)")).toBeInTheDocument();
+    expect(screen.getAllByTestId("related-error-content").map((node) => node.textContent)).toEqual([
+      "Harness cleanup failed.\n\nLifecycle diagnostics:\ncleanup: exit 1",
+      "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+    ]);
+  });
+
+  it("offers recovery from a retryable related disconnect", async () => {
+    const onRetry = vi.fn(async () => {});
+    const relatedDisconnect = {
+      itemId: "related-disconnect",
+      message: "Runner disconnected.",
+      source: "execution",
+      code: "runner_disconnected",
+    };
+    render(
+      <ErrorBanner
+        itemId="primary-error"
+        message="The runner failed."
+        source="execution"
+        code="runner_error"
+        relatedErrors={[relatedDisconnect]}
+        onRetry={onRetry}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedDisconnect));
+  });
+
+  it("retries classified rate-limit errors and preserves the provider's details", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={RATE_LIMIT_ERROR}
+        source="llm"
+        code="rate_limit_exceeded"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model's rate limit was reached. You can retry this turn.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /model's rate limit was reached/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(RATE_LIMIT_ERROR);
+
+    const retry = screen.getByRole("button", { name: "Retry" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent(/^Retrying$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+
+    await act(async () => resolveRetry?.());
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+  });
+
+  it("does not offer rate-limit retry without a handler", () => {
+    render(<ErrorBanner message={RATE_LIMIT_ERROR} source="llm" code="rate_limit_exceeded" />);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("offers turn retry for a transient upstream failure", async () => {
+    const onRetry = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ErrorBanner
+        message="API Error: Server error mid-response. The response above may be incomplete."
+        source="llm"
+        code="transient_upstream_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model service hit a temporary error mid-response; retrying usually continues the turn.",
+    );
+    // Turn retry, not a runner resume — the session itself is healthy.
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledTimes(1));
+  });
+
+  it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
+    "does not infer rate-limit retry from the message for code %s",
+    (code) => {
+      render(
+        <ErrorBanner message={RATE_LIMIT_ERROR} source="execution" code={code} onRetry={vi.fn()} />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
+  it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
+    "does not offer reconnect for live-runner code %s",
+    (code) => {
+      render(
+        <ErrorBanner message="The turn failed." source="execution" code={code} onRetry={vi.fn()} />,
+      );
+      expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    },
+  );
+
+  it("offers Retry (not Resume session) for a connection_error", async () => {
+    const onRetry = vi.fn(async () => {});
+    render(
+      <ErrorBanner
+        itemId="conn-err-1"
+        message="peer closed connection without sending complete message body (incomplete chunked read)"
+        source="harness"
+        code="connection_error"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    const retryButton = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryButton);
+    await waitFor(() =>
+      expect(onRetry).toHaveBeenCalledWith(expect.objectContaining({ code: "connection_error" })),
+    );
+  });
+
+  it("suppresses the runner's unavailable last-output diagnostics tab", () => {
+    render(
+      <ErrorBanner
+        message={[
+          "Terminal failed.",
+          "",
+          "Terminal diagnostics:",
+          "pid: 42",
+          "",
+          "Last captured output: unavailable. The process exited before Omnigent captured a pane snapshot.",
+        ].join("\n")}
+        source="execution"
+        code="required_terminal_exited"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    expect(screen.queryByRole("tab", { name: "Last captured output" })).toBeNull();
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent("pid: 42");
+  });
+
+  it("keeps the selected diagnostics tab valid when parsed sections change", () => {
+    const { rerender } = render(
+      <ErrorBanner message={TERMINAL_ERROR} source="execution" code="required_terminal_exited" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /terminal exited unexpectedly/i }));
+    fireEvent.click(screen.getByRole("button", { name: "View diagnostics" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Last captured output" }));
+    rerender(
+      <ErrorBanner
+        message={["Terminal failed.", "", "Terminal diagnostics:", "pid: 99"].join("\n")}
+        source="execution"
+        code="required_terminal_exited"
+      />,
+    );
+    expect(screen.getByTestId("error-diagnostics-content")).toHaveTextContent("pid: 99");
+  });
+});
+
+describe("Codex compaction on the previous model", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  const cause =
+    "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted.";
+  const gatewayError =
+    'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":"Budget \\"example-budget\\" has reached its limit of $100."}';
+
+  it("leads with the provider's error, then explains and forks without expanding", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message={gatewayError}
+          source="execution"
+          code="codex_compaction_model_failed"
+          title="gpt-6-astra is over its AI gateway budget"
+          cause={cause}
+        />
+      </ForkDialogContextProvider>,
+    );
+
+    const hint = screen.getByTestId("error-compaction-model-hint");
+    expect(hint.textContent?.startsWith(`${gatewayError}${cause}`)).toBe(true);
+    expect(hint).toHaveTextContent(/Fork session…$/);
+    fireEvent.click(screen.getByRole("button", { name: "Fork session…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({ sourceSessionId: "conv_parent" });
+  });
+
+  it("copies the provider's error from the hint", async () => {
+    render(
+      <ErrorBanner
+        message={gatewayError}
+        source="execution"
+        code="codex_compaction_model_failed"
+        title="gpt-6-astra is over its AI gateway budget"
+        cause={cause}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy error" }));
+
+    expect(copyText).toHaveBeenLastCalledWith(gatewayError);
+    expect(await screen.findByRole("button", { name: "Error copied" })).toBeInTheDocument();
+  });
+
+  it("does not repeat the hint in a Message section", () => {
+    render(
+      <ErrorBanner
+        message={gatewayError}
+        source="execution"
+        code="codex_compaction_model_failed"
+        title="gpt-6-astra is over its AI gateway budget"
+        cause={cause}
+        remediation="Fork this session to continue on gpt-6-1-sol."
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /over its AI gateway budget/i }));
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+    expect(screen.queryByTestId("error-message-content")).toBeNull();
+    expect(screen.queryByText(/Try this:/)).toBeNull();
+    expect(screen.getAllByText(gatewayError)).toHaveLength(1);
+  });
+
+  it("offers the fork when the compaction failure is grouped under another error", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="Runner disconnected."
+          source="execution"
+          code="runner_disconnected"
+          relatedErrors={[
+            {
+              itemId: "related-compaction",
+              message: gatewayError,
+              source: "execution",
+              code: "codex_compaction_model_failed",
+              cause,
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+
+    const hint = screen.getByTestId("error-compaction-model-hint");
+    expect(hint.textContent?.startsWith(`${gatewayError}${cause}`)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Fork session…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({ sourceSessionId: "conv_parent" });
+  });
+
+  it.each([
+    { canFork: false, code: "codex_compaction_model_failed" },
+    { canFork: true, code: "budget_exhausted" },
+  ])("does not offer the fork for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Fork session…" })).not.toBeInTheDocument();
+  });
+});
+
+describe("missing workspace recovery", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  it.each([null, "conv_side_chat"])("continues the displayed conversation (%s)", (scope) => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ConversationScopeContext.Provider value={scope}>
+          <ErrorBanner
+            message="workspace path does not exist: /missing"
+            source="execution"
+            code="workspace_missing"
+          />
+        </ConversationScopeContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: scope ?? "conv_parent",
+      workspaceRecovery: true,
+    });
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+  });
+
+  it("offers directory recovery for grouped workspace errors instead of retrying the missing path", () => {
+    const onRetry = vi.fn();
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="The runner disconnected"
+          source="execution"
+          code="runner_disconnected"
+          onRetry={onRetry}
+          relatedErrors={[
+            {
+              itemId: "workspace-error",
+              code: "workspace_missing",
+              source: "execution",
+              message: "Missing directory",
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Resume session" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { canFork: false, code: "workspace_missing" },
+    { canFork: true, code: "runner_error" },
+  ])("does not offer directory recovery for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Continue in another directory…" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the action disabled when forking is unavailable", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          currentSessionId: "conv_parent",
+          canFork: true,
+          disabledReason: "Forking is unavailable",
+          openForkDialog,
+        }}
+      >
+        <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+      </ForkDialogContextProvider>,
+    );
+    const button = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "lets a scoped child resolve its capabilities independently of root canFork=%s",
+    (canFork) => {
+      const openForkDialog = vi.fn();
+      render(
+        <ForkDialogContextProvider
+          value={{
+            currentSessionId: "conv_parent",
+            canFork,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <ConversationScopeContext.Provider value="conv_side_chat">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>,
+      );
+
+      const button = screen.getByRole("button", { name: "Continue in another directory…" });
+      expect(button).toBeEnabled();
+      fireEvent.click(button);
+      expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+        sourceSessionId: "conv_side_chat",
+        workspaceRecovery: true,
+      });
+    },
+  );
 });
 
 describe("RoutingDecisionCard — session-level auto-routing", () => {
@@ -73,7 +1056,7 @@ describe("RoutingDecisionCard — session-level auto-routing", () => {
       />,
     );
     const card = screen.getByTestId("routing-decision-card");
-    expect(card).toHaveTextContent("Intelligent routing");
+    expect(card).toHaveTextContent("Smart routing");
     expect(card).toHaveTextContent("· applied");
     expect(card).toHaveTextContent("Session");
     expect(card).toHaveTextContent("opus");
@@ -123,5 +1106,293 @@ describe("RoutingDecisionCard — session-level auto-routing", () => {
     expect(screen.queryByText(/"rationale"/)).toBeNull();
     fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
     expect(screen.getByText(/"rationale"/)).toBeInTheDocument();
+  });
+});
+
+describe("routing decision — harness / scope / raw pick", () => {
+  // Harness + which sub-agent the decision covers: without the badge a
+  // native-subagent decision is indistinguishable from a session one, and a
+  // badge on a session/turn decision would invent a sub-agent that has none.
+  // Every chip also shortens the harness id: "-native" is how the pane runs,
+  // not something a chip needs to say, whatever scope took the decision.
+  it.each([
+    ["native_subagent", "subagent: researcher"],
+    ["turn", null],
+    ["session", null],
+  ] as const)("card: %s scope renders the sub-agent badge as %s", (scope, badge) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="short task"
+        agent="researcher"
+        routing={{ harness: "claude-native", scope }}
+      />,
+    );
+    // Anchored: a bare "claude" would also match the unshortened id.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent(/^· claude$/);
+    if (badge === null) {
+      expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    } else {
+      expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(badge);
+    }
+  });
+
+  // A shared type or rationale cannot identify the work a decision governs.
+  it("card: names the task the decision governed, in place of the shared type row", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-4-6"
+        applied={false}
+        rationale="Routing unavailable; spawn allowed unchanged"
+        agent="general-purpose"
+        routing={{ scope: "native_subagent", taskDescription: "Research auth flows" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-task")).toHaveTextContent("Research auth flows");
+    // The shared type stays visible on the scope badge.
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(
+      "subagent: general-purpose",
+    );
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"task_description": "Research auth flows"/)).toBeInTheDocument();
+  });
+
+  it.each([undefined, "", " \t\n"])(
+    "card: an unlabeled spawn (%j) keeps the agent row label",
+    (taskDescription) => {
+      render(
+        <RoutingDecisionCard
+          model="databricks-claude-sonnet-4-6"
+          applied={false}
+          rationale="x"
+          agent="general-purpose"
+          routing={{ scope: "native_subagent", taskDescription }}
+        />,
+      );
+      expect(screen.queryByTestId("routing-decision-task")).toBeNull();
+      expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
+    },
+  );
+
+  // The router's vocabulary pick may have had no endpoint and been mapped to a
+  // servable id — that must be visible. When it resolves to the same short
+  // name there is nothing to disclose, so the row stays off.
+  it.each([
+    ["gpt-5-6-sol", "gpt-5-6-sol"],
+    ["claude-sonnet-5", null],
+  ] as const)("card: raw pick %s is disclosed as %s", (rawModel, shown) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ rawModel }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("sonnet");
+    if (shown === null) {
+      expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    } else {
+      expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent(shown);
+    }
+  });
+
+  it("card: renders harness, scope badge, raw pick, and the extras in the raw JSON", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="short task"
+        agent="researcher"
+        routing={{
+          harness: "codex-native",
+          scope: "child_session",
+          decisionId: "dec_123",
+          rawModel: "gpt-5-6-sol",
+          attemptedOverride: "databricks-claude-opus-4-8",
+        }}
+      />,
+    );
+    // child_session is a sub-agent scope, so the harness id renders shortened.
+    expect(screen.getByTestId("routing-decision-harness")).toHaveTextContent("codex");
+    // The badge's exact wording is pinned once, on subagentScopeLabel.
+    expect(screen.getByTestId("routing-decision-scope")).toBeTruthy();
+    expect(screen.getByTestId("routing-decision-raw-model")).toHaveTextContent("gpt-5-6-sol");
+    // The overridden ask is the point of the row, so it shows at a glance; the
+    // decision id stays audit data behind the chevron.
+    expect(screen.getByTestId("routing-decision-attempted-override")).toHaveTextContent("opus");
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"decision_id"/)).toBeInTheDocument();
+    expect(screen.getByText(/"attempted_override"/)).toBeInTheDocument();
+  });
+
+  // Strict adherence to the router means a spawn's own model ask is applied
+  // only when the router agrees; when it doesn't, the substitution has to be
+  // visible without expanding the verdict.
+  it.each([
+    ["databricks-claude-opus-4-8", "opus"],
+    // Same short name as the pill — a struck-through duplicate reads as a bug.
+    ["system.ai.claude-sonnet-5", null],
+  ] as const)("card: attempted override %s is disclosed as %s", (attemptedOverride, shown) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="Spawn requested databricks-claude-opus-4-8; overridden."
+        routing={{ attemptedOverride }}
+      />,
+    );
+    if (shown === null) {
+      expect(screen.queryByTestId("routing-decision-attempted-override")).toBeNull();
+    } else {
+      const span = screen.getByTestId("routing-decision-attempted-override");
+      expect(span).toHaveTextContent(shown);
+      expect(span.className).toContain("line-through");
+      // Only the first of (attempted, raw pick, pill) pushes the group right.
+      expect(span.className).toContain("ml-auto");
+    }
+  });
+
+  it("card: the attempted override takes ml-auto ahead of the raw pick", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ attemptedOverride: "databricks-claude-opus-4-8", rawModel: "gpt-5-6-sol" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-attempted-override").className).toContain(
+      "ml-auto",
+    );
+    // Exactly one spacer, else the row splits into two right-aligned groups.
+    expect(screen.getByTestId("routing-decision-raw-model").className).not.toContain("ml-auto");
+  });
+
+  it("card: omits the new rows and JSON keys when the fields are absent", () => {
+    render(
+      <RoutingDecisionCard model="databricks-claude-opus-4-8" applied rationale="deep reasoning" />,
+    );
+    expect(screen.queryByTestId("routing-decision-harness")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-scope")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-raw-model")).toBeNull();
+    expect(screen.queryByTestId("routing-decision-attempted-override")).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.queryByText(/"harness"/)).toBeNull();
+    expect(screen.queryByText(/"raw_model"/)).toBeNull();
+  });
+
+  // Only an AI-Gateway-routed decision is marked: the built-in judge is the
+  // plain case, and a legacy row predates the field entirely.
+  const AIGW_MARK = "routing-decision-source-databricks";
+  const AIGW_NAME = "Routed by the Databricks Unity Gateway";
+
+  it("card: marks a decision the Databricks Unity Gateway answered", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={{ routerSource: "databricks-aigw" }}
+      />,
+    );
+    expect(screen.getByTestId(AIGW_MARK)).toBeTruthy();
+    // The wrapper carries the name — the brand mark itself is aria-hidden, and
+    // it must never announce as the model family ("DBRX").
+    expect(screen.getByRole("img", { name: AIGW_NAME })).toBeTruthy();
+    expect(screen.queryByTitle(/DBRX/i)).toBeNull();
+    expect(screen.queryByLabelText(/DBRX/i)).toBeNull();
+    expect(screen.queryByText(/DBRX/i)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"router_source"/)).toBeInTheDocument();
+  });
+
+  it.each([
+    ["the built-in judge answered", { routerSource: "oss-llm" }],
+    ["the field is absent", {}],
+  ] as const)("card: leaves the mark off when %s", (_case, routing) => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-5"
+        applied
+        rationale="x"
+        routing={routing}
+      />,
+    );
+    expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
+    expect(screen.queryByRole("img", { name: AIGW_NAME })).toBeNull();
+  });
+
+  it("card: leaves the mark off a legacy row with no routing at all", () => {
+    render(<RoutingDecisionCard model="databricks-claude-sonnet-5" applied rationale="x" />);
+    expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.queryByText(/"router_source"/)).toBeNull();
+  });
+});
+
+describe("ErrorBanner — budget tone", () => {
+  it.each(["budget_exhausted", "codex_compaction_model_failed"])(
+    "renders %s in the neutral tone",
+    (code) => {
+      render(
+        <ErrorBanner message="Budget has reached its limit." source="execution" code={code} />,
+      );
+      const pill = screen.getByTestId("error-pill");
+      // Still a failed turn, only without the failure color.
+      expect(pill).toHaveAttribute("data-level", "error");
+      expect(pill.getAttribute("style")).toContain("--muted-foreground");
+      expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
+    },
+  );
+
+  it("keeps the failure tone when another failure is grouped with it", () => {
+    render(
+      <ErrorBanner
+        message="Budget has reached its limit."
+        source="execution"
+        code="budget_exhausted"
+        relatedErrors={[
+          {
+            itemId: "related-disconnect",
+            message: "Runner disconnected.",
+            source: "execution",
+            code: "runner_disconnected",
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByTestId("error-pill").getAttribute("style")).toContain("--destructive");
+    expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
+  });
+});
+
+describe("ErrorBanner — info level", () => {
+  it("renders a neutral notice pill with the code's headline and an info icon", () => {
+    render(
+      <ErrorBanner
+        message="Codex could not load this session's saved transcript."
+        source="harness"
+        code="codex_thread_reset"
+        level="info"
+      />,
+    );
+    const pill = screen.getByTestId("error-pill");
+    expect(pill).toHaveAttribute("data-level", "info");
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+    );
+    expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
+    // Disclosure chevron is always shown; destructive styling is on the headline, not the icon.
+    expect(screen.getByTestId("error-disclosure-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("error-disclosure-icon")).not.toHaveClass("text-destructive");
+    expect(screen.getByRole("button", { name: "Dismiss notice" })).toBeInTheDocument();
+  });
+
+  it("keeps the destructive pill as the default level", () => {
+    render(<ErrorBanner message="boom" source="execution" code="runner_error" />);
+    expect(screen.getByTestId("error-pill")).toHaveAttribute("data-level", "error");
+    expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });

@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
-from omnigent import codex_native_forwarder
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from tests.e2e_ui.conftest import open_right_rail
 
 
@@ -86,4 +86,6 @@ def test_codex_spawn_activity_appears_in_agents_rail(
     child_row = rail.locator('[data-testid="subagent-row"]')
     expect(child_row).to_have_count(1, timeout=30_000)
     expect(child_row).to_contain_text("Codex")
-    expect(child_row.get_by_test_id("subagent-status-dot")).to_have_attribute("aria-label", "Done")
+    expect(child_row.get_by_test_id("subagent-status-avatar")).to_have_attribute(
+        "aria-label", "Done"
+    )

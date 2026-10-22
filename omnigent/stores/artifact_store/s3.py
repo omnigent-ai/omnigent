@@ -193,7 +193,10 @@ class S3ArtifactStore(ArtifactStore):
 
         try:
             resp = self._client.get_object(Bucket=self._bucket, Key=self._resolve(key))
-            return resp["Body"].read()
+            data = resp["Body"].read()
+            if not isinstance(data, bytes):
+                raise TypeError(f"S3 object body returned {type(data).__name__}, expected bytes")
+            return data
         except ClientError as exc:
             if _is_not_found(exc):
                 raise KeyError(key) from None

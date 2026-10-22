@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import json
 import logging
 import os
+import pathlib
+import re
+import shlex
 import subprocess
 import sys
+from unittest import mock
+
+import pytest
 
 from omnigent.inner.sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     SandboxPolicy,
     create_exec_launcher,
     run_launcher,
@@ -43,6 +51,60 @@ def _noop_policy_arg() -> str:
         "utf-8"
     )
     return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+@pytest.mark.parametrize("grant_field", ["write_roots", "write_files"])
+@pytest.mark.parametrize("grant_parent", [False, True])
+def test_exec_launcher_rejects_writable_launcher_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, grant_field: str, grant_parent: bool
+) -> None:
+    launcher_dir = tmp_path / "launchers"
+    launcher_dir.mkdir()
+    monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(launcher_dir))
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type="linux_bwrap")
+    setattr(policy, grant_field, [tmp_path if grant_parent else launcher_dir])
+
+    with pytest.raises(ValueError, match="Grant a dedicated scratch directory"):
+        create_exec_launcher(sys.executable, policy)
+    assert list(launcher_dir.iterdir()) == []
+
+
+def test_exec_launcher_accepts_dedicated_scratch_directory(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launcher_dir = tmp_path / "launchers"
+    launcher_dir.mkdir()
+    scratch = launcher_dir / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr("omnigent.inner.sandbox.tempfile.tempdir", str(launcher_dir))
+    policy = dataclasses.replace(
+        _noop_policy(), active=True, backend_type="linux_bwrap", write_roots=[scratch]
+    )
+
+    path = pathlib.Path(create_exec_launcher(sys.executable, policy, cwd=str(scratch)))
+    try:
+        assert path.parent == launcher_dir
+        assert path.stat().st_mode & 0o777 == 0o700
+    finally:
+        path.unlink()
+
+
+def test_exec_launcher_freezes_phoenix_proc_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A filtered child launcher does not need the Phoenix marker."""
+    captured: list[SandboxPolicy] = []
+    policy = dataclasses.replace(_noop_policy(), active=True, backend_type="linux_bwrap")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
+    monkeypatch.setattr(
+        "omnigent.inner.sandbox._launcher_inline_source",
+        lambda _target, resolved, *, cwd=None: captured.append(resolved) or "pass",
+    )
+
+    path = pathlib.Path(create_exec_launcher(sys.executable, policy))
+    path.unlink()
+
+    assert captured[0].bind_host_proc is True
 
 
 def test_run_launcher_emits_logger_checkpoints(caplog) -> None:
@@ -137,6 +199,28 @@ def test_exec_launcher_wrapper_subprocess_emits_markers_to_stderr() -> None:
     assert "[omnigent-sandbox] target exited rc=0" in result.stderr, result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher script")
+def test_exec_launcher_ignores_workspace_modules(tmp_path: pathlib.Path) -> None:
+    """Modules in the spawner's cwd never replace the launcher's own imports."""
+    for name in ("logging", "json", "base64"):
+        (tmp_path / f"{name}.py").write_text(f"raise ImportError('{name} loaded from the cwd')\n")
+    wrapper_path = create_exec_launcher(sys.executable, _noop_policy())
+    try:
+        result = subprocess.run(
+            [wrapper_path, "-c", "print('target ran')"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "target ran"
+
+
 def test_run_launcher_wraps_target_with_strace_when_env_set(monkeypatch, caplog) -> None:
     """
     ``OMNIGENT_SANDBOX_STRACE=1`` must prepend ``strace -f -y -e
@@ -223,13 +307,32 @@ def test_sandbox_policy_round_trips_spawn_env_allowlist() -> None:
     """
     policy = _noop_policy()
     policy.spawn_env_allowlist = ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
+    policy.bind_host_proc = True
 
     decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
 
     assert decoded.spawn_env_allowlist == ["HOME", "PATH", "PI_CODING_AGENT_DIR"]
+    assert decoded.bind_host_proc is True
+    assert SandboxPolicy.from_jsonable({}).bind_host_proc is None
+    assert SandboxPolicy.from_jsonable({"bind_host_proc": "false"}).bind_host_proc is None
+    assert SandboxPolicy.from_jsonable({"bind_host_proc": False}).bind_host_proc is False
     # Old payloads (no key) and unset policies must decode to None —
     # "no prune", not "prune everything".
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).spawn_env_allowlist is None
+
+
+def test_credential_source_paths_survive_serialization_and_cloning(tmp_path: pathlib.Path) -> None:
+    from omnigent.inner.sandbox import with_additional_read_roots, with_additional_write_roots
+
+    policy = _noop_policy()
+    protected = (tmp_path / "token.sock").resolve()
+    policy.credential_source_paths = [protected]
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+    cloned = with_additional_read_roots(decoded, [tmp_path / "tools"])
+    cloned = with_additional_write_roots(cloned, [tmp_path / "scratch"])
+    assert cloned.credential_source_paths == [protected]
+    assert cloned.credential_source_paths is not decoded.credential_source_paths
+    assert SandboxPolicy.from_jsonable({}).credential_source_paths is None
 
 
 def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
@@ -252,6 +355,59 @@ def test_sandbox_policy_round_trips_deny_unix_socket_paths() -> None:
     # Old payloads (no key) and unset policies decode to None — "no
     # deny", not an empty-but-present list.
     assert SandboxPolicy.from_jsonable(_noop_policy().to_jsonable()).deny_unix_socket_paths is None
+
+
+def test_sandbox_policy_round_trips_mask_and_recursive_fields() -> None:
+    """``cwd_hidden_scan_recursive`` + ``mask_paths`` survive the wire.
+
+    Both fields cross the parent/helper boundary as JSON. If either
+    dropped out of ``to_jsonable`` / ``from_jsonable`` the helper would
+    decode the recursive flag as ``False`` and the explicit masks as
+    ``None`` — silently weakening the sandbox view.
+    """
+    from pathlib import Path
+
+    policy = _noop_policy()
+    policy.cwd_hidden_scan_recursive = True
+    policy.mask_paths = [Path("/work/config/production.key")]
+
+    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
+
+    assert decoded.cwd_hidden_scan_recursive is True
+    assert decoded.mask_paths == [Path("/work/config/production.key")]
+    # Old payloads (no key) and unset policies must decode to the safe
+    # defaults: non-recursive and no explicit masks.
+    baseline = SandboxPolicy.from_jsonable(_noop_policy().to_jsonable())
+    assert baseline.cwd_hidden_scan_recursive is False
+    assert baseline.mask_paths is None
+
+
+def test_with_additional_write_roots_records_mask_scan_skip_roots() -> None:
+    """A framework write root added post-resolve is excluded from the
+    dotfile mask scan.
+
+    The per-helper scratch tmpdir (holding the egress ``.egress.sock``,
+    CA bundle, credential-proxy files) is folded into ``write_roots`` via
+    :func:`with_additional_write_roots`. It must also land in
+    ``mask_scan_skip_roots`` so the scan never masks ``.egress.sock`` and
+    breaks the egress relay. The source policy stays untouched (builders
+    are chained off a shared base).
+    """
+    from pathlib import Path
+
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    policy = _noop_policy()
+    scratch = Path("/tmp/omnigent-helper-ab12")
+
+    augmented = with_additional_write_roots(policy, [scratch])
+
+    resolved = scratch.resolve(strict=False)
+    assert resolved in augmented.write_roots
+    assert augmented.mask_scan_skip_roots == [resolved]
+    # Source policy not mutated.
+    assert policy.mask_scan_skip_roots is None
+    assert augmented is not policy
 
 
 def test_with_denied_unix_sockets_resolves_dedupes_and_is_pure() -> None:
@@ -345,6 +501,47 @@ def test_exec_launcher_prunes_inherited_env_to_spawn_allowlist(tmp_path) -> None
     assert child_env.get("PATH") == os.environ["PATH"]
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="bubblewrap is Linux-only")
+def test_run_launcher_keeps_resolved_proc_bind_after_env_pruning(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The proc choice survives launcher environment pruning."""
+    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+    monkeypatch.setattr("omnigent.inner.bwrap_sandbox._LAKEBOX_MARKER", tmp_path / "absent")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "phoenix-kubernetes")
+    monkeypatch.setattr(
+        "omnigent.inner.bwrap_sandbox.shutil.which", lambda _name: "/usr/bin/bwrap"
+    )
+    policy = BwrapSandboxBackend().resolve(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        tmp_path,
+    )
+    policy = dataclasses.replace(policy, spawn_env_allowlist=["PATH"])
+    raw = json.dumps(policy.to_jsonable(), separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    captured: list[str] = []
+
+    def _capture_exec(_file: str, argv: list[str]) -> None:
+        captured.extend(argv)
+        raise SystemExit
+
+    monkeypatch.setattr("omnigent.inner.sandbox.create_private_tmpdir", lambda: scratch)
+    monkeypatch.setattr(os, "execvp", _capture_exec)
+
+    with mock.patch.dict(os.environ):
+        with pytest.raises(SystemExit):
+            run_launcher(encoded, sys.executable, ["-c", "pass"], cwd=str(tmp_path))
+        assert HOST_SANDBOX_BACKEND_ENV not in os.environ
+    assert any(
+        captured[index : index + 3] == ["--bind", "/proc", "/proc"]
+        for index in range(len(captured) - 2)
+    )
+
+
 def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     """A policy with ``spawn_env_allowlist=None`` (spawner didn't opt
     in) must NOT prune — existing launcher users (claude-sdk, terminal)
@@ -361,7 +558,11 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
             capture_output=True,
             text=True,
             timeout=30,
-            env={**os.environ, "DELIBERATE_EXTRA": "kept"},
+            env={
+                **os.environ,
+                "DELIBERATE_EXTRA": "kept",
+                HOST_SANDBOX_BACKEND_ENV: "phoenix-kubernetes",
+            },
         )
     finally:
         with contextlib.suppress(OSError):
@@ -371,3 +572,102 @@ def test_exec_launcher_without_allowlist_keeps_inherited_env(tmp_path) -> None:
     child_env = json.loads(out_file.read_text())
     # Opt-in contract: no allowlist, no prune.
     assert child_env.get("DELIBERATE_EXTRA") == "kept"
+    assert child_env[HOST_SANDBOX_BACKEND_ENV] == "phoenix-kubernetes"
+
+
+def _read_launcher(target: str) -> tuple[str, str]:
+    """Create a launcher for ``target`` and return ``(path, contents)``."""
+    path = create_exec_launcher(target, _noop_policy())
+    return path, pathlib.Path(path).read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_exec_launcher_shebang_is_bin_sh_not_sys_executable() -> None:
+    """The launcher must not name ``sys.executable`` in its shebang.
+
+    Spawners such as the Claude Agent SDK ``execve`` this file directly.
+    A ``#!<python>`` line is only executable when that python is itself
+    a native binary reachable within the kernel's shebang buffer; when
+    it is not, the spawn fails with an opaque ENOEXEC. ``/bin/sh`` is
+    the one interpreter that always satisfies the kernel.
+    """
+    wrapper_path, script = _read_launcher(sys.executable)
+    try:
+        assert script.startswith("#!/bin/sh\n"), script
+        assert f"#!{sys.executable}" not in script, script
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_exec_launcher_runs_when_sys_executable_is_a_shell_script(tmp_path, monkeypatch) -> None:
+    """A shim interpreter must still produce a runnable launcher.
+
+    macOS refuses to run a script whose shebang interpreter is itself a
+    ``#!`` script, so a python installed behind a wrapper (pyenv-style
+    shims, vendored launchers) used to make every wrapped harness
+    startup fail with ENOEXEC. Invoking the interpreter as an argument
+    of ``/bin/sh`` removes the nesting entirely.
+    """
+    shim = tmp_path / "python-shim"
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shim))
+
+    wrapper_path, script = _read_launcher(sys.executable)
+    try:
+        assert script.startswith("#!/bin/sh\n"), script
+        result = subprocess.run(
+            [wrapper_path, "-c", "pass"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shebang behaviour")
+def test_exec_launcher_runs_when_interpreter_path_has_a_space(tmp_path, monkeypatch) -> None:
+    """A space in the interpreter path must not split the exec.
+
+    A shebang line is split on whitespace, so ``/Applications/My
+    Python/bin/python3`` resolved to ``/Applications/My``. The shell
+    wrapper quotes the interpreter instead.
+    """
+    spaced_dir = tmp_path / "My Python"
+    spaced_dir.mkdir()
+    shim = spaced_dir / "python3"
+    shim.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
+    shim.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shim))
+
+    wrapper_path, _script = _read_launcher(sys.executable)
+    try:
+        result = subprocess.run(
+            [wrapper_path, "-c", "pass"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result
+
+
+def test_exec_launcher_rejects_an_unnameable_interpreter(monkeypatch) -> None:
+    """An empty ``sys.executable`` must fail loudly, not silently.
+
+    Embedded interpreters leave ``sys.executable`` empty; writing the
+    launcher anyway yields a file no kernel can run, and the caller
+    only learns about it as ENOEXEC from an unrelated spawn.
+    """
+    monkeypatch.setattr(sys, "executable", "")
+    with pytest.raises(OSError, match=re.escape("sys.executable is empty")):
+        create_exec_launcher("/bin/true", _noop_policy())

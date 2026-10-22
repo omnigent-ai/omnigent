@@ -39,7 +39,7 @@ type LastSeenMap = Record<string, number>;
 // The browser-durable read-state, hydrated from localStorage at module
 // load, raised (never lowered) by the server seed, and updated
 // optimistically on each mutation before the best-effort PUT lands.
-const lastSeenMap: LastSeenMap = {};
+let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
 
 // localStorage persistence. Best-effort everywhere: storage can be
@@ -198,8 +198,8 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
  * between tests (the mirror is intentionally module-scoped, not React state).
  * Not used in production.
  */
-export function __resetReadStateForTests(): void {
-  for (const id of Object.keys(lastSeenMap)) delete lastSeenMap[id];
+export function resetReadStateForTests(): void {
+  lastSeenMap = {};
   explicitlyUnread.clear();
   seeded.clear();
   hydrated = false;
@@ -285,20 +285,65 @@ export function markConversationUnread(conversationId: string, updatedAt: number
 }
 
 /**
+ * Marks a conversation read on explicit user action — the inverse of
+ * {@link markConversationUnread}, backing the row menu's and bulk bar's
+ * "Mark as read". Clears the explicit-unread override first (it would
+ * otherwise veto the baseline write), then anchors the baseline at or above
+ * the row's `updated_at` so the dot clears even when the server clock leads
+ * the client. Explicit intent, so unlike {@link markConversationSeen} it is
+ * exempt from the hydration gate.
+ */
+export function markConversationRead(conversationId: string, updatedAt: number): void {
+  const hadOverride = explicitlyUnread.delete(conversationId);
+  const baseline = Math.max(nowSeconds(), updatedAt);
+  const stored = lastSeenMap[conversationId];
+  const advanced = stored === undefined || stored < baseline;
+  if (advanced) lastSeenMap[conversationId] = baseline;
+  if (!hadOverride && !advanced) return;
+  persistToStorage();
+  notifySubscribers();
+  void syncReadState(conversationId);
+}
+
+/**
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not
- * on the next conversations poll.
+ * on the next conversations poll. When disabled, returns 0 without subscribing.
  */
-export function useUnseenTick(): number {
+export function useUnseenTick(enabled = true): number {
+  const version = () => (enabled ? writeVersion : 0);
   return useSyncExternalStore(
+    (onChange) => {
+      if (!enabled) return () => {};
+      subscribers.add(onChange);
+      return () => subscribers.delete(onChange);
+    },
+    version,
+    version,
+  );
+}
+
+export function useConversationReadState(
+  conversationId: string,
+  updatedAt: number,
+  status: string | undefined,
+): { unseen: boolean; explicitlyUnread: boolean } {
+  const read = () =>
+    (isConversationUnseen(conversationId, updatedAt, status) ? 1 : 0) |
+    (isExplicitlyUnread(conversationId) ? 2 : 0);
+  const state = useSyncExternalStore(
     (onChange) => {
       subscribers.add(onChange);
       return () => subscribers.delete(onChange);
     },
-    () => writeVersion,
-    () => writeVersion,
+    read,
+    read,
   );
+  return {
+    unseen: (state & 1) !== 0,
+    explicitlyUnread: (state & 2) !== 0,
+  };
 }
 
 /**
@@ -367,7 +412,11 @@ export function useMarkConversationSeen(
   useEffect(() => {
     if (!conversationId || updatedAt === undefined) return;
     const markIfFocused = () => {
-      if (windowHasFocus()) markConversationSeen(conversationId);
+      // Anchor at or above the updated_at being viewed: a server clock that
+      // leads the client must not leave a just-read turn reading as unseen
+      // (updated_at > client wall clock). Wall clock still wins when it's
+      // ahead, capturing an update the poll hasn't picked up yet.
+      if (windowHasFocus()) markConversationSeen(conversationId, Math.max(nowSeconds(), updatedAt));
     };
     markIfFocused();
     window.addEventListener("focus", markIfFocused);

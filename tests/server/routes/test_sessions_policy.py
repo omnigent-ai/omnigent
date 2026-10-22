@@ -8,6 +8,7 @@ spec's guardrails and returns the correct verdict.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -17,7 +18,10 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
-from omnigent.policies.types import PolicyAction, PolicyResult
+from omnigent.policies.types import EvaluationContext, PolicyAction, PolicyResult
+from omnigent.server.routes._sessions.orchestration import (
+    _evaluate_policy_with_fresh_engine,
+)
 from omnigent.server.routes.sessions import (
     _build_evaluation_context,
     _build_skill_slash_command_policy_body,
@@ -210,6 +214,47 @@ _CACHE_PATCH = "omnigent.server.routes.sessions.get_agent_cache"
 _ENGINE_PATCH = "omnigent.server.routes.sessions.build_policy_engine"
 _HOLD_GATE_PATCH = "omnigent.server.routes.sessions._hold_native_ask_gate"
 _STREAM_PATCH = "omnigent.server.routes.sessions.session_stream"
+
+
+@pytest.mark.asyncio
+async def test_fresh_policy_engines_are_serialized_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent deployed tool calls cannot race persisted policy state."""
+    active = 0
+    max_active = 0
+
+    class _Engine:
+        async def evaluate(self, _ctx: Any) -> PolicyResult:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0)
+            active -= 1
+            return PolicyResult(action=PolicyAction.ALLOW)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._build_policy_engine_from_spec",
+        lambda *_args: _Engine(),
+    )
+    conversation_store = _FakeConversationStore()
+    conv = conversation_store.get_conversation("sess_serialized")
+    ctx = EvaluationContext(phase=Phase.TOOL_CALL, content={}, tool_name="tool")
+
+    await asyncio.gather(
+        *(
+            _evaluate_policy_with_fresh_engine(
+                "sess_serialized",
+                _make_spec_no_guardrails(),
+                conversation_store,
+                conv,
+                ctx,
+            )
+            for _ in range(5)
+        )
+    )
+
+    assert max_active == 1
 
 
 @pytest.mark.asyncio
@@ -870,22 +915,24 @@ def _make_assistant_message_body(
 
 
 @pytest.mark.asyncio
-async def test_output_allow_verdict():
-    """OUTPUT policy evaluation returns allow when the engine
-    ALLOWs the assistant response.
-    """
+@pytest.mark.parametrize("turn_final", [True, False, None])
+@pytest.mark.parametrize("text", ["This is a safe response.", ""])
+async def test_output_allow_verdict(text: str, turn_final: bool | None) -> None:
+    """Nonempty responses forward finality; empty responses skip evaluation."""
     from omnigent.server.routes.sessions import _evaluate_output_policy
 
     conv_store = _FakeConversationStore()
     agent_store = _FakeAgentStore(agent=_make_agent())
     conv = conv_store.get_conversation("sess_1")
-    body = _make_assistant_message_body("This is a safe response.")
+    body = _make_assistant_message_body(text)
 
     spec = _make_spec_with_guardrails()
     loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
     allow_result = PolicyResult(action=PolicyAction.ALLOW)
+    captured: list[EvaluationContext] = []
 
-    async def _eval(_ctx: Any) -> PolicyResult:
+    async def _eval(ctx: EvaluationContext) -> PolicyResult:
+        captured.append(ctx)
         return allow_result
 
     with (
@@ -904,9 +951,18 @@ async def test_output_allow_verdict():
             conv_store,
             agent_store,
             None,
+            turn_final=turn_final,
         )
 
     assert result is None
+    if text:
+        mock_build.assert_called_once()
+        assert len(captured) == 1
+        ctx = captured[0]
+        assert (ctx.phase, ctx.content, ctx.turn_final) == (Phase.RESPONSE, text, turn_final)
+    else:
+        mock_build.assert_not_called()
+        assert not captured
 
 
 @pytest.mark.asyncio

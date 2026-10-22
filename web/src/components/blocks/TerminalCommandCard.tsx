@@ -25,7 +25,7 @@ export function TerminalCommandCard({ kind, input, stdout, stderr }: TerminalCom
         data-testid="terminal-command-card"
         data-terminal-kind="input"
       >
-        <span className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs">
+        <span className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm">
           <SquareTerminalIcon className="size-3 shrink-0 text-emerald-500 dark:text-emerald-400" />
           <span className="min-w-0 flex-1 truncate font-mono">
             <span className="font-semibold text-foreground">$</span> {input ?? ""}
@@ -41,7 +41,7 @@ export function TerminalCommandCard({ kind, input, stdout, stderr }: TerminalCom
 
   const trigger = (
     <span
-      className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground"
       data-testid="terminal-command-card"
       data-terminal-kind="output"
     >

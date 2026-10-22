@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _WORKING = '[data-testid="working-indicator"]'
@@ -122,16 +122,9 @@ def test_jump_to_top_reveals_on_scroll_up_then_auto_hides(
     assert scroll_top > 50, (
         f"conversation did not overflow enough to scroll (scrollTop={scroll_top})"
     )
-    assert page.evaluate(_PILL_INTERACTIVE) is False
-
-    # Park the cursor near the BOTTOM of the conversation — clear of the 140px
-    # top hover band — so the reveal (and, crucially, the auto-hide) is driven by
-    # the scroll alone, never a lingering hover. The viewport is only 320px tall,
-    # so the conversation's *center* still falls inside the band; the bottom edge
-    # does not.
-    box = page.locator("[data-pw-scroller]").bounding_box()
-    assert box is not None
-    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] - 5)
+    # Keep the pointer outside the short transcript's entire hover band.
+    page.mouse.move(0, 0)
+    page.wait_for_function(f"!({_PILL_INTERACTIVE})", timeout=10_000)
 
     # Scroll up to roughly the middle. Setting scrollTop dispatches a real
     # 'scroll' event — the same signal a wheel/drag emits, and exactly how

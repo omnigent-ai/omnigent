@@ -4,7 +4,9 @@ Registered as a ``pre_tool_call`` hook in the per-session
 ``HERMES_HOME/config.yaml`` written by :func:`_populate_hermes_home`
 in :mod:`hermes_executor`.
 
-Hermes pipes a JSON payload to stdin before each tool execution::
+Hermes pipes a JSON payload to stdin before each tool execution:
+
+.. code-block:: json
 
     {
         "hook_event_name": "pre_tool_call",
@@ -76,7 +78,7 @@ def main() -> None:
     }
 
     try:
-        from omnigent.native_policy_hook import (
+        from omnigent.native.native_policy_hook import (
             _RELAY_TOKEN_ENV,
             _RELAY_URL_ENV,
             policy_hook_reauth,

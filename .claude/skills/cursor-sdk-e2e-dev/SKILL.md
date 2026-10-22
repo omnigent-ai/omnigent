@@ -108,7 +108,7 @@ that works, the full stack is good: key, egress, bridge, harness.
    setup`) > ambient `CURSOR_API_KEY`.
 4. **No Databricks gateway.** Cursor talks only to Cursor's backend, so a
    `databricks-*` model is silently resolved to cursor `auto` — it will *not*
-   route through the AI Gateway like claude-sdk/codex/pi.
+   route through the Unity Gateway like claude-sdk/codex/pi.
 5. **Use a model id from the account's catalog.** Bare `gpt-5` is **not** valid;
    the SDK rejects unknown ids. Valid examples seen live: `default`,
    `composer-2.5`, `claude-opus-4-8`, `gpt-5.5`. Run with `--model` and read the
@@ -128,12 +128,12 @@ that works, the full stack is good: key, egress, bridge, harness.
 
 ```bash
 # Unit tests (use --frozen; the cwsandbox extra is unsatisfiable on public PyPI here)
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/inner/test_cursor_executor.py \
   tests/runtime/test_cursor_spawn_env.py \
   tests/onboarding/test_cursor_auth.py -q
 # Gated end-to-end harness test
-uv run --frozen --extra dev python -m pytest tests/e2e/omnigent/test_per_harness_cursor.py -q
+uv run --frozen --group test python -m pytest tests/e2e/omnigent/test_per_harness_cursor.py -q
 ```
 
 ## Bug-bash (fan out)

@@ -24,20 +24,79 @@ import logging
 import os
 import signal
 import subprocess
+import time
+import weakref
 from contextlib import suppress
-from typing import Protocol
+from typing import Protocol, TypedDict
 
-import psutil
+import psutil  # type: ignore[import-untyped]
 
-from omnigent._platform import IS_POSIX
+from omnigent._platform import IS_LINUX, IS_POSIX
 
 logger = logging.getLogger(__name__)
+
+# glibc allocator defaults for spawned children. glibc creates up to 8*ncpu
+# malloc arenas by default; on a many-core host a threaded child (the runner
+# uses asyncio.to_thread heavily) multiplies RSS across arenas that never
+# return to the OS. Capping arenas and setting a trim threshold bounds that
+# growth. Both are read by the C runtime at startup, so the parent must set
+# them in the child env before exec.
+_DEFAULT_MALLOC_ARENA_MAX = "2"
+_DEFAULT_MALLOC_TRIM_THRESHOLD = "134217728"  # 128 MiB
+
+
+def malloc_tuning_env() -> dict[str, str]:
+    """Env vars that bound glibc allocator RSS for a spawned child.
+
+    Arena multiplication is specific to glibc's allocator. macOS libmalloc uses
+    per-CPU magazines with madvise-based reclaim and exposes no equivalent knob
+    (``MALLOC_ARENA_MAX`` is simply ignored there), so macOS hosts get their
+    reduction from the threadpool cap instead — see ``_entry`` — not from here.
+
+    Returns an empty dict off Linux (macOS has no ``mallopt``; Windows and musl
+    ignore these), so callers can merge unconditionally without a platform
+    branch. Honors operator overrides ``OMNIGENT_RUNNER_MALLOC_ARENA_MAX``
+    (default ``"2"``; ``"0"`` disables the cap) and
+    ``OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD`` (default 128 MiB).
+
+    :returns: Mapping to merge into a child ``env`` dict, e.g.
+        ``{"MALLOC_ARENA_MAX": "2", "MALLOC_TRIM_THRESHOLD_": "134217728"}``.
+    """
+    if not IS_LINUX:
+        return {}
+    out: dict[str, str] = {}
+    arena_max = os.environ.get(
+        "OMNIGENT_RUNNER_MALLOC_ARENA_MAX", _DEFAULT_MALLOC_ARENA_MAX
+    ).strip()
+    if arena_max and arena_max != "0":
+        out["MALLOC_ARENA_MAX"] = arena_max
+    trim = os.environ.get(
+        "OMNIGENT_RUNNER_MALLOC_TRIM_THRESHOLD", _DEFAULT_MALLOC_TRIM_THRESHOLD
+    ).strip()
+    if trim:
+        out["MALLOC_TRIM_THRESHOLD_"] = trim
+    return out
+
 
 # Resolved via getattr so this module type-checks and imports on Windows, where
 # process groups and SIGKILL do not exist. None on non-POSIX hosts.
 _killpg_fn = getattr(os, "killpg", None)
 _getpgid_fn = getattr(os, "getpgid", None)
 _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+_CREATE_NEW_PROCESS_GROUP = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+_owned_process_groups: weakref.WeakKeyDictionary[object, int] = weakref.WeakKeyDictionary()
+_owned_process_identities: weakref.WeakKeyDictionary[object, dict[int, float]] = (
+    weakref.WeakKeyDictionary()
+)
+_CENSUS_MAX_ITERATIONS = 3
+_CENSUS_MAX_SECONDS = 0.05
+
+
+class SpawnKwargs(TypedDict, total=False):
+    """Platform-specific process-group arguments accepted by subprocess APIs."""
+
+    start_new_session: bool
+    creationflags: int
 
 
 class _ProcessLike(Protocol):
@@ -58,7 +117,7 @@ class _ProcessLike(Protocol):
         pass
 
 
-def spawn_kwargs() -> dict[str, object]:
+def spawn_kwargs() -> SpawnKwargs:
     """
     Keyword args that isolate a child process into its own group/session.
 
@@ -73,10 +132,49 @@ def spawn_kwargs() -> dict[str, object]:
     """
     if IS_POSIX:
         return {"start_new_session": True}
-    return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
 
 
-def _killpg(pid: int, sig: int) -> bool:
+def remember_process_group(process: _ProcessLike) -> None:
+    """Remember the isolated group while its leader is still observable."""
+    pid = process.pid
+    if not IS_POSIX or pid is None or pid <= 1 or _getpgid_fn is None:
+        return
+    try:
+        pgid = _getpgid_fn(pid)
+        if pgid == pid and pgid != _getpgid_fn(0):
+            _owned_process_groups[process] = pgid
+    except (ProcessLookupError, PermissionError, OSError, TypeError):
+        return
+    identities = _snapshot_identities(pid)
+    if identities:
+        with suppress(TypeError):
+            _owned_process_identities[process] = identities
+
+
+def refresh_process_tree(process: _ProcessLike | None) -> None:
+    """Add currently observable descendants without adopting a reused root PID."""
+    if process is None or process.pid is None or process.returncode is not None:
+        return
+    pid = process.pid
+    remembered = _remember_identities(process, {})
+    current = _snapshot_identities(pid)
+    expected_root = remembered.get(pid)
+    if expected_root is not None and current.get(pid) != expected_root:
+        return
+    _remember_identities(process, current)
+
+
+def _owned_process_group(process: _ProcessLike, *, remove: bool = False) -> int | None:
+    try:
+        if remove:
+            return _owned_process_groups.pop(process, None)
+        return _owned_process_groups.get(process)
+    except TypeError:
+        return None
+
+
+def _killpg(pid: int, sig: int, *, owned_pgid: int | None = None) -> bool:
     """
     POSIX fast path: signal the child's whole process group.
 
@@ -99,8 +197,12 @@ def _killpg(pid: int, sig: int) -> bool:
     if not IS_POSIX or _killpg_fn is None or _getpgid_fn is None:
         return False
     try:
-        target_pgid = _getpgid_fn(pid)
-        if target_pgid == _getpgid_fn(0):
+        target_pgid = owned_pgid if owned_pgid is not None else _getpgid_fn(pid)
+        # pgid <= 1 is never a real agent group: killpg(1, sig) is kill(-1,
+        # sig) - a broadcast to every process this user may signal (it took
+        # down the CI runner when a mocked pid coerced to 1) - and 0/negative
+        # would re-target our own group.
+        if target_pgid <= 1 or target_pgid == _getpgid_fn(0):
             return False
         _killpg_fn(target_pgid, sig)
         return True
@@ -120,6 +222,117 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _process_start_stamp(proc: psutil.Process) -> float:
+    """Return ``proc``'s creation time on a clock that wall-clock steps can't move.
+
+    Linux ``create_time()`` adds ``/proc/stat`` btime, which shifts when NTP or a
+    hypervisor steps the clock; psutil 7 exposes the boot-relative start instead.
+    """
+    platform_create_time = getattr(getattr(proc, "_proc", None), "create_time", None)
+    if callable(platform_create_time):
+        with suppress(TypeError):  # psutil < 7 and non-Linux take no monotonic flag
+            stamp = platform_create_time(monotonic=True)
+            if isinstance(stamp, float):
+                return stamp
+    return proc.create_time()
+
+
+def _snapshot_identities(pid: int) -> dict[int, float]:
+    """Snapshot a process tree using PID plus creation time identity."""
+    identities: dict[int, float] = {}
+    for proc in _walk_descendants(pid):
+        if proc.pid <= 1 or proc.pid == os.getpid():
+            continue
+        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+            identities[proc.pid] = _process_start_stamp(proc)
+    return identities
+
+
+def _remember_identities(
+    process: _ProcessLike,
+    identities: dict[int, float],
+    *,
+    remove: bool = False,
+) -> dict[int, float]:
+    try:
+        if remove:
+            remembered = _owned_process_identities.pop(process, {})
+            remembered.update(identities)
+        else:
+            remembered = _owned_process_identities.get(process, {})
+            remembered.update(identities)
+            _owned_process_identities[process] = remembered
+        return dict(remembered)
+    except TypeError:
+        return dict(identities)
+
+
+def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
+    """Signal only PIDs whose current creation time matches the snapshot."""
+    for pid, create_time in identities.items():
+        if pid <= 1 or pid == os.getpid():
+            continue
+        try:
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) != create_time:
+                continue
+            if force:
+                proc.kill()
+            else:
+                proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+
+def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
+    """Whether the group still contains at least one identity we observed."""
+    if _getpgid_fn is None:
+        return False
+    for pid, create_time in identities.items():
+        try:
+            proc = psutil.Process(pid)
+            if _process_start_stamp(proc) == create_time and _getpgid_fn(pid) == pgid:
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+    return False
+
+
+def _signal_tree_census(
+    process: _ProcessLike,
+    pid: int,
+    *,
+    force: bool,
+    remove: bool,
+    snapshot_root: bool,
+) -> dict[int, float]:
+    """Signal a bounded union of remembered and currently observable descendants."""
+    remembered = _remember_identities(process, {}, remove=False)
+    current = _snapshot_identities(pid) if snapshot_root else {}
+    expected_root = remembered.get(pid)
+    if expected_root is not None and current.get(pid) != expected_root:
+        # The direct child was already reaped and its PID was reused. Never
+        # adopt the replacement process or its descendants into this tree.
+        current = {}
+        snapshot_root = False
+    identities = _remember_identities(process, current, remove=remove)
+    deadline = time.monotonic() + _CENSUS_MAX_SECONDS
+    for _ in range(_CENSUS_MAX_ITERATIONS):
+        current = _snapshot_identities(pid) if snapshot_root else {}
+        if expected_root is not None and current.get(pid) != expected_root:
+            current = {}
+            snapshot_root = False
+        before = len(identities)
+        identities.update(current)
+        _signal_identities(identities, force=force)
+        if len(identities) == before or time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    if not remove:
+        _remember_identities(process, identities)
+    return identities
+
+
 def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     """
     Gracefully stop ``process`` and all of its descendants.
@@ -133,7 +346,7 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
     :param process: A ``Popen``/``asyncio`` process handle, or ``None``.
     :param grace: Optional seconds to wait for the tree to exit after signaling.
     """
-    if process is None or process.returncode is not None:
+    if process is None:
         return
     pid = process.pid
     if pid is None:
@@ -141,16 +354,26 @@ def terminate_tree(process: _ProcessLike | None, *, grace: float = 0.0) -> None:
             process.terminate()
         return
 
-    if _killpg(pid, signal.SIGTERM):
-        if grace:
-            _wait_gone(pid, grace)
+    owned_pgid = _owned_process_group(process)
+    if process.returncode is not None and owned_pgid is None:
         return
-
-    procs = _walk_descendants(pid)
-    for proc in procs:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            proc.terminate()
-    if not procs:
+    leader_live = process.returncode is None
+    observed = _remember_identities(process, {})
+    current = _snapshot_identities(pid) if leader_live else {}
+    if observed.get(pid) is not None and current.get(pid) != observed[pid]:
+        current = {}
+        leader_live = False
+    observed = _remember_identities(process, current)
+    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    identities = _signal_tree_census(
+        process,
+        pid,
+        force=False,
+        remove=False,
+        snapshot_root=leader_live,
+    )
+    group_signaled = group_is_owned and _killpg(pid, signal.SIGTERM, owned_pgid=owned_pgid)
+    if not group_signaled and not identities:
         with suppress(Exception):
             process.terminate()
     if grace:
@@ -165,7 +388,7 @@ def kill_tree(process: _ProcessLike | None) -> None:
     ``TerminateProcess`` (Windows). Use after a grace period when a graceful
     terminate did not take.
     """
-    if process is None or process.returncode is not None:
+    if process is None:
         return
     pid = process.pid
     if pid is None:
@@ -173,14 +396,26 @@ def kill_tree(process: _ProcessLike | None) -> None:
             process.kill()
         return
 
-    if _killpg(pid, _SIGKILL):
+    owned_pgid = _owned_process_group(process, remove=True)
+    if process.returncode is not None and owned_pgid is None:
         return
-
-    procs = _walk_descendants(pid)
-    for proc in procs:
-        with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            proc.kill()
-    if not procs:
+    leader_live = process.returncode is None
+    observed = _remember_identities(process, {})
+    current = _snapshot_identities(pid) if leader_live else {}
+    if observed.get(pid) is not None and current.get(pid) != observed[pid]:
+        current = {}
+        leader_live = False
+    observed = _remember_identities(process, current)
+    group_is_owned = owned_pgid is None or _identity_in_group(observed, owned_pgid)
+    identities = _signal_tree_census(
+        process,
+        pid,
+        force=True,
+        remove=True,
+        snapshot_root=leader_live,
+    )
+    group_signaled = group_is_owned and _killpg(pid, _SIGKILL, owned_pgid=owned_pgid)
+    if not group_signaled and not identities:
         with suppress(Exception):
             process.kill()
 
@@ -204,7 +439,7 @@ def process_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        return bool(psutil.Process(pid).status() != psutil.STATUS_ZOMBIE)
     except psutil.NoSuchProcess:
         # Includes psutil.ZombieProcess (a NoSuchProcess subclass).
         return False

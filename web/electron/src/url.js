@@ -12,9 +12,8 @@
   const api = factory();
   if (typeof module === "object" && module.exports) {
     module.exports = api;
-  } else {
-    root.omnigentUrl = api;
   }
+  root.omnigentUrl = api;
 })(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
@@ -46,10 +45,14 @@
   }
 
   /**
-   * Normalize a user-entered server URL into something navigable. Accepts a
-   * bare `host[:port][/path]` and defaults the scheme (https://, or http:// for
-   * loopback hosts), trims whitespace, and rejects anything that isn't an
-   * http(s) URL — fail loud rather than navigate to garbage.
+   * Normalize a user-entered server URL to its origin. Accepts a bare
+   * `host[:port][/path]`, defaults the scheme (https://, or http:// for loopback
+   * hosts), trims whitespace, and discards paths, fragments, and query
+   * parameters. Databricks workspace hosts use HTTPS unless a custom port is
+   * specified, and preserve `o` (the workspace organization selector).
+   * A server connection always starts at the
+   * canonical root; workspace mounts
+   * are discovered separately by expandDatabricksWorkspaceUrl.
    *
    * @param {string} raw
    * @returns {string} A normalized absolute http(s) URL.
@@ -63,65 +66,218 @@
     let url;
     try {
       url = new URL(withScheme);
-    } catch (e) {
-      throw new Error(`invalid URL: ${e.message}`);
+    } catch (error) {
+      throw new Error(`invalid URL: ${error.message}`, { cause: error });
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);
     }
-    return url.toString();
+    const normalized = new URL(`${url.origin}/`);
+    upgradeWorkspaceProtocol(normalized);
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        normalized.searchParams.append("o", organization);
+      }
+    }
+    return normalized.toString();
+  }
+
+  /**
+   * Normalize persisted recent-server targets for the setup-page picker. The
+   * stored target may include an internal mount such as `/omnigent`; the picker
+   * shows and reconnects through the user-facing root URL instead. Invalid and
+   * duplicate entries are omitted.
+   *
+   * @param {unknown} rawRecents
+   * @returns {string[]}
+   */
+  function normalizeRecentServers(rawRecents) {
+    if (!Array.isArray(rawRecents)) return [];
+    const normalized = [];
+    const seen = new Set();
+    for (const candidate of rawRecents) {
+      if (typeof candidate !== "string") continue;
+      let url;
+      try {
+        url = normalizeUrl(candidate);
+      } catch {
+        continue;
+      }
+      if (seen.has(url)) continue;
+      seen.add(url);
+      normalized.push(url);
+    }
+    return normalized;
+  }
+
+  /**
+   * Compact label for a server in the setup-page recent list: host (including
+   * a non-default port), plus `/?o=…` for a Databricks organization selector.
+   *
+   * @param {string} rawUrl
+   * @returns {string}
+   */
+  function serverDisplayLabel(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return String(rawUrl ?? "");
+    }
+    const query = new URLSearchParams();
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        query.append("o", organization);
+      }
+    }
+    const serialized = query.toString();
+    return `${url.host}${serialized ? `/?${serialized}` : ""}`;
   }
 
   /**
    * True when the entered URL is unencrypted http:// to a non-local host — the
-   * setup page warns before connecting. Mirrors normalizeUrl's scheme-
-   * defaulting (https:// by default, http:// for loopback), so a bare remote
-   * host — now https — does not trip the warning; only an explicit http:// to a
-   * remote host does. Invalid URLs return false so the real error comes from
-   * normalizeUrl on Connect.
+   * setup page warns before connecting. Use the actual connection scheme,
+   * including HTTPS upgrades for Databricks workspaces. Invalid URLs return
+   * false so the real error comes from normalizeUrl on Connect.
    *
    * @param {string} raw
    * @returns {boolean}
    */
   function isPlainHttpRemote(raw) {
-    const trimmed = (raw || "").trim();
-    if (trimmed === "") return false;
-    const withScheme = trimmed.includes("://")
-      ? trimmed
-      : `${defaultSchemeFor(trimmed)}://${trimmed}`;
     let url;
     try {
-      url = new URL(withScheme);
+      url = new URL(normalizeUrl(raw));
     } catch {
       return false;
     }
     return url.protocol === "http:" && !LOCAL_HOSTS.has(url.hostname);
   }
 
-  /**
-   * Path under a Databricks workspace where the Omnigent web UI is mounted. A
-   * bare workspace URL serves the workspace's own web app at the root, so a
-   * user who pastes just the workspace host (e.g.
-   * ``https://<ws>.azuredatabricks.net``) lands on a 404 unless this suffix is
-   * appended.
-   *
-   * NOTE: the Python CLI records the UI mount as ``/omnigent`` in
-   * ``omnigent/conversation_browser.py`` (WORKSPACE_UI_PATH), whereas the
-   * desktop deliberately keeps ``/ml/omnigents`` for now — that is the path the
-   * live workspace serves the embedded SPA on. The two are intentionally
-   * divergent pending reconciliation; do not "fix" this to ``/omnigent``
-   * without verifying what the workspace actually serves to the desktop shell.
-   */
-  const WORKSPACE_UI_PATH = "/ml/omnigents";
+  /** Path where the Omnigent SPA is mounted in a Databricks workspace. */
+  const WORKSPACE_UI_PATH = "/omnigent";
 
   /**
-   * Databricks Apps are served from ``*.databricksapps.com`` and answer with the
-   * same ``server: databricks`` header as a workspace, but they are NOT
-   * workspaces and have no ``/ml/omnigents`` mount. Skip expansion for these
-   * hosts so a user who points the shell at a Databricks App is left on the URL
-   * they entered.
+   * Domains that serve Databricks workspaces. Databricks Apps are deliberately
+   * absent: ``*.databricksapps.com`` serves the app itself at the root and must
+   * not be redirected to a workspace mount.
    */
+  const WORKSPACE_DOMAINS = ["databricks.com", "azuredatabricks.net"];
   const DATABRICKS_APPS_HOST_SUFFIX = "databricksapps.com";
+
+  /** True when a host is, or sits under, a Databricks workspace domain. */
+  function isDatabricksWorkspaceHost(host) {
+    const normalized = (host ?? "").toLowerCase();
+    return WORKSPACE_DOMAINS.some(
+      (domain) => normalized === domain || normalized.endsWith(`.${domain}`),
+    );
+  }
+
+  /** Upgrade in place before origin pinning; custom ports may serve HTTP-only proxies. */
+  function upgradeWorkspaceProtocol(url) {
+    if (url.protocol !== "http:" || url.port || !isDatabricksWorkspaceHost(url.hostname)) {
+      return false;
+    }
+    url.protocol = "https:";
+    return true;
+  }
+
+  /**
+   * Return the workspace UI URL for a bare Databricks workspace root.
+   * Deliberate deep links are left untouched, while query and fragment survive
+   * because e.g. ``?o=<org>`` can select the workspace.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {string | null}
+   */
+  function databricksWorkspaceUiUrl(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (!isDatabricksWorkspaceHost(url.hostname)) return null;
+    if (url.pathname !== "/" && url.pathname !== "") return null;
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
+  }
+
+  const WORKSPACE_API_PATHS = new Set([
+    "/api/2.0/omnigent",
+    // Databricks keeps this plural route for older clients.
+    "/api/2.0/omnigents",
+  ]);
+
+  /**
+   * Upgrade saved Databricks HTTP URLs and map API mounts to the browser UI.
+   *
+   * The CLI records the API mount, but Electron must load the SPA mount.
+   * Query and fragment state survive so workspace selectors and deep-link
+   * state are not lost. Non-workspace hosts and existing UI paths stay exact.
+   *
+   * @param {string} rawUrl A saved server URL (may be undefined/empty/garbage).
+   * @returns {string} The browser-facing URL, or the input unchanged.
+   */
+  function normalizeSavedServerUrl(rawUrl) {
+    if (typeof rawUrl !== "string" || rawUrl === "") return rawUrl;
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return rawUrl;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return rawUrl;
+    if (!isDatabricksWorkspaceHost(url.hostname)) return rawUrl;
+    const upgraded = upgradeWorkspaceProtocol(url);
+    const pathWithoutTrailingSlash = url.pathname.replace(/\/+$/, "");
+    if (!WORKSPACE_API_PATHS.has(pathWithoutTrailingSlash)) {
+      return upgraded ? url.toString() : rawUrl;
+    }
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
+  }
+
+  /**
+   * True when a server URL is hosted by Databricks — a workspace domain
+   * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
+   * self-hosted server is never "Databricks-managed", whatever its hostname
+   * claims. Used to scope Databricks-internal desktop features (e.g. the Arca
+   * host option) to Databricks-managed servers.
+   *
+   * @param {string | null | undefined} rawUrl
+   * @returns {boolean}
+   */
+  function isDatabricksManagedServerUrl(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== "https:") return false;
+    const host = url.hostname.toLowerCase();
+    if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
+      return true;
+    }
+    return isDatabricksWorkspaceHost(host);
+  }
+
+  /** Browser OAuth/session bridging is workspace/account-only, not Databricks Apps. */
+  function isDatabricksOAuthServerUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl);
+      return (
+        url.protocol === "https:" &&
+        !url.username &&
+        !url.password &&
+        !url.port &&
+        WORKSPACE_DOMAINS.some((domain) => url.hostname.endsWith(`.${domain}`))
+      );
+    } catch {
+      return false;
+    }
+  }
 
   /**
    * Probe timeout for Databricks workspace detection. Deliberately short: a
@@ -138,17 +294,19 @@
    * hostnames, probe the URL and adopt the mount only when the host answers
    * like a Databricks workspace — a response carrying the ``server: databricks``
    * header. URLs that already carry a path, or aren't https, are returned
-   * untouched WITHOUT a probe, so a user who pastes the full ``…/ml/omnigents``
+   * untouched WITHOUT a probe, so a user who pastes the full ``…/omnigent``
    * URL (or connects to any non-workspace server) is never second-guessed.
    *
    * The CLI appends the API mount because it's an API client; the desktop shell
    * loads the web UI, so it appends the SPA mount instead.
    *
    * @param {string} normalized A normalized http(s) URL from normalizeUrl().
+   * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
    * @returns {Promise<string>} The workspace UI URL when expansion applies,
    *   else the input unchanged.
    */
-  async function expandDatabricksWorkspaceUrl(normalized) {
+  async function expandDatabricksWorkspaceUrl(normalized, { signal } = {}) {
+    signal?.throwIfAborted();
     let url;
     try {
       url = new URL(normalized);
@@ -162,7 +320,7 @@
       return normalized;
     }
     // Databricks Apps share the workspace ``server: databricks`` header but have
-    // no ``/ml/omnigents`` mount, so never expand them.
+    // no workspace UI mount, so never expand them.
     const host = url.hostname.toLowerCase();
     if (host === DATABRICKS_APPS_HOST_SUFFIX || host.endsWith(`.${DATABRICKS_APPS_HOST_SUFFIX}`)) {
       return normalized;
@@ -172,26 +330,211 @@
       probe = await fetch(`${url.origin}/`, {
         method: "HEAD",
         redirect: "manual",
-        signal: AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS)])
+          : AbortSignal.timeout(WORKSPACE_PROBE_TIMEOUT_MS),
       });
     } catch {
-      // Unreachable / DNS / TLS / timeout: connect to the URL as given and let
-      // the did-fail-load fallback surface any real failure.
+      // Explicit cancellation must not become an ordinary failed probe.
+      signal?.throwIfAborted();
       return normalized;
     }
     if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
       return normalized;
     }
-    return `${url.origin}${WORKSPACE_UI_PATH}`;
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
+  }
+
+  /**
+   * Path of the server's version manifest (RFC 8615 well-known URI). Served
+   * unauthed so the shell can read it before the SPA loads / any login.
+   */
+  const WELL_KNOWN_MANIFEST_PATH = "/.well-known/omnigent.json";
+
+  /**
+   * The manifest a pre-manifest server implies: every server older than the
+   * route, which 404s. NOT an error — the shell keeps its existing behavior.
+   * `manifestVersion: 0` means "older than version 1", so the ordinary `>=`
+   * gate excludes it without callers special-casing null.
+   */
+  const PRE_MANIFEST_BASELINE = Object.freeze({
+    manifestVersion: 0,
+    serverVersion: null,
+    minDesktopVersion: null,
+    ui: Object.freeze({}),
+    auth: null,
+    serverName: null,
+  });
+
+  /** Sign-in modes a server may name in its manifest's `auth.mode`. */
+  const MANIFEST_AUTH_MODES = new Set(["oidc", "accounts", "header", "custom", "none"]);
+  /** The only session cookies an Omnigent server sets. */
+  const SESSION_COOKIE_NAMES = new Set(["__Host-ap_session", "ap_session"]);
+  /** Longest server name the shell displays, in characters. */
+  const MAX_SERVER_NAME_LENGTH = 64;
+
+  /**
+   * The manifest's `auth` block, or null when absent or untrustworthy. The
+   * manifest is unauthenticated server input, so only known modes and the two
+   * real cookie names pass, and a `__Host-` cookie only for an https server
+   * (Chromium rejects it on http).
+   *
+   * @param {unknown} raw The manifest's `auth` value.
+   * @param {string} serverUrl The URL the manifest was fetched for.
+   * @returns {{ mode: string, sessionCookie: string | null } | null}
+   */
+  function parseManifestAuth(raw, serverUrl) {
+    if (raw === null || typeof raw !== "object" || !MANIFEST_AUTH_MODES.has(raw.mode)) {
+      return null;
+    }
+    let sessionCookie = null;
+    if (typeof raw.session_cookie === "string" && SESSION_COOKIE_NAMES.has(raw.session_cookie)) {
+      sessionCookie = raw.session_cookie;
+    }
+    let https = false;
+    try {
+      https = new URL(serverUrl).protocol === "https:";
+    } catch {
+      // Not a URL: treat as not https.
+    }
+    if (sessionCookie?.startsWith("__Host-") && !https) sessionCookie = null;
+    return { mode: raw.mode, sessionCookie };
+  }
+
+  /**
+   * A server-supplied display name made safe to show: control and invisible
+   * format characters (bidi marks and overrides, zero-width characters)
+   * removed, whitespace collapsed, at most {@link MAX_SERVER_NAME_LENGTH}
+   * user-perceived characters. Null when nothing is left.
+   *
+   * @param {unknown} raw
+   * @returns {string | null}
+   */
+  function sanitizeServerName(raw) {
+    if (typeof raw !== "string") return null;
+    const cleaned = raw
+      .replace(/[\p{Cc}\p{Cf}]/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const graphemes =
+      typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+        ? Array.from(
+            new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(cleaned),
+            (s) => s.segment,
+          )
+        : Array.from(cleaned);
+    const name =
+      graphemes.length > MAX_SERVER_NAME_LENGTH
+        ? graphemes.slice(0, MAX_SERVER_NAME_LENGTH).join("").trimEnd()
+        : cleaned;
+    return name || null;
+  }
+
+  /**
+   * Timeout for the manifest fetch. Short and non-fatal for the same reason as
+   * the workspace probe: connecting must never stall behind it. On timeout we
+   * fall back to the pre-manifest baseline and connect anyway.
+   */
+  const MANIFEST_FETCH_TIMEOUT_MS = 5000;
+
+  /**
+   * Read a server's version manifest, so the shell can adapt to the server it
+   * actually reached instead of assuming its own release's behavior.
+   *
+   * Unless explicitly cancelled, this never throws or blocks a connection. Anything short of a
+   * well-formed manifest — 404 (older server), unreachable host, HTML from an
+   * SPA catch-all, malformed JSON, wrong types — yields
+   * {@link PRE_MANIFEST_BASELINE}. "I could not learn anything" and "this
+   * server predates the manifest" are deliberately the same answer: both mean
+   * "use existing behavior", which is what keeps an older shell working
+   * against a newer server and vice versa.
+   *
+   * Callers gate with `manifestVersion >= N`, never `=== N`, so a server that
+   * bumps the envelope stays usable by a shell that predates the bump.
+   *
+   * @param {string} serverUrl A normalized absolute http(s) server URL.
+   * @param {{ signal?: AbortSignal }} [options] Optional connection cancellation.
+   * @returns {Promise<{manifestVersion: number, serverVersion: string | null,
+   *   minDesktopVersion: string | null, ui: Record<string, unknown>,
+   *   auth: { mode: string, sessionCookie: string | null } | null,
+   *   serverName: string | null}>}
+   */
+  async function fetchServerManifest(serverUrl, { signal } = {}) {
+    signal?.throwIfAborted();
+    let origin;
+    try {
+      origin = new URL(serverUrl).origin;
+    } catch {
+      return PRE_MANIFEST_BASELINE;
+    }
+    let response;
+    try {
+      response = await fetch(`${origin}${WELL_KNOWN_MANIFEST_PATH}`, {
+        // A redirect to a login page is not a manifest; don't follow it.
+        redirect: "manual",
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS)])
+          : AbortSignal.timeout(MANIFEST_FETCH_TIMEOUT_MS),
+      });
+    } catch {
+      signal?.throwIfAborted();
+      return PRE_MANIFEST_BASELINE;
+    }
+    if (!response.ok) return PRE_MANIFEST_BASELINE;
+    // Guard the content type explicitly: a server whose SPA catch-all swallows
+    // unknown paths answers 200 text/html, and parsing that as a manifest would
+    // be worse than not having one. (Servers with the route also exclude
+    // `.well-known` from the SPA fallback, so this is belt-and-braces for
+    // proxies and older builds.)
+    const contentType = (response.headers.get("content-type") ?? "").toLowerCase();
+    if (!contentType.includes("json")) return PRE_MANIFEST_BASELINE;
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      signal?.throwIfAborted();
+      return PRE_MANIFEST_BASELINE;
+    }
+    if (body === null || typeof body !== "object") return PRE_MANIFEST_BASELINE;
+    // An envelope whose version isn't a number tells us nothing we can gate
+    // on, so treat it as absent rather than trusting the rest of the document.
+    if (typeof body.manifest_version !== "number" || !Number.isFinite(body.manifest_version)) {
+      return PRE_MANIFEST_BASELINE;
+    }
+    return {
+      manifestVersion: body.manifest_version,
+      serverVersion: typeof body.server_version === "string" ? body.server_version : null,
+      minDesktopVersion:
+        typeof body.min_desktop_version === "string" ? body.min_desktop_version : null,
+      // Passed through as-is: unknown keys are the extension point, so the
+      // shell must not filter to the ones this release happens to know.
+      ui: body.ui !== null && typeof body.ui === "object" ? body.ui : {},
+      auth: parseManifestAuth(body.auth, serverUrl),
+      serverName: sanitizeServerName(body.server_name),
+    };
   }
 
   return {
     LOCAL_HOSTS,
     defaultSchemeFor,
     normalizeUrl,
+    normalizeRecentServers,
+    serverDisplayLabel,
     isPlainHttpRemote,
+    normalizeSavedServerUrl,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
+    databricksWorkspaceUiUrl,
     expandDatabricksWorkspaceUrl,
+    isDatabricksManagedServerUrl,
+    isDatabricksOAuthServerUrl,
+    WELL_KNOWN_MANIFEST_PATH,
+    MANIFEST_FETCH_TIMEOUT_MS,
+    PRE_MANIFEST_BASELINE,
+    MAX_SERVER_NAME_LENGTH,
+    parseManifestAuth,
+    sanitizeServerName,
+    fetchServerManifest,
   };
 });

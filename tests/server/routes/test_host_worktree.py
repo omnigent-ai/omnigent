@@ -90,7 +90,7 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             sent_frames.append(frame)
             if isinstance(frame, HostCreateWorktreeFrame):
                 fut = conn.pending_create_worktrees.pop(frame.request_id, None)
@@ -112,12 +112,14 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
         conn.outbound_queue.put_nowait(None)
         try:
             await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             drain_task.cancel()
 
 
+@pytest.mark.parametrize("workspace", [None, "/Users/alice/myrepo-worktrees/feature-login/web"])
 async def test_create_worktree_success_returns_path_and_branch(
     host_setup: HostRegistry,
+    workspace: str | None,
 ) -> None:
     """A successful host reply is unpacked into the worktree path + branch."""
     registry = host_setup
@@ -129,6 +131,8 @@ async def test_create_worktree_success_returns_path_and_branch(
             "error": None,
         }
     )
+    if workspace is not None:
+        registry._create_reply_for_test["workspace"] = workspace  # type: ignore[attr-defined]
     conn = registry.get(_HOST_ID)
     assert conn is not None
     result = await create_worktree_on_host(
@@ -142,6 +146,7 @@ async def test_create_worktree_success_returns_path_and_branch(
     # routing or unpacking would drop one and break session create.
     assert result.worktree_path == "/Users/alice/myrepo-worktrees/feature-login"
     assert result.branch == "feature/login"
+    assert result.workspace == workspace
     # The frame the proxy actually sent carries the request params.
     sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
     assert isinstance(sent, HostCreateWorktreeFrame)

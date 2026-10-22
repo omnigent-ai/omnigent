@@ -24,33 +24,18 @@ from __future__ import annotations
 import os
 import re
 import signal
-import subprocess
+from collections.abc import Callable
 
 import httpx
 from playwright.sync_api import Page, expect
 
-
-def _find_runner_pids() -> list[int]:
-    """Find PIDs of the runner entry point (``omnigent.runner._entry``).
-
-    The runner is a sibling subprocess of the server (both spawned by the
-    fixture), so we match on the command line rather than the parent PID.
-
-    :returns: List of runner PIDs (may be empty).
-    """
-    result = subprocess.run(
-        ["pgrep", "-f", "omnigent.runner._entry"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return []
-    return [int(line.strip()) for line in result.stdout.strip().splitlines() if line.strip()]
+from tests.e2e_ui.conftest import _server_state
 
 
 def test_stopped_session_shows_reconnect_affordance(
     page: Page,
     seeded_session: tuple[str, str],
+    _recover_shared_runner: Callable[[], None],
 ) -> None:
     """A dropped runner flips the open chat to the reconnect banner + dialog.
 
@@ -63,9 +48,8 @@ def test_stopped_session_shows_reconnect_affordance(
     - clicking it opens the reconnect dialog carrying the session's
       ``--resume`` command.
 
-    Killing the shared runner is order-independent: the ``seeded_session``
-    fixture respawns it for the next test (same contract as
-    ``test_stale_stream``).
+    The shared runner is recovered after the offline assertions so later
+    tests can reuse it.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` for a pre-created
@@ -85,7 +69,7 @@ def test_stopped_session_shows_reconnect_affordance(
     ):
         page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
 
     health = httpx.get(f"{base_url}/health?session_id={session_id}", timeout=5).json()
@@ -93,20 +77,19 @@ def test_stopped_session_shows_reconnect_affordance(
         f"runner should be online before the kill, got: {health}"
     )
 
-    runner_pids = _find_runner_pids()
-    assert runner_pids, "no runner processes found to stop"
-    for pid in runner_pids:
-        os.kill(pid, signal.SIGKILL)
+    os.kill(int(_server_state["runner_pid"]), signal.SIGKILL)
+    try:
+        # The health poll fires every 10s; the banner flips on the next poll
+        # that reads runner_online=false. Budget generously past one interval.
+        indicator = page.get_by_test_id("disconnected-indicator")
+        expect(indicator).to_be_visible(timeout=30_000)
+        expect(indicator).to_contain_text(re.compile("disconnected", re.IGNORECASE))
 
-    # The health poll fires every 10s; the banner flips on the next poll
-    # that reads runner_online=false. Budget generously past one interval.
-    indicator = page.get_by_test_id("disconnected-indicator")
-    expect(indicator).to_be_visible(timeout=30_000)
-    expect(indicator).to_contain_text(re.compile("disconnected", re.IGNORECASE))
-
-    # Clicking it opens the reconnect dialog with the resume command the
-    # user runs to bring the stopped session back.
-    indicator.click()
-    dialog = page.get_by_test_id("reconnect-session-dialog")
-    expect(dialog).to_be_visible()
-    expect(dialog).to_contain_text(session_id)
+        # Clicking it opens the reconnect dialog with the resume command the
+        # user runs to bring the stopped session back.
+        indicator.click()
+        dialog = page.get_by_test_id("reconnect-session-dialog")
+        expect(dialog).to_be_visible()
+        expect(dialog).to_contain_text(session_id)
+    finally:
+        _recover_shared_runner()

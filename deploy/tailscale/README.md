@@ -50,6 +50,25 @@ Origin header"* on chat and file uploads. Without `OMNIGENT_ACCOUNTS_BASE_URL`
 session cookies won't use the `__Host-` prefix and invite links resolve to
 the wrong host.
 
+If several devices on your tailnet will each connect with their own
+`<machine>.ts.net` hostname, trust the whole tailnet in one entry instead
+of listing every machine — but scope the wildcard to *your* tailnet's
+name, not the bare `ts.net` suffix. `ts.net` is Tailscale's single shared
+public suffix across every customer's tailnet, so `https://*.ts.net`
+would trust every Tailscale user's devices, not just yours:
+
+```dotenv
+OMNIGENT_WS_ALLOWED_ORIGINS=https://*.<tailnet>.ts.net
+```
+
+Find `<tailnet>` in a device's full MagicDNS name (`tailscale status`, or
+the admin console) — it's the label between the machine name and
+`ts.net`: `laptop.foo-tailnet.ts.net` → `<tailnet>` is `foo-tailnet`. See
+[`../README.md`](../README.md#browser-origin-allowlist) for the general
+`*.` wildcard syntax. `OMNIGENT_ACCOUNTS_BASE_URL` still needs one
+concrete host, since it is used to build actual URLs rather than to
+check one.
+
 **With Docker Compose** (`deploy/docker/`), add both lines to your `.env`:
 
 ```bash
@@ -117,6 +136,6 @@ sandbox:
 
 | Variable | Purpose |
 |---|---|
-| `OMNIGENT_WS_ALLOWED_ORIGINS` | Comma-separated origin allowlist. Set to `https://<machine>.ts.net` to trust the Tailscale origin for WebSocket and multipart routes. |
+| `OMNIGENT_WS_ALLOWED_ORIGINS` | Comma-separated origin allowlist. Set to `https://<machine>.ts.net` to trust the Tailscale origin for WebSocket and multipart routes, or `https://*.<tailnet>.ts.net` to trust every device on *your* tailnet in one entry — never the bare `https://*.ts.net`, which spans every Tailscale customer's tailnet (see [`../README.md`](../README.md#browser-origin-allowlist)). |
 | `OMNIGENT_ACCOUNTS_BASE_URL` | Public base URL. Used for session cookie security (`__Host-` prefix) and invite / magic-link URLs. |
 | `OMNIGENT_AUTH_ENABLED` | `1` to require login. Recommended when using Tailscale Funnel (public internet exposure). |

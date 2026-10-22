@@ -1,0 +1,493 @@
+import { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
+import { Link, useNavigate } from "@/lib/routing";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { customAgentsSettingsEnabled } from "@/lib/capabilities";
+import { useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
+import { nativeCodingAgentForAgentName } from "@/lib/nativeCodingAgents";
+import { isAcpHarnessAgent } from "@/lib/agentGrouping";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { CreateAgentForm } from "@/shell/CreateAgentDialog";
+import { useSettingsRoute } from "@/shell/settingsNav";
+import {
+  useCustomAgents,
+  useCustomAgent,
+  useSaveCustomAgent,
+  useDeleteCustomAgent,
+  type ManagedAgent,
+} from "@/hooks/useCustomAgents";
+import { CustomAgentConfigForm } from "./CustomAgentConfigForm";
+import { BackButton } from "./HarnessCatalog";
+import { ApiError } from "@/lib/sessionsApi";
+
+const BASE = "/settings/custom-agents";
+const agentPath = (id: string) => `${BASE}/${encodeURIComponent(id)}`;
+const date = (value: number | null) =>
+  value === null
+    ? "—"
+    : new Date(value * 1000).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+
+export function SettingsCustomAgentsSection() {
+  const info = useServerInfo();
+  const enabled = customAgentsSettingsEnabled(info);
+  const supported = enabled && info !== "loading" && info.agent_detail === true;
+  const { agentId } = useSettingsRoute();
+  const navigate = useNavigate();
+  const servers = useCustomAgents("server", supported && !agentId);
+  const yours = useCustomAgents("user", supported && !agentId);
+  const save = useSaveCustomAgent();
+  const labels = useHarnessLabels(supported);
+  const acpHarnesses = useAcpHarnessIds(supported);
+  const [search, setSearch] = useState("");
+  const serverAgents = useMemo(
+    () => servers.data?.pages.flatMap((page) => page.data) ?? [],
+    [servers.data],
+  );
+  const userAgents = useMemo(
+    () => yours.data?.pages.flatMap((page) => page.data) ?? [],
+    [yours.data],
+  );
+  const detailId = agentId === "new" ? undefined : agentId;
+  const detail = useCustomAgent(detailId, supported);
+
+  const searchTerm = search.trim().toLowerCase();
+  const { builtins, filtered } = useMemo(() => {
+    const matches = (a: ManagedAgent) =>
+      `${a.name} ${a.description ?? ""}`.toLowerCase().includes(searchTerm);
+    return {
+      builtins: serverAgents.filter(
+        (a) =>
+          !(
+            a.builtin &&
+            (nativeCodingAgentForAgentName(a.name) ||
+              isAcpHarnessAgent({
+                harness: a.harness,
+                acpHarness: acpHarnesses.has(a.harness ?? "") || undefined,
+              }))
+          ) && matches(a),
+      ),
+      filtered: userAgents.filter(matches),
+    };
+  }, [serverAgents, userAgents, acpHarnesses, searchTerm]);
+
+  if (!enabled) return null;
+  if (!supported) return <UnsupportedServer />;
+  const back = (
+    <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+  );
+  if (agentId === "new") {
+    return (
+      <div className="@container">
+        {back}
+        <h1 className="mb-6 text-2xl font-semibold">Create custom agent</h1>
+        <CreateAgentForm
+          submitLabel="Save agent"
+          notice="Saving an existing installed agent's name replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
+          onCancel={() => navigate(BASE)}
+          onCreate={async (input) => {
+            const agent = await save.mutateAsync(input);
+            navigate(agentPath(agent.id));
+          }}
+        />
+      </div>
+    );
+  }
+  if (detailId) {
+    return (
+      <div className="@container">
+        {!detail.data && back}
+        {detail.isError && detail.data && (
+          <p role="alert" className="mb-4 text-ui">
+            Could not refresh this agent.{" "}
+            <Button variant="link" onClick={() => void detail.refetch()}>
+              Retry
+            </Button>
+          </p>
+        )}
+        {detail.isError && !detail.data ? (
+          detail.error instanceof ApiError && [405, 501].includes(detail.error.status) ? (
+            <UnsupportedServer />
+          ) : (
+            <p role="alert">
+              Could not load this agent.{" "}
+              <Button variant="link" onClick={() => void detail.refetch()}>
+                Retry
+              </Button>
+            </p>
+          )
+        ) : detail.data ? (
+          <AgentDetail
+            key={detail.data.id}
+            agent={detail.data}
+            owned={detail.data.user_owned}
+            editable={info.agent_config_edit === true}
+            harness={labels[detail.data.harness ?? ""] ?? detail.data.harness ?? "Unknown"}
+            onDeleted={() => navigate(BASE)}
+          />
+        ) : (
+          <>
+            <h1 className="mb-6 text-2xl font-semibold">Custom agent</h1>
+            <p className="text-ui text-muted-foreground">
+              {detail.isPending
+                ? "Loading agent…"
+                : "Agent not found. It may have been removed or belong to another user."}
+            </p>
+          </>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="@container">
+      <h1 className="pb-6 text-2xl font-semibold">Custom agents</h1>
+      <div className="mb-6 flex items-center gap-2">
+        <div className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-border px-2.5">
+          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+          <input
+            type="search"
+            aria-label="Search agents"
+            placeholder="Search agents…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="min-w-0 flex-1 bg-transparent text-ui outline-none placeholder:text-muted-foreground/50"
+          />
+        </div>
+        <Button asChild size="sm">
+          <Link to={`${BASE}/new`} componentId="settings.custom_agents.create">
+            <PlusIcon />
+            Create
+          </Link>
+        </Button>
+      </div>
+      {(yours.hasNextPage || servers.hasNextPage) && (
+        <p className="mb-4 text-xs text-muted-foreground">
+          Search filters loaded agents. Load more to include older agents.
+        </p>
+      )}
+      <section className="mb-8" aria-label="Built-in agents">
+        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Built-in &amp; server agents
+        </h2>
+        <div className="grid gap-3 @lg:grid-cols-2">
+          {builtins.map((agent) => (
+            <Link
+              key={agent.id}
+              to={agentPath(agent.id)}
+              componentId="settings.custom_agents.review_server"
+              className="flex flex-col gap-3 rounded-xl border border-border p-4 hover:bg-muted/40"
+            >
+              <span className="flex items-center gap-3 font-medium">
+                <BotIcon className="size-5 shrink-0" aria-hidden />
+                {agent.name}
+              </span>
+              <span className="text-ui text-muted-foreground">
+                {agent.description || "Server-provided agent"}
+              </span>
+            </Link>
+          ))}
+        </div>
+        <ListStatus
+          query={servers}
+          scope="server"
+          empty={builtins.length === 0}
+          emptyText={search ? "No matching server agents." : "No server agents."}
+        />
+      </section>
+      <section aria-label="Your agents">
+        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Yours
+        </h2>
+        {filtered.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[36rem] text-left text-ui">
+              <thead>
+                <tr className="border-b border-border">
+                  <th scope="col" className="h-10 px-2 font-medium">
+                    Name
+                  </th>
+                  <th scope="col" className="h-10 w-[130px] px-2 font-medium">
+                    Agent SDK
+                  </th>
+                  <th scope="col" className="h-10 w-[120px] whitespace-nowrap px-2 font-medium">
+                    Created
+                  </th>
+                  <th scope="col" className="h-10 w-[120px] whitespace-nowrap px-2 font-medium">
+                    Last edited
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((agent) => (
+                  <tr
+                    key={agent.id}
+                    className="relative border-b border-border transition-colors last:border-0 hover:bg-muted/40 focus-within:bg-muted/40"
+                  >
+                    <td className="max-w-0 p-2">
+                      <Link
+                        to={agentPath(agent.id)}
+                        componentId="settings.custom_agents.review"
+                        className="flex items-center gap-2.5 rounded-sm outline-none after:absolute after:inset-0 focus-visible:ring-2 focus-visible:ring-ring"
+                        aria-label={agent.name}
+                      >
+                        <span className="flex size-7 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground">
+                          <BotIcon className="size-[15px]" aria-hidden />
+                        </span>
+                        <span className="min-w-0">
+                          <span className="block truncate font-medium">{agent.name}</span>
+                          <span className="block truncate text-xs text-muted-foreground">
+                            {agent.description}
+                          </span>
+                        </span>
+                      </Link>
+                    </td>
+                    <td className="whitespace-nowrap p-2">
+                      {labels[agent.harness ?? ""] ?? agent.harness ?? "Unknown"}
+                    </td>
+                    <td className="whitespace-nowrap p-2">{date(agent.created_at)}</td>
+                    <td className="whitespace-nowrap p-2">{date(agent.updated_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <ListStatus
+          query={yours}
+          scope="user"
+          empty={filtered.length === 0}
+          emptyText={
+            search
+              ? "No matching agents in the loaded results."
+              : "No custom agents yet. Create an agent to keep it available for new sessions."
+          }
+        />
+      </section>
+    </div>
+  );
+}
+
+function UnsupportedServer() {
+  return (
+    <div>
+      <h1 className="mb-6 text-2xl font-semibold">Custom agents</h1>
+      <p role="alert" className="text-ui text-muted-foreground">
+        Custom agents settings is unavailable on this server. Update the server and reload to enable
+        it.
+      </p>
+    </div>
+  );
+}
+
+function ListStatus({
+  query,
+  scope,
+  empty,
+  emptyText,
+}: {
+  query: ReturnType<typeof useCustomAgents>;
+  scope: "user" | "server";
+  empty: boolean;
+  emptyText: string;
+}) {
+  const client = useQueryClient();
+  if (query.isPending) return <p className="py-4 text-ui text-muted-foreground">Loading agents…</p>;
+  if (query.isError)
+    return (
+      <p role="alert" className="py-4 text-ui">
+        Could not load agents.{" "}
+        <Button
+          variant="link"
+          onClick={() => void client.resetQueries({ queryKey: ["settings-agents", scope] })}
+        >
+          Retry
+        </Button>
+      </p>
+    );
+  return (
+    <>
+      {empty && <p className="py-4 text-ui text-muted-foreground">{emptyText}</p>}
+      {query.hasNextPage && (
+        <Button
+          className="mt-4"
+          variant="outline"
+          loading={query.isFetchingNextPage}
+          disabled={query.isFetching}
+          onClick={() => void query.fetchNextPage()}
+        >
+          Load more {scope === "user" ? "agents" : "server agents"}
+        </Button>
+      )}
+    </>
+  );
+}
+
+function AgentDetail({
+  agent,
+  owned,
+  editable,
+  harness,
+  onDeleted,
+}: {
+  agent: ManagedAgent;
+  owned: boolean | undefined;
+  editable: boolean;
+  harness: string;
+  onDeleted: () => void;
+}) {
+  const remove = useDeleteCustomAgent();
+  const [confirm, setConfirm] = useState(false);
+  const [inUse, setInUse] = useState<string | null>(null);
+  function confirmDelete() {
+    remove.reset();
+    setInUse(null);
+    setConfirm(true);
+  }
+  const canEdit = owned === true && editable;
+  async function onRemove() {
+    try {
+      const count = await remove.mutateAsync({ id: agent.id, force: inUse !== null });
+      if (count === null) onDeleted();
+      else setInUse(count);
+    } catch {
+      /* The mutation error is displayed in the dialog. */
+    }
+  }
+  return (
+    <>
+      {canEdit ? (
+        <CustomAgentConfigForm id={agent.id} name={agent.name} onDelete={confirmDelete} />
+      ) : (
+        <>
+          <BackButton label="Custom agents" to={BASE} componentId="settings.custom_agents.back" />
+          <div className="flex items-start justify-between gap-4">
+            <h1 className="min-w-0 break-words text-2xl font-semibold">{agent.name}</h1>
+            {owned === true && (
+              <Button variant="ghost" size="icon" aria-label="Delete agent" onClick={confirmDelete}>
+                <TrashIcon className="size-4" />
+              </Button>
+            )}
+          </div>
+          <p className="mt-3 text-ui text-muted-foreground">
+            {agent.description || "No description."}
+          </p>
+        </>
+      )}
+      <dl className="my-6 grid grid-cols-2 gap-4 text-ui">
+        {!canEdit && (
+          <div>
+            <dt className="text-muted-foreground">Harness</dt>
+            <dd>{harness}</dd>
+          </div>
+        )}
+        <div>
+          <dt className="text-muted-foreground">Version</dt>
+          <dd>{agent.version}</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Created</dt>
+          <dd>{date(agent.created_at)}</dd>
+        </div>
+        <div>
+          <dt className="text-muted-foreground">Last edited</dt>
+          <dd>{date(agent.updated_at)}</dd>
+        </div>
+      </dl>
+      {!canEdit && (
+        <section className="mb-6">
+          <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            MCP servers
+          </h2>
+          {agent.mcp_servers?.length ? (
+            <ul className="space-y-2">
+              {agent.mcp_servers.map((server) => (
+                <li key={server.name} className="rounded-xl border border-border p-3">
+                  <p className="text-ui font-medium">{server.name}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {server.transport}
+                    {server.description ? ` · ${server.description}` : ""}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-ui text-muted-foreground">No MCP servers listed.</p>
+          )}
+        </section>
+      )}
+      <section className="mb-6">
+        <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+          Skills
+        </h2>
+        {agent.skills?.length ? (
+          <ul className="space-y-2">
+            {agent.skills.map((skill) => (
+              <li key={skill.name} className="rounded-xl border border-border p-3">
+                <p className="text-ui font-medium">{skill.name}</p>
+                <p className="text-xs text-muted-foreground">{skill.description}</p>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="text-ui text-muted-foreground">No skills listed.</p>
+        )}
+      </section>
+      <p className="text-xs text-muted-foreground">
+        {owned === true
+          ? editable
+            ? "Changes apply to sessions on their next turn."
+            : "Update the server to enable configuration editing."
+          : owned === false
+            ? "Server-provided agents are read-only."
+            : "Update the server to enable agent deletion. Ownership information is unavailable."}
+      </p>
+      <Dialog
+        open={confirm}
+        onOpenChange={(open) => {
+          if (!remove.isPending) setConfirm(open);
+        }}
+      >
+        <DialogContent showCloseButton={!remove.isPending}>
+          <DialogHeader>
+            <DialogTitle>Delete {agent.name}?</DialogTitle>
+            <DialogDescription>
+              {inUse === null
+                ? "This removes the agent from your collection. This cannot be undone."
+                : `${inUse} session(s) still use this agent. Removing it can stop those sessions from continuing. Remove it anyway?`}
+            </DialogDescription>
+          </DialogHeader>
+          {remove.error && (
+            <p role="alert" className="text-ui text-destructive">
+              {remove.error.message}
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="ghost" disabled={remove.isPending} onClick={() => setConfirm(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              loading={remove.isPending}
+              disabled={remove.isPending}
+              onClick={() => void onRemove()}
+            >
+              {inUse === null ? "Delete" : "Remove anyway"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

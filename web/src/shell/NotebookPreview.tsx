@@ -1,15 +1,28 @@
 import type { RefObject, UIEvent } from "react";
 import type { BundledLanguage } from "shiki";
 import AnsiDefault from "ansi-to-react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { CodeBlockContent } from "@/components/ai-elements/code-block";
 import { cn } from "@/lib/utils";
+import { ExternalPreviewLink } from "./ExternalPreviewLink";
+import { isWorkspaceRelativeSrc } from "./TipTapWorkspaceImage";
 
 // ansi-to-react is CJS with a TS-compiled `exports.default`; depending on the
 // bundler interop (Vite dev prebundle vs vitest vs production build) the
 // default import is either the component or the whole exports object.
 const Ansi = ("default" in AnsiDefault ? AnsiDefault.default : AnsiDefault) as typeof AnsiDefault;
+
+// URLs open outside the app window, as in the Markdown preview; a plain anchor
+// would navigate the app itself off its server.
+const NOTEBOOK_MARKDOWN_COMPONENTS: Components = {
+  a: ({ node: _node, href, ...props }) =>
+    href && !isWorkspaceRelativeSrc(href) ? (
+      <ExternalPreviewLink href={href} {...props} />
+    ) : (
+      <a href={href} {...props} />
+    ),
+};
 
 // ---------------------------------------------------------------------------
 // NotebookPreview — read-only render of a Jupyter notebook (.ipynb, nbformat 4).
@@ -125,7 +138,7 @@ function AnsiText({ text, className }: { text: string; className?: string }) {
   return (
     <pre
       className={cn(
-        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-xs p-2",
+        "overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] font-mono text-sm p-2",
         className,
       )}
     >
@@ -178,10 +191,10 @@ function OutputView({ output }: { output: NotebookOutput }) {
   return (
     <div>
       {imageError && (
-        <div className="text-xs text-muted-foreground italic px-2 pt-1">{imageError}</div>
+        <div className="text-sm text-muted-foreground italic px-2 pt-1">{imageError}</div>
       )}
       {suppressedHtml && (
-        <div className="text-xs text-muted-foreground italic px-2 pt-1">
+        <div className="text-sm text-muted-foreground italic px-2 pt-1">
           Rich HTML output hidden — showing plain text.
         </div>
       )}
@@ -194,11 +207,11 @@ function CodeCell({ cell, language }: { cell: NotebookCell; language: BundledLan
   const count = cell.execution_count;
   return (
     <div className="flex gap-2">
-      <div className="w-14 shrink-0 pt-1 text-right font-mono text-xs text-muted-foreground select-none">
+      <div className="w-14 shrink-0 pt-1 text-right font-mono text-sm text-muted-foreground select-none">
         In [{count ?? " "}]:
       </div>
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="rounded border bg-muted/30 text-xs">
+        <div className="rounded border bg-muted/30 text-sm">
           <CodeBlockContent code={joinSource(cell.source)} language={language} />
         </div>
         {(cell.outputs ?? []).map((output, i) => (
@@ -223,7 +236,7 @@ export function NotebookPreview({
 
   if (error || !notebook) {
     return (
-      <div className="p-8 text-sm">
+      <div className="p-8 text-ui">
         <div className="text-destructive">Cannot render notebook: {error}</div>
         <div className="mt-1 text-muted-foreground">
           Switch to the source view to inspect the raw file.
@@ -247,7 +260,9 @@ export function NotebookPreview({
           return (
             // eslint-disable-next-line react/no-array-index-key
             <div key={i} className="prose dark:prose-invert prose-sm max-w-none pl-16">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{joinSource(cell.source)}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={NOTEBOOK_MARKDOWN_COMPONENTS}>
+                {joinSource(cell.source)}
+              </ReactMarkdown>
             </div>
           );
         }

@@ -66,7 +66,7 @@ export function ToolbarBtn({
       onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       className={cn(
-        "min-w-[1.75rem] rounded px-1.5 py-0.5 text-xs transition-colors",
+        "min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm transition-colors",
         active
           ? "bg-accent text-accent-foreground"
           : "text-muted-foreground hover:bg-muted hover:text-foreground",
@@ -94,7 +94,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         aria-label="Insert table"
         disabled={!editor}
         onMouseDown={(e) => e.preventDefault()}
-        className="min-w-[1.75rem] rounded px-1.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+        className="min-w-[1.75rem] rounded px-1.5 py-0.5 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
       >
         <Table2 className="size-3.5" />
       </PopoverTrigger>
@@ -103,19 +103,19 @@ function TableBtn({ editor }: { editor: Editor | null }) {
         align="start"
         onMouseLeave={() => setHovered({ rows: 0, cols: 0 })}
       >
-        <p className="mb-1.5 text-xs text-muted-foreground">
+        <p className="mb-1.5 text-sm text-muted-foreground">
           {hovered.rows > 0 ? `${hovered.rows} × ${hovered.cols} table` : "Insert table"}
         </p>
         <div className="flex flex-col gap-0.5">
-          {Array.from({ length: MAX }, (_, r) => (
-            <div key={r} className="flex gap-0.5">
-              {Array.from({ length: MAX }, (_, c) => (
+          {Array.from({ length: MAX }, (_, rowIndex) => (
+            <div key={rowIndex} className="flex gap-0.5">
+              {Array.from({ length: MAX }, (__, columnIndex) => (
                 <button
-                  key={c}
+                  key={columnIndex}
                   type="button"
-                  aria-label={`Insert ${r + 1}×${c + 1} table`}
+                  aria-label={`Insert ${rowIndex + 1}×${columnIndex + 1} table`}
                   onMouseDown={(e) => e.preventDefault()}
-                  onMouseEnter={() => setHovered({ rows: r + 1, cols: c + 1 })}
+                  onMouseEnter={() => setHovered({ rows: rowIndex + 1, cols: columnIndex + 1 })}
                   onClick={() => {
                     // Use stable loop indices rather than async hovered state to
                     // avoid a 0×0 insert on fast clicks before state flushes.
@@ -123,8 +123,8 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                       ?.chain()
                       .focus()
                       .insertTable({
-                        rows: r + 1,
-                        cols: c + 1,
+                        rows: rowIndex + 1,
+                        cols: columnIndex + 1,
                         withHeaderRow: true,
                       })
                       .run();
@@ -132,7 +132,7 @@ function TableBtn({ editor }: { editor: Editor | null }) {
                   }}
                   className={cn(
                     "h-5 w-5 cursor-pointer rounded-sm border transition-colors",
-                    r < hovered.rows && c < hovered.cols
+                    rowIndex < hovered.rows && columnIndex < hovered.cols
                       ? "border-primary bg-primary/20"
                       : "border-border bg-muted hover:border-primary/50 hover:bg-primary/10",
                   )}
@@ -466,7 +466,7 @@ export function ToolbarPlugin({
           onClick={saveClickable ? handleSave : undefined}
           disabled={!saveClickable}
           className={cn(
-            "flex items-center gap-1 rounded px-2 py-0.5 text-xs transition-colors",
+            "flex items-center gap-1 rounded px-2 py-0.5 text-sm transition-colors",
             saveStatus.tone === "error" &&
               "text-destructive hover:bg-destructive/10 cursor-pointer",
             saveStatus.tone === "offline" && "text-warning cursor-default",

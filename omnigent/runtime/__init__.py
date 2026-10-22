@@ -253,6 +253,10 @@ def get_caps() -> RuntimeCaps:
     :returns: The :class:`RuntimeCaps` instance. Always
         non-None (defaults are used if none were provided).
     """
+    if _globals._caps is None:
+        with _globals._caps_lock:
+            if _globals._caps is None:
+                _globals._caps = RuntimeCaps()
     return _globals._caps
 
 
@@ -357,6 +361,24 @@ def set_runner_ws_factory(factory: Any) -> None:
 def get_runner_ws_factory() -> Any:
     """Return the runner WebSocket factory, or ``None`` if unset."""
     return _globals._runner_ws_factory
+
+
+def set_runner_direct_attach_resolver(resolver: Any) -> None:
+    """Set the conversation-id → direct-attach-endpoint resolver.
+
+    The resolver is a callable ``(conversation_id: str) ->
+    DirectAttachEndpoint | None`` built by
+    :func:`omnigent.server._runner_ws_tunnel.make_direct_attach_resolver`.
+    The terminals API uses it to expose a loopback attach URL for
+    browsers on the same machine as the runner. Leave unset (``None``)
+    when the server has no runner tunnels.
+    """
+    _globals._runner_direct_attach_resolver = resolver
+
+
+def get_runner_direct_attach_resolver() -> Any:
+    """Return the direct-attach resolver, or ``None`` if unset."""
+    return _globals._runner_direct_attach_resolver
 
 
 def set_runner_id(runner_id: str | None) -> None:

@@ -44,15 +44,18 @@ class LoadSkillTool(Tool):
             the agent spec.
         """
         all_skills = list(skills)
-        # Discover host-scope skills. Use agent_root when provided,
-        # but fall back to cwd — in production the server process
-        # runs from the user's project, so cwd finds .claude/skills/
-        # even when agent_root is a cache dir.
-        discovery_root = agent_root or Path.cwd()
         from omnigent.spec.parser import discover_host_skills
 
+        try:
+            discovery_root = agent_root or Path.cwd()
+        except OSError:
+            # A runner can outlive its working directory; bundled skills still work.
+            host_skills = []
+        else:
+            host_skills = discover_host_skills(discovery_root, skills_filter)
+
         bundled_names = {s.name for s in skills}
-        for hs in discover_host_skills(discovery_root, skills_filter):
+        for hs in host_skills:
             if hs.name not in bundled_names:
                 all_skills.append(hs)
         self._skills = all_skills
@@ -133,7 +136,7 @@ class LoadSkillTool(Tool):
             return "Error: missing required 'name' argument"
         if not isinstance(skill_name, str):
             return "Error: 'name' must be a string"
-        skill = self._skills_by_name.get(skill_name)
+        skill = find_skill_by_name(self._skills, skill_name)
         if skill is None:
             available = list(self._skills_by_name.keys())
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
@@ -145,18 +148,24 @@ def list_skill_resources(skill: SkillSpec) -> list[str]:
     """
     List resource files in a skill's directory.
 
-    Scans ``references/``, ``scripts/``, and ``assets/``
-    subdirectories. Returns relative paths suitable for
-    ``read_skill_file``.
+    Covers auxiliary files beside ``SKILL.md`` (a common layout for
+    skills that split long guidance across sibling documents) plus
+    everything under ``references/``, ``scripts/``, and ``assets/``.
+    Returns relative paths suitable for ``read_skill_file``.
 
     :param skill: The skill to scan.
-    :returns: Sorted list of relative path strings, e.g.
-        ``["references/style-guide.md"]``. Empty if the
-        skill has no ``skill_dir`` or no resource files.
+    :returns: List of relative path strings, e.g.
+        ``["DEEPENING.md", "references/style-guide.md"]``. Root-level
+        files come first, each group sorted. Empty if the skill has no
+        ``skill_dir`` or no resource files.
     """
-    if skill.skill_dir is None:
+    if skill.skill_dir is None or not skill.skill_dir.is_dir():
         return []
     files: list[str] = []
+    for fp in sorted(skill.skill_dir.iterdir()):
+        # Dotfiles are editor/OS cruft, and SKILL.md is the skill itself.
+        if fp.is_file() and fp.name != "SKILL.md" and not fp.name.startswith("."):
+            files.append(fp.name)
     for subdir_name in ("references", "scripts", "assets"):
         subdir = skill.skill_dir / subdir_name
         if not subdir.is_dir():
@@ -197,20 +206,88 @@ def format_skill_content(
     return "\n".join(lines)
 
 
+def _has_plugin_provenance(skill: SkillSpec, plugin: str) -> bool:
+    """
+    Whether *skill*'s on-disk location shows it came from *plugin*.
+
+    Plugin-derived skills live in the plugin cache under the structural
+    layout ``.../cache/<marketplace>/<plugin>/<version>/skills/<skill>``
+    (both the Claude and Codex plugin stores use this shape), and the
+    codex runtime links them into ``CODEX_HOME/skills/<skill>`` via a
+    symlink that resolves back into that cache. The full structural
+    sequence is required — not just the plugin name appearing somewhere
+    in the path — so an unrelated skill under a directory that happens
+    to be named like the plugin does not acquire its provenance. An
+    in-memory skill (``skill_dir is None``) never matches.
+
+    :param skill: Candidate skill for an aliased lookup.
+    :param plugin: The plugin namespace from the requested name, e.g.
+        ``"myplugin"`` for a ``"myplugin:code-review"`` request.
+    :returns: ``True`` when the resolved skill directory sits at
+        ``cache/<marketplace>/<plugin>/<version>/skills/<dir>``.
+    """
+    if skill.skill_dir is None or not plugin:
+        return False
+    try:
+        parts = skill.skill_dir.resolve().parts
+    except OSError:
+        return False
+    return (
+        len(parts) >= 6 and parts[-2] == "skills" and parts[-4] == plugin and parts[-6] == "cache"
+    )
+
+
+def _label_alias(skill: SkillSpec) -> str:
+    """
+    The name a skill had before directory-name invocation.
+
+    :param skill: Skill with a frontmatter label, e.g. ``plugin:review``
+        labelled ``code-review``.
+    :returns: The label, keeping any namespace, e.g. ``"plugin:code-review"``.
+    """
+    namespace, sep, _ = skill.name.rpartition(":")
+    return f"{namespace}{sep}{skill.display_name}"
+
+
 def find_skill_by_name(skills: list[SkillSpec], name: str) -> SkillSpec | None:
     """
-    Return the skill with the requested name.
+    Return the skill with the requested name, accepting namespace aliases.
+
+    An exact match always wins. Otherwise two kinds of alias are tried, and
+    a name that more than one skill answers to stays unresolved rather than
+    guessing. A frontmatter label is an alias, so a name from an older
+    server (``code-review`` for directory ``review``) still works. Plugin
+    namespaces are aliases too: the same installed plugin skill is surfaced
+    as ``<plugin>:<skill>`` by claude-family discovery but as the bare
+    ``<skill>`` by codex-family discovery, so a name carried from one
+    context into the other would otherwise fail to resolve. A namespaced
+    request falls back to the bare skill name only when that skill's
+    on-disk provenance shows it belongs to the named plugin (so
+    ``pluginb:deploy`` cannot hijack an unrelated ``deploy``); a bare
+    request falls back to a namespaced entry only when exactly one plugin
+    exposes that skill.
 
     :param skills: Discovered skills for an agent (bundled + host),
         e.g. the merged list from :attr:`LoadSkillTool.skills`.
-    :param name: Skill name to match exactly, e.g. ``"code-review"``.
+    :param name: Skill name to match, e.g. ``"code-review"`` or the
+        namespaced ``"myplugin:code-review"``.
     :returns: The matching :class:`SkillSpec`, or ``None`` when the
         command references a skill the agent does not expose.
     """
     for skill in skills:
         if skill.name == name:
             return skill
-    return None
+    # Older servers name a skill by its frontmatter label.
+    aliases = [s for s in skills if s.display_name is not None and _label_alias(s) == name]
+    if ":" in name:
+        plugin, bare = name.split(":", 1)
+        provenanced = [s for s in skills if s.name == bare and _has_plugin_provenance(s, plugin)]
+        aliases += provenanced[:1]
+    else:
+        aliases += [s for s in skills if ":" in s.name and s.name.split(":", 1)[1] == name]
+    # One skill reachable through both alias kinds is still a single match.
+    matches = list({id(s): s for s in aliases}.values())
+    return matches[0] if len(matches) == 1 else None
 
 
 def format_skill_meta_text(skill: SkillSpec, arguments: str) -> str:

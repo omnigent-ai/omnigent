@@ -65,24 +65,6 @@ def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
     }
 
 
-def test_native_message_forwards_authenticated_author_metadata() -> None:
-    """Native runner events carry trusted authorship separately from text."""
-    from omnigent.server.routes import sessions as sessions_routes
-
-    conv = _conversation_with_wrapper("codex-native-ui")
-
-    event = sessions_routes._build_native_terminal_message_event(
-        conv,
-        _message_event(),
-        created_by="alice@example.com",
-        author_attribution_required=True,
-    )
-
-    assert event["created_by"] == "alice@example.com"
-    assert event["author_attribution_required"] is True
-    assert event["content"] == [{"type": "input_text", "text": "hello"}]
-
-
 def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
     """Kiro-native web messages use the native bypass, like Codex."""
     from omnigent.server.routes import sessions as sessions_routes
@@ -121,6 +103,33 @@ def test_antigravity_native_session_uses_antigravity_harness_for_web_messages() 
         "harness": "antigravity-native",
         "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
+
+
+def test_native_message_event_carries_the_session_harness_override() -> None:
+    """A cross-harness override session's native message carries the override.
+
+    The runner resolves the turn's harness from its recorded session
+    override; carrying the persisted override in-band keeps that resolution
+    correct even when the runner's session cache is cold (fresh process,
+    missed init), instead of dropping the turn onto the spec's harness and
+    evicting the override harness.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    conv = Conversation(
+        id="e1f7c651c9f97fac088ea70ef633409d",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="e1f7c651c9f97fac088ea70ef633409d",
+        agent_id="d5de5cef9504e12d06e729f3071d4f48",
+        harness_override="codex-native",
+    )
+
+    assert sessions_routes._is_native_terminal_session(conv) is True
+    event = sessions_routes._build_native_terminal_message_event(conv, _message_event())
+    assert event["harness_override"] == "codex-native", (
+        f"The native message event must carry the persisted session override; got {event!r}."
+    )
 
 
 def test_antigravity_native_runtime_maps_wrapper_to_agy_terminal() -> None:

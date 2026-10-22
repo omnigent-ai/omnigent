@@ -9,13 +9,22 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.inner.terminal import TerminalInstance
+from omnigent.native import native_cost_popup
+from omnigent.runner.app import create_runner_app
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
+    PANE_OUTPUT_BUSY_WINDOW_S,
     NativePaneReaper,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
 )
+from omnigent.terminals.registry import TerminalRegistry
+from tests.runner.helpers import NullServerClient
 
 
 def _pane(conv: str, name: str = "claude") -> PaneRef:
@@ -187,3 +196,102 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
     finally:
         await r.shutdown()
     assert f.reaped == []
+
+
+def test_kimi_is_exempt_from_pane_reaping() -> None:
+    # kimi records no resumable chat id, so a reaped pane cannot be re-created
+    # with its context; the name filter must never offer kimi panes to the reaper.
+    from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
+
+    assert "kimi" not in NATIVE_PANE_TERMINAL_NAMES
+    assert "claude" in NATIVE_PANE_TERMINAL_NAMES
+
+
+async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The runner's busy check treats a fresh approval-wait marker as busy.
+
+    A pane parked on a permission prompt has no active turn, no ``running``
+    status, no attached client and no output, so every other signal reads idle
+    and the reaper would kill the prompt under a still-answerable card.
+    """
+    # Bound by name when the app is built, so stub before building: no tmux here.
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    pane = PaneRef(
+        "conv_parked", terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+    )
+
+    assert not await reaper._is_busy(pane)
+
+    marker = claude_native_bridge.approval_wait_marker_path("conv_parked")
+    marker.parent.mkdir(parents=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+    assert await reaper._is_busy(pane)
+    # Another session's parked prompt does not spare this pane.
+    other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
+    assert not await reaper._is_busy(other)
+
+
+async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An attached viewer spares the pane only while a human recently drove it.
+
+    A CLI tab's keypress (tmux ``client_activity``) or a web-bridge event (the
+    terminal's interaction stamp) inside the busy window reads busy; an idle
+    attached viewer, or stale input, does not — a tab left open overnight must
+    not keep the native stack resident.
+    """
+    tmux_input_at: dict[str, float | None] = {"value": None}
+    monkeypatch.setattr(
+        native_cost_popup, "_tmux_last_client_input_at", lambda *_args: tmux_input_at["value"]
+    )
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    registry._by_conversation["conv_viewed"] = {("claude", "main"): instance}
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    pane = PaneRef(
+        "conv_viewed", terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+    )
+
+    # Attached but idle on both signals: not busy.
+    assert not await reaper._is_busy(pane)
+    # A CLI keypress inside the window spares the pane; a stale one does not.
+    tmux_input_at["value"] = time.time() - 1.0
+    assert await reaper._is_busy(pane)
+    tmux_input_at["value"] = time.time() - PANE_OUTPUT_BUSY_WINDOW_S - 1.0
+    assert not await reaper._is_busy(pane)
+    # A web-bridge event on the pane's terminal spares it; a stale one does not.
+    instance.note_client_interaction()
+    assert await reaper._is_busy(pane)
+    instance._last_client_interaction_at = time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 1.0
+    assert not await reaper._is_busy(pane)

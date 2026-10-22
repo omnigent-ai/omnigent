@@ -3,9 +3,10 @@
 The pre-commit fixer rewrites every ``source = { registry = "<url>" }``
 in ``uv.lock`` to public PyPI so a developer's local index/proxy never
 leaks into the committed lockfile. These tests pin that contract:
-arbitrary registry URLs are normalized, non-registry sources are left
-alone, the fixer is idempotent, and ``main`` signals modifications via
-its exit code (1 = changed → commit aborts and re-stages; 0 = clean).
+arbitrary registry URLs are normalized, artifact metadata and
+non-registry sources are left alone, the fixer is idempotent, and
+``main`` signals modifications via its exit code (1 = changed → commit
+aborts and re-stages; 0 = clean).
 """
 
 from __future__ import annotations
@@ -126,7 +127,7 @@ def test_main_handles_multiple_files(tmp_path: Path) -> None:
     assert b.read_text() == canonical
 
 
-def test_non_canonical_registries_lists_offenders() -> None:
+def test_non_canonical_entries_lists_offenders() -> None:
     """The check helper reports each non-canonical registry URL, in order."""
     proxy = "https://pypi-proxy.cloud.databricks.com/simple"
     text = (
@@ -134,13 +135,13 @@ def test_non_canonical_registries_lists_offenders() -> None:
         f'source = {{ registry = "{_CANONICAL}" }}\n'
         f'source = {{ registry = "{proxy}" }}\n'
     )
-    assert _MOD.non_canonical_registries(text) == [proxy, proxy]
+    assert _MOD.non_canonical_entries(text) == [proxy, proxy]
 
 
-def test_non_canonical_registries_empty_when_canonical() -> None:
+def test_non_canonical_entries_empty_when_canonical() -> None:
     """A fully-canonical lockfile reports no offenders."""
     text = f'source = {{ registry = "{_CANONICAL}" }}\n'
-    assert _MOD.non_canonical_registries(text) == []
+    assert _MOD.non_canonical_entries(text) == []
 
 
 def test_main_check_fails_without_writing(tmp_path: Path) -> None:
@@ -166,3 +167,17 @@ def test_main_check_flag_position_independent(tmp_path: Path) -> None:
     lock = tmp_path / "uv.lock"
     lock.write_text(f'source = {{ registry = "{_CANONICAL}" }}\n')
     assert _MOD.main([str(lock), "--check"]) == 0
+
+
+def test_normalize_text_preserves_artifact_metadata() -> None:
+    """File sizes, hashes, and upload times survive URL normalization."""
+    proxy = "https://pypi-proxy.cloud.databricks.com"
+    text = (
+        f'sdist = {{ url = "{proxy}/packages/ab/cd/pkg.tar.gz", '
+        'hash = "sha256:aaaa", size = 116543, upload-time = "2026-01-28T10:17:05.322Z" }\n'
+    )
+    assert _MOD.normalize_text(text) == (
+        'sdist = { url = "https://files.pythonhosted.org/packages/ab/cd/pkg.tar.gz", '
+        'hash = "sha256:aaaa", size = 116543, upload-time = "2026-01-28T10:17:05.322Z" }\n'
+    )
+    assert _MOD.non_canonical_entries(_MOD.normalize_text(text)) == []

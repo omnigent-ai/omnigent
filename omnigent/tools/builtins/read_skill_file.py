@@ -43,8 +43,9 @@ class ReadSkillFileTool(Tool):
         :returns: Human-readable description of the tool.
         """
         return (
-            "Read a file from a skill's directory "
-            "(references/, scripts/, or assets/). "
+            "Read a file from a skill's directory, "
+            "including files beside SKILL.md and under "
+            "references/, scripts/, or assets/. "
             "Requires the skill name and a relative "
             "file path."
         )
@@ -60,8 +61,9 @@ class ReadSkillFileTool(Tool):
             "function": {
                 "name": "read_skill_file",
                 "description": (
-                    "Read a file from a skill's directory "
-                    "(references/, scripts/, or assets/). "
+                    "Read a file from a skill's directory, "
+                    "including files beside SKILL.md and under "
+                    "references/, scripts/, or assets/. "
                     "Requires the skill name and a relative "
                     "file path."
                 ),

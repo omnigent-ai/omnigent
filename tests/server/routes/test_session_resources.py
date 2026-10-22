@@ -4,20 +4,48 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
+import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
+from urllib.parse import quote
 
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.runtime import _globals, session_stream, set_runner_client, set_runner_router
+from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runtime import (
+    _globals,
+    session_stream,
+    set_runner_client,
+    set_runner_direct_attach_resolver,
+    set_runner_router,
+)
+from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    UnifiedAuthProvider,
+)
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
+from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
 class _ConversationStore:
@@ -116,10 +144,20 @@ class _ConversationStore:
             ),
         }
         self.appended_items: list[Any] = []
+        # Items appended with a stable_id, keyed by it — the real store uses the
+        # stable_id as the row id, which ``get_item`` looks up.
+        self.persisted_by_stable_id: dict[str, Any] = {}
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Return the conversation or None."""
         return self._conversations.get(conversation_id)
+
+    def get_item(self, conversation_id: str, item_id: str) -> Any:
+        """Return an appended item by stable id or fake id, else ``None``."""
+        del conversation_id
+        if item_id in self.persisted_by_stable_id:
+            return self.persisted_by_stable_id[item_id]
+        return next((item for item in self.appended_items if item.id == item_id), None)
 
     def list_conversations(
         self,
@@ -156,14 +194,16 @@ class _ConversationStore:
 
         :param conversation_id: Conversation id to update.
         :param title: Optional title to set.
-        :param kwargs: Extra store fields ignored by this test stub.
+        :param kwargs: Additional conversation fields used by relay tests.
         :returns: Updated conversation, or ``None`` if absent.
         """
-        del kwargs
         conv = self._conversations.get(conversation_id)
         if conv is None:
             return None
-        conv.title = title
+        if title is not None:
+            conv.title = title
+        if "reported_model" in kwargs:
+            conv.reported_model = kwargs["reported_model"]
         return conv
 
     def set_labels(
@@ -176,6 +216,22 @@ class _ConversationStore:
         del updated_at
         conv = self._conversations[conversation_id]
         conv.labels.update(updates)
+
+    def set_host_id(
+        self,
+        conversation_id: str,
+        host_id: str,
+        workspace: str | None = None,
+        git_branch: str | None = None,
+    ) -> Conversation:
+        """Set a conversation's host placement fields."""
+        conv = self._conversations[conversation_id]
+        conv.host_id = host_id
+        if workspace is not None:
+            conv.workspace = workspace
+        if git_branch is not None:
+            conv.git_branch = git_branch
+        return conv
 
     def append(
         self,
@@ -204,6 +260,8 @@ class _ConversationStore:
                 created_by=getattr(item, "created_by", None),
             )
             self.appended_items.append(persisted)
+            if getattr(item, "stable_id", None):
+                self.persisted_by_stable_id[item.stable_id] = persisted
             result.append(persisted)
         return result
 
@@ -411,27 +469,49 @@ class _FakeRunnerRouter:
     def __init__(self, client: _FakeRunnerClient) -> None:
         self.client = client
         self.resource_calls: list[str] = []
+        self.resource_conversations: list[Conversation | None] = []
 
-    def client_for_session_resources(self, session_id: str) -> _RoutedRunner:
+    def client_for_session_resources(
+        self,
+        session_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> _RoutedRunner:
         self.resource_calls.append(session_id)
+        self.resource_conversations.append(conversation)
         return _RoutedRunner(self.client)
 
 
 @pytest.fixture
 def runner_globals_reset() -> Iterator[None]:
+    from omnigent.server.routes._sessions.common import (
+        get_server_runner_router,
+        set_server_runner_router,
+    )
+
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
+    prior_direct = _globals._runner_direct_attach_resolver
+    prior_server_router = get_server_runner_router()
     set_runner_client(None)
     set_runner_router(None)
+    set_runner_direct_attach_resolver(None)
+    set_server_runner_router(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
+    set_runner_direct_attach_resolver(prior_direct)
+    set_server_runner_router(prior_server_router)
 
 
 @pytest.fixture
 def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
     app = FastAPI()
+    conversation_store = _ConversationStore()
+    host_registry = HostRegistry()
+    app.state.test_conversation_store = conversation_store
+    app.state.test_host_registry = host_registry
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -456,8 +536,9 @@ def app(runner_globals_reset: None) -> FastAPI:
 
     app.include_router(
         create_sessions_router(
-            _ConversationStore(),  # type: ignore[arg-type]
+            conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -551,6 +632,9 @@ async def test_list_session_resources_proxies_to_bound_runner(
 
     assert resp.status_code == 200
     assert fake_router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    assert [conv.id for conv in fake_router.resource_conversations if conv is not None] == [
+        "79b22ebd2309e48fdeb450c65611d51b"
+    ]
     assert fake_runner.calls == [
         ("GET", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
     ]
@@ -588,6 +672,49 @@ async def test_list_session_resources_rejects_malformed_runner_response(
 
     assert resp.status_code == 502
     assert resp.json()["detail"] == "runner session-resources endpoint returned malformed response"
+
+
+@pytest.mark.asyncio
+async def test_list_session_resources_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The list proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -651,6 +778,10 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
+    forwarded = fake_runner.post_json_calls[1][1]
+    assert re.fullmatch(r"[0-9a-f]{32}", forwarded["delivery_attempt_id"])
+    assert isinstance(forwarded["input_enqueued_at_ms"], int)
+    assert forwarded["input_enqueued_at_ms"] > 0
     assert fake_runner.post_json_calls == [
         (
             "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
@@ -658,6 +789,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "terminal": "claude",
                 "session_key": "main",
                 "ensure_native_terminal": True,
+                "persist_resource_event": True,
             },
         ),
         (
@@ -671,6 +803,9 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 # Forwarded so the runner resolves the harness spec on the
                 # first message (before POST /v1/sessions caches it).
                 "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
+                "pending_id": body["pending_id"],
+                "delivery_attempt_id": forwarded["delivery_attempt_id"],
+                "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
             },
         ),
     ]
@@ -1042,6 +1177,85 @@ async def test_list_terminals_forwards_pagination_params_to_runner(
     assert fake_runner.get_params == [{"order": "asc", "limit": "1000"}]
 
 
+def _terminals_only_payload() -> dict[str, object]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "terminal_runner_s1",
+                "object": "session.resource",
+                "type": "terminal",
+                "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+                "name": "runner:s1",
+                "metadata": {
+                    "terminal_name": "runner",
+                    "session_key": "s1",
+                    "running": True,
+                },
+            },
+        ],
+        "first_id": "terminal_runner_s1",
+        "last_id": "terminal_runner_s1",
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_adds_direct_attach_url_when_advertised(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner-advertised loopback listener surfaces per-terminal URLs.
+
+    Permissions are disabled in this harness (single-user mode), which
+    the disclosure gate treats as owner — mirroring the relay's
+    write-attach behavior.
+    """
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(
+        lambda conversation_id: DirectAttachEndpoint(port=54321, token="tok_abc")
+    )
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert item["metadata"]["direct_attach_url"] == (
+        "ws://127.0.0.1:54321/v1/sessions/79b22ebd2309e48fdeb450c65611d51b"
+        "/resources/terminals/terminal_runner_s1/attach?token=tok_abc"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_resolver_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_list_terminals_without_runner_advert_leaves_payload_untouched(
+    client: httpx.AsyncClient,
+) -> None:
+    """A resolver miss (runner offline / no listener) adds nothing."""
+    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_direct_attach_resolver(lambda conversation_id: None)
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals")
+
+    assert resp.status_code == 200
+    (item,) = resp.json()["data"]
+    assert "direct_attach_url" not in item["metadata"]
+
+
 @pytest.mark.asyncio
 async def test_list_environments_rejects_unknown_session(
     client: httpx.AsyncClient,
@@ -1099,6 +1313,94 @@ async def test_get_resource_by_id_404_from_runner(
     assert resp.json()["error"]["code"] == "not_found"
 
 
+@pytest.mark.asyncio
+async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The GET proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone")
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer exists" in message
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_404_with_non_mapping_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """A malformed runner 404 uses the default not-found message."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"], status_code=404)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/nonexistent")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"]["message"] == "Resource not found"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_rejects_invalid_runner_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """Malformed runner JSON becomes a controlled 502."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/bad-json"
+    fake_runner = _FakeRunnerClient(
+        text_responses={path: (200, "not-json", {"content-type": "application/json"})}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_rejects_non_mapping_runner_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """Valid non-object runner JSON becomes a distinct controlled 502."""
+    fake_runner = _FakeRunnerClient(payload=["not", "an", "object"])
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/non-object")
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "runner resource endpoint returned non-object JSON"
+
+
 @pytest.fixture
 def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve the session's agent spec to one declaring a ``bash`` terminal.
@@ -1117,6 +1419,40 @@ def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.spec.types import AgentSpec
 
     spec = AgentSpec(spec_version=1, terminals={"bash": TerminalEnvSpec(command="bash")})
+    monkeypatch.setattr(
+        sessions_module,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: spec,
+    )
+
+
+@pytest.fixture
+def bash_only_native_host(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the canned session to a native spec on a bash-only host."""
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.spec.types import AgentSpec
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conv = app.state.test_conversation_store._conversations[session_id]
+    conv.host_id = "host_bash_only"
+    conv.workspace = "/workspace"
+    app.state.test_host_registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="bash-only",
+            interactive_shells=["bash"],
+        ),
+        owner=None,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals={"zsh": TerminalEnvSpec(command="zsh")},
+    )
     monkeypatch.setattr(
         sessions_module,
         "_load_agent_spec_for_session",
@@ -1156,6 +1492,58 @@ async def test_create_terminal_proxies_to_runner(
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_uses_native_host_shell_inventory(
+    client: httpx.AsyncClient,
+    bash_only_native_host: None,
+) -> None:
+    """A native host shell is allowed even when the baked spec differs."""
+    terminal_resource = {
+        "id": "terminal_bash_s1",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+        "name": "bash:s1",
+        "environment": DEFAULT_ENVIRONMENT_ID,
+        "metadata": {
+            "terminal_name": "bash",
+            "session_key": "s1",
+            "running": True,
+        },
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "bash", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert fake_runner.calls == [
+        ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_rejects_shell_absent_from_native_host(
+    client: httpx.AsyncClient,
+    bash_only_native_host: None,
+) -> None:
+    """A shell baked on the server cannot be launched on a host lacking it."""
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "zsh", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 400
+    assert "bash" in resp.json()["error"]["message"]
+    assert fake_runner.calls == []
 
 
 @pytest.mark.asyncio
@@ -1376,6 +1764,28 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
 
 
 @pytest.mark.asyncio
+async def test_sign_in_link_proxies_to_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /sign-in-link validates the session, then asks the runner for the live prompt."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/sign-in-link"
+    payload = {
+        "pending": True,
+        "url": "https://signin.example.com/device",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_claude_main",
+    }
+    fake_runner = _FakeRunnerClient(responses={path: (200, payload)})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert fake_runner.calls == [("GET", path)]
+
+
+@pytest.mark.asyncio
 async def test_delete_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1403,10 +1813,125 @@ async def test_delete_terminal_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_level,target_level,host_owner,expected_status,admin,inherited",
+    [
+        (LEVEL_READ, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_EDIT, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_MANAGE, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_READ, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_EDIT, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_MANAGE, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "bob@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, None, 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "", 404, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, True),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, True),
+    ],
+)
+async def test_terminal_transfer_requires_session_and_host_ownership(
+    db_uri: str,
+    runner_globals_reset: None,
+    source_level: int,
+    target_level: int,
+    host_owner: str | None,
+    expected_status: int,
+    admin: bool,
+    inherited: bool,
+) -> None:
+    """Placement changes require authority over both sessions and their host."""
+    del runner_globals_reset
+    source_id = "79b22ebd2309e48fdeb450c65611d51b"
+    target_id = "5d29bee4350489d66feafecfebd94a97"
+    host_id = uuid.uuid4().hex
+    conversations = _ConversationStore()
+    source = conversations.get_conversation(source_id)
+    target = conversations.get_conversation(target_id)
+    assert source is not None and target is not None
+    source.host_id = host_id
+    source.workspace = "/workspace/project"
+    source.git_branch = "feature/rotation"
+    if inherited:
+        parent = conversations.get_conversation("64a784c3aa907d1774f44313546947c6")
+        assert parent is not None
+        parent.host_id = host_id
+        source.host_id = None
+        source.kind = "sub_agent"
+        source.parent_conversation_id = parent.id
+        source.runner_id = "runner_one"
+    permissions = _StubPermissionStore()
+    if admin:
+        permissions.add_admin("alice@example.com")
+    permissions.add_grant("alice@example.com", source_id, source_level)
+    permissions.add_grant("alice@example.com", target_id, target_level)
+    if inherited:
+        permissions.add_grant("alice@example.com", parent.id, source_level)
+    application = FastAPI()
+    if host_owner is not None:
+        hosts = HostStore(db_uri)
+        # An empty owner leaves the host unregistered in a configured store.
+        if host_owner:
+            hosts.upsert_on_connect(host_id, "test-host", host_owner)
+        application.state.host_store = hosts
+
+    @application.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(status_code=exc.http_status, content={"error": exc.code})
+
+    application.include_router(
+        create_sessions_router(
+            conversations,  # type: ignore[arg-type]
+            Mock(),  # Agent loading is outside the transfer boundary.
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+            permission_store=permissions,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    # No terminal process is needed to exercise authorization and stored placement.
+    runner = _FakeRunnerClient(payload={"id": "terminal_main", "session_id": target_id})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://server"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{source_id}/resources/terminals/terminal_main/transfer",
+            json={"target_session_id": target_id},
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    assert response.status_code == expected_status, response.text
+    assert source.host_id == (None if inherited else host_id)
+    assert source.workspace == "/workspace/project"
+    if expected_status == 200 and not inherited:
+        assert response.json()["session_id"] == target_id
+        assert target.host_id == source.host_id
+        assert target.workspace == source.workspace
+        assert target.git_branch == source.git_branch
+    else:
+        if expected_status == 200:
+            assert runner.calls
+            assert response.json()["session_id"] == target_id
+        else:
+            assert runner.calls == []
+        assert target.host_id is None
+        assert target.workspace is None
+        assert target.git_branch is None
+
+
+@pytest.mark.asyncio
 async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
     client: httpx.AsyncClient,
+    app: FastAPI,
 ) -> None:
-    """POST terminal transfer validates source and target then proxies."""
+    """POST terminal transfer proxies and carries the source placement."""
+    conversation_store: _ConversationStore = app.state.test_conversation_store
+    source = conversation_store.get_conversation("79b22ebd2309e48fdeb450c65611d51b")
+    assert source is not None
+    source.host_id = "host_arca"
+    source.workspace = "/home/alice/workspace"
+    source.git_branch = "feature/clear"
     terminal_resource = {
         "id": "terminal_bash_s1",
         "object": "session.resource",
@@ -1444,6 +1969,11 @@ async def test_transfer_terminal_authorizes_sessions_and_proxies_to_runner(
         ),
     ]
     assert router.resource_calls == ["79b22ebd2309e48fdeb450c65611d51b"]
+    target = conversation_store.get_conversation("5d29bee4350489d66feafecfebd94a97")
+    assert target is not None
+    assert target.host_id == "host_arca"
+    assert target.workspace == "/home/alice/workspace"
+    assert target.git_branch == "feature/clear"
 
 
 @pytest.mark.asyncio
@@ -1531,6 +2061,53 @@ async def test_transfer_terminal_surfaces_runner_error_without_crashing(
 
 
 @pytest.mark.asyncio
+async def test_transfer_terminal_surfaces_a_runner_conflict_as_409(
+    client: httpx.AsyncClient,
+) -> None:
+    """A terminal-name collision on the target reaches the caller as a 409.
+
+    The runner returns 409 ``resource_conflict`` when the target session
+    already owns a terminal under the same name — a state conflict the
+    caller cannot fix by changing its request. Mapping it to
+    ``INVALID_INPUT`` surfaced it as a 400, so a real collision was
+    indistinguishable from a malformed transfer, and the 409 a client did
+    see had to have come from somewhere else entirely.
+
+    :param client: Server test client.
+    :returns: None.
+    """
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    path = f"/v1/sessions/{session_id}/resources/terminals/terminal_bash_s1/transfer"
+    fake_runner = _FakeRunnerClient(
+        responses={
+            path: (
+                409,
+                {
+                    "error": {
+                        "code": "resource_conflict",
+                        "message": (
+                            "target session already has terminal 'bash' for session key 's1'"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(path, json={"target_session_id": "5d29bee4350489d66feafecfebd94a97"})
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"]["code"] == ErrorCode.CONFLICT
+    assert body["error"]["message"] == (
+        "target session already has terminal 'bash' for session key 's1'"
+    )
+    assert "id" not in body
+    assert fake_runner.calls == [("POST", path)]
+
+
+@pytest.mark.asyncio
 async def test_delete_terminal_surfaces_runner_404(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1601,6 +2178,14 @@ def artifact_store() -> _InMemoryArtifactStore:
     return _InMemoryArtifactStore()
 
 
+class _NoAgentStore:
+    """Agent store stub for file tests: holds no agents."""
+
+    def get(self, agent_id: str) -> None:
+        """Return no agent for *agent_id*."""
+        del agent_id
+
+
 @pytest.fixture
 def file_app(
     runner_globals_reset: None,
@@ -1612,6 +2197,21 @@ def file_app(
     del runner_globals_reset
 
     test_app = FastAPI()
+    host_registry = HostRegistry()
+    host_registry.register(
+        "host_files",
+        Mock(),
+        HostHelloFrame(
+            version="0.15.0",
+            frame_protocol_version=1,
+            name="files",
+            capabilities=HOST_CAPABILITIES,
+        ),
+        owner=None,
+    )
+    test_app.state.host_registry = host_registry
+    for session_id in ("64a784c3aa907d1774f44313546947c6", "405bfe154d5c0e795a2b87021bc897bf"):
+        file_conv_store._conversations[session_id].host_id = "host_files"
 
     @test_app.exception_handler(OmnigentError)
     async def _handle(
@@ -1629,9 +2229,10 @@ def file_app(
     test_app.include_router(
         create_sessions_router(
             file_conv_store,  # type: ignore[arg-type]
-            object(),  # type: ignore[arg-type]  — stub agent store
+            _NoAgentStore(),  # type: ignore[arg-type]
             file_store=file_store,  # type: ignore[arg-type]
             artifact_store=artifact_store,  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -1717,6 +2318,41 @@ async def test_download_session_file_content(
         "attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt"
     )
     assert resp.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_download_session_file_content_is_revalidatable(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Content is immutable per file id, so it must be cacheable and revalidate to 304.
+
+    Transcripts re-render the same attachments on every session load and
+    the originals run to megabytes; without these headers the browser
+    re-downloads all of them each time.
+    """
+    upload = await file_client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+        files={"file": ("shot.png", b"pretend-png-bytes", "image/png")},
+    )
+    file_id = upload.json()["id"]
+    url = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files/{file_id}/content"
+
+    resp = await file_client.get(url)
+    assert resp.status_code == 200
+    etag = resp.headers["etag"]
+    assert etag == f'"{file_id}"'
+    assert resp.headers["cache-control"] == "private, max-age=31536000, immutable"
+
+    # A conditional re-request must skip the bytes entirely.
+    cached = await file_client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert cached.content == b""
+    assert cached.headers["etag"] == etag
+
+    # A stale validator still gets the full body back.
+    stale = await file_client.get(url, headers={"If-None-Match": '"file_gone"'})
+    assert stale.status_code == 200
+    assert stale.content == b"pretend-png-bytes"
 
 
 @pytest.mark.asyncio
@@ -1873,6 +2509,229 @@ async def test_copy_files_from_direct_parent(
     )
     assert content.status_code == 200
     assert content.content == b"parent bytes"
+
+
+@pytest.mark.asyncio
+async def test_copy_files_carries_source_metadata(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied downscaled image keeps its source_metadata for the subagent."""
+    source = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename="shot.webp",
+        bytes=3,
+        content_type="image/webp",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    artifact_store.put(source.id, b"abc")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [source.id],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][source.id]["new_id"]
+
+    copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
+    assert copied is not None
+    assert copied.source_metadata == {"width": 6000, "height": 4000}
+
+
+def _seed_parent_zip(file_store: Any, artifact_store: _InMemoryArtifactStore, name: str) -> str:
+    """Store a zip in the parent session directly, bypassing the upload route."""
+    stored = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename=name,
+        bytes=4,
+        content_type="application/zip",
+    )
+    artifact_store.put(stored.id, b"PK\x03\x04")
+    return stored.id
+
+
+@pytest.mark.asyncio
+async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied zip would be dropped by an SDK child, as an uploaded one would."""
+    zip_id = _seed_parent_zip(file_store, artifact_store, "bundle.zip")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [zip_id]},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert "Claude Code or Codex" in resp.text
+    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
+    assert listed.data == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_type", [False, True], ids=["default-type", "recorded-gz"])
+async def test_copy_spends_the_child_workspace_quota(
+    file_client: httpx.AsyncClient,
+    file_conv_store: _ConversationStore,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_type: bool,
+) -> None:
+    """Copies count against the child's workspace quota, like uploads."""
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.filesystem_attachment_file_limit",
+        lambda: 1,
+    )
+    file_conv_store._conversations["405bfe154d5c0e795a2b87021bc897bf"].labels.update(
+        CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+    )
+    first = _seed_parent_zip(file_store, artifact_store, "first.zip")
+    if recorded_type:
+        # Counted by its recorded delivery, since .gz isn't a default extension.
+        stored = file_store.create(
+            session_id="b460374fc8e697b296708f52dc9d8179",
+            filename="second.gz",
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata={"delivery": "filesystem"},
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        second = stored.id
+    else:
+        second = _seed_parent_zip(file_store, artifact_store, "second.zip")
+    url = "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy"
+    source = "b460374fc8e697b296708f52dc9d8179"
+
+    ok = await file_client.post(url, json={"source_session_id": source, "file_ids": [first]})
+    assert ok.status_code == 200, ok.text
+    over = await file_client.post(url, json={"source_session_id": source, "file_ids": [second]})
+
+    assert over.status_code == 413, over.text
+    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
+    assert [f.filename for f in listed.data] == ["first.zip"]
+
+
+@pytest.mark.asyncio
+async def test_native_forward_leaves_a_workspace_file_for_the_runner(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A zip reaches the native runner as a file_id, with no resolution warning."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("bundle.zip", b"PK\x03\x04", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    zip_block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "bundle.zip"}
+
+    with caplog.at_level(logging.WARNING):
+        resp = await file_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "message", "data": {"role": "user", "content": [zip_block]}},
+        )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert forwarded["content"] == [zip_block]
+    assert "File reference resolution failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_native_forward_drops_client_delivery_claims(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Only an upload's stored record can mark a file for filesystem delivery."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [
+        {"type": "input_file", "file_id": upload.json()["id"], "delivery": "filesystem"},
+        {
+            "type": "input_file",
+            "filename": "inline.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+            "delivery": "filesystem",
+        },
+    ]
+
+    resp = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert len(forwarded["content"]) == 2
+    assert all("delivery" not in block for block in forwarded["content"])
+
+
+@pytest.mark.asyncio
+async def test_downscaled_upload_reaches_native_resolver(
+    file_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notices
+    from omnigent.runner.app_support import _resolve_forwarded_message_content
+    from omnigent.runtime import content_resolver
+
+    monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(content_resolver, "IMAGE_MAX_EDGE_PX", 64)
+    original = BytesIO()
+    Image.new("RGB", (300, 200), "red").save(original, format="PNG", compress_level=0)
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("photo.png", original.getvalue(), "image/png")},
+    )
+    assert upload.status_code == 201, upload.text
+    file_id = upload.json()["id"]
+    resource = await file_client.get(f"/v1/sessions/{session_id}/resources/files/{file_id}")
+    assert resource.json()["metadata"]["source_metadata"] == {"width": 300, "height": 200}
+    inventory = await file_client.get(f"/v1/sessions/{session_id}/resources")
+    assert inventory.status_code == 200
+    listed = next(entry for entry in inventory.json()["data"] if entry["id"] == file_id)
+    assert listed["metadata"]["source_metadata"] == {"width": 300, "height": 200}
+    authored = [
+        {"type": "input_image", "file_id": file_id, "filename": "photo.png"},
+        {"type": "input_text", "text": "inspect this"},
+    ]
+    resolved = await _resolve_forwarded_message_content(
+        authored, session_id=session_id, server_client=file_client
+    )
+    assert "300×200" in framework_notices(resolved)[0]
+    items = _content_to_input_items(resolved, tmp_path)
+    assert "downscaled-from-300x200" in items[0]["path"]
+    assert items[1] == {"type": "text", "text": "inspect this"}
+    assert len(authored) == 2
 
 
 @pytest.mark.asyncio
@@ -2344,6 +3203,155 @@ async def test_files_route_not_captured_as_resource_id(
 
 
 @pytest.mark.asyncio
+async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GET /resources/github proxies to the runner and returns its payload.
+
+    Also guards route ordering: registered before the generic
+    ``/resources/{resource_id}`` lookup so ``github`` is not a resource id.
+    """
+    payload = {
+        "object": "session.github.info",
+        "available": True,
+        "authenticated": True,
+        "branch": "feature",
+        "base_ref": "main",
+        "pr": None,
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github")
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+    """A provider refusal keeps the runner's status and message for the panel."""
+    from omnigent.runner import github_resource
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/labels"
+    detail = "The GitHub account on the host cannot edit this pull request's labels."
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    timeouts: list[float | None] = []
+    proxy_get, proxy_post = fake_runner.get, fake_runner.post
+
+    async def get(url: str, *, params: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_get(url, params=params, timeout=timeout)
+
+    async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_post(url, json=json, timeout=timeout)
+
+    fake_runner.get, fake_runner.post = get, post  # type: ignore[method-assign]
+
+    resp = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"]}
+    )
+    malformed = await client.post(path, json={"add": ["bug"]})
+    await client.get(path, params={"pr_url": "https://github.com/acme/widgets/pull/17"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert malformed.status_code == 400
+    # The server and the host tunnel both outwait the runner's label request budget.
+    assert timeouts == [routes_resources._LABEL_PROXY_TIMEOUT_S] * 2
+    assert github_resource._LABEL_REQUEST_SECONDS < routes_resources._LABEL_PROXY_TIMEOUT_S
+    assert github_resource._LABEL_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
+    assert fake_runner.post_json_calls == [
+        (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"], "remove": []})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/changes proxies the PR file list to the runner."""
+    fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes"
+    )
+
+    assert resp.status_code == 200
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> None:
+    """GET /resources/github/diff (no path) proxies the whole-PR patch."""
+    payload = {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff")
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_path", "status"),
+    [
+        (None, 200),
+        ("old/%2F #?.py", 200),
+        ("folder/../old.py", 400),
+        ("folder//old.py", 400),
+        ("", 400),
+        ("/old.py", 400),
+    ],
+)
+async def test_github_diff_proxies_path_and_base(
+    client: httpx.AsyncClient, previous_path: str | None, status: int
+) -> None:
+    """GET /resources/github/diff/{path} proxies the path + base to the runner."""
+    payload = {
+        "object": "session.github.file_diff",
+        "path": "src/app.py",
+        "before": "old",
+        "after": "new",
+    }
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    params = {"base": "main"}
+    if previous_path is not None:
+        params["previous_path"] = previous_path
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
+        params=params,
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert fake_runner.calls == []
+        return
+    assert resp.json() == payload
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
+    ) in fake_runner.calls
+    assert params in fake_runner.get_params
+
+
+@pytest.mark.asyncio
 async def test_files_appear_in_unified_inventory(
     file_client: httpx.AsyncClient,
 ) -> None:
@@ -2645,6 +3653,80 @@ async def test_filesystem_path_omits_absent_cursors(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_base_host_forwards_an_absolute_path(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?base=host`` reads a bare ``{path}`` as an absolute host path and
+    forwards it to the runner ``%2F``-encoded.
+
+    This is the wire form that survives a reverse proxy which merges the ``//``
+    the old leading-``%2F`` marker decoded to (the Databricks Apps front door
+    does exactly that). The path arrives here with literal slashes and no
+    leading marker; ``base=host`` is what restores its absoluteness, so a
+    directory above the workspace lists instead of showing an empty tree.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/Users/me/reports?limit=1000&order=asc&base=host",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    # The runner receives an absolute path: the leading slash re-added and
+    # sent as %2F, interior slashes literal.
+    assert "/filesystem/%2FUsers/me/reports?" in forwarded_url
+
+
+@pytest.mark.asyncio
+async def test_filesystem_bare_path_without_base_is_workspace_relative(
+    client: httpx.AsyncClient,
+) -> None:
+    """Without ``base=host`` a bare ``{path}`` stays workspace-relative.
+
+    This is the exact shape a slash-merging proxy produced from the old
+    absolute wire form — the regression. Pinned as the contrast that documents
+    why ``base=host`` is load-bearing: the runner must NOT receive a ``%2F``
+    absolute path here.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/Users/me/reports?limit=1000&order=asc",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    assert "/filesystem/Users/me/reports?" in forwarded_url
+    assert "%2F" not in forwarded_url
+
+
+@pytest.mark.asyncio
+async def test_filesystem_root_base_host_forwards_filesystem_root(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?base=host`` on the no-path route browses the filesystem root, not the
+    workspace root: navigating up to ``/`` must not silently show the workspace.
+    """
+    fake_runner = _FakeRunnerClient(payload=_fs_list_payload())
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem?limit=1000&order=asc&base=host",
+    )
+
+    assert resp.status_code == 200
+    forwarded_url = fake_runner.calls[0][1]
+    # Root reconstructs to "/" -> %2F with an empty remainder.
+    assert "/filesystem/%2F?" in forwarded_url
+
+
+@pytest.mark.asyncio
 async def test_filesystem_read_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
@@ -2667,6 +3749,312 @@ async def test_filesystem_read_proxies_to_runner(
     assert resp.json()["content"] == "hello world"
 
 
+@contextlib.asynccontextmanager
+async def _runner_app_client(runner: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """Route session resources to a stub runner app over a real httpx client.
+
+    The download proxy streams through ``build_request``/``send`` rather
+    than the canned ``get`` the fake client answers, so it needs a client
+    with real transport semantics.
+
+    :param runner: Stub runner app serving the filesystem route.
+    :returns: The client bound to the stub, installed as the runner router.
+    """
+    transport = httpx.ASGITransport(app=runner)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner_http:
+        set_runner_router(_FakeRunnerRouter(runner_http))  # type: ignore[arg-type]
+        yield runner_http
+
+
+_FS_ROUTE = (
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}"
+    "/filesystem/{relative_path:path}"
+)
+_DOWNLOAD_URL = (
+    "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+    "/filesystem/data/big.bin?download=true"
+)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_streams_runner_attachment(
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    """``?download=true`` forwards the runner's attachment and headers verbatim.
+
+    The download URL is assembled separately from the listing/read URL, so
+    this also pins that the owner's workspace-relative download carries the
+    ``scope=reach`` mark the runner needs to follow an outward symlink.
+    """
+    payload = bytes(range(256)) * 64
+    (tmp_path / "big.bin").write_bytes(payload)
+    runner = FastAPI()
+    seen: list[tuple[str, bool, str | None]] = []
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        download: bool = False,
+        scope: str | None = None,
+    ) -> FileResponse:
+        del session_id, environment_id
+        seen.append((relative_path, download, scope))
+        return FileResponse(
+            tmp_path / "big.bin",
+            filename="big.bin",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 200
+    assert resp.content == payload
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+    assert resp.headers["cache-control"] == "no-store"
+    assert seen == [("data/big.bin", True, "reach")]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_rejects_runner_without_download_support(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner that ignores ``download`` answers the capped JSON envelope.
+
+    Serving that would truncate silently, so the proxy fails loudly instead.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            {
+                "object": "session.environment.filesystem.file_content",
+                "content": "partial",
+                "truncated": True,
+            }
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == "runner_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("runner_status", "code"),
+    [(404, "path_not_found"), (400, "invalid_path"), (403, "path_unreachable")],
+)
+async def test_filesystem_download_forwards_runner_errors(
+    client: httpx.AsyncClient,
+    runner_status: int,
+    code: str,
+) -> None:
+    """A missing, directory, or out-of-grant path keeps the runner's status and code."""
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=runner_status,
+            content={"error": {"code": code, "message": "nope"}},
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == runner_status
+    assert resp.json()["error"] == {"code": code, "message": "nope"}
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` on download is typed and sanitized.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition. The download proxy re-derives the typed 410 with the fixed
+    client-safe message instead of forwarding the runner's raw resolver
+    text (which names the resolver and the raw agent id) verbatim.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": {
+                    "code": "session_agent_missing",
+                    "message": (
+                        "session spec resolver: agent 'ag_gone' for "
+                        "session 'conv_test' was not found"
+                    ),
+                }
+            },
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer exists" in message
+
+
+@pytest.mark.asyncio
+async def test_filesystem_write_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` on a mutation is typed and sanitized.
+
+    Same lifecycle condition as the read/download paths: the mutation proxy
+    re-derives the typed 410 with the fixed client-safe message instead of
+    forwarding the runner's raw resolver text verbatim.
+    """
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/new.txt"
+    )
+    fake_runner = _FakeRunnerClient(
+        responses={
+            path: (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.put(path, json={"content": "hello", "encoding": "utf-8"})
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer exists" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "download", "write"])
+async def test_filesystem_forwards_a_literal_percent_still_encoded(
+    client: httpx.AsyncClient,
+    operation: str,
+) -> None:
+    """A name the server decoded to a literal ``%2F`` reaches the runner as that name.
+
+    Forwarded verbatim it would decode once more into an absolute path,
+    past the owner-only gate the server applied at workspace level.
+    """
+    runner = FastAPI()
+    seen: list[str] = []
+
+    @runner.get(_FS_ROUTE)
+    @runner.put(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id
+        seen.append(relative_path)
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "path_not_found", "message": "nope"}},
+        )
+
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/%252Fetc/passwd"
+    )
+    async with _runner_app_client(runner):
+        if operation == "write":
+            await client.put(url, json={"content": "x", "encoding": "utf-8"})
+        else:
+            await client.get(url, params={"download": "true"} if operation == "download" else None)
+
+    assert seen == ["%2Fetc/passwd"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "environments/default/filesystem",
+        "environments/default/diff",
+        "github/diff",
+        "environments/default/search",
+    ],
+)
+@pytest.mark.parametrize("name", ["docs/release #1?.md", "notes/%2Fdata.txt"])
+async def test_resource_reads_preserve_literal_paths(
+    client: httpx.AsyncClient, resource: str, name: str
+) -> None:
+    runner = FastAPI()
+    seen: list[tuple[str, str]] = []
+
+    @runner.get(f"/v1/sessions/{{session_id}}/resources/{resource}/{{relative_path:path}}")
+    async def serve(request: Request, session_id: str, relative_path: str) -> JSONResponse:
+        del session_id
+        seen.append((relative_path, request.query_params.get("q", "")))
+        return JSONResponse({"path": relative_path})
+
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+    async with _runner_app_client(runner):
+        response = await client.get(f"{base}/{resource}/{quote(name)}", params={"q": "notes"})
+    assert response.status_code == 200, response.text
+    assert seen == [(name, "notes" if resource.endswith("search") else "")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,resource",
+    [
+        ("GET", "environments/default/filesystem"),
+        ("PUT", "environments/default/filesystem"),
+        ("PATCH", "environments/default/filesystem"),
+        ("DELETE", "environments/default/filesystem"),
+        ("GET", "environments/default/diff"),
+        ("GET", "github/diff"),
+        ("GET", "environments/default/search"),
+    ],
+)
+async def test_resource_paths_reject_parent_segments_before_forwarding(
+    client: httpx.AsyncClient, method: str, resource: str
+) -> None:
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+    response = await client.request(
+        method,
+        f"{base}/{resource}/folder/%2E%2E/notes.txt",
+        params={"q": "notes"},
+        json={"content": "notes", "encoding": "utf-8", "old_text": "old", "new_text": "new"},
+    )
+    assert response.status_code == 400, response.text
+    assert runner.calls == []
+
+
 @pytest.mark.asyncio
 async def test_filesystem_write_proxies_to_runner(
     client: httpx.AsyncClient,
@@ -2687,6 +4075,111 @@ async def test_filesystem_write_proxies_to_runner(
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
         ),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_wake", [False, True])
+async def test_filesystem_save_reconnects_runner_on_live_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_first_wake: bool,
+) -> None:
+    """Save (or Retry after a failed wake) reconnects before forwarding the edit."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    store = app.state.test_conversation_store
+    conv = store._conversations[session_id]
+    conv.host_id = "host_save"
+    conv.runner_id = "runner_old"
+    conv.workspace = "/workspace"
+    registry = app.state.test_host_registry
+    app.state.host_registry = registry
+    registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="save-host"),
+        owner=None,
+    )
+    fake_runner = _FakeRunnerClient(payload=_fs_write_payload())
+    connected = False
+
+    class _SleepingRouter(_FakeRunnerRouter):
+        def client_for_session_resources(
+            self, session_id: str, *, conversation: Conversation | None = None
+        ) -> _RoutedRunner:
+            if not connected:
+                raise OmnigentError("runner disconnected", code=ErrorCode.RUNNER_UNAVAILABLE)
+            assert conversation is not None and conversation.runner_id == "runner_new"
+            return super().client_for_session_resources(session_id, conversation=conversation)
+
+    router = _SleepingRouter(fake_runner)
+    set_runner_router(router)  # type: ignore[arg-type]
+    attempts = 0
+
+    async def _launch(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal connected, attempts
+        attempts += 1
+        assert fake_runner.calls == []
+        if fail_first_wake and attempts == 1:
+            raise OmnigentError("wake timed out", code=ErrorCode.RUNNER_UNAVAILABLE)
+        # Recovery replaces the row: forwarding with the old binding would fail.
+        store._conversations[session_id] = replace(conv, runner_id="runner_new")
+        connected = True
+        return SimpleNamespace(runner_id="runner_new", error_code=None, error=None)
+
+    async def _wait(*_args: Any, **kwargs: Any) -> Any:
+        assert kwargs["runner_id"] == "runner_new"
+        assert connected
+        return fake_runner
+
+    async def _no_managed_wake(**_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0)
+    monkeypatch.setattr(
+        orchestration, "_maybe_wake_stale_resumable_managed_sandbox", _no_managed_wake
+    )
+    monkeypatch.setattr(orchestration, "_launch_runner_on_host", _launch)
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _wait)
+    url = f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt"
+    body = {"content": "edited without a chat message", "encoding": "utf-8"}
+
+    if fail_first_wake:
+        failed = await client.put(url, json=body)
+        assert failed.status_code == 503
+        assert fake_runner.calls == []
+
+    response = await client.put(url, json=body)
+    assert response.status_code == 200
+    assert fake_runner.calls == [("PUT", url)]
+    assert attempts == (2 if fail_first_wake else 1)
+    assert store.appended_items == []
+
+
+@pytest.mark.asyncio
+async def test_filesystem_save_authorizes_before_reconnecting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid session must not trigger runner recovery."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    wake = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    response = await client.put(
+        "/v1/sessions/missing/resources/environments/default/filesystem/new.txt",
+        json={"content": "hello", "encoding": "utf-8"},
+    )
+    assert response.status_code == 404
+    wake.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2907,6 +4400,9 @@ class _FakeStreamCtx:
         """Exit the context without suppressing exceptions."""
         return False
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield each configured SSE frame string in order."""
         for frame in self._frames:
@@ -2968,6 +4464,9 @@ class _ScriptedStreamCtx:
     async def __aexit__(self, *exc: object) -> bool:
         """Exit the context without suppressing exceptions."""
         return False
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield frame steps in order, running callable steps in between."""
@@ -3042,6 +4541,36 @@ async def test_relay_persists_terminal_resource_created_from_runner() -> None:
     assert events[0].data.resource["id"] == "terminal_zsh_s1"
     # Resource events thread on the session id (matches the REST path).
     assert events[0].response_id == "79b22ebd2309e48fdeb450c65611d51b"
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_persist_transient_terminal_resource_created() -> None:
+    """Retry recovery publishes terminal readiness without changing history."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "session.resource.created",
+                    "persist_resource_event": False,
+                    "resource": {
+                        "id": "terminal_claude_main",
+                        "type": "terminal",
+                        "name": "claude:main",
+                        "metadata": {"terminal_name": "claude", "session_key": "main"},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream("79b22ebd2309e48fdeb450c65611d51b", client, store)  # type: ignore[arg-type]
+
+    events = [item for item in store.appended_items if item.type == "resource_event"]
+    assert events == []
 
 
 @pytest.mark.asyncio
@@ -3499,7 +5028,30 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error() -> None:
+@pytest.mark.parametrize(
+    "failure_context",
+    [
+        pytest.param(None, id="legacy"),
+        pytest.param("malformed", id="malformed-context"),
+        pytest.param(
+            {
+                "failure_id": "err_synthetic_startup",
+                "failure_source": "native_terminal_start",
+                "exception_type": "RuntimeError",
+                "exception_cause_type": "FileNotFoundError",
+                "native_launch_os_errno": 2,
+                "native_launch_os_errno_name": "ENOENT",
+                "origin": "forged",
+                "exception_message": "private launch path",
+            },
+            id="structured-context",
+        ),
+    ],
+)
+async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error(
+    caplog: pytest.LogCaptureFixture,
+    failure_context: object,
+) -> None:
     """Definitive native terminal failure consumes the user message quickly.
 
     The Omnigent server first asks the runner to ensure the native terminal.
@@ -3520,7 +5072,10 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
                     "error": {
                         "code": "native_terminal_start_failed",
                         "message": "Native Claude requires the 'claude' CLI on PATH.",
-                    }
+                    },
+                    **(
+                        {"failure_context": failure_context} if failure_context is not None else {}
+                    ),
                 },
             )
         }
@@ -3562,10 +5117,26 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     assert len(errors) == 1
     assert errors[0].data.code == "native_terminal_start_failed"
     assert errors[0].data.message == "Native Claude requires the 'claude' CLI on PATH."
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["origin"] == "native_terminal_boot_failed"
+    if isinstance(failure_context, dict):
+        assert record.attributes["failure_id"] == failure_context["failure_id"]
+        assert record.attributes["exception_cause_type"] == "FileNotFoundError"
+        assert record.attributes["native_launch_os_errno"] == "2"
+        assert record.attributes["native_launch_os_errno_name"] == "ENOENT"
+        assert "private launch path" not in str(record.attributes)
+    else:
+        assert "failure_id" not in record.attributes
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
+@pytest.mark.parametrize("agent_revision", [None, "bundle.zip:mcp:selection-v2"])
+async def test_kiro_native_dispatch_forwards_without_persisting(
+    caplog: pytest.LogCaptureFixture,
+    agent_revision: str | None,
+) -> None:
     """Kiro web-chat input is mirrored by Kiro's session forwarder."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
@@ -3577,8 +5148,13 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
     client = _FakeRunnerClient()
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "stable_id": "a" * 32,
+        },
     )
+    caplog.set_level("INFO")
 
     try:
         result = await _dispatch_session_event_to_runner(
@@ -3588,6 +5164,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
             store,  # type: ignore[arg-type]
             client,  # type: ignore[arg-type]
             agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
             file_store=None,
             artifact_store=None,
             created_by="alice@example.com",
@@ -3606,13 +5183,104 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
         assert store.appended_items == []
         forwarded = client.post_json_calls[1][1]
         assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
+        if agent_revision is None:
+            assert "agent_revision" not in forwarded
+        else:
+            assert forwarded["agent_revision"] == agent_revision
         assert forwarded["model"] == "kiro-native-ui"
+        assert forwarded["input_stable_id"] == "a" * 32
+        assert forwarded["pending_id"] == result.pending_id
+        assert len(forwarded["delivery_attempt_id"]) == 32
+        assert forwarded["input_enqueued_at_ms"] > 0
+        repeated = await _dispatch_session_event_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            client,  # type: ignore[arg-type]
+            agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+        assert repeated.pending_id == result.pending_id
+        assert len([call for call in client.post_json_calls if call[0].endswith("/events")]) == 1
+        events = {getattr(r, "event_name", None): r for r in caplog.records}
+        for event_name in (
+            "native_input_enqueued",
+            "turn_dispatched",
+            "native_input_retry_deduplicated",
+        ):
+            attrs = events[event_name].attributes
+            assert attrs["input_stable_id"] == "a" * 32
+            assert attrs["pending_id"] == result.pending_id
+            assert attrs["delivery_attempt_id"] == forwarded["delivery_attempt_id"]
+            assert "hello" not in repr(attrs)
     finally:
         pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> None:
+async def test_codex_side_dispatch_forwards_without_pending_input_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A side-chat command bypasses the parent's pending-input queue."""
+    from omnigent.native.input_diagnostics import INPUT_FIELDS, input_delivery_scope
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    client = _FakeRunnerClient()
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "/side explain this function"}],
+            "stable_id": "a" * 32,
+        },
+    )
+    caplog.set_level("INFO")
+
+    try:
+        with input_delivery_scope({"input_stable_id": "b" * 32}):
+            result = await _dispatch_session_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                store,
+                client,  # type: ignore[arg-type]
+                agent_name="codex-native-ui",
+                file_store=None,
+                artifact_store=None,
+            )
+
+        assert result.item_id is None
+        assert result.pending_id is None
+        assert pending_inputs.snapshot_for(conv.id) == []
+        assert store.appended_items == []
+        [forwarded] = [
+            payload for path, payload in client.post_json_calls if path.endswith("/events")
+        ]
+        assert forwarded["content"] == body.data["content"]
+        assert not INPUT_FIELDS.intersection(forwarded)
+        assert not any(
+            str(getattr(record, "event_name", "")).startswith("native_input_")
+            for record in caplog.records
+        )
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
+    cancelled: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     """A failed Kiro tmux injection must not leave a ghost pending input."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
@@ -3621,18 +5289,30 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
     store = _ConversationStore()
     conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
-    client = _FakeRunnerClient(
+
+    class _FailingForwardClient(_FakeRunnerClient):
+        def _make_response(self, method: str, url: str) -> httpx.Response:
+            if cancelled and url.endswith("/events"):
+                raise asyncio.CancelledError()
+            return super()._make_response(method, url)
+
+    client = _FailingForwardClient(
         responses={
             "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events": (500, {"error": "tmux failed"})
         }
     )
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "private prompt"}],
+            "stable_id": "a" * 32,
+        },
     )
+    caplog.set_level("INFO")
 
     try:
-        with pytest.raises(HTTPException):
+        with pytest.raises(asyncio.CancelledError if cancelled else HTTPException):
             await _dispatch_session_event_to_runner(
                 "823dbd1aab969b5a813fac59bb977a77",
                 conv,
@@ -3651,6 +5331,18 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
         ]
         assert store.appended_items == []
         assert pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77") == []
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_forward_finished"
+        ]
+        forwarded = client.post_json_calls[1][1]
+        attrs = record.attributes
+        assert attrs["outcome"] == ("cancelled" if cancelled else "error")
+        assert attrs["input_stable_id"] == "a" * 32
+        for key in ("pending_id", "delivery_attempt_id", "input_enqueued_at_ms"):
+            assert attrs[key] == forwarded[key]
+        assert "private prompt" not in repr(attrs)
     finally:
         pending_inputs.reset_for_tests()
 
@@ -3707,6 +5399,1181 @@ async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() 
         assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
         assert matched_user.created_by == "alice@example.com"
         assert first != second
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_skipped_entries_persist_before_the_matched_item() -> None:
+    """Failed Kiro prompts must precede the accepted prompt in stored order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    for text in ("first failed", "second failed", "tell me a joke"):
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # Stored order mirrors the live broadcast: both skipped web inputs
+        # (each a user message + error pair) precede the accepted prompt.
+        assert [i.type for i in store.appended_items] == [
+            "message",
+            "error",
+            "message",
+            "error",
+            "message",
+        ]
+        first_user, _err1, second_user, _err2, matched_user = store.appended_items
+        assert first_user.data.content == [{"type": "input_text", "text": "first failed"}]
+        assert second_user.data.content == [{"type": "input_text", "text": "second failed"}]
+        assert matched_user.data.content == [{"type": "input_text", "text": "tell me a joke"}]
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> None:
+    """A duplicate re-post restores skipped drains instead of persisting them."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    class _DedupingStore(_ConversationStore):
+        """Store whose matched item is already persisted: every append dedupes."""
+
+        def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+            result = [
+                ConversationItem(
+                    id=item.stable_id or f"item_{i}",
+                    type=item.type,
+                    status="completed",
+                    response_id=item.response_id,
+                    created_at=1,
+                    data=item.data,
+                    deduplicated=True,
+                )
+                for i, item in enumerate(items)
+            ]
+            self.appended_items.extend(result)
+            return result
+
+    pending_inputs.reset_for_tests()
+    store = _DedupingStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    recorded = [
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": text}], created_by="alice@example.com"
+        )
+        for text in ("first failed", "second failed", "tell me a joke")
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "tell me a joke"}],
+            },
+            "response_id": "kiro:prompt-joke",
+            "source_id": "kiro:prompt-joke:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        # The batch was submitted but all items came back deduplicated (retry
+        # of an already-committed message); skipped drains are restored.
+        assert all(item.deduplicated for item in store.appended_items)
+        snapshot = pending_inputs.snapshot_for(sid)
+        assert [entry["pending_id"] for entry in snapshot] == recorded
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_matches_pending_text_and_reports_lost_input() -> None:
+    """A web message Claude never recorded must not take the next message's drain.
+
+    A pasted message the TUI never recorded (a dying host, a hook that failed
+    closed) leaves its entry at the head of the queue. Draining by position
+    would hand that entry to the NEXT mirrored message and name it in
+    ``session.input.consumed``, so every client settles the wrong bubble and the
+    new message renders twice. The mirror's text selects its own entry; the
+    skipped one is persisted as an undelivered message with an error.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "lost in the reconnect"}], created_by="a@example.com"
+    )
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "still here?"}], created_by="a@example.com"
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_user, lost_error, matched_user = store.appended_items
+        assert lost_user.data.content == [{"type": "input_text", "text": "lost in the reconnect"}]
+        assert lost_user.created_by == "a@example.com"
+        assert lost_error.data.code == "native_prompt_not_recorded"
+        assert lost_error.data.message.startswith("Claude never recorded this message")
+        assert matched_user.data.content == [{"type": "input_text", "text": "still here?"}]
+        assert matched_user.created_by == "a@example.com"
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry() -> None:
+    """A mirror whose text the transcript reformatted still drains by position.
+
+    Nothing is skipped and no undelivered pair is written: the oldest entry is
+    the message, exactly as before text matching existed.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "> quoted line\n\nwhat about this?"}],
+        created_by="a@example.com",
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "quoted line -- what about this?"}],
+            },
+            "response_id": "resp_reformatted",
+            "source_id": "claude:reformatted:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert store.appended_items[0].created_by is None
+        assert pending_inputs.snapshot_for(sid) == []
+        assert pending_id  # the drained entry was the reformatted message itself
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_never_takes_an_interrupted_entry() -> None:
+    """A message typed in the TUI after a cancelled web message is not the cancelled one.
+
+    With no text match the mirror falls back to the oldest entry. A cancelled
+    entry is never that guess: the TUI message would inherit its attachment,
+    author and client id, and the entry would be reported as settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cancelled = pending_inputs.record(
+        sid,
+        [
+            {"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"},
+            {"type": "input_text", "text": "the cancelled web message"},
+        ],
+        created_by="alice@example.com",
+        stable_id="ab" * 16,
+    )
+    pending_inputs.mark_interrupted(sid, [cancelled])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_typed",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        typed = store.appended_items[0]
+        assert typed.data.content == [{"type": "input_text", "text": "typed in the terminal"}]
+        assert typed.created_by == "bob@example.com"
+        assert store.persisted_by_stable_id == {}
+        # The cancelled entry is untouched: hidden, and left to a later match or the TTL.
+        assert pending_inputs.pending_ids(sid) == [cancelled]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> None:
+    """Attachment marker lines the executor prepends don't defeat the text match."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "lost"}], created_by="a@example.com"
+    )
+    image = {"type": "input_image", "file_id": "file_x", "filename": "shot.png"}
+    pending_inputs.record(
+        sid, [image, {"type": "input_text", "text": "look at this"}], created_by="a@example.com"
+    )
+    mirrored_text = "[Attached: /tmp/omnigent/shot.png]\n\nlook at this"
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": mirrored_text}],
+            },
+            "response_id": "resp_attached",
+            "source_id": "claude:attached:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_user, _lost_error, matched_user = store.appended_items
+        assert lost_user.data.content == [{"type": "input_text", "text": "lost"}]
+        assert lost_user.data.user_authored is True
+        assert image in matched_user.data.content
+        assert {"type": "input_text", "text": mirrored_text} in matched_user.data.content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_retried_mirror_leaves_the_queue_alone() -> None:
+    """A forwarder retry of an already-persisted mirror must not drain anything.
+
+    The retried text can match a NEWER identical queued message; draining that
+    would skip everything queued in between and mark it undelivered although
+    it may still be on its way. The store already holds the item under its
+    source-derived id, so the retry returns that id and changes nothing.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "yes"}]},
+            "response_id": "resp_yes",
+            "source_id": "claude:yes:0",
+        },
+    )
+
+    try:
+        first_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message"]
+        # Meanwhile the person queues a message still on its way, then "yes" again.
+        in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+
+        retried_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert retried_id == first_id
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            in_flight,
+            again,
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+async def test_claude_native_mirrored_slash_command_drains_its_queued_entry(
+    prior_state: str,
+) -> None:
+    """A web-typed command mirrored as a slash_command clears its own queued entry.
+
+    Without this the entry outlives the executed command and the next ordinary
+    message would skip it, persisting a false "not delivered" error for a
+    command Claude ran. Older entries are left in place.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(sid)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(sid, [older])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "command",
+                "name": "model",
+                "arguments": "sonnet",
+            },
+            "response_id": "resp_model",
+            "source_id": "claude:model:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert pending_inputs.pending_ids(sid) == [older]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [] if prior_state == "interrupted" else [older]
+        )
+        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
+        assert delayed.matched is not None and delayed.matched.pending_id == older
+        assert delayed.matched.interrupted == (prior_state == "interrupted")
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_overlapping_retries_persist_nothing_extra() -> None:
+    """Two overlapping posts of one mirror persist it once and skip nothing.
+
+    The store probe alone cannot catch a retry that arrives while the first
+    append is still in flight. The per-conversation lock makes probe, drain and
+    append one critical section, so the retry observes the first commit and
+    returns its id even though messages were queued in between — none of which
+    may be marked undelivered.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "yes"}]},
+            "response_id": "resp_yes",
+            "source_id": "claude:yes:0",
+        },
+    )
+
+    async def persist() -> str:
+        return await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+    try:
+        first = asyncio.create_task(persist())
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        # While the first append is in flight the person queues a message that
+        # is still on its way, then "yes" again — and the forwarder retries.
+        in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+        second = asyncio.create_task(persist())
+        await asyncio.sleep(0.05)
+        assert not second.done(), "the retry must wait for the first attempt"
+        store.release_first_append.set()
+
+        first_id = await first
+        second_id = await second
+
+        assert second_id == first_id
+        assert store.append_count == 1
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            in_flight,
+            again,
+        ]
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+class _BlockingStore(_ConversationStore):
+    """Store whose first append parks until the test releases it, then optionally raises."""
+
+    def __init__(self, *, fail_first_append: bool = False) -> None:
+        super().__init__()
+        self.fail_first_append = fail_first_append
+        self.first_append_started = threading.Event()
+        self.release_first_append = threading.Event()
+        self.append_count = 0
+
+    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+        self.append_count += 1
+        if self.append_count == 1:
+            self.first_append_started.set()
+            assert self.release_first_append.wait(timeout=5)
+            if self.fail_first_append:
+                raise RuntimeError("database unavailable")
+        return super().append(conversation_id, items)
+
+
+class _FailOnceStore(_ConversationStore):
+    """Store whose first append raises; later appends behave normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_left = 1
+
+    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+        if self.failures_left:
+            self.failures_left -= 1
+            raise RuntimeError("database unavailable")
+        return super().append(conversation_id, items)
+
+
+@pytest.mark.asyncio
+async def test_claude_native_failed_append_restores_the_queue_for_the_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror whose append fails leaves the queue as it was, so the retry lands right.
+
+    Text matching removes the matched entry and the skipped older ones before
+    the append. If the append raises, they must go back in their original
+    order; otherwise the retry matches nothing, drains whatever is oldest, and
+    the lost message's undelivered pair is never written.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "lost in the reconnect"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+            )
+        assert store.appended_items == []
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            lost,
+            matched,
+        ]
+
+        # The forwarder retries the same mirror once the store is back.
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert item_id == store.appended_items[-1].id
+        assert pending_inputs.snapshot_for(sid) == []
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, matched]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_prompt_with_literal_attachment_text_matches_its_entry() -> None:
+    """A marker-like phrase the person typed is not stripped, so Kiro's exact match holds."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    text = "explain [Attached: example]"
+    pending_inputs.record(sid, [{"type": "input_text", "text": text}], created_by="a@example.com")
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            "response_id": "kiro:prompt-literal",
+            "source_id": "kiro:prompt-literal:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert store.appended_items[0].created_by == "a@example.com"
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+async def test_claude_native_failed_slash_command_append_restores_its_entry(
+    prior_state: str,
+) -> None:
+    """A slash-command mirror whose append fails puts its queued entry back, in order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(sid)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(sid, [older])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "command",
+                "name": "model",
+                "arguments": "sonnet",
+            },
+            "response_id": "resp_model",
+            "source_id": "claude:model:0",
+        },
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+            )
+        assert store.appended_items == []
+        assert pending_inputs.pending_ids(sid) == [older, command]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [command] if prior_state == "interrupted" else [older, command]
+        )
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert pending_inputs.pending_ids(sid) == [older]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [] if prior_state == "interrupted" else [older]
+        )
+        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
+        assert delayed.matched is not None and delayed.matched.pending_id == older
+        assert delayed.matched.interrupted == (prior_state == "interrupted")
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_failed_append_keeps_held_entries_when_the_queue_refills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entries a persist has drained survive a refill of the queue during a failed append.
+
+    Full queue: a lost message A at the head, B behind it, then filler. Mirror B
+    (A skipped, B matched). While the append is in flight three new messages
+    arrive, then the append fails. Only unheld entries count against the cap,
+    so the refill evicts the oldest filler once it overflows, never A or B; the
+    retry then persists A as undelivered, matches B, and the receipts name A
+    then B.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore(fail_first_append=True)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "lost in the reconnect"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+    filler = [
+        pending_inputs.record(sid, [{"type": "input_text", "text": f"filler {i}"}])
+        for i in range(cap - 2)
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    async def persist() -> str:
+        return await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+    try:
+        first = asyncio.create_task(persist())
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        newer = [
+            pending_inputs.record(sid, [{"type": "input_text", "text": f"new {i}"}])
+            for i in range(3)
+        ]
+        store.release_first_append.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await first
+
+        # The refill evicted the oldest filler entry, not the held ones.
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            lost,
+            matched,
+            *filler[1:],
+            *newer,
+        ]
+        assert store.appended_items == []
+
+        item_id = await persist()
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert item_id == store.appended_items[-1].id
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            *filler[1:],
+            *newer,
+        ]
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, matched]
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request cancelled mid-append still releases its held entries and publishes.
+
+    The persist is shielded from the caller's cancellation: the append thread
+    runs to completion, the held entries are released (or unheld on failure),
+    and the receipts go out. Without that they would stay held until the TTL
+    and a retry, finding the item persisted, would return without ever
+    acknowledging them.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "lost in the reconnect"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    async def persist() -> str:
+        return await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+    try:
+        request = asyncio.create_task(persist())
+        assert await asyncio.to_thread(store.first_append_started.wait, budget(5))
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        # Still in flight: the entries stay held, so nothing else can drain them.
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            lost,
+            matched,
+        ]
+        assert pending_inputs.resolve_matching_text(sid, "still here?").matched is None
+
+        store.release_first_append.set()
+        # Settlement precedes title seeding and publication of the final receipt.
+        await poll_until_async(
+            lambda: any(
+                event.get("type") == "session.input.consumed"
+                and event["data"]["cleared_pending_id"] == matched
+                for _conversation_id, event in published
+            ),
+            timeout_s=budget(5),
+        )
+
+        assert pending_inputs.snapshot_for(sid) == []
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, matched]
+        # The forwarder's retry is a no-op.
+        assert await persist() == store.appended_items[-1].id
+        assert len(store.appended_items) == 3
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_attachment_message_is_not_confused_with_a_typed_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image message's mirror settles its own entry, not an older typed look-alike.
+
+    Queue a lost plain message ``[Attached: literal] same`` and then an image
+    with the text ``same``. The executor pastes the image behind a generated
+    marker line, so the mirror reads ``[Attached: <path>]\\n\\nsame``: it must
+    match the image message (persisting its image block and naming its entry
+    in the receipt) and surface the older lost message as undelivered.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    typed = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "[Attached: literal] same"}]
+    )
+    image = {"type": "input_image", "file_id": "file_x", "filename": "shot.png"}
+    with_image = pending_inputs.record(sid, [image, {"type": "input_text", "text": "same"}])
+    mirrored_text = "[Attached: /tmp/omnigent/shot.png]\n\nsame"
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": mirrored_text}],
+            },
+            "response_id": "resp_same",
+            "source_id": "claude:same:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_user, _lost_error, matched_user = store.appended_items
+        assert lost_user.data.content == [
+            {"type": "input_text", "text": "[Attached: literal] same"}
+        ]
+        assert image in matched_user.data.content
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [typed, with_image]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_source_less_mirror_never_marks_older_entries_undelivered() -> None:
+    """A mirror with no source id cannot be told from a retry, so it surfaces nothing.
+
+    Forwarders that omit ``source_id`` retry a POST whose response was lost.
+    Such a retry may text-match a newer identical queued message; branding the
+    entries in between undelivered would be a false failure. Without a
+    retry-safe identity the older entries stay queued for their own mirrors.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+
+    def mirror(text: str, response_id: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": response_id,
+            },
+        )
+
+    try:
+        # A's mirror lands, but its response is lost on the way back.
+        pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+        await _persist_external_conversation_item(sid, conv, mirror("yes", "resp_a"), store)  # type: ignore[arg-type]
+        in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+
+        # The forwarder retries A; the text matches the newer "yes".
+        await _persist_external_conversation_item(sid, conv, mirror("yes", "resp_a"), store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [in_flight]
+        assert again not in [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)]
+
+        # B's own mirror still finds its entry.
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            mirror("continue", "resp_b"),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message", "message", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_append_stays_bounded_after_a_rolled_back_overflow() -> None:
+    """A hold, refill, fail cycle cannot make the next append exceed its row bound.
+
+    Hold the whole cap for an append, record another cap's worth while it is
+    parked, fail the append (everything unheld: twice the cap queued), then
+    mirror the newest message. The drain surfaces at most a cap of skipped
+    entries, so the append writes at most ``2 * cap + 1`` rows and the rest
+    stays queued for later drains.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore(fail_first_append=True)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    first_wave = [
+        pending_inputs.record(sid, [{"type": "input_text", "text": f"a{i}"}]) for i in range(cap)
+    ]
+
+    def mirror(text: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"resp_{text}",
+                "source_id": f"claude:{text}:0",
+            },
+        )
+
+    try:
+        first = asyncio.create_task(
+            _persist_external_conversation_item(sid, conv, mirror(f"a{cap - 1}"), store)  # type: ignore[arg-type]
+        )
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        second_wave = [
+            pending_inputs.record(sid, [{"type": "input_text", "text": f"b{i}"}])
+            for i in range(cap)
+        ]
+        store.release_first_append.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await first
+        assert len(pending_inputs.snapshot_for(sid)) == 2 * cap
+
+        await _persist_external_conversation_item(sid, conv, mirror(f"b{cap - 1}"), store)  # type: ignore[arg-type]
+
+        assert len(store.appended_items) == 2 * cap + 1
+        assert [item.type for item in store.appended_items[-3:]] == ["message", "error", "message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == second_wave[
+            :-1
+        ]
+        assert first_wave[0] not in [
+            entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)
+        ]
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_reformatted_mirror_never_brands_later_messages_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A positional drain leaves no entry that a later match could call undelivered.
+
+    Lost A sits ahead of B. B's mirror comes back reformatted beyond what
+    matching normalizes, so it drains A by position and B's own entry stays
+    queued although B was delivered. When C's exact mirror jumps over B, B
+    must not be persisted a second time as undelivered; it is drained quietly.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+
+    def mirror(text: str, key: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"resp_{key}",
+                "source_id": f"claude:{key}:0",
+            },
+        )
+
+    try:
+        lost = pending_inputs.record(
+            sid, [{"type": "input_text", "text": "lost in the reconnect"}]
+        )
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": "> quoted\n\nwhat about this?"}]
+        )
+        # B is delivered, but its mirror is reformatted: no match, so A drains by position.
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            mirror("quoted -- what about this?", "b"),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert len(pending_inputs.snapshot_for(sid)) == 1
+
+        third = pending_inputs.record(sid, [{"type": "input_text", "text": "and now?"}])
+        await _persist_external_conversation_item(sid, conv, mirror("and now?", "c"), store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, third]
     finally:
         pending_inputs.reset_for_tests()
 
@@ -3870,6 +6737,569 @@ async def test_native_dispatch_tunnel_close_is_definitive_ensure_error() -> None
         errors[0].data.message
         == "Native Claude terminal ensure request failed. tunnel closed before request completed"
     )
+
+
+class _FailingEnsureRunnerClient(_FakeRunnerClient):
+    """Fake runner whose terminal-ensure POSTs fail with a scripted sequence, then succeed."""
+
+    def __init__(self, ensure_path: str, failures: list[Exception]) -> None:
+        super().__init__()
+        self._ensure_path = ensure_path
+        self._failures = list(failures)
+        self.drops = 0
+
+    def _make_response(self, method: str, url: str) -> httpx.Response:
+        if url == self._ensure_path and self._failures:
+            self.drops += 1
+            self.calls.append((method, url))
+            raise self._failures.pop(0)
+        return super()._make_response(method, url)
+
+
+def _ensure_request(path: str) -> httpx.Request:
+    return httpx.Request("POST", f"http://runner{path}")
+
+
+_TUNNEL_CLOSED = "tunnel closed before request completed"
+
+
+class _ReconnectWaitRouter:
+    """Fake router recording reconnect waits and answering them canned."""
+
+    def __init__(self, *, reconnects: bool) -> None:
+        self._reconnects = reconnects
+        self.waits: list[tuple[str, float]] = []
+
+    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+        """These reconnect fixtures have no registry MCPs."""
+
+    async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
+        self.waits.append((runner_id, timeout_s))
+        return self._reconnects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnects(
+    drop_kind: str,
+) -> None:
+    """A tunnel drop mid-ensure waits for the runner and asks again.
+
+    The runner behind a dropped tunnel is usually alive but stalled; it
+    re-registers and the terminal it was creating is still there. Failing
+    the message on the drop threw the user's input away while the server
+    itself re-ran the ensure on reconnect moments later. Both shapes the
+    tunnel transport raises qualify: the bare ``ConnectionError`` of a drop
+    under an in-flight request and the ``httpx.ConnectError`` of a runner
+    already offline when the request is sent.
+    """
+    import dataclasses
+
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    drop: Exception = (
+        ConnectionError(_TUNNEL_CLOSED)
+        if drop_kind == "tunnel_closed"
+        else httpx.ConnectError(
+            "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+        )
+    )
+    client = _FailingEnsureRunnerClient(terminals_path, [drop])
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            "64a784c3aa907d1774f44313546947c6",
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by=None,
+            runner_router=router,  # type: ignore[arg-type]
+        )
+
+        assert router.waits == [
+            ("runner_one", orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S)
+        ]
+        assert client.drops == 1
+        # Two ensure attempts, then the message forwards as usual.
+        assert [call for call in client.calls if call[0] == "POST"] == [
+            ("POST", terminals_path),
+            ("POST", terminals_path),
+            ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
+        ]
+        assert result.pending_id is not None
+        assert [i.type for i in store.appended_items if i.type == "error"] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_fails_when_runner_stays_gone() -> None:
+    """A runner that never re-registers within the grace fails the turn as before."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(terminals_path, [ConnectionError(_TUNNEL_CLOSED)])
+    router = _ReconnectWaitRouter(reconnects=False)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert len(router.waits) == 1
+    # No second ensure attempt against a runner that never came back.
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. tunnel closed before request completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_unrelated_transport_error_fails_without_waiting() -> None:
+    """A transport error that is not a tunnel drop keeps the immediate durable failure."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert errors[0].data.message == "Native Claude terminal ensure request failed. read timed out"
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_retry_failure_is_durable_after_one_attempt() -> None:
+    """A retry that also fails stops there and reports the retry's error."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [
+            ConnectionError(_TUNNEL_CLOSED),
+            httpx.ConnectError(
+                "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+            ),
+        ],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    # One wait, two ensure attempts, no third; the message is not forwarded.
+    assert len(router.waits) == 1
+    assert [call for call in client.calls if call[0] == "POST"] == [
+        ("POST", terminals_path),
+        ("POST", terminals_path),
+    ]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. runner 'runner_one' is offline"
+    )
+
+
+_RUNNER_UNREACHABLE = "The runner is unreachable. Reconnect the host and retry your message."
+
+
+@pytest.fixture
+def published_stream_events(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Capture what the server publishes to a session's live stream."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    return published
+
+
+def _host_bound_native_conv(store: _ConversationStore) -> Conversation:
+    """The canned native session row, bound to a host and to a runner on it."""
+    import dataclasses
+
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    return dataclasses.replace(conv, runner_id="runner_one", host_id="host_x")
+
+
+def _tunnel_loss(kind: str, terminals_path: str) -> Exception:
+    """A tunnel-loss failure: a drop under the request, or a runner already offline."""
+    if kind == "tunnel_closed":
+        return ConnectionError(_TUNNEL_CLOSED)
+    return httpx.ConnectError(
+        "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+    )
+
+
+async def _send_native_message(
+    store: _ConversationStore,
+    conv: Conversation,
+    client: _FailingEnsureRunnerClient,
+    router: _ReconnectWaitRouter,
+) -> Any:
+    """Send a user message to the native session through the event dispatch."""
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+    return await _dispatch_session_event_to_runner(
+        conv.id,
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_host_bound_tunnel_drop_refuses_send_when_runner_stays_gone(
+    drop_kind: str,
+    published_stream_events: list[dict[str, Any]],
+) -> None:
+    """A host-bound send whose runner never re-registers is refused with the input kept.
+
+    The ensure never reached the runner, so nothing shows the terminal failed
+    to boot. Recording a failed turn would consume the message and leave the
+    session failed after the host returns.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    drop = _tunnel_loss(drop_kind, terminals_path)
+    client = _FailingEnsureRunnerClient(terminals_path, [drop])
+    router = _ReconnectWaitRouter(reconnects=False)
+
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
+
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.message == _RUNNER_UNREACHABLE
+    assert exc.value.__cause__ is drop
+    assert router.waits == [
+        ("runner_one", orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S)
+    ]
+    # No second ensure attempt and no message forward.
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    # Nothing consumed: no user or error item, no failed status, no optimistic bubble.
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_host_bound_retry_failure_refuses_send_after_one_attempt(
+    published_stream_events: list[dict[str, Any]],
+) -> None:
+    """A repeat ensure that loses the tunnel again stops there and keeps the message."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    retry_drop = _tunnel_loss("runner_offline", terminals_path)
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [_tunnel_loss("tunnel_closed", terminals_path), retry_drop]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
+
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.message == _RUNNER_UNREACHABLE
+    assert exc.value.__cause__ is retry_drop
+    # One wait, two ensure attempts, no third; the message is not forwarded.
+    assert len(router.waits) == 1
+    assert [call for call in client.calls if call[0] == "POST"] == [
+        ("POST", terminals_path),
+        ("POST", terminals_path),
+    ]
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_host_bound_tunnel_drop_forwards_after_runner_reconnects(
+    drop_kind: str,
+) -> None:
+    """A host-bound send still rides out a short drop: the repeat ensure succeeds."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(terminals_path, [_tunnel_loss(drop_kind, terminals_path)])
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    try:
+        result = await _send_native_message(store, conv, client, router)
+
+        assert len(router.waits) == 1
+        assert [call for call in client.calls if call[0] == "POST"] == [
+            ("POST", terminals_path),
+            ("POST", terminals_path),
+            ("POST", f"/v1/sessions/{conv.id}/events"),
+        ]
+        assert result.pending_id is not None
+        assert [i for i in store.appended_items if i.type == "error"] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drops_first", [False, True], ids=["timeout_first", "timeout_on_repeat"])
+async def test_native_dispatch_host_bound_non_tunnel_error_stays_durable(
+    drops_first: bool,
+) -> None:
+    """Only a lost tunnel is refused; any other transport error still fails the turn durably."""
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    failures: list[Exception] = [
+        httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
+    ]
+    if drops_first:
+        failures.insert(0, _tunnel_loss("tunnel_closed", terminals_path))
+    client = _FailingEnsureRunnerClient(terminals_path, failures)
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    result = await _send_native_message(store, conv, client, router)
+
+    # A tunnel drop waits and repeats the ensure once; a timeout does neither.
+    assert len(router.waits) == int(drops_first)
+    ensure_attempts = [("POST", terminals_path)] * len(failures)
+    assert [call for call in client.calls if call[0] == "POST"] == ensure_attempts
+    assert result.pending_id is None
+    assert [i.type for i in store.appended_items] == ["message", "error"]
+    error = store.appended_items[1]
+    assert error.data.code == "native_terminal_ensure_failed"
+    assert error.data.message == "Native Claude terminal ensure request failed. read timed out"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["router", "runner_id"])
+async def test_ensure_native_terminal_ready_host_bound_refuses_unwaitable_tunnel_loss(
+    missing: str,
+) -> None:
+    """With no router or runner id to wait on, a host-bound tunnel loss is still refused."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [_tunnel_loss("tunnel_closed", terminals_path)]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    if missing == "runner_id":
+        conv = dataclasses.replace(conv, runner_id=None)
+
+    with pytest.raises(OmnigentError) as exc:
+        await _ensure_native_terminal_ready(
+            client,  # type: ignore[arg-type]
+            conv.id,
+            conv,
+            runner_router=None if missing == "router" else router,  # type: ignore[arg-type]
+        )
+
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert router.waits == []
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_ready_retries_over_the_runners_new_tunnel() -> None:
+    """Over the real tunnel transport, a mid-request drop waits for re-registration and retries.
+
+    Uses the real ``TunnelRegistry``/``WSTunnelTransport``/``RunnerRouter``:
+    deregistering the runner aborts the in-flight ensure with the transport's
+    own ``ConnectionError``, and the probe must stay pending until the runner
+    registers a new tunnel, then repeat the request over it.
+    """
+    import dataclasses
+
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        ResponseBodyFrame,
+        ResponseEndFrame,
+        ResponseHeadFrame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    hello = HelloFrame(
+        runner_version="0.1.0", frame_protocol_version=1, harnesses=["claude-native"], envs=[]
+    )
+    registry = TunnelRegistry()
+    registry.register("runner_one", _IdleWS(), hello)
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+
+    async def _in_flight_request_id() -> str:
+        for _ in range(400):
+            session = registry.get("runner_one")
+            if session is not None and session.in_flight:
+                return next(iter(session.in_flight))
+            await asyncio.sleep(0.005)
+        raise AssertionError("ensure request never reached the tunnel")
+
+    try:
+        task = asyncio.create_task(
+            _ensure_native_terminal_ready(client, conv.id, conv, runner_router=router)
+        )
+        await _in_flight_request_id()
+        # The runner's tunnel dies under the in-flight ensure.
+        registry.deregister("runner_one")
+        await asyncio.sleep(0.02)
+        assert not task.done(), "the drop must park the ensure, not fail it"
+
+        # The runner re-registers; the ensure repeats over the new tunnel.
+        registry.register("runner_one", _IdleWS(), hello)
+        req_id = await _in_flight_request_id()
+        registry.route_response_frame(
+            "runner_one",
+            ResponseHeadFrame(
+                id=req_id, status=200, headers=[["content-type", "application/json"]]
+            ),
+        )
+        registry.route_response_frame(
+            "runner_one", ResponseBodyFrame(id=req_id, body="{}", encoding="utf-8")
+        )
+        registry.route_response_frame("runner_one", ResponseEndFrame(id=req_id))
+
+        outcome = await asyncio.wait_for(task, timeout=5.0)
+        assert outcome.error is None
+    finally:
+        await client.aclose()
+        await router.aclose()
 
 
 @pytest.mark.asyncio
@@ -4040,6 +7470,63 @@ async def test_relay_skips_malformed_resource_created_from_runner() -> None:
 
     events = [i for i in store.appended_items if i.type == "resource_event"]
     assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.failed"])
+@pytest.mark.parametrize("reported_model", ["claude-opus-4-8", "<synthetic>"])
+async def test_relay_persists_harness_reported_model(
+    terminal_type: str,
+    reported_model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK terminal usage records the concrete model on the session snapshot."""
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    store = _ConversationStore()
+    client = _FakeStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": terminal_type,
+                    "response": {
+                        "id": "resp_model",
+                        "model": "repro_agent",
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                            "model": reported_model,
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+    expected = None if reported_model == "<synthetic>" else reported_model
+    assert store.get_conversation(session_id).reported_model == expected  # type: ignore[union-attr]
+    model_events = [event for event in published if event.get("type") == "session.model"]
+    assert model_events == (
+        []
+        if expected is None
+        else [
+            {
+                "type": "session.model",
+                "conversation_id": session_id,
+                "model": "claude-opus-4-8",
+            }
+        ]
+    )
 
 
 @pytest.mark.asyncio
@@ -4316,6 +7803,613 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
         f"cancelled-turn delta must not be forwarded; got {published_deltas}"
     )
     assert "REAL REPLY" in published_deltas
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_append", [False, True])
+async def test_relay_settles_queued_native_message_on_failed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fail_first_append: bool,
+) -> None:
+    """A failed native turn commits the queued web message ahead of its error item.
+
+    Native sessions do not persist a web message at POST time; the transcript
+    forwarder mirrors it back and drains its queued entry. When the runner
+    reports the turn failed, the harness never received the message, so the
+    relay commits the queued entry as the user message (sender intact),
+    publishes the consumed event that swaps the optimistic bubble, and leaves
+    nothing queued for a later mirrored message to drain by mistake.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _settle_undelivered_native_input,
+    )
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _FailOnceStore() if fail_first_append else _ConversationStore()
+    content = [{"type": "input_text", "text": "set up the worktree"}]
+    pending_id = pending_inputs.record(
+        sid,
+        content,
+        created_by="alice@example.com",
+        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+    )
+    original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    caplog.set_level(logging.INFO)
+    # A second message the runner is still holding for the next turn.
+    queued_next = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "then run the tests"}],
+        created_by="alice@example.com",
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_fail", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    # The runner names the message this turn carried.
+                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    "response": {
+                        "id": "resp_fail",
+                        "model": "codex",
+                        "error": {
+                            "code": "databricks_sign_in_pending",
+                            "message": "Codex is waiting for a sign-in in the terminal.",
+                            # The harness says the message never reached it.
+                            "undelivered": True,
+                        },
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "response_id": "resp_fail",
+                    "error": {
+                        "code": "databricks_sign_in_pending",
+                        "message": "Codex is waiting for a sign-in in the terminal.",
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        if fail_first_append:
+            await _settle_undelivered_native_input(
+                store,  # type: ignore[arg-type]
+                sid,
+                "resp_fail",
+                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+            )
+            assert store.appended_items == []
+            assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+                pending_id,
+                queued_next,
+            ]
+            restored = pending_inputs.delivery_attributes_for(sid, pending_id)
+            assert restored["delivery_attempt_id"] == original["delivery_attempt_id"]
+            assert restored["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
+            assert not any(
+                getattr(record, "event_name", None) == "native_input_settled"
+                for record in caplog.records
+            )
+            assert not any(e.get("type") == "session.input.consumed" for e in published)
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        types = [i.type for i in store.appended_items]
+        assert types == ["message", "error"], types
+        # The runner's failed edge names its turn; the relay keeps that id so the
+        # web folds the edge into the response's own error card.
+        failed_edges = [
+            e
+            for e in published
+            if e.get("type") == "session.status" and e.get("status") == "failed"
+        ]
+        assert [e.get("response_id") for e in failed_edges] == ["resp_fail"]
+        message, error = store.appended_items
+        assert message.data.user_authored is True
+        assert message.data.role == "user"
+        assert "".join(b["text"] for b in message.data.content) == "set up the worktree"
+        assert message.created_by == "alice@example.com"
+        # Both items share the failed turn's id so they group in one bubble.
+        assert message.response_id == "resp_fail"
+        assert error.response_id == "resp_fail"
+        assert error.data.code == "databricks_sign_in_pending"
+        # Only the failed turn's own message settled; the next one stays queued.
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [queued_next]
+        consumed = [e for e in published if e.get("type") == "session.input.consumed"]
+        assert len(consumed) == 1
+        assert consumed[0]["data"]["cleared_pending_id"] == pending_id
+        assert consumed[0]["data"]["created_by"] == "alice@example.com"
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_settled"
+        ]
+        attrs = record.attributes
+        assert attrs["outcome"] == "reported_undelivered"
+        assert attrs["pending_id"] == pending_id
+        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
+        assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
+        assert attrs["item_id"] == consumed[0]["data"]["item_id"]
+        assert attrs["response_id"] == message.response_id == "resp_fail"
+        assert attrs["match_method"] == "input_stable_id"
+        assert attrs["cause_class"] == "rejected_before_handoff"
+        assert attrs["reason_code"] == "databricks_sign_in_pending"
+        assert attrs["lifecycle_response_id"] == "resp_fail"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "set up the worktree"}],
+        created_by="alice@example.com",
+        stable_id=stable_id,
+    )
+    next_pending = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "then run the tests"}],
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": stable_id,
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "runner_error",
+                            "message": "turn setup failed",
+                            "undelivered": True,
+                        },
+                    },
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed",
+                        "undelivered": True,
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": "runner_error", "message": "turn setup failed"},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            next_pending
+        ]
+        consumed = [event for event in published if event.get("type") == "session.input.consumed"]
+        assert [event["data"]["cleared_pending_id"] for event in consumed] == [pending_id]
+        assert not [event for event in published if event.get("type") == "response.failed"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [(event["error"]["code"], event.get("response_id")) for event in failed] == [
+            ("runner_error", None)
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("undelivered", [True, False])
+async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
+    undelivered: bool,
+) -> None:
+    """Preserve one real error without a second missing-transcript error on the next turn."""
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_content = [{"type": "input_text", "text": "set up the worktree"}]
+    next_content = [{"type": "input_text", "text": "then run the tests"}]
+    first_pending = pending_inputs.record(
+        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+    )
+    next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    # Script only the executor boundary; the real adapter must transport its evidence.
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="test-agent", input=first_content), ctx
+            )
+        error = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        client = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_not_ready", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_not_ready",
+                            "model": "claude",
+                            "error": error,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        if not undelivered:
+            assert [item.type for item in store.appended_items] == ["error"]
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+                first_pending,
+                next_pending,
+            ]
+            return
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        first, failure = store.appended_items
+        assert first.data.content == first_content
+        assert first.created_by == "alice@example.com"
+        assert first.response_id == failure.response_id == "resp_not_ready"
+        assert failure.data.code == "RuntimeError"
+        assert failure.data.message == "inner executor error: Terminal is not ready"
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            next_pending
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": next_content},
+                    "response_id": "resp_next",
+                    "source_id": "claude:next-input:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[-1].data.content == next_content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        await adapter.on_shutdown()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+    tmp_path: Path,
+) -> None:
+    """A pre-delivery refusal must not be reported again as a missing message.
+
+    Claude refuses web ``/login`` before touching the terminal. If that failure
+    is not marked undelivered, the input stays pending. The next successful
+    message's transcript mirror skips it and persists a second error with code
+    ``native_prompt_not_recorded``.
+    """
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    auth_content = [{"type": "input_text", "text": "/login"}]
+    later_content = [{"type": "input_text", "text": "continue after login"}]
+    first_pending = pending_inputs.record(
+        session_id,
+        auth_content,
+        created_by="alice@example.com",
+        stable_id=first_stable_id,
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    context = TurnContext(
+        response_id="resp_login_refused",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="claude", input=auth_content),
+                context,
+            )
+        refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        failed_turn = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_login_refused", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_login_refused",
+                            "model": "claude",
+                            "error": refusal,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(session_id, failed_turn, store)  # type: ignore[arg-type]
+
+        later_pending = pending_inputs.record(
+            session_id,
+            later_content,
+            created_by="alice@example.com",
+            stable_id=later_stable_id,
+        )
+        await _persist_external_conversation_item(
+            session_id,
+            conversation,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": later_content},
+                    "response_id": "native_later_turn",
+                    "source_id": "claude:later:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        missing_errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_not_recorded"
+        ]
+        assert missing_errors == [], (
+            "generated 'Web message missing from native transcript': the refused input "
+            f"{first_pending} stayed pending and was reported missing when the later mirror "
+            f"settled {later_pending}; persisted={missing_errors}"
+        )
+        assert refusal.get("undelivered") is True
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+        assert later_pending not in pending_inputs.pending_ids(session_id)
+    finally:
+        await adapter.on_shutdown()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_the_queue_alone_when_the_harness_may_have_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failure the harness does not mark undelivered settles nothing, even with the id.
+
+    Codex can accept a turn and fail before its mirror arrives. The stamped id
+    says which message the turn carried, not that it never got through; if the
+    relay settled it, the late mirror would drain the next queued entry and
+    give this message that entry's identity and attachments. So the message
+    stays queued for its own mirror, and the entry behind it is untouched.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "86c9a6e5cc129f3996166535768169e8"
+    store = _ConversationStore()
+    a_stable = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    a_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "A"}],
+        created_by="alice@example.com",
+        stable_id=a_stable,
+    )
+    b_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "B"}],
+        created_by="alice@example.com",
+        stable_id="5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_a", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": a_stable,
+                    "response": {
+                        "id": "resp_a",
+                        "model": "codex",
+                        "error": {
+                            "code": "codex_turn_error",
+                            "message": "Codex native executor error: connection reset.",
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+            a_pending,
+            b_pending,
+        ]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_later_queued_messages_when_a_delivered_turn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A turn that fails after its message was mirrored settles nothing.
+
+    Message A reached the harness and was mirrored back (its entry drained);
+    B and C are still queued because the runner holds them for later turns.
+    When A then fails mid-turn, settling by queue order would commit B under
+    A's response and let B's own mirror consume C. Settlement is by the id
+    the runner stamps on the failure, so B and C stay queued, in order.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "75b895d4bb018e2885055424657058d7"
+    store = _ConversationStore()
+    a_stable = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    a_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "A"}],
+        created_by="alice@example.com",
+        stable_id=a_stable,
+    )
+    b_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "B"}],
+        created_by="alice@example.com",
+        stable_id="2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+    )
+    c_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "C"}],
+        created_by="alice@example.com",
+        stable_id="3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+    )
+    # A's mirror already drained its entry before the turn failed.
+    assert pending_inputs.resolve(sid, a_pending) is not None
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_a", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": a_stable,
+                    "response": {
+                        "id": "resp_a",
+                        "model": "codex",
+                        "error": {"code": "codex_turn_error", "message": "Codex crashed."},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+            b_pending,
+            c_pending,
+        ]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
@@ -4993,3 +9087,1213 @@ async def test_relay_never_delivers_terminal_on_pty_status(
     await _relay_runner_stream(child_id, client, store)  # type: ignore[arg-type]
 
     assert client.posts == []
+
+
+# ── Offline (agent asleep) environment synthesis ──────────────────────────────
+
+_OFFLINE_SESSION = "b17c0a4f9d2e4c6a8f1b3d5e7a9c0b2d"
+_OFFLINE_WORKSPACE = "/Users/dev/project"
+
+
+class _OfflineRunnerClient:
+    """Runner client whose tunnel is gone, as a sleeping agent's is."""
+
+    async def get(self, url: str, *, params: Any = None, timeout: float | None = None) -> Any:
+        del params, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    async def post(self, url: str, *, json: Any = None, timeout: float | None = None) -> Any:
+        del json, timeout
+        raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+
+@pytest.fixture
+def offline_env_app(
+    runner_globals_reset: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> FastAPI:
+    """App whose session is host-bound but whose runner is offline."""
+    del runner_globals_reset
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id="host_offline",
+        workspace=_OFFLINE_WORKSPACE,
+    )
+    # The seeded native-agent shape: no OS-level sandbox, so the reach the
+    # runner would report is "unconfined, anchored on the workspace".
+    monkeypatch.setattr(
+        _routes,
+        "_load_agent_spec_for_session",
+        lambda _conv, _agent_store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        ),
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]  — stub agent store
+            host_registry=SimpleNamespace(get=lambda _host_id: object()),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return application
+
+
+@pytest.fixture
+async def offline_env_client(offline_env_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    transport = httpx.ASGITransport(app=offline_env_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_offline_environment_advertises_the_same_reach_as_the_runner(
+    offline_env_client: httpx.AsyncClient,
+) -> None:
+    """A sleeping agent's environment still reports what browsing can reach.
+
+    The file panel gates its navigation affordance on ``metadata.reachable``.
+    When the runner sleeps the server synthesizes this resource itself, and
+    omitting the field there made the panel silently decide "nowhere else to
+    go" and drop the control -- even though the host-served path authorizes
+    and serves absolute browsing exactly as the live runner does.
+
+    Asserted as the full payload, not just presence: a synthesis that
+    advertised a *different* reach from the runner's would be its own bug.
+    """
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert resp.status_code == 200, resp.text
+    metadata = resp.json()["metadata"]
+    assert metadata["root"] == _OFFLINE_WORKSPACE
+    assert metadata["reachable"] == {
+        "unconfined": True,
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_github_info_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub info is served over the host tunnel when the runner is offline."""
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, params
+        captured["op"] = op
+        captured["workspace"] = workspace
+        return {
+            "object": "session.github.info",
+            "available": True,
+            "gh_available": True,
+            "authenticated": True,
+            "branch": "feature",
+            "base_ref": "main",
+            "repo": {"name_with_owner": "acme/app"},
+            "pr": None,
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    resp = await offline_env_client.get(f"/v1/sessions/{_OFFLINE_SESSION}/resources/github")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["branch"] == "feature"
+    assert captured["op"] == "github_info"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_path", "status"),
+    [
+        (None, 200),
+        ("old/%2F #?.py", 200),
+        ("folder/../old.py", 400),
+        ("folder//old.py", 400),
+        ("", 400),
+        ("/old.py", 400),
+    ],
+)
+async def test_github_diff_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_path: str | None,
+    status: int,
+) -> None:
+    """The GitHub diff (gzip route) also falls back to the host tunnel offline.
+
+    Proves the file-read router's GitHub diff route is wired to the fallback,
+    and that the ``base`` + ``path`` reach the host op.
+    """
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_read(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, workspace
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "object": "session.github.file_diff",
+            "path": "app.py",
+            "before": "base",
+            "after": "changed",
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
+
+    params = {"base": "main"}
+    if previous_path is not None:
+        params["previous_path"] = previous_path
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py", params=params
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert captured == {}
+        return
+    assert resp.json()["after"] == "changed"
+    assert captured["op"] == "github_diff"
+    assert captured["params"] == {"path": "app.py", **params}
+
+
+@pytest.mark.asyncio
+async def test_github_set_preference_falls_back_to_host_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The preference WRITE is served over the host tunnel when the runner is offline.
+
+    Proves the POST endpoint's runner-offline branch routes to the host write op
+    with the selection params, and returns the refreshed info.
+    """
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_write(
+        *,
+        host_registry: Any,
+        host_conn: Any,
+        op: str,
+        workspace: str,
+        session_id: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id
+        captured["op"] = op
+        captured["workspace"] = workspace
+        captured["params"] = params
+        return {"object": "session.github.info", "available": True, "selected_account": "octocat"}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", _fake_write)
+
+    resp = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/preferences",
+        json={"account": "octocat"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["selected_account"] == "octocat"
+    assert captured["op"] == "github_set_preference"
+    assert captured["workspace"] == _OFFLINE_WORKSPACE
+    assert captured["params"] == {"account": "octocat", "remote": None}
+
+
+# ── Workspace-file gzip (GZipFileContentRoute) ───────────────────
+#
+# These exercise the real routes through the real router, because the whole
+# point of the route class is that eligibility follows the route table. A
+# synthesized endpoint would not prove the production routes are wrapped.
+
+
+def _fs_text_read_payload(lines: int = 2000) -> dict[str, object]:
+    """Canned runner response for a text file read.
+
+    Mirrors the runner's ``file_content`` shape and key order, including a
+    ``content_type`` that is deliberately *not* a text type: ``.ts`` resolves
+    to ``video/mp2t`` via ``mimetypes``, so a MIME-based eligibility check
+    would wrongly skip real TypeScript source. Compression must be decided
+    from ``encoding`` instead.
+
+    :param lines: How many lines of source to synthesize, e.g. ``2000``.
+    :returns: The payload dict.
+    """
+    content = "    const someVariableName = computeSomething(alpha, beta);\n" * lines
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": "src/main.ts",
+        "content_type": "video/mp2t",
+        "bytes": len(content.encode()),
+        "truncated": False,
+        "encoding": "utf-8",
+        "content": content,
+    }
+
+
+def _fs_binary_read_payload(size: int = 256 * 1024) -> dict[str, object]:
+    """Canned runner response for a binary (base64) file read.
+
+    :param size: Decoded payload size in bytes, e.g. ``262144``.
+    :returns: The payload dict, with ``content`` as base64.
+    """
+    import base64
+
+    # Incompressible bytes: gzip would return ~1.0x for real CPU.
+    raw = bytes((i * 7 + 11) % 256 for i in range(size))
+    return {
+        "object": "session.environment.filesystem.file_content",
+        "path": "docs/logo.png",
+        "content_type": "image/png",
+        "bytes": size,
+        "truncated": False,
+        "encoding": "base64",
+        "content": base64.b64encode(raw).decode(),
+    }
+
+
+_FS_BASE = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+
+
+@pytest.mark.asyncio
+async def test_file_read_is_gzipped(client: httpx.AsyncClient) -> None:
+    """A text file read is compressed, and the body survives the round-trip.
+
+    The read inlines the whole file in ``content``, so without compression the
+    response costs a full file transfer.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    # A shared cache must not serve these bytes to an identity client.
+    assert "accept-encoding" in resp.headers.get("vary", "").lower()
+    # httpx inflates transparently, so an intact body proves the encoding
+    # header and the bytes on the wire agree.
+    assert resp.json() == payload
+    # Compression actually happened, rather than the header being set on
+    # unchanged bytes.
+    assert int(resp.headers["content-length"]) < len(str(payload["content"]))
+
+
+@pytest.mark.asyncio
+async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+    """A base64 (binary) read skips compression.
+
+    Base64 of already-compressed media only carries base64's own redundancy, so
+    gzip returns ~1.3x for real event-loop time — 385 ms at the 10 MiB binary
+    cap. The decision comes from the payload's ``encoding``, because these
+    routes always answer ``application/json`` and the file's own MIME type is
+    merely a field inside that JSON.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_binary_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/docs/logo.png",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_binary_read_is_not_gzipped(client: httpx.AsyncClient) -> None:
+    """A long ``path`` must not push the ``encoding`` field out of range.
+
+    Eligibility is read from the serialized body. ``path`` precedes ``encoding``
+    and is bounded only by ``PATH_MAX``, so a fixed-size prefix scan would miss
+    the field on a deeply nested file and send a multi-megabyte binary through
+    synchronous gzip — the exact case this guards.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_binary_read_payload()
+    # ~680 chars, comfortably past any small window.
+    payload["path"] = "/".join(["nested_directory"] * 40)
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/{payload['path']}",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_text_whose_content_fakes_the_encoding_marker_is_gzipped(
+    client: httpx.AsyncClient,
+) -> None:
+    """A text file containing ``"encoding":"base64"`` still compresses.
+
+    Eligibility matches the complete serialized key/value pair, which cannot
+    occur inside a JSON string — an embedded quote is backslash-escaped — so a
+    file's own bytes cannot fake a binary payload and suppress compression.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    payload["content"] = 'config = {"encoding":"base64"}\n' * 200
+    payload["path"] = "settings.py"
+    payload["bytes"] = len(str(payload["content"]).encode())
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/settings.py",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_directory_listing_is_gzipped(client: httpx.AsyncClient) -> None:
+    """A directory listing large enough to clear the minimum size compresses.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    listing = _fs_list_payload()
+    entries = listing["data"]
+    assert isinstance(entries, list)
+    # One entry is below minimum_size; a real directory of any depth is not.
+    listing["data"] = [dict(entries[0], id=f"f{i}.py", name=f"f{i}.py") for i in range(200)]
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=listing)))  # type: ignore[arg-type]
+
+    resp = await client.get(f"{_FS_BASE}/filesystem", headers={"Accept-Encoding": "gzip"})
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == listing
+
+
+@pytest.mark.asyncio
+async def test_file_diff_is_gzipped(client: httpx.AsyncClient) -> None:
+    """The diff read carries two file bodies, so it compresses too.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    text = "    const value = compute(alpha, beta);\n" * 1000
+    payload: dict[str, object] = {
+        "object": "session.environment.filesystem.file_diff",
+        "path": "src/main.ts",
+        "before": text,
+        "after": text + "// changed\n",
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/diff/src/main.ts",
+        headers={"Accept-Encoding": "gzip"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.headers["content-encoding"] == "gzip"
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_file_read_honors_identity_request(client: httpx.AsyncClient) -> None:
+    """A client that declines gzip receives identity bytes.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": "identity"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token", "expect_gzip"),
+    [
+        ("gzip", True),
+        # Coding tokens are case-insensitive (RFC 9110 §12.5.3).
+        ("GZip", True),
+        ("GZIP", True),
+        ("gzip, deflate, br", True),
+        ("gzip;q=0.5", True),
+        ("*;q=0, gzip", True),
+        # q=0 means "do not use this coding" — a substring test would miss it.
+        ("gzip;q=0", False),
+        ("deflate, gzip;q=0", False),
+        ("deflate", False),
+        ("identity", False),
+    ],
+)
+async def test_file_read_negotiates_accept_encoding(
+    client: httpx.AsyncClient,
+    token: str,
+    expect_gzip: bool,
+) -> None:
+    """Compression follows ``Accept-Encoding``, including case and ``q`` values.
+
+    :param client: Test HTTP client.
+    :param token: The ``Accept-Encoding`` value to send.
+    :param expect_gzip: Whether gzip is expected for that value.
+    :returns: None.
+    """
+    payload = _fs_text_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/src/main.ts",
+        headers={"Accept-Encoding": token},
+    )
+
+    assert resp.status_code == 200
+    assert (resp.headers.get("content-encoding") == "gzip") is expect_gzip
+    assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("PUT", "filesystem/notes.txt"),
+        ("PATCH", "filesystem/notes.txt"),
+        ("DELETE", "filesystem/notes.txt"),
+    ],
+)
+async def test_filesystem_mutations_are_not_gzipped(
+    client: httpx.AsyncClient,
+    method: str,
+    path: str,
+) -> None:
+    """Mutating handlers on the read paths stay uncompressed.
+
+    They share a URL with the read but return a small ack, so there is nothing
+    to compress. This is the guarantee a path-matching middleware could not
+    make: a path alone says nothing about the method. Because the reads live on
+    their own router, Starlette rejects a mismatched method before the wrapper
+    is ever reached.
+
+    :param client: Test HTTP client.
+    :param method: HTTP method under test.
+    :param path: Environment-relative request path.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "object": "session.environment.filesystem.write_result",
+        "path": "notes.txt",
+        # Padded past minimum_size so only the method decides the outcome.
+        "detail": "x" * 4096,
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    resp = await client.request(
+        method,
+        f"{_FS_BASE}/{path}",
+        headers={"Accept-Encoding": "gzip"},
+        json={"content": "hi", "old_text": "a", "new_text": "b"},
+    )
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["changes", "search?q=main", "shell"])
+async def test_sibling_environment_routes_are_not_gzipped(
+    client: httpx.AsyncClient,
+    path: str,
+) -> None:
+    """Sibling environment routes return bounded metadata and stay uncompressed.
+
+    Keeps the change's blast radius to the endpoints that inline file contents.
+
+    :param client: Test HTTP client.
+    :param path: Environment-relative request path.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "object": "list",
+        "data": [{"path": f"f{i}.py", "status": "modified"} for i in range(200)],
+        "has_more": False,
+    }
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    url = f"{_FS_BASE}/{path}"
+    headers = {"Accept-Encoding": "gzip"}
+    if path == "shell":
+        resp = await client.post(url, headers=headers, json={"command": "ls"})
+    else:
+        resp = await client.get(url, headers=headers)
+
+    assert resp.status_code == 200
+    assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.parametrize(
+    "resource,op",
+    [
+        ("", "github_info"),
+        ("/changes", "github_changes"),
+        ("/diff", "github_pr_diff"),
+        ("/diff/new.py", "github_diff"),
+        ("/labels", "github_labels"),
+    ],
+)
+async def test_selected_pr_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    op: str,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info"}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+    )
+    assert response.status_code == 200
+    assert captured["op"] == op
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"]["pr_url"] == url
+
+
+async def test_pr_attachment_uses_bound_session_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info", "prs": []}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/prs",
+        json={"url": url, "action": "attach", "session_id": "untrusted"},
+    )
+    assert response.status_code == 200, response.text
+    assert captured["op"] == "github_prs_update"
+    assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
+
+
+async def test_pr_label_edit_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+    labels = {"object": "session.github.pr_labels", "labels": []}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return labels
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/labels",
+        json={"pr_url": url, "remove": ["bug"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == labels
+    assert captured["op"] == "github_labels_update"
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"] == {"pr_url": url, "add": [], "remove": ["bug"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "host_tier", "status"),
+    [
+        ("archive.zip", "none", 409),
+        ("archive.zip", "attachments", 200),
+        ("trace.gz", "attachments", 409),
+        ("trace.gz", "current", 200),
+    ],
+    ids=[
+        "default-type-needs-attachments",
+        "default-type-on-attachments-host",
+        "recorded-type-needs-delivery",
+        "recorded-type-on-current-host",
+    ],
+)
+async def test_copy_requires_the_hosts_attachment_support(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    filename: str,
+    host_tier: str,
+    status: int,
+) -> None:
+    """A copy into a capable harness still needs a host that can deliver the file."""
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+
+    child = "405bfe154d5c0e795a2b87021bc897bf"
+    parent = "b460374fc8e697b296708f52dc9d8179"
+    file_conv_store._conversations[child].labels.update(
+        CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+    )
+    file_app.state.host_registry.get("host_files").hello.capabilities = {
+        "none": [],
+        "attachments": [CAP_FILESYSTEM_ATTACHMENTS],
+        "current": HOST_CAPABILITIES,
+    }[host_tier]
+    if filename.endswith(".zip"):
+        file_id = _seed_parent_zip(file_store, artifact_store, filename)
+        source_metadata = None
+    else:
+        # Outside the default extensions, so only the record marks it for disk.
+        source_metadata = {"delivery": "filesystem"}
+        stored = file_store.create(
+            session_id=parent,
+            filename=filename,
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata=source_metadata,
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        file_id = stored.id
+
+    response = await file_client.post(
+        f"/v1/sessions/{child}/resources/files:copy",
+        json={"source_session_id": parent, "file_ids": [file_id]},
+    )
+
+    assert response.status_code == status, response.text
+    assert file_store.get(file_id, session_id=parent) is not None
+    if status == 200:
+        copied = file_store.get(response.json()["mapping"][file_id]["new_id"], session_id=child)
+        assert copied is not None
+        assert copied.source_metadata == source_metadata
+    else:
+        assert file_store.list(child).data == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_history", [False, True])
+async def test_native_send_rechecks_runtime_after_upload(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+) -> None:
+    """A downgrade/fork binding rejects incoming and retained files before dispatch."""
+    from omnigent.entities import MessageData
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("archive.zip", b"data", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "renamed.txt"}
+    content = [block]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached archive again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = []
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == 409, response.text
+    assert "Update Omnigent" in response.text
+    assert runner.post_json_calls == []
+    assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retained_history", "host_has_attachments", "status"),
+    [(False, True, 409), (True, True, 202), (True, False, 409)],
+)
+async def test_native_send_requires_delivery_support_for_new_types(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+    host_has_attachments: bool,
+    status: int,
+) -> None:
+    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+
+    A recorded file in retained history still needs filesystem attachment support.
+    """
+    from omnigent.entities import MessageData
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENTS,
+        FilesystemAttachmentPolicy,
+    )
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+        all_types=True
+    )
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [{"type": "input_file", "file_id": upload.json()["id"]}]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached trace again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = (
+        [CAP_FILESYSTEM_ATTACHMENTS] if host_has_attachments else []
+    )
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == status, response.text
+    if status == 202:
+        assert runner.post_json_calls
+    else:
+        assert runner.post_json_calls == []
+        if not retained_history:
+            assert "this file type" in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("typed", "kind", "recorded_name", "arguments"),
+    [
+        # A skill typed /simplify is recorded under its plugin-qualified name.
+        ("/simplify the parser", "skill", "dev-productivity:simplify", "the parser"),
+        (
+            "/dev-productivity:simplify the parser",
+            "skill",
+            "dev-productivity:simplify",
+            "the parser",
+        ),
+        ("/compact", "command", "compact", ""),
+    ],
+    ids=["plugin-short-name", "plugin-qualified-name", "builtin"],
+)
+async def test_claude_native_slash_command_drains_its_queued_entry_under_either_name(
+    typed: str,
+    kind: str,
+    recorded_name: str,
+    arguments: str,
+) -> None:
+    """A web-typed command drains its entry whether Claude records it plugin-qualified or bare.
+
+    The older entry still waits for its own mirror.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": typed}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": kind,
+                "name": recorded_name,
+                "arguments": arguments,
+            },
+            "response_id": "resp_command",
+            "source_id": "claude:command:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_top_level_local_command_echo_drains_its_queued_entry(
+    tmp_path: Path,
+) -> None:
+    """A ``/model`` Claude records as a top-level ``local_command`` settles its web entry.
+
+    Only the matching entry drains: an older message and a different queued
+    command keep waiting for their own mirrors.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "model-echo",
+                "content": (
+                    "<command-name>/model</command-name>"
+                    "<command-message>model</command-message>"
+                    "<command-args>example-model</command-args>"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    assert len(items) == 1
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model example-model"}])
+    later = pending_inputs.record(sid, [{"type": "input_text", "text": "/effort high"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": items[0].item_type,
+            "item_data": items[0].data,
+            "response_id": items[0].response_id,
+            "source_id": items[0].source_id,
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            later,
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", ["/simplify the lexer", "/review the parser"])
+async def test_claude_native_plugin_slash_command_leaves_a_different_queued_command(
+    typed: str,
+) -> None:
+    """Trying the bare name never settles an entry with other arguments or another command."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    other = pending_inputs.record(sid, [{"type": "input_text", "text": typed}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "skill",
+                "name": "dev-productivity:simplify",
+                "arguments": "the parser",
+            },
+            "response_id": "resp_simplify",
+            "source_id": "claude:simplify:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [other]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_override", "text"),
+    [
+        (None, "/btw what is a monad"),
+        (None, "/btw"),
+        # A forced-auto pane has not routed yet, but its terminal is already Claude.
+        ("auto", "/btw what is a monad"),
+    ],
+    ids=["question", "bare", "forced-auto-pane"],
+)
+async def test_claude_native_btw_message_is_forwarded_without_a_queued_entry(
+    harness_override: str | None,
+    text: str,
+) -> None:
+    """A /btw never reaches the transcript, so it must not leave a skippable entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.harness_override = harness_override
+    client = _FakeRunnerClient()
+    content = [{"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.pending_id is None
+        assert pending_inputs.snapshot_for(sid) == []
+        # The text still reaches Claude's terminal, which answers it in its own overlay.
+        url, forwarded = client.post_json_calls[-1]
+        assert url == f"/v1/sessions/{sid}/events"
+        assert forwarded["content"] == content
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper", "agent_name", "text", "attachments"),
+    [
+        ("claude-code-native-ui", "claude-native-ui", "/btwx foo", []),
+        ("claude-code-native-ui", "claude-native-ui", "does /btw answer in an overlay?", []),
+        ("codex-native-ui", "codex-native-ui", "/btw what is a monad", []),
+        # An attachment is pasted ahead of the text, so Claude sees an ordinary prompt.
+        (
+            "claude-code-native-ui",
+            "claude-native-ui",
+            "/btw what is this?",
+            [{"type": "input_image", "file_id": "file_x", "filename": "a.png"}],
+        ),
+    ],
+    ids=["longer-command-name", "mentioned-mid-sentence", "codex-pane", "with-attachment"],
+)
+async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
+    wrapper: str,
+    agent_name: str,
+    text: str,
+    attachments: list[dict[str, str]],
+) -> None:
+    """Only a text-only /btw on a Claude pane skips the queue; anything else keeps its entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": wrapper},
+    )
+    client = _FakeRunnerClient()
+    content = [*attachments, {"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name=agent_name,
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.pending_id is not None
+        assert [entry["content"] for entry in pending_inputs.snapshot_for(sid)] == [content]
+        assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "",
+        "/filesystem",
+        "/filesystem/file.txt",
+        "/changes",
+        "/diff/file.txt",
+        "/search",
+        "/search/folder",
+    ],
+)
+@pytest.mark.parametrize("environment_id", ["default", "env?draft#one%two", ".", ".."])
+async def test_environment_id_is_one_runner_url_segment(
+    client: httpx.AsyncClient, suffix: str, environment_id: str
+) -> None:
+    from urllib.parse import quote
+
+    fake_runner = _FakeRunnerClient(payload={"data": []})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    encoded = quote(environment_id, safe="").replace(".", "%2E")
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/"
+    response = await client.get(base + encoded + suffix, params={"q": "file"})
+    if environment_id in {".", ".."}:
+        assert response.status_code == 400, response.text
+        assert fake_runner.calls == []
+    else:
+        assert response.status_code == 200, response.text
+        assert fake_runner.calls
+        forwarded = httpx.URL(fake_runner.calls[-1][1])
+        assert (
+            forwarded.raw_path.split(b"?", 1)[0]
+            == (base + quote(environment_id, safe="") + suffix).encode()
+        )
+        assert forwarded.fragment == ""

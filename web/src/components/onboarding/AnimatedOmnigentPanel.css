@@ -1,0 +1,121 @@
+/* Onboarding card + animated panel. Ported from the design handoff; `motion`
+   spring resize replaced with CSS transitions, hardcoded colors + the
+   prefers-color-scheme block replaced with repo theme tokens + the .dark class. */
+
+.omnigent-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--onboarding-modal-border);
+  border-radius: 24px;
+  background: var(--background);
+  box-shadow: var(--onboarding-modal-shadow);
+  /* The prototype's resize curve: a soft ease-out with no overshoot. */
+  --omnigent-resize: 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  transition:
+    width var(--omnigent-resize),
+    height var(--omnigent-resize);
+}
+
+/* Dark cards read as a translucent overlay surface, not the solid page bg. */
+.dark .omnigent-card {
+  background: #1f1f2199;
+}
+
+.omnigent-animated-panel {
+  position: relative;
+  flex-shrink: 0;
+  overflow: hidden;
+  margin: -12px;
+  margin-bottom: 0;
+  /* Hard cutoff at the band's bottom edge (matches the prototype's two-region
+     split); the blob grid fades on its own, so no soft mask here. */
+  border-radius: 14px 14px 0 0;
+  transition: height var(--omnigent-resize);
+}
+
+.omnigent-panel-logo {
+  position: absolute;
+  z-index: 1;
+  /* Pinned to a fixed offset from the panel top (centers it at the 308px landing
+     height: (308 - 56) / 2). NOT top:50% — with a shrinking panel that re-centers
+     the logo into the collapsing panel so it vanishes in place; a fixed offset
+     lets the panel's overflow clip slide it up and out the top instead. */
+  top: 126px;
+  left: 50%;
+  display: block;
+  object-fit: contain;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+/* Collapsed flavor: band content (e.g. harness icons) centered over the blobs,
+   replacing the logo. */
+.omnigent-panel-band-content {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+/* Auth-card variant: content-sized, translucent surface, logo centered (no
+   between-step shrink animation to clip it out the top). */
+.omnigent-panel-logo--centered {
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.omnigent-card--auto {
+  height: auto;
+  background: var(--card);
+}
+
+/* On a short viewport the card clamps (max-height); let the band shrink and the
+   body scroll instead of overflowing. */
+.omnigent-card--auto .omnigent-animated-panel {
+  flex-shrink: 1;
+  min-height: 120px;
+}
+
+.omnigent-card--auto .omnigent-card-body {
+  min-height: 140px;
+  overflow-y: auto;
+}
+
+/* Card body (the current onboarding step) sits below the animated panel and
+   fills the remaining card height. */
+.omnigent-card-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+/* Each step mounts a fresh body child; fade it in rather than snapping. */
+.omnigent-card-body > * {
+  animation: omnigent-step-in 0.2s ease-out;
+}
+
+@keyframes omnigent-step-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omnigent-card,
+  .omnigent-animated-panel {
+    transition: none;
+  }
+
+  .omnigent-card-body > * {
+    animation: none;
+  }
+}

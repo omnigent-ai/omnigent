@@ -7,14 +7,24 @@ they live here following the source ↔ test directory mirroring rule.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from PIL import Image
 
+from omnigent.native.native_coding_agents import (
+    ANTIGRAVITY_NATIVE_AGENT_NAME,
+    QWEN_NATIVE_AGENT_NAME,
+)
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -64,6 +74,71 @@ def test_server_version_reads_version_constant() -> None:
     from omnigent.version import VERSION
 
     assert server_app._server_version() == VERSION
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_shape(client: httpx.AsyncClient) -> None:
+    """GET /.well-known/omnigent.json returns the version manifest.
+
+    The desktop shell reads this BEFORE loading the SPA to decide how to open a
+    window, so the envelope keys are a contract: every one asserted here is a
+    key a shipped shell may branch on.
+    """
+    from omnigent.version import VERSION
+
+    resp = await client.get("/.well-known/omnigent.json")
+    assert resp.status_code == 200
+    # JSON, not the SPA's index.html — see the not-swallowed test below.
+    assert resp.headers["content-type"].startswith("application/json")
+    body = resp.json()
+
+    assert body["manifest_version"] == server_app.WELL_KNOWN_MANIFEST_VERSION
+    # An int, so clients can compare with >= rather than parsing a string.
+    assert isinstance(body["manifest_version"], int)
+    # Same source of truth as /api/version and /v1/info.server_version, so a
+    # client never sees three different answers for one server.
+    assert body["server_version"] == VERSION
+    # Present-but-null: clients rely on the key existing, and null is the
+    # "no floor" path every shipped shell must accept.
+    assert "min_desktop_version" in body
+    assert body["min_desktop_version"] is None
+    # Tells the shell where server-driven chrome lives, so it need not infer
+    # placement from the version number.
+    assert body["ui"]["server_picker"] == "sidebar"
+    # This fixture runs without an auth provider, so there is nothing to sign in to,
+    # and no native app redirect is advertised outside OIDC.
+    assert body["auth"] == {"mode": "none", "session_cookie": None, "native_redirect_uris": None}
+    # Present-but-null when the operator names nothing.
+    assert "server_name" in body
+    assert body["server_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_well_known_manifest_is_unauthed(client: httpx.AsyncClient) -> None:
+    """The manifest is readable without a session cookie.
+
+    The shell consults it before the app loads — i.e. before any login could
+    have happened — so an auth gate here would defeat its purpose entirely.
+    """
+    resp = await client.get("/.well-known/omnigent.json", headers={"Cookie": ""})
+    assert resp.status_code == 200
+    assert resp.json()["manifest_version"] >= 1
+
+
+def test_well_known_prefix_is_not_spa_fallback() -> None:
+    """An unmatched /.well-known/* path must 404, never fall back to the SPA.
+
+    The web UI is mounted at "/" and serves ``index.html`` for unmatched paths
+    so client routes survive a refresh. Without ``.well-known`` on the API
+    allowlist, a shell probing an OLDER server (which has no manifest route)
+    would receive ``200 text/html`` and could parse the SPA shell as a
+    manifest. The 404 is what makes "no manifest" detectable, and therefore
+    what makes the pre-manifest fallback path work at all.
+    """
+    assert server_app._is_web_ui_api_fallback_path(".well-known/omnigent.json")
+    assert server_app._is_web_ui_api_fallback_path(".well-known/anything-else")
+    # Sanity: a real client route still falls through to index.html.
+    assert not server_app._is_web_ui_api_fallback_path("c/conv_abc123")
 
 
 class _StubWebSocket:
@@ -391,6 +466,405 @@ async def test_info_includes_server_version(
     assert body["server_version"] == VERSION
 
 
+def _branding_png(color: tuple[int, int, int, int]) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", (2, 2), color).save(output, format="PNG")
+    return output.getvalue()
+
+
+def _build_branding_app(
+    db_uri: str,
+    tmp_path: Path,
+    label: str,
+    *,
+    server_config: dict[str, object] | None = None,
+    **create_app_kwargs: Any,
+) -> FastAPI:
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / f"artifacts-{label}"))
+    return server_app.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / f"cache-{label}",
+        ),
+        server_config=server_config,
+        **create_app_kwargs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_config", "create_app_kwargs", "expected"),
+    [
+        (
+            {},
+            {},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": False,
+            },
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {},
+            {"extensions": [".gz"], "all_types": False},
+        ),
+        # A deployment-supplied value or callable takes precedence over the config file.
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": [".har"]},
+            {"extensions": [".har"], "all_types": False},
+        ),
+        (
+            {"filesystem_attachment_allowed_extensions": [".gz"]},
+            {"filesystem_attachment_allowed_extensions": lambda: ["*"]},
+            {
+                "extensions": [".db", ".docx", ".pptx", ".sqlite", ".sqlite3", ".xlsx", ".zip"],
+                "all_types": True,
+            },
+        ),
+    ],
+)
+async def test_info_reports_the_filesystem_attachment_policy(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    server_config: dict[str, object],
+    create_app_kwargs: dict[str, Any],
+    expected: dict[str, object],
+) -> None:
+    """Clients read which uploads become files from /v1/info."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        server_config=server_config,
+        **create_app_kwargs,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        info = (await client.get("/v1/info")).json()
+
+    assert info["filesystem_attachments"] == expected
+
+
+async def test_info_evaluates_a_callable_policy_per_request(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """A callable policy can change while the server runs, e.g. behind a feature flag."""
+    policies = iter([[".gz"], ["*"]])
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "attachments",
+        filesystem_attachment_allowed_extensions=lambda: next(policies),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = (await client.get("/v1/info")).json()["filesystem_attachments"]
+        second = (await client.get("/v1/info")).json()["filesystem_attachments"]
+
+    assert first == {"extensions": [".gz"], "all_types": False}
+    assert second["all_types"] is True
+
+
+def test_session_title_instructions_are_wired_into_coordinator(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "custom-titles",
+        server_config={"session_title_instructions": "Prefix titles with the current date."},
+    )
+
+    assert (
+        app.state.background_title_coordinator._additional_instructions
+        == "Prefix titles with the current date."
+    )
+
+
+@pytest.mark.asyncio
+async def test_branding_logo_route_serves_only_validated_asset_pre_auth(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    payload = _branding_png((25, 100, 200, 255))
+    (assets / "logo.png").write_bytes(payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    app = _build_branding_app(db_uri, tmp_path, "pre-auth")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/branding/logo/main", headers={"Cookie": ""})
+
+    assert response.status_code == 200
+    assert response.content == payload
+    assert response.headers["content-type"].startswith("image/png")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
+async def test_branding_snapshot_performs_no_request_time_io_or_decode(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from omnigent.server import server_config as server_config_module
+
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        "branding:\n"
+        "  app_name: Acme\n"
+        "  logo:\n"
+        "    main: logo.png\n"
+        "    loading: ./logo.png\n"
+        "    favicon: logo.png\n"
+    )
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    logo = assets / "logo.png"
+    payload = _branding_png((25, 100, 200, 255))
+    logo.write_bytes(payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    config_loads = 0
+    logo_reads = 0
+    validations = 0
+    pillow_opens = 0
+    original_load = server_config_module.load_server_config
+    original_read_bytes = Path.read_bytes
+    original_validation = server_config_module._validated_image
+    original_image_open = server_config_module.Image.open
+    resolved_logo = logo.resolve()
+
+    def _counted_load() -> dict[str, object]:
+        nonlocal config_loads
+        config_loads += 1
+        return original_load()
+
+    def _counted_read_bytes(path: Path) -> bytes:
+        nonlocal logo_reads
+        if path == resolved_logo:
+            logo_reads += 1
+        return original_read_bytes(path)
+
+    def _counted_validation(
+        path: Path,
+    ) -> server_config_module.BrandingAsset | None:
+        nonlocal validations
+        validations += 1
+        return original_validation(path)
+
+    def _counted_image_open(*args: object, **kwargs: object) -> object:
+        nonlocal pillow_opens
+        pillow_opens += 1
+        return original_image_open(*args, **kwargs)
+
+    monkeypatch.setattr(server_config_module, "load_server_config", _counted_load)
+    monkeypatch.setattr(Path, "read_bytes", _counted_read_bytes)
+    monkeypatch.setattr(server_config_module, "_validated_image", _counted_validation)
+    monkeypatch.setattr(server_config_module.Image, "open", _counted_image_open)
+
+    app = _build_branding_app(db_uri, tmp_path, "no-request-io")
+    startup_counts = (config_loads, logo_reads, validations, pillow_opens)
+    assert startup_counts == (1, 1, 1, 2)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = await asyncio.gather(
+            *(
+                client.get(path, headers={"Cookie": ""})
+                for _ in range(8)
+                for path in (
+                    "/v1/info",
+                    "/v1/branding/logo/main",
+                    "/v1/branding/logo/loading",
+                    "/v1/branding/logo/favicon",
+                )
+            )
+        )
+
+    assert all(response.status_code == 200 for response in responses)
+    assert all(
+        response.content == payload
+        for response in responses
+        if response.request.url.path.startswith("/v1/branding/logo/")
+    )
+    assert (config_loads, logo_reads, validations, pillow_opens) == startup_counts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("branding", "expected"),
+    [
+        ({"server_name": "  Acme Engineering  "}, "Acme Engineering"),
+        ({"server_name": "   "}, None),
+        # No fallback: the product name doesn't identify one deployment.
+        ({"app_name": "Acme Agent"}, None),
+    ],
+)
+async def test_well_known_manifest_server_name(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    branding: dict[str, object],
+    expected: str | None,
+) -> None:
+    app = _build_branding_app(
+        db_uri, tmp_path, "server-name", server_config={"branding": branding}
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        manifest = (await client.get("/.well-known/omnigent.json")).json()
+        info_branding = (await client.get("/v1/info")).json()["branding"]
+
+    assert manifest["server_name"] == expected
+    # The /v1/info branding block is unchanged; the name lives in the manifest.
+    assert "server_name" not in info_branding
+
+
+@pytest.mark.asyncio
+async def test_branding_snapshot_is_immutable_and_isolated_per_app(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    first_dir.mkdir()
+    first_config = first_dir / "config.yaml"
+    first_config.write_text("branding:\n  app_name: First\n  logo: logo.png\n")
+    first_assets = first_dir / "branding-assets"
+    first_assets.mkdir()
+    first_logo = first_assets / "logo.png"
+    first_payload = _branding_png((25, 100, 200, 255))
+    first_logo.write_bytes(first_payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(first_config))
+    first_app = _build_branding_app(db_uri, tmp_path, "first")
+
+    updated_payload = _branding_png((200, 100, 25, 255))
+    first_config.write_text("branding:\n  app_name: Updated\n  logo: logo.png\n")
+    first_logo.write_bytes(updated_payload)
+
+    second_dir = tmp_path / "second"
+    second_dir.mkdir()
+    second_config = second_dir / "config.yaml"
+    second_config.write_text("branding:\n  app_name: Second\n  logo: logo.png\n")
+    second_assets = second_dir / "branding-assets"
+    second_assets.mkdir()
+    second_payload = _branding_png((100, 25, 200, 255))
+    (second_assets / "logo.png").write_bytes(second_payload)
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(second_config))
+    second_app = _build_branding_app(db_uri, tmp_path, "second")
+
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(first_config))
+    recreated_app = _build_branding_app(db_uri, tmp_path, "recreated")
+
+    async def _branding(app: FastAPI) -> tuple[dict[str, object], bytes]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            info = (await client.get("/v1/info")).json()["branding"]
+            logo_response = await client.get("/v1/branding/logo/main")
+        assert logo_response.status_code == 200
+        return info, logo_response.content
+
+    first, second, recreated = await asyncio.gather(
+        _branding(first_app),
+        _branding(second_app),
+        _branding(recreated_app),
+    )
+
+    assert first[0]["app_name"] == "First"
+    assert first[1] == first_payload
+    assert second[0]["app_name"] == "Second"
+    assert second[1] == second_payload
+    assert recreated[0]["app_name"] == "Updated"
+    assert recreated[1] == updated_payload
+
+
+@pytest.mark.asyncio
+async def test_branding_missing_at_startup_remains_missing_until_app_recreation(
+    db_uri: str,
+    runtime_init: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("branding:\n  logo: logo.png\n")
+    assets = tmp_path / "branding-assets"
+    assets.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    missing_app = _build_branding_app(db_uri, tmp_path, "missing")
+
+    payload = _branding_png((25, 100, 200, 255))
+    (assets / "logo.png").write_bytes(payload)
+    recreated_app = _build_branding_app(db_uri, tmp_path, "now-present")
+
+    missing_transport = httpx.ASGITransport(app=missing_app)
+    async with httpx.AsyncClient(
+        transport=missing_transport, base_url="http://test"
+    ) as missing_client:
+        missing_info = (await missing_client.get("/v1/info")).json()["branding"]
+        missing_logo = await missing_client.get("/v1/branding/logo/main")
+
+    recreated_transport = httpx.ASGITransport(app=recreated_app)
+    async with httpx.AsyncClient(
+        transport=recreated_transport, base_url="http://test"
+    ) as recreated_client:
+        recreated_info = (await recreated_client.get("/v1/info")).json()["branding"]
+        recreated_logo = await recreated_client.get("/v1/branding/logo/main")
+
+    assert missing_info["logos"]["main"] is None
+    assert missing_logo.status_code == 404
+    assert recreated_info["logos"]["main"] == "/v1/branding/logo/main"
+    assert recreated_logo.status_code == 200
+    assert recreated_logo.content == payload
+
+
+@pytest.mark.asyncio
+async def test_branding_openapi_declares_binary_images_and_typed_info(
+    client: httpx.AsyncClient,
+) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    logo_response = schema["paths"]["/v1/branding/logo/{variant}"]["get"]["responses"]["200"]
+    assert set(logo_response["content"]) == {
+        "image/gif",
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/x-icon",
+    }
+    assert logo_response["content"]["image/png"]["schema"] == {
+        "type": "string",
+        "format": "binary",
+    }
+
+    info_schema = schema["paths"]["/v1/info"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert info_schema["$ref"].endswith("/ServerInfoResponse")
+    properties = schema["components"]["schemas"]["ServerInfoResponse"]["properties"]
+    assert properties["branding"]["$ref"].endswith("/BrandingInfo")
+    assert properties["accounts_enabled"]["type"] == "boolean"
+
+
 @pytest.mark.asyncio
 async def test_health_bare_returns_status_ok(db_uri: str, tmp_path: Path) -> None:
     """
@@ -471,6 +945,161 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[coding_fork.id]["runner_online"] is False
     # Chat-only fork → still reachable in-process.
     assert sessions[chat_fork.id]["runner_online"] is True
+
+
+def test_generic_credentials_route_does_not_shadow_detected(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The generic ``/hosts/{id}/credentials/{provider}`` route must not shadow
+    the literal ``/hosts/{id}/credentials/detected`` owned by ``create_hosts_router``.
+
+    Regression guard for the mount order: the credentials router carries a
+    ``{provider}`` path param, and Starlette matches routes in registration order
+    with no literal-over-parameter priority. If the credentials router is
+    registered before the hosts router, ``…/credentials/detected`` resolves to the
+    generic handler and the credential-adoption endpoint breaks.
+    """
+    from starlette.routing import Match
+
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    def endpoint_for(path: str) -> str | None:
+        scope = {"type": "http", "method": "GET", "path": path}
+        for route in app.router.routes:
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return getattr(getattr(route, "endpoint", None), "__name__", None)
+        return None
+
+    # The literal wins over the generic {provider} param, and github still routes
+    # to the generic broker handler.
+    assert endpoint_for("/v1/hosts/h1/credentials/detected") == "detect_host_credentials"
+    assert endpoint_for("/v1/hosts/h1/credentials/github") == "host_credential"
+
+
+@pytest.mark.asyncio
+async def test_health_unbound_imported_session_reads_offline(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """
+    An unbound imported transcript reads offline; a plain session online.
+
+    Both are unbound (no runner, no host). The ``omnigent.import.source``
+    label is the difference: an import has no live executor anywhere, so it
+    must launch a runner on a host first and reads ``runner_online: false``
+    (routing the open view to the resume picker). A plain unbound session
+    resumes in-process and stays online. Regression guard for the
+    ``imported`` branch of ``_bulk_session_liveness``.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    imported = conversation_store.create_conversation()
+    conversation_store.set_labels(imported.id, {"omnigent.import.source": "claude"})
+    plain = conversation_store.create_conversation()
+
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        host_store=host_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+    ids = f"{imported.id},{plain.id}"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/health?session_ids={ids}")
+
+    assert resp.status_code == 200
+    sessions = resp.json()["sessions"]
+    # Imported → offline (needs a host). A True here means the unbound branch
+    # ignored the import marker (the pre-fix behavior).
+    assert sessions[imported.id]["runner_online"] is False
+    # Plain unbound session → reachable in-process.
+    assert sessions[plain.id]["runner_online"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_sharded", "status", "code"),
+    [(True, 400, "wrong_replica"), (None, 409, "conflict")],
+)
+async def test_host_route_for_live_host_on_another_replica(
+    db_uri: str,
+    tmp_path: Path,
+    host_sharded: bool | None,
+    status: int,
+    code: str,
+) -> None:
+    """
+    A live host absent from this replica is re-addressable only when sharded.
+
+    The web client retries a host-keyed request without its routing key only
+    on 400 ``wrong_replica``. A 409 on a sharded deployment leaves the new-chat
+    model picker loading for a host that is online on another replica.
+    ``None`` omits ``host_sharded`` to cover the constructor default.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.routes._host_launch import configure_host_sharding
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    # Online and freshly seen, but its tunnel never registered on this replica.
+    host_store.upsert_on_connect(host_id, "laptop", "local")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    sharding = {} if host_sharded is None else {"host_sharded": host_sharded}
+    try:
+        app = create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            host_store=host_store,
+            agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+            **sharding,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.get(f"/v1/hosts/{host_id}/harnesses/claude-native/model-options")
+    finally:
+        configure_host_sharding(False)
+
+    assert resp.status_code == status, resp.text
+    assert resp.json()["error"]["code"] == code
 
 
 @dataclass(frozen=True)
@@ -605,43 +1234,288 @@ def test_ensure_extra_builtin_agents_skips_bad_path_and_seeds_good(
     assert seed_stores.agent_store.get_by_name("does-not-exist") is None
 
 
-def test_ensure_default_qwen_agent_seeds_card(seed_stores: _SeedStores) -> None:
+def test_ensure_default_native_agents_seeds_qwen_card(seed_stores: _SeedStores) -> None:
     """
-    Seeding registers qwen-native-ui as a built-in the picker can render.
+    The native seeding loop registers qwen-native-ui as a picker-renderable built-in.
 
     The new-session picker reads built-ins from ``GET /v1/agents``; without this
     seeder Qwen Code only appears after the ``omnigent qwen`` CLI first registers
     it, so it was absent from the Web UI dropdown.
     """
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+    seeded = seed_stores.agent_store.get_by_name(QWEN_NATIVE_AGENT_NAME)
     assert seeded is not None, "qwen-native-ui was not registered"
-    assert seeded.name == "qwen-native-ui"
+    assert seeded.name == QWEN_NATIVE_AGENT_NAME
     # The bundle must be retrievable, not just referenced.
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
-def test_ensure_default_qwen_agent_is_idempotent(seed_stores: _SeedStores) -> None:
-    """A second seed call is a no-op — startup runs the seeder every boot."""
-    server_app._ensure_default_qwen_agent(
+def test_ensure_default_native_agents_seeds_every_native_agent(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    The loop seeds every ``NATIVE_CODING_AGENTS`` entry under its stable id.
+
+    Guards the whole seeded set (not just one card): each native agent must be
+    registered as a session-scope-NULL built-in, keyed by its name-derived
+    :func:`builtin_agent_id`, with a retrievable bundle. A harness dropped from
+    the loop — or seeded under the wrong name/id — is caught here.
+    """
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
+
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
-    first = seed_stores.agent_store.get_by_name(server_app._QWEN_NATIVE_AGENT_NAME)
+
+    for agent in NATIVE_CODING_AGENTS:
+        seeded = seed_stores.agent_store.get_by_name(agent.agent_name)
+        assert seeded is not None, f"{agent.agent_name} was not registered"
+        assert seeded.id == builtin_agent_id(agent.agent_name)
+        assert seeded.session_id is None, "built-ins must be session-scope NULL"
+        assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_acp_agents_seeds_configured_agent(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured ``acp:<slug>`` agent becomes a picker-renderable built-in.
+
+    This is the ACP analogue of the native seeding: the New-Session picker reads
+    built-ins from ``GET /v1/agents``, so a configured ACP agent must seed to
+    appear — the same way ``opencode-native-ui`` etc. do.
+
+    **What breaks if this fails**: a user with Devin (or any ``acp:`` agent) set
+    up on their machine never sees it in the web picker.
+    """
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    # A display label with a space ("Gemini CLI") must not become the agent name
+    # (spec names are [a-zA-Z0-9_-]+); the slug is used instead.
+    entry = AcpAgentEntry(
+        slug="gemini-cli", name="Gemini CLI", command="gemini --experimental-acp"
+    )
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # No builtin ACP CLI installed, so only the configured agent seeds.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    # Keyed by the slug, not the label.
+    seeded = seed_stores.agent_store.get_by_name("gemini-cli")
+    assert seeded is not None, "configured acp:<slug> agent was not seeded into the picker"
+    assert seed_stores.agent_store.get_by_name("Gemini CLI") is None, (
+        "the invalid space-bearing label must not be used as the agent name"
+    )
+    assert seeded.id == builtin_agent_id("gemini-cli")
+    assert seeded.session_id is None, "built-ins must be session-scope NULL"
+    assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+
+
+def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every builtin ACP CLI row seeds even when no vendor CLI is on this host.
+
+    The vendor CLI runs on the *executing* host (the attached runner), not on the
+    server, so the server's own PATH says nothing about launchability. The picker
+    hides a row the selected host can't run via that host's ``configured_harnesses``
+    readiness map — the same way natives are seeded unconditionally and filtered.
+
+    **What breaks if this fails**: on a remote server (no vendor CLI in its
+    container) Devin and Grok vanish from the New Chat picker even though the Mac
+    runner attached to it has them installed — the row is never seeded, so no
+    per-host filter can bring it back.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    # No vendor CLI resolves here — the remote-server / app-container shape.
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    # Keyed by the catalog id (a valid slug), not the display label.
+    for key in ACP_CLI_HARNESSES:
+        assert seed_stores.agent_store.get_by_name(key) is not None, (
+            f"builtin ACP CLI {key!r} was not seeded"
+        )
+
+
+def test_ensure_default_acp_agents_configured_agent_beats_same_slug_builtin(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured agent whose slug is a builtin row id keeps its own command.
+
+    ``AcpAgentEntry(name="Devin")`` slugifies to ``devin``, which is also a
+    catalog row id, so both sources seed the same :func:`builtin_agent_id`. The
+    row must be skipped rather than seeded second and overwriting the user's
+    entry — while an unrelated row (``grok``) still seeds alongside.
+
+    **What breaks if this fails**: picking "Devin" in the web picker silently
+    runs the fixed row argv (account-default model) instead of the command the
+    user configured, e.g. ``devin acp --model swe-1-7-medium``.
+    """
+    import io
+    import tarfile
+
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+    from omnigent.spec import load
+
+    entry = AcpAgentEntry(slug="devin", name="Devin", command="devin acp --model swe-1-7-medium")
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [entry])
+    # Both vendor CLIs are installed, so the devin row would otherwise seed too.
+    monkeypatch.setattr(
+        "omnigent._platform.resolve_cli_binary", lambda _b, **k: "/usr/local/bin/x"
+    )
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    seeded = seed_stores.agent_store.get_by_name("devin")
+    assert seeded is not None
+    assert seeded.id == builtin_agent_id("devin"), "both sources key the same id"
+    assert seed_stores.agent_store.get_by_name("grok") is not None, (
+        "a non-colliding builtin row must still seed"
+    )
+
+    # Presence is not enough — assert the surviving row launches the *configured*
+    # harness, since the bug was an overwrite that kept the name and lost the spec.
+    bundle = seed_stores.artifact_store.get(seeded.bundle_location)
+    assert bundle is not None
+    dest = tmp_path / "seeded"
+    with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    assert load(dest).executor.config["harness"] == "acp:devin"
+
+
+def test_ensure_default_acp_agents_seeds_no_slug_rows_without_acp_config(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty ``acp:`` block seeds no ``acp:<slug>`` row — only catalog rows.
+
+    Unlike a builtin row, a configured agent's launch command is resolved from the
+    host's own ``acp:`` block at spawn time, so a slug this host never defined could
+    not launch anywhere. Only the fixed catalog rows are host-independent.
+
+    **What breaks if this fails**: the picker grows a row for a slug no config
+    defines, and choosing it fails at spawn with an unresolvable ACP command.
+    """
+    from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+    assert seed_stores.agent_store.get_by_name("kilocode") is None, (
+        "a slug absent from config must not be seeded"
+    )
+    seeded = {
+        key for key in ACP_CLI_HARNESSES if seed_stores.agent_store.get_by_name(key) is not None
+    }
+    assert seeded == set(ACP_CLI_HARNESSES), "catalog rows are host-independent and always seed"
+
+
+def test_ensure_default_acp_agents_survives_unreadable_config(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed ``acp:`` block is skipped, never fatal to server startup."""
+
+    def _boom(*_a: object, **_k: object) -> list[object]:
+        raise ValueError("bad acp: block")
+
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", _boom)
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
+
+    # Must not raise — startup calls this and a bad user config can't take the
+    # whole server down.
+    server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+
+def test_build_acp_bundle_carries_the_harness_id(tmp_path: Path) -> None:
+    """The seeded bundle's spec runs on ``acp:<slug>`` — resolved at spawn.
+
+    **What breaks if this fails**: the picker row exists but launches the wrong
+    (or no) ACP agent because the harness id didn't reach the bundle.
+    """
+    import io
+    import tarfile
+
+    from omnigent.spec import load
+
+    data = server_app._build_acp_bundle(harness="acp:devin", name="devin")
+    dest = tmp_path / "bundle"
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    spec = load(dest)
+    assert spec.name == "devin"
+    assert spec.executor.config["harness"] == "acp:devin"
+
+
+def test_ensure_default_native_agents_raises_when_provider_missing(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native agent with no provider row raises instead of silently unseeding."""
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.setattr(server_app, "native_provider_for_key", lambda _key: None)
+    with pytest.raises(OmnigentError, match="no provider row to seed from"):
+        server_app._ensure_default_native_agents(
+            seed_stores.agent_store,
+            seed_stores.artifact_store,
+            seed_stores.agent_cache,
+        )
+
+
+def test_build_native_bundle_raises_without_materialize_hook() -> None:
+    """A provider missing its ``materialize_agent_spec`` hook raises loudly."""
+    from omnigent.errors import OmnigentError
+    from omnigent.harness_plugins import NativeHarnessProvider
+
+    provider = NativeHarnessProvider(
+        key="ghost",
+        run_native="omnigent.ghost_native:run_ghost_native",
+        auto_create_terminal="omnigent.runner.native:_launch_ghost",
+        input_ready_probe="omnigent.ghost_native.bridge:native_input_ready",
+        materialize_agent_spec=None,
+    )
+    with pytest.raises(OmnigentError, match="no materialize_agent_spec hook"):
+        server_app._build_native_bundle(provider)
+
+
+def test_ensure_default_native_agents_is_idempotent(seed_stores: _SeedStores) -> None:
+    """A second seed call is a no-op — startup runs the seeder every boot."""
+    server_app._ensure_default_native_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    first = seed_stores.agent_store.get_by_name(QWEN_NATIVE_AGENT_NAME)
     assert first is not None
-    server_app._ensure_default_qwen_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
     page = seed_stores.agent_store.list(limit=100)
-    qwen_rows = [a for a in page.data if a.name == "qwen-native-ui"]
+    qwen_rows = [a for a in page.data if a.name == QWEN_NATIVE_AGENT_NAME]
     assert len(qwen_rows) == 1
     assert qwen_rows[0].id == first.id
     assert qwen_rows[0].version == first.version == 1
@@ -677,15 +1551,15 @@ def test_ensure_default_antigravity_agent_seeds_card(seed_stores: _SeedStores) -
     NULL (a built-in) and carry the ``antigravity-native`` harness so the
     runner boots the agy native terminal rather than an SDK harness.
     """
-    server_app._ensure_default_antigravity_agent(
+    server_app._ensure_default_native_agents(
         seed_stores.agent_store,
         seed_stores.artifact_store,
         seed_stores.agent_cache,
     )
 
-    seeded = seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME)
+    seeded = seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME)
     assert seeded is not None, "antigravity-native-ui was not registered"
-    assert seeded.name == "antigravity-native-ui"
+    assert seeded.name == ANTIGRAVITY_NATIVE_AGENT_NAME
     # Built-ins are session-scope NULL so ``GET /v1/agents`` (which filters on
     # ``session_id IS NULL``) returns them to the picker.
     assert seeded.session_id is None
@@ -711,9 +1585,7 @@ def test_ensure_default_agents_includes_antigravity(seed_stores: _SeedStores) ->
         seed_stores.agent_cache,
     )
 
-    assert (
-        seed_stores.agent_store.get_by_name(server_app._ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
-    )
+    assert seed_stores.agent_store.get_by_name(ANTIGRAVITY_NATIVE_AGENT_NAME) is not None
 
 
 def test_ensure_default_polly_agent_is_idempotent(seed_stores: _SeedStores) -> None:
@@ -882,6 +1754,117 @@ def test_ensure_default_polly_agent_repairs_stale_cache(
     repaired = seed_stores.agent_cache.load(agent.id, agent.bundle_location).spec.description
     assert repaired == real_desc
     assert repaired != "STALE CACHED SPEC"
+
+
+def test_ensure_default_polly_agent_repairs_lost_bundle_blob(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    A matching-hash re-seed restores a bundle blob lost from the store.
+
+    The matching-hash fast path trusts the artifact store without
+    checking the blob is present. If the row survives but the bundle is
+    gone (artifacts pruned, or the DB restored without the matching
+    store), every restart re-computes the same hash, matches the stored
+    ``bundle_location``, and returns without re-``put``-ing — so boot can
+    never self-heal and each session launch raises ``failed to load
+    agent spec``. The seeder must re-``put`` on the matching path when
+    the store is missing the blob. Without the fix this test fails: the
+    blob stays absent and the reload raises ``KeyError``.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(agent.bundle_location)
+
+    # Re-seed: source unchanged → hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # The fast path re-put the lost bundle: the store has it again and a
+    # fresh load succeeds instead of raising.
+    assert seed_stores.artifact_store.exists(agent.bundle_location)
+    reloaded = seed_stores.agent_cache.load(agent.id, agent.bundle_location)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == agent.bundle_location
+    assert still.version == agent.version
+
+
+def test_ensure_default_polly_agent_repairs_legacy_prefixed_bundle_location(
+    seed_stores: _SeedStores,
+) -> None:
+    """
+    The lost-blob repair targets the row's own ``bundle_location``, so it
+    also heals a legacy ``ag_``-prefixed one.
+
+    Rows seeded before the binary-uuid migration keep an ``ag_``-prefixed
+    left segment in ``bundle_location`` while ``id`` is bare hex (the
+    migration excluded ``bundle_location`` as a physical artifact key), and
+    they reach the matching-hash path through the sha-segment compare.
+
+    What breaks if this fails: keying the repair off ``f"{id}/{hash}"``
+    probes and writes a key nothing reads, so an upgraded deployment whose
+    built-in blob was pruned keeps raising ``failed to load agent spec`` on
+    every session launch while boot leaves an orphan bundle behind.
+    """
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    agent = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert agent is not None
+    bundle_hash = agent.bundle_location.rsplit("/", 1)[-1]
+    bundle_bytes = seed_stores.artifact_store.get(agent.bundle_location)
+
+    # Rewrite the row into the pre-migration shape: bare-hex id, blob and
+    # location under the ``ag_``-prefixed physical key.
+    legacy_loc = f"ag_{agent.id}/{bundle_hash}"
+    seed_stores.artifact_store.put(legacy_loc, bundle_bytes)
+    seed_stores.artifact_store.delete(agent.bundle_location)
+    legacy = seed_stores.agent_store.update(agent.id, legacy_loc)
+    assert legacy is not None
+
+    # Lose the blob while the row survives, and drop the local cache so
+    # nothing masks the missing bundle at load time.
+    seed_stores.artifact_store.delete(legacy_loc)
+    seed_stores.agent_cache.evict(agent.id)
+    assert not seed_stores.artifact_store.exists(legacy_loc)
+
+    # Re-seed: source unchanged -> hash matches the row (the fast path).
+    server_app._ensure_default_polly_agent(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    # Repaired at the key the loader reads, and nothing written to the
+    # bare-hex key the row does not point at.
+    assert seed_stores.artifact_store.exists(legacy_loc)
+    assert not seed_stores.artifact_store.exists(f"{agent.id}/{bundle_hash}")
+    reloaded = seed_stores.agent_cache.load(agent.id, legacy_loc)
+    assert reloaded.spec is not None
+    # Row untouched on the matching path: same location, no version bump.
+    still = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert still is not None
+    assert still.bundle_location == legacy_loc
+    assert still.version == legacy.version
 
 
 def test_tar_gz_dir_is_order_independent(tmp_path: Path) -> None:
@@ -1145,3 +2128,670 @@ def test_load_debug_routers_collects_entries() -> None:
     _router, prefix, tags = entries[0]
     assert prefix == "/debug"
     assert tags == ["debug"]
+
+
+def test_session_id_from_request_parses_session_path() -> None:
+    """The exception handlers read the session id off the request path.
+
+    A ``/v1/sessions/<id>/…`` path yields the id (threaded into the 500 log so
+    the debug-logs row is correlated); anything else yields ``None``.
+    """
+    from types import SimpleNamespace
+
+    def _req(path: str) -> object:
+        return SimpleNamespace(url=SimpleNamespace(path=path))
+
+    parse = server_app._session_id_from_request
+    assert parse(_req("/v1/sessions/conv_abc/events")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions/conv_abc")) == "conv_abc"  # type: ignore[arg-type]
+    assert parse(_req("/health")) is None  # type: ignore[arg-type]
+    assert parse(_req("/v1/sessions")) is None  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    ``RUNNER_UNAVAILABLE`` logs a stateful WARN; other 5xx keep ERROR.
+
+    Both arms are asserted together because the point is the contrast:
+    downgrading every 5xx would hide genuine faults just as effectively
+    as an offline session's polling buried them.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    handler = app.exception_handlers[OmnigentError]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            "raw_path": b"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        offline = await handler(
+            request,
+            OmnigentError(
+                "runner 'runner_token_x' is offline",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ),
+        )
+        fault = await handler(request, OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
+
+    # The wire contract is untouched: only the log level moves.
+    assert offline.status_code == 503
+    assert fault.status_code == 500
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 2, f"expected one record per error, got {records}"
+    unavailable, internal = records
+    assert unavailable.levelno == logging.WARNING
+    # Raised deliberately from a known site, so a stack adds no information.
+    assert unavailable.exc_info is None
+    assert "Internal error" not in unavailable.getMessage()
+    assert internal.levelno == logging.ERROR
+    assert internal.exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unhandled(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A peer-cancelled backing RPC books a coded WARN 499; real faults keep 500.
+
+    Both arms are asserted together because the point is the contrast: the
+    upstream cancelling an in-flight call (a teardown/restart burst) is an
+    expected, retryable condition that must not read as an ERROR-level
+    ``Unhandled exception``, while a genuinely uncoded fault must keep
+    exactly that booking. The cancelled RPC is a structural stand-in (an
+    exception class literally named ``RpcError`` with a ``code()`` status
+    accessor) because the deployed build vendors grpc — the handler must
+    match shape, not class identity.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import json
+
+    class _Status:
+        name = "CANCELLED"
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+    handler = app.exception_handlers[Exception]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/mas/workspace-tree/children",
+            "raw_path": b"/v1/mas/workspace-tree/children",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        cancelled = await handler(request, RpcError("RPC terminated with CANCELLED"))
+        fault = await handler(request, RuntimeError("boom"))
+
+    # The cancellation answers the coded, retryable 499; the fault keeps 500.
+    assert cancelled.status_code == 499
+    assert json.loads(cancelled.body)["error"]["code"] == "upstream_cancelled"
+    assert fault.status_code == 500
+    assert json.loads(fault.body)["error"]["code"] == "internal_error"
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 2, f"expected one record per exception, got {records}"
+    upstream, unhandled = records
+    assert upstream.levelno == logging.WARNING
+    assert not upstream.getMessage().startswith("Unhandled exception:")
+    assert unhandled.levelno == logging.ERROR
+    assert unhandled.getMessage().startswith("Unhandled exception:")
+
+
+async def test_missing_conversation_is_a_404_not_an_unhandled_error(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A store's not-found error must answer 404, not book an internal error.
+
+    ``ConversationNotFoundError`` documents that "the route layer must return a
+    typed 404", but with no handler registered it fell through to the catch-all
+    and was logged as ``Unhandled exception`` with an ``internal_error`` 500 —
+    so a caller referencing a deleted parent conversation read as a server
+    fault and counted against the mid-session error rate.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import json
+
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    handler = app.exception_handlers[ConversationNotFoundError]
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/sessions",
+            "raw_path": b"/v1/sessions",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+        response = await handler(
+            request, ConversationNotFoundError("parent conversation 776940532653827 not found")
+        )
+
+    assert response.status_code == 404
+    assert json.loads(response.body)["error"]["code"] == "not_found"
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 1, f"expected exactly one record, got {records}"
+    # Traced, but not as a fault.
+    assert records[0].levelno == logging.INFO
+    assert not records[0].getMessage().startswith("Unhandled exception:")
+
+
+# ---------------------------------------------------------------------------
+# _on_runner_connect logging behaviour
+# ---------------------------------------------------------------------------
+
+
+def _build_minimal_app(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[FastAPI, dict[str, object]]:
+    """Create a minimal ``create_app`` instance and capture ``_on_runner_connect``.
+
+    Patches ``create_runner_tunnel_router`` to snag the callback before it is
+    buried in the tunnel route's closure, then calls ``create_app`` with real
+    SQLite stores. Returns the app and a dict with key ``"callback"`` set to
+    the captured async function.
+    """
+    import omnigent.server.app as app_module
+    from omnigent.server.app import create_app
+    from omnigent.server.routes.runner_tunnel import (
+        create_runner_tunnel_router as real_create_router,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    captured: dict[str, object] = {}
+
+    def _capture_router(*args: object, **kwargs: object) -> object:
+        captured["callback"] = kwargs.get("on_runner_connect")
+        return real_create_router(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app_module, "create_runner_tunnel_router", _capture_router)
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+    return app, captured
+
+
+def _bind_sessions(db_uri: str, runner_id: str, count: int = 1) -> list[str]:
+    """Create *count* sessions bound to *runner_id* and return their ids."""
+    from omnigent.db.utils import generate_agent_id
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore as _AgentStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore as _ConvStore,
+    )
+
+    agent = _AgentStore(db_uri).create(generate_agent_id(), "test", "loc")
+    conv_store = _ConvStore(db_uri)
+    ids = []
+    for _ in range(count):
+        conv = conv_store.create_conversation(agent_id=agent.id)
+        conv_store.set_runner_id(conv.id, runner_id)
+        ids.append(conv.id)
+    return ids
+
+
+def _attach_live_connection(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, runner_id: str
+) -> object:
+    """Make the tunnel registry report a live connection and stub relay helpers."""
+    import types
+
+    import omnigent.server.routes.sessions as sessions_routes
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    connection = types.SimpleNamespace(generation=1)
+    monkeypatch.setattr(app.state.tunnel_registry, "get", lambda _rid: connection)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay", lambda *a, **k: None)
+    monkeypatch.setattr(sessions_routes, "prefetch_session_routing_catalogs", lambda *a, **k: None)
+    monkeypatch.setattr(sessions_routes, "_publish_runner_recovered_status", _noop_async)
+    monkeypatch.setattr(
+        app.state.runner_session_initializer, "require_generation", lambda *a, **k: None
+    )
+    return connection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["runner_unavailable", "wrong_replica"])
+async def test_on_runner_connect_offline_runner_logs_warning_without_traceback(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    code: str,
+) -> None:
+    """A runner that dropped again before resolution is a WARNING, not an ERROR."""
+    from omnigent.errors import OmnigentError
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_offline_test"
+    conv_ids = _bind_sessions(db_uri, runner_id, count=2)
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    calls: list[str] = []
+
+    def _raise_offline(conv_id: str, **_kwargs: object) -> object:
+        calls.append(conv_id)
+        raise OmnigentError(
+            f"runner {runner_id!r} is offline for conversation {conv_id!r}",
+            code=code,
+        )
+
+    app.state.runner_router.client_for_session_resources = _raise_offline  # type: ignore[assignment]
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert sorted(calls) == sorted(conv_ids)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    offline = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", "") == "runner_reconnect_client_offline"
+    ]
+    assert len(offline) == 2
+    assert all(r.levelno == logging.WARNING and r.exc_info is None for r in offline)
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_other_resolve_error_keeps_exception(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Non-offline OmnigentError codes still log ERROR with a traceback."""
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_not_found_test"
+    _bind_sessions(db_uri, runner_id)
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+
+    def _raise_not_found(conv_id: str, **_kwargs: object) -> object:
+        raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
+
+    app.state.runner_router.client_for_session_resources = _raise_not_found  # type: ignore[assignment]
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "Failed to resolve runner client" in errors[0].getMessage()
+    assert errors[0].exc_info is not None
+
+
+async def _reconnect_with_initialize(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    initialize: Callable[..., Awaitable[httpx.Response]],
+) -> list[logging.LogRecord]:
+    """Run one reconnect whose session initialization is *initialize*."""
+    from omnigent.runner.routing import RoutedRunner
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_reassign_test"
+    _bind_sessions(db_uri, runner_id)
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", initialize)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
+    return [r for r in caplog.records if r.name == "omnigent.server.app"]
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle trees attach on reconnect without starting runner runtimes."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions.orchestration import (
+        _ensure_runner_session_initialized,
+    )
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_idle_reconnect_test"
+    idle_id, archived_id, active_parent_id, orphan_parent_id = _bind_sessions(
+        db_uri, runner_id, count=4
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    idle = store.get_conversation(idle_id)
+    archived = store.get_conversation(archived_id)
+    active_parent = store.get_conversation(active_parent_id)
+    orphan_parent = store.get_conversation(orphan_parent_id)
+    assert idle is not None and archived is not None
+    assert active_parent is not None and orphan_parent is not None
+    store.set_session_live_status(idle.id, "idle")
+    store.set_session_live_status(archived.id, "running")
+    store.update_conversation(archived.id, archived=True)
+    store.set_session_live_status(active_parent.id, "idle")
+    active_child = store.create_conversation(
+        agent_id=active_parent.agent_id,
+        runner_id=runner_id,
+        kind="sub_agent",
+        parent_conversation_id=active_parent.id,
+    )
+    store.set_session_live_status(active_child.id, "running")
+    store.set_session_live_status(orphan_parent.id, "idle")
+    idle_child = store.create_conversation(
+        agent_id=orphan_parent.agent_id,
+        runner_id=runner_id,
+        kind="sub_agent",
+        parent_conversation_id=orphan_parent.id,
+    )
+    store.set_session_live_status(idle_child.id, "idle")
+    orphan = store.create_conversation(
+        agent_id=orphan_parent.agent_id,
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=idle_child.id,
+    )
+    store.set_session_live_status(orphan.id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    initialized: list[tuple[str, bool]] = []
+
+    async def _initialize(conv: Conversation, *_a: object, **kwargs: object) -> httpx.Response:
+        initialized.append((conv.id, bool(kwargs.get("suppress_recovery_turn"))))
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert set(initialized) == {
+        (active_parent.id, False),
+        (orphan_parent.id, False),
+        (active_child.id, False),
+        (idle_child.id, True),
+        (orphan.id, False),
+    }
+    initialized_ids = [session_id for session_id, _ in initialized]
+    assert initialized_ids.index(active_parent.id) < initialized_ids.index(active_child.id)
+    assert initialized_ids.index(orphan_parent.id) < initialized_ids.index(idle_child.id)
+    assert initialized_ids.index(idle_child.id) < initialized_ids.index(orphan.id)
+    assert store.get_conversation(orphan.id).runner_id == runner_id  # type: ignore[union-attr]
+
+    refreshed_idle = store.get_conversation(idle.id)
+    assert refreshed_idle is not None
+    initialized_on_demand = await _ensure_runner_session_initialized(
+        idle.id,
+        refreshed_idle,
+        routed.client,
+        store,
+        app.state.runner_session_initializer,
+        suppress_recovery_turn=True,
+        require_success=True,
+    )
+
+    assert initialized_on_demand is True
+    assert initialized[-1] == (idle.id, True)
+    assert all(session_id != archived.id for session_id, _ in initialized)
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Reconnect logs runner_session_init_deferred event with reason for idle/archived sessions."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_deferred_event_test"
+    idle_id, archived_id, active_id = _bind_sessions(db_uri, runner_id, count=3)
+    store = SqlAlchemyConversationStore(db_uri)
+    idle = store.get_conversation(idle_id)
+    archived = store.get_conversation(archived_id)
+    active = store.get_conversation(active_id)
+    assert idle is not None and archived is not None and active is not None
+    store.set_session_live_status(idle.id, "idle")
+    store.set_session_live_status(archived.id, "running")
+    store.update_conversation(archived.id, archived=True)
+    store.set_session_live_status(active.id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+        await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    deferred_events = [
+        r
+        for r in caplog.records
+        if r.name == "omnigent.server.app"
+        and getattr(r, "event_name", "") == "runner_session_init_deferred"
+    ]
+    # Check we have events for idle and archived sessions, but not active
+    assert len(deferred_events) == 2
+    messages = {r.getMessage() for r in deferred_events}
+    # Verify both idle and archived session IDs appear in the logs with the right reason
+    assert any(f"session={idle.id}" in msg and "reason=idle" in msg for msg in messages)
+    assert any(f"session={archived.id}" in msg and "reason=archived" in msg for msg in messages)
+    # Verify active session does not have a deferred event
+    assert not any(f"session={active.id}" in msg for msg in messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
+async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_read: str,
+) -> None:
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_scan_failure_test"
+    root_id, other_id = _bind_sessions(db_uri, runner_id, count=2)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(root_id, "idle")
+    store.set_session_live_status(other_id, "idle")
+    orphan = store.create_conversation(
+        agent_id=store.get_conversation(root_id).agent_id,  # type: ignore[union-attr]
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=root_id,
+    )
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    attached: list[str] = []
+    initialized: list[str] = []
+    monkeypatch.setattr(
+        sessions_routes,
+        "_ensure_runner_relay",
+        lambda session_id, *_a, **_k: attached.append(session_id),
+    )
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        initialized.append(conv.id)
+        return httpx.Response(201, request=httpx.Request("POST", "http://runner/v1/sessions"))
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    original = getattr(SqlAlchemyConversationStore, failed_read)
+    failed = False
+
+    def _fail_once(self: SqlAlchemyConversationStore, *args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if not failed and (
+            failed_read != "get_conversations"
+            or (isinstance(args[0], list) and orphan.id in args[0])
+        ):
+            failed = True
+            raise RuntimeError("child scan unavailable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, failed_read, _fail_once)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert failed
+    assert set(attached) == {root_id, other_id}
+    assert set(initialized) == {root_id, other_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [ConnectionError("tunnel closed"), httpx.ConnectError("tunnel closed")],
+)
+async def test_on_runner_connect_reassign_transport_loss_logs_warning(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+) -> None:
+    """Transport loss while re-assigning is a WARNING without a traceback."""
+
+    async def _initialize(*_a: object, **_k: object) -> httpx.Response:
+        raise error
+
+    records = await _reconnect_with_initialize(db_uri, tmp_path, monkeypatch, caplog, _initialize)
+    assert not [r for r in records if r.levelno >= logging.ERROR]
+    [lost] = [
+        r
+        for r in records
+        if getattr(r, "event_name", "") == "runner_reconnect_reassign_lost_tunnel"
+    ]
+    assert lost.levelno == logging.WARNING
+    assert lost.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_reassign_agent_removed_is_not_an_error(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The 410 removed-agent response returns quietly."""
+    from omnigent.errors import ErrorCode
+
+    async def _initialize(*_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            410,
+            json={"error": ErrorCode.SESSION_AGENT_MISSING},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    records = await _reconnect_with_initialize(db_uri, tmp_path, monkeypatch, caplog, _initialize)
+    assert not [r for r in records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "level"),
+    [(503, logging.WARNING), (404, logging.WARNING), (500, logging.ERROR)],
+)
+async def test_on_runner_connect_reassign_http_status_levels(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    level: int,
+) -> None:
+    """Transient statuses warn; unexpected ones stay ERROR with status and body."""
+
+    async def _initialize(*_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            status,
+            json={"error": "runner said no"},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    records = await _reconnect_with_initialize(db_uri, tmp_path, monkeypatch, caplog, _initialize)
+    [row] = [
+        r for r in records if getattr(r, "event_name", "") == "runner_reconnect_reassign_rejected"
+    ]
+    assert row.levelno == level
+    assert row.exc_info is None
+    assert f"HTTP {status}: runner said no" in row.getMessage()

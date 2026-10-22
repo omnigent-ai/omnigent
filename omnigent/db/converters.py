@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from omnigent.db.db_models import SqlAgent
-from omnigent.db.enum_codecs import AGENT_KIND
+from omnigent.db.enum_codecs import AGENT_KIND, decode_agent_kind
 from omnigent.entities import Agent
 
 
@@ -27,5 +27,7 @@ def sql_agent_to_entity(row: SqlAgent, session_id: str | None = None) -> Agent:
         version=row.version,
         description=row.description,
         updated_at=row.updated_at,
-        session_id=None if row.kind == AGENT_KIND["template"] else session_id,
+        session_id=None if row.kind == AGENT_KIND["server"] else session_id,
+        created_by=row.created_by,
+        kind=decode_agent_kind(row.kind),
     )

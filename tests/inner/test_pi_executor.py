@@ -1,18 +1,21 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import itertools
 import json
 import logging
 import os
+import shlex
 import shutil
 import socket
 import tempfile
 import textwrap
 import unittest
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 
@@ -29,8 +32,11 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.pi_executor import (
     PiExecutor,
+    PiSubprocessConfig,
     _build_models_json,
+    _databricks_model_wire_catalog,
     _generate_extension_js,
+    _only_configured_family,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
@@ -39,7 +45,25 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+
+def _cancel_all_tasks(loop):
+    """Cancel and drain leftover tasks, the way :func:`asyncio.run` does.
+
+    A task still pending when the loop closes has its callbacks invoked
+    against a dead loop and raises "Event loop is closed" from the loop's
+    exception handler. Under pytest-xdist that surfaces as an INTERNALERROR
+    which kills the whole worker instead of failing one test.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
 def _run(coro):
@@ -47,8 +71,11 @@ def _run(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -316,13 +343,14 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
     sanitized_args = _sanitize_schema(params)["properties"]["args"]
 
-    # Structured fields the purpose guard and the per-dispatch model
-    # override read must survive the collapse.
+    # Structured fields the purpose guard and the per-dispatch model /
+    # reasoning-effort overrides read must survive the collapse.
     assert sanitized_args["type"] == "object"
     assert set(sanitized_args["properties"]) == {
         "input",
         "purpose",
         "model",
+        "reasoning_effort",
         "file_ids",
         "cost_budget",
     }
@@ -341,7 +369,41 @@ def test_sanitize_real_sys_session_send_args_collapses_to_object() -> None:
 
 class TestPiProviderForModel(unittest.TestCase):
     def test_gpt_model(self):
-        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks")
+        self.assertEqual(_pi_provider_for_model("databricks-gpt-5-4-mini"), "databricks-openai")
+
+    def test_catalog_chat_only_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+            "databricks",
+        )
+
+    def test_catalog_responses_gpt_model(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "databricks-gpt-next",
+                frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+            ),
+            "databricks-openai",
+        )
+
+    def test_generic_provider_uses_configured_wire(self):
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="chat",
+            ),
+            "databricks-completions",
+        )
+        self.assertEqual(
+            _pi_provider_for_model(
+                "gpt-next",
+                generic_openai_wire_api="responses",
+            ),
+            "databricks-openai",
+        )
 
     def test_claude_model(self):
         self.assertEqual(
@@ -463,14 +525,24 @@ class TestBuildModelsJson(unittest.TestCase):
         entry = next(e for e in provider["models"] if e["id"] == model)
         self.assertNotIn("reasoning", entry)
 
-    def test_static_model_declared_image_capable(self):
-        # #516 review: a STATIC (pre-registered) vision model must also
-        # advertise image input. The dynamic-registration append is gated on
-        # the model not already being listed, so a default model like GPT-5.4
-        # (openai-completions) or Claude would otherwise keep an input-less
-        # entry and have its images stripped.
-        for model in ("databricks-gpt-5-4", "databricks-claude-opus-4-8"):
-            result = _build_models_json("https://host.example.com", "tok", model=model)
+    def test_catalog_model_declared_image_capable(self):
+        # A pre-registered catalog model must advertise image input. The
+        # selected-model append is skipped when the id is already listed.
+        for model, wire_api in (
+            ("databricks-gpt-catalog", ModelWireAPI.OPENAI_RESPONSES),
+            ("databricks-claude-catalog", ModelWireAPI.ANTHROPIC_MESSAGES),
+        ):
+            catalog_model = ModelEntry(
+                id=model,
+                family="openai",
+                metadata=ModelMetadata(wire_apis=frozenset({wire_api})),
+            )
+            result = _build_models_json(
+                "https://host.example.com",
+                "tok",
+                model=model,
+                catalog_models=(catalog_model,),
+            )
             provider = result["providers"][_pi_provider_for_model(model)]
             entry = next(e for e in provider["models"] if e["id"] == model)
             self.assertEqual(entry.get("input"), ["text", "image"], model)
@@ -548,6 +620,72 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertEqual(p["databricks"]["baseUrl"], "https://openrouter.ai/api/v1")
         self.assertEqual(p["databricks-completions"]["baseUrl"], "https://openrouter.ai/api/v1")
 
+    def test_generic_openai_providers_include_auth_header(self):
+        # Generic (non-Databricks) OpenAI-compatible gateways expect
+        # ``Authorization: Bearer <token>``.  The "databricks" and
+        # "databricks-completions" provider entries must carry
+        # ``authHeader: True`` so Pi sends that header rather than the
+        # Databricks-native auth scheme which the gateway does not recognise
+        # (resulting in a 401 "Missing Authentication header").
+        result = _build_models_json(
+            "https://host.example.com",
+            "tok",
+            {"openai": "https://openrouter.ai/api/v1"},
+        )
+        p = result["providers"]
+        self.assertTrue(p["databricks"].get("authHeader"), "databricks entry missing authHeader")
+        self.assertTrue(
+            p["databricks-completions"].get("authHeader"),
+            "databricks-completions entry missing authHeader",
+        )
+
+    def test_databricks_native_providers_omit_auth_header(self):
+        # On the Databricks-native path (no openai base_url), the "databricks"
+        # and "databricks-completions" entries must NOT carry ``authHeader``
+        # (the workspace endpoint uses a different auth scheme).
+        result = _build_models_json("https://host.example.com", "tok")
+        p = result["providers"]
+        self.assertNotIn("authHeader", p["databricks"])
+        self.assertNotIn("authHeader", p["databricks-completions"])
+
+    def test_generic_openai_model_uses_configured_responses_wire(self):
+        result = _build_models_json(
+            "https://unused.example.com",
+            "tok",
+            {"openai": "https://gateway.example.com/v1"},
+            model="vendor/model-next",
+            openai_wire_api="responses",
+        )
+
+        responses = result["providers"]["databricks-openai"]
+        self.assertEqual(responses["baseUrl"], "https://gateway.example.com/v1")
+        self.assertIn("vendor/model-next", [entry["id"] for entry in responses["models"]])
+
+    def test_dedicated_gateway_uses_catalog_wire_and_workspace_chat_url(self):
+        result = _build_models_json(
+            "https://workspace.cloud.databricks.com",
+            "tok",
+            {
+                "openai": "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+            },
+            model="databricks-gpt-next",
+            model_wire_apis={
+                "databricks-gpt-next": frozenset({ModelWireAPI.OPENAI_CHAT}),
+            },
+            openai_wire_api="responses",
+        )
+
+        chat = result["providers"]["databricks"]
+        self.assertEqual(
+            chat["baseUrl"],
+            "https://workspace.cloud.databricks.com/serving-endpoints",
+        )
+        self.assertIn("databricks-gpt-next", [entry["id"] for entry in chat["models"]])
+        self.assertEqual(
+            result["providers"]["databricks-openai"]["baseUrl"],
+            "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+        )
+
     def test_api_key_set(self):
         result = _build_models_json("https://host.example.com", "mytoken")
         for prov in result["providers"].values():
@@ -561,6 +699,170 @@ class TestBuildModelsJson(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # _generate_extension_js tests
 # ---------------------------------------------------------------------------
+
+
+def test_anthropic_only_family_routes_non_claude_model_to_anthropic_surface():
+    # A provider configuring only an anthropic family (a vendor whose
+    # anthropic-wire endpoint also fronts non-Claude-named models, e.g.
+    # moonshot serving kimi at /anthropic) must route a non-claude model to
+    # that configured surface. Routing by name token instead sent the model
+    # to the completions provider against a fabricated /serving-endpoints
+    # path that only exists on a Databricks workspace, so the vendor
+    # answered 404 url.not_found.
+    result = _build_models_json(
+        "https://api.moonshot.ai",
+        "tok",
+        {"claude": "https://api.moonshot.ai/anthropic"},
+        model="kimi-k2.7-code",
+    )
+    p = result["providers"]
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "kimi-k2.7-code" in anthropic_ids
+    assert p["databricks-anthropic"]["baseUrl"] == "https://api.moonshot.ai/anthropic"
+    for name, provider in p.items():
+        if name != "databricks-anthropic":
+            ids = [e.get("id") for e in provider.get("models", [])]
+            assert "kimi-k2.7-code" not in ids, name
+
+
+def test_openai_only_family_routes_claude_named_model_to_openai_surface():
+    # Symmetric: a provider configuring only an openai family that serves a
+    # Claude-named id (a LiteLLM-style passthrough) must keep that model on
+    # the configured openai surface. The name heuristic sent it to the
+    # anthropic provider against a fabricated /serving-endpoints/anthropic
+    # path. Configured families win over name tokens in both directions.
+    result = _build_models_json(
+        "https://gw.example.com",
+        "tok",
+        {"openai": "https://gw.example.com/v1"},
+        model="claude-k2.7",
+    )
+    p = result["providers"]
+    completions_ids = [e.get("id") for e in p["databricks-completions"]["models"]]
+    assert "claude-k2.7" in completions_ids
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "claude-k2.7" not in anthropic_ids
+
+
+def test_databricks_claude_only_gateway_keeps_gpt_on_responses_surface():
+    # The cli-config Databricks path serializes only the gateway's Anthropic
+    # surface (workflow._apply_cli_config_databricks_to_pi), yet the same
+    # workspace serves GPT on the derived /ai-gateway/codex/v1 Responses
+    # surface. One *serialized* family is not one *served* surface there, so
+    # a lone Databricks URL must not pin an explicit GPT override onto the
+    # Anthropic Messages endpoint.
+    result = _build_models_json(
+        "https://ws.cloud.databricks.com",
+        "tok",
+        {"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"},
+        model="databricks-gpt-5-5",
+    )
+    p = result["providers"]
+    responses_ids = [e.get("id") for e in p["databricks-openai"]["models"]]
+    assert "databricks-gpt-5-5" in responses_ids
+    assert (
+        p["databricks-openai"]["baseUrl"] == "https://ws.cloud.databricks.com/ai-gateway/codex/v1"
+    )
+    anthropic_ids = [e.get("id") for e in p["databricks-anthropic"]["models"]]
+    assert "databricks-gpt-5-5" not in anthropic_ids
+    # Claude keeps the configured gateway surface.
+    assert (
+        p["databricks-anthropic"]["baseUrl"]
+        == "https://ws.cloud.databricks.com/ai-gateway/anthropic"
+    )
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "expected"),
+    [
+        # Generic single-family vendors pin, in both directions.
+        ({"claude": "https://api.moonshot.ai/anthropic"}, "claude"),
+        ({"openai": "https://gw.example.com/v1"}, "openai"),
+        # Both families (or neither) configured: routing unchanged.
+        ({"claude": "https://a.example.com", "openai": "https://b.example.com/v1"}, None),
+        ({"claude": ""}, None),
+        ({}, None),
+        (None, None),
+        # A lone Databricks gateway URL never pins: workspace-hosted path form
+        # and dedicated ai-gateway host form.
+        ({"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"}, None),
+        ({"openai": "https://ws.cloud.databricks.com/ai-gateway/codex/v1"}, None),
+        ({"claude": "https://ws.ai-gateway.cloud.databricks.com/anthropic"}, None),
+    ],
+)
+def test_only_configured_family_pins_generic_vendors_only(base_urls, expected):
+    assert _only_configured_family(base_urls) == expected
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "model", "expected_provider"),
+    [
+        # Generic anthropic-only vendor fronting a non-Claude id.
+        (
+            {"claude": "https://api.moonshot.ai/anthropic"},
+            "kimi-k2.7-code",
+            "databricks-anthropic",
+        ),
+        # Generic openai-only passthrough serving a Claude-named id.
+        ({"openai": "https://gw.example.com/v1"}, "claude-k2.7", "databricks-completions"),
+        # Databricks cli-config shape: lone claude URL, explicit GPT override
+        # stays on the Responses surface.
+        (
+            {"claude": "https://ws.cloud.databricks.com/ai-gateway/anthropic"},
+            "databricks-gpt-5-5",
+            "databricks-openai",
+        ),
+    ],
+)
+def test_ensure_rpc_launch_selector_matches_registration(base_urls, model, expected_provider):
+    """The launch-time ``provider/<model>`` selector agrees with models.json.
+
+    Drives the REAL ``_ensure_rpc`` for a gateway executor with only the
+    subprocess spawn stubbed and checks the selector handed to
+    ``_PiRpcSession.start`` names the same provider ``_build_models_json``
+    registered the model under, so the two decision points cannot drift.
+    """
+    lone_url = next(iter(base_urls.values()))
+    parsed = urlparse(lone_url)
+    host = f"{parsed.scheme}://{parsed.netloc}"
+
+    registered = _build_models_json(host, "tok", base_urls, model=model)["providers"]
+    assert model in [e.get("id") for e in registered[expected_provider]["models"]]
+    for name, provider in registered.items():
+        if name != expected_provider:
+            assert model not in [e.get("id") for e in provider["models"]], name
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.inner.pi_executor._fetch_shell_command_token", return_value="tok"),
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host=host,
+            base_urls_override=base_urls,
+            gateway_auth_command="printf tok",
+        )
+
+    seen: dict[str, object] = {}
+
+    async def fake_start(self, pi_path, **kwargs):
+        seen["model"] = kwargs.get("model")
+
+    async def _test():
+        with (
+            patch.object(_PiRpcSession, "start", fake_start),
+            patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})),
+            patch.object(
+                executor,
+                "_build_env_and_dir",
+                return_value=PiSubprocessConfig(env={}, tmp_dir="", extra_args=[]),
+            ),
+        ):
+            await executor._ensure_rpc("session", "system", model, [])
+
+    _run(_test())
+
+    assert seen["model"] == f"{expected_provider}/{model}"
 
 
 class TestGenerateExtensionJs(unittest.TestCase):
@@ -706,7 +1008,7 @@ class TestToolServer(unittest.TestCase):
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 stdout, stderr = await proc.communicate()
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -827,7 +1129,10 @@ class TestToolServer(unittest.TestCase):
 
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
-                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
+                    "tags": {1, 2, 3},
+                }
 
             server._tool_executor = executor
 
@@ -861,7 +1166,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -881,8 +1186,12 @@ class TestToolServer(unittest.TestCase):
             server = _ToolServer()
             await server.start()
 
-            async def executor(name, args):
-                return {"when": datetime(2026, 6, 18, 12, 0, 0), "tags": {1, 2, 3}}
+            async def executor(name, args, *, call_id=None):
+                self.assertEqual(call_id, "call-1")
+                return {
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
+                    "tags": {1, 2, 3},
+                }
 
             server._tool_executor = executor
             try:
@@ -1225,6 +1534,7 @@ class TestPiRpcSession(unittest.TestCase):
             payload = "x" * (70 * 1024)
             event = {
                 "type": "tool_execution_end",
+                "toolCallId": "pi_add",
                 "toolName": "large_result",
                 "isError": False,
                 "result": {"content": payload},
@@ -1286,6 +1596,52 @@ class TestPiRpcSession(unittest.TestCase):
 
         _run(_test())
 
+    def test_stdout_at_eof_false_while_reader_running(self):
+        # A read_line timeout while the reader is alive is idle, not EOF.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+            try:
+                self.assertIsNone(await rpc.read_line(timeout=0.05))
+                self.assertFalse(rpc.stdout_at_eof())
+            finally:
+                rpc._read_task.cancel()
+                await asyncio.gather(rpc._read_task, return_exceptions=True)
+
+        _run(_test())
+
+    def test_stdout_at_eof_true_when_reader_finished_or_absent(self):
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            # Never started (spawn failed) — nothing more can arrive.
+            self.assertTrue(rpc.stdout_at_eof())
+            # Finished reader (process exited, pipe closed).
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
+    def test_stdout_at_eof_false_until_buffered_lines_drained(self):
+        # A finished reader with lines still queued is not EOF yet: the
+        # buffered output (and the None sentinel) must be drained first.
+        async def _test():
+            rpc = _PiRpcSession()
+            rpc._line_queue = asyncio.Queue()
+            rpc._line_queue.put_nowait('{"type": "agent_end"}')
+            rpc._line_queue.put_nowait(None)
+            rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertEqual(await rpc.read_line(timeout=0.05), '{"type": "agent_end"}')
+            self.assertFalse(rpc.stdout_at_eof())
+            self.assertIsNone(await rpc.read_line(timeout=0.05))
+            self.assertTrue(rpc.stdout_at_eof())
+
+        _run(_test())
+
 
 # ---------------------------------------------------------------------------
 # PiExecutor constructor tests
@@ -1312,6 +1668,7 @@ class TestPiExecutorConstructor(unittest.TestCase):
             ),
         ):
             executor = PiExecutor(gateway=True)
+            _run(executor._get_gateway_token())
         self.assertTrue(executor._gateway)
         self.assertEqual(executor._databricks_host, "https://h.example.com")
         self.assertEqual(executor._databricks_token, "tok")
@@ -1349,8 +1706,11 @@ class TestPiExecutorConstructor(unittest.TestCase):
                 gateway_auth_command="printf token",
             )
 
+            fetch_command_token.assert_not_called()
+            _run(executor._get_gateway_token())
+
         read_cfg.assert_not_called()
-        fetch_command_token.assert_called_once_with("printf token")
+        fetch_command_token.assert_awaited_once_with("printf token")
         self.assertEqual(executor._databricks_host, "https://example.databricks.com")
         self.assertEqual(executor._databricks_token, "command-token")
         self.assertEqual(
@@ -1364,8 +1724,9 @@ class TestPiExecutorConstructor(unittest.TestCase):
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.pi_executor._read_databrickscfg", return_value=None),
         ):
-            with self.assertRaises(EnvironmentError):
-                PiExecutor(gateway=True)
+            executor = PiExecutor(gateway=True)
+            with self.assertRaisesRegex(OSError, "authentication returned no token"):
+                _run(executor._get_gateway_token())
 
     def test_constructor_with_model_override(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -1535,8 +1896,11 @@ class TestBuildEnvAndDir(unittest.TestCase):
             ),
         ):
             executor = PiExecutor(gateway=True)
+            _run(executor._get_gateway_token())
 
-        config = executor._build_env_and_dir([], None, None, None)
+        config = executor._build_env_and_dir(
+            [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+        )
         try:
             self.assertIn("PI_CODING_AGENT_DIR", config.env)
             managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
@@ -1608,8 +1972,11 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         ),
     ):
         executor = PiExecutor(gateway=True)
+        _run(executor._get_gateway_token())
 
-    config = executor._build_env_and_dir([], None, None, None)
+    config = executor._build_env_and_dir(
+        [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+    )
     try:
         managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
         settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
@@ -1731,6 +2098,218 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("credential_source", ["command", "profile"])
+async def test_gateway_refresh_reuses_process_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_source: str
+) -> None:
+    from omnigent.inner import pi_executor
+
+    if not shutil.which("node"):
+        pytest.skip("node is required for the generated credential client")
+    private_dir = tmp_path / "Pi's config"
+    private_dir.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "pi-agent")
+    monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
+    current_token = "initial-token"
+
+    async def fetch_token(_):
+        return current_token
+
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch_token)
+    monkeypatch.setattr(
+        pi_executor,
+        "_read_databrickscfg",
+        lambda _: (
+            DatabricksCredentials(host="https://example.test", token=current_token)
+            if current_token
+            else None
+        ),
+    )
+
+    async def start(rpc, *args, **kwargs):
+        rpc.process = _FakeProcess()
+
+    monkeypatch.setattr(_PiRpcSession, "start", start)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        model="mock-model",
+        gateway_host="https://example.test" if credential_source == "command" else None,
+        gateway_auth_command="get-token" if credential_source == "command" else None,
+        gateway_auth_refresh_interval_ms="0",
+    )
+    monkeypatch.setattr(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={}))
+    try:
+        events = [e async for e in executor.run_turn([], [], "")]
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        rpc = executor._session_states["__default__"].rpc
+        agent_dir = Path(rpc._tmp_dir)
+        assert agent_dir.stat().st_mode & 0o777 == 0o700
+        assert (agent_dir / "gateway-auth.cjs").stat().st_mode & 0o777 == 0o600
+        assert (agent_dir / "gateway-auth.json").stat().st_mode & 0o777 == 0o600
+        models_text = (agent_dir / "models.json").read_text()
+        bridge_token = executor._tool_server.token
+        assert bridge_token not in models_text
+        assert bridge_token not in (agent_dir / "gateway-auth.cjs").read_text()
+        command = next(iter(json.loads(models_text)["providers"].values()))["apiKey"][1:]
+        for current_token in (
+            "initial-token",
+            "!literal-$TOKEN-$(no-execution)",
+            None,
+            "recovered-token",
+        ):
+            # Run the actual JS client asynchronously so the parent can serve it.
+            process = await asyncio.create_subprocess_shell(
+                command, stdout=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), 10)
+            assert bool(process.returncode == 0) is bool(current_token)
+            assert stdout.decode() == (current_token or "")
+            events = [e async for e in executor.run_turn([], [], "")]
+            assert bool([e for e in events if isinstance(e, ExecutorError)]) is (
+                current_token is None
+            )
+            assert executor._session_states["__default__"].rpc is rpc
+            if current_token:
+                assert current_token not in models_text
+    finally:
+        server = executor._tool_server
+        await executor.close()
+    assert not agent_dir.exists()
+    assert not server._clients
+
+
+@pytest.mark.parametrize("interval", [None, "100", "0"])
+async def test_gateway_cache_honors_ttl_and_serializes_refresh(monkeypatch, interval):
+    from omnigent.inner import pi_executor
+
+    fetch = AsyncMock(return_value="first")
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="get-token",
+        gateway_auth_refresh_interval_ms=interval,
+    )
+    # Use a controlled monotonic clock only for this cache-policy test.
+    clock = SimpleNamespace(monotonic=lambda: now)
+    monkeypatch.setattr(pi_executor, "time", clock)
+    now = 100.0
+    assert await executor._get_gateway_token() == "first"
+    fetch.reset_mock()
+    fetch.return_value = "rotated"
+    if interval != "0":
+        assert await executor._get_gateway_token() == "first"
+        fetch.assert_not_called()
+        now += (900 if interval is None else 0.1) + 0.001
+    assert (
+        await asyncio.gather(*(executor._get_gateway_token() for _ in range(3))) == ["rotated"] * 3
+    )
+    assert fetch.call_count == (3 if interval == "0" else 1)
+    now += 901
+    fetch.side_effect = RuntimeError("secret must not leak")
+    with pytest.raises(OSError, match="credential refresh failed") as failure:
+        await executor._get_gateway_token()
+    assert "secret" not in str(failure.value)
+    fetch.side_effect = None
+    fetch.return_value = "recovered"
+    assert await executor._get_gateway_token() == "recovered"
+
+
+@pytest.mark.parametrize("interval", ["-1", "nonsense"])
+def test_gateway_rejects_invalid_refresh_interval(interval):
+    with pytest.raises(ValueError):
+        PiExecutor(pi_path="/usr/bin/pi", gateway_auth_refresh_interval_ms=interval)
+
+
+@pytest.mark.parametrize(
+    ("command", "error"),
+    [
+        ("printf secret; printf secret >&2; exit 1", "command failed"),
+        ("printf '  '", "empty token"),
+        ("sleep 30 & wait", "timed out"),
+    ],
+)
+async def test_gateway_helper_failure_is_bounded_and_redacted(monkeypatch, command, error):
+    from omnigent.inner import pi_executor
+
+    if error == "timed out":
+        monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.05)
+    with pytest.raises(OSError, match=error) as failure:
+        await pi_executor._fetch_shell_command_token(command)
+    assert "secret" not in str(failure.value)
+
+
+async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
+    pid_file = tmp_path / "helper pid"
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=f"echo $$ > {shlex.quote(str(pid_file))}; sleep 30 & wait",
+    )
+    assert not pid_file.exists(), "construction must not run a blocking auth helper"
+    port = await executor._ensure_tool_server([])
+    server = executor._tool_server
+    try:
+        for token in (None, server.token + "wrong"):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(json.dumps({"kind": "gateway_auth", "token": token}).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline())["error"] == "unauthorized"
+            writer.close()
+            await writer.wait_closed()
+        assert not pid_file.exists(), "unauthenticated requests must not resolve credentials"
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(json.dumps({"kind": "gateway_auth", "token": server.token}).encode() + b"\n")
+        await writer.drain()
+        async with asyncio.timeout(3):
+            while not pid_file.exists():
+                await asyncio.sleep(0.01)
+        pid = int(pid_file.read_text())
+    finally:
+        await asyncio.wait_for(executor.close(), 3)
+    assert await reader.read() == b""
+    writer.close()
+    await writer.wait_closed()
+    assert not server._clients
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+async def test_gateway_profile_timeout_does_not_publish_a_late_result(monkeypatch):
+    import threading
+
+    from omnigent.inner import pi_executor
+
+    release = threading.Event()
+    finished = threading.Event()
+
+    def resolve(_):
+        release.wait(timeout=2)
+        finished.set()
+        return DatabricksCredentials(host="https://example.test", token="late-token")
+
+    monkeypatch.setattr(pi_executor, "_read_databrickscfg", resolve)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 0.05)
+    executor = PiExecutor(pi_path="/usr/bin/pi", gateway=True, model="mock-model")
+    try:
+        events = [e async for e in executor.run_turn([], [], "")]
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [
+            "Pi gateway credential refresh timed out"
+        ]
+        assert not executor._session_states
+        assert executor._databricks_token == ""
+    finally:
+        release.set()
+        await executor.close()
+    assert await asyncio.to_thread(finished.wait, timeout=1)
+    assert executor._databricks_token == ""
+    assert executor._gateway_refresh_after == 0
+
+
 class TestRunTurn(unittest.TestCase):
     def _make_executor(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -1843,11 +2422,17 @@ class TestRunTurn(unittest.TestCase):
             lines = [
                 json.dumps({"type": "response", "success": True}),
                 json.dumps(
-                    {"type": "tool_execution_start", "toolName": "add", "args": {"a": 1, "b": 2}}
+                    {
+                        "type": "tool_execution_start",
+                        "toolCallId": "pi_add",
+                        "toolName": "add",
+                        "args": {"a": 1, "b": 2},
+                    }
                 ),
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "add",
                         "isError": False,
                         "result": {"sum": 3},
@@ -1960,6 +2545,120 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
+    def test_stdout_idle_timeout_during_long_tool_call_keeps_waiting(self):
+        """A silent (>idle budget) tool call must not end the turn.
+
+        The stdout read times out repeatedly while pi's reader is still
+        running (long tool call producing no output); the turn must keep
+        waiting and complete when the final answer eventually arrives,
+        instead of dying with 'Pi process ended without response.'.
+        """
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+            # A live reader task: pi is running, just silent.
+            fake_rpc._read_task = asyncio.create_task(asyncio.sleep(30))
+
+            async def feed_after_delay():
+                # Stay silent across several idle-timeout windows (the
+                # patched budget is 0.05s), then deliver the turn.
+                await asyncio.sleep(0.3)
+                for line in (
+                    json.dumps({"type": "response", "success": True}),
+                    json.dumps(
+                        {
+                            "type": "message_update",
+                            "assistantMessageEvent": {
+                                "type": "text_delta",
+                                "delta": "Done after long tool",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "agent_end", "messages": []}),
+                ):
+                    fake_rpc._line_queue.put_nowait(line)
+
+            feeder = asyncio.create_task(feed_after_delay())
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            try:
+                with patch(
+                    "omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S",
+                    0.05,
+                ):
+                    events = [
+                        e
+                        async for e in executor.run_turn(
+                            [{"role": "user", "content": "run the long task"}],
+                            [],
+                            "system",
+                        )
+                    ]
+            finally:
+                feeder.cancel()
+                fake_rpc._read_task.cancel()
+                await asyncio.gather(fake_rpc._read_task, return_exceptions=True)
+
+            errors = [e for e in events if isinstance(e, ExecutorError)]
+            self.assertEqual(
+                errors,
+                [],
+                f"idle timeout with a live pi process ended the turn: {errors}",
+            )
+            turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+            self.assertEqual(len(turn_complete), 1)
+            self.assertEqual(turn_complete[0].response, "Done after long tool")
+
+        _run(_test())
+
+    def test_stdout_eof_from_finished_reader_still_errors(self):
+        """A real pi death (reader finished, None sentinel) still errors."""
+
+        async def _test():
+            executor = self._make_executor()
+
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc._line_queue.put_nowait(None)  # reader's EOF sentinel
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            fake_rpc.process.stdin = _FakeStreamWriter()
+            fake_rpc._stderr_lines = []
+            # Finished reader: the process exited and stdout closed.
+            fake_rpc._read_task = asyncio.create_task(asyncio.sleep(0))
+            await asyncio.sleep(0.01)
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+
+            events = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hello"}],
+                    [],
+                    "system",
+                )
+            ]
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], ExecutorError)
+            self.assertIn("Pi process ended without response", events[0].message)
+
+        _run(_test())
+
     def test_agent_end_extracts_response_from_messages(self):
         """When no text deltas were streamed, response is extracted from agent_end messages."""
 
@@ -2026,6 +2725,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "fail_tool",
                         "isError": True,
                         "result": "Something broke",
@@ -2186,6 +2886,7 @@ class TestRunTurn(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "sys_os_shell",
                         "isError": False,
                         "result": {"content": [{"type": "text", "text": "ok"}]},
@@ -2270,6 +2971,192 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
 
     executor._ensure_rpc = fake_ensure_rpc
     return executor
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+async def test_pi_native_tool_results_survive_adapter_and_persistence(is_error: bool) -> None:
+    """Native results pair by Pi ID, including overlapping calls of the same tool."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    starts = [
+        {
+            "type": "tool_execution_start",
+            "toolCallId": cid,
+            "toolName": "read",
+            "args": {"path": cid},
+        }
+        for cid in ("read_a", "read_b")
+    ]
+    ends = [
+        {
+            "type": "tool_execution_end",
+            "toolCallId": cid,
+            "toolName": "read",
+            "isError": is_error,
+            "result": {"content": [{"type": "text", "text": f"result_{cid}"}]},
+        }
+        for cid in ("read_b", "read_a")
+    ]
+    executor = _executor_with_scripted_rpc(
+        [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+    )
+    adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
+    queue = asyncio.Queue()
+    ctx = TurnContext("turn_pi", queue, asyncio.Event())
+    persisted = []
+    live = []
+    async for event in executor.run_turn([{"role": "user", "content": "read files"}], [], ""):
+        adapter._translate_event(event, ctx)
+        while not queue.empty():
+            wire = queue.get_nowait().model_dump()
+            live.append(wire["item"])
+            item = _extract_persistent_item_from_sse(wire, response_id=ctx.response_id)
+            if item is not None:
+                persisted.append(item)
+
+    assert [item["status"] for item in live[:2]] == ["in_progress", "in_progress"]
+    assert [(item.type, item.data.call_id) for item in persisted] == [
+        ("function_call", "read_b"),
+        ("function_call_output", "read_b"),
+        ("function_call", "read_a"),
+        ("function_call_output", "read_a"),
+    ]
+    assert all(item.response_id == "turn_pi" for item in persisted)
+    for item in persisted:
+        if item.type == "function_call_output":
+            assert f"result_{item.data.call_id}" in item.data.output
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_calls
+
+
+@pytest.mark.parametrize("callback_first", [False, True])
+async def test_pi_bridge_correlates_out_of_order_tcp_and_stdout(callback_first: bool) -> None:
+    """TCP callbacks keep their own IDs even before stdout or in reverse call order."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes._sessions.helpers import _extract_persistent_item_from_sse
+
+    starts = [
+        {
+            "type": "tool_execution_start",
+            "toolCallId": cid,
+            "toolName": "sys_os_shell",
+            "args": {"command": cid},
+        }
+        for cid in ("shell_a", "shell_b")
+    ]
+    ends = [
+        {
+            "type": "tool_execution_end",
+            "toolCallId": cid,
+            "toolName": "sys_os_shell",
+            "result": {"result": cid},
+        }
+        for cid in ("shell_b", "shell_a")
+    ]
+    executor = _executor_with_scripted_rpc(
+        [json.dumps(e) for e in [*starts, *ends, {"type": "agent_end", "messages": []}]]
+    )
+    adapter = ExecutorAdapter(lambda: executor, harness_label="Pi")
+    queue = asyncio.Queue()
+    ctx = TurnContext("turn_pi", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "Pi"
+    server = _ToolServer()
+    server._tool_executor = adapter._stable_tool_executor
+    await server.start()
+    stream = executor.run_turn(
+        [{"role": "user", "content": "run commands"}], [{"name": "sys_os_shell"}], ""
+    )
+    wire_events = []
+
+    async def call_tool(cid: str) -> dict:
+        reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+        try:
+            writer.write(
+                (
+                    json.dumps(
+                        {
+                            "id": f"tcp_{cid}",
+                            "token": server.token,
+                            "call_id": cid,
+                            "tool": "sys_os_shell",
+                            "args": {"command": cid},
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            await writer.drain()
+            return json.loads(await asyncio.wait_for(reader.readline(), timeout=5))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def dispatch(cid: str) -> None:
+        task = asyncio.create_task(call_tool(cid))
+        try:
+            while True:
+                wire = (await asyncio.wait_for(queue.get(), timeout=5)).model_dump()
+                wire_events.append(wire)
+                item = wire["item"]
+                if item.get("status") == "action_required":
+                    assert item["call_id"] == cid
+                    assert json.loads(item["arguments"]) == {"command": cid}
+                    break
+            assert ctx._complete_tool(cid, json.dumps({"result": cid}))
+            response = await asyncio.wait_for(task, timeout=5)
+            assert response == {"id": f"tcp_{cid}", "result": {"result": cid}}
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        if not callback_first:
+            for _ in starts:
+                adapter._translate_event(await anext(stream), ctx)
+        for cid in ("shell_b", "shell_a"):
+            await dispatch(cid)
+        async for event in stream:
+            adapter._translate_event(event, ctx)
+        while not queue.empty():
+            wire_events.append(queue.get_nowait().model_dump())
+    finally:
+        await stream.aclose()
+        await server.stop()
+
+    persisted = [
+        item
+        for wire in wire_events
+        if (item := _extract_persistent_item_from_sse(wire, response_id=ctx.response_id))
+        is not None
+    ]
+    assert [(item.type, item.data.call_id) for item in persisted] == [
+        ("function_call", "shell_b"),
+        ("function_call_output", "shell_b"),
+        ("function_call", "shell_a"),
+        ("function_call_output", "shell_a"),
+    ]
+    assert not adapter._pending_mcp_call_ids
+    assert not adapter._observed_tool_calls
+    if callback_first:
+        assert not any(wire["item"].get("status") == "in_progress" for wire in wire_events)
+
+
+@pytest.mark.parametrize("call_id", [None, "", 123])
+async def test_pi_ignores_tool_events_without_correlation_id(call_id) -> None:
+    """Malformed tool events must not create cards whose results can never pair."""
+    executor = _executor_with_scripted_rpc(
+        [
+            json.dumps({"type": kind, "toolCallId": call_id, "toolName": "read"})
+            for kind in ("tool_execution_start", "tool_execution_end")
+        ]
+        + [json.dumps({"type": "agent_end", "messages": []})]
+    )
+    events = [e async for e in executor.run_turn([{"role": "user", "content": "read"}], [], "")]
+    assert not any(isinstance(e, (ToolCallRequest, ToolCallComplete)) for e in events)
 
 
 def test_pi_thinking_deltas_stream_as_reasoning_chunks() -> None:
@@ -2635,6 +3522,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": {"blocked": True, "reason": "Policy blocked it"},
@@ -2657,6 +3545,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": {"content": [{"type": "text", "text": blocked_json}]},
@@ -2678,6 +3567,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": True,
                         "result": json.dumps({"blocked": True, "reason": "Denied"}),
@@ -2700,6 +3590,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "ping",
                         "isError": False,  # top-level is False!
                         "result": {
@@ -2724,6 +3615,7 @@ class TestBlockedToolDetection(unittest.TestCase):
                 json.dumps(
                     {
                         "type": "tool_execution_end",
+                        "toolCallId": "pi_add",
                         "toolName": "fail",
                         "isError": True,
                         "result": "Connection refused",
@@ -2853,6 +3745,270 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
     assert _resolve_pi_skill_args(["alpha"], None) == ["--no-skills"]
 
 
+def test_resolve_pi_skill_args_finds_pi_native_skills_layout(tmp_path: Path) -> None:
+    """``skills_filter='all'`` surfaces a skill shipped in Pi's own ``.pi/skills/<name>/``
+    layout via ``--skill``.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    pi_skills_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(pi_skills_root, "grilling")
+
+    args = _resolve_pi_skill_args("all", bundle)
+
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert str(pi_skills_root / "grilling") in paths, (
+        f"bundle skill under .pi/skills/ was not exposed via --skill; got args={args}"
+    )
+
+
+def test_resolve_pi_skill_args_named_subset_spans_both_skill_roots(tmp_path: Path) -> None:
+    """A named filter resolves skills from ``skills/`` and ``.pi/skills/``
+    alike, and ``skills/`` wins when both roots ship the same name.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    flat_root = bundle / "skills"
+    pi_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(flat_root, "shared")
+    _make_pi_skill_dir(pi_root, "shared")
+    _make_pi_skill_dir(pi_root, "grilling")
+
+    args = _resolve_pi_skill_args(["grilling", "shared", "missing"], bundle)
+
+    assert args[0] == "--no-skills"
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert paths == [str(pi_root / "grilling"), str(flat_root / "shared")], f"got {paths}"
+
+
+def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> None:
+    """Each bundled extension entry point is passed via ``--extension`` so bundled extensions
+    load regardless of Pi's cwd.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_args
+
+    bundle = tmp_path / "bundle"
+    marker_dir = bundle / ".pi" / "extensions" / "marker"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "index.js").write_text("module.exports = function () {};\n")
+
+    assert _resolve_pi_bundle_extension_args(bundle) == [
+        "--extension",
+        str(marker_dir / "index.js"),
+    ]
+    assert _resolve_pi_bundle_extension_args(None) == []
+    assert _resolve_pi_bundle_extension_args(tmp_path / "no-extensions") == []
+
+
+def test_resolve_pi_bundle_extension_entries_discovery_shapes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
+    files, subdir ``index.ts`` over ``index.js``, ``package.json``
+    ``pi.extensions`` manifests over index files (file entries inside the
+    extension dir only), dotfiles and ``node_modules`` skipped. A broken
+    manifest falls back to the index file with a warning.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    ext_root.mkdir(parents=True)
+    (ext_root / "flat.js").write_text("module.exports = function () {};\n")
+    (ext_root / ".hidden.js").write_text("skip me\n")
+    (ext_root / "node_modules").mkdir()
+    (ext_root / "node_modules" / "index.js").write_text("skip me\n")
+    ts_dir = ext_root / "a-ts-ext"
+    ts_dir.mkdir()
+    (ts_dir / "index.ts").write_text("export default function () {}\n")
+    (ts_dir / "index.js").write_text("compiled; index.ts must win\n")
+    manifest_dir = ext_root / "b-manifest-ext"
+    manifest_dir.mkdir()
+    (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
+    (manifest_dir / "index.js").write_text("manifest entry must win\n")
+    (manifest_dir / "lib").mkdir()
+    broken_dir = ext_root / "c-broken-manifest"
+    broken_dir.mkdir()
+    (broken_dir / "package.json").write_text("{not json")
+    (broken_dir / "index.js").write_text("module.exports = function () {};\n")
+    (tmp_path / "outside.js").write_text("must never be loaded\n")
+    (manifest_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "pi": {
+                    "extensions": [
+                        "lib",
+                        "../../../outside.js",
+                        str(tmp_path / "outside.js"),
+                        "main.js",
+                    ]
+                }
+            }
+        )
+    )
+    (ext_root / "empty-dir").mkdir()
+
+    with caplog.at_level(logging.WARNING):
+        entries = _resolve_pi_bundle_extension_entries(ext_root)
+
+    assert entries == [
+        ts_dir / "index.ts",
+        manifest_dir / "main.js",
+        broken_dir / "index.js",
+        ext_root / "flat.js",
+    ], f"got {entries}"
+    assert "could not read extension manifest" in caplog.text
+    assert caplog.text.count("skipping manifest extension entry") == 3
+
+
+def test_resolve_pi_bundle_extension_entries_root_entry_wins(tmp_path: Path) -> None:
+    """An entry point directly under ``.pi/extensions`` makes that directory
+    the single extension, so child directories are not scanned — as in Pi.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    child = ext_root / "child"
+    child.mkdir(parents=True)
+    (child / "index.js").write_text("module.exports = function () {};\n")
+    (ext_root / "index.js").write_text("module.exports = function () {};\n")
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "index.js"]
+
+    (ext_root / "main.js").write_text("module.exports = function () {};\n")
+    (ext_root / "package.json").write_text(json.dumps({"pi": {"extensions": ["main.js"]}}))
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "main.js"]
+
+
+def test_read_pi_bundle_context_follows_pi_candidate_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bundle-root context file is read by content in Pi's own precedence order; a missing,
+    blank or undecodable file yields nothing, the last with a warning instead of failing
+    executor construction.
+    """
+    from omnigent.inner.pi_executor import _read_pi_bundle_context
+
+    assert _read_pi_bundle_context(None) is None
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.md").write_text("   \n")
+    assert _read_pi_bundle_context(bundle) is None
+
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+    assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Override guidance."
+
+    (bundle / "AGENTS.override.md").write_bytes(b"Caf\xe9 guidance\n")
+    with caplog.at_level(logging.WARNING):
+        assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+    assert "could not read bundle context file" in caplog.text
+    (bundle / "AGENTS.md").unlink()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.override.md").unlink()
+    (bundle / "CLAUDE.md").write_text("Claude guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Claude guidance."
+
+
+def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
+    """The bundle-root context file is an automatic context file: it is dropped with
+    ``context_files=False`` and not appended twice when the composed instructions
+    already carry it (``instructions: AGENTS.md``).
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        enabled = PiExecutor(bundle_dir=bundle)
+        disabled = PiExecutor(bundle_dir=bundle, context_files=False)
+
+    assert enabled._with_bundle_context("Agent prompt.") == (
+        "Agent prompt.\n\nBundle guidance marker."
+    )
+    assert enabled._with_bundle_context("") == "Bundle guidance marker."
+    adopted = "Bundle guidance marker.\n\nFramework notes."
+    assert enabled._with_bundle_context(adopted) == adopted
+    reflowed = "Bundle   guidance\nmarker.\n\nFramework notes."
+    assert enabled._with_bundle_context(reflowed) == reflowed
+    # Quoting the text inside other instructions is not adoption.
+    quoted = 'Agent prompt. Sample wording, not policy: "Bundle guidance marker."'
+    assert enabled._with_bundle_context(quoted) == f"{quoted}\n\nBundle guidance marker."
+    assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
+    assert "--no-context-files" in disabled._extra_args
+
+    # Parser-adopted AGENTS.md and Pi's AGENTS.override.md context must both survive.
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        layered = PiExecutor(bundle_dir=bundle)
+    assert layered._with_bundle_context(adopted) == f"{adopted}\n\nOverride guidance."
+
+
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_pi_subprocess_receives_bundle_resources_from_session_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system_prompt_mode: str
+) -> None:
+    """Pi discovers ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md`` relative
+    to its cwd, so the executor must pass bundle resources explicitly while
+    keeping the session workspace as cwd. The bundle context travels in the one
+    content-bearing prompt flag of the active mode.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    ext_entry = bundle / ".pi" / "extensions" / "ext" / "index.ts"
+    ext_entry.parent.mkdir(parents=True)
+    ext_entry.write_text("export default function (pi) {}\n")
+    skill_dir = _make_pi_skill_dir(bundle / ".pi" / "skills", "grilling")
+    (bundle / "AGENTS.md").write_text("BUNDLE_CONTEXT_MARKER: answer like a pirate.\n")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProcess()
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(
+            cwd=str(workspace), bundle_dir=bundle, system_prompt_mode=system_prompt_mode
+        )
+
+    async def _drive() -> None:
+        with patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})):
+            try:
+                await executor._ensure_rpc("session", "You are the bundle agent.", "gpt-4o", [])
+            finally:
+                await executor.close()
+
+    _run(_drive())
+
+    assert captured["cwd"] == str(workspace), "pi must keep the session workspace as its cwd"
+    argv = list(captured["argv"])
+    pairs = list(itertools.pairwise(argv))
+    assert ("--extension", str(ext_entry)) in pairs, f"got argv={argv}"
+    assert ("--skill", str(skill_dir)) in pairs, f"got argv={argv}"
+    composed = "You are the bundle agent.\n\nBUNDLE_CONTEXT_MARKER: answer like a pirate."
+    prompt_values = [
+        argv[i + 1]
+        for i, tok in enumerate(argv)
+        if tok in ("--system-prompt", "--append-system-prompt")
+    ]
+    if system_prompt_mode == "append":
+        assert "--system-prompt" not in argv
+        assert prompt_values == [composed]
+    else:
+        assert argv[argv.index("--system-prompt") + 1] == composed
+        # Replace mode keeps its empty append, which suppresses APPEND_SYSTEM.md.
+        assert prompt_values == [composed, ""]
+
+
 # ---------------------------------------------------------------------------
 # Databricks gateway default-model + models.json parity tests — the pi
 # mirror of the claude-sdk default plumbing. The ucode-cached
@@ -2868,8 +4024,12 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     the shared Databricks default instead of ``None``.
 
     Failure means pi falls back to its own host default — an
-    Anthropic-direct id the Databricks AI gateway rejects, surfacing as a
+    Anthropic-direct id the Databricks Unity Gateway rejects, surfacing as a
     model error on the agent's first turn.
+
+    Live discovery is stubbed unavailable so the resolver drops to the bundled
+    catalog (its documented last resort); the discovery-first path is covered
+    by ``test_profile_gateway_uses_discovered_model``.
     """
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
@@ -2879,9 +4039,42 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
         ),
     ):
         executor = PiExecutor(gateway=True)
-    assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
-        "catalog-databricks-claude-default"
-    )
+    with patch(
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+        side_effect=RuntimeError("live listing unavailable"),
+    ):
+        assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
+            "catalog-databricks-claude-default"
+        )
+
+
+def test_profile_gateway_uses_discovered_model() -> None:
+    """Unset model resolves to the workspace's live Claude model, not the catalog.
+
+    ``_resolve_model`` prefers the live Unity Catalog listing (via the shared
+    claude-sdk resolver, walking ``opus > sonnet > haiku > fable``) over the
+    bundled ``databricks-*`` catalog default.
+    """
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+            return_value=SimpleNamespace(families={"opus": "system.ai.claude-opus-5"}),
+        ),
+    ):
+        resolved = _run(executor._resolve_model(ExecutorConfig(model=None)))
+    assert resolved == "system.ai.claude-opus-5"
 
 
 def test_catalog_default_is_registered_in_models_json() -> None:
@@ -2893,8 +4086,13 @@ def test_catalog_default_is_registered_in_models_json() -> None:
             "omnigent.inner.pi_executor._read_databrickscfg",
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
+        # Live discovery unavailable → the bundled catalog default is used.
         patch(
-            "omnigent.model_catalog.resolve_catalog_model",
+            "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
+            side_effect=RuntimeError("live listing unavailable"),
+        ),
+        patch(
+            "omnigent.models.model_catalog.resolve_catalog_model",
             return_value=SimpleNamespace(model_id=catalog_default),
         ),
     ):
@@ -2927,6 +4125,157 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
     ):
         executor = PiExecutor(gateway=True, model="databricks-gpt-5-4")
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) == "databricks-gpt-5-4"
+
+
+def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
+    """Pi reuses UC availability and enriches aliases with MLflow limits."""
+    responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    entries = (
+        ModelEntry(
+            id="system.ai.gpt-next",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=responses),
+        ),
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            return_value=entries,
+        ) as fetch,
+        patch(
+            "omnigent.models.model_catalog.catalog_model_entries",
+            return_value=(
+                ModelEntry(
+                    id="databricks-gpt-next",
+                    family="openai",
+                    metadata=ModelMetadata(
+                        context_window=400_000,
+                        max_output_tokens=128_000,
+                    ),
+                ),
+            ),
+        ) as enrich,
+    ):
+        executor = PiExecutor(gateway=True)
+        first = _run(executor._load_gateway_model_wire_apis())
+        second = _run(executor._load_gateway_model_wire_apis())
+
+    assert first["databricks-gpt-next"] == responses
+    assert second is first
+    assert executor._gateway_model_entries is not None
+    assert executor._gateway_model_entries[0].metadata.context_window == 400_000
+    assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+    enrich.assert_called_once_with("databricks")
+
+
+def test_gateway_wire_catalog_failure_is_cached() -> None:
+    """A catalog outage does not delay every later Pi subprocess startup."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            side_effect=OSError("offline"),
+        ) as fetch,
+    ):
+        executor = PiExecutor(gateway=True)
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_called_once_with("https://h.example.com", "tok")
+
+
+def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> None:
+    """MLflow downtime does not erase workspace-discovered picker models."""
+    entries = (
+        ModelEntry(
+            id="system.ai.gpt-live",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES})),
+        ),
+    )
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._read_databrickscfg",
+            return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
+        ),
+        patch(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            return_value=entries,
+        ),
+        patch(
+            "omnigent.models.model_catalog.catalog_model_entries",
+            side_effect=OSError("offline"),
+        ),
+    ):
+        executor = PiExecutor(gateway=True)
+        wire_catalog = _run(executor._load_gateway_model_wire_apis())
+
+    assert wire_catalog["system.ai.gpt-live"] == frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    assert executor._gateway_model_entries == entries
+
+
+def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
+    """Dedicated gateway hosts resolve their workspace before UC discovery."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="gateway-token",
+        ),
+        patch(
+            "omnigent.harnesses.pi_native.credentials.resolve_databricks_workspace",
+            return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
+        ),
+        patch(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            return_value=(),
+        ) as fetch,
+        patch("omnigent.models.model_catalog.catalog_model_entries", return_value=()),
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://123.ai-gateway.cloud.databricks.com",
+            base_urls_override={"claude": "https://123.ai-gateway.cloud.databricks.com/anthropic"},
+            gateway_auth_command="printf token",
+        )
+        _run(executor._load_gateway_model_wire_apis())
+
+    fetch.assert_called_once_with(
+        "https://workspace.cloud.databricks.com",
+        "gateway-token",
+    )
+
+
+def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
+    """A generic provider must not receive Databricks workspace API requests."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.inner.pi_executor._fetch_shell_command_token",
+            return_value="provider-key",
+        ),
+        patch("omnigent.models.model_catalog.fetch_databricks_model_service_entries") as fetch,
+    ):
+        executor = PiExecutor(
+            gateway=True,
+            gateway_host="https://anthropic.example.com",
+            base_urls_override={"claude": "https://anthropic.example.com/v1"},
+            gateway_auth_command="printf token",
+        )
+        assert _run(executor._load_gateway_model_wire_apis()) == {}
+
+    fetch.assert_not_called()
 
 
 def test_ucode_gateway_host_path_does_not_inject_default_model() -> None:
@@ -2965,50 +4314,109 @@ def test_non_gateway_path_does_not_inject_default_model() -> None:
     assert _run(executor._resolve_model(ExecutorConfig(model=None))) is None
 
 
-def test_models_json_lists_only_gateway_verified_models() -> None:
-    """
-    The hardcoded model lists match the set verified live against the
-    Databricks gateway endpoint metadata and the API paths pi uses
-    (Anthropic Messages for Claude, OpenAI-compatible serving endpoints for
-    GPT).
-
-    Failure direction matters: a missing working id silently shrinks pi's
-    model menu; a reintroduced broken id (``sonnet-4-5-v2`` rejects
-    Anthropic passthrough, the llama endpoint 404s) fails at request time
-    for anyone who selects it.
-    """
-    models = _build_models_json("https://host.example.com", "tok")
+def test_models_json_lists_only_live_gateway_models() -> None:
+    """Pi's picker mirrors live workspace models and their wire surfaces."""
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.claude-catalog",
+            family="claude",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES})),
+        ),
+        ModelEntry(
+            id="databricks-gpt-chat-catalog",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT})),
+        ),
+        ModelEntry(
+            id="system.ai.gpt-responses-catalog",
+            family="openai",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES})),
+        ),
+        ModelEntry(
+            id="system.ai.llama-catalog",
+            family="other",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT})),
+        ),
+    )
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        catalog_models=catalog_models,
+    )
     providers = models["providers"]
     anthropic_ids = [m["id"] for m in providers["databricks-anthropic"]["models"]]
-    assert anthropic_ids == [
-        "databricks-claude-opus-4-8",
-        "databricks-claude-sonnet-4-6",
-        "databricks-claude-sonnet-4-5",
-    ]
-    # Older GPT models (no tool-rejection via /chat/completions) → completions.
+    assert anthropic_ids == ["system.ai.claude-catalog"]
     openai_completions_ids = [m["id"] for m in providers["databricks"]["models"]]
-    assert openai_completions_ids == [
-        "databricks-gpt-5-4-mini",
-        "databricks-gpt-5-4",
-    ]
-    # Newer GPT → responses API. Kimi/inkling/Qwen3 registered dynamically only.
+    assert openai_completions_ids == ["databricks-gpt-chat-catalog"]
     openai_responses_ids = [m["id"] for m in providers["databricks-openai"]["models"]]
-    assert openai_responses_ids == [
-        "databricks-gpt-5-5",
-        "databricks-gpt-5-5-pro",
+    assert openai_responses_ids == ["system.ai.gpt-responses-catalog"]
+    assert [m["id"] for m in providers["databricks-mlflow"]["models"]] == [
+        "system.ai.llama-catalog"
     ]
-    # The llama serving endpoint no longer exists; the provider stays as
-    # the routing home for future non-Claude/GPT endpoints.
-    assert providers["databricks-completions"]["models"] == []
 
 
-def test_models_json_uses_oss_verified_gpt_55_caps() -> None:
-    """GPT-5.5 endpoint metadata on the OSS profile advertises 128K output."""
-    models = _build_models_json("https://host.example.com", "tok")
+def test_models_json_attributes_only_unity_gateway_providers() -> None:
+    """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+    providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
+
+    attributed = {name for name, provider in providers.items() if "headers" in provider}
+    assert attributed == {"databricks-openai", "databricks-mlflow"}
+    assert providers["databricks-openai"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+
+
+def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:
+    """An offline catalog never sends a newly released GPT to Chat by guess."""
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model="databricks-gpt-uncatalogued",
+    )
+
+    assert models["providers"]["databricks"]["models"] == []
+    assert [model["id"] for model in models["providers"]["databricks-openai"]["models"]] == [
+        "databricks-gpt-uncatalogued",
+    ]
+
+
+def test_databricks_wire_catalog_indexes_system_and_endpoint_aliases() -> None:
+    """UC system ids supply wire metadata for serving-endpoint aliases."""
+    wire_apis = frozenset({ModelWireAPI.OPENAI_RESPONSES})
+    catalog = _databricks_model_wire_catalog(
+        [
+            ModelEntry(
+                id="system.ai.gpt-next",
+                family="openai",
+                metadata=ModelMetadata(wire_apis=wire_apis),
+            )
+        ]
+    )
+
+    assert catalog["system.ai.gpt-next"] == wire_apis
+    assert catalog["databricks-gpt-next"] == wire_apis
+
+
+def test_models_json_uses_catalog_token_limits() -> None:
+    """MLflow-enriched token limits are rendered into Pi's schema."""
+    catalog_model = ModelEntry(
+        id="databricks-gpt-catalog",
+        family="openai",
+        metadata=ModelMetadata(
+            context_window=400_000,
+            max_output_tokens=128_000,
+            wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+        ),
+    )
+    models = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        catalog_models=(catalog_model,),
+    )
     by_id = {m["id"]: m for m in models["providers"]["databricks-openai"]["models"]}
-    for model_id in ("databricks-gpt-5-5", "databricks-gpt-5-5-pro"):
-        assert by_id[model_id]["contextWindow"] == 400000
-        assert by_id[model_id]["maxTokens"] == 128000
+    assert by_id["databricks-gpt-catalog"]["contextWindow"] == 400_000
+    assert by_id["databricks-gpt-catalog"]["maxTokens"] == 128_000
 
 
 if __name__ == "__main__":
@@ -3055,26 +4463,62 @@ def test_build_models_json_registers_unknown_model_with_routed_provider() -> Non
     )
 
 
-def test_build_models_json_known_model_not_duplicated_and_lists_not_mutated() -> None:
-    """A model already in a static list is not re-registered, and the static
-    module-level lists never absorb a run's model id.
-
-    The second build (no model) must not contain the first build's foreign
-    id — if it does, the registration mutated the shared module-level list
-    instead of rebinding, leaking one run's model into every later
-    subprocess config.
-    """
+def test_build_models_json_known_catalog_model_not_duplicated() -> None:
+    """The selected model is not appended when live discovery listed it."""
+    model_id = "databricks-claude-catalog"
+    catalog_models = (
+        ModelEntry(
+            id=model_id,
+            family="claude",
+            metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES})),
+        ),
+    )
     result = _build_models_json(
-        "https://host.example.com", "tok", model="databricks-claude-sonnet-4-6"
+        "https://host.example.com",
+        "tok",
+        model=model_id,
+        catalog_models=catalog_models,
     )
     anthropic_ids = [m["id"] for m in result["providers"]["databricks-anthropic"]["models"]]
-    # Exactly one entry for the already-listed id — no duplicate appended.
-    assert anthropic_ids.count("databricks-claude-sonnet-4-6") == 1
+    assert anthropic_ids.count(model_id) == 1
 
+
+def test_build_models_json_registers_selected_catalog_alias_once() -> None:
+    """An equivalent live alias is rewritten to the exact launch selector."""
+    selected_model = "databricks-claude-catalog"
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.claude-catalog",
+            family="claude",
+            metadata=ModelMetadata(
+                context_window=200_000,
+                wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES}),
+            ),
+        ),
+    )
+
+    result = _build_models_json(
+        "https://host.example.com",
+        "tok",
+        model=selected_model,
+        catalog_models=catalog_models,
+    )
+
+    anthropic_models = result["providers"]["databricks-anthropic"]["models"]
+    assert anthropic_models == [
+        {
+            "id": selected_model,
+            "input": ["text", "image"],
+            "contextWindow": 200_000,
+            "reasoning": True,
+        }
+    ]
+
+
+def test_build_models_json_does_not_leak_selected_model_between_builds() -> None:
+    """A selected model from one build never appears in a later build."""
     _build_models_json("https://host.example.com", "tok", model="moonshotai/kimi-k2.6")
     fresh = _build_models_json("https://host.example.com", "tok")
-    # A model-less build after a foreign-model build is pristine: empty
-    # catch-all list, exactly the static Databricks ids elsewhere.
     assert fresh["providers"]["databricks-completions"]["models"] == []
 
 
@@ -3285,9 +4729,11 @@ def test_redact_argv_for_log_hides_equals_joined_system_prompt() -> None:
         assert "/tmp/ext.js" in redacted
 
 
-def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
-    """``_PiRpcSession.start`` must not write the full ``--append-system-prompt``
-    value to the debug log; it should be redacted to a length placeholder.
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_rpc_start_log_does_not_leak_system_prompt(
+    monkeypatch, caplog, system_prompt_mode
+) -> None:
+    """``_PiRpcSession.start`` must redact prompt values to a length placeholder.
 
     Guards F92: the old code logged ``" ".join(args)`` verbatim, leaking the
     entire system prompt into debug logs.
@@ -3311,6 +4757,7 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
             env={"PATH": "/usr/bin"},
             model="some-model",
             system_prompt=test_prompt,
+            system_prompt_mode=system_prompt_mode,
             extra_args=["--extension", "/tmp/ext.js"],
         )
         await rpc.close()
@@ -3331,7 +4778,10 @@ def test_rpc_start_log_does_not_leak_system_prompt(monkeypatch, caplog) -> None:
     assert "--extension" in spawn_line
 
 
-def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog) -> None:
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(
+    monkeypatch, caplog, system_prompt_mode
+) -> None:
     """The normal ``PiExecutor.run_turn`` path must pass the system prompt to
     Pi without leaking it into the spawn debug log.
 
@@ -3366,7 +4816,7 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
-        executor = PiExecutor(pi_path="/usr/bin/pi")
+        executor = PiExecutor(pi_path="/usr/bin/pi", system_prompt_mode=system_prompt_mode)
         try:
             return [
                 e
@@ -3387,8 +4837,14 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
     assert turn_complete[0].response == "hi"
 
     argv = captured["argv"]
-    assert "--append-system-prompt" in argv
-    assert argv[argv.index("--append-system-prompt") + 1] == test_prompt
+    prompt_flag = (
+        "--system-prompt" if system_prompt_mode == "replace" else "--append-system-prompt"
+    )
+    assert argv[argv.index(prompt_flag) + 1] == test_prompt
+    if system_prompt_mode == "replace":
+        assert argv[argv.index("--append-system-prompt") + 1] == ""
+    else:
+        assert "--system-prompt" not in argv
 
     spawn_logs = [
         r.getMessage() for r in caplog.records if "PiExecutor: spawning" in r.getMessage()
@@ -3398,8 +4854,23 @@ def test_run_turn_spawn_log_redacts_system_prompt_end_to_end(monkeypatch, caplog
 
     assert test_prompt not in spawn_line
     assert f"[system prompt {len(test_prompt)} chars]" in spawn_line
-    assert "--append-system-prompt" in spawn_line
+    assert prompt_flag in spawn_line
     assert "--mode" in spawn_line
+
+
+def test_executor_rejects_invalid_system_prompt_mode() -> None:
+    with pytest.raises(ValueError, match="system_prompt_mode must be 'append' or 'replace'"):
+        PiExecutor(pi_path="/fake/pi", system_prompt_mode="invalid")
+
+
+@pytest.mark.parametrize("prompt", [None, "", " \n "])
+def test_rpc_replace_rejects_empty_prompt(prompt: str | None) -> None:
+    async def _test():
+        rpc = _PiRpcSession()
+        with pytest.raises(ValueError, match="requires non-empty instructions"):
+            await rpc.start("/fake/pi", env={}, system_prompt=prompt, system_prompt_mode="replace")
+
+    _run(_test())
 
 
 def test_run_turn_spawn_env_has_no_host_secrets(monkeypatch) -> None:
@@ -3527,7 +4998,10 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
     assert "FAKE_HOST_SECRET" not in captured["env"]
 
 
-def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("layout", ["dist/cli.js", "dist/bundle/cli.js", "standalone"])
+def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
+    monkeypatch, tmp_path, layout
+) -> None:
     """The sandbox launcher policy names exactly the env the executor spawns.
 
     Defense in depth: ``_clean_pi_env`` already filters the spawn env,
@@ -3549,8 +5023,21 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
     captured: dict[str, SandboxPolicy] = {}
+    if layout == "standalone":
+        executable = tmp_path / "install/bin/pi"
+        pi_binary = executable
+        install = executable.parent
+    else:
+        install = tmp_path / "install/node_modules"
+        executable = install / "@earendil-works/pi-coding-agent" / layout
+        pi_binary = install / ".bin/pi"
+        pi_binary.parent.mkdir(parents=True)
+        pi_binary.symlink_to(executable)
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.touch()
 
     def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        assert target_path == str(executable.resolve())
         captured["policy"] = sandbox
         return "/fake/launcher"
 
@@ -3570,7 +5057,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
         executor = PiExecutor(
             cwd=str(tmp_path),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
@@ -3580,6 +5067,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     # fallback in ``_try_sandbox_pi``'s except clause).
     assert executor._sandboxed is True
     assert executor._pi_launch_path == "/fake/launcher"
+    assert captured["policy"].read_roots == [tmp_path.resolve(), install.resolve()]
     allowlist = captured["policy"].spawn_env_allowlist
     assert allowlist is not None
     # Per-spawn gateway var must be pruneproof even though it is not in
@@ -3591,6 +5079,90 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     # The host secret is not in the clean env, so it must not be in the
     # launcher's keep-set either.
     assert "FAKE_HOST_SECRET" not in allowlist
+
+
+def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
+    """Only the bundle roots that contributed a ``--skill`` / ``--extension`` path are granted,
+    in a stable order; no bundle or no resources grants nothing.
+    """
+    from omnigent.inner.pi_executor import _pi_bundle_resource_roots
+
+    bundle = tmp_path / "bundle"
+    args = [
+        "--no-tools",
+        "--skill",
+        str(bundle / ".pi" / "skills" / "grilling"),
+        "--extension",
+        str(bundle / ".pi" / "extensions" / "ext" / "index.js"),
+    ]
+
+    assert _pi_bundle_resource_roots(bundle, args) == [
+        bundle / ".pi" / "skills",
+        bundle / ".pi" / "extensions",
+    ]
+    assert _pi_bundle_resource_roots(bundle, ["--no-tools"]) == []
+    assert _pi_bundle_resource_roots(None, args) == []
+
+
+def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_path) -> None:
+    """A sandboxed Pi is granted the bundle resource directories it is passed."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, SandboxPolicy] = {}
+
+    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        captured["policy"] = sandbox
+        return "/fake/launcher"
+
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    flat_skills = bundle / "skills"
+    pi_skills = bundle / ".pi" / "skills"
+    extensions = bundle / ".pi" / "extensions"
+    _make_pi_skill_dir(flat_skills, "alpha")
+    _make_pi_skill_dir(pi_skills, "grilling")
+    (extensions / "ext").mkdir(parents=True)
+    (extensions / "ext" / "index.js").write_text("module.exports = function () {};\n")
+    (bundle / "AGENTS.md").write_text("Bundle guidance.\n")
+
+    def _granted_read_roots(skills_filter: str = "all") -> list[Path]:
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor(
+                cwd=str(workspace),
+                bundle_dir=bundle,
+                os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                skills_filter=skills_filter,
+            )
+        assert executor._sandboxed is True
+        return [root.resolve(strict=False) for root in captured["policy"].read_roots or []]
+
+    granted = _granted_read_roots()
+    assert flat_skills.resolve() in granted
+    assert pi_skills.resolve() in granted
+    assert extensions.resolve() in granted
+    assert bundle.resolve() not in granted
+
+    # ``skills: none`` passes no --skill flags, so only the extensions root is granted.
+    granted = _granted_read_roots(skills_filter="none")
+    assert extensions.resolve() in granted
+    assert flat_skills.resolve() not in granted
+    assert pi_skills.resolve() not in granted
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
@@ -3987,3 +5559,934 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
         assert turn_complete[0].response == "Hi there"
 
     _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Reasoning effort → pi thinking level
+# ---------------------------------------------------------------------------
+
+
+def _levels_response(levels: list[str]) -> str:
+    return json.dumps(
+        {
+            "type": "response",
+            "command": "get_available_thinking_levels",
+            "success": True,
+            "data": {"levels": levels},
+        }
+    )
+
+
+def _live_session_executor(
+    lines: list[str], *, applied_thinking: str | None = None
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Executor with one live session whose RPC replays *lines*.
+
+    :param lines: JSONL lines the fake pi process emits, in order.
+    :param applied_thinking: Level the session is already running at.
+    :returns: ``(executor, rpc)`` — the rpc's ``process.stdin.data`` records
+        every command the executor sent, in order.
+    """
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = MagicMock()
+    rpc.process.returncode = None
+    rpc.process.stdin = _FakeStreamWriter()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    executor._session_states["s1"] = _PiSessionState(
+        rpc=rpc,
+        system_prompt="system",
+        model=None,
+        applied_thinking=applied_thinking,
+    )
+    return executor, rpc
+
+
+def _sent_commands(rpc: _PiRpcSession) -> list[dict]:
+    return [json.loads(chunk.decode()) for chunk in rpc.process.stdin.data]
+
+
+def test_pi_thinking_from_config_translates_and_clears() -> None:
+    """Canonical effort → pi level; a clear value or absence → ``None``."""
+    from omnigent.inner.pi_executor import _pi_thinking_from_config
+
+    assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": "high"})) == "high"
+    assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": "none"})) == "off"
+    for clear in ("default", "off", "reset"):
+        assert _pi_thinking_from_config(ExecutorConfig(extra={"reasoning_effort": clear})) is None
+    assert _pi_thinking_from_config(ExecutorConfig()) is None
+    assert _pi_thinking_from_config(None) is None
+
+
+def test_run_turn_spawns_pi_with_thinking_flag(monkeypatch) -> None:
+    """``reasoning_effort=high`` reaches the pi subprocess as ``--thinking high``."""
+    from omnigent.inner import pi_executor as pi_mod
+
+    captured: dict[str, tuple[str, ...]] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProcess(
+            stdout_lines=[
+                _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
+                json.dumps({"type": "response", "command": "prompt", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor()
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+        await executor.close()
+        return events
+
+    events = _run(_test())
+
+    argv = list(captured["args"])
+    assert "--thinking" in argv
+    assert argv[argv.index("--thinking") + 1] == "high"
+    assert not [e for e in events if isinstance(e, ExecutorError)]
+
+
+def test_midsession_effort_change_sets_thinking_level_before_prompt() -> None:
+    """A changed effort is applied over RPC on the live session, before the prompt."""
+    executor, rpc = _live_session_executor(
+        [
+            _levels_response(["off", "low", "medium", "high", "xhigh", "max"]),
+            json.dumps({"type": "response", "command": "prompt", "success": True}),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ],
+        applied_thinking="low",
+    )
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+
+    _run(_test())
+
+    types = [cmd["type"] for cmd in _sent_commands(rpc)]
+    assert types == ["get_available_thinking_levels", "set_thinking_level", "prompt"]
+    assert _sent_commands(rpc)[1]["level"] == "high"
+    assert executor._session_states["s1"].applied_thinking == "high"
+
+
+def test_unsupported_thinking_level_clamps_with_warning(caplog) -> None:
+    """A level the current model doesn't report clamps down instead of failing.
+
+    Guards the model-change path too: a model switch respawns pi with
+    ``--thinking``, and the same probe re-asserts (or clamps) the level there.
+    """
+    executor, rpc = _live_session_executor(
+        [
+            _levels_response(["off", "low", "high"]),
+            json.dumps({"type": "response", "command": "prompt", "success": True}),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ],
+        applied_thinking=None,
+    )
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "xhigh"}),
+            )
+        ]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.pi_executor"):
+        _run(_test())
+
+    commands = _sent_commands(rpc)
+    assert [cmd["type"] for cmd in commands] == [
+        "get_available_thinking_levels",
+        "set_thinking_level",
+        "prompt",
+    ]
+    assert commands[1]["level"] == "high"
+    assert "does not support thinking level" in caplog.text
+
+
+def test_midsession_effort_clear_leaves_level_untouched() -> None:
+    """A clear value is a no-op mid-session: no RPC, current level persists."""
+    executor, rpc = _live_session_executor(
+        [
+            json.dumps({"type": "response", "command": "prompt", "success": True}),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ],
+        applied_thinking="high",
+    )
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "default"}),
+            )
+        ]
+
+    _run(_test())
+
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
+    assert executor._session_states["s1"].applied_thinking == "high"
+
+
+def test_unsupported_effort_value_fails_the_turn() -> None:
+    """An effort outside pi's ladder surfaces a non-retryable executor error."""
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hi", "session_id": "s1"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "turbo"}),
+            )
+        ]
+
+    events = _run(_test())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].retryable is False
+    assert "not supported by pi" in events[0].message
+
+
+def test_run_turn_prompt_command_includes_streaming_behavior():
+    """run_turn must include streamingBehavior='followUp' in the RPC prompt command.
+
+    Without it, a residual race against a still-alive Pi process (e.g. after an
+    interrupt where the reap races the slice) surfaces Pi's raw
+    'Agent is already processing' protocol error instead of queuing the prompt.
+    """
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor()
+
+    fake_rpc = _PiRpcSession()
+    fake_rpc._line_queue = asyncio.Queue()
+    fake_rpc.process = MagicMock()
+    fake_rpc.process.returncode = None
+    stdin = _FakeStreamWriter()
+    fake_rpc.process.stdin = stdin
+    fake_rpc._stderr_lines = []
+
+    for line in [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "hi"},
+            }
+        ),
+        json.dumps({"type": "agent_end", "messages": []}),
+    ]:
+        fake_rpc._line_queue.put_nowait(line)
+
+    async def fake_ensure_rpc(*args, **kwargs):
+        return fake_rpc
+
+    executor._ensure_rpc = fake_ensure_rpc
+
+    async def _test():
+        return [
+            e
+            async for e in executor.run_turn([{"role": "user", "content": "hello"}], [], "system")
+        ]
+
+    events = _run(_test())
+
+    turn_complete = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(turn_complete) == 1
+
+    written = b"".join(stdin.data).decode()
+    commands = [json.loads(line) for line in written.splitlines() if line.strip()]
+    prompts = [c for c in commands if c.get("type") == "prompt"]
+    assert prompts, "expected run_turn to emit a prompt command"
+
+    cmd = prompts[0]
+    assert cmd.get("streamingBehavior") == "followUp", (
+        "RPC prompt command must include streamingBehavior='followUp' so a "
+        "residual race against a still-alive Pi process queues instead of "
+        f"surfacing the raw protocol error; got {cmd!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settled turn boundary (pi >= 0.80.4): only ``agent_settled`` ends the turn.
+# ---------------------------------------------------------------------------
+
+_SETTLED_PI_VERSION = (0, 85, 1)
+_SESSION_KEY = "s1"
+_RETRYABLE_503 = "503 Service Unavailable: upstream overloaded, please retry"
+
+
+def _rpc_frame(**event) -> str:
+    return json.dumps(event)
+
+
+def _text_delta_frame(text: str) -> str:
+    return _rpc_frame(
+        type="message_update",
+        assistantMessageEvent={"type": "text_delta", "delta": text},
+    )
+
+
+def _assistant_message(
+    text: str = "", *, stop_reason: str = "stop", error_message: str | None = None
+) -> dict:
+    message: dict = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}] if text else [],
+        "stopReason": stop_reason,
+    }
+    if error_message is not None:
+        message["errorMessage"] = error_message
+    return message
+
+
+def _session_executor(
+    lines: list[str], *, pi_version: tuple[int, int, int] | None = _SETTLED_PI_VERSION
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Executor with one live RPC session whose fake pi replays *lines*; the
+    *pi_version* probe result selects the turn boundary."""
+    from omnigent.inner.pi_executor import _PiSessionState
+
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi_native.main.pi_version", return_value=pi_version),
+    ):
+        executor = PiExecutor()
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = _FakeProcess()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    executor._session_states[_SESSION_KEY] = _PiSessionState(
+        rpc=rpc, system_prompt="system", model=None
+    )
+    return executor, rpc
+
+
+async def _run_session_turn(executor: PiExecutor, prompt: str) -> list:
+    messages = [{"role": "user", "content": prompt, "session_id": _SESSION_KEY}]
+    return [event async for event in executor.run_turn(messages, [], "system")]
+
+
+def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
+    assert _SESSION_KEY not in executor._session_states, "the RPC session was kept"
+    # ``_PiRpcSession.close`` terminates the process and then clears it.
+    assert rpc.process is None, "the pi process was not closed"
+
+
+def _retry_recovery_frames(recovered: str) -> list[str]:
+    """pi's frame sequence for a 503 that its automatic retry recovers from."""
+    errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=errored),
+        _rpc_frame(type="agent_end", messages=[errored], willRetry=True),
+        _rpc_frame(
+            type="auto_retry_start",
+            attempt=1,
+            maxAttempts=3,
+            delayMs=2000,
+            errorMessage=_RETRYABLE_503,
+        ),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame(recovered),
+        _rpc_frame(type="message_end", message=_assistant_message(recovered)),
+        _rpc_frame(type="auto_retry_end", success=True, attempt=1),
+        _rpc_frame(type="agent_end", messages=[_assistant_message(recovered)], willRetry=False),
+        _rpc_frame(type="agent_settled"),
+    ]
+
+
+def _plain_answer_frames(answer: str) -> list[str]:
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="agent_start"),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _text_delta_frame(answer),
+        _rpc_frame(type="message_end", message=_assistant_message(answer)),
+        _rpc_frame(type="agent_end", messages=[_assistant_message(answer)], willRetry=False),
+        _rpc_frame(type="agent_settled"),
+    ]
+
+
+def test_constructor_probes_pi_version_once() -> None:
+    """The version gate reuses the single ``pi --version`` probe."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch(
+            "omnigent.harnesses.pi_native.main.pi_version", return_value=_SETTLED_PI_VERSION
+        ) as probe,
+    ):
+        executor = PiExecutor()
+    assert probe.call_count == 1
+    assert "--approve" in executor._extra_args
+
+
+def test_settled_turn_returns_recovered_answer_after_auto_retry() -> None:
+    """A retryable provider error followed by pi's own recovery completes
+    the turn with the recovered answer instead of the abandoned error."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(_retry_recovery_frames("RECOVERED"))
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["RECOVERED"]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+        assert rpc._line_queue.empty(), "recovery frames were left for the next turn"
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_next_turn_reads_only_its_own_frames() -> None:
+    """On a persistent session the turn after a retry-recovered one must
+    not consume the earlier turn's leftover recovery frames."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            _retry_recovery_frames("FIRST") + _plain_answer_frames("SECOND")
+        )
+
+        first_events = await _run_session_turn(executor, "first")
+        second_events = await _run_session_turn(executor, "second")
+
+        assert not any(isinstance(e, ExecutorError) for e in first_events + second_events)
+        first_complete = [e for e in first_events if isinstance(e, TurnComplete)]
+        assert [t.response for t in first_complete] == ["FIRST"]
+        assert [e.text for e in second_events if isinstance(e, TextChunk)] == ["SECOND"]
+        second_complete = [e for e in second_events if isinstance(e, TurnComplete)]
+        assert [t.response for t in second_complete] == ["SECOND"]
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_error_without_retry_fails_after_settlement() -> None:
+    """A provider error pi does not retry is reported once every terminal
+    frame, including ``agent_settled``, has been consumed."""
+
+    async def _test() -> None:
+        errored = _assistant_message(stop_reason="error", error_message="Rate limited")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=errored),
+                _rpc_frame(type="agent_end", messages=[errored], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events] == [ExecutorError]
+        assert events[0].message == "Rate limited"
+        assert rpc._line_queue.empty(), "agent_settled was left for the next turn"
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_failed_message_with_streamed_text_stops_and_evicts() -> None:
+    """When the failed message already streamed text, the turn stops with
+    the error and drops the session instead of appending pi's regenerated
+    answer after the partial one."""
+
+    async def _test() -> None:
+        partial = _assistant_message("partial ", stop_reason="error", error_message=_RETRYABLE_503)
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial "),
+                _rpc_frame(type="message_end", message=partial),
+                _rpc_frame(type="agent_end", messages=[partial], willRetry=True),
+                _rpc_frame(
+                    type="auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    delayMs=2000,
+                    errorMessage=_RETRYABLE_503,
+                ),
+                *_plain_answer_frames("REGENERATED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial "]
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [_RETRYABLE_503]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_eof_before_settlement_is_an_error() -> None:
+    """pi exiting after ``agent_end`` but before ``agent_settled`` fails the
+    turn; a partial run is not reported as a completed one."""
+
+    async def _test() -> None:
+        answer = _assistant_message("Done")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("Done"),
+                _rpc_frame(type="message_end", message=answer),
+                _rpc_frame(type="agent_end", messages=[answer], willRetry=False),
+            ]
+        )
+        rpc._stderr_lines = ["pi: fatal"]
+        rpc._line_queue.put_nowait(None)  # stdout EOF: the process died.
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["Done"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        (error,) = [e for e in events if isinstance(e, ExecutorError)]
+        assert "settled" in error.message
+        assert "pi: fatal" in error.message
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
+    """A context-overflow error that pi repairs by compacting and re-running
+    the prompt completes with the recovered answer."""
+
+    async def _test() -> None:
+        overflow = _assistant_message(
+            stop_reason="error", error_message="Context overflow: prompt is too long"
+        )
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=overflow),
+                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+                _rpc_frame(type="compaction_start", reason="overflow"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="overflow",
+                    result={"summary": "..."},
+                    aborted=False,
+                    willRetry=True,
+                ),
+                *_plain_answer_frames("RECOVERED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+    """A truncated answer that already streamed is not followed by the
+    regenerated one pi produces after overflow compaction."""
+
+    async def _test() -> None:
+        truncated = _assistant_message("partial", stop_reason="length")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+                _rpc_frame(type="message_end", message=truncated),
+                _rpc_frame(type="agent_end", messages=[truncated], willRetry=False),
+                _rpc_frame(type="compaction_start", reason="overflow"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="overflow",
+                    result={"summary": "..."},
+                    aborted=False,
+                    willRetry=True,
+                ),
+                *_plain_answer_frames("REGENERATED")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_retry_backoff_longer_than_error_drain_budget_keeps_waiting() -> None:
+    """After ``agent_end(willRetry=true)`` pi is silent during its retry
+    backoff; the short post-error drain budget must not end the turn."""
+
+    async def _test() -> None:
+        errored = _assistant_message(stop_reason="error", error_message=_RETRYABLE_503)
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=errored),
+                _rpc_frame(type="agent_end", messages=[errored], willRetry=True),
+                _rpc_frame(
+                    type="auto_retry_start",
+                    attempt=1,
+                    maxAttempts=3,
+                    delayMs=300,
+                    errorMessage=_RETRYABLE_503,
+                ),
+            ]
+        )
+        # A live reader: pi is running, just silent during the backoff.
+        reader = asyncio.create_task(asyncio.sleep(30))
+        rpc._read_task = reader
+
+        async def recover_after_backoff() -> None:
+            await asyncio.sleep(0.3)
+            for line in _plain_answer_frames("RECOVERED")[2:]:
+                rpc._line_queue.put_nowait(line)
+
+        feeder = asyncio.create_task(recover_after_backoff())
+        try:
+            with (
+                patch("omnigent.inner.pi_executor._TURN_STDOUT_IDLE_TIMEOUT_S", 0.05),
+                patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+            ):
+                events = await _run_session_turn(executor, "hello")
+        finally:
+            feeder.cancel()
+            reader.cancel()
+            await asyncio.gather(feeder, reader, return_exceptions=True)
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "RECOVERED"
+
+    _run(_test())
+
+
+def test_settled_missing_agent_end_after_error_evicts_session() -> None:
+    """pi always follows an errored call with ``agent_end``; when it does not
+    arrive within the drain budget the session is dropped, not reused."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(
+                    type="message_end",
+                    message=_assistant_message(stop_reason="error", error_message="boom"),
+                ),
+            ]
+        )
+        reader = asyncio.create_task(asyncio.sleep(30))
+        rpc._read_task = reader
+        try:
+            with patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05):
+                events = await _run_session_turn(executor, "hello")
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == ["boom"]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_aborted_message_evicts_session() -> None:
+    """An aborted message ends the turn and drops the session so the
+    ``agent_end``/``agent_settled`` frames still coming cannot be misread
+    by the next turn."""
+
+    async def _test() -> None:
+        aborted = _assistant_message(stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+                _rpc_frame(type="agent_settled"),
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events] == [ExecutorError]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+def test_settled_rejected_prompt_evicts_session() -> None:
+    """A prompt pi refuses leaves the session in an unknown state; drop it."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [_rpc_frame(type="response", success=False, error="Agent is already processing")]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [
+            "Agent is already processing"
+        ]
+        _assert_session_evicted(executor, rpc)
+
+    _run(_test())
+
+
+@pytest.mark.parametrize("pi_version", [(0, 80, 3), None])
+def test_older_or_unknown_pi_keeps_agent_end_boundary(
+    pi_version: tuple[int, int, int] | None,
+) -> None:
+    """Without ``agent_settled`` support the turn still ends at ``agent_end``."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _text_delta_frame("Hi"),
+                _rpc_frame(type="agent_end", messages=[_assistant_message("Hi")]),
+            ],
+            pi_version=pi_version,
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "Hi"
+        assert rpc._line_queue.empty()
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_queued_continuation_stays_in_the_turn() -> None:
+    """A follow-up pi queued behind the run continues the same turn: its
+    answer streams after the first one and the turn ends at ``agent_settled``."""
+
+    async def _test() -> None:
+        first = _assistant_message("First. ")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="agent_start"),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("First. "),
+                _rpc_frame(type="message_end", message=first),
+                _rpc_frame(type="agent_end", messages=[first], willRetry=False),
+                *_plain_answer_frames("Second.")[1:],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
+        assert [e.text for e in events if isinstance(e, TextChunk)] == ["First. ", "Second."]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "First. Second."
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_build_models_json_catalog_reasoning_models_get_reasoning_flag() -> None:
+    """Catalog-reasoning GPT/Gemini entries get ``reasoning: true``; catalog False stays off."""
+    from omnigent.models.model_metadata import ModelCapability
+
+    reasoning = frozenset({ModelCapability.REASONING})
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.gpt-6-luna",
+            family="openai",
+            metadata=ModelMetadata(
+                supported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES, ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+        ModelEntry(
+            id="system.ai.gemini-3-8-flash",
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+        ModelEntry(
+            id="system.ai.llama-4-maverick",
+            family="other",
+            metadata=ModelMetadata(
+                unsupported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+    )
+
+    result = _build_models_json("https://host.example.com", "tok", catalog_models=catalog_models)
+
+    providers = result["providers"]
+    by_id = {
+        entry["id"]: entry
+        for name in ("databricks-openai", "databricks-mlflow")
+        for entry in providers[name]["models"]
+    }
+    assert by_id["system.ai.gpt-6-luna"].get("reasoning") is True
+    assert by_id["system.ai.gemini-3-8-flash"].get("reasoning") is True
+    assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "wire_api"),
+    [
+        ({"openai": "https://gateway.example/v1"}, "chat"),
+        ({"openai": "https://gateway.example/v1"}, "responses"),
+        (None, None),
+    ],
+    ids=["generic-chat", "generic-responses", "databricks"],
+)
+def test_generic_and_databricks_reasoning_use_pi_compat_detection(base_urls, wire_api):
+    config = _build_models_json(
+        "https://gateway.example",
+        "synthetic",
+        base_urls,
+        model="deepseek-test",
+        openai_wire_api=wire_api,
+    )
+    selected = next(p for p in config["providers"].values() if p["models"])
+    assert selected["models"][0]["reasoning"] is True
+    for provider in config["providers"].values():
+        if provider["api"].startswith("openai"):
+            assert "supportsReasoningEffort" not in provider["compat"]
+
+
+@pytest.mark.parametrize("destination", ["generic", "mixed-databricks", "catalog"])
+async def test_generic_catalog_discovery_does_not_block_runtime(
+    monkeypatch, tmp_path, destination
+):
+    import asyncio
+    import threading
+
+    from omnigent.inner import pi_executor as pi_mod
+
+    started = threading.Event()
+    release = threading.Event()
+    heartbeat_ran = False
+
+    def discover(model):
+        assert destination == "generic", "unused generic catalog lookup"
+        started.set()
+        assert release.wait(2), "catalog discovery blocked the runtime event loop"
+        return {"id": model, "reasoning": True}
+
+    async def heartbeat():
+        nonlocal heartbeat_ran
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        heartbeat_ran = True
+        release.set()
+
+    async def spawn(*args, **kwargs):
+        return _FakeProcess(
+            stdout_lines=[
+                _levels_response(["off", "low", "high"]),
+                json.dumps({"type": "response", "command": "prompt", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+    monkeypatch.setattr(pi_mod, "pi_generic_model_json_entry", discover)
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", spawn)
+    monkeypatch.setattr(pi_mod, "_find_pi_cli", lambda: "/usr/bin/pi")
+    model = "system.ai.gpt-5" if destination == "mixed-databricks" else "custom-model"
+    base_urls = (
+        {
+            "openai": "https://workspace.example/ai-gateway/codex/v1",
+            "claude": "http://generic.example/anthropic",
+        }
+        if destination == "mixed-databricks"
+        else {"openai": "http://generic.example/v1"}
+    )
+    executor = PiExecutor(
+        gateway=True,
+        gateway_host="http://generic.example",
+        gateway_auth_command="printf synthetic",
+        base_urls_override=base_urls,
+        model=model,
+        cwd=str(tmp_path),
+    )
+    executor._gateway_model_wire_apis = {}
+    executor._gateway_model_entries = (
+        (ModelEntry(id=model, family="other"),) if destination == "catalog" else ()
+    )
+    beat = asyncio.create_task(heartbeat()) if destination == "generic" else None
+    try:
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "generic"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        assert heartbeat_ran is (destination == "generic")
+    finally:
+        release.set()
+        if beat is not None:
+            beat.cancel()
+            await asyncio.gather(beat, return_exceptions=True)
+        await executor.close()

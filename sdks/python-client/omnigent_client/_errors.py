@@ -6,6 +6,9 @@ import httpx
 
 _BODY_PREVIEW_CHARS = 200
 
+STALE_CURSOR_CODE = "stale_cursor"
+"""Server error code for a pagination cursor whose row is gone."""
+
 
 class OmnigentError(Exception):
     """Base exception for all omnigent client errors."""
@@ -36,12 +39,31 @@ class InvalidInputError(OmnigentError):
     """Bad request — invalid input, missing fields, etc. (HTTP 400)."""
 
 
+class StaleCursorError(InvalidInputError):
+    """
+    A pagination cursor no longer resolves (HTTP 400, ``stale_cursor``).
+
+    Raised when an ``after``/``before`` cursor names a row that has since
+    been deleted, so the server cannot compute the keyset bound and refuses
+    to guess. Enumeration cannot continue from this cursor — restart the
+    walk from the first page, with no cursor, and de-duplicate by id if the
+    caller keeps results across the restart.
+
+    Subclasses :class:`InvalidInputError` so existing ``except
+    InvalidInputError`` handlers keep catching it.
+    """
+
+
 class ConflictError(OmnigentError):
     """Resource conflict — duplicate name, stale state, etc. (HTTP 409)."""
 
 
 class BundleInvalidError(OmnigentError):
     """Agent bundle is invalid — corrupt tarball, bad config, etc. (HTTP 400)."""
+
+
+class RateLimitedError(OmnigentError):
+    """Request was rate-limited (HTTP 429) — transient, safe to retry."""
 
 
 class ServerError(OmnigentError):
@@ -96,8 +118,16 @@ def raise_for_status(status_code: int, body: dict[str, object] | str) -> None:
     if status_code == 409:
         raise ConflictError(message, status_code, code)
 
+    if code == STALE_CURSOR_CODE:
+        # Classified by code, not status: a stale cursor is recoverable
+        # (restart the walk) where a generic 400 is not.
+        raise StaleCursorError(message, status_code, code)
+
     if status_code == 400:
         raise InvalidInputError(message, status_code, code)
+
+    if status_code == 429:
+        raise RateLimitedError(message, status_code, code)
 
     if status_code >= 500:
         raise ServerError(message, status_code, code)

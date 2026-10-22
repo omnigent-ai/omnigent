@@ -17,6 +17,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
@@ -55,6 +56,9 @@ def mint_session_token(
     cookie_secret: bytes,
     ttl_seconds: int,
     provider: str,
+    *,
+    account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -71,6 +75,8 @@ def mint_session_token(
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback,
+        never included in runner, refresh, or CLI-issued credentials.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -80,6 +86,10 @@ def mint_session_token(
         "exp": now + ttl_seconds,
         "provider": provider,
     }
+    if account_generation is not None:
+        payload["account_generation"] = account_generation
+    if cli_login_ticket is not None:
+        payload["cli_login_ticket"] = cli_login_ticket
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -88,6 +98,9 @@ def mint_session_cookie(
     cookie_secret: bytes,
     ttl_hours: int,
     provider: str,
+    *,
+    account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -97,9 +110,17 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback.
     :returns: An HS256-signed JWT string.
     """
-    return mint_session_token(user_id, cookie_secret, ttl_hours * 3600, provider)
+    return mint_session_token(
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        cli_login_ticket=cli_login_ticket,
+    )
 
 
 def hmac_digest(token: str, secret: bytes) -> str:
@@ -137,7 +158,7 @@ class OIDCConfig:
     :param issuer: OIDC issuer URL, e.g.
         ``"https://accounts.google.com"``.
     :param client_id: OAuth client ID registered with the IdP.
-    :param client_secret: OAuth client secret.
+    :param client_secret: OAuth client secret, or empty for public PKCE clients.
     :param redirect_uri: Full callback URL, e.g.
         ``"https://myapp.example.com/auth/callback"``.
     :param cookie_secret: HMAC key for session cookie signing
@@ -232,8 +253,9 @@ class OIDCConfig:
     def from_env() -> OIDCConfig:
         """Read and validate all OIDC env vars.
 
-        Fetches the OIDC discovery document for standard providers,
-        or uses hardcoded endpoints for GitHub.
+        Uses explicit endpoints or discovery for standard providers,
+        and hardcoded endpoints for GitHub. Public clients must opt in
+        to token endpoint authentication method ``none``.
 
         :returns: A validated :class:`OIDCConfig`.
         :raises RuntimeError: If any required env var is missing or
@@ -251,7 +273,25 @@ class OIDCConfig:
 
         issuer = _require("OMNIGENT_OIDC_ISSUER")
         client_id = _require("OMNIGENT_OIDC_CLIENT_ID")
-        client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
+        auth_method = (
+            os.environ.get("OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD") or "client_secret_post"
+        ).strip()
+        if auth_method not in {"client_secret_post", "none"}:
+            raise RuntimeError(
+                "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD must be client_secret_post or none"
+            )
+        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        if auth_method == "none":
+            if is_github:
+                raise RuntimeError("GitHub login requires client_secret_post authentication")
+            if os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip():
+                raise RuntimeError(
+                    "Unset OMNIGENT_OIDC_CLIENT_SECRET when "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none"
+                )
+            client_secret = ""
+        else:
+            client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
         # Redirect URI: an explicit value wins; otherwise derive it from
         # OMNIGENT_DOMAIN (the same var the Caddy HTTPS overlay uses) as
         # ``https://<domain>/auth/callback``. A domain-based deploy then
@@ -331,7 +371,43 @@ class OIDCConfig:
                 )
 
         # Determine provider type and resolve endpoints.
-        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        endpoints = {
+            name: os.environ.get(f"OMNIGENT_OIDC_{name.upper()}", "").strip()
+            for name in ("authorization_endpoint", "token_endpoint", "jwks_uri")
+        }
+        if any(endpoints.values()):
+            if is_github:
+                raise RuntimeError("OIDC endpoint overrides are not supported for GitHub login")
+            if not all(endpoints.values()):
+                raise RuntimeError(
+                    "Set all three OIDC endpoint overrides: OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT, "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT, and OMNIGENT_OIDC_JWKS_URI"
+                )
+            for name, endpoint in endpoints.items():
+                try:
+                    parsed = urlsplit(endpoint)
+                    valid = (
+                        bool(parsed.hostname)
+                        and parsed.username is None
+                        and parsed.password is None
+                        and not parsed.fragment
+                        and (parsed.port is None or parsed.port > 0)
+                        and not any(character.isspace() for character in endpoint)
+                        and (
+                            parsed.scheme == "https"
+                            or (
+                                parsed.scheme == "http"
+                                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                            )
+                        )
+                    )
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise RuntimeError(
+                        f"OMNIGENT_OIDC_{name.upper()} must be an absolute HTTPS URL "
+                        "without userinfo or a fragment (HTTP is allowed only for loopback)"
+                    )
 
         if is_github:
             # Empty string (forwarded by `${VAR:-}` wrappers) → default.
@@ -358,14 +434,17 @@ class OIDCConfig:
         # Standard OIDC: fetch discovery document.
         scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or "openid email profile").strip()
         discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
-        try:
-            resp = httpx.get(discovery_url, timeout=10.0)
-            resp.raise_for_status()
-            doc = resp.json()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
-            ) from exc
+        if all(endpoints.values()):
+            doc = endpoints
+        else:
+            try:
+                resp = httpx.get(discovery_url, timeout=10.0)
+                resp.raise_for_status()
+                doc = resp.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
+                ) from exc
 
         authorization_endpoint = doc.get("authorization_endpoint")
         token_endpoint = doc.get("token_endpoint")

@@ -1,3 +1,8 @@
+import { renderSidebar as renderSidebarAt } from "@/test/sidebarTestHelpers";
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 // Layout regression tests for the project-folder header's icon/chevron.
 // Desired behaviour: a project folder shows its folder icon by default and,
 // on desktop hover/focus, swaps that folder icon for a chevron *in place*
@@ -12,95 +17,29 @@
 //   3. A header without a leading icon (the "Projects" group header) keeps a
 //      hover-revealed trailing chevron and does NOT swap an icon.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({
-    mutate: vi.fn(),
-    reset: vi.fn(),
-    isPending: false,
-    isError: false,
-  }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  // One project so a folder header renders. Empty projects are not filtered
-  // out, so no conversations are needed to exercise the header layout.
-  useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),
-  useProjectSessions: () => ({
-    data: undefined,
-    isLoading: false,
-    hasNextPage: false,
-    isFetchingNextPage: false,
-    fetchNextPage: vi.fn(),
-  }),
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: () => Promise.resolve([]),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useProjects: () => ({ data: [{ id: "p_my", name: "My Project" }] }),
+  };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
-import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
 
 function mockConversations(conversations: Conversation[]) {
-  const withData = {
-    data: {
-      pages: [
-        {
-          data: conversations,
-          first_id: conversations[0]?.id ?? null,
-          last_id: conversations.at(-1)?.id ?? null,
-          has_more: false,
-        },
-      ],
-      pageParams: [undefined],
-    },
-    isLoading: false,
-    isError: false,
-    error: null,
-    fetchNextPage: vi.fn(),
-    hasNextPage: false,
-    isFetchingNextPage: false,
-  } as unknown as ReturnType<typeof useConversations>;
+  const withData = conversationPage(conversations);
   useConvMock.mockImplementation(() => withData);
 }
 
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
-    </QueryClientProvider>,
-  );
+function renderSidebar(initialEntry = "/") {
+  return renderSidebarAt({ route: initialEntry });
 }
 
 /** The <button> header for a section/folder, found by its accessible name. */
@@ -127,14 +66,17 @@ describe("project folder header icon/chevron", () => {
     renderSidebar();
     const header = headerButton("My Project");
 
-    // Project folders are real rows, not muted section labels: use a 26px row
-    // (20px line + 3px vertical padding), 8px insets/gap, and regular 13px
-    // foreground text.
+    // Project folders are real rows, not muted section labels: use the shared
+    // text-ui compact treatment with 8px insets/gap and foreground text.
     expect(header).toHaveClass(
+      "sidebar-row",
+      "h-auto",
+      "min-h-0",
       "gap-2",
       "rounded-[var(--radius-otto-button)]",
       "px-2",
-      "py-[3px]",
+      "py-1.5",
+      "md:py-1",
       "sidebar-compact-text",
       "text-foreground",
     );
@@ -176,13 +118,80 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
+  it("highlights the project row instead of global New session for a project-scoped composer", () => {
+    renderSidebar("/?project=My%20Project");
+
+    const header = headerButton("My Project");
+    expect(header).toHaveAttribute("aria-current", "page");
+    expect(header).toHaveClass(
+      "bg-[var(--sidebar-active)]",
+      "text-[var(--sidebar-active-foreground)]",
+    );
+    expect(header.querySelector(".lucide-folder")).toHaveClass(
+      "text-[var(--sidebar-active-foreground)]",
+    );
+
+    const newSession = screen.getByTestId("new-chat-button");
+    expect(newSession).not.toHaveClass("bg-[var(--sidebar-active)]");
+    expect(newSession.querySelector("svg")).toHaveClass("text-muted-foreground");
+  });
+
+  it("shows a left-aligned empty-project message and new-session action", () => {
+    renderSidebar();
+    fireEvent.click(headerButton("My Project"));
+
+    const action = screen
+      .getAllByRole("link", { name: "new session" })
+      .find((link) => link.getAttribute("href") === "/?project=My%20Project")!;
+    const empty = action.closest(".sidebar-row")!;
+    expect(empty.parentElement).toHaveClass("pl-6");
+    expect(empty).toHaveClass(
+      "sidebar-row",
+      "sidebar-compact-text",
+      "h-auto",
+      "min-h-0",
+      "w-full",
+      "px-2",
+      "py-1.5",
+      "md:py-1",
+      "justify-center",
+      "rounded-[var(--radius-otto-button)]",
+      "text-left",
+      "text-muted-foreground",
+    );
+    expect(empty).not.toHaveClass(
+      "ml-8",
+      "mr-2",
+      "border",
+      "border-dashed",
+      "items-center",
+      "text-center",
+      "px-0",
+      "pb-2",
+      "md:pb-2",
+    );
+    const message = empty.querySelector("p")!;
+    expect(message).not.toHaveClass("text-ui");
+    const body = message.querySelector("span")!;
+    expect(body).not.toHaveClass("text-ui");
+    expect(body).toHaveTextContent("No sessions. Start a new session.");
+    expect(body).toContainElement(action);
+    expect(message).toContainElement(action);
+    expect(within(empty as HTMLElement).getByRole("link", { name: "new session" })).toBe(action);
+    expect(action).toHaveAttribute("href", "/?project=My%20Project");
+    expect(action).toHaveClass("text-primary", "hover:underline");
+    expect(action).not.toHaveAttribute("data-slot", "button");
+    expect(action.querySelector("svg")).toBeNull();
+  });
+
   it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {
     renderSidebar();
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
 
-    // The parent section label remains the compact muted caption tier.
-    expect(header).toHaveClass("gap-1", "pb-1", "pl-2", "text-xs", "leading-4");
+    // The parent section label uses the settings-scaled subtitle tier.
+    expect(header).toHaveClass("gap-1", "pl-2", "text-sm", "font-normal");
+    expect(header).not.toHaveClass("font-medium", "uppercase");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 

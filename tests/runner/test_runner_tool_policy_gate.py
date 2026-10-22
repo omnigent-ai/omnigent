@@ -140,6 +140,58 @@ async def test_valid_allow_policy_unchanged() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_result_policy_transformations_are_chained() -> None:
+    gate = RunnerToolPolicyGate.from_spec(
+        _agent_with_policies(
+            _tool_policy("first", _FIXED_ALLOW),
+            _tool_policy("second", _FIXED_ALLOW),
+        ),
+    )
+    first_policy, second_policy = gate._policies
+    first_original = first_policy.policy._callable
+    second_original = second_policy.policy._callable
+    seen: list[object] = []
+
+    def _first(_event: object) -> dict[str, object]:
+        return {"result": "allow", "data": "first transform"}
+
+    def _second(event: object) -> dict[str, object]:
+        assert isinstance(event, dict)
+        seen.append(event.get("data"))
+        return {"result": "allow", "data": "second transform"}
+
+    first_policy.policy._callable = _first  # type: ignore[method-assign]
+    second_policy.policy._callable = _second  # type: ignore[method-assign]
+    try:
+        output = await gate.evaluate_tool_result("web_search", "raw output")
+    finally:
+        first_policy.policy._callable = first_original
+        second_policy.policy._callable = second_original
+
+    assert seen == ["first transform"]
+    assert output == "second transform"
+
+
+@pytest.mark.asyncio
+async def test_tool_result_policy_rejects_non_string_replacement() -> None:
+    gate = RunnerToolPolicyGate.from_spec(
+        _agent_with_policies(_tool_policy("invalid_transform", _FIXED_ALLOW)),
+    )
+    gated = gate._policies[0]
+    original = gated.policy._callable
+
+    def _invalid(_event: object) -> dict[str, object]:
+        return {"result": "allow", "data": {"redacted": True}}
+
+    gated.policy._callable = _invalid  # type: ignore[method-assign]
+    try:
+        with pytest.raises(TypeError, match="replacement data must be a string"):
+            await gate.evaluate_tool_result("web_search", "raw output")
+    finally:
+        gated.policy._callable = original
+
+
+@pytest.mark.asyncio
 async def test_valid_deny_policy_unchanged() -> None:
     """Successfully resolved DENY policies keep their reason and denial shape."""
     gate = RunnerToolPolicyGate.from_spec(

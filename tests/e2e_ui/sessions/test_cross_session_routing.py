@@ -18,6 +18,12 @@ never-to-A — once for a plain-text follow-up, and once for a follow-up carryin
 an image (upload → ``input_image`` post, both addressed to B). (The FIFO/idle
 unit behavior is covered by the ``chatStore`` tests.)
 
+A third test pins the other side of that isolation: a send whose POST never
+settles must not wedge a DIFFERENT session. POSTs are serialized through a
+client-side ordering chain, and while that chain was one per tab a single
+stalled POST blocked every later send in every conversation — silently, with
+a page reload as the only recovery.
+
 Why async Playwright (not the sync ``page`` fixture): the test inspects the
 body of every ``/events`` POST via a route handler and asserts on which
 session each was addressed to, across interleaved UI actions (send, switch
@@ -36,63 +42,20 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.polling import poll_until_async
+
+_COMPOSER_PLACEHOLDER = "Send a message…"
 # Unique sentinels so each POST body is unambiguously identifiable.
 _MSG1 = "sentinel-xsess-msg1-3a7f first message into B"
 _MSG2 = "sentinel-xsess-msg2-9c2e second message into B"
+_MSG3 = "sentinel-xsess-msg3-5d1b message into A while B is stalled"
 
 _EVENTS_RE = re.compile(r"/v1/sessions/([^/]+)/events$")
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    """Run *coro* to completion in a dedicated thread with its own event loop.
-
-    This file is a sync test that drives async Playwright. The e2e_ui suite
-    runs many pytest-playwright **sync** tests in the same session; once one
-    has run, pytest-asyncio can't start a loop on the main thread
-    ("Runner.run() cannot be called from a running event loop"). Running the
-    coroutine from a fresh thread via :func:`asyncio.run` sidesteps that
-    entirely. Any exception — including assertion failures — is captured and
-    re-raised on the calling thread so the test fails normally.
-
-    :param coro: The coroutine to run to completion.
-    :raises BaseException: Whatever the coroutine raised, re-raised here.
-    """
-    captured: dict[str, BaseException] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except BaseException as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    """Poll ``predicate`` on the event loop until true or timeout.
-
-    :param predicate: Zero-arg callable returning truthy when satisfied.
-    :param timeout_s: Max seconds to wait before failing the test.
-    :raises AssertionError: If the predicate never becomes truthy.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def test_queued_message_stays_bound_to_origin_session(
@@ -125,6 +88,100 @@ def test_queued_message_with_image_flushes_to_origin(
     """
     base_url, session_a, session_b = seeded_session_pair
     _run_in_fresh_loop(_drive_cross_session_image_flush(base_url, session_a, session_b))
+
+
+def test_stalled_send_does_not_block_another_session(
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """A send whose POST never settles must not wedge a different session.
+
+    POSTs are serialized through a client-side chain so they reach the
+    server in submission order. That chain used to be one per tab, and a
+    POST whose connection dies mid-flight never settles — so its link was
+    never released and EVERY later send, in every conversation, parked on
+    it forever. The composer just kept queueing with no error, and only a
+    page reload cleared it.
+
+    Failure mode this catches: B's stalled POST blocks the send in A, so
+    ``_MSG3`` never reaches the server at all.
+    """
+    base_url, session_a, session_b = seeded_session_pair
+    _run_in_fresh_loop(_drive_stalled_send_isolation(base_url, session_a, session_b))
+
+
+async def _drive_stalled_send_isolation(base_url: str, session_a: str, session_b: str) -> None:
+    """Async body of the stalled-send isolation test.
+
+    :param base_url: Spawned server base URL.
+    :param session_a: The healthy session, sent to while B is stalled.
+    :param session_b: The session whose POST is held open for good.
+    """
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        # Never set during the test body: B's POST models a connection that
+        # died in flight, so it stays pending until teardown releases the
+        # handler (leaving it awaiting a browser close would strand the task).
+        release_b = asyncio.Event()
+        try:
+            event_posts: list[tuple[str, str]] = []
+            b_post_held = False
+
+            async def handle_events(route: Route) -> None:
+                nonlocal b_post_held
+                request = route.request
+                match = _EVENTS_RE.search(request.url)
+                assert match is not None, f"unexpected /events url: {request.url}"
+                session_id = match.group(1)
+                text = request.post_data_json["data"]["content"][0]["text"]
+                event_posts.append((session_id, text))
+                if session_id == session_b and not b_post_held:
+                    b_post_held = True
+                    await release_b.wait()
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+                )
+
+            await page.route("**/v1/sessions/*/events", handle_events)
+
+            await page.goto(f"{base_url}/c/{session_b}")
+            composer = page.get_by_label("Message the agent")
+            await page.get_by_placeholder(_COMPOSER_PLACEHOLDER).wait_for(
+                state="visible", timeout=15_000
+            )
+            send_button = page.get_by_role("button", name="Send", exact=True)
+
+            # B's POST goes out and is never answered — the stalled send.
+            await composer.fill(_MSG1)
+            await send_button.click()
+            await poll_until_async(lambda: b_post_held)
+
+            # Switch to A via the sidebar (client-side nav — a reload would
+            # reset the JS module state holding the chain, dissolving the bug).
+            await page.locator(f'a[href="/c/{session_a}"]').click()
+            await page.wait_for_url(re.compile(rf"/c/{re.escape(session_a)}"))
+            # A is its own session and idle, so this send dispatches rather
+            # than queueing — the placeholder proves it before we type.
+            await page.get_by_placeholder(_COMPOSER_PLACEHOLDER).wait_for(
+                state="visible", timeout=15_000
+            )
+
+            # The assertion: A's send reaches the server while B is still
+            # stalled. Before the fix it never POSTed at all.
+            await page.get_by_label("Message the agent").fill(_MSG3)
+            await page.get_by_role("button", name="Send", exact=True).click()
+            await poll_until_async(lambda: any(text == _MSG3 for _, text in event_posts))
+            assert [sid for sid, text in event_posts if text == _MSG3] == [session_a], (
+                f"msg3 must be delivered to the active session A, got {event_posts}"
+            )
+            # B's POST is still in flight — the isolation is what let A through,
+            # not B's send having quietly resolved.
+            assert not release_b.is_set()
+        finally:
+            release_b.set()
+            await browser.close()
 
 
 async def _drive_cross_session_image_flush(base_url: str, session_a: str, session_b: str) -> None:
@@ -195,7 +252,7 @@ async def _drive_cross_session_image_flush(base_url: str, session_a: str, sessio
             # msg1 → POST to B, held open by the route handler → B stays busy.
             await composer.fill(_MSG1)
             await send_button.click()
-            await _wait_until(lambda: first_b_post_held)
+            await poll_until_async(lambda: first_b_post_held)
 
             # Attach an image + text while B is busy → held in B's client-side
             # queue. Set the hidden file input directly (the attach button just
@@ -227,7 +284,7 @@ async def _drive_cross_session_image_flush(base_url: str, session_a: str, sessio
                     for _, content in event_posts
                 )
 
-            await _wait_until(_msg2_posted)
+            await poll_until_async(_msg2_posted)
             msg2 = next(
                 content
                 for sid, content in event_posts
@@ -305,7 +362,7 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
             # msg1 → POST to B, held open by the route handler → B stays busy.
             await composer.fill(_MSG1)
             await send_button.click()
-            await _wait_until(lambda: first_b_post_held)
+            await poll_until_async(lambda: first_b_post_held)
 
             # msg2 → typed while B is busy → held in B's client-side queue,
             # shown in the docked strip, NOT POSTed.
@@ -330,7 +387,7 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
             # Background flush now delivers the queued msg2 to B (its origin),
             # even though A is the active session — the key guarantee. It must
             # go to B, never to A.
-            await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
+            await poll_until_async(lambda: any(text == _MSG2 for _, text in event_posts))
             msg2_targets = [sid for sid, text in event_posts if text == _MSG2]
             assert msg2_targets == [session_b], (
                 f"msg2 was composed in session B ({session_b}) and must be "

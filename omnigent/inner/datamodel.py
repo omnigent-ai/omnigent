@@ -353,12 +353,16 @@ class ExecutorSpec:
         base_url). Carried through so the omnigent spec translator
         can forward it into the child :class:`ExecutorSpec` without
         re-reading raw YAML.
+    :param context_files: Pi context-file discovery override. None uses Pi's default.
+    :param system_prompt_mode: Pi prompt delivery: append (default) or replace its base prompt.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
+    context_files: bool | None = None
+    system_prompt_mode: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -381,20 +385,36 @@ class CredentialSourceSpec:
     The secret is resolved in the *parent* (trusted) process and never
     handed to the sandbox verbatim — only a synthetic placeholder is.
 
-    :param kind: Resolution mode, one of ``"env"``, ``"file"``, or
-        ``"command"``.
+    :param kind: Resolution mode: env, file, command, or unix_socket.
     :param env: Environment-variable name carrying the secret when
         ``kind="env"``, e.g. ``"OA_TEST_GITHUB_PAT"``.
-    :param path: File path to read when ``kind="file"`` (``~`` is
-        expanded), e.g. ``"~/.config/tokens/github_pat.txt"``.
+    :param path: File or Unix socket path (``~`` is expanded).
     :param command: Shell command whose stdout is the secret when
         ``kind="command"``, e.g. ``"gh auth token"``.
+    :param refresh_interval_seconds: Re-resolve file or Unix socket sources on
+        access after this interval. ``None`` resolves only at startup.
     """
 
-    kind: Literal["env", "file", "command"]
+    kind: Literal["env", "file", "command", "unix_socket"]
     env: str | None = None
     path: str | None = None
     command: str | None = None
+    refresh_interval_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class GitSshBinding:
+    """Parent-owned SSH identity bound to one Git repository and destination."""
+
+    host: str
+    port: int
+    username: str
+    repository: str
+    operations: frozenset[str]
+    identity_file: str
+    known_hosts_file: str
+    allowed_cidrs: tuple[str, ...] = ()
+    allow_loopback: bool = False
 
 
 @dataclass
@@ -506,16 +526,57 @@ class CredentialProxySpec:
     databricks: DatabricksProxySpec | None = None
 
 
+@dataclass(frozen=True)
+class WritePathSpec:
+    """A directory write grant, optionally backed by a disposable overlay."""
+
+    path: str
+    copy_on_write: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not self.path:
+            raise ValueError("write_paths.path must be a non-empty string")
+        if not isinstance(self.copy_on_write, bool):
+            raise ValueError("write_paths.copy_on_write must be a boolean")
+
+
+def parse_write_paths(raw: object) -> list[str | WritePathSpec] | None:
+    """Validate write grants, preserving the existing string shorthand."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("os_env.sandbox.write_paths must be a list")
+    result: list[str | WritePathSpec] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            WritePathSpec(entry)
+            result.append(entry)
+        elif isinstance(entry, WritePathSpec):
+            result.append(entry)
+        elif isinstance(entry, dict):
+            if set(entry) - {"path", "copy_on_write"}:
+                raise ValueError("write_paths entries only accept path and copy_on_write")
+            path = entry.get("path")
+            copy_on_write = entry.get("copy_on_write", False)
+            if not isinstance(path, str) or not isinstance(copy_on_write, bool):
+                raise ValueError("write_paths requires a string path and boolean copy_on_write")
+            result.append(WritePathSpec(path, copy_on_write))
+        else:
+            raise ValueError("write_paths entries must be path strings or mappings")
+    return result
+
+
 @dataclass
 class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
     # Backend identifier, e.g. ``"linux_bwrap"``,
-    # ``"darwin_seatbelt"``, or ``"none"``. The dataclass default of
-    # ``"linux_bwrap"`` is a safe sentinel for in-process construction
-    # (``OSEnvSandboxSpec(type=self.type_name)`` is the idiomatic call
-    # site); YAML parsers map a missing ``type:`` field to the platform
-    # default at parse time via
+    # ``"darwin_seatbelt"``, or ``"none"``. YAML also accepts ``"auto"``
+    # and resolves it to the platform default before constructing this value.
+    # The dataclass default of ``"linux_bwrap"`` is a safe sentinel for
+    # in-process construction (``OSEnvSandboxSpec(type=self.type_name)`` is
+    # the idiomatic call site); YAML parsers map a missing ``type:`` field to
+    # the platform default at parse time via
     # :func:`omnigent.inner.sandbox._default_sandbox_for_platform`,
     # which picks ``linux_bwrap`` on Linux (with ``bwrap`` on PATH)
     # and ``darwin_seatbelt`` on macOS.
@@ -557,7 +618,8 @@ class OSEnvSandboxSpec:
     # the entry cap; the resulting :class:`OSError` names the
     # offending root and the tunables.
     read_paths: list[str] | None = None
-    write_paths: list[str] | None = None
+    write_paths: list[str | WritePathSpec] | None = None
+
     # Per-file write grants. Use this for single files that can't be
     # expressed as a directory write path (e.g. ``~/.claude.json``).
     # The bwrap backend treats each entry as an additional
@@ -576,6 +638,9 @@ class OSEnvSandboxSpec:
     # Matching is by basename, so an entry ``".venv"`` allows
     # ``cwd/.venv``,
     # ``cwd/services/api/.venv``, and ``<read_path>/.venv`` alike.
+    # The explicit entry ``"*"`` allows every dotpath while the
+    # escaping-symlink defense remains active. Use it only for trusted
+    # roots whose hidden files must persist across helper invocations.
     # ``None`` means "use the backend's documented default" (both
     # bwrap and seatbelt expand ``None`` to ``[".venv"]`` so a
     # typical Python project keeps working out of the box). An empty
@@ -636,6 +701,36 @@ class OSEnvSandboxSpec:
     # (untrusted source trees, supervisor-spawned forks) where an
     # unmasked dotfile past the cap would be an unacceptable leak.
     cwd_hidden_scan_overflow: str = "warn"
+    # Whether the dotfile / escaping-symlink masker recurses into
+    # subdirectories. ``False`` (default) scans only the immediate
+    # children of cwd and each ``read_paths`` / ``write_paths`` root —
+    # the top-level dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``,
+    # ...) that carry the overwhelming majority of secrets are still
+    # masked, but the walker no longer pays to descend the whole tree.
+    # This is the scalable default: a recursive walk of a medium/large
+    # project (or ``read_paths: ["~/"]``) visits enormous numbers of
+    # entries and routinely trips :attr:`cwd_hidden_scan_max_entries`.
+    #
+    # L6 (security trade-off): with the top-level-only default, a
+    # dotfile nested below the first level (e.g.
+    # ``cwd/services/api/.env`` or ``~/projects/foo/.netrc``) is NOT
+    # masked and stays readable by the sandboxed helper. Set this to
+    # ``True`` for untrusted source trees where a deeply-nested
+    # credential file would be an unacceptable leak; the cap /
+    # overflow knobs then bound the cost of the full walk.
+    cwd_hidden_scan_recursive: bool = False
+    # Explicit files/directories to hide from the sandboxed helper,
+    # regardless of whether their basename starts with ``.``. Each
+    # entry is a path string resolved like ``read_paths`` (``~`` is
+    # expanded; relative paths are taken against cwd; ``$VAR`` is NOT
+    # expanded). Directories are masked as an empty view, files as an
+    # empty file — the same masking the dotfile walker emits. Use this
+    # to hide a specific secret the name-based masker wouldn't catch
+    # (e.g. ``config/production.key``) or a deeply-nested dotfile
+    # without turning on full recursion. Applied on top of the
+    # dotfile mask in every mode. ``None`` and ``[]`` both mean "no
+    # explicit masks".
+    mask_paths: list[str] | None = None
     # Environment-variable allowlist for the helper subprocess, beyond
     # the always-passed minimal default (PATH/HOME/USER/LANG/LC_*/etc.;
     # see :data:`omnigent.inner.os_env._DEFAULT_ENV_PASSTHROUGH`).
@@ -704,6 +799,21 @@ class OSEnvSandboxSpec:
     # credential and rejects placeholder leaks) and a backend that
     # hard-isolates the network (``linux_bwrap`` / ``darwin_seatbelt``).
     credential_proxy: CredentialProxySpec | None = None
+    # Git's SSH transport runs in the trusted parent. Only the private
+    # broker socket and a Git helper command are exposed to the sandbox.
+    git_ssh: list[GitSshBinding] | None = None
+
+    @property
+    def requires_network_enforcement(self) -> bool:
+        return bool(self.egress_rules or self.git_ssh)
+
+    @property
+    def write_path_specs(self) -> list[WritePathSpec]:
+        """Normalize shorthand and structured grants at the policy boundary."""
+        return [
+            WritePathSpec(entry) if isinstance(entry, str) else entry
+            for entry in parse_write_paths(self.write_paths) or []
+        ]
 
 
 @dataclass
@@ -723,6 +833,14 @@ class OSEnvSpec:
     sandbox: OSEnvSandboxSpec | None = None
     fork: bool = False
     start_in_scratch: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.fork
+            and self.sandbox is not None
+            and any(p.copy_on_write for p in self.sandbox.write_path_specs)
+        ):
+            raise ValueError("os_env.fork cannot be combined with copy_on_write paths")
 
 
 @dataclass
@@ -770,15 +888,8 @@ class TerminalEnvSpec:
         the pane's inner process exits (``remain-on-exit`` / ``exit-empty
         off``), so a single CLI exit no longer reaps the server and cascades
         into ``no server running``. Opt-in because it changes the
-        ``has-session``-means-alive contract; enabled for the claude-native
-        agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
-    :param terminal_transport: How the web UI attaches to this terminal:
-        ``"control"`` (``tmux -C`` control mode, giving the browser xterm
-        native scrollback + selection — the default) or ``"pty"`` (the legacy
-        forked-``tmux attach`` PTY stream). ``None`` defers to the global
-        default, which is control mode unless ``terminal.transport`` in
-        ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
-        ``?transport=`` query overrides both.
+        ``has-session``-means-alive contract; enabled for runner-owned Claude
+        and Codex terminals, whose liveness is decided by ``#{pane_dead}``.
     """
 
     command: str | None = None
@@ -795,7 +906,6 @@ class TerminalEnvSpec:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
-    terminal_transport: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -852,10 +962,11 @@ class AgentDef:
     # translated to an AgentSpec.
     agent_session_sharing: str = "none"
     os_env: OSEnvSpec | None = None
+    model_egress: list[str] | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by
-    # the Claude SDK harness to expose ``<bundle>/skills/<name>/
+    # the Claude SDK harness to expose ``<bundle>/skills/<dir>/
     # SKILL.md`` files as plugin skills via the SDK's
     # ``--plugin-dir`` mechanism. Set by the AgentSpec → AgentDef
     # bridge from the spec's parsed ``skill_dir`` paths; left

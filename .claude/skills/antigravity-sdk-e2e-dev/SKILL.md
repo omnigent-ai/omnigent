@@ -125,7 +125,7 @@ streaming, harness.
 4. **No OpenAI gateway / Databricks.** The SDK has no `base_url`; a `databricks`
    or generic-`provider` auth is **warned and ignored**, and the run falls back
    to ambient Gemini creds. Don't expect `databricks-*` models to route through
-   the AI Gateway like claude-sdk/codex/pi.
+   the Unity Gateway like claude-sdk/codex/pi.
 5. **Model ids are Gemini ids.** Default `gemini-3.5-flash`. `gemini-3-pro`
    **404s on a plain AI-Studio key** — use `gemini-2.5-flash` / `gemini-3.5-flash`
    unless your key has Pro access.
@@ -146,7 +146,7 @@ streaming, harness.
 
 ```bash
 # Unit tests (use --frozen; the cwsandbox extra is unsatisfiable on public PyPI here)
-uv run --frozen --extra dev python -m pytest \
+uv run --frozen --group test python -m pytest \
   tests/inner/test_antigravity_executor.py \
   tests/inner/test_antigravity_harness.py \
   tests/runtime/test_antigravity_spawn_env.py \

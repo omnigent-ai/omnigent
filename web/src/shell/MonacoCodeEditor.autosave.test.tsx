@@ -47,7 +47,7 @@ interface FakeEditor {
   getContribution: () => null;
   /** Test-only: set getValue() without firing onChange (mirrors a user keystroke
    *  landing in the buffer; the test fires onChange separately). */
-  __set: (v: string) => void;
+  setValueForTest: (v: string) => void;
 }
 
 function makeFakeEditor(initial: string): FakeEditor {
@@ -80,7 +80,7 @@ function makeFakeEditor(initial: string): FakeEditor {
     restoreViewState: () => {},
     getAction: () => ({ run: () => {} }),
     getContribution: () => null,
-    __set: (v) => {
+    setValueForTest: (v) => {
       value = v;
     },
   };
@@ -121,7 +121,10 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
 import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
@@ -170,7 +173,7 @@ async function renderMounted(el: React.ReactElement) {
 
 // Drive a user edit: update the buffer, then fire the captured onChange.
 async function fireEdit(value: string) {
-  fakeEditor!.__set(value);
+  fakeEditor!.setValueForTest(value);
   await act(async () => {
     h.onChange?.(value, {});
   });
@@ -291,8 +294,9 @@ describe("MonacoCodeEditor auto-save wiring (integration)", () => {
   });
 
   it("flushes accumulated edits when the runner reconnects", async () => {
-    // Offline → auto-save suppressed.
+    // Runner down, no host to serve the workspace → auto-save suppressed.
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
+    vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(null);
     const { rerender } = await renderMounted(makeEditor());
     await fireEdit(EDITED);
     await act(async () => {

@@ -23,10 +23,9 @@ so unrelated version literals (host/runner wire-protocol versions,
 docstring examples, third-party dependency floors like
 ``databricks-mcp>=0.9.0``) are left untouched.
 
-``web/package.json`` (a ``0.0.0`` sentinel for the private SPA) and
-``web/electron/package.json`` (the desktop app's independent
-version) are intentionally OUT of scope: neither is part of the
-release-validated Python lockstep.
+The desktop app (``web/electron/package.json``) and private SPA
+(``web/package.json``) are intentionally OUT of scope: neither is part
+of the Python distributions' release-validated lockstep.
 
 After editing the ``pyproject.toml`` files, regenerate the lockfile so
 the embedded sibling specifiers track the new version::
@@ -53,10 +52,10 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-import tomllib
 from packaging.version import InvalidVersion, Version
 
 # scripts/update_versions.py -> repo root is one level up.

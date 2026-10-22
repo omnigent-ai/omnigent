@@ -155,6 +155,17 @@ def use_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def use_error_with_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MockExecutor that yields an ExecutorError carrying observed usage."""
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "error_with_usage")
+
+
+@pytest.fixture
+def use_provider_auth_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "provider_auth_failure")
+
+
+@pytest.fixture
 def use_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     """MockExecutor that yields a provider-side TurnCancelled."""
     monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "cancelled")
@@ -403,6 +414,128 @@ async def test_executor_error_terminates_with_response_failed(
     assert "mock error" in error_detail["message"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preserve_session", [False, True])
+async def test_executor_error_preserves_only_explicitly_idle_sessions(
+    preserve_session: bool,
+) -> None:
+    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor, TextChunk
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    error = ExecutorError(message="model unavailable", retryable=True)
+    if preserve_session:
+        error.preserve_session = True
+        executor.enqueue_events([error])
+    else:
+        executor.enqueue_events([TextChunk(text="partial response"), error])
+    executor.interrupt_session = AsyncMock(return_value=True)
+    executor.close_session = AsyncMock()
+    executor.close = AsyncMock()
+    factory = Mock(return_value=executor)
+    adapter = ExecutorAdapter(executor_factory=factory)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_failed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        await adapter.run_turn(request, ctx)
+
+    if preserve_session:
+        assert adapter._executor is executor
+        assert adapter._abandoned_executor_cleanup is None
+        executor.interrupt_session.assert_not_awaited()
+        executor.close.assert_not_awaited()
+        executor.enqueue_response("retried")
+        retry_ctx = TurnContext(
+            response_id="resp_retry", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(request, retry_ctx)
+        factory.assert_called_once()
+    else:
+        assert adapter._executor is None
+        assert adapter._abandoned_executor_cleanup is not None
+        await adapter._abandoned_executor_cleanup
+        executor.interrupt_session.assert_awaited_once()
+        executor.close_session.assert_awaited_once()
+        executor.close.assert_awaited_once()
+
+
+async def test_executor_error_usage_reaches_response_failed(
+    use_error_with_usage: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """An ExecutorError's observed usage rides on the response.failed event.
+
+    A turn that fails after the model call started has already observed its
+    prompt size. The adapter must stash that usage on the turn context so the
+    scaffold's terminal ``response.failed`` carries it — otherwise the web
+    client's context-occupancy ring freezes at the previous successful turn's
+    value exactly when the session is in trouble.
+
+    Regression guard: pre-fix the adapter dropped ``ExecutorError.usage``
+    and the failed response carried ``usage: null``.
+    """
+    conv_id = "conv_err_usage"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    usage = events[-1].data["response"]["usage"]
+    assert usage is not None
+    # context_tokens is the window-fill figure the ring renders from.
+    assert usage["context_tokens"] == 100_000
+    assert usage["input_tokens"] == 400
+    # The failure is still a failure — the error detail must not be
+    # displaced by the usage payload.
+    assert events[-1].data["response"]["error"] is not None
+
+
+async def test_provider_auth_required_survives_adapter_and_sse_envelope(
+    use_provider_auth_failure: None,
+    manager: HarnessProcessManager,
+) -> None:
+    conv_id = "conv_provider_auth"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    events: list[_ParsedSSEEvent] = []
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        async for event in _stream_iter(response):
+            events.append(event)
+
+    assert events[-1].event == "response.failed"
+    error = events[-1].data["response"]["error"]
+    assert error == {
+        "code": "PROVIDER_AUTH_REQUIRED",
+        "message": (
+            "Provider authentication required for host "
+            "https://workspace.cloud.databricks.com and profile agent-profile. "
+            "Run `ucode configure` or `databricks auth login --host "
+            "https://workspace.cloud.databricks.com --profile agent-profile`, then Retry."
+        ),
+        "title": "Databricks authentication required",
+        "cause": (
+            "Databricks authentication for the selected workspace/profile is missing or expired."
+        ),
+        "remediation": "ucode configure",
+    }
+    assert "stderr" not in str(error).lower()
+    assert "token" not in str(error).lower()
+
+
 async def test_turn_cancelled_terminates_with_response_cancelled(
     use_cancelled: None,
     manager: HarnessProcessManager,
@@ -429,6 +562,119 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
 
 
 # ── Error-code classification ──────────────────────────────────
+
+
+def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
+    """
+    An executor that names its failure (``ExecutorError.code``) is raised as
+    :class:`InnerExecutorError`; the detail keeps that code plus the headline
+    and next step, so the web card reads as that failure instead of as a bare
+    ``RuntimeError``.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    error = InnerExecutorError(
+        "Codex is waiting for a sign-in in this session's terminal.",
+        code="databricks_sign_in_pending",
+        title="Codex can't start until you sign in to Databricks",
+        remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+        undelivered=True,
+    )
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "databricks_sign_in_pending"
+    # The relay settles the queued message only on a failure before delivery.
+    assert detail.undelivered is True
+    assert detail.message == "Codex is waiting for a sign-in in this session's terminal."
+    assert detail.title == "Codex can't start until you sign in to Databricks"
+    assert detail.remediation is not None
+    assert "HQ7M-2KPD" in detail.remediation
+
+
+@pytest.mark.asyncio
+async def test_coded_executor_error_is_raised_with_its_code() -> None:
+    """
+    An ``ExecutorError`` that names its failure surfaces as
+    :class:`InnerExecutorError` carrying that code, headline and next step,
+    with the executor's own sentence as the message (no "inner executor
+    error:" prefix). An uncoded error keeps today's generic wrap.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [
+            ExecutorError(
+                message="Codex is waiting for a sign-in in this session's terminal.",
+                code="databricks_sign_in_pending",
+                title="Codex can't start until you sign in to Databricks",
+                remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
+                undelivered=True,
+            )
+        ]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(model="test-agent", input="hello")
+    ctx = TurnContext(
+        response_id="resp_coded", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    with pytest.raises(InnerExecutorError) as raised:
+        await adapter.run_turn(request, ctx)
+
+    assert str(raised.value) == "Codex is waiting for a sign-in in this session's terminal."
+    assert raised.value.code == "databricks_sign_in_pending"
+    assert raised.value.title == "Codex can't start until you sign in to Databricks"
+    assert raised.value.remediation is not None
+    assert "HQ7M-2KPD" in raised.value.remediation
+    assert raised.value.undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [None, "databricks_sign_in_pending"])
+@pytest.mark.parametrize("undelivered", [False, True])
+async def test_executor_delivery_evidence_survives_without_an_error_code(
+    code: str | None, undelivered: bool
+) -> None:
+    """The relay needs delivery evidence independently of error classification."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", code=code, undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.undelivered is (True if undelivered else None)
+        assert detail.code == (code or "RuntimeError")
+        assert detail.message == (
+            "Terminal is not ready" if code else "inner executor error: Terminal is not ready"
+        )
+    finally:
+        await adapter.on_shutdown()
 
 
 def test_build_error_detail_uses_omnigent_error_code() -> None:
@@ -469,6 +715,132 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     # this assertion would fail.
     base_detail = HarnessApp._build_error_detail(adapter, RuntimeError("oops"))
     assert base_detail.code == "RuntimeError"
+
+
+# Claude Code's result text when its version predates the selected model.
+_OLD_CLI_REFUSAL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+
+
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_codes_old_cli_model_refusal(undelivered: bool) -> None:
+    """
+    A claude-sdk turn ending on Claude Code's "version N or newer is required"
+    refusal reaches the adapter as a bare ``RuntimeError``; the detail is coded
+    ``client_update_required`` and names both versions and the update command,
+    with the raw text kept as the message.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    message = f"inner executor error: {_OLD_CLI_REFUSAL}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "client_update_required"
+    assert detail.undelivered is (True if undelivered else None)
+    assert detail.message == str(error)
+    assert detail.title == "Claude Code needs an update"
+    assert detail.cause is not None
+    assert "2.1.217" in detail.cause
+    assert "2.1.280" in detail.cause
+    assert detail.remediation is not None
+    assert "`claude update`" in detail.remediation
+
+
+def test_old_cli_refusal_text_does_not_override_other_classifications() -> None:
+    """
+    The text check is a last resort: an executor-named code and an SDK-typed
+    failure keep their code, and an unrelated ``RuntimeError`` stays generic.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_OLD_CLI_REFUSAL, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.cause is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_OLD_CLI_REFUSAL))
+    assert typed.code == "connection_error"
+    assert typed.cause is None
+
+    unrelated = adapter._build_error_detail(RuntimeError("inner executor error: boom"))
+    assert unrelated.code == "RuntimeError"
+    assert unrelated.title is None
+    assert unrelated.cause is None
+    assert unrelated.remediation is None
+
+
+# The provider's model-not-found text as it reaches the adapter from the SDK.
+_MODEL_NOT_FOUND = (
+    "There's an issue with the selected model (anthropic/claude-opus-4-8). "
+    "It may not exist or you may not have access to it."
+)
+
+
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_adds_model_unavailable_recovery_hint(undelivered: bool) -> None:
+    """
+    A claude-sdk turn ending on a model-not-found refusal reaches the adapter as
+    a bare ``RuntimeError``; the detail gains a recovery hint while keeping the
+    generic ``RuntimeError`` code (so the web shows the agent-turn-error
+    headline) and the original message with its model id.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    message = f"inner executor error: {_MODEL_NOT_FOUND}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "RuntimeError"
+    assert detail.undelivered is (True if undelivered else None)
+    assert detail.message == str(error)
+    # No title/cause so the web keeps the agent-named turn-error headline and the
+    # original provider message, matching the already-covered native card.
+    assert detail.title is None
+    assert detail.cause is None
+    assert "anthropic/claude-opus-4-8" in detail.message
+    assert detail.remediation is not None
+    assert "model picker" in detail.remediation
+    assert "/model" in detail.remediation
+
+
+def test_model_unavailable_hint_does_not_override_other_classifications() -> None:
+    """The hint is a last-resort text check: a coded or SDK-typed failure keeps
+    its code and gains no spurious remediation."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_MODEL_NOT_FOUND, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.remediation is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_MODEL_NOT_FOUND))
+    assert typed.code == "connection_error"
+    assert typed.remediation is None
 
 
 def test_classify_openai_exception_maps_known_types() -> None:
@@ -986,6 +1358,8 @@ class _RecordingTurnContext:
     Only the surface the adapter touches is implemented.
     """
 
+    session_id = None
+
     def __init__(self, response_id: str = "resp_xyz") -> None:
         """Initialize recording state.
 
@@ -1090,6 +1464,152 @@ def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
     assert ctx.emitted == []
 
 
+def _fc_items(ctx: _RecordingTurnContext) -> list[dict[str, Any]]:
+    """The ``item`` dicts of the OutputItemDoneEvents ``ctx`` recorded."""
+    return [e.item for e in ctx.emitted if getattr(e, "item", None) is not None]
+
+
+def test_observed_tool_call_reemits_a_completed_function_call() -> None:
+    """An observed tool call's completion re-emits a durable ``completed`` card.
+
+    **What breaks if this fails**: the inline ToolCallRequest emits status
+    ``"in_progress"``, which the turn-persist filter drops — so the card renders
+    live but disappears on refresh (the reported bug for generic-ACP harnesses).
+    On completion the adapter re-emits the same call as a ``completed``
+    function_call (which persists), then the function_call_output. Same call_id →
+    the web dedupes the live in_progress render and this one into a single card.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_obs")
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(name="Ran command", args={"command": "ls"}, metadata={"call_id": "c1"}),
+        ctx,
+    )
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="Ran command",
+            status=ToolCallStatus.SUCCESS,
+            result="a.txt",
+            metadata={"call_id": "c1"},
+        ),
+        ctx,
+    )
+
+    items = _fc_items(ctx)
+    assert [(i["type"], i.get("status")) for i in items] == [
+        ("function_call", "in_progress"),  # live-only; dropped by the persist filter
+        ("function_call", "completed"),  # durable — survives reload
+        ("function_call_output", None),
+    ]
+    completed = items[1]
+    assert completed["call_id"] == "c1", "same call_id → dedupes with the live card"
+    assert completed["name"] == "Ran command"
+    assert completed["arguments"] == '{"command": "ls"}', "args carried from the request"
+
+
+def test_uncached_completion_reemits_no_function_call() -> None:
+    """A completion with no cached in_progress request re-emits no card.
+
+    The re-emission is gated on the request having been cached (an in_progress
+    observation). A ToolCallComplete for a call the adapter never saw start emits
+    only the function_call_output — never a synthesized completed card. That gate
+    is what keeps the re-emission from firing for a call whose durable completed
+    form some other path already produced (see the observed_call_completed test).
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_obs")
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="grep", status=ToolCallStatus.SUCCESS, result="hit", metadata={"call_id": "c9"}
+        ),
+        ctx,
+    )
+    items = _fc_items(ctx)
+    assert [(i["type"], i.get("status")) for i in items] == [
+        ("function_call_output", None),
+    ]
+
+
+def test_observed_call_completed_request_is_not_reemitted_at_completion() -> None:
+    """An executor that self-emits a durable completed card is not doubled.
+
+    Codex built-ins re-emit their own completed function_call at completion (via
+    ``observed_call_completed`` on the ToolCallRequest) because the relay persists
+    only completed calls. That request is emitted completed in one shot AND drops
+    the cache entry, so the ToolCallComplete that follows must NOT re-emit a second
+    completed card. Regression guard: without the cache pop, this observed call
+    would render (and persist) two identical completed cards.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_obs")
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    # Live start (in_progress), then codex's own completed re-emit + the completion.
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(name="shell", args={"command": "ls"}, metadata={"call_id": "cb"}),
+        ctx,
+    )
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallRequest(
+            name="shell",
+            args={"command": "ls"},
+            metadata={"call_id": "cb", "observed_call_completed": True},
+        ),
+        ctx,
+    )
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="shell", status=ToolCallStatus.SUCCESS, result="a.txt", metadata={"call_id": "cb"}
+        ),
+        ctx,
+    )
+
+    items = _fc_items(ctx)
+    assert [(i["type"], i.get("status")) for i in items] == [
+        ("function_call", "in_progress"),  # live-only; dropped by the persist filter
+        ("function_call", "completed"),  # the executor's own durable re-emit
+        ("function_call_output", None),  # completion emits only the output — no 2nd card
+    ]
+    assert sum(i["type"] == "function_call" and i.get("status") == "completed" for i in items) == 1
+
+
+def test_dispatched_call_does_not_reemit_a_completed_function_call() -> None:
+    """A dispatched tool's completion stays suppressed — no duplicate card.
+
+    Dispatched (runner-side) tools already persist their own completed
+    function_call via dispatch_tool, so the ToolCallComplete short-circuits before
+    the re-emission. Re-emitting here would double the card.
+    """
+    from omnigent.inner.executor import ToolCallComplete, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    adapter._dispatched_call_ids.add("d1")
+
+    adapter._translate_event(  # type: ignore[arg-type]
+        ToolCallComplete(
+            name="x", status=ToolCallStatus.SUCCESS, result="out", metadata={"call_id": "d1"}
+        ),
+        ctx,
+    )
+    assert ctx.emitted == []
+
+
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     """
     A ``ToolCallRequest`` with an MCP-prefixed name pushes the
@@ -1154,10 +1674,8 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
     result panel for the orphan call (the 2026-04-29
     user-reported regression on ``sys_timer_set``).
 
-    For codex / pi which emit ToolCallRequest but run the
-    tool natively (without invoking _stable_tool_executor for
-    that call), the push is harmless — the queue entry just
-    sits there until a real bridged-tool call drains it.
+    Executors that observe a tool already run by the native harness mark
+    it ``internally_executed`` and bypass this queue entirely.
     """
     from omnigent.inner.executor import ToolCallRequest
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -1184,6 +1702,43 @@ def test_translate_event_non_mcp_request_queues_tool_use_id() -> None:
         f"with different call_ids and the REPL double-renders "
         f"the ⏵ line."
     )
+
+
+def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
+    """Keep an observed native tool from corrupting a later dispatch identity."""
+
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    adapter._translate_event(
+        ToolCallRequest(
+            name="shell",
+            args={"command": "pwd"},
+            metadata={"call_id": "native-command-1", "internally_executed": True},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    adapter._translate_event(
+        ToolCallComplete(
+            name="shell",
+            status=ToolCallStatus.SUCCESS,
+            result="/workspace\n",
+            metadata={"call_id": "native-command-1"},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert list(adapter._pending_mcp_call_ids) == []
+    # The live in_progress card is cached and re-emitted completed at completion so
+    # it survives reload; the queue bypass asserted above is orthogonal to that.
+    assert [(e.item["type"], e.item.get("status")) for e in ctx.emitted] == [
+        ("function_call", "in_progress"),
+        ("function_call", "completed"),
+        ("function_call_output", None),
+    ]
 
 
 def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
@@ -1597,6 +2152,8 @@ class _OneInjectionCtx:
 
         self._injection: Any = injection
         self.emitted: list[Any] = []
+        self.response_id = "resp_injection"
+        self.session_id = "session_injection"
         # Mirror TurnContext: the watcher skips delivery once cancelled.
         self.cancelled = asyncio.Event()
 
@@ -1667,6 +2224,90 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert isinstance(marker, InjectionConsumedEvent)
     assert marker.type == "injection.consumed"
     assert marker.injection_id == "inj_x"
+
+
+class _ScriptedInjectionExecutor:
+    """Inner executor stub whose enqueue_session_message returns or raises a scripted outcome."""
+
+    def __init__(self, outcome: bool | BaseException) -> None:
+        """Hold the outcome to return or raise.
+
+        :param outcome: ``True``/``False`` to return, or an exception to raise.
+        """
+        self.outcome = outcome
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        """Return or raise the scripted outcome.
+
+        :param session_key: Adapter session key.
+        :param content: The injected user text.
+        :returns: The scripted boolean.
+        """
+        del session_key, content
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "consumed", "logged"),
+    [
+        (True, True, "executor_accepted"),
+        (False, False, "executor_refused"),
+        (None, True, "executor_ambiguous"),
+        (RuntimeError("socket closed before sending"), False, "error"),
+    ],
+    ids=["accepted", "refused", "ambiguous", "error"],
+)
+async def test_watch_injections_marks_ambiguous_delivery_consumed(
+    outcome: bool | BaseException | None,
+    consumed: bool,
+    logged: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An injection the harness may already hold is marked consumed, so it is never resent."""
+    import asyncio as _aio
+    import logging
+
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    executor = _ScriptedInjectionExecutor(
+        InjectionDeliveryAmbiguous("reply lost") if outcome is None else outcome
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(
+            model="m", input="steer me", injection_id="inj_x", input_stable_id="a" * 32
+        )
+    )
+
+    caplog.set_level(logging.INFO)
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if any(
+                getattr(record, "event_name", None) == "native_input_steering_finished"
+                for record in caplog.records
+            ):
+                break
+            await _aio.sleep(0.01)
+        await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    finished = [
+        record.attributes["outcome"]
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_steering_finished"
+    ]
+    assert finished == [logged]
+    markers = [event for event in ctx.emitted if isinstance(event, InjectionConsumedEvent)]
+    assert [marker.injection_id for marker in markers] == (["inj_x"] if consumed else [])
 
 
 @pytest.mark.asyncio
@@ -1860,6 +2501,38 @@ def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None
     )
 
 
+def test_completed_observed_tool_request_is_durable() -> None:
+    """Mark the completed observation durable while retaining the live start."""
+
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+
+    request = ToolCallRequest(
+        name="shell",
+        args={"command": "pwd"},
+        metadata={"call_id": "command-1", "internally_executed": True},
+    )
+    adapter._translate_event(request, ctx)  # type: ignore[arg-type]
+    adapter._translate_event(
+        ToolCallRequest(
+            name="shell",
+            args={"command": "pwd"},
+            metadata={
+                "call_id": "command-1",
+                "internally_executed": True,
+                "observed_call_completed": True,
+            },
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+
+    assert [event.item["status"] for event in ctx.emitted] == ["in_progress", "completed"]
+    assert list(adapter._pending_mcp_call_ids) == []
+
+
 # ── ToolCallComplete suppression scoped to dispatched call ids ──────────────
 #
 # A tool routed through ``_stable_tool_executor`` → ``ctx.dispatch_tool`` already
@@ -1982,7 +2655,7 @@ def test_idless_tool_complete_is_suppressed() -> None:
 
 
 async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
-    """With no active turn context (turn-context desync, #1026) the policy
+    """With no active turn context (turn-context desync) the policy
     evaluator must not blanket-ALLOW. PHASE_TOOL_CALL fails closed (this adapter
     is the only enforcement point, never re-checked server-side); advisory LLM
     phases and the post-execution result phase fail open so a transient desync
@@ -2001,3 +2674,316 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
         assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
         assert verdict.reason is None, advisory_phase
+
+
+class _CancelFlag:
+    """Records whether the adapter signalled cancellation.
+
+    A real class rather than MagicMock so an unexpected attribute access on the
+    flag fails loud, per the project's testing rules.
+    """
+
+    def __init__(self) -> None:
+        self.was_set = False
+
+    def set(self) -> None:
+        """Mark the turn cancelled."""
+        self.was_set = True
+
+
+class _ElicitingTurnContext:
+    """Stand-in for :class:`TurnContext` that captures one elicitation.
+
+    Only the surface the elicitation bridges touch is implemented: ``elicit`` and
+    ``cancelled``.
+    """
+
+    def __init__(self, reply: Any) -> None:  # type: ignore[explicit-any]
+        """:param reply: The :class:`ElicitationResult` to answer with."""
+        self.reply = reply
+        self.cancelled = _CancelFlag()
+        self.seen: list[Any] = []  # type: ignore[explicit-any]
+
+    async def elicit(self, elicitation_id: str, params: Any) -> Any:  # type: ignore[explicit-any]
+        """Record the request and return the canned reply."""
+        self.seen.append((elicitation_id, params))
+        return self.reply
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> None:
+    """The card is asked for buttons, and the chosen label comes back.
+
+    The ``answer`` enum shape is a contract with the web approval card, which
+    renders one button per enum value and replies ``content={"answer": <label>}``
+    (see ``web/src/components/blocks/ApprovalCard.test.tsx``). A change to either
+    half silently collapses the card back to Approve/Reject, so it is asserted
+    exactly here.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(
+        ElicitationResult(action="accept", content={"answer": "Allow this session"})
+    )
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    chosen = await adapter._stable_elicitation_choice_handler(
+        "Ran command",
+        {"command": "ls"},
+        ["Allow", "Allow this session", "Reject"],
+    )
+
+    assert chosen == "Allow this session"
+    (_elicitation_id, params) = ctx.seen[0]
+    assert params.requestedSchema == {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string", "enum": ["Allow", "Allow this session", "Reject"]}
+        },
+        "required": ["answer"],
+    }
+    # The card still names the tool and previews its arguments, as the binary one does.
+    assert "Ran command" in params.message
+    assert params.content_preview == 'Ran command({"command": "ls"})'
+    assert params.phase == "tool_call"
+    assert not ctx.cancelled.was_set
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_declines_on_a_dismissed_card() -> None:
+    """A declined card returns no choice and signals cancellation, as before."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    assert (
+        await adapter._stable_elicitation_choice_handler("shell", {}, ["Allow", "Reject"]) is None
+    )
+    assert ctx.cancelled.was_set
+
+
+@pytest.mark.asyncio
+async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
+    """An orphaned callback declines rather than granting a scope unreviewed."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    assert adapter._current_ctx is None
+
+    assert (
+        await adapter._stable_elicitation_choice_handler("shell", {}, ["Allow", "Reject"]) is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> None:
+    """The choice bridge reaches executors that accept it, and only those.
+
+    Bridges are installed by attribute, so a rename on either side would leave the
+    feature silently inert — the card would quietly stay Approve/Reject. Executors
+    that don't offer the agent's own options must not grow the attribute.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _ChoiceCapableExecutor(Executor):
+        """Declares the attribute, as :class:`AcpExecutor` does."""
+
+        def __init__(self) -> None:
+            self._elicitation_choice_handler = None
+
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield TurnComplete(response="ok")
+
+    class _BinaryOnlyExecutor(Executor):
+        """Declares no choice attribute — e.g. the SDK harnesses."""
+
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            yield TurnComplete(response="ok")
+
+    for executor, expected in ((_ChoiceCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
+        adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
+        ctx = TurnContext(
+            response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+
+        installed = getattr(executor, "_elicitation_choice_handler", None) is not None
+        assert installed is expected, type(executor).__name__
+        # The yes/no bridge is installed on both — the choice bridge is additive.
+        assert getattr(executor, "_elicitation_handler", None) is not None
+
+
+def test_translate_event_emits_subagent_started() -> None:
+    """A ``SubAgentStarted`` becomes the runner-internal ``subagent.started`` SSE event.
+
+    This is the harness half of the surfacing seam: the runner turns this event
+    into a child session. If it stops emitting, the Subagents panel goes empty
+    for the agent.
+    """
+    from omnigent.inner.executor import SubAgentStarted
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentStartedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentStarted(child_key="a0ac9364", title="mathutils", task="create files"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentStartedEvent)
+    assert (ev.type, ev.child_key, ev.title, ev.task) == (
+        "subagent.started",
+        "a0ac9364",
+        "mathutils",
+        "create files",
+    )
+
+
+def test_translate_event_emits_subagent_completed() -> None:
+    """A ``SubAgentCompleted`` becomes the runner-internal ``subagent.completed`` SSE event."""
+    from omnigent.inner.executor import SubAgentCompleted
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentCompletedEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentCompleted(child_key="a0ac9364", ok=True, summary="3 tests pass"),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentCompletedEvent)
+    assert (ev.type, ev.child_key, ev.ok, ev.summary) == (
+        "subagent.completed",
+        "a0ac9364",
+        True,
+        "3 tests pass",
+    )
+
+
+def test_translate_event_emits_subagent_tool_call() -> None:
+    """A ``SubAgentToolCall`` becomes ``subagent.tool_call`` with JSON arguments.
+
+    The runner appends this to the child transcript as a ``function_call`` card,
+    so ``arguments`` must be the JSON-encoded string the item expects.
+    """
+    from omnigent.inner.executor import SubAgentToolCall
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import SubagentToolCallEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext(response_id="resp_sa")
+    adapter._translate_event(
+        SubAgentToolCall(
+            child_key="a0ac9364",
+            call_id="toolu_01",
+            name="Wrote mathutils.py",
+            args={"file_path": "mathutils.py"},
+        ),
+        ctx,  # type: ignore[arg-type]
+    )
+    assert len(ctx.emitted) == 1
+    ev = ctx.emitted[0]
+    assert isinstance(ev, SubagentToolCallEvent)
+    assert (ev.type, ev.child_key, ev.call_id, ev.name) == (
+        "subagent.tool_call",
+        "a0ac9364",
+        "toolu_01",
+        "Wrote mathutils.py",
+    )
+    assert json.loads(ev.arguments) == {"file_path": "mathutils.py"}
+
+
+def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
+    """_INTERRUPT_SLICE_S must be >= _PiRpcSession.close()'s reap wait_for budget.
+
+    When the outer slice fires first it injects a CancelledError into close()'s
+    inner wait_for -- not the TimeoutError its except clause catches -- so the
+    SIGKILL fallback never runs and the Pi subprocess is orphaned. The fix
+    raises the slice to 3.0s to give close() room to time out cleanly first.
+    """
+    from omnigent.inner.pi_executor import _RPC_SESSION_CLOSE_REAP_TIMEOUT_S
+    from omnigent.runtime.harnesses._executor_adapter import _INTERRUPT_SLICE_S
+
+    assert _INTERRUPT_SLICE_S >= _RPC_SESSION_CLOSE_REAP_TIMEOUT_S, (
+        f"_INTERRUPT_SLICE_S={_INTERRUPT_SLICE_S} is shorter than "
+        f"_PiRpcSession.close()'s {_RPC_SESSION_CLOSE_REAP_TIMEOUT_S}s wait_for; "
+        "outer slice fires first, injects CancelledError (not TimeoutError) "
+        "into close(), SIGKILL fallback is skipped, Pi subprocess orphaned."
+    )
+
+
+def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) -> None:
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runner.session_prs import SessionPrRegistry
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    adapter = ExecutorAdapter(executor_factory=_StubExecutor)
+    ctx = _RecordingTurnContext(response_id="resp_pr")
+    url = "https://github.com/example/sdk/pull/42"
+    ctx.session_id = "conv_sdk"
+    adapter._translate_event(
+        ToolCallRequest(
+            name="mcp__custom__create_pull_request", args={}, metadata={"call_id": "pr1"}
+        ),
+        ctx,
+    )
+    adapter._translate_event(
+        ToolCallComplete(
+            name="mcp__custom__create_pull_request",
+            status=ToolCallStatus.SUCCESS,
+            result={"html_url": url},
+            metadata={"call_id": "pr1"},
+        ),
+        ctx,
+    )
+    assert [entry.url for entry in SessionPrRegistry("conv_sdk").list()] == [url]
+    assert SessionPrRegistry("resp_pr").list() == []
+
+
+async def test_subprocess_tracking_uses_validated_session_without_telemetry(
+    manager: HarnessProcessManager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("MOCK_EXECUTOR_SCRIPT", "pr_tracking")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "0")
+    conv_id = "conv_pr_process"
+    client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    async with client.stream(
+        "POST", f"/v1/sessions/{conv_id}/events", json=_start_turn_body()
+    ) as response:
+        events = [event async for event in _stream_iter(response)]
+    assert events[-1].event == "response.completed"
+    assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
+        "https://github.com/example/sdk/pull/42"
+    ]

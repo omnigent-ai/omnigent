@@ -6,9 +6,12 @@ connection, so we test only the synchronous helpers here.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.server.routes._workspace_validation import (
     _is_relative_cwd,
     _is_subpath_of,
+    restore_host_filesystem_url_path,
 )
 
 
@@ -58,3 +61,56 @@ class TestIsSubpathOf:
 
     def test_trailing_slash_boundary(self) -> None:
         assert _is_subpath_of("/a/b/c", "/a/b/") is True
+
+    def test_windows_backslash_child(self) -> None:
+        assert _is_subpath_of("C:\\a\\b", "C:\\a") is True
+
+    def test_windows_drive_case_insensitive(self) -> None:
+        assert _is_subpath_of("C:\\Users\\me\\work", "c:\\Users\\me") is True
+
+    def test_windows_prefix_collision(self) -> None:
+        assert _is_subpath_of("C:\\a\\foo", "C:\\a\\fo") is False
+
+    def test_posix_backslash_is_not_a_separator(self) -> None:
+        """A POSIX filename may contain a backslash; it is not a separator."""
+        assert _is_subpath_of("/allowed\\escape/project", "/allowed") is False
+
+    def test_windows_mixed_separators(self) -> None:
+        assert _is_subpath_of("C:\\Users\\alice\\work", "C:/Users/alice") is True
+
+    @pytest.mark.parametrize(
+        ("workspace", "boundary", "contained"),
+        [
+            (r"\\server\share\repo\web", r"\\server\share\repo", True),
+            (r"\\SERVER\share\repo\web", "//server/share/repo", True),
+            ("//server/share/repo/web", r"\\SERVER\share\repo", True),
+            (r"\\server\share\repo-other\web", r"\\server\share\repo", False),
+            (r"\\server\other-share\repo\web", r"\\server\share\repo", False),
+            (r"\\other-server\share\repo\web", r"\\server\share\repo", False),
+        ],
+    )
+    def test_unc_containment(self, workspace: str, boundary: str, contained: bool) -> None:
+        """UNC containment normalizes separators and case without crossing boundaries."""
+        assert _is_subpath_of(workspace, boundary) is contained
+
+
+class TestRestoreHostFilesystemUrlPath:
+    """FastAPI :path capture restoration for POSIX vs Windows paths."""
+
+    def test_posix_stripped_slash_is_restored(self) -> None:
+        assert restore_host_filesystem_url_path("Users/corey/proj") == "/Users/corey/proj"
+
+    def test_posix_already_absolute(self) -> None:
+        assert restore_host_filesystem_url_path("/Users/corey/proj") == "/Users/corey/proj"
+
+    def test_tilde_is_unchanged(self) -> None:
+        assert restore_host_filesystem_url_path("~/proj") == "~/proj"
+
+    def test_windows_drive_forward_slash_is_not_prefixed(self) -> None:
+        assert restore_host_filesystem_url_path("C:/Users/alice/work") == "C:/Users/alice/work"
+
+    def test_windows_drive_backslash_is_not_prefixed(self) -> None:
+        assert restore_host_filesystem_url_path(r"C:\Users\alice\work") == r"C:\Users\alice\work"
+
+    def test_unc_is_not_prefixed(self) -> None:
+        assert restore_host_filesystem_url_path("//server/share/proj") == "//server/share/proj"

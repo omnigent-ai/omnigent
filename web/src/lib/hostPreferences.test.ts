@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readLastHostChoice, writeLastHostChoice, SANDBOX_HOST_CHOICE } from "./hostPreferences";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  readLastSandboxProvider,
+  writeLastSandboxProvider,
+  SANDBOX_HOST_CHOICE,
+} from "./hostPreferences";
 
 afterEach(() => {
   localStorage.clear();
@@ -46,5 +52,31 @@ describe("hostPreferences", () => {
     });
     expect(() => writeLastHostChoice("host_x")).not.toThrow();
     expect(readLastHostChoice()).toBeNull();
+  });
+
+  it("round-trips the last sandbox provider", () => {
+    // Paired with the sandbox sentinel: names which provider the sandbox pick
+    // launched on, so the composer reopens on it.
+    writeLastSandboxProvider("modal");
+    expect(readLastSandboxProvider()).toBe("modal");
+  });
+
+  it("clears the sandbox provider when the pick names none", () => {
+    writeLastSandboxProvider("modal");
+    // A provider-less server default (null) must clear the slot, not persist
+    // the string "null" — the next read falls back to the first offered row.
+    writeLastSandboxProvider(null);
+    expect(readLastSandboxProvider()).toBeNull();
+  });
+
+  it("never throws reading/writing the sandbox provider when storage is inaccessible", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("access denied");
+    });
+    expect(() => writeLastSandboxProvider("modal")).not.toThrow();
+    expect(readLastSandboxProvider()).toBeNull();
   });
 });

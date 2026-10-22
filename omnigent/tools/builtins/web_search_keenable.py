@@ -110,11 +110,31 @@ def _search_keenable(
     return _format_results(resp.json(), _resolve_max_results(config))
 
 
+#: Characters of page text kept per result. Keenable returns the whole page on
+#: every search result, an order of magnitude more than a search snippet.
+_SNIPPET_MAX_CHARS = 500
+
+
+def _snippet(item: dict[str, Any]) -> str:
+    """
+    Return the page text of one result.
+
+    Keenable sends both ``snippet`` and ``description``: ``snippet`` carries the
+    page text and ``description`` is the page's meta description, which is empty
+    for most pages. The text is whole-page, so it is collapsed and capped.
+
+    :param item: One entry of the Keenable ``results`` list.
+    :returns: The result's text, or an empty string when it has none.
+    """
+    text = str(item.get("snippet") or item.get("description") or "")
+    return " ".join(text.split())[:_SNIPPET_MAX_CHARS].strip()
+
+
 def _format_results(data: dict[str, Any], max_results: int) -> str:
     """
     Format Keenable's ``/v1/search`` JSON response into readable text.
 
-    Keenable returns ``{"results": [{"title", "url", "description", ...}]}``.
+    Keenable returns ``{"results": [{"title", "url", "snippet", ...}]}``.
     The list is sliced to ``max_results`` and rendered as numbered entries.
 
     :param data: The parsed JSON response from Keenable.
@@ -131,6 +151,6 @@ def _format_results(data: dict[str, Any], max_results: int) -> str:
             continue
         title = item.get("title", "")
         url = item.get("url", "")
-        snippet = item.get("description") or ""
+        snippet = _snippet(item)
         formatted.append(f"{i + 1}. {title}\n   {url}\n   {snippet}")
     return "\n\n".join(formatted) if formatted else "No results found."

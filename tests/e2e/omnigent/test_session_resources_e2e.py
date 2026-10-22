@@ -13,14 +13,11 @@ Design reference: ``designs/SESSION_RESOURCES_API_DESIGN.md``
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import secrets
 import signal
-import socket
 import subprocess
-import tarfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,6 +25,9 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.live_server import find_free_port
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 
 _BOOT_TIMEOUT = 30.0
 _API_TIMEOUT = 15.0
@@ -46,16 +46,6 @@ os_env:
   sandbox:
     type: none
 """
-
-
-def _find_free_port() -> int:
-    """Return a free TCP port on localhost.
-
-    :returns: An ephemeral port number.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _clean_env() -> dict[str, str]:
@@ -213,12 +203,7 @@ def _bundle_yaml(yaml_path: Path) -> bytes:
         ``POST /v1/sessions``.
     """
     config_bytes = yaml_path.read_bytes()
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config_bytes)
-        archive.addfile(info, io.BytesIO(config_bytes))
-    return buffer.getvalue()
+    return bundle_files({"config.yaml": config_bytes})
 
 
 def _create_session(client: httpx.Client, yaml_path: Path, runner_id: str) -> str:
@@ -230,24 +215,11 @@ def _create_session(client: httpx.Client, yaml_path: Path, runner_id: str) -> st
         ``"runner_e2e"``.
     :returns: The session id.
     """
-    session_resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                _bundle_yaml(yaml_path),
-                "application/gzip",
-            )
-        },
-    )
+    session_resp = post_session_bundle(client.post, "/v1/sessions", _bundle_yaml(yaml_path))
     assert session_resp.status_code == 201, session_resp.text
     session_id = session_resp.json()["session_id"]
-    bind_resp = client.patch(
-        f"/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-    )
-    bind_resp.raise_for_status()
+    # The client already owns the base URL; keep the PATCH path relative.
+    bind_session_runner(client.patch, "", session_id, runner_id)
     return session_id
 
 
@@ -291,7 +263,7 @@ def test_session_resources_e2e(
 
     python = omnigent_python
     repo_root = omnigent_repo_root
-    port = _find_free_port()
+    port = find_free_port()
 
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
@@ -485,3 +457,110 @@ def test_session_resources_e2e(
             assert body["stdout"].strip() == "e2e_shell_test"
             assert body["exit_code"] == 0
             assert body["timed_out"] is False
+
+
+def test_direct_attach_e2e(
+    mock_credentials_env: dict[str, str],
+    omnigent_python: Path,
+    omnigent_repo_root: Path,
+    tmp_path: Path,
+) -> None:
+    """Loopback direct attach works end-to-end against a real runner.
+
+    Boots the real server + a real tunneled runner subprocess, then
+    verifies the whole direct-attach chain: the runner's loopback
+    listener starts and is advertised over the tunnel hello; the
+    terminals API surfaces a ``direct_attach_url``; a WebSocket client
+    on that URL (with the server's Origin) reaches the real tmux
+    terminal with zero relay legs; and the listener rejects wrong
+    tokens and foreign origins before accepting the handshake.
+
+    :param mock_credentials_env: Mock credentials env from conftest.
+    :param omnigent_python: Python interpreter fixture.
+    :param omnigent_repo_root: Repo root fixture.
+    :param tmp_path: Pytest temp directory for the agent YAML
+        and SQLite database.
+    """
+    import asyncio
+
+    import websockets
+    from websockets.exceptions import InvalidStatus
+
+    from omnigent.runner.identity import token_bound_runner_id
+
+    python = omnigent_python
+    repo_root = omnigent_repo_root
+    port = find_free_port()
+
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    yaml_path = agent_dir / "config.yaml"
+    yaml_path.write_text(_AGENT_YAML)
+    db_path = tmp_path / "test.db"
+    binding_token = secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+    env = dict(mock_credentials_env)
+    base_url = f"http://127.0.0.1:{port}"
+
+    with _omnigent_server(
+        python=python,
+        agent_path=agent_dir,
+        port=port,
+        env=env,
+        cwd=repo_root,
+        db_path=db_path,
+        runner_id=runner_id,
+        binding_token=binding_token,
+    ) as proc:
+        _wait_for_health(port, timeout=_BOOT_TIMEOUT, proc=proc, runner_id=runner_id)
+
+        with httpx.Client(base_url=base_url, timeout=_API_TIMEOUT) as client:
+            session_id = _create_session(client, yaml_path, runner_id)
+
+            resp = client.get(f"/v1/sessions/{session_id}/resources/terminals")
+            assert resp.status_code == 200
+            (terminal,) = resp.json()["data"]
+            direct_url = terminal["metadata"].get("direct_attach_url")
+            assert isinstance(direct_url, str) and direct_url.startswith("ws://127.0.0.1:"), (
+                f"terminals API did not surface a loopback direct_attach_url; "
+                f"metadata={terminal['metadata']!r}"
+            )
+            # The listener is its own port, not the server's.
+            assert f":{port}/" not in direct_url
+
+        async def _exercise_direct_attach() -> None:
+            # Real attach through the loopback listener: the control
+            # bridge seeds the current pane and echoes typed input, so
+            # typing into the REPL composer must come back as output.
+            async with websockets.connect(
+                direct_url,
+                origin=base_url,
+            ) as ws:
+                await ws.send(json.dumps({"type": "resize", "cols": 100, "rows": 30}))
+                await ws.send(b"DIRECT-OK")
+                collected = b""
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline and b"DIRECT-OK" not in collected:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                    except TimeoutError:
+                        continue
+                    if isinstance(msg, bytes):
+                        collected += msg
+                assert b"DIRECT-OK" in collected, (
+                    f"typed input never echoed through the direct attach; "
+                    f"got {len(collected)} bytes: {collected[-500:]!r}"
+                )
+
+            # Wrong token: rejected before accept (HTTP 403 denial).
+            bad_token_url = direct_url.split("?", 1)[0] + "?token=wrong"
+            with pytest.raises(InvalidStatus):
+                async with websockets.connect(bad_token_url, origin=base_url):
+                    pass
+
+            # Foreign browser origin: rejected despite the valid token.
+            with pytest.raises(InvalidStatus):
+                async with websockets.connect(direct_url, origin="https://evil.example"):
+                    pass
+
+        asyncio.run(_exercise_direct_attach())

@@ -21,19 +21,24 @@ callers obtain it via ``client.sessions.create()``.
 
 from __future__ import annotations
 
+import builtins
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent.harness_availability import harness_launch_availability
 from omnigent.server.schemas import ServerStreamEvent
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
-from ._errors import raise_for_status, require_json_object, response_body
+from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
+from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
 # ``MAX_TREE_DEPTH`` and the REPL's ``_MAX_SUBAGENT_TREE_DEPTH`` so the SDK
@@ -125,13 +130,17 @@ class Session:
     :param agent_id: Durable identifier of the bound agent, e.g.
         ``"ag_abc123"``. Stable across renames of the agent.
     :param agent_name: Human-readable name of the bound agent, e.g.
-        ``"polly"``. Changes when the session is switched to a
-        different agent in place (``POST .../switch-agent``), so
-        attached clients can refresh their displayed agent label.
+        ``"polly"``.
         ``None`` when the server couldn't resolve the agent row.
     :param status: Session lifecycle status. One of ``"idle"``,
         ``"running"``, or ``"failed"``.
     :param created_at: Unix epoch seconds of creation.
+    :param updated_at: Unix epoch seconds of the last persisted session
+        activity. Advances when conversation items are appended and on session
+        metadata edits (rename, agent switch, archive), so a mid-stall rename
+        resets the clock — treat it as a session-write heartbeat, not a pure
+        item-append signal. ``None`` when connected to an older server that
+        does not return the field.
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -171,14 +180,17 @@ class Session:
         conversations.
     :param archived: Whether the session is archived. Archived
         sessions are hidden from the default ``list`` listing and
-        returned only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        returned with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
+    :param host_id: Host owning this session's runner, or ``None`` when unbound.
     """
 
     id: str
     agent_id: str
     status: str
     created_at: int
+    updated_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -193,6 +205,7 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -208,11 +221,13 @@ class Session:
         labels_raw = raw.get("labels", {})
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
+        raw_updated_at = raw.get("updated_at")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
+            updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
             agent_name=raw.get("agent_name"),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
@@ -227,6 +242,7 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            host_id=raw.get("host_id"),
         )
 
 
@@ -247,6 +263,11 @@ class SessionListItem:
     :param title: Optional human-readable title.
     :param labels: Session-scoped guardrails labels.
     :param runner_id: Runner currently bound to the session.
+    :param host_id: Host that launched the runner for this session,
+        or ``None`` for sessions without a host binding (e.g. a
+        caller-managed runner). Native resume pickers rely on it to
+        drop rows bound to other hosts, whose runtime state is not
+        reachable from the invoking machine.
     :param reasoning_effort: Per-session reasoning-effort hint.
     :param owner: User ID of the session owner.
     :param external_session_id: Runtime-native session id this
@@ -259,8 +280,11 @@ class SessionListItem:
         running can tell which ones are blocked on them. ``0`` when
         the session has no outstanding prompts.
     :param archived: Whether the session is archived. Returned by
-        ``list`` only when ``include_archived=True``. ``False`` for
-        normal sessions.
+        ``list`` with ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. ``False`` for normal
+        sessions.
+    :param parent_session_id: Parent session for a sub-agent child; ``None``
+        for top-level sessions or when omitted by an older server.
     """
 
     id: str
@@ -271,11 +295,13 @@ class SessionListItem:
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
     runner_id: str | None = None
+    host_id: str | None = None
     reasoning_effort: str | None = None
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     archived: bool = False
+    parent_session_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -296,12 +322,31 @@ class SessionListItem:
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},
             runner_id=raw.get("runner_id"),
+            host_id=raw.get("host_id"),
             reasoning_effort=raw.get("reasoning_effort"),
             owner=raw.get("owner"),
             external_session_id=raw.get("external_session_id"),
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
+            parent_session_id=raw.get("parent_session_id"),
         )
+
+
+@dataclass(frozen=True)
+class LaunchHost:
+    """
+    A connected host the server can launch a session's runner on.
+
+    :param host_id: Durable host identifier.
+    :param name: Display name; the id when the host reported none.
+    :param launchable: Whether it can run the requested harness (or hasn't said).
+    :param unavailable_reason: Why not, e.g. ``"binary-missing"``; ``None`` when launchable.
+    """
+
+    host_id: str
+    name: str
+    launchable: bool = True
+    unavailable_reason: str | None = None
 
 
 class SessionsNamespace:
@@ -344,6 +389,8 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
         """
         Create a new session from an uploaded agent bundle.
@@ -363,11 +410,18 @@ class SessionsNamespace:
             starts with no labels.
         :param reasoning_effort: Optional per-session reasoning
             effort, e.g. ``"high"``. ``None`` uses the agent default.
-        :param workspace: Optional absolute starting cwd to record on
-            the session, e.g. ``"/Users/corey/projects/myapp"``.
-            CLI-launched sessions populate this with ``os.getcwd()``
-            so the Web UI can show "running locally in <workspace>";
-            sessions with no recorded workspace pass ``None``.
+        :param workspace: Optional starting workspace. For an external
+            host (the default), an absolute cwd to record on the session,
+            e.g. ``"/Users/corey/projects/myapp"`` — CLI-launched sessions
+            populate this with ``os.getcwd()``. For ``host_type="managed"``,
+            a git repository URL (optionally ``#<branch>``) the server
+            clones into the sandbox. ``None`` records no workspace.
+        :param host_type: ``"external"`` (default) uploads the bundle and
+            runs it on a caller-managed runner; ``"managed"`` uploads the
+            bundle and has the server provision a sandbox host to run it.
+        :param sandbox_provider: With ``host_type="managed"``, which
+            configured sandbox provider to provision (e.g. ``"lakebox"``);
+            ``None`` takes the server's first. Ignored for external hosts.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
@@ -381,6 +435,10 @@ class SessionsNamespace:
             metadata["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             metadata["workspace"] = workspace
+        if host_type != "external":
+            metadata["host_type"] = host_type
+        if sandbox_provider is not None:
+            metadata["sandbox_provider"] = sandbox_provider
         resp = await self._http.post(
             f"{self._base}/v1/sessions",
             data={"metadata": json.dumps(metadata)},
@@ -390,6 +448,230 @@ class SessionsNamespace:
         created = require_json_object(resp, "POST /v1/sessions")
         session_id = str(created["session_id"])
         return await self.get(session_id)
+
+    async def create_from_agent_id(
+        self,
+        agent_id: str,
+        *,
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_id: str | None = None,
+    ) -> Session:
+        """
+        Create a new session bound to an already-registered agent.
+
+        Calls JSON ``POST /v1/sessions`` with an ``agent_id`` body. This
+        is the path for a client with no local bundle to upload — the
+        agent is already registered on the server, as when connecting to
+        a remote URL. Unlike :meth:`create`, the JSON route returns the
+        full session snapshot, so no follow-up ``GET`` is needed.
+
+        :param agent_id: Durable identifier of a registered agent, e.g.
+            ``"ag_abc123"``.
+        :param title: Optional human-readable title for the session,
+            e.g. ``"debugging auth flow"``.
+        :param labels: Initial guardrails labels to set. ``None``
+            starts with no labels.
+        :param reasoning_effort: Optional per-session reasoning
+            effort, e.g. ``"high"``. ``None`` uses the agent default.
+        :param workspace: Optional absolute starting cwd to record on
+            the session, e.g. ``"/Users/corey/projects/myapp"``.
+        :param host_id: Launch the runner on this host; read timeout is at least
+            3660 seconds. Longer or unlimited client timeouts are retained.
+        :returns: The newly created :class:`Session` snapshot.
+        :raises OmnigentError: If the server returns a non-2xx status,
+            or a host-targeted create times out before its outcome is known.
+        """
+        body: dict[str, Any] = {"agent_id": agent_id}
+        if title is not None:
+            body["title"] = title
+        if labels is not None:
+            body["labels"] = labels
+        if reasoning_effort is not None:
+            body["reasoning_effort"] = reasoning_effort
+        if workspace is not None:
+            body["workspace"] = workspace
+        if host_id is not None:
+            body["host_id"] = host_id
+        timeout = httpx.Timeout(self._http.timeout)
+        if host_id is not None and timeout.read is not None:
+            timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
+        try:
+            resp = await self._http.post(f"{self._base}/v1/sessions", json=body, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            if host_id is None:
+                raise
+            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                raise OmnigentError(
+                    f"Timed out connecting to the server to launch a runner on host {host_id!r} "
+                    "(POST /v1/sessions). The launch request was not sent; "
+                    "check the server connection and retry."
+                ) from exc
+            raise OmnigentError(
+                f"Timed out waiting for runner launch on host {host_id!r} "
+                "(POST /v1/sessions). The launch may still complete on the server; "
+                "check the host's runners before retrying."
+            ) from exc
+        raise_for_status(resp.status_code, response_body(resp))
+        created = require_json_object(resp, "POST /v1/sessions")
+        return Session.from_dict(created)
+
+    async def resolve_agent(self, agent_name: str) -> RegisteredAgent:
+        """
+        Resolve a registered agent's id and harness from its display name.
+
+        Used by clients that only know the name the user picked — the
+        remote-URL chat picker lists names, but session creation binds
+        by id. Searches server agents (``GET /v1/agents``), then the
+        caller's own (``scope=user``, from ``omnigent agent add``); a
+        session-scoped agent is not resolvable this way and raises
+        ``LookupError``.
+
+        Follows the listing cursor, so an agent past the first page
+        still resolves. A walk ends quietly when the server reports
+        ``has_more`` false, or when the ``scope=user`` listing answers
+        401, 403, 404 or 422 (no usable user agents); a stalled listing
+        raises instead of masquerading as a clean miss.
+
+        :param agent_name: Agent display name, e.g. ``"hello_world"``.
+        :returns: The matching agent's id and advertised harness.
+        :raises OmnigentError: If a listing returns another non-2xx
+            status, or reports ``has_more`` with a missing or non-advancing
+            ``last_id`` cursor (a stalled walk, not an absent agent).
+        :raises LookupError: If no registered agent has that name.
+        """
+        agents = await self.list_registered_agents(stop_at=agent_name)
+        for agent in agents:
+            if agent.name == agent_name:
+                return RegisteredAgent(id=agent.id, harness=agent.harness)
+        names = [agent.name for agent in agents]
+        available = ", ".join(names[:50]) + (", ..." if len(names) > 50 else "")
+        raise LookupError(
+            f"No agent named {agent_name!r} is registered on this server. Available: {available}"
+        )
+
+    async def list_registered_agents(
+        self, *, stop_at: str | None = None
+    ) -> list[AgentCatalogEntry]:
+        """List server and user registrations with server-first name precedence.
+
+        :param stop_at: Stop after a validated page containing this name.
+        :returns: Unique registrations in catalog order.
+        :raises OmnigentError: On failed requests, malformed rows or stalled pagination.
+        """
+        catalog = RegisteredAgentCatalog(stop_at=stop_at)
+        while not catalog.done:
+            resp = await self._http.get(f"{self._base}/v1/agents", params=catalog.params)
+            if catalog.skip_unavailable_scope(resp.status_code):
+                break
+            raise_for_status(resp.status_code, response_body(resp))
+            catalog.add_page(require_json_object(resp, "GET /v1/agents"))
+        return list(catalog.entries.values())
+
+    async def resolve_online_runner(
+        self,
+        *,
+        harness: str | None = None,
+        canonicalize: Callable[[str], str] | None = None,
+    ) -> str | None:
+        """
+        Find an online runner on the server that can drive *harness*.
+
+        A remote-URL client has no local runner of its own, but the
+        session still needs one bound before a turn can dispatch.
+        ``GET /v1/runners`` lists the online runners owned by the
+        requesting user along with the harnesses each advertises, so
+        the client can bind to one the server already has.
+
+        :param harness: Harness the session needs, e.g.
+            ``"openai-agents"``. ``None`` accepts any online runner.
+        :param canonicalize: Optional harness-name normalizer applied to
+            both sides of the comparison, so a spec spelling that is an
+            alias (``"claude"``) still matches a runner advertising the
+            canonical name (``"claude-sdk"``). Mirrors the server's own
+            matching. ``None`` compares the names as given.
+        :returns: A matching runner id, or ``None`` when the server has
+            no online runner that advertises *harness*.
+        :raises OmnigentError: If the listing returns a non-2xx status.
+        """
+        resp = await self._http.get(f"{self._base}/v1/runners")
+        raise_for_status(resp.status_code, response_body(resp))
+        listing = require_json_object(resp, "GET /v1/runners")
+        data = listing.get("data", [])
+        # Accept either spelling on either side, as the server does.
+        wanted = {harness} if harness is not None else set()
+        if harness is not None and canonicalize is not None:
+            wanted.add(canonicalize(harness))
+        # Prefer a runner that advertises the harness; fall back to any
+        # online runner that didn't report its harness list at all.
+        unknown_harness: str | None = None
+        for item in data if isinstance(data, list) else []:
+            if not isinstance(item, dict) or not item.get("online"):
+                continue
+            runner_id = item.get("runner_id")
+            if not isinstance(runner_id, str) or not runner_id:
+                continue
+            advertised = item.get("harnesses")
+            if not isinstance(advertised, list):
+                unknown_harness = unknown_harness or runner_id
+                continue
+            if not wanted:
+                return runner_id
+            names = {name for name in advertised if isinstance(name, str)}
+            if canonicalize is not None:
+                names |= {canonicalize(name) for name in names}
+            if wanted & names:
+                return runner_id
+        return unknown_harness
+
+    async def list_launch_hosts(
+        self,
+        *,
+        harness: str | None = None,
+    ) -> list[LaunchHost]:
+        """
+        List the caller's connected hosts a runner could be launched on, with readiness.
+
+        Skip sandbox hosts and use ``harness_launch_availability`` so readiness
+        matches the server. Unknown readiness counts as launchable.
+
+        :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
+        :returns: Online hosts in listing order; empty when there are none.
+        :raises OmnigentError: If the listing returns a non-2xx status.
+        """
+        resp = await self._http.get(f"{self._base}/v1/hosts")
+        raise_for_status(resp.status_code, response_body(resp))
+        listing = require_json_object(resp, "GET /v1/hosts")
+        hosts = listing.get("hosts")
+        if not isinstance(hosts, list):
+            raise OmnigentError("GET /v1/hosts returned an unexpected hosts listing")
+
+        result: list[LaunchHost] = []
+        for item in hosts:
+            if not isinstance(item, dict) or item.get("status") != "online":
+                continue
+            if item.get("sandbox_provider") is not None:
+                continue
+            host_id = item.get("host_id")
+            if not isinstance(host_id, str) or not host_id:
+                continue
+            name = item.get("name")
+            display = name if isinstance(name, str) and name else host_id
+            readiness = item.get("configured_harnesses")
+            available, reason = harness_launch_availability(
+                harness, readiness if isinstance(readiness, dict) else None
+            )
+            result.append(
+                LaunchHost(
+                    host_id,
+                    display,
+                    available is not False,
+                    reason if available is False else None,
+                )
+            )
+        return result
 
     async def list(
         self,
@@ -402,6 +684,8 @@ class SessionsNamespace:
         order: str = "desc",
         sort_by: str = "created_at",
         include_archived: bool = False,
+        visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        kind: Literal["default", "sub_agent", "any"] | None = None,
     ) -> list[SessionListItem]:
         """
         List sessions with cursor-based pagination.
@@ -421,13 +705,31 @@ class SessionsNamespace:
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
         :param sort_by: Column to sort on, ``"created_at"`` or
             ``"updated_at"``.
-        :param include_archived: When ``False`` (default), archived
-            sessions are omitted. When ``True``, archived sessions are
-            returned alongside active ones.
+        :param include_archived: With ``visibility="all"``, include
+            archived sessions alongside active ones when ``True``.
+            Defaults to ``False``. Other visibility modes determine
+            archive filtering themselves.
+        :param visibility: ``"all"`` (default) returns all accessible
+            sessions. ``"mine"`` returns owned active sessions, and
+            ``"shared"`` returns accessible active sessions not owned
+            by the caller. ``"archived"`` returns only archived sessions.
+            Without server authentication, ``"mine"`` and ``"shared"``
+            behave like ``"all"``. Always sent explicitly to the server.
+        :param kind: ``"default"`` returns top-level sessions,
+            ``"sub_agent"`` returns children, and ``"any"`` includes both.
+            ``None`` leaves the server's top-level-only default unchanged.
         :returns: List of :class:`SessionListItem`.
+        :raises StaleCursorError: If ``after``/``before`` names a session
+            that has since been deleted. The walk cannot continue from
+            that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
-        params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
+        params: dict[str, str | int] = {
+            "limit": limit,
+            "order": order,
+            "sort_by": sort_by,
+            "visibility": visibility,
+        }
         if after is not None:
             params["after"] = after
         if before is not None:
@@ -438,6 +740,8 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        if kind is not None:
+            params["kind"] = kind
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,
@@ -588,9 +892,10 @@ class SessionsNamespace:
 
         Calls ``PATCH /v1/sessions/{session_id}`` with
         ``{"archived": ...}``. Archived sessions are hidden from the
-        default :meth:`list` listing and surfaced only with
-        ``include_archived=True``. Owner-only (the web UI stops the
-        session on archive, an owner-gated lifecycle action, so archive
+        default :meth:`list` listing and surfaced with
+        ``visibility="archived"`` or with
+        ``visibility="all", include_archived=True``. Owner-only (the web
+        UI stops the session on archive, an owner-gated lifecycle action, so archive
         is held to the same gate); note this method only flips the
         archived flag — it does not stop the session.
 
@@ -652,7 +957,7 @@ class SessionsNamespace:
         limit: int = 100,
         after: str | None = None,
         order: str = "asc",
-    ) -> list[dict[str, Any]]:
+    ) -> PaginatedList:
         """
         List items in a session with cursor-based pagination.
 
@@ -666,7 +971,12 @@ class SessionsNamespace:
         :param after: Cursor — return items after this item ID.
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
-        :returns: List of conversation item dicts.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
+        :raises StaleCursorError: If ``after`` names an item that has since
+            been deleted. The walk cannot continue from that cursor —
+            restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
@@ -679,14 +989,15 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/items")
-        return body.get("data", [])
+        return PaginatedList.from_dict(body)
 
     async def child_sessions(
         self,
         session_id: str,
         *,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+        after: str | None = None,
+    ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
 
@@ -701,18 +1012,23 @@ class SessionsNamespace:
             e.g. ``"conv_parent123"``.
         :param limit: Maximum number of children to return
             (1-1000, default 100).
-        :returns: List of child-session summary dicts (empty when the
-            session has no sub-agents).
+        :param after: Cursor — return children after this session ID.
+        :returns: :class:`PaginatedList` with ``data``, ``has_more``,
+            ``first_id``, and ``last_id``.  Pass ``result.last_id`` as
+            ``after=`` to fetch the next page when ``result.has_more``.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """
+        params: dict[str, str | int] = {"limit": limit}
+        if after is not None:
+            params["after"] = after
         resp = await self._http.get(
             f"{self._base}/v1/sessions/{session_id}/child_sessions",
-            params={"limit": limit},
+            params=params,
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions/{session_id}/child_sessions")
-        return body.get("data", [])
+        return PaginatedList.from_dict(body)
 
     async def child_sessions_tree(
         self,
@@ -720,7 +1036,7 @@ class SessionsNamespace:
         *,
         max_depth: int = _DEFAULT_SUBTREE_DEPTH,
         limit: int = 100,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """List the whole sub-agent subtree under *session_id*, flattened.
 
         :meth:`child_sessions` is one level deep; this recurses it breadth-first
@@ -748,8 +1064,8 @@ class SessionsNamespace:
         while frontier and depth < max_depth:
             next_frontier: list[str] = []
             for parent_id in frontier:
-                rows = await self.child_sessions(parent_id, limit=limit)
-                for row in rows:
+                page = await self.child_sessions(parent_id, limit=limit)
+                for row in page.data:
                     if not isinstance(row, dict):
                         continue
                     sid = row.get("id")
@@ -1026,14 +1342,30 @@ async def _stream_session_events(
         to subscribe to, e.g. ``"conv_abc123"``.
     :yields: :class:`ServerStreamEvent` envelopes parsed from the SSE
         ``data:`` payload.
+    :raises OmnigentError: If the stream open fails with a non-2xx
+        status, including a redirect that was not followed.
+    :raises httpx.TooManyRedirects: If on-origin redirects loop past
+        httpx's limit.
     """
     async with http.stream(
         "GET",
         f"{base_url}/v1/sessions/{session_id}/stream",
+        timeout=_SSE_TIMEOUT,
     ) as resp:
         if resp.status_code >= 400:
             await resp.aread()
             raise_for_status(resp.status_code, response_body(resp))
+        elif 300 <= resp.status_code < 400:
+            # OmnigentClient follows redirects, so a 3xx here was not
+            # followable (no Location header, a 304, or a caller-supplied
+            # client with redirects disabled). Parsing its non-SSE body
+            # would yield a silent, error-free, empty stream — fail loud
+            # instead.
+            raise OmnigentError(
+                f"stream open returned a 3xx response (status {resp.status_code}) "
+                "instead of an event stream",
+                resp.status_code,
+            )
 
         async for event in _parse_sse_lines(resp.aiter_lines()):
             yield event

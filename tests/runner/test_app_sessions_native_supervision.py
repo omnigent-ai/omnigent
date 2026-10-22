@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from typing import Any
 
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-)
-from omnigent.claude_native_bridge import (
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
-from omnigent.runner import create_runner_app
+from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import (
     _BlockingHarnessClient,
+    _build_app_for_spec,
     _build_interrupt_app,
     _drain_session_event_queue,
     _FakeProcessManager,
@@ -51,6 +51,11 @@ async def test_interrupt_inserts_cancellation_items_in_history() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "85b147537400967b1fb8542367423306"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
 
         # Start the turn — it blocks after the first function_call
         # frame, before the second one and response.completed.
@@ -158,6 +163,11 @@ async def test_interrupt_cancel_floor_finalizes_stuck_turn() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "97d2b96d733e685433e2b3864eb97652"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -208,6 +218,11 @@ async def test_stop_session_cancels_inprocess_turn() -> None:
 
     async with _runner_client(app) as client:
         conv_id = "422963919abf3c166633d99ea20f2b8e"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -318,7 +333,7 @@ async def test_interrupt_during_setup_phase_recovers_stuck_turn() -> None:
         try:
             await _aio.wait_for(resolver_entered.wait(), timeout=5.0)
             fresh_turn_started = True
-        except _aio.TimeoutError:
+        except TimeoutError:
             fresh_turn_started = False
 
         resolver_gate.set()  # release the blocked turn for clean teardown
@@ -356,6 +371,11 @@ async def test_interrupt_marker_instructs_model_to_disregard_abandoned_request()
 
     async with _runner_client(app) as client:
         conv_id = "86ba5bc9053ae8771fdb988e882f04b5"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={
@@ -432,7 +452,7 @@ async def test_external_session_status_idle_delivers_forwarded_native_output_to_
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
     runner_app._session_histories_ref[child_id] = [
         {
             "type": "message",
@@ -440,7 +460,7 @@ async def test_external_session_status_idle_delivers_forwarded_native_output_to_
             "content": [{"type": "output_text", "text": "LOCAL_SHOULD_NOT_WIN"}],
         }
     ]
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="worker",
@@ -479,8 +499,8 @@ async def test_external_session_status_idle_delivers_forwarded_native_output_to_
                 session_inbox=session_inbox,
             )
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_histories_ref.pop(child_id, None)
 
     assert "sub-agent task 66a84f142181a489d004f744cc76c67b completed" in inbox_output
@@ -511,20 +531,20 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
 
     runner_app._session_event_queues_ref.pop(parent_id, None)
     runner_app._session_event_queues_ref.pop(child_id, None)
-    runner_app.register_child_session(
+    subagent_work.register_child_session(
         child_id,
         parent_session_id=parent_id,
         title="codex:impl",
         tool="codex",
         session_name="impl",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="codex",
         title="impl",
     )
-    entry = runner_app.get_subagent_work(child_id)
+    entry = subagent_work.get_subagent_work(child_id)
     assert entry is not None
     assert entry.status == "launching"
 
@@ -535,14 +555,14 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
                 json={"type": "external_session_status", "data": {"status": "running"}},
             )
         assert resp.status_code == 204, resp.text
-        entry = runner_app.get_subagent_work(child_id)
+        entry = subagent_work.get_subagent_work(child_id)
         assert entry is not None
         assert entry.status == "running"
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app.unregister_child_session(child_id)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_child_session(child_id)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
 
@@ -587,7 +607,7 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
 
     runner_app._session_event_queues_ref.pop(parent_id, None)
     runner_app._session_event_queues_ref.pop(child_id, None)
-    runner_app.register_child_session(
+    subagent_work.register_child_session(
         child_id,
         parent_session_id=parent_id,
         title="codex:impl",
@@ -614,7 +634,7 @@ async def test_external_status_sequence_coalesces_duplicates_but_emits_task_stat
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
-        runner_app.unregister_child_session(child_id)
+        subagent_work.unregister_child_session(child_id)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
 
@@ -693,7 +713,7 @@ async def test_external_status_idle_fans_out_forwarded_output_preview_to_parent(
             "content": [{"type": "output_text", "text": "STALE_RUNNER_HISTORY"}],
         }
     ]
-    runner_app.register_child_session(
+    subagent_work.register_child_session(
         child_id,
         parent_session_id=parent_id,
         title="codex:impl",
@@ -714,7 +734,7 @@ async def test_external_status_idle_fans_out_forwarded_output_preview_to_parent(
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
-        runner_app.unregister_child_session(child_id)
+        subagent_work.unregister_child_session(child_id)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
         runner_app._session_histories_ref.pop(child_id, None)
@@ -762,7 +782,7 @@ async def test_external_status_idle_without_output_omits_stale_history_preview()
 
     runner_app._session_event_queues_ref.pop(parent_id, None)
     runner_app._session_event_queues_ref.pop(child_id, None)
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
     runner_app._session_histories_ref[child_id] = [
         {
             "type": "message",
@@ -770,14 +790,14 @@ async def test_external_status_idle_without_output_omits_stale_history_preview()
             "content": [{"type": "output_text", "text": "STALE_RUNNER_HISTORY"}],
         }
     ]
-    runner_app.register_child_session(
+    subagent_work.register_child_session(
         child_id,
         parent_session_id=parent_id,
         title="codex:impl",
         tool="codex",
         session_name="impl",
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="codex",
@@ -795,11 +815,11 @@ async def test_external_status_idle_without_output_omits_stale_history_preview()
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
-        runner_app.unregister_child_session(child_id)
-        runner_app.unregister_subagent_work(child_id)
+        subagent_work.unregister_child_session(child_id)
+        subagent_work.unregister_subagent_work(child_id)
         runner_app._session_event_queues_ref.pop(parent_id, None)
         runner_app._session_event_queues_ref.pop(child_id, None)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
         runner_app._session_histories_ref.pop(child_id, None)
 
     assert events == [
@@ -873,7 +893,6 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     the inbox still fills but no parent ``/events`` POST is made — exactly the
     "nessie doesn't know its sub-agent finished" bug this fixes.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "bf881b8f7e32add48bfcd6afc476452a"
     child_id = "7ec2f4cd958a2c2a8c02bd3c03cbacc6"
@@ -885,8 +904,8 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="claude_code",
@@ -906,8 +925,8 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
             # Wake is a background task; await the recorded POST (TimeoutError if none).
             await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # Delivery still happens: the child result is in the parent inbox. If 0,
     # external_session_status:idle did not deliver the completion at all.
@@ -978,7 +997,6 @@ async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> Non
     204 would tell AP/the forwarder the completion was delivered even though
     the parent can never drain it.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "41bd085f8d34ad9201cd59c372312a1a"
     child_id = "6d17e94dcad6a73de34441f490d140b4"
@@ -987,7 +1005,7 @@ async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> Non
         process_manager=pm,  # type: ignore[arg-type]
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="worker",
@@ -1003,9 +1021,9 @@ async def test_tracked_subagent_status_without_parent_inbox_returns_503() -> Non
                     "data": {"status": "idle", "output": "DONE_BUT_UNDELIVERED"},
                 },
             )
-        entry = runner_app.get_subagent_work(child_id)
+        entry = subagent_work.get_subagent_work(child_id)
     finally:
-        runner_app.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work(child_id)
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["reason"] == "missing_parent_inbox"
@@ -1026,12 +1044,11 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
     parent should receive that latest report rather than stale cancellation
     text from the first failed delivery attempt.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "05f117c03074f5d4b0ebe450f79b0684"
     child_id = "01a9880c1386637a7d0a154ecb2c4a72"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app.register_subagent_work(
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="worker",
@@ -1039,21 +1056,21 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
     )
 
     try:
-        first_ack = runner_app.mark_subagent_work_terminal(
+        first_ack = subagent_work.mark_subagent_work_terminal(
             child_id,
             status="cancelled",
             output="[System: sub-agent stopped]",
         )
-        runner_app._session_inboxes_ref[parent_id] = session_inbox
-        second_ack = runner_app.mark_subagent_work_terminal(
+        subagent_work._session_inboxes_ref[parent_id] = session_inbox
+        second_ack = subagent_work.mark_subagent_work_terminal(
             child_id,
             status="completed",
             output="DONE_AFTER_RETRY",
         )
-        entry = runner_app.get_subagent_work(child_id)
+        entry = subagent_work.get_subagent_work(child_id)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert first_ack.reason == "missing_parent_inbox"
     assert first_ack.delivered is False
@@ -1070,6 +1087,120 @@ def test_subagent_terminal_delivery_retry_uses_latest_undelivered_report() -> No
     assert delivered["output"] == "DONE_AFTER_RETRY"
 
 
+def test_stop_after_completed_does_not_downgrade_status() -> None:
+    """
+    A stop_session arriving after sub-agent completion must not downgrade status.
+
+    Sequence that triggers the bug:
+    1. The sub-agent completes — ``mark_subagent_work_terminal("completed")`` is
+       called, but delivery fails because the parent inbox is not yet registered.
+    2. ``stop_session`` fires — ``mark_subagent_work_terminal("cancelled")`` is
+       called with the inbox now available.
+
+    Before the fix, step 2 overwrites ``"completed"`` with ``"cancelled"`` and
+    the parent inbox receives the wrong status. After the fix, the first
+    terminal status that is not ``"cancelled"`` is preserved: the parent
+    receives ``"completed"``.
+    """
+
+    parent_id = "aa11bb22cc33dd44aa11bb22cc330001"
+    child_id = "aa11bb22cc33dd44aa11bb22cc330002"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="cursor-native",
+        title="task",
+    )
+
+    try:
+        # Sub-agent completes; inbox not yet registered — delivery fails.
+        completed_ack = subagent_work.mark_subagent_work_terminal(
+            child_id,
+            status="completed",
+            output="Task done successfully.",
+        )
+        assert completed_ack.delivered is False
+        assert completed_ack.reason == "missing_parent_inbox"
+
+        # stop_session fires with the inbox now available.
+        subagent_work._session_inboxes_ref[parent_id] = session_inbox
+        stop_ack = subagent_work.mark_subagent_work_terminal(
+            child_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+
+        entry = subagent_work.get_subagent_work(child_id)
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    # The stop report must have triggered delivery, but with the original status.
+    assert stop_ack.delivered is True
+    assert entry is not None and entry.delivered is True
+
+    assert session_inbox.qsize() == 1
+    delivered = session_inbox.get_nowait()
+    assert delivered["task_id"] == child_id
+    assert delivered["status"] == "completed", (
+        f"stop_session must not downgrade 'completed' to 'cancelled'; got {delivered['status']!r}"
+    )
+    assert delivered["output"] == "Task done successfully."
+
+
+def test_stop_after_failed_does_not_downgrade_status() -> None:
+    """
+    A stop_session arriving after a failed sub-agent must not downgrade to cancelled.
+
+    Same race as the completed case but with ``"failed"``: the sub-agent
+    reported failure before stop_session arrived, and the parent must see
+    ``"failed"`` rather than ``"cancelled"``.
+    """
+
+    parent_id = "aa11bb22cc33dd44aa11bb22cc330003"
+    child_id = "aa11bb22cc33dd44aa11bb22cc330004"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="cursor-native",
+        title="failing-task",
+    )
+
+    try:
+        failed_ack = subagent_work.mark_subagent_work_terminal(
+            child_id,
+            status="failed",
+            output="Something went wrong.",
+        )
+        assert failed_ack.delivered is False
+
+        subagent_work._session_inboxes_ref[parent_id] = session_inbox
+        stop_ack = subagent_work.mark_subagent_work_terminal(
+            child_id,
+            status="cancelled",
+            output="[System: sub-agent stopped]",
+        )
+
+        entry = subagent_work.get_subagent_work(child_id)
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    assert stop_ack.delivered is True
+    assert entry is not None and entry.delivered is True
+
+    assert session_inbox.qsize() == 1
+    delivered = session_inbox.get_nowait()
+    assert delivered["status"] == "failed", (
+        f"stop_session must not downgrade 'failed' to 'cancelled'; got {delivered['status']!r}"
+    )
+    assert delivered["output"] == "Something went wrong."
+
+
 def test_subagent_terminal_delivery_handles_missing_output() -> None:
     """
     Terminal work with no assistant text still delivers a marker payload.
@@ -1078,13 +1209,12 @@ def test_subagent_terminal_delivery_handles_missing_output() -> None:
     message. That must not become an unstructured ``RuntimeError`` after the
     parent inbox is available.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "9c98fbe12742d712819dd26553a7a9ee"
     child_id = "c2a7357e26dc400e4aa6e5c25c611853"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="worker",
@@ -1092,14 +1222,14 @@ def test_subagent_terminal_delivery_handles_missing_output() -> None:
     )
 
     try:
-        ack = runner_app.mark_subagent_work_terminal(
+        ack = subagent_work.mark_subagent_work_terminal(
             child_id,
             status="completed",
             output=None,
         )
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert ack.reason == "delivered"
     assert ack.delivered is True
@@ -1160,7 +1290,6 @@ async def test_repeated_idle_status_wakes_parent_only_once() -> None:
     re-deliver or re-wake — this is what keeps a parallel fan-out (or a
     forwarder that re-sends idle) from triggering a wake storm.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "f42f428f0217c078c09803aea44cd57b"
     child_id = "e63625ecd31e483b65e5333e6195cc13"
@@ -1172,8 +1301,8 @@ async def test_repeated_idle_status_wakes_parent_only_once() -> None:
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="worker",
@@ -1197,8 +1326,8 @@ async def test_repeated_idle_status_wakes_parent_only_once() -> None:
             for _ in range(5):
                 await asyncio.sleep(0)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # One delivery, one wake — the second idle was a no-op. A count of 2 would
     # mean the already-delivered gate regressed and re-marking re-wakes.
@@ -1220,7 +1349,6 @@ async def test_delete_session_clears_pending_subagent_wake() -> None:
     away too; otherwise a later session reusing the same id can receive a child
     result in its inbox but never get the wake notice that tells it to drain.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "514616cf803ec0ca696db4cdf75be6f6"
     first_child_id = "7cb2d00b228b559198a369204d1e1ffd"
@@ -1242,8 +1370,8 @@ async def test_delete_session_clears_pending_subagent_wake() -> None:
             )
             assert create_resp.status_code == 201, create_resp.text
 
-            runner_app._session_inboxes_ref[parent_id] = first_inbox
-            runner_app.register_subagent_work(
+            subagent_work._session_inboxes_ref[parent_id] = first_inbox
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=first_child_id,
                 agent="worker",
@@ -1264,8 +1392,8 @@ async def test_delete_session_clears_pending_subagent_wake() -> None:
             assert delete_resp.status_code == 200, delete_resp.text
             server_client.wake_seen.clear()
 
-            runner_app._session_inboxes_ref[parent_id] = second_inbox
-            runner_app.register_subagent_work(
+            subagent_work._session_inboxes_ref[parent_id] = second_inbox
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=second_child_id,
                 agent="worker",
@@ -1281,10 +1409,10 @@ async def test_delete_session_clears_pending_subagent_wake() -> None:
             assert second_resp.status_code == 204, second_resp.text
             await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
     finally:
-        runner_app.unregister_subagent_work(first_child_id)
-        runner_app.unregister_subagent_work(second_child_id)
-        runner_app.unregister_subagent_work_for_session(parent_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(first_child_id)
+        subagent_work.unregister_subagent_work(second_child_id)
+        subagent_work.unregister_subagent_work_for_session(parent_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert first_inbox.qsize() == 1
     assert second_inbox.qsize() == 1
@@ -1307,7 +1435,6 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
     turn is still active should therefore enqueue a follow-up wake rather than
     leaving the result stranded until a human sends another message.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "44026e683bcf8dd047e509d974196bf9"
     first_child_id = "1a9cf84a190d53d5e9b6ec4e9c534f31"
@@ -1328,8 +1455,8 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=first_child_id,
         agent="codex",
@@ -1365,7 +1492,7 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
             await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
             assert harness_client.posted_bodies, "parent wake turn must reach the harness"
 
-            runner_app.register_subagent_work(
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=second_child_id,
                 agent="codex",
@@ -1383,9 +1510,9 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
             gate.set()
     finally:
         gate.set()
-        runner_app.unregister_subagent_work(first_child_id)
-        runner_app.unregister_subagent_work(second_child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(first_child_id)
+        subagent_work.unregister_subagent_work(second_child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert session_inbox.qsize() == 2, (
         f"Expected both completions in the parent inbox, got {session_inbox.qsize()}."
@@ -1418,7 +1545,6 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
     *coalesced* against the re-armed flag (inbox grows, no 4th wake). Child C is
     kept only to pin that coalesce contract — the signal is the step-3 wake.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "22b91e208e5501fb8d2b502837391f04"
     child_a = "27cb54833afaf691aacb1bb7ec7ce66b"
@@ -1440,8 +1566,8 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_a,
         agent="claude",
@@ -1486,7 +1612,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
             # 2. Child B finishes DURING the active parent turn: not debounced
             # (flag was just cleared), posts its own wake, and re-arms the flag.
             # No new turn starts on this wake, so nothing clears it again.
-            runner_app.register_subagent_work(
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=child_b,
                 agent="gpt",
@@ -1546,7 +1672,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
             # 4. Child C finishes post-idle. The recovery wake re-armed the
             # flag, so C must COALESCE: result lands in the inbox, no new wake.
             # Yield generously so a (wrongly) scheduled extra wake would land.
-            runner_app.register_subagent_work(
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=child_c,
                 agent="claude",
@@ -1564,10 +1690,10 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
                 await asyncio.sleep(0)
     finally:
         gate.set()
-        runner_app.unregister_subagent_work(child_a)
-        runner_app.unregister_subagent_work(child_b)
-        runner_app.unregister_subagent_work(child_c)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_a)
+        subagent_work.unregister_subagent_work(child_b)
+        subagent_work.unregister_subagent_work(child_c)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # All 3 completions reached the inbox regardless of coalescing; 2 = a
     # completion was lost.
@@ -1633,7 +1759,6 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
     fresh wake [3]. Under the bug, step 4 leaves the flag set, so step 5's C
     is debounced (count stays [2]) and C's result strands.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "8f0e87b24df3f773e7f8de693347dad9"
     child_a = "95dae25caa3d012baa1a1309cde1674b"
@@ -1655,8 +1780,8 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_a,
         agent="claude",
@@ -1701,7 +1826,7 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
             # 2. Child B finishes DURING the active parent turn: not debounced
             # (flag was just cleared), posts its own wake, and re-arms the flag.
             # No new turn starts on this wake, so nothing clears it again.
-            runner_app.register_subagent_work(
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=child_b,
                 agent="gpt",
@@ -1773,7 +1898,7 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
             # is debounced and its result strands with no wake — the exact
             # regression this guards. Await the wake directly: under the bug it
             # never posts and this wait_for times out.
-            runner_app.register_subagent_work(
+            subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=child_c,
                 agent="claude",
@@ -1801,10 +1926,10 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
                 ) from None
     finally:
         gate.set()
-        runner_app.unregister_subagent_work(child_a)
-        runner_app.unregister_subagent_work(child_b)
-        runner_app.unregister_subagent_work(child_c)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_a)
+        subagent_work.unregister_subagent_work(child_b)
+        subagent_work.unregister_subagent_work(child_c)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # Child C posted the 3rd wake: the stuck flag was cleared on idle. 2 = flag
     # stayed stuck and C was debounced (the regression); 4 = a spurious extra
@@ -1832,6 +1957,341 @@ async def test_parent_idle_with_stuck_wake_flag_and_drained_inbox_clears_flag() 
 
 
 @pytest.mark.asyncio
+async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
+    """
+    A recovery wake identical to the previous one is skipped, not re-posted.
+
+    The stranded-inbox recovery wake (``_rewake_parent_if_inbox_stranded``)
+    re-nudges a parent that idled without draining. In a steady-state
+    homogeneous fan-out — many same-named children, the parent draining at
+    roughly the completion rate so the inbox count plateaus — the latest
+    child's label and the pending count don't change between turn boundaries,
+    so the recovery wake would repeat the *same* ``[System: ...]`` line every
+    round. That verbatim repeat is pure spam: the parent already holds that
+    exact instruction. The fix records the last delivered re-wake per parent
+    and skips a follow-up re-wake that matches it.
+
+    The critical companion guarantee — the FIRST recovery wake still fires
+    even when it matches an earlier *completion* wake — is pinned by
+    ``test_parent_idle_with_stuck_wake_flag_posts_recovery_wake``; only
+    repeat *re-wakes* are deduped, never completion notices.
+
+    Sequence (wake counts bracketed): children share the ``gp/fanout`` label so
+    the notices can match. (1) child A completes idle → wake [1]; parent turn
+    T1 starts (clears flag); (2) child B completes mid-T1 → completion wake [2],
+    re-arms flag; (3) T1 ends → recovery wake [3] ``gp/fanout … 2 results``
+    (recorded as the last re-wake); (4) parent turn T2 starts (clears flag),
+    the test drains one inbox item then child C completes mid-T2, bringing the
+    count back to 2 → completion wake [4] (a fresh completion always posts);
+    (5) T2 ends → the recovery wake would again be ``gp/fanout … 2 results`` —
+    identical to step 3 — so it is SKIPPED (count stays [4]). Without the fix
+    step 5 posts a 5th, duplicate wake — the discriminator.
+    """
+
+    parent_id = "b3d5c9f1a26e4708b1f0c4d29e7a6f13"
+    child_a = "5f2a1c8b90d34e6fa7c1b2d3e4f50617"
+    child_b = "6a3b2d9c81e45f70b8d2c3e4f5061728"
+    child_c = "7b4c3e0d92f560810c9e4d5a6b172839"
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _WakeRecordingServerClient(parent_id)
+    gate = asyncio.Event()
+    harness_client = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_dedupe"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_dedupe"}}),
+        ],
+        gate,
+    )
+    pm = _FakeProcessManager(harness_client)  # type: ignore[arg-type]
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    for child in (child_a, child_b, child_c):
+        subagent_work.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child,
+            agent="gp",
+            title="fanout",
+        )
+
+    async def _start_blocking_parent_turn() -> None:
+        """Post a parent message and wait for the (blocking) turn to start.
+
+        ``post_seen`` resolves only after ``_run_turn_bg`` clears the wake
+        flag, so callers know the flag is clear before completing a child.
+        """
+        harness_client.post_seen.clear()
+        parent_resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "c1d2e3f4a5b60718293a4b5c6d7e8f90",
+                "model": "test-agent",
+                "harness": "openai-agents",
+                "content": [{"type": "input_text", "text": "wake notice"}],
+            },
+        )
+        assert parent_resp.status_code == 202, parent_resp.text
+        await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+
+    async def _complete_child(child_id: str, output: str) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle", "output": output}},
+        )
+        assert resp.status_code == 204, resp.text
+
+    async def _wait_turn_idle() -> None:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while app.state.has_active_work():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("parent turn did not end within 5s")
+            await asyncio.sleep(0.01)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    try:
+        async with _runner_client(app) as client:
+            # 1. Child A completes idle → first wake.
+            await _complete_child(child_a, "A_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+
+            # 2. Start T1, then child B completes mid-turn → completion wake,
+            #    re-arms the flag with no later turn to clear it.
+            await _start_blocking_parent_turn()
+            await _complete_child(child_b, "B_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 2, (
+                f"Expected A + B wakes before T1 ends, got {len(server_client.wake_posts)}."
+            )
+
+            # 3. End T1 → recovery wake (the first re-wake). It matches child
+            #    B's completion wake verbatim yet must still fire — that
+            #    contract is guarded elsewhere; here it seeds the last-re-wake
+            #    record used to dedupe step 5.
+            gate.set()
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 3, (
+                f"Expected the recovery wake to bring the count to 3, got "
+                f"{len(server_client.wake_posts)}."
+            )
+            recovery_text = server_client.wake_posts[2]["data"]["content"][0]["text"]
+            assert "sub-agent gp/fanout finished (completed)" in recovery_text
+            assert "2 results waiting in inbox" in recovery_text
+            await _wait_turn_idle()
+
+            # 4. Start T2 (clears the flag). Drain one inbox item, then child C
+            #    completes mid-T2 — the count returns to 2, so C's completion
+            #    wake is identical text to the step-3 recovery wake. A fresh
+            #    completion always posts (never deduped), so this is wake [4].
+            gate.clear()
+            await _start_blocking_parent_turn()
+            assert not session_inbox.empty()
+            session_inbox.get_nowait()
+            await _complete_child(child_c, "C_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 4, (
+                f"Expected child C's completion wake as the 4th, got "
+                f"{len(server_client.wake_posts)}."
+            )
+
+            # 5. End T2 → the recovery wake would repeat "gp/fanout … 2 results"
+            #    verbatim (identical to step 3), so it must be SUPPRESSED. Give a
+            #    wrongly-scheduled 5th wake room to land before asserting.
+            gate.set()
+            await _wait_turn_idle()
+    finally:
+        gate.set()
+        for child in (child_a, child_b, child_c):
+            subagent_work.unregister_subagent_work(child)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    # Exactly 4 wakes: A + B + recovery + C's completion. A 5th would be the
+    # duplicate recovery wake this fix suppresses; 3 would mean C's genuine
+    # completion notice was wrongly swallowed.
+    assert len(server_client.wake_posts) == 4, (
+        f"Expected the repeat recovery wake to be suppressed (4 wakes total), "
+        f"got {len(server_client.wake_posts)}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_wake_fires_again_for_an_episode_after_a_full_drain() -> None:
+    """
+    A full inbox drain ends the stranding episode, so dedupe must not carry over.
+
+    ``_last_rewake_notice`` suppresses a recovery wake that repeats the previous
+    one verbatim (see
+    ``test_repeat_identical_recovery_wake_is_suppressed``). That record describes
+    *outstanding* work, so it goes stale the moment the parent drains: a later
+    fan-out round that happens to produce the same label and pending count is a
+    genuinely new stranding episode and is still owed its nudge. Without
+    clearing the record on drain the parent is left holding undelivered results
+    with the wake flag cleared — nothing re-arms it once every child has
+    finished, which is the exact strand ``_rewake_parent_if_inbox_stranded``
+    exists to break.
+
+    Sequence (wake counts bracketed), all children sharing the ``gp/fanout``
+    label so the notices can match. Episode 1: (1) child A completes idle →
+    wake [1]; (2) parent turn T1 starts, child B completes mid-T1 → wake [2],
+    re-arming the flag; (3) T1 ends → recovery wake [3] ``… 2 results``,
+    recorded. (4) Turn T2 drains BOTH items and ends with the inbox empty —
+    episode over. Episode 2: (5) child C completes → wake [4]; (6) turn T3
+    starts, child D completes mid-T3 → wake [5], count back to 2. (7) T3 ends →
+    the recovery wake reads ``… 2 results``, matching step 3, but the drain in
+    step 4 cleared the record, so it MUST still fire → wake [6]. Carrying the
+    record across the drain yields 5 and a parent stranded on 2 results — the
+    discriminator.
+    """
+
+    parent_id = "a1b2c3d4e5f60718293a4b5c6d7e8f01"
+    child_a = "11112c8b90d34e6fa7c1b2d3e4f50617"
+    child_b = "22222d9c81e45f70b8d2c3e4f5061728"
+    child_c = "33333e0d92f560810c9e4d5a6b172839"
+    child_d = "44444f1e03a671920dae5e6b7c28394a"
+    children = (child_a, child_b, child_c, child_d)
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server_client = _WakeRecordingServerClient(parent_id)
+    gate = asyncio.Event()
+    harness_client = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_drain"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_drain"}}),
+        ],
+        gate,
+    )
+    pm = _FakeProcessManager(harness_client)  # type: ignore[arg-type]
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    for child in children:
+        subagent_work.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child,
+            agent="gp",
+            title="fanout",
+        )
+
+    async def _start_blocking_parent_turn() -> None:
+        """Post a parent message and wait for the (blocking) turn to start.
+
+        ``post_seen`` resolves only after ``_run_turn_bg`` clears the wake flag,
+        so callers know the flag is clear before completing a child.
+        """
+        harness_client.post_seen.clear()
+        parent_resp = await client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "c1d2e3f4a5b60718293a4b5c6d7e8f90",
+                "model": "test-agent",
+                "harness": "openai-agents",
+                "content": [{"type": "input_text", "text": "wake notice"}],
+            },
+        )
+        assert parent_resp.status_code == 202, parent_resp.text
+        await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+
+    async def _complete_child(child_id: str, output: str) -> None:
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle", "output": output}},
+        )
+        assert resp.status_code == 204, resp.text
+
+    async def _wait_turn_idle() -> None:
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while app.state.has_active_work():
+            if asyncio.get_running_loop().time() > deadline:
+                raise AssertionError("parent turn did not end within 5s")
+            await asyncio.sleep(0.01)
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    try:
+        async with _runner_client(app) as client:
+            # Episode 1, steps 1-3: strand the inbox at 2 and take the recovery
+            # wake, which records "… 2 results" as the last re-wake.
+            await _complete_child(child_a, "A_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            await _start_blocking_parent_turn()
+            await _complete_child(child_b, "B_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            gate.set()
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            await _wait_turn_idle()
+            assert len(server_client.wake_posts) == 3, (
+                f"Expected A + B + recovery wakes to end episode 1, got "
+                f"{len(server_client.wake_posts)}."
+            )
+            assert (
+                "2 results waiting in inbox"
+                in (server_client.wake_posts[2]["data"]["content"][0]["text"])
+            )
+
+            # Step 4: the parent fully drains during T2, ending the episode.
+            gate.clear()
+            await _start_blocking_parent_turn()
+            while not session_inbox.empty():
+                session_inbox.get_nowait()
+            gate.set()
+            await _wait_turn_idle()
+            assert len(server_client.wake_posts) == 3, (
+                f"A drained inbox owes no wake, got {len(server_client.wake_posts)}."
+            )
+
+            # Episode 2, steps 5-6: two new children bring the count back to 2,
+            # so the pending recovery notice matches episode 1's verbatim.
+            gate.clear()
+            await _complete_child(child_c, "C_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            await _start_blocking_parent_turn()
+            await _complete_child(child_d, "D_DONE")
+            await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            server_client.wake_seen.clear()
+            assert len(server_client.wake_posts) == 5, (
+                f"Expected C + D completion wakes in episode 2, got "
+                f"{len(server_client.wake_posts)}."
+            )
+
+            # Step 7: T3 ends → the new episode's recovery wake must fire even
+            # though its text matches episode 1's. Swallow the wait timeout so a
+            # missing wake surfaces as the count assertion below, not a
+            # TimeoutError.
+            gate.set()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            await _wait_turn_idle()
+    finally:
+        gate.set()
+        for child in children:
+            subagent_work.unregister_subagent_work(child)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+    assert len(server_client.wake_posts) == 6, (
+        f"Expected episode 2's recovery wake to fire after the drain (6 wakes "
+        f"total), got {len(server_client.wake_posts)}."
+    )
+    assert not session_inbox.empty(), "The stranded results should still be waiting."
+
+
+@pytest.mark.asyncio
 async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
     """
     Replayed terminal status after parent drain is a benign duplicate.
@@ -1841,7 +2301,6 @@ async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
     sees an already-delivered ack instead of a false ``missing_work_entry``
     503 for a still-known child session.
     """
-    from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
     parent_id = "fde99284fcd969bcadb10a80290e6dc5"
@@ -1853,8 +2312,8 @@ async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
         process_manager=pm,  # type: ignore[arg-type]
         server_client=server_client,  # type: ignore[arg-type]
     )
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
-    runner_app.register_subagent_work(
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work.register_subagent_work(
         parent_session_id=parent_id,
         child_session_id=child_id,
         agent="worker",
@@ -1904,12 +2363,12 @@ async def test_replayed_idle_status_after_inbox_drain_is_acknowledged() -> None:
                     conversation_id=parent_id,
                     session_inbox=session_inbox,
                 )
-            assert runner_app.get_subagent_work(child_id) is None
+            assert subagent_work.get_subagent_work(child_id) is None
             replay_resp = await client.post(f"/v1/sessions/{child_id}/events", json=idle_event)
     finally:
-        runner_app.unregister_subagent_work(child_id)
-        runner_app.unregister_subagent_work_for_session(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert "DONE_AND_DRAINED" in drain_output
     assert replay_resp.status_code == 204, replay_resp.text
@@ -1929,7 +2388,6 @@ async def test_concurrent_subagent_completions_coalesce_into_one_wake() -> None:
     and tripping the executor's per-turn tool-context guard ("no active turn
     context") — the regression this guards against.
     """
-    from omnigent.runner import app as runner_app
 
     parent_id = "0c51258a4c62e5c390402b8473ae8271"
     child_ids = [
@@ -1945,9 +2403,9 @@ async def test_concurrent_subagent_completions_coalesce_into_one_wake() -> None:
         server_client=server_client,  # type: ignore[arg-type]
     )
 
-    runner_app._session_inboxes_ref[parent_id] = session_inbox
+    subagent_work._session_inboxes_ref[parent_id] = session_inbox
     for idx, child_id in enumerate(child_ids):
-        runner_app.register_subagent_work(
+        subagent_work.register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent="claude_code",
@@ -1971,8 +2429,8 @@ async def test_concurrent_subagent_completions_coalesce_into_one_wake() -> None:
                 await asyncio.sleep(0)
     finally:
         for child_id in child_ids:
-            runner_app.unregister_subagent_work(child_id)
-        runner_app._session_inboxes_ref.pop(parent_id, None)
+            subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     # All three completions were delivered to the parent inbox...
     assert session_inbox.qsize() == 3, (
@@ -2040,17 +2498,7 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         # POST /v1/sessions seeds _session_spec_cache so the
@@ -2320,17 +2768,7 @@ async def test_events_interrupt_on_native_session_503_skips_cleanup_when_inject_
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        """Return the native spec for any agent_id."""
-        del agent_id
-        return native_spec
-
-    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
-    app = create_runner_app(
-        process_manager=pm,  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    app, _ = await _build_app_for_spec(native_spec)
 
     async with _runner_client(app) as client:
         create_resp = await client.post(

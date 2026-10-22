@@ -34,10 +34,10 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.agents.conftest import JokeSubagentsSession
 from tests.e2e_ui.conftest import open_right_rail
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
-_SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'
+_SUBAGENT_STATUS_AVATAR = '[data-testid="subagent-status-avatar"]'
 
 # One relay = dispatch turn + two sub-agent turns + the auto-wake
 # continuation, several serial real-LLM calls, so the nonce assertions
@@ -96,8 +96,8 @@ def test_two_joke_subagents_appear_and_navigate(
     expect(rows).to_have_count(2, timeout=30_000)
     expect(rail).to_contain_text("comic_one")
     expect(rail).to_contain_text("comic_two")
-    # Each row carries a status dot and its own child session id.
-    expect(rows.first.locator(_SUBAGENT_STATUS_DOT)).to_be_visible()
+    # Each row carries a status avatar and its own child session id.
+    expect(rows.first.locator(_SUBAGENT_STATUS_AVATAR)).to_be_visible()
     # The count badge grew past the lone-agent baseline of 1 (main + 2).
     expect(agents_tab).to_contain_text("3")
 
@@ -105,16 +105,20 @@ def test_two_joke_subagents_appear_and_navigate(
     target_row = rows.first
     child_session_id = target_row.get_attribute("data-child-session-id")
     assert child_session_id, "subagent row is missing data-child-session-id"
+    target_name = target_row.locator("span.font-medium").first.inner_text()
+    assert target_name in {"comic_one", "comic_two"}, target_name
     target_row.click()
     page.wait_for_url(re.compile(re.escape(f"/c/{child_session_id}")))
 
     # The header carries the back-to-parent affordance: a "Back to parent
-    # session" link pointing at the parent conversation, beside the
-    # "Sub-agent" identity caption.
+    # session" link pointing at the parent conversation, beside the child's
+    # own sub-agent identity (the comedian's name — NOT the parent bundle's
+    # agent name, which is what the bound-agent row carries).
     back_link = page.get_by_role("link", name="Back to parent session")
     expect(back_link).to_be_visible(timeout=30_000)
     expect(back_link).to_have_attribute("href", re.compile(re.escape(f"/c/{chat.session_id}")))
-    expect(page.get_by_text("Sub-agent", exact=True)).to_be_visible()
+    breadcrumb = page.get_by_role("navigation", name="Conversation")
+    expect(breadcrumb.get_by_text(target_name, exact=True)).to_be_visible()
 
     # Following it returns to the parent session.
     back_link.click()

@@ -7,10 +7,13 @@ pure-function helpers directly instead of via HTTP.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.server.admin_list import AdminList
+from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes.auth import (
     _GITHUB_EMAILS_ENDPOINT,
     _claim_is_verified_true,
@@ -18,6 +21,7 @@ from omnigent.server.routes.auth import (
     _evict_expired_tickets,
     _resolve_github_email,
     _sanitize_return_to,
+    create_auth_router,
 )
 
 # ── _sanitize_return_to ──────────────────────────────────────────────
@@ -196,6 +200,33 @@ class TestResolveGithubEmail:
 
         assert email is None
 
+    @pytest.mark.asyncio
+    async def test_malformed_email_entries_are_ignored(self) -> None:
+        async with _github_client(
+            emails=httpx.Response(
+                200,
+                json=[
+                    "not-an-object",
+                    {"email": 42, "primary": True, "verified": True},
+                ],
+            ),
+            profile=httpx.Response(200, json={"email": "profile@example.com"}),
+        ) as client:
+            email = await _resolve_github_email(client, "tok")
+
+        assert email is None
+
     def test_emails_endpoint_constant_is_user_emails(self) -> None:
         """Guard: the resolver queries the verified-email list endpoint."""
         assert _GITHUB_EMAILS_ENDPOINT.endswith("/user/emails")
+
+
+def test_create_auth_router_requires_oidc_config(tmp_path: Path) -> None:
+    provider = UnifiedAuthProvider(source="header")
+
+    with pytest.raises(ValueError, match="OIDC-configured auth provider"):
+        create_auth_router(
+            provider,
+            permission_store=None,
+            admin_list=AdminList(tmp_path / "admins"),
+        )

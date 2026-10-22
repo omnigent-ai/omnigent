@@ -1,6 +1,6 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { type TerminalInfo } from "@/hooks/useTerminals";
+import type { TerminalInfo } from "@/hooks/useTerminals";
 import { useTerminalStatuses } from "./useTerminalStatuses";
 
 function terminal(overrides: Partial<TerminalInfo> = {}): TerminalInfo {

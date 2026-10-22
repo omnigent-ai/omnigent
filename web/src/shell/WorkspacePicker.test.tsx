@@ -7,15 +7,20 @@
 //      but a late-arriving listing (home resolving) must NOT clobber
 //      what the user is typing.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   basename,
+  isHostAbsolutePath,
+  isNavigablePath,
   joinPath,
   listingFilter,
   normalizeTypedPath,
   parentOf,
+  resolveWorkspacePath,
+  useResolvedHostHome,
   WorkspacePicker,
 } from "./WorkspacePicker";
 import {
@@ -23,6 +28,12 @@ import {
   useHostFilesystem,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
+import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
+import {
+  WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
+  WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+} from "./WorktreeRadioRow";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -31,25 +42,49 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // is open, so the default is harmless for the other suites.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
+  useHostWorktrees: vi.fn(() => ({
+    data: [],
+    isFetching: false,
+    isPlaceholderData: false,
+    error: null,
+  })),
+}));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
+const useHostWorktreesMock = vi.mocked(useHostWorktrees);
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
 }
 
+function file(name: string, path: string): HostFilesystemEntry {
+  return { name, path, type: "file", bytes: 1024, modified_at: 0 };
+}
+
 interface FakeListing {
   data?: { entries: HostFilesystemEntry[]; truncated: boolean };
   isLoading: boolean;
+  isFetching?: boolean;
   isPlaceholderData: boolean;
-  error?: null;
+  error?: Error | null;
 }
 
 /** Cast a minimal query result to the hook's return type. */
 function result(value: FakeListing): ReturnType<typeof useHostFilesystem> {
   return value as unknown as ReturnType<typeof useHostFilesystem>;
 }
+
+beforeEach(() => {
+  useHostWorktreesMock.mockReturnValue({
+    data: [],
+    isFetching: false,
+    isPlaceholderData: false,
+    error: null,
+  } as unknown as ReturnType<typeof useHostWorktrees>);
+});
 
 describe("parentOf", () => {
   it("returns null at the home view (empty path)", () => {
@@ -80,6 +115,22 @@ describe("parentOf", () => {
     // climb correctly; without the strip the parent would
     // wrongly include the trailing-empty segment.
     expect(parentOf("/Users/corey/")).toBe("/Users");
+  });
+
+  it("climbs Windows drive paths without falling through to POSIX root", () => {
+    // Host listings on Windows return backslash paths. lastIndexOf("/")
+    // is -1 on those, which previously made parentOf return "/" and
+    // sent the picker to the drive root.
+    expect(parentOf("C:\\Users\\alice\\work")).toBe("C:\\Users\\alice");
+    expect(parentOf("C:\\Users\\alice")).toBe("C:\\Users");
+    expect(parentOf("C:\\Users")).toBe("C:\\");
+    expect(parentOf("C:\\")).toBeNull();
+    expect(parentOf("C:/Users/alice/work")).toBe("C:/Users/alice");
+    expect(parentOf("C:/Users")).toBe("C:/");
+  });
+
+  it("does not treat a backslash as a separator on POSIX paths", () => {
+    expect(parentOf("/tmp/a\\b")).toBe("/tmp");
   });
 });
 
@@ -162,6 +213,12 @@ describe("normalizeTypedPath", () => {
     // resolve. Out of scope for v1 — fall through to "invalid".
     expect(normalizeTypedPath("~root/foo", "/Users/corey")).toBeNull();
   });
+
+  it("accepts a Windows drive path as already absolute", () => {
+    expect(normalizeTypedPath("C:\\Users\\alice\\work")).toBe("C:\\Users\\alice\\work");
+    expect(normalizeTypedPath("C:/Users/alice/work")).toBe("C:/Users/alice/work");
+    expect(normalizeTypedPath("  C:/Users/alice/work/  ")).toBe("C:/Users/alice/work");
+  });
 });
 
 describe("basename", () => {
@@ -188,6 +245,15 @@ describe("basename", () => {
     // produce an empty basename.
     expect(basename("/Users/corey/")).toBe("corey");
   });
+
+  it("returns the last segment of a Windows drive path", () => {
+    expect(basename("C:\\Users\\alice\\work")).toBe("work");
+    expect(basename("C:/Users/alice/work")).toBe("work");
+  });
+
+  it("keeps a POSIX backslash inside the basename", () => {
+    expect(basename("/tmp/a\\b")).toBe("a\\b");
+  });
 });
 
 // listingFilter decides whether (and how) the path-bar text narrows the
@@ -196,6 +262,107 @@ describe("basename", () => {
 // root) and the cases that must NOT — blank, exactly the current path, or a
 // path into a different directory (which is navigation, not a filter). A
 // false positive here would hide entries while the user is navigating away.
+describe("isNavigablePath", () => {
+  it("accepts POSIX absolute, home, and Windows drive paths", () => {
+    expect(isNavigablePath("/Users/me/work")).toBe(true);
+    expect(isNavigablePath("~/work")).toBe(true);
+    expect(isNavigablePath("~")).toBe(true);
+    expect(isNavigablePath("C:\\Users\\alice\\work")).toBe(true);
+    expect(isNavigablePath("C:/Users/alice/work")).toBe(true);
+    expect(isNavigablePath("work")).toBe(false);
+    expect(isNavigablePath("C:relative")).toBe(false);
+  });
+});
+
+describe("isHostAbsolutePath", () => {
+  it("rejects relative and tilde paths", () => {
+    expect(isHostAbsolutePath("/tmp")).toBe(true);
+    expect(isHostAbsolutePath("C:\\Users\\alice")).toBe(true);
+    expect(isHostAbsolutePath("~/work")).toBe(false);
+    expect(isHostAbsolutePath("")).toBe(false);
+  });
+});
+
+describe("resolveWorkspacePath", () => {
+  it("resolves a typed tilde path against the host's home", () => {
+    // The reported bug: a "~/…" workspace reads like a real directory but the
+    // server never expands ~. Resolving it against home makes it directly
+    // submittable without opening the tree browser.
+    expect(resolveWorkspacePath("~/git/omnigent", "/Users/alice")).toBe(
+      "/Users/alice/git/omnigent",
+    );
+    expect(resolveWorkspacePath("~", "/Users/alice")).toBe("/Users/alice");
+  });
+
+  it("passes an already-absolute path through, no home needed", () => {
+    expect(resolveWorkspacePath("/tmp/work", null)).toBe("/tmp/work");
+    expect(resolveWorkspacePath("  /tmp/work/  ", null)).toBe("/tmp/work");
+    expect(resolveWorkspacePath("/", null)).toBe("/");
+  });
+
+  it("preserves an absolute path verbatim — no slash-run collapsing", () => {
+    // Absolute values must match the prior normalizeWorkspacePath (trailing
+    // slash strip only). Routing them through normalizeTypedPath would rewrite
+    // a typed leading "//foo" → "/foo" — a behavior change we avoid.
+    expect(resolveWorkspacePath("//foo", null)).toBe("//foo");
+    expect(resolveWorkspacePath("/a//b", null)).toBe("/a//b");
+  });
+
+  it("stays null for a tilde path until home resolves, and for unusable input", () => {
+    // Home not yet known → the submit stays gated rather than launching a
+    // literal "~/…" the server can't use.
+    expect(resolveWorkspacePath("~/git/omnigent", null)).toBeNull();
+    expect(resolveWorkspacePath("relative/dir", "/Users/alice")).toBeNull();
+    expect(resolveWorkspacePath("", "/Users/alice")).toBeNull();
+  });
+});
+
+describe("useResolvedHostHome", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+  });
+
+  it("derives the absolute home from the home listing's first entry", () => {
+    // Entries share one parent, so the first entry's parent is home.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    const { result: hook } = renderHook(() => useResolvedHostHome("host_1"));
+    expect(hook.current).toBe("/Users/alice");
+  });
+
+  it("stays null for a null host, an empty home, or placeholder data", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBeNull();
+
+    // Placeholder (prior dir kept on screen mid-load) must not resolve home
+    // from the wrong directory.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("git", "/Users/alice/git")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: true,
+      }),
+    );
+    expect(renderHook(() => useResolvedHostHome("host_1")).result.current).toBeNull();
+
+    useHostFilesystemMock.mockReturnValue(
+      result({ data: undefined, isLoading: false, isPlaceholderData: false }),
+    );
+    expect(renderHook(() => useResolvedHostHome(null)).result.current).toBeNull();
+  });
+});
+
 describe("listingFilter", () => {
   it.each<[string, string, string | null, string | null]>([
     // [pathInput, currentAbsolute, home, expected]
@@ -217,6 +384,9 @@ describe("listingFilter", () => {
     ["~/pro", "/Users/me", "/Users/me", "pro"],
     // At the root, "/sr" is a fragment of "/" → filters.
     ["/sr", "/", null, "sr"],
+    ["C:\\Users\\me\\pro", "C:\\Users\\me", null, "pro"],
+    ["C:\\Users\\me", "C:\\Users\\me", null, null],
+    ["C:/Users/Alice/pro", "c:\\users\\alice", null, "pro"],
   ])("listingFilter(%j, %j, %j) → %j", (input, current, home, expected) => {
     expect(listingFilter(input, current, home)).toBe(expected);
   });
@@ -278,6 +448,33 @@ describe("WorkspacePicker path bar", () => {
     const input = screen.getByTestId("workspace-picker-path-input") as HTMLInputElement;
     fireEvent.click(screen.getByTestId("workspace-picker-entry-projects"));
     expect(input.value).toBe("/Users/serena.ruan/projects");
+  });
+
+  it("does not treat a Windows home listing as the POSIX root", () => {
+    // Home view (path "") lists entries whose paths are C:\Users\...\name.
+    // Deriving the current dir via lastIndexOf("/") used to yield "/", so
+    // onNavigate fired with the drive root and Select could not pick work/.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [
+            dir("work", "C:\\Users\\alice\\work"),
+            dir("Documents", "C:\\Users\\alice\\Documents"),
+          ],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    const onNavigate = vi.fn();
+    const onSelect = vi.fn();
+    render(<WorkspacePicker hostId="host_1" onNavigate={onNavigate} onSelect={onSelect} />);
+    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\alice");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenCalledWith("C:\\Users\\alice");
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-work"));
+    expect(onNavigate).toHaveBeenCalledWith("C:\\Users\\alice\\work");
   });
 
   it("resolves a tilde start path to an absolute one for selection", () => {
@@ -392,6 +589,7 @@ describe("WorkspacePicker live selection (onNavigate)", () => {
     // The live-update callers drop the explicit commit button entirely.
     render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={vi.fn()} />);
     expect(screen.queryByTestId("workspace-picker-select")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass("h-7", "px-2", "py-[3px]");
   });
 });
 
@@ -444,6 +642,631 @@ describe("WorkspacePicker listing filter", () => {
     expect(screen.getByText("No matching entries")).toBeTruthy();
     expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
   });
+
+  it("filters from the dedicated search field and clears it with Escape", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    const search = screen.getByTestId("workspace-picker-search-input") as HTMLInputElement;
+
+    fireEvent.change(search, { target: { value: "do" } });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toBeTruthy();
+    expect(screen.queryByTestId("workspace-picker-entry-src")).toBeNull();
+
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(search.value).toBe("");
+    expect(screen.getByTestId("workspace-picker-entry-src")).toBeTruthy();
+  });
+
+  it("clears search when navigating into a matching directory", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    const search = screen.getByTestId("workspace-picker-search-input") as HTMLInputElement;
+
+    fireEvent.change(search, { target: { value: "src" } });
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+
+    expect(search.value).toBe("");
+  });
+});
+
+describe("WorkspacePicker breadcrumbs", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockImplementation((_hostId, path) =>
+      result({
+        data: {
+          entries: path === "" ? [dir("projects", "/Users/corey/projects")] : [],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it.each([
+    ["/", "/"],
+    ["/Users", "/Users"],
+    ["/var/log", "/var/log"],
+    ["/Users/corey", "corey"],
+    ["/Users/corey/projects/app", "corey/projects/app"],
+  ])("renders %s without duplicating the root separator", (path, expected) => {
+    render(<WorkspacePicker hostId="host_1" initialPath={path} />);
+
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toBe(expected);
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue(path);
+  });
+
+  it("navigates through intermediate breadcrumbs and selects their canonical paths", () => {
+    const onNavigate = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/var/log"
+        onNavigate={onNavigate}
+        onSelect={onSelect}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "var" }));
+    expect(onNavigate).toHaveBeenLastCalledWith("/var");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toBe("/var");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/var");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenLastCalledWith("/var");
+  });
+
+  it("keeps the root breadcrumb navigable and selects canonical paths", () => {
+    const onNavigate = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users"
+        onNavigate={onNavigate}
+        onSelect={onSelect}
+      />,
+    );
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/Users");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenLastCalledWith("/Users");
+
+    fireEvent.click(screen.getByTestId("workspace-picker-home"));
+    expect(onNavigate).toHaveBeenLastCalledWith("/");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toBe("/");
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/");
+    fireEvent.click(screen.getByTestId("workspace-picker-select"));
+    expect(onSelect).toHaveBeenLastCalledWith("/");
+  });
+});
+
+describe("WorkspacePicker modal actions", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [
+            dir("src", "/Users/corey/repo/src"),
+            file("README.md", "/Users/corey/repo/README.md"),
+          ],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("renders the reference action labels and commits the current folder", () => {
+    const onClose = vi.fn();
+    const onSelect = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onClose={onClose}
+        onSelect={onSelect}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
+    expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass("h-7", "px-2", "py-[3px]");
+    expect(screen.getByTestId("workspace-picker-listing")).toHaveClass("space-y-px", "px-2");
+    expect(screen.getByTestId("workspace-picker-header")).toHaveClass("h-12", "px-3", "py-0");
+    expect(screen.getByTestId("workspace-picker-breadcrumbs")).not.toHaveClass("px-1");
+    expect(screen.getByTestId("workspace-picker-search-row")).toHaveClass("border-b-0");
+    expect(screen.getByTestId("workspace-picker-search-field")).toHaveClass(
+      "h-8",
+      "rounded-lg",
+      "border-input",
+      "px-2.5",
+    );
+    expect(screen.getByTestId("workspace-picker-search-icon")).toHaveClass("size-4");
+    const newFolder = screen.getByTestId("workspace-picker-new-folder");
+    const hiddenToggle = screen.getByTestId("workspace-picker-show-hidden");
+    expect(screen.getByTestId("workspace-picker-header")).toContainElement(newFolder);
+    expect(newFolder.compareDocumentPosition(hiddenToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(screen.getByTestId("workspace-picker-search-row")).not.toContainElement(newFolder);
+    for (const testId of [
+      "workspace-picker-up",
+      "workspace-picker-new-folder",
+      "workspace-picker-show-hidden",
+      "workspace-picker-refresh",
+      "workspace-picker-close",
+    ]) {
+      expect(screen.getByTestId(testId)).toHaveAttribute("data-variant", "ghost");
+      expect(screen.getByTestId(testId)).toHaveAttribute("data-size", "icon");
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(onSelect).toHaveBeenCalledWith("/Users/corey/repo");
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("keeps files disabled while directories remain navigable", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+
+    expect(screen.getByTestId("workspace-picker-entry-README.md")).toBeDisabled();
+    expect(screen.getByTestId("workspace-picker-entry-src")).not.toBeDisabled();
+  });
+
+  it.each([undefined, null, "other", "github"] as const)(
+    "selects linked worktrees regardless of provider metadata (%s)",
+    (remoteProvider) => {
+      useHostWorktreesMock.mockReturnValue({
+        data: [
+          {
+            path: "/Users/corey/repo",
+            branch: "main",
+            is_main: true,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+            updated_at: 1_700_000_000,
+          },
+          {
+            path: "/Users/corey/worktrees/feature-layout",
+            branch: "feature/layout",
+            is_main: false,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+            updated_at: 1_700_000_000,
+          },
+        ],
+        isFetching: false,
+        isPlaceholderData: false,
+        error: null,
+      } as unknown as ReturnType<typeof useHostWorktrees>);
+      const onNavigate = vi.fn();
+      const onSelect = vi.fn();
+
+      render(
+        <WorkspacePicker
+          hostId="host_1"
+          initialPath="/Users/corey/repo"
+          onSelect={onSelect}
+          onNavigate={onNavigate}
+        />,
+      );
+
+      expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
+      expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
+      expect(screen.getByTestId("workspace-picker-worktrees-label")).toHaveClass(
+        "h-12",
+        "text-xs",
+        "text-muted-foreground",
+      );
+      expect(
+        screen.getByTestId("workspace-picker-worktrees-label").querySelector("svg"),
+      ).toBeNull();
+      expect(screen.getByText("Don't use")).toBeInTheDocument();
+      expect(screen.getByText("feature-layout")).toBeInTheDocument();
+      expect(screen.queryByText("main")).toBeNull();
+
+      expect(screen.getByTestId("workspace-picker")).toHaveClass(
+        "h-[min(600px,calc(100dvh-4rem))]",
+        "w-[min(800px,calc(100vw-2rem))]",
+        "rounded-[20px]",
+      );
+      expect(screen.getByTestId("workspace-picker-body")).toHaveClass(
+        "md:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
+      );
+      const currentFolderRow = screen.getByTestId("workspace-picker-current-folder");
+      const linkedWorktreeRow = screen.getByTestId(
+        "workspace-picker-worktree-/Users/corey/worktrees/feature-layout",
+      );
+      const spaciousRowClasses = WORKTREE_RADIO_SPACIOUS_ROW_CLASS.split(" ");
+      const spaciousInputClasses = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS.split(" ");
+      expect(currentFolderRow).toHaveClass(...spaciousRowClasses);
+      expect(linkedWorktreeRow).toHaveClass(...spaciousRowClasses);
+      expect(screen.getByRole("radio", { name: "Don't use" })).toHaveClass(...spaciousInputClasses);
+      expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toHaveClass(
+        ...spaciousInputClasses,
+      );
+      expect(screen.getByRole("radiogroup", { name: "Choose a worktree" })).toHaveClass(
+        "space-y-px",
+        "px-2",
+      );
+      expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass(
+        "h-7",
+        "px-2",
+        "py-[3px]",
+      );
+      expect(screen.getByTestId("workspace-picker-select")).toHaveClass(
+        "h-8",
+        "px-2.5",
+        "font-normal",
+      );
+
+      fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
+      expect(
+        screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
+      ).toHaveClass("bg-muted");
+      expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+      fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+      expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+      expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
+    },
+  );
+
+  it("keeps cached verified worktrees and selection while a nested path query is disabled", () => {
+    useHostFilesystemMock.mockImplementation((_host, path) =>
+      path === "/Users/corey/repo/src"
+        ? result({
+            data: {
+              entries: [dir("src", "/Users/corey/repo/src")],
+              truncated: false,
+            },
+            isLoading: false,
+            isFetching: true,
+            isPlaceholderData: true,
+            error: null,
+          })
+        : result({
+            data: {
+              entries: [dir("src", "/Users/corey/repo/src")],
+              truncated: false,
+            },
+            isLoading: false,
+            isPlaceholderData: false,
+            error: null,
+          }),
+    );
+    useHostWorktreesMock.mockImplementation(
+      (_host, path) =>
+        (path === null
+          ? {
+              data: undefined,
+              isFetching: false,
+              isPlaceholderData: false,
+              error: null,
+            }
+          : {
+              data: [
+                {
+                  path: "/Users/corey/repo",
+                  branch: "main",
+                  is_main: true,
+                  detached: false,
+                },
+                {
+                  path: "/Users/corey/worktrees/feature-layout",
+                  branch: "feature/layout",
+                  is_main: false,
+                  detached: false,
+                },
+              ],
+              isFetching: false,
+              isPlaceholderData: false,
+              error: null,
+            }) as ReturnType<typeof useHostWorktrees>,
+    );
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
+
+    expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
+    const worktreeRadio = screen.getByRole("radio", { name: "Use worktree feature-layout" });
+    fireEvent.click(worktreeRadio);
+    expect(worktreeRadio).toBeChecked();
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+    expect(useHostWorktreesMock).toHaveBeenLastCalledWith("host_1", null);
+    expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
+    expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toBeChecked();
+  });
+
+  it("hides the worktree panel for a non-Git directory", () => {
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
+
+    expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
+  });
+
+  it("queries linked worktrees for a Windows path in the full modal", () => {
+    const windowsPath = "C:\\Users\\alice\\repo";
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [dir("src", `${windowsPath}\\src`)],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" initialPath={windowsPath} onSelect={vi.fn()} />);
+
+    expect(useHostWorktreesMock).toHaveBeenCalledWith("host_1", windowsPath);
+  });
+
+  it("uses the same fixed frame and compact rows regardless of callback shape", () => {
+    const { rerender } = render(
+      <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onNavigate={vi.fn()} />,
+    );
+
+    expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
+    const liveClass = screen.getByTestId("workspace-picker").className;
+    expect(liveClass).toContain("h-[min(600px,calc(100dvh-4rem))]");
+    expect(liveClass).toContain("w-[min(800px,calc(100vw-2rem))]");
+
+    rerender(
+      <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />,
+    );
+    const modalClass = screen.getByTestId("workspace-picker").className;
+    expect(modalClass).toBe(liveClass);
+  });
+
+  it("keeps full-dialog geometry invariant as worktree states change", async () => {
+    const fullPicker = () => screen.getByTestId("workspace-picker");
+    const header = () => screen.getByTestId("workspace-picker-header");
+    const footer = () => screen.getByTestId("workspace-picker-footer");
+    const frameClasses = ["h-[min(600px,calc(100dvh-4rem))]", "w-[min(800px,calc(100vw-2rem))]"];
+    const expectFixedFrame = (expectedClassName: string) => {
+      expect(fullPicker().className).toBe(expectedClassName);
+      for (const className of frameClasses) expect(fullPicker().className).toContain(className);
+      expect(header().className).toContain("min-h-12");
+      expect(footer().className).toContain("min-h-16");
+    };
+
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    const { rerender } = render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    const expectedClassName = fullPicker().className;
+    expect(screen.queryByTestId("workspace-picker-worktrees")).toBeNull();
+    expectFixedFrame(expectedClassName);
+
+    useHostWorktreesMock.mockReturnValue({
+      data: undefined,
+      isFetching: true,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    rerender(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    expectFixedFrame(expectedClassName);
+
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        { path: "/Users/corey/repo", branch: "main", is_main: true, detached: false },
+        {
+          path: "/Users/corey/worktrees/feature-layout",
+          branch: "feature/layout",
+          is_main: false,
+          detached: false,
+        },
+      ],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    rerender(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible());
+    expectFixedFrame(expectedClassName);
+
+    fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
+    expectFixedFrame(expectedClassName);
+  });
+});
+
+describe("WorkspacePicker refresh", () => {
+  const refetchListing = vi.fn();
+  const refetchWorktrees = vi.fn();
+
+  function mockListing(overrides: Partial<FakeListing> = {}) {
+    useHostFilesystemMock.mockReturnValue({
+      ...result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isFetching: false,
+        isPlaceholderData: false,
+        error: null,
+        ...overrides,
+      }),
+      refetch: refetchListing,
+    } as unknown as ReturnType<typeof useHostFilesystem>);
+  }
+
+  beforeEach(() => {
+    refetchListing.mockReset();
+    refetchWorktrees.mockReset();
+    useHostFilesystemMock.mockReset();
+    mockListing();
+    useHostWorktreesMock.mockReturnValue({
+      data: [],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+      refetch: refetchWorktrees,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("re-reads the folder listing and its worktrees from the host", () => {
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    expect(screen.getByTestId("workspace-picker-header")).toContainElement(refresh);
+    expect(
+      refresh.compareDocumentPosition(screen.getByTestId("workspace-picker-close")) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    fireEvent.click(refresh);
+
+    expect(refetchListing).toHaveBeenCalledOnce();
+    expect(refetchWorktrees).toHaveBeenCalledOnce();
+  });
+
+  it("skips the worktree read when the picker has no worktree panel", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+
+    expect(refetchListing).toHaveBeenCalledOnce();
+    expect(refetchWorktrees).not.toHaveBeenCalled();
+  });
+
+  it("is disabled while the listing is already loading", () => {
+    mockListing({ isFetching: true });
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onClose={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+
+  it("is disabled without a host", () => {
+    render(<WorkspacePicker hostId={null} onClose={vi.fn()} />);
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+});
+
+describe("WorkspacePicker navigation status", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("replaces stale placeholder rows with a busy loading state", () => {
+    useHostFilesystemMock.mockImplementation((_hostId, queryPath) => {
+      if (queryPath === "/repo/src") {
+        return result({
+          data: {
+            entries: [dir("src", "/repo/src"), dir("docs", "/repo/docs")],
+            truncated: false,
+          },
+          isLoading: false,
+          isFetching: true,
+          isPlaceholderData: true,
+          error: null,
+        });
+      }
+      return result({
+        data: {
+          entries: [dir("src", "/repo/src"), dir("docs", "/repo/docs")],
+          truncated: false,
+        },
+        isLoading: false,
+        isFetching: false,
+        isPlaceholderData: false,
+        error: null,
+      });
+    });
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/repo" />);
+    fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+
+    expect(screen.getByTestId("workspace-picker-listing")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Loading folder…")).toBeInTheDocument();
+    expect(screen.queryByTestId("workspace-picker-entry-docs")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-new-folder")).toBeDisabled();
+  });
+
+  it("keeps a cached listing on screen while it refetches in the background", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/repo/src")], truncated: false },
+        isLoading: false,
+        isFetching: true,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/repo" onSelect={vi.fn()} />);
+
+    expect(screen.getByTestId("workspace-picker-listing")).not.toHaveAttribute("aria-busy");
+    expect(screen.queryByText("Loading folder…")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-entry-src")).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-picker-select")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+
+  it("announces directory listing errors", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: undefined,
+        isLoading: false,
+        isFetching: false,
+        isPlaceholderData: false,
+        error: new Error("directory is unavailable"),
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/missing" />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("directory is unavailable");
+    expect(screen.getByRole("alert")).toHaveAttribute("aria-live", "assertive");
+  });
 });
 
 describe("joinPath", () => {
@@ -463,6 +1286,11 @@ describe("joinPath", () => {
 
   it("trims surrounding whitespace from the child name", () => {
     expect(joinPath("/Users/me", "  foo  ")).toBe("/Users/me/foo");
+  });
+
+  it("joins a Windows drive path with a backslash", () => {
+    expect(joinPath("C:\\Users\\alice", "work")).toBe("C:\\Users\\alice\\work");
+    expect(joinPath("C:\\", "Users")).toBe("C:\\Users");
   });
 });
 
@@ -497,7 +1325,14 @@ describe("WorkspacePicker new folder", () => {
       isPending: false,
     } as unknown as ReturnType<typeof useCreateHostDirectory>);
 
-    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/projects" />);
+    const onNavigate = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/projects"
+        onNavigate={onNavigate}
+      />,
+    );
 
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder"));
     fireEvent.change(screen.getByTestId("workspace-picker-new-folder-input"), {
@@ -505,7 +1340,9 @@ describe("WorkspacePicker new folder", () => {
     });
     fireEvent.click(screen.getByTestId("workspace-picker-new-folder-create"));
 
-    await Promise.resolve();
+    await waitFor(() => {
+      expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/fresh");
+    });
     expect(mutateAsync).toHaveBeenCalledWith({
       hostId: "host_1",
       path: "/Users/corey/projects/fresh",
@@ -530,9 +1367,9 @@ describe("WorkspacePicker new folder", () => {
 
     // Let the rejected mutation settle and the error state render.
     await screen.findByTestId("workspace-picker-new-folder-error");
-    expect(screen.getByTestId("workspace-picker-new-folder-error").textContent).toContain(
-      "already exists",
-    );
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("already exists");
+    expect(alert).toHaveAttribute("aria-live", "assertive");
   });
 
   it("disables the New folder button until an absolute directory resolves", () => {
@@ -571,5 +1408,107 @@ describe("WorkspacePicker new folder", () => {
 
     await Promise.resolve();
     expect(mutateAsync).toHaveBeenCalledWith({ hostId: "host_1", path: "~/fresh" });
+  });
+});
+
+describe("WorkspacePicker back-to-workspace", () => {
+  it("is absent when no workspace is supplied", () => {
+    // The new-session / fork / project dialogs are *choosing* a workspace, so
+    // there is nothing to go back to and Home (~) is the only anchor. This is
+    // why the button is its own control rather than a repurposed Home.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("app", "/Users/corey/projects/app")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" />);
+
+    expect(screen.queryByTestId("workspace-picker-workspace")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-home")).toBeInTheDocument();
+  });
+
+  it("returns to the workspace in one click after wandering off", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("Music", "/Users/corey/Music")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+    const onNavigate = vi.fn();
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey"
+        workspacePath="/Users/corey/repo"
+        onNavigate={onNavigate}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("workspace-picker-workspace"));
+
+    expect(onNavigate).toHaveBeenCalledWith("/Users/corey/repo");
+  });
+
+  it("is disabled once the workspace is already showing", () => {
+    // Same treatment as Up at the filesystem root: kept in place but inert,
+    // so the header does not reflow as the user navigates.
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+
+    render(
+      <WorkspacePicker
+        hostId="host_1"
+        initialPath="/Users/corey/repo"
+        workspacePath="/Users/corey/repo"
+      />,
+    );
+
+    expect(screen.getByTestId("workspace-picker-workspace")).toBeDisabled();
+  });
+});
+
+// The picker opens inside popovers and dialogs, which focus their first
+// tabbable child — the header's Up button. Auto-focus must not add transient
+// chrome over the search and listing.
+describe("WorkspacePicker initial focus", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("focuses Up without rendering an overlay", async () => {
+    render(
+      <Popover>
+        <PopoverTrigger data-testid="open-picker">Working folder</PopoverTrigger>
+        <PopoverContent>
+          <WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" />
+        </PopoverContent>
+      </Popover>,
+    );
+
+    fireEvent.click(screen.getByTestId("open-picker"));
+    const up = await screen.findByTestId("workspace-picker-up");
+    // Assert Radix autofocus still lands predictably for keyboard users.
+    expect(up).toHaveFocus();
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 });

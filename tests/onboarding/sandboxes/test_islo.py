@@ -11,7 +11,11 @@ import click
 import pytest
 
 import omnigent.onboarding.sandboxes.islo as islo_mod
-from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+from omnigent.onboarding.sandboxes.base import (
+    DEFAULT_HOST_IMAGE,
+    SandboxGoneError,
+    render_host_config_write_command,
+)
 from omnigent.onboarding.sandboxes.islo import (
     API_KEY_ENV_VAR,
     HOST_IMAGE_ENV_VAR,
@@ -600,9 +604,23 @@ def test_resume_paused_or_stopped_sandbox(monkeypatch: pytest.MonkeyPatch, statu
     assert fake.resumed == ["sb-1"]
 
 
-@pytest.mark.parametrize("status", ["deleted", "failed", "mystery"])
+@pytest.mark.parametrize("status", ["deleted", "deleting"])
+def test_resume_gone_states_raise_typed_error(
+    monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Deleted sandboxes trigger a fresh managed-host generation."""
+    fake = _FakeIsloAPI(statuses={"sb-1": status})
+    launcher = IsloSandboxLauncher()
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    with pytest.raises(SandboxGoneError, match=status):
+        launcher.resume("sb-1")
+    assert fake.resumed == []
+
+
+@pytest.mark.parametrize("status", ["failed", "mystery"])
 def test_resume_rejects_non_resumable_states(monkeypatch: pytest.MonkeyPatch, status: str) -> None:
-    """Deleted, failed, and unknown states are not papered over."""
+    """Failed and unknown states remain ordinary resume failures."""
     fake = _FakeIsloAPI(statuses={"sb-1": status})
     launcher = IsloSandboxLauncher()
     monkeypatch.setattr(launcher, "_islo", lambda: fake)
@@ -610,6 +628,20 @@ def test_resume_rejects_non_resumable_states(monkeypatch: pytest.MonkeyPatch, st
     with pytest.raises(click.ClickException, match="cannot"):
         launcher.resume("sb-1")
     assert fake.resumed == []
+
+
+def test_resume_missing_sandbox_raises_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A structured Islo 404 is preserved through the launcher boundary."""
+    fake = _FakeIsloAPI(
+        get_error=islo_mod._IsloSandboxGoneError("Islo sandbox 'sb-1' no longer exists")
+    )
+    launcher = IsloSandboxLauncher()
+    monkeypatch.setattr(launcher, "_islo", lambda: fake)
+
+    with pytest.raises(SandboxGoneError, match="no longer exists"):
+        launcher.resume("sb-1")
+
+    assert launcher.is_running("sb-1") is False
 
 
 def test_resume_sdk_failure_maps_to_click_exception(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -630,6 +662,7 @@ def test_start_host_stops_preserved_daemon_before_launch(monkeypatch: pytest.Mon
     fake = _FakeIsloAPI()
     launcher = IsloSandboxLauncher()
     monkeypatch.setattr(launcher, "_islo", lambda: fake)
+    host_config = {"providers": {"example": {"base_url": "https://gateway.example.com"}}}
 
     workspace = launcher.start_host(
         "sb-1",
@@ -637,10 +670,12 @@ def test_start_host_stops_preserved_daemon_before_launch(monkeypatch: pytest.Mon
         host_id="host_1",
         host_name="managed-1",
         server_url="https://omnigent.example.com",
+        host_config=host_config,
     )
 
     assert workspace == "/root/workspace"
     commands = [call.command[-1] for call in fake.exec_calls]
+    assert render_host_config_write_command(host_config) in commands
     cleanup_index = next(i for i, cmd in enumerate(commands) if "preserved omnigent host" in cmd)
     launch_index = next(i for i, cmd in enumerate(commands) if "OMNIGENT_HOST_TOKEN" in cmd)
     assert cleanup_index < launch_index

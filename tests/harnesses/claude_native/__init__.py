@@ -1,0 +1,1 @@
+"""Claude-native adapter tests."""

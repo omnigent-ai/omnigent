@@ -16,7 +16,18 @@ on:
     # Security Gate via rerun-security-gate.yml, so label churn need not re-run
     # the heavy integration suite. (#399 added these for the gate; superseded.)
     types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ['web/**', 'tests/e2e_ui/**']
+    paths-ignore:
+      - 'docs/**'
+      - 'designs/**'
+      - 'CHANGELOG.md'
+      - 'tests/browser_ui/**'
+      - 'tests/e2e_ui/**'
+      - 'web/**'
+      - 'tests/scripts/**'
+      - 'tests/github/**'
+      - '.github/scripts/polly-review-*.py'
+      - '.github/workflows/polly-review*.yml'
+      - '.github/workflows/*.js'
   workflow_dispatch:
 
 permissions:
@@ -34,8 +45,8 @@ env:
   CLAUDE_CODE: ""
 
 concurrency:
-  # Key by PR number so re-syncs cancel; push/dispatch key by SHA/branch.
-  group: integration-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.branch || github.sha }}
+  # Key by PR number so re-syncs cancel, dispatch by ref, and schedule by SHA.
+  group: integration-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.ref) || github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -43,6 +54,9 @@ jobs:
   # (see security-gate.yml); trusted authors / non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Harness matrix (integration-matrix.sh). Fork PRs run by default; draft PRs
   # resolve to an empty matrix.
@@ -55,19 +69,25 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Check out CI scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Triggering ref (not pinned to main): the script must exist on the
           # running ref, and it is not a security gate -- it only selects which
           # harness legs run and can't expose secrets, so the PR's own copy is
           # fine.
-          sparse-checkout: .github/scripts/ci
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
           persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - name: Compute integration matrix
         id: matrix
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          RUN_TESTS: ${{ steps.scope.outputs.integration }}
         run: bash .github/scripts/ci/integration-matrix.sh
 
   integration:
@@ -91,9 +111,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Shared verbatim with server-compat.yml's backcompat-integration job via
       # the composite action, so the two never drift. server_version is omitted

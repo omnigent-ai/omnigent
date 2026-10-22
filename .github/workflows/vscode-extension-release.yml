@@ -9,8 +9,8 @@
 # match the input), so the tag and the packaged version can't diverge.
 #
 # This produces the ARTIFACT ONLY — it does NOT publish to the VS Code
-# Marketplace or Open VSX. That runs from the central secure-release repo
-# (databricks/secure-public-registry-releases-eng), on hardened runners, where
+# Marketplace or Open VSX. That runs from a Databricks-internal secure-release
+# repo, on hardened runners, where
 # a workflow downloads this `.vsix`, verifies its `.sha256`, scans it, and
 # publishes. Keeping the two halves separate is deliberate: this job only
 # builds and uploads; the secured half holds the marketplace tokens and scan
@@ -64,7 +64,7 @@ jobs:
 
       # Build from the FROZEN release branch, not main. Later main commits can't
       # leak into the release.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: release/vscode-v${{ inputs.version }}
 

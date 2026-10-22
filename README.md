@@ -11,7 +11,7 @@ Omnigent is an open-source **meta-harness** that gives you a common orchestratio
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/omnigent)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
-[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/download/mac)**
+[omnigent.ai](https://omnigent.ai) · **[⬇️ Download the macOS desktop app](https://omnigent.ai/quickstart/install#install-the-desktop-app)**
 
 </div>
 
@@ -43,10 +43,13 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [Gensee](https://gensee.ai),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
-  [Boxlite](https://github.com/boxlite-ai/boxlite), or
+  [Boxlite](https://github.com/boxlite-ai/boxlite),
+  [microsandbox](https://github.com/superradcompany/microsandbox), or
   [Databricks](https://www.databricks.com) sandboxes, launched from the
   CLI or provisioned by the server per session (*managed hosts*).
 
@@ -67,21 +70,27 @@ One command installs Omnigent and everything it needs:
 curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh
 ```
 
+The installer includes Databricks support and installs the Databricks CLI
+alongside Omnigent, or reuses an existing CLI that supports workspace login.
+Pass `--no-databricks` to omit them.
+
 <details>
 <summary>Optional integrations and extras</summary>
 
 Need an optional integration? Pass one or more extras to the installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra databricks
 curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh -s -- --extra modal,e2b
 ```
 
+The Antigravity SDK extra conflicts with Databricks dependencies. Install it
+with `--no-databricks --extra antigravity`.
+
 Available user-facing extras include:
 
-- **Model providers:** `databricks`, `bedrock`, `vertex`
-- **Sandbox providers:** `modal`, `daytona`, `boxlite`, `cwsandbox`, `e2b`,
-  `openshell`, `kubernetes`
+- **Model providers:** `databricks` (included by default), `bedrock`, `vertex`
+- **Sandbox providers:** `modal`, `daytona`, `blaxel`, `boxlite`, `microsandbox`,
+  `cwsandbox`, `e2b`, `openshell`, `kubernetes`
 - **SDK harnesses:** `antigravity`, `copilot`, `cursor`, `agents-sdk`
 - **Storage and memory:** `s3`, `hindsight`
 
@@ -108,6 +117,20 @@ Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
 brew install omnigent-ai/tap/omnigent
 ```
 
+For source builds on networks that require package mirrors, replace these example
+URLs with your mirrors:
+
+```bash
+HOMEBREW_PIP_INDEX_URL='https://pypi.example.com/simple' \
+HOMEBREW_CARGO_INDEX_URL='https://cargo.example.com/index/' \
+  brew install --build-from-source omnigent-ai/tap/omnigent
+```
+
+The PyPI setting also routes pip's isolated build dependencies through the mirror.
+The Cargo setting takes a sparse registry index URL ending in `/`, without the
+`sparse+` prefix. Both overrides are optional and do not affect prebuilt-bottle
+installs.
+
 Or install straight from the repo:
 
 ```bash
@@ -126,13 +149,18 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
   both from a single Node install; pnpm is available via
   `corepack enable` or `npm install -g pnpm`.
+- **Devin CLI** (optional), for `omnigent devin`: install with
+  `curl -fsSL https://cli.devin.ai/install.sh | bash`, then sign in with
+  `devin auth login`. Devin tool approvals appear as Chat approval cards
+  (its `PermissionRequest` hook is mirrored to the web UI) and stay
+  answerable in the embedded Terminal. See `docs/devin-native.md`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
+  (`claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
@@ -141,11 +169,12 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   missing `bwrap` binary makes those terminals fail to start
   (`apt install bubblewrap`; the installer offers to install it for you). macOS
   uses the built-in `seatbelt` sandbox and needs nothing extra.
-- **Databricks** (optional). To use a Databricks workspace as your model
-  provider, install Omnigent with the `databricks` extra:
-  `uv tool install "omnigent[databricks]"` — or pass it to the bootstrap
-  installer with `... | sh -s -- --extra databricks`. Signing in to the
-  workspace also uses the [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install).
+- **Databricks.** The bootstrap installer includes the `databricks` extra
+  and the Databricks CLI. If installing with uv directly, use
+  `uv tool install "omnigent[databricks]"` and install the
+  [Databricks CLI](https://docs.databricks.com/aws/en/dev-tools/cli/install)
+  separately. Sign in to a workspace-hosted server with
+  `omnigent login <workspace-url>/omnigent`.
 
 </details>
 
@@ -241,7 +270,7 @@ also launches a local web UI at `http://localhost:6767` that shows the same
 session in the browser, or on a phone on your network (step 4). The
 [desktop app](https://omnigent.ai/docs/interact/desktop) wraps that same UI
 in a native window and adds OS notifications (with a configurable sound) and a dock badge —
-[download it for macOS](https://omnigent.ai/download/mac).
+[download it for macOS](https://omnigent.ai/quickstart/install#install-the-desktop-app).
 
 > [!NOTE]
 > The install puts two names for the same CLI on your PATH: `omnigent` and
@@ -262,10 +291,74 @@ Or launch a specific agent runtime:
 omnigent claude                      # Claude Code, in a session your team can join
 omnigent codex                       # Codex
 omnigent cursor                      # Cursor
+omnigent agy                         # Antigravity
 omnigent opencode                    # OpenCode
 omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
+omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
+
+`omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
+direct Gemini API authentication takes precedence over agy's saved OAuth login.
+
+To configure native agy credentials, run `omni setup` →
+**Antigravity** → **Configure native agy API key / gateway** → **Add a credential**
+and choose the option matching your connection:
+
+- **Gemini — API key** for a Google AI Studio key.
+- **Gemini API gateway — URL + key** for an external gateway implementing native
+  Gemini requests and `x-goog-api-key` authentication. Supply its API root, such
+  as `https://gateway.example/gemini`, without `/v1beta` or a model operation.
+- **Databricks — profile** for a Databricks workspace with native Gemini API
+  access. Omnigent manages profile authentication and model-name mapping; no
+  workspace URL or token needs to be pasted into the gateway form.
+
+OpenAI Responses and Chat Completions endpoints are **not supported by native
+agy**, even when they serve Gemini models. A separate protocol adapter would be
+required. The first Gemini credential becomes the default; select **Make default
+for Gemini** when switching, then start a fresh `omni agy` session.
+
+See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibility
+requirements, model and authentication behavior, troubleshooting, and smoke
+steps. These settings configure native agy; the Antigravity Python SDK retains
+its separate key/Vertex setup.
+
+Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
+its coding agents or drive a live OpenClaw Gateway session over ACP.
+
+<details>
+<summary>Grok Build and Devin</summary>
+
+Two more coding agents are built in but have no `omnigent <name>` launcher of
+their own, because each ships a CLI that holds its own login. Install the vendor
+CLI, log in with it, then name the harness:
+
+```bash
+# Grok Build (xAI)
+curl -fsSL https://x.ai/cli/install.sh | bash
+grok login --device-auth              # xAI OAuth
+omnigent run --harness grok           # 'grok-build' also works
+
+# Devin (Cognition)
+curl -fsSL https://cli.devin.ai/install.sh | bash
+devin auth login
+omnigent run --harness devin
+```
+
+Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
+stdio, and Omnigent stores no credential for either — each CLI reads back the
+login it wrote to disk. That also means `--model` is refused rather than
+silently dropped: both run their account-default model. To pin one, configure an
+`acp:` agent whose command passes the vendor's own model flag.
+
+Use the vendor login rather than an API key. A builtin ACP row has no
+`env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
+credential allowlist, so exporting it in your shell does not reach the agent.
+If you need the key route, pass it explicitly with
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
+declares the passthrough.
+
+</details>
 
 #### 🐙 Polly and 🟠🔵 Debby
 
@@ -274,6 +367,7 @@ Two example agents ship with the repo, and they make good first sessions:
 ```bash
 omnigent run examples/polly/
 omnigent run examples/debby/
+omnigent run examples/deep-research/
 
 # ...or on a different harness (sub-agents keep their own):
 omnigent run examples/polly/ --harness <harness>
@@ -291,15 +385,74 @@ side by side. Type `/debate` and the heads critique each other for a few
 rounds before converging. (She needs both a Claude and an OpenAI credential;
 see step 3.)
 
-**Prefer the browser?** Start a server and register your machine as a host:
+**🔎 Deep Research** is a single agent that answers a question with a cited,
+cross-checked report. It plans sub-queries, searches the live web and reads
+full pages through an MCP search server, and verifies each claim across
+independent sources. It's also the simplest example to copy from: one agent
+plus one `tools/mcp/*.yaml` server, no sub-agents.
+
+**Prefer the browser?** One command starts the local server and registers this
+machine as a host:
 
 ```bash
-omnigent server --background   # start the local server and web UI in the background
-omnigent host           # (separate terminal) register this machine as a host
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
-In the web UI, hit **New Chat**, pick your machine, and go. Check status with
-`omnigent server status`; stop everything with `omnigent stop`.
+Open the server URL it prints, hit **New Chat**, pick your machine, and go.
+Check status with `omnigent server status`; stop everything with
+`omnigent stop`.
+
+To suppress the automatic browser tab, use `omni host --no-open` or set
+`OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
+--background` and `omni start`. Sign-in may still open a browser; use
+`--non-interactive` in scripts to fail if sign-in is required.
+
+A session can also start itself: the **Automations** page runs an agent on a
+recurring schedule. See the [automations guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/AUTOMATIONS.md)
+for the schedule format, the REST API, and the current limits.
+
+<details>
+<summary>Customize automatic session titles</summary>
+
+Set additional natural-language requirements for the isolated title generator:
+
+```bash
+omnigent config set --global \
+  'session_title_instructions=Prefix titles with the current date as lowercase mon-dd. Use PR-number-short-name for pull requests, issue-number-short-description for issues, and a short snake_case activity otherwise.'
+```
+
+The title generator receives the current date as `YYYY-MM-DD`, then applies
+these requirements to the first user message. The setting is server-owned and
+does not alter an agent's portable instructions. Default generated titles are
+limited to 100 characters; custom title requirements may use up to 200.
+Default titles over 100 characters are rejected, leaving the first-message
+fallback title in place. Custom titles over 200 characters are truncated with
+a trailing ellipsis. Manually assigned titles are also limited to 200
+characters. The setting applies after the local Omnigent server restarts, both
+to new sessions and to later agent-initiated renames through `sys_session_rename`.
+Agent proposals are formatted using the same title requirements; if formatting
+fails, the existing title is preserved. Manual renames remain unchanged.
+For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
+block scalar:
+
+```yaml
+session_title_instructions: |
+  Prefix every title with the current date as lowercase mon-dd.
+  For pull requests use mon-dd-PR-number-short-name.
+  For issues use mon-dd-issue-number-short-description.
+  For other work use mon-dd-short_snake_case_activity.
+```
+
+Server operators can set the same key in the YAML passed to
+`omnigent server --config`.
+
+Claude Code sessions generate titles with the `haiku` model alias. If that
+model answers the message instead of returning a title, set
+`OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL` to another Claude model alias, such as
+`sonnet`, in the environment of the `omnigent` or `omnigent host` process that
+runs the session.
+
+</details>
 
 ### 3. Choose & switch models
 
@@ -353,8 +506,10 @@ Face Spaces**, **Modal**, **Cloudflare** (serverless, scale-to-zero), and
 covered too — and a **Cloudflare quick tunnel** (public) or **Tailscale**
 (private) reaches a server running on your own laptop without a deploy. The
 server can also provision a cloud sandbox per session (*managed hosts*), so no
-laptop has to stay online. The full menu of targets, the database options, and
-the sandbox setup live in
+laptop has to stay online. The full menu of targets, the database options, the
+sandbox setup, and
+[branding/white-labeling](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md#branding-white-labeling)
+live in
 [`deploy/README.md`](https://github.com/omnigent-ai/omnigent/blob/main/deploy/README.md).
 
 Once the server is up, sign in and register your laptop as a host:
@@ -399,6 +554,12 @@ and they're in. Signup is invite-only.
 
 - **Share a live session.** Hit **Share** in the web UI and send the link;
   teammates watch your agent work and chat with it in real time.
+- **Share with everyone who can sign in.** Admins can allow public Edit in
+  **Settings > Sharing > Maximum public permission**. Owners then choose
+  **Share > General access > Edit**. The default stays Read.
+- **Leave a shared session.** Done with a session someone shared with you?
+  Pick **Leave session** from its sidebar row menu to drop it from your
+  sidebar. Nothing is deleted — the owner keeps it and can share it again.
 - **Co-drive.** A teammate co-attaches to your running session; their
   messages execute on **your** machine. Great for pairing or handing the
   keyboard to a domain expert mid-investigation.
@@ -413,11 +574,6 @@ and they're in. Signup is invite-only.
   ```bash
   omnigent run --fork <session_id>
   ```
-
-Shared sessions identify model-visible messages with `[account]:` labels by
-default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
-labels. This does not change stored authors, UI avatars, or who may approve or
-run privileged actions.
 
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,
@@ -467,6 +623,14 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 ---
 
 ## Write your own agent
+
+For centrally managed remote tools, reusable account connections, and a gateway
+with session policies around built-in or external backends, see the
+[MCP registry and gateway prototype](examples/mcp-registry/README.md).
+Direct MCP requests use the caller's connected account. A shared session's runner
+uses its authenticated account (normally the owner), while policies evaluate the
+turn's initiating user. Databricks connections ask for a workspace URL before
+OAuth. KMS limits serialized grants to 4096 bytes; use Vault for larger grants.
 
 An agent is a short YAML file: your prompt, your tools — local Python
 functions, MCP servers, and sub-agents a supervisor can delegate to. You don't

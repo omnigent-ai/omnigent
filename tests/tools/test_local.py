@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
-from omnigent.spec.types import LocalToolInfo, SandboxConfig
+from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
 from omnigent.tools.base import ToolContext
 from omnigent.tools.local import (
     LocalPythonTool,
@@ -125,6 +125,49 @@ def test_invoke_subprocess_success(tmp_path: Path, tool_ctx: ToolContext) -> Non
     # actually traversed the subprocess pipeline.
     assert "hello" in result
     assert "result:" in result
+
+
+def test_stateless_tool_does_not_create_tool_state_directory(tmp_path: Path) -> None:
+    """A stateless custom tool must not dirty its execution workspace."""
+    py_dir = tmp_path / "bundle" / "tools" / "python"
+    _write_decorated_tool(py_dir, "echo_tool.py", func_name="echo_tool")
+    info = LocalToolInfo(name="echo_tool", path="tools/python/echo_tool.py", language="python")
+    tools = load_local_python_tools([info], tmp_path / "bundle")
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    ctx = ToolContext(task_id="task_test", agent_id="ag_test", workspace=workspace)
+
+    assert "hello" in tools[0].invoke(json.dumps({"value": "hello"}), ctx)
+    assert not (workspace / ".tool_state").exists()
+
+
+def test_stateful_tool_receives_isolated_state_root(tmp_path: Path) -> None:
+    """Only a reserved ``tool_state`` parameter enables persistent state."""
+    bundle = tmp_path / "bundle"
+    py_dir = bundle / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "stateful.py").write_text(
+        "from omnigent_client.tools import ToolState, tool\n\n"
+        "@tool\n"
+        "def stateful(value: str, tool_state: ToolState) -> str:\n"
+        "    prior = tool_state.get('value')\n"
+        "    tool_state.set('value', value)\n"
+        "    return f'{prior}|{value}'\n"
+    )
+    info = LocalToolInfo(name="stateful", path="tools/python/stateful.py", language="python")
+    tool = load_local_python_tools([info], bundle)[0]
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    first_ctx = ToolContext(task_id="first", agent_id="ag_test", workspace=first_workspace)
+    second_ctx = ToolContext(task_id="second", agent_id="ag_test", workspace=second_workspace)
+
+    assert tool.invoke(json.dumps({"value": "one"}), first_ctx) == "None|one"
+    assert tool.invoke(json.dumps({"value": "two"}), first_ctx) == "one|two"
+    assert tool.invoke(json.dumps({"value": "other"}), second_ctx) == "None|other"
+    assert (first_workspace / ".tool_state" / "ag_test").is_dir()
+    assert (second_workspace / ".tool_state" / "ag_test").is_dir()
 
 
 def test_invoke_subprocess_strips_runner_binding_token(
@@ -330,6 +373,29 @@ def test_load_skips_typescript(tmp_path: Path) -> None:
     info = LocalToolInfo(name="ts_tool", path="tools/typescript/ts_tool.ts", language="typescript")
     tools = load_local_python_tools([info], tmp_path)
     assert tools == []
+
+
+def test_load_skips_client_runtime_tool(tmp_path: Path) -> None:
+    info = LocalToolInfo(
+        name="client_tool",
+        path=None,
+        language="python",
+        runtime=ToolRuntime.CLIENT,
+    )
+
+    assert load_local_python_tools([info], tmp_path) == []
+
+
+def test_load_server_tool_without_path_fails_loud(tmp_path: Path) -> None:
+    info = LocalToolInfo(
+        name="pathless",
+        path=None,
+        language="python",
+        runtime=ToolRuntime.SERVER,
+    )
+
+    with pytest.raises(LocalToolLoadError, match="no source path"):
+        load_local_python_tools([info], tmp_path, agent_name="testagent")
 
 
 def test_load_missing_file_fails_loud(tmp_path: Path) -> None:

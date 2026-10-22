@@ -104,6 +104,38 @@ object NativeBridgeScript {
             },
           });
 
+          // getServerPicker waiters: each call parks a resolver here; native
+          // answers every request with one emit, resolving all of them.
+          const serverPickerWaiters = new Set();
+          Object.defineProperty(window, "__omnigentNativeEmitServerPicker", {
+            configurable: false, enumerable: false, writable: false,
+            value(payload) {
+              if (!payload || typeof payload !== "object") return;
+              if (typeof payload.currentOrigin !== "string" || !payload.currentOrigin) return;
+              const cleanList = (value) =>
+                Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+              const info = {
+                currentOrigin: payload.currentOrigin,
+                managedServers: cleanList(payload.managedServers),
+                recentServers: cleanList(payload.recentServers),
+                canSignOut: payload.canSignOut === true,
+              };
+              for (const resolve of serverPickerWaiters) { try { resolve(info); } catch (_) {} }
+              serverPickerWaiters.clear();
+            },
+          });
+
+          // signOutOfServer waiters: native answers true once it has taken over the
+          // sign-out, false when this connection can't be signed out natively.
+          const signOutWaiters = new Set();
+          Object.defineProperty(window, "__omnigentNativeEmitSignOutResult", {
+            configurable: false, enumerable: false, writable: false,
+            value(handled) {
+              for (const resolve of signOutWaiters) { try { resolve(handled === true); } catch (_) {} }
+              signOutWaiters.clear();
+            },
+          });
+
           const insetCallbacks = new Set();
           // Cache the last footprint so a subscriber that registers AFTER native
           // first emitted (the React app mounts later than document-start) still
@@ -250,7 +282,40 @@ object NativeBridgeScript {
               if (lastInsets) { try { callback(lastInsets); } catch (_) {} }
               return () => insetCallbacks.delete(callback);
             },
+            getServerPicker() {
+              // Fetch fresh per call (the sidebar picker re-reads on every menu
+              // open so a runtime MDM change appears without a reload); native
+              // answers each request with an emit, resolving every waiter.
+              const pending = new Promise((resolve) => { serverPickerWaiters.add(resolve); });
+              post({ method: "requestServerPicker" });
+              return pending;
+            },
+            switchServer(url) {
+              if (typeof url === "string") post({ method: "switchServer", url });
+              return Promise.resolve();
+            },
+            signOutOfServer() {
+              const pending = new Promise((resolve) => { signOutWaiters.add(resolve); });
+              post({ method: "signOutOfServer" });
+              return pending;
+            },
+            openServerSetup() {
+              post({ method: "openServerSetup" });
+            },
           });
         })();
         """.trimIndent()
+
+    fun source(managesWorkspace: Boolean): String {
+        if (!managesWorkspace) return source
+        val marker = "    openServerSetup() {"
+        val signOut =
+            """
+            signOut() {
+              post({ method: "signOut" });
+              return Promise.resolve();
+            },
+            """.trimIndent().prependIndent("    ")
+        return source.replace(marker, "$signOut\n$marker")
+    }
 }

@@ -4,7 +4,8 @@
 native forwarder report a connectivity failure to the harness idle-turn
 watchdog (issue #1119). These cover its record / recency / clear contract; the
 writer (forwarder retry loops) and reader (watchdog) integrations are tested in
-``tests/test_native_post_delivery.py``, ``tests/test_codex_native_forwarder.py``,
+``tests/test_native_post_delivery.py``,
+``tests/harnesses/codex_native/forwarder/``,
 and ``tests/runtime/harnesses/test_scaffold.py``.
 """
 
@@ -13,7 +14,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent import _native_forwarder_health as health
+from omnigent.native import _native_forwarder_health as health
 
 
 class _FakeClock:
@@ -89,5 +90,36 @@ def test_note_post_success_clears_a_prior_failure() -> None:
         assert health.recent_post_failure(60.0) is not None
         health.note_post_success()
         assert health.recent_post_failure(60.0) is None
+    finally:
+        health.clear()
+
+
+def test_record_transport_failure_surfaces_preformatted_detail() -> None:
+    """A ready-to-surface detail (e.g. an SDK head's parsed gateway 401) is
+    stored verbatim and returned within the recency window."""
+    health.clear()
+    try:
+        health.record_transport_failure("gateway returned 401 Unauthorized at https://h/x")
+        detail = health.recent_post_failure(60.0)
+        assert detail == "gateway returned 401 Unauthorized at https://h/x"
+    finally:
+        health.clear()
+
+
+def test_note_post_success_stamps_last_post_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A successful POST round-trip records its monotonic time for the runner
+    idle watchdog; ``clear`` resets the stamp for test isolation."""
+    clock = _FakeClock(start=500.0)
+    monkeypatch.setattr(health, "time", clock)
+    health.clear()
+    try:
+        assert health.last_post_at() is None
+        health.note_post_success()
+        assert health.last_post_at() == 500.0
+        clock.now = 640.0
+        health.note_post_success()
+        assert health.last_post_at() == 640.0
+        health.clear()
+        assert health.last_post_at() is None
     finally:
         health.clear()

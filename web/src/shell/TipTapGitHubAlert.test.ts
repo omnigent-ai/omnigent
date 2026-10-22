@@ -13,7 +13,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import { extractAlert, GitHubAlertBlockquote, toBlockContent } from "./TipTapGitHubAlert";
 
 let editor: Editor | null = null;

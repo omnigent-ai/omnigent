@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <title>Reconnecting</title>
+    <style>
+      /* Same design tokens as setup/index.html and return-banner/index.html. */
+      :root {
+        color-scheme: light dark;
+        --background: #fff;
+        --foreground: #11171c;
+        --muted-foreground: #6f6f6f;
+        --border: #e8ecf0;
+        --radius-lg: 0.5rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --background: #1e1927;
+          --foreground: oklch(0.965 0.003 240);
+          --muted-foreground: #92a4b3;
+          --border: oklch(0.28 0.005 240);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        /* Dims the window's page, which stays visible underneath. */
+        background: rgb(0 0 0 / 0.45);
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        font-size: 13px;
+        user-select: none;
+      }
+      #card {
+        width: 340px;
+        padding: 20px;
+        background: var(--background);
+        color: var(--foreground);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-lg);
+        box-shadow: 0 12px 32px rgb(0 0 0 / 0.25);
+      }
+      #title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0;
+        font-size: 15px;
+        font-weight: 600;
+      }
+      #spinner {
+        flex-shrink: 0;
+        width: 16px;
+        height: 16px;
+        border: 2px solid currentColor;
+        border-right-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #spinner {
+          animation: none;
+        }
+      }
+      #hint {
+        margin: 8px 0 16px 26px;
+        color: var(--muted-foreground);
+        line-height: 1.4;
+      }
+      #hint:empty {
+        display: none;
+      }
+      .actions {
+        display: flex;
+        justify-content: flex-end;
+      }
+      button {
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--foreground);
+        font: inherit;
+        cursor: pointer;
+        padding: 5px 14px;
+        border-radius: 6px;
+      }
+      button:hover {
+        background: color-mix(in srgb, var(--foreground) 8%, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="card" role="alertdialog" aria-labelledby="title" aria-describedby="hint">
+      <p id="title"><span id="spinner" aria-hidden="true"></span>Reconnecting to Databricks…</p>
+      <p id="hint"></p>
+      <div class="actions"><button id="cancel" type="button">Cancel</button></div>
+    </div>
+    <script>
+      // Uses the overlay preload bridge (electron/src/reconnect_overlay_preload.js).
+      document.getElementById("hint").textContent =
+        new URLSearchParams(location.search).get("hint") ?? "";
+      const cancel = () => window.omnigentReconnectOverlay.cancel();
+      document.getElementById("cancel").addEventListener("click", cancel);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") cancel();
+      });
+      document.getElementById("cancel").focus();
+    </script>
+  </body>
+</html>

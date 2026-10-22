@@ -20,33 +20,55 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
+import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.debug_logging import debug_event, set_current_user_id
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
+    HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
     HostHarnessReadinessFrame,
+    HostHarnessStartupResultFrame,
     HostHelloFrame,
+    HostImportedLocalSession,
+    HostImportLocalDoneFrame,
+    HostImportLocalSessionChunkFrame,
+    HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
     HostLaunchRunnerResultFrame,
     HostListDirResultFrame,
     HostListWorktreesResultFrame,
+    HostMcpServersResultFrame,
+    HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
+    HostPluginsResultFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillContentResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
+    ImportLocalSessionChunkAssembler,
     decode_host_frame,
+    encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+from omnigent.runner.transports.ws_tunnel.diagnostics import silence_source
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -59,6 +81,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     RunnerExitReports,
 )
+from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
@@ -66,6 +89,52 @@ _logger = logging.getLogger(__name__)
 SUPPORTED_FRAME_PROTOCOL_MAJOR = 1
 PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
+_HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
+# Per phase: persistence/workers, diagnostics and notification total at most 15s.
+_DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
+# WebSocket close codes a host sends on purpose: 1000 normal, 1001 going away.
+_CLEAN_CLOSE_CODES = frozenset({1000, 1001})
+
+RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
+"""Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
+
+
+def log_runner_exited(
+    host_id: str,
+    runner_id: str,
+    error: str,
+    *,
+    session_id: str | None = None,
+) -> None:
+    """Emit the ``runner_exited`` debug event for a host-reported runner death.
+
+    Callers that can resolve the runner's bound sessions emit one row per
+    session so each crash row is attributable; ``session_id=None`` is the
+    fallback when no session is bound or the lookup is unavailable.
+
+    :param host_id: Reporting host, e.g. ``"host_abc"``.
+    :param runner_id: The dead runner, e.g. ``"runner_abc123..."``.
+    :param error: Daemon-composed cause (exit code + log tail).
+    :param session_id: Session bound to the runner, if known.
+    :returns: None.
+    """
+    # A runner-process fault; the free-text cause is unparsed, and the runner
+    # may have died before or during a turn, so the lifecycle stage is unknown.
+    _logger.warning(
+        "Host %s reported runner %s exited: %s",
+        host_id,
+        runner_id,
+        error,
+        extra=debug_event(
+            "runner_exited",
+            session_id=session_id,
+            host_id=host_id,
+            runner_id=runner_id,
+            error_category=ErrorCategory.RUNNER.value,
+            error_impact=ErrorImpact.BLOCKING.value,
+            error_phase=ErrorPhase.UNKNOWN.value,
+        ),
+    )
 
 
 def create_host_tunnel_router(
@@ -76,7 +145,7 @@ def create_host_tunnel_router(
     on_host_connect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_disconnect: Callable[[str, str | None], Awaitable[None]] | None = None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None = None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None = None,
+    on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
 ) -> APIRouter:
@@ -101,11 +170,13 @@ def create_host_tunnel_router(
         Used for reconnect reconciliation.
     :param on_runner_exited: Optional async callback fired when a host
         reports one of its spawned runners died unexpectedly
-        (``host.runner_exited``). Receives ``(runner_id, error)``.
+        (``host.runner_exited``). Receives ``(host_id, runner_id, error)``.
         The server wires this to mark the runner's session(s) failed
         and push the cause to the open view — the only failure signal
         for a runner that crashed before connecting its tunnel (so the
-        runner-tunnel ``on_runner_disconnect`` path never fires).
+        runner-tunnel ``on_runner_disconnect`` path never fires). When
+        set, it owns the ``runner_exited`` event (see
+        :func:`log_runner_exited`) so rows carry the bound session.
     :param on_host_disconnect: Optional async callback fired when
         a host's tunnel closes. Receives the ``host_id``.
     :param on_host_update: Optional async callback fired when a connected
@@ -150,7 +221,19 @@ def create_host_tunnel_router(
             host_id = uuid_to_bytes(host_id).hex()
         except InvalidUuidError:
             _logger.warning("Refusing host tunnel: malformed host id %r", host_id)
-            await ws.close(code=4003, reason="invalid host id")
+            # Refuse with a real HTTP 400 + body rather than a bare pre-accept
+            # close: the latter reaches the client as an opaque 403 (empty
+            # body), indistinguishable from an auth failure. A 400 that names
+            # the problem lets the host surface an actionable error.
+            await _refuse_upgrade(
+                ws,
+                status=400,
+                reason=(
+                    f"Invalid host id {host_id!r}: host ids must be UUIDs. Set "
+                    "OMNIGENT_HOST_ID to a UUID (or unset it to have one "
+                    "generated) and reconnect."
+                ),
+            )
             return
 
         # Authenticate from the handshake BEFORE accepting the upgrade,
@@ -175,19 +258,26 @@ def create_host_tunnel_router(
                 return
             tunnel_owner = managed.user_id
         elif auth_provider is not None:
-            tunnel_owner = auth_provider.get_user_id(ws)
-            if tunnel_owner is None:
+            authenticated_owner = auth_provider.get_user_id(ws)
+            if authenticated_owner is None:
                 # Auth is enabled but this peer didn't authenticate. Fail
                 # closed — never fall back to RESERVED_USER_LOCAL, which is
                 # admin-equivalent under the multi-user header scheme
                 # Closing before accept() refuses the handshake.
                 await ws.close(code=4004, reason="unauthenticated")
                 return
+            tunnel_owner = authenticated_owner
         else:
             # No auth provider configured = explicit single-user / local
             # deployment; RESERVED_USER_LOCAL is the accepted local owner
             # (consistent with get_user_id returning None on the HTTP side).
             tunnel_owner = RESERVED_USER_LOCAL
+
+        # Attribute debug-log records emitted while servicing this host's tunnel
+        # to its owner. This WebSocket handler runs in its own task, so the set
+        # is scoped to this connection (child loop tasks inherit it) and cannot
+        # bleed across concurrent host connections.
+        set_current_user_id(tunnel_owner)
 
         # Reject a cross-owner takeover before accept(). ``host_id`` is
         # UNIQUE, so a peer authenticated as one user dialing in on a
@@ -227,125 +317,256 @@ def create_host_tunnel_router(
 
         await ws.accept()
         conn: HostConnection | None = None
+        host_persisted = False
+        stage = "hello"
+        connected_at = time.monotonic()
+        ended_by: str | None = None
+        disconnect_error: BaseException | None = None
+        disconnect_attrs: dict[str, Any] | None = None
+
+        def connection_attrs() -> dict[str, Any]:
+            if disconnect_attrs is not None:
+                return {
+                    **disconnect_attrs,
+                    "ended_by": ended_by,
+                    **(conn.diagnostics.snapshot() if conn else {}),
+                }
+            return {
+                "host_id": host_id,
+                "connection_id": conn.hello.connection_id if conn else None,
+                "connection_age_s": round(time.monotonic() - connected_at, 3),
+                "ended_by": ended_by,
+                "retirement_reason": conn.retirement_reason if conn else None,
+                "sender_end_reason": conn.sender_end_reason if conn else None,
+                **(conn.diagnostics.snapshot() if conn else {}),
+            }
+
+        def report_diagnostics() -> None:
+            _logger.warning(
+                "Host %s tunnel scheduling or send delay",
+                host_id,
+                extra=debug_event("host_tunnel_health", **connection_attrs()),
+            )
+
         try:
-            raw = await ws.receive_text()
+            raw = await receive_tunnel_hello(ws, peer_kind="host", peer_id=host_id)
+            if raw is None:
+                return
             frame = decode_host_frame(raw)
             if not isinstance(frame, HostHelloFrame):
-                await ws.close(code=4001, reason="expected host.hello frame")
+                error = "expected host.hello frame"
+                await _send_connection_error(ws, stage="hello", error=error)
+                await ws.close(code=4001, reason=error)
                 return
 
+            stage = "protocol"
             remote_major = frame.frame_protocol_version
             if remote_major != SUPPORTED_FRAME_PROTOCOL_MAJOR:
-                await ws.close(
-                    code=4002,
-                    reason=(
-                        f"frame_protocol_version mismatch: "
-                        f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
-                        f"host sent {remote_major}"
-                    ),
+                error = (
+                    f"frame_protocol_version mismatch: "
+                    f"server supports {SUPPORTED_FRAME_PROTOCOL_MAJOR}, "
+                    f"host sent {remote_major}"
                 )
+                await _send_connection_error(ws, stage="protocol", error=error)
+                await ws.close(code=4002, reason=error)
                 return
 
-            await asyncio.to_thread(
+            stage = "registration"
+            persisted_host = await asyncio.to_thread(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
+                managed_token=managed_token,
             )
+            host_persisted = True
+            if persisted_host.account_generation is not None:
+                from omnigent.db.account_authority import bind_account_authority
 
+                bind_account_authority(tunnel_owner, persisted_host.account_generation)
+
+            stage = "registry"
             conn = host_registry.register(
                 host_id,
                 ws,
                 frame,
                 owner=tunnel_owner,
+                # A resolved launch token is proof this is a server-provisioned
+                # sandbox, not a user machine reconnecting on a managed host id.
+                registered_with_managed_token=managed_token is not None,
             )
+            # Delivered on the handshake, never persisted: a replica that just
+            # started learns the host's gateway backing here, so a server
+            # restart converges as soon as each host reconnects.
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            stage = "connected"
+            conn.diagnostics.settings.update(
+                tunnel_side="server",
+                app_ping_interval_s=PING_INTERVAL_S,
+                app_silence_timeout_s=PING_INTERVAL_S * PING_MISS_THRESHOLD,
+                protocol_keepalive_source="unavailable_from_asgi",
+            )
+            conn.diagnostics.frame_received()
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
                 host_id,
                 frame.version,
                 frame.name,
                 frame.runners,
-            )
-
-            sender_task = asyncio.create_task(
-                _sender_loop(ws, conn),
-                name=f"host-sender:{host_id}",
-            )
-            ping_task = asyncio.create_task(
-                _ping_loop(ws, conn, host_id, host_store),
-                name=f"host-ping:{host_id}",
-            )
-            receive_task = asyncio.create_task(
-                _receive_loop(
-                    ws,
-                    conn,
-                    host_id,
-                    host_store,
-                    runner_exit_reports,
-                    on_runner_exited,
-                    on_host_update,
+                extra=debug_event(
+                    "host_tunnel",
+                    phase="connected",
+                    version=frame.version,
+                    **connection_attrs(),
                 ),
-                name=f"host-receive:{host_id}",
             )
 
-            if on_host_connect is not None:
+            async with contextlib.AsyncExitStack() as diagnostics_cleanup:
+                await diagnostics_cleanup.enter_async_context(
+                    conn.diagnostics.monitoring(
+                        report_diagnostics, connection_id=frame.connection_id
+                    )
+                )
+                sender_task = asyncio.create_task(
+                    _sender_loop(ws, conn),
+                    name=f"host-sender:{host_id}",
+                )
+                heartbeat_requested = asyncio.Event()
+                heartbeat_task = asyncio.create_task(
+                    _heartbeat_loop(
+                        heartbeat_requested,
+                        host_id=host_id,
+                        host_store=host_store,
+                        connection_id=frame.connection_id,
+                    ),
+                    name=f"host-heartbeat:{host_id}",
+                )
+                ping_task = asyncio.create_task(
+                    _ping_loop(ws, conn, host_id, heartbeat_requested),
+                    name=f"host-ping:{host_id}",
+                )
+                receive_task = asyncio.create_task(
+                    _receive_loop(
+                        ws,
+                        conn,
+                        host_id,
+                        host_store,
+                        host_registry,
+                        runner_exit_reports,
+                        on_runner_exited,
+                        on_host_update,
+                    ),
+                    name=f"host-receive:{host_id}",
+                )
+
                 try:
-                    await asyncio.wait_for(
-                        on_host_connect(host_id, tunnel_owner),
-                        timeout=30.0,
-                    )
-                except asyncio.TimeoutError:
-                    _logger.warning(
-                        "on_host_connect callback timed out for %s",
-                        host_id,
-                    )
-                except Exception:
-                    _logger.exception(
-                        "on_host_connect callback failed for %s",
-                        host_id,
-                    )
+                    if on_host_connect is not None:
+                        try:
+                            await asyncio.wait_for(
+                                on_host_connect(host_id, tunnel_owner),
+                                timeout=30.0,
+                            )
+                        except TimeoutError:
+                            _logger.warning(
+                                "on_host_connect callback timed out for %s",
+                                host_id,
+                            )
+                        except Exception:
+                            _logger.exception(
+                                "on_host_connect callback failed for %s",
+                                host_id,
+                            )
 
-            try:
-                done, _pending = await asyncio.wait(
-                    {sender_task, ping_task, receive_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    exc = task.exception() if not task.cancelled() else None
-                    if exc is not None:
-                        raise exc
-            finally:
-                for task in (sender_task, ping_task, receive_task):
-                    task.cancel()
-                await asyncio.gather(
-                    sender_task,
-                    ping_task,
-                    receive_task,
-                    return_exceptions=True,
-                )
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
-                if on_host_disconnect is not None:
+                    done, _pending = await asyncio.wait(
+                        {sender_task, ping_task, receive_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
+                    for task in done:
+                        exc = task.exception() if not task.cancelled() else None
+                        if exc is not None:
+                            raise exc
+                finally:
+                    conn.diagnostics.freeze()
+                    disconnect_attrs = connection_attrs()
+                    # Shield teardown from ASGI cancellation, but do not let a
+                    # stalled dependency hold shutdown indefinitely.
                     try:
-                        await on_host_disconnect(host_id, tunnel_owner)
-                    except Exception:
-                        _logger.exception(
-                            "on_host_disconnect callback failed for %s",
-                            host_id,
-                        )
+                        for task in (sender_task, ping_task, receive_task, heartbeat_task):
+                            task.cancel()
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as cleanup_scope:
+                            try:
+                                await asyncio.gather(
+                                    sender_task,
+                                    ping_task,
+                                    receive_task,
+                                    heartbeat_task,
+                                    return_exceptions=True,
+                                )
+                            finally:
+                                # A replaced connection must not mark its successor offline.
+                                if host_registry.deregister(host_id, conn=conn):
+                                    offline_cancelled = threading.Event()
+                                    try:
+                                        await asyncio.to_thread(
+                                            host_store.set_offline,
+                                            host_id,
+                                            cancelled=offline_cancelled.is_set,
+                                        )
+                                    except Exception:
+                                        _logger.exception(
+                                            "Failed to mark host %s offline after disconnect",
+                                            host_id,
+                                        )
+                                    finally:
+                                        offline_cancelled.set()
+                        if cleanup_scope.cancel_called:
+                            # The row ages out via its liveness TTL if persistence stalls.
+                            _logger.warning("Timed out cleaning up host %s", host_id)
+                    finally:
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as diagnostics_scope:
+                            try:
+                                await diagnostics_cleanup.aclose()
+                            except Exception:
+                                _logger.exception("Failed to close host %s diagnostics", host_id)
+                        if diagnostics_scope.cancel_called:
+                            _logger.warning("Timed out closing host %s diagnostics", host_id)
+                    if on_host_disconnect is not None:
+                        with anyio.move_on_after(
+                            _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
+                        ) as callback_scope:
+                            try:
+                                await on_host_disconnect(host_id, tunnel_owner)
+                            except Exception:
+                                _logger.exception(
+                                    "on_host_disconnect callback failed for %s",
+                                    host_id,
+                                )
+                        if callback_scope.cancel_called:
+                            _logger.warning(
+                                "on_host_disconnect callback timed out for %s", host_id
+                            )
 
-        except WebSocketDisconnect:
-            _logger.warning("Host %s disconnected", host_id)
+        except asyncio.CancelledError as exc:
+            disconnect_error = exc
+            ended_by = "handler_cancelled"
+            raise
+        except WebSocketDisconnect as exc:
+            disconnect_error = exc
             # Only run disconnect cleanup if we actually registered this
             # host on THIS connection. A connect that failed before
             # register — e.g. the upsert IntegrityError when a peer
             # connects with another owner's host_id — must not deregister
             # or flip that owner's host offline (cross-user DoS).
             if conn is not None:
-                host_registry.deregister(host_id)
-                await asyncio.to_thread(host_store.set_offline, host_id)
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
                 if on_host_disconnect is not None:
                     try:
                         await on_host_disconnect(host_id, tunnel_owner)
@@ -354,14 +575,90 @@ def create_host_tunnel_router(
                             "on_host_disconnect callback failed for %s",
                             host_id,
                         )
-        except Exception:
-            _logger.exception("Host tunnel error for %s", host_id)
-            # Same guard as above: don't touch a host we never registered.
+        except Exception as exc:
+            disconnect_error = exc
+            _logger.exception(
+                "Host tunnel error for %s",
+                host_id,
+                extra=debug_event("host_tunnel", phase="error", stage=stage, **connection_attrs()),
+            )
+            retryable = stage in {"registration", "registry", "connected"}
+            await _send_connection_error(
+                ws,
+                stage=stage,
+                error=str(exc),
+                retryable=retryable,
+            )
             if conn is not None:
-                host_registry.deregister(host_id)
+                conn.close_requested_code = 4005
+                conn.close_requested_reason = "host connection failed"
+            with contextlib.suppress(Exception):
+                await ws.close(code=4005, reason="host connection failed")
+            if conn is not None:
+                if host_registry.deregister(host_id, conn=conn):
+                    await asyncio.to_thread(host_store.set_offline, host_id)
+            elif host_persisted:
                 await asyncio.to_thread(host_store.set_offline, host_id)
+        finally:
+            if conn is not None or disconnect_error is not None:
+                log = _logger.info
+                # A normal or going-away close (host stop, restart) is expected.
+                clean_close = (
+                    isinstance(disconnect_error, WebSocketDisconnect)
+                    and disconnect_error.code in _CLEAN_CLOSE_CODES
+                )
+                if (
+                    disconnect_error is not None
+                    and not isinstance(disconnect_error, asyncio.CancelledError)
+                    and not clean_close
+                ):
+                    log = _logger.warning
+                log(
+                    "Host %s disconnected",
+                    host_id,
+                    extra=debug_event(
+                        "host_tunnel",
+                        phase="disconnected",
+                        stage=stage,
+                        **connection_attrs(),
+                        error_type=type(disconnect_error).__name__ if disconnect_error else None,
+                        close_code=(
+                            disconnect_error.code
+                            if isinstance(disconnect_error, WebSocketDisconnect)
+                            else None
+                        ),
+                        close_reason=(
+                            disconnect_error.reason
+                            if isinstance(disconnect_error, WebSocketDisconnect)
+                            else None
+                        ),
+                        close_requested_code=conn.close_requested_code if conn else None,
+                        close_requested_reason=conn.close_requested_reason if conn else None,
+                    ),
+                )
 
     return router
+
+
+async def _send_connection_error(
+    ws: WebSocket,
+    *,
+    stage: str,
+    error: str,
+    retryable: bool = False,
+) -> None:
+    """Best-effort error report while the accepted WebSocket is writable."""
+    message = error or "unknown server error"
+    with contextlib.suppress(Exception):
+        await ws.send_text(
+            encode_host_frame(
+                HostConnectionErrorFrame(
+                    stage=stage,
+                    error=message,
+                    retryable=retryable,
+                )
+            )
+        )
 
 
 async def _refuse_upgrade(ws: WebSocket, *, status: int, reason: str) -> None:
@@ -390,12 +687,38 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection whose outbound queue to drain.
+    :returns: None when the queue is retired, or when the socket was
+        closed by another task (ping timeout, retire) while a send
+        raced it.
     """
     while True:
-        data = await conn.outbound_queue.get()
-        if data is None:
+        frame = await conn.outbound_queue.get()
+        if frame is None:
+            conn.sender_end_reason = "queue_retired"
             return
-        await ws.send_text(data)
+        conn.diagnostics.dequeued(frame)
+        try:
+            await conn.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
+        except RuntimeError:
+            if WebSocketState.DISCONNECTED in (ws.application_state, ws.client_state):
+                # A local close (ping timeout, retire) or the peer's close won the
+                # race; the receive helper or closer reports the disconnect.
+                _logger.debug("Host %s send raced a concurrent close", conn.host_id)
+                conn.sender_end_reason = "send_after_close"
+                return
+            raise
+
+
+def _import_session_queue_payload(total: int, session: HostImportedLocalSession) -> dict[str, Any]:
+    """Build the pending-import queue payload for one streamed session."""
+    return {
+        "total": total,
+        "external_session_id": session.external_session_id,
+        "workspace": session.workspace,
+        "items": session.items,
+        "title": session.title,
+        "source": session.source,
+    }
 
 
 async def _receive_loop(
@@ -403,8 +726,9 @@ async def _receive_loop(
     conn: HostConnection,
     host_id: str,
     host_store: HostStore,
+    host_registry: HostRegistry,
     runner_exit_reports: RunnerExitReports | None,
-    on_runner_exited: Callable[[str, str], Awaitable[None]] | None,
+    on_runner_exited: RunnerExitedCallback | None,
     on_host_update: Callable[[str, str | None], Awaitable[None]] | None,
 ) -> None:
     """Receive host frames and route results to pending futures.
@@ -413,13 +737,21 @@ async def _receive_loop(
     :param conn: Host connection for resolving pending requests.
     :param host_id: Host id for logging.
     :param host_store: Persistent store receiving live readiness updates.
+    :param host_registry: Live host registry, so a frame only refreshes
+        liveness while ``conn`` is still the registered generation; it also
+        receives the reported gateway-inference map (held in memory, never
+        persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
-    :param on_runner_exited: Callback fired with ``(runner_id, error)``
-        when a ``host.runner_exited`` frame arrives; ``None`` skips it.
+    :param on_runner_exited: Callback fired with ``(host_id, runner_id,
+        error)`` when a ``host.runner_exited`` frame arrives; ``None``
+        logs the session-less ``runner_exited`` event here instead.
     :param on_host_update: Callback fired after readiness changes persist;
         ``None`` skips it.
     """
+    # Per-request reassembly of chunked import sessions; buffers die with the
+    # connection, so a tunnel drop can never leak a partial session.
+    import_chunk_assemblers: dict[str, ImportLocalSessionChunkAssembler] = {}
     while True:
         message = await ws.receive()
         if message["type"] == "websocket.disconnect":
@@ -427,11 +759,15 @@ async def _receive_loop(
                 code=message.get("code", 1000),
                 reason=message.get("reason"),
             )
+        conn.diagnostics.frame_received()
         raw = message.get("text")
         if not isinstance(raw, str):
             continue
 
-        conn.last_frame_at = time.time()
+        if not host_registry.mark_frame_seen(conn):
+            # This connection was replaced or removed, so stop reading: marking
+            # it alive would keep a host that nothing can reach looking healthy.
+            return
 
         try:
             frame = decode_host_frame(raw)
@@ -451,6 +787,7 @@ async def _receive_loop(
                 )
                 continue
             if isinstance(runner_frame, PongFrame):
+                conn.diagnostics.app_pong_received(runner_frame.ts)
                 # Host-tunnel keepalive round-trip. DEBUG because pings are
                 # frequent — opt in via log level. ``ts`` is epoch-ms stamped
                 # when the server pinged, so now - ts is the daemon round-trip.
@@ -474,6 +811,10 @@ async def _receive_loop(
                 frame.configured_harnesses,
             )
             conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)
@@ -501,24 +842,25 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerExitedFrame):
-            # One-way report: a runner this host spawned died
-            # unexpectedly. Stash the cause so the runner status
-            # endpoint can answer "offline, and here is why" to the
-            # client still waiting for the runner to connect.
-            _logger.warning(
-                "Host %s reported runner %s exited: %s",
-                host_id,
-                frame.runner_id,
-                frame.error,
-            )
+            # One-way report: a runner this host spawned died unexpectedly. Stash
+            # the cause so the runner status endpoint can answer "offline, and
+            # here is why" to the client still waiting for the runner to connect.
             if runner_exit_reports is not None:
-                runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
-            if on_runner_exited is not None:
-                # Mark the runner's session(s) failed and push the cause
-                # to the open view. A runner that crashed before
-                # connecting its tunnel has no runner-tunnel disconnect
-                # event, so this report is the only failure signal.
-                await on_runner_exited(frame.runner_id, frame.error)
+                runner_exit_reports.record(
+                    frame.runner_id, frame.error, conn.owner, had_connected=frame.had_connected
+                )
+            if on_runner_exited is None:
+                log_runner_exited(host_id, frame.runner_id, frame.error)
+            else:
+                # Only failure signal for a runner that crashed before connecting
+                # its tunnel; the callback resolves bound sessions and logs the event.
+                try:
+                    await on_runner_exited(host_id, frame.runner_id, frame.error)
+                except Exception:
+                    # One failed report must not tear down the tunnel for every runner.
+                    _logger.exception(
+                        "on_runner_exited callback failed for %s/%s", host_id, frame.runner_id
+                    )
             continue
 
         if isinstance(frame, HostRunnerStatusResultFrame):
@@ -570,6 +912,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "worktree_path": frame.worktree_path,
+                        "workspace": frame.workspace,
                         "branch": frame.branch,
                         "error": frame.error,
                     }
@@ -618,6 +961,21 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "version": frame.version,
+                        "gateway_inference": frame.gateway_inference,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostRefreshHarnessesResultFrame):
+            refresh_future = conn.pending_harness_refreshes.pop(frame.request_id, None)
+            if refresh_future is not None and not refresh_future.done():
+                refresh_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -630,6 +988,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }
                 )
@@ -662,8 +1021,115 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "models": frame.models,
+                        "routable_models": frame.routable_models,
                         "error": frame.error,
                     }
+                )
+            continue
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(frame)
+            continue
+        if isinstance(frame, HostHarnessStartupResultFrame):
+            startup_future = conn.pending_harness_startup.pop(frame.request_id, None)
+            if startup_future is not None and not startup_future.done():
+                startup_future.set_result(frame.startup)
+            continue
+        if isinstance(frame, HostMcpServersResultFrame):
+            mcp_future = conn.pending_mcp_servers.pop(frame.request_id, None)
+            if mcp_future is not None and not mcp_future.done():
+                mcp_future.set_result(frame)
+            continue
+        if isinstance(frame, HostPluginsResultFrame):
+            plugins_future = conn.pending_plugins.pop(frame.request_id, None)
+            if plugins_future is not None and not plugins_future.done():
+                plugins_future.set_result(frame)
+            continue
+        if isinstance(frame, HostSkillContentResultFrame):
+            content_future = conn.pending_skill_content.pop(frame.request_id, None)
+            if content_future is not None and not content_future.done():
+                content_future.set_result(frame)
+            continue
+        if isinstance(frame, HostMcpToolsResultFrame):
+            tools_future = conn.pending_mcp_tools.pop(frame.request_id, None)
+            if tools_future is not None and not tools_future.done():
+                tools_future.set_result(frame)
+            continue
+        if isinstance(frame, HostImportLocalSessionFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is not None:
+                queue.put_nowait(
+                    ("session", _import_session_queue_payload(frame.total, frame.session))
+                )
+            continue
+        if isinstance(frame, HostImportLocalSessionChunkFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            if queue is None:
+                # Never allocate memory for an unsolicited or expired request.
+                import_chunk_assemblers.pop(frame.request_id, None)
+                continue
+
+            # Every slice proves the host is making progress. Feed the request
+            # queue so a large session on a slow tunnel cannot hit the
+            # inter-session timeout while chunks are actively arriving.
+            queue.put_nowait(("progress", {}))
+
+            assembler = import_chunk_assemblers.setdefault(
+                frame.request_id, ImportLocalSessionChunkAssembler()
+            )
+            if assembler.opens_new_session(frame):
+                # The previous session never sent its final slice: count it as
+                # failed on its own so this one still assembles.
+                _logger.warning(
+                    "Host %s started a chunked import session before finishing the previous one",
+                    host_id,
+                )
+                queue.put_nowait(("session", {"total": frame.total}))
+            # Every in-flight request on this connection shares one buffer cap.
+            buffered_elsewhere = sum(
+                candidate.buffered_chars
+                for request_id, candidate in import_chunk_assemblers.items()
+                if request_id != frame.request_id
+            )
+            try:
+                session = assembler.add(
+                    frame,
+                    budget=IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS - buffered_elsewhere,
+                )
+            except ValueError as exc:
+                _logger.warning(
+                    "Host %s sent an unusable chunked import session: %s",
+                    host_id,
+                    exc,
+                )
+                # A payload with no external_session_id makes the import loop
+                # count one failed session and continue, keeping the stream
+                # (and the rest of the batch) alive.
+                queue.put_nowait(("session", {"total": frame.total}))
+                continue
+            if session is None:
+                continue
+            queue.put_nowait(("session", _import_session_queue_payload(frame.total, session)))
+            continue
+        if isinstance(frame, HostImportLocalDoneFrame):
+            queue = conn.pending_import_local.get(frame.request_id)
+            assembler = import_chunk_assemblers.pop(frame.request_id, None)
+            if queue is not None and assembler is not None and assembler.in_progress:
+                # A stream that ends before the final slice must count the
+                # partial session as failed instead of silently dropping it.
+                queue.put_nowait(("session", {"total": 0}))
+            if queue is not None:
+                queue.put_nowait(
+                    (
+                        "done",
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
+                    )
                 )
             continue
 
@@ -674,45 +1140,137 @@ async def _receive_loop(
         )
 
 
+async def _heartbeat_loop(
+    requested: asyncio.Event,
+    *,
+    host_id: str,
+    host_store: HostStore,
+    connection_id: str | None = None,
+) -> None:
+    """Serialize host-liveness writes independently of socket pings."""
+    failure_count = 0
+    last_failure_log_at = 0.0
+    while True:
+        await requested.wait()
+        requested.clear()
+        started_at = time.monotonic()
+        try:
+            # Cancellation cannot stop the thread, but heartbeat only updates
+            # last-seen; a late write cannot change an offline host's status.
+            await asyncio.to_thread(host_store.heartbeat, host_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
+            failure_count += 1
+            now = time.monotonic()
+            if (
+                failure_count == 1
+                or now - last_failure_log_at >= _HEARTBEAT_FAILURE_LOG_INTERVAL_S
+            ):
+                _logger.warning(
+                    "Host %s heartbeat persistence failed (%s; failure %d)",
+                    host_id,
+                    type(exc).__name__,
+                    failure_count,
+                    extra=debug_event(
+                        "host_heartbeat_failed",
+                        host_id=host_id,
+                        connection_id=connection_id,
+                        failure_count=failure_count,
+                        error_type=type(exc).__name__,
+                        duration_s=round(time.monotonic() - started_at, 3),
+                        error_category=ErrorCategory.SERVER.value,
+                        error_impact=ErrorImpact.TRANSIENT.value,
+                        error_phase=ErrorPhase.UNKNOWN.value,
+                    ),
+                )
+                last_failure_log_at = now
+            continue
+
+        if failure_count:
+            _logger.info(
+                "Host %s heartbeat persistence recovered after %d failure(s)",
+                host_id,
+                failure_count,
+                extra=debug_event(
+                    "host_heartbeat_recovered",
+                    host_id=host_id,
+                    connection_id=connection_id,
+                    failure_count=failure_count,
+                    duration_s=round(time.monotonic() - started_at, 3),
+                    error_category=ErrorCategory.SERVER.value,
+                    error_impact=ErrorImpact.TRANSIENT.value,
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
+            )
+            failure_count = 0
+            last_failure_log_at = 0.0
+
+
 async def _ping_loop(
     ws: WebSocket,
     conn: HostConnection,
     host_id: str,
-    host_store: HostStore,
+    heartbeat_requested: asyncio.Event,
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
-    Each tick that the host is still alive also persists a heartbeat
-    (``host_store.heartbeat``) so the host's last-seen timestamp stays
-    fresh in the DB. That timestamp is the liveness freshness gate
-    (:data:`omnigent.stores.host_store.HOST_LIVENESS_TTL_S`): when a
-    host dies without a graceful disconnect, the heartbeat stops, the
-    timestamp goes stale, and the host's sessions correctly drop out of
-    the connected set even though ``set_offline`` never ran.
+    Heartbeat persistence is signalled to a separate connection-owned worker,
+    so a slow or failing store cannot delay application pings or tear down the
+    socket route. The host's last-seen timestamp remains the liveness gate:
+    when a dead host stops responding, the ping timeout still closes it.
 
     :param ws: Accepted Starlette WebSocket.
     :param conn: Host connection for timing checks.
     :param host_id: Host id for logging.
-    :param host_store: Persistent host store the heartbeat is written to.
+    :param heartbeat_requested: Event consumed by the heartbeat writer.
     """
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
-        elapsed = time.time() - conn.last_frame_at
+        elapsed = time.monotonic() - conn.last_frame_monotonic
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
-            _logger.warning(
+            conn.close_requested_code = 4003
+            conn.close_requested_reason = "ping timeout"
+            # A sleeping or offline machine is expected; a stall of this
+            # server's own loop is not.
+            diagnostics = conn.diagnostics.snapshot()
+            source = silence_source(elapsed, diagnostics)
+            _logger.log(
+                logging.WARNING if source == "local_event_loop" else logging.INFO,
                 "Host %s missed %d ping intervals (%.0fs); declaring dead",
                 host_id,
                 PING_MISS_THRESHOLD,
                 elapsed,
+                extra=debug_event(
+                    "host_ping_timeout",
+                    host_id=host_id,
+                    connection_id=conn.hello.connection_id,
+                    silent_s=round(elapsed, 3),
+                    silence_source=source,
+                    close_requested_code=4003,
+                    close_requested_reason="ping timeout",
+                    **diagnostics,
+                ),
             )
             with contextlib.suppress(RuntimeError):
                 await ws.close(code=4003, reason="ping timeout")
             return
-        # The host is still within the liveness window — refresh its
-        # last-seen so the freshness gate keeps it in the online set.
-        await asyncio.to_thread(host_store.heartbeat, host_id)
+        # Keep persistence off this task: a slow/failing store must not delay
+        # the application ping or terminate the socket route.
+        heartbeat_requested.set()
         try:
-            ping_text = encode_frame(PingFrame(ts=int(time.time() * 1000)))
-            conn.outbound_queue.put_nowait(ping_text)
-        except Exception:  # noqa: BLE001
+            ping_ts = int(time.time() * 1000)
+            conn.enqueue(encode_frame(PingFrame(ts=ping_ts)), app_ping_ts=ping_ts)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "Host %s application ping enqueue failed",
+                host_id,
+                extra=debug_event(
+                    "host_ping_failed",
+                    host_id=host_id,
+                    connection_id=conn.hello.connection_id,
+                    error_type=type(exc).__name__,
+                    **conn.diagnostics.snapshot(),
+                ),
+            )
             return

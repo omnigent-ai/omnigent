@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
 // Hand-ported. When _blocks.py changes, update this file and the
@@ -8,7 +9,11 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
-import type { RememberScope, Response } from "./types";
+import { capitalizeAgentName } from "./agentLabels";
+import { agentRootName } from "./forkHarness";
+import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
+import type { RoutingDecisionExtras } from "./routingDecision";
+import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -40,14 +45,139 @@ export interface BlockContext {
   responseId: string;
   itemId: string | null;
   createdBy?: string;
+  /** Server-side creation time (unix epoch seconds), when the item came
+   *  from history hydration. A DIFFERENT clock from `timestamp` (page-
+   *  relative `performance.now()` seconds, live streaming only) — never
+   *  mix the two; each is only compared against itself. */
+  createdAtS?: number;
+  /** Client-side creation time (unix epoch seconds) for LIVE blocks, which
+   *  carry no server stamp yet. Display-only (bubble timestamps) — a THIRD
+   *  clock that must never feed `turnWorkedForS`/`turnLastActivityAtS`,
+   *  whose same-clock guards assume `createdAtS` is server-stamped. */
+  clientCreatedAtS?: number;
+}
+
+/**
+ * An image attached to a user message.
+ *
+ * Uploads carry a `file_id` addressing stored session bytes. A session
+ * imported from another harness carries the bytes inline as an `image_url`
+ * data URI instead and has no `file_id` at all, and a truncated transcript can
+ * carry neither — so both fields are optional and every reader narrows with
+ * {@link imagePreview}.
+ */
+export interface ImageContentBlock {
+  type: "input_image";
+  file_id?: string;
+  image_url?: string;
+  filename?: string;
 }
 
 /** Per-message-item content blocks. Both user input and assistant output. */
 export type MessageContentBlock =
   | { type: "input_text"; text: string }
-  | { type: "input_image"; file_id: string; filename?: string }
-  | { type: "input_file"; file_id: string; filename?: string }
+  | ImageContentBlock
+  | { type: "input_file"; file_id?: string; filename?: string }
   | { type: "output_text"; text: string };
+
+/** Marks an attachment whose upload has not returned a file id yet. Shared so
+ * the writer that mints the sentinel and the readers that strip it can't drift. */
+export const PENDING_FILE_PREFIX = "pending:";
+
+/**
+ * Only inline image bytes may become an `<img src>`. A remote URL from an
+ * imported transcript would make every viewer's browser fetch attacker-chosen
+ * content on load, so it renders as a placeholder instead.
+ */
+const RENDERABLE_IMAGE_URL = /^data:image\//i;
+
+/** How an {@link ImageContentBlock} should be rendered. */
+export type ImagePreview =
+  | { kind: "pending"; label: string }
+  | { kind: "uploaded"; fileId: string; alt: string }
+  | { kind: "inline"; src: string; alt: string }
+  | { kind: "unavailable"; label: string };
+
+/**
+ * A transcript field is only usable when it really holds a string. An imported
+ * or third-party-written rollout is copied verbatim, so any type can land here.
+ */
+function asText(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Resolve how one image block renders, tolerating every shape the transcript
+ * can hold.
+ *
+ * :param block: The `input_image` block to render.
+ * :returns: The preview variant for it, never throwing on a partial block.
+ */
+export function imagePreview(block: ImageContentBlock): ImagePreview {
+  const fileId = asText(block.file_id);
+  const imageUrl = asText(block.image_url);
+  const filename = asText(block.filename);
+  if (fileId?.startsWith(PENDING_FILE_PREFIX)) {
+    return { kind: "pending", label: filename ?? fileId.slice(PENDING_FILE_PREFIX.length) };
+  }
+  if (fileId) return { kind: "uploaded", fileId, alt: filename ?? fileId };
+  if (imageUrl && RENDERABLE_IMAGE_URL.test(imageUrl)) {
+    return { kind: "inline", src: imageUrl, alt: filename ?? "Attached image" };
+  }
+  return { kind: "unavailable", label: filename ?? "Unavailable image" };
+}
+
+/**
+ * True for a text block that really carries text. An imported transcript's
+ * `text` can hold any type; such a block contributes no text at all rather
+ * than "[object Object]".
+ */
+export function isTextBlock(
+  block: MessageContentBlock,
+): block is Extract<MessageContentBlock, { type: "input_text" }> {
+  return block.type === "input_text" && typeof block.text === "string";
+}
+
+/**
+ * Label for an attachment chip, tolerating every shape the transcript can
+ * hold — a field that isn't a string carries no label and falls through.
+ *
+ * :param block: The attachment block to label.
+ * :returns: A string safe to render, never a raw transcript value.
+ */
+export function attachmentLabel(block: { file_id?: string; filename?: string }): string {
+  return asText(block.filename) ?? asText(block.file_id) ?? "Attachment";
+}
+
+/**
+ * Pair each attachment with a stable render key.
+ *
+ * Every field on an attachment block is optional and the same file can be
+ * attached twice, so neither the block nor its identity alone is unique. The
+ * key is that identity — bounded, because an inline image's data URI runs to
+ * megabytes — plus an occurrence counter.
+ *
+ * :param items: Attachments in the order they render.
+ * :param identify: Identity of one attachment, if it carries any.
+ * :returns: The attachments, each paired with a key unique within the list.
+ */
+export function keyedAttachments<T>(
+  items: T[],
+  identify: (item: T) => string | undefined,
+): { key: string; item: T }[] {
+  const seen = new Map<string, number>();
+  return items.map((item) => {
+    // A block field that isn't a string carries no usable identity; the
+    // occurrence counter still keys such attachments apart.
+    const identity = (asText(identify(item)) ?? "attachment").slice(0, MAX_KEY_LENGTH);
+    const occurrence = seen.get(identity) ?? 0;
+    seen.set(identity, occurrence + 1);
+    return { key: occurrence === 0 ? identity : `${identity}#${occurrence}`, item };
+  });
+}
+
+/** Cap on the identity a render key is built from. */
+const MAX_KEY_LENGTH = 96;
 
 /** A single tool call paired with its result. Mirrors `ToolExecution`. */
 export interface ToolExecution {
@@ -204,6 +334,8 @@ export function slashCommandEchoItemId(slashItemId: string): string {
 export interface RoutingDecisionBlock {
   type: "routing_decision";
   ctx: BlockContext;
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
@@ -227,6 +359,17 @@ export interface TerminalCommandBlock {
   stderr: string | null;
 }
 
+export function isTerminalCommandInput(
+  block: AnyBlock,
+): block is TerminalCommandBlock & { kind: "input"; input: string } {
+  return (
+    block.type === "terminal_command" &&
+    block.kind === "input" &&
+    block.input !== null &&
+    block.input.trim().length > 0
+  );
+}
+
 // ── Text ─────────────────────────────────────────────────
 
 /** A flushed chunk of streamed text. */
@@ -244,6 +387,10 @@ export interface TextDone {
   hasCodeBlocks: boolean;
   /** True when this persisted assistant text came from an interrupted turn. */
   interrupted?: boolean;
+  /** UI-only marker for a provisional native preview with missing live output. */
+  previewInterrupted?: boolean;
+  /** Last native chunk index rendered in this provisional preview. */
+  streamIndex?: number;
 }
 
 // ── Reasoning ────────────────────────────────────────────
@@ -298,11 +445,88 @@ export interface ErrorBlock {
   type: "error";
   ctx: BlockContext;
   message: string;
+  /** `"info"` renders as a neutral notice pill instead of a destructive error. */
+  level?: "error" | "info";
   /** Where the error originated, e.g. "llm". */
   source: string;
   /** Machine-readable error code, e.g. "llm_auth_failed". Empty when omitted. */
   code: string;
+  /**
+   * Optional friendly headline naming what went wrong, e.g. "Claude Code
+   * can't run as root". Present when the runner classified the failure;
+   * lets the banner show a clear title instead of the raw `code`.
+   */
+  title?: string;
+  /** Optional one/two-sentence explanation of why it failed. Paired with `title`. */
+  cause?: string;
+  /** Optional concrete next step to fix it, e.g. a command to run. */
+  remediation?: string;
 }
+
+/**
+ * Extract the optional structured failure fields (`title` / `cause` /
+ * `remediation`), naming the agent for otherwise unclassified turn errors.
+ * Capture the name with the failure so later agent switches cannot relabel it.
+ */
+export function structuredErrorFields(
+  src: {
+    code?: string | null;
+    source?: string | null;
+    level?: "error" | "info";
+    title?: string | null;
+    cause?: string | null;
+    remediation?: string | null;
+  } | null,
+  agentName?: string | null,
+): Pick<ErrorBlock, "title" | "cause" | "remediation"> {
+  const out: Pick<ErrorBlock, "title" | "cause" | "remediation"> = {};
+  if (src?.title) out.title = src.title;
+  if (!out.title && src?.level !== "info" && isAgentTurnError(src) && agentName?.trim()) {
+    const rootName = agentRootName(agentName.trim());
+    const displayName =
+      nativeCodingAgentForAgentName(rootName)?.displayName ?? capitalizeAgentName(rootName);
+    out.title = `${displayName} ran into an error during this turn.`;
+  }
+  if (src?.cause) out.cause = src.cause;
+  if (src?.remediation) out.remediation = src.remediation;
+  return out;
+}
+
+function isAgentTurnError(src: { code?: string | null; source?: string | null } | null): boolean {
+  if (src?.source === "tool") return false;
+  const code = src?.code ?? "";
+  if (AGENT_TURN_ERROR_CODES.has(code)) return true;
+  // Keep specific diagnoses and infrastructure failures in their existing words.
+  if (
+    SPECIFIC_ERROR_CODES.has(code) ||
+    /^(?:runner_|host_|workspace_|terminal_|required_terminal_|native_terminal_)/.test(code)
+  ) {
+    return false;
+  }
+  return src?.source === "harness" || src?.source === "llm" || src?.source === "execution";
+}
+
+const AGENT_TURN_ERROR_CODES = new Set([
+  "native_turn_error",
+  "codex_turn_error",
+  "executor_error",
+  "unknown_error",
+  "response_failed",
+  "RuntimeError",
+]);
+
+const SPECIFIC_ERROR_CODES = new Set([
+  "connection_error",
+  "context_length_exceeded",
+  "rate_limit_exceeded",
+  "codex_thread_reset",
+  "session_agent_missing",
+  "harness_not_configured",
+  "internal_error",
+  "wrong_replica",
+  "native_policy_not_enforced",
+  "model_change_not_applied",
+]);
 
 /** The server is retrying. */
 export interface RetryBlock {
@@ -324,6 +548,12 @@ export interface RetryBlock {
 export interface CompactionInProgressBlock {
   type: "compaction_loading";
   ctx: BlockContext;
+  /**
+   * Unix epoch seconds when the server first saw this compaction in
+   * progress — the authoritative anchor for the elapsed counter. Absent
+   * when the emitter doesn't track it (fall back to client receive time).
+   */
+  startedAtS?: number;
 }
 
 /** Conversation compaction finished. Emitted from `response.compaction.completed`. */
@@ -374,6 +604,9 @@ export interface ResponseEndBlock {
  * dictates as the next stream events.
  */
 export interface ElicitationBlock {
+  nativeDelivery?: NativePermissionDelivery;
+  /** Positive native resolution evidence; snapshot absence alone is insufficient. */
+  nativeDeliveryResolved?: boolean;
   type: "elicitation";
   ctx: BlockContext;
   elicitationId: string;
@@ -417,7 +650,14 @@ export interface ElicitationBlock {
    */
   response: {
     action: "accept" | "decline" | "cancel" | "auto_resolved";
+    /**
+     * Refines `auto_resolved`: `"unanswered"` means the server cleared
+     * the prompt because the hook stopped waiting before anyone
+     * answered, so the card says the prompt expired and how to resume.
+     */
+    reason?: "unanswered";
     content?: Record<string, unknown>;
+    _meta?: Record<string, unknown>;
   } | null;
   /**
    * Structured AskUserQuestion payload — present when the gated
@@ -455,6 +695,12 @@ export interface ElicitationBlock {
    */
   allowAllEdits?: boolean;
   /**
+   * Eligible Claude-native tool prompts: when true, the card offers an
+   * "Approve & switch to auto mode" button (accept + session-scoped
+   * ``setMode(auto)``). Absent/false for all other elicitations.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button
    * that installs a session-scoped allow rule on accept (the web
@@ -463,6 +709,14 @@ export interface ElicitationBlock {
    * Absent/null for all other elicitations.
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP approval persistence modes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
+  /**
+   * Agy-native permission prompts only: the action description and
+   * advertised always-allow persist pattern agy's own prompt shows, so
+   * the card can render them. Null for every other elicitation.
+   */
+  agyPermission?: AgyPermission | null;
 }
 
 /** Union of all block types. */
@@ -488,3 +742,29 @@ export type AnyBlock =
   | ElicitationBlock
   | PolicyDeniedBlock
   | ResponseEndBlock;
+
+/**
+ * Item-id prefix marking a provisional, in-flight assistant-text block —
+ * a live-streaming preview that lives in `blocks` until its authoritative
+ * `text_done` replaces it. Never a real server item id.
+ */
+export const LIVE_ITEM_PREFIX = "live:";
+
+/**
+ * Response-id prefix the block stream stamps on an elicitation that has
+ * no turn to anchor to — a REQUEST-phase gate on the user's prompt, or a
+ * terminal-driven harness that never opened a response. Such a card is
+ * its own bubble and sits BELOW the message it gated; a card carrying a
+ * real turn id belongs to that turn instead.
+ */
+export const ELICITATION_RESPONSE_PREFIX = "elicit_";
+
+/**
+ * Item id for the answered question / plan card history rebuilds from a
+ * gated tool call. Derived from the call's own item id so the card keys
+ * stably across re-hydrations without colliding with the tool row for
+ * the same call.
+ */
+export function answeredElicitationItemId(callItemId: string): string {
+  return `${callItemId}:answer`;
+}

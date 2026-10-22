@@ -3,7 +3,7 @@
 The routing API ships a protobuf schema
 (``omnigent/api/routing/v1/routing.proto``); the runtime imports the generated
 ``omnigent.api.routing.v1.routing_pb2`` module. Generated
-code is checked in (so a plain ``pip install`` / editor / mypy sees it without a
+code is checked in (so a plain ``pip install`` / editor / type checker sees it without a
 build step), and this script is the one blessed way to regenerate it — run it
 whenever ``routing.proto`` changes and commit the result.
 
@@ -61,7 +61,7 @@ def _run_protoc(out_dir: Path) -> None:
     except FileNotFoundError:
         raise SystemExit(
             "grpc_tools.protoc not found. Install the dev dependencies first:\n"
-            "  uv sync --extra dev"
+            "  uv sync --group lint"
         ) from None
 
 

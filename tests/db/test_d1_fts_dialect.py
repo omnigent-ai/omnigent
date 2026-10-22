@@ -47,7 +47,7 @@ def d1_engine(monkeypatch):
     A real ``cloudflare_d1`` SQLAlchemy engine whose ``/raw`` HTTP endpoint is
     served from one in-memory SQLite connection (autocommit, like D1).
     """
-    # The cloudflare_d1 dialect is a deploy/test dependency (pyproject [dev]);
+    # The cloudflare_d1 dialect is in the repository's test dependency group;
     # skip gracefully if a minimal install lacks it.
     pytest.importorskip("sqlalchemy_cloudflare_d1")
     monkeypatch.setenv("CF_D1_BASE_URL", _D1_BASE)

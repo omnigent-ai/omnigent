@@ -678,6 +678,16 @@ def test_full_pipeline_walkthrough() -> None:
 # ── _snapshot_event ────────────────────────────────────────────────────
 
 
+def test_snapshot_event_model_dump() -> None:
+    """Model-backed events are captured through ``model_dump``."""
+
+    class _ModelEvent:
+        def model_dump(self) -> dict[str, object]:
+            return {"status": "complete", "sequence": 3}
+
+    assert _snapshot_event(_ModelEvent()) == {"status": "complete", "sequence": 3}
+
+
 def test_snapshot_event_dataclass() -> None:
     """Dataclass events are captured via ``dataclasses.asdict``."""
     event = _FakeTextDelta(delta="hello world")

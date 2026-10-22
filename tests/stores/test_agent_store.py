@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+from threading import Barrier
+
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import get_or_create_engine
-from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.entities import Agent, PagedList
+from omnigent.errors import StaleCursorError
+from omnigent.stores.agent_store import AgentStore
+from omnigent.stores.agent_store.sqlalchemy_store import (
+    _USER_AGENT_READ_CAP,
+    SqlAlchemyAgentStore,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 
 
 def test_create_and_get(agent_store: SqlAlchemyAgentStore) -> None:
@@ -218,6 +234,7 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
         agent_id="409a6849f6efefc6ba8da809a29b9b0b",
         name="updatable",
         bundle_location="ag_test_upd/hash1",
+        description="Original description",
     )
     # version=1 and updated_at=None on creation
     assert agent.version == 1
@@ -230,6 +247,12 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
     assert updated.updated_at is not None
     # Name stays the same
     assert updated.name == "updatable"
+    assert updated.description == "Original description"
+    replaced = agent_store.update(agent.id, "ag_test_upd/hash3", description="Replacement")
+    assert replaced is not None and replaced.description == "Replacement"
+    cleared = agent_store.update(agent.id, "ag_test_upd/hash4", description=None)
+    assert cleared is not None and cleared.description is None and cleared.version == 4
+    assert agent_store.get(agent.id) == cleared
 
 
 def test_update_nonexistent_agent(agent_store: SqlAlchemyAgentStore) -> None:
@@ -238,16 +261,111 @@ def test_update_nonexistent_agent(agent_store: SqlAlchemyAgentStore) -> None:
 
 
 def test_update_increments_version(agent_store: SqlAlchemyAgentStore) -> None:
-    """Multiple updates increment version monotonically."""
-    agent_store.create(
+    """Concurrent unconditional updates each increment the stored version."""
+    agent = agent_store.create(
         agent_id="9dafdd1d4311d9f16337323a6d653308",
         name="versioned",
         bundle_location="ag_test_ver/h1",
     )
-    v2 = agent_store.update("9dafdd1d4311d9f16337323a6d653308", "ag_test_ver/h2")
-    v3 = agent_store.update("9dafdd1d4311d9f16337323a6d653308", "ag_test_ver/h3")
-    assert v2 is not None and v2.version == 2
-    assert v3 is not None and v3.version == 3
+    ready = Barrier(2)
+
+    def write(location: str) -> Agent | None:
+        ready.wait(timeout=10)
+        return agent_store.update(agent.id, location)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["ag_test_ver/h2", "ag_test_ver/h3"]))
+    assert all(result is not None for result in results)
+    assert sorted(result.version for result in results if result is not None) == [2, 3]
+    assert agent_store.get(agent.id) == next(
+        result for result in results if result is not None and result.version == 3
+    )
+
+
+def test_update_stamps_created_by_when_null(agent_store: SqlAlchemyAgentStore) -> None:
+    """update() claims an unowned (legacy) user agent on first authorized write."""
+    agent = agent_store.create_user_agent(
+        "c0000000000000000000000000000001", "claimable", "ag_claim/h1", owner=None
+    )
+    assert agent.created_by is None
+
+    updated = agent_store.update(agent.id, "ag_claim/h2", "alice@example.com")
+    assert updated is not None
+    assert updated.created_by == "alice@example.com"
+
+
+def test_update_never_gives_a_server_agent_an_owner(agent_store: SqlAlchemyAgentStore) -> None:
+    """The server listing requires created_by IS NULL, so an owner would hide it."""
+    agent = agent_store.create(
+        agent_id="c0000000000000000000000000000003", name="shared", bundle_location="ag_s/h1"
+    )
+
+    updated = agent_store.update(agent.id, "ag_s/h2", "alice@example.com")
+
+    assert updated is not None and updated.created_by is None
+    assert [a.id for a in agent_store.list().data] == [agent.id]
+    assert (
+        agent_store.update_configuration(
+            updated, updated.bundle_location, description=None, created_by="alice@example.com"
+        )
+        == updated
+    )
+    edited = agent_store.update_configuration(
+        updated, "ag_s/h3", description=None, created_by="alice@example.com"
+    )
+    assert edited is not None and edited.created_by is None
+
+
+def test_update_does_not_overwrite_existing_created_by(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Claim-on-write only fills an empty owner; it never reassigns one."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="c0000000000000000000000000000002",
+        agent_name="owned",
+        agent_bundle_location="ag_owned/h1",
+        agent_description=None,
+        created_by="owner@example.com",
+    )
+    assert created.agent.created_by == "owner@example.com"
+
+    # A later write carrying a different identity must not steal ownership.
+    updated = agent_store.update(created.agent.id, "ag_owned/h2", "attacker@example.com")
+    assert updated is not None
+    assert updated.created_by == "owner@example.com"
+
+
+def test_update_created_by_none_leaves_owner_untouched(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A template-refresh style update (created_by=None) never stamps an owner."""
+    agent = agent_store.create(
+        agent_id="c0000000000000000000000000000003",
+        name="template-ish",
+        bundle_location="ag_tmpl/h1",
+    )
+    updated = agent_store.update(agent.id, "ag_tmpl/h2")
+    assert updated is not None
+    assert updated.created_by is None
+
+
+def test_create_session_with_agent_records_created_by(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A session-scoped agent persists the creating user for owner checks."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="c0000000000000000000000000000004",
+        agent_name="scoped",
+        agent_bundle_location="ag_scoped/h1",
+        agent_description=None,
+        created_by="alice@example.com",
+    )
+    assert created.agent.created_by == "alice@example.com"
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.created_by == "alice@example.com"
 
 
 def test_create_agent_has_version_1(agent_store: SqlAlchemyAgentStore) -> None:
@@ -317,3 +435,486 @@ def test_delete_nonexistent_returns_false(agent_store: SqlAlchemyAgentStore) -> 
     """delete returns False for an ID that was never created."""
     result = agent_store.delete("5996d55aa263c10a717e2ee631f46409")
     assert result is False
+
+
+# ── Session-scoped agent → spawn-tree root resolution ──────────────
+#
+# Regression for OMNI-1611. Named ``sys_session_send`` children are created
+# bound to the *same* agent_id as their mint, so several conversation rows share
+# it. ``get()`` resolves ``agent.session_id`` to the agent's spawn-tree ROOT,
+# which backs the owning-session auth check in ``validate_session_agent``
+# (``check_session_access`` grants on the root's ACL). Every row sharing the
+# agent_id carries the same ``root_conversation_id``, so the lookup is a single
+# bounded query and returns the same root regardless of which row it reads — no
+# "wrong row" to return, and never ``None`` for a session-scoped agent.
+
+
+def _add_named_child(
+    conversation_store: SqlAlchemyConversationStore,
+    *,
+    agent_id: str,
+    parent_conversation_id: str,
+    sub_agent_name: str,
+) -> str:
+    """Create a named sub-agent child bound to the parent's agent_id.
+
+    Mirrors the production named-``sys_session_send`` create, which passes
+    ``agent_id=<parent agent>`` and a non-null ``sub_agent_name``.
+
+    :returns: The new child conversation id.
+    """
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        title=f"{sub_agent_name}:child",
+        parent_conversation_id=parent_conversation_id,
+        agent_id=agent_id,
+        sub_agent_name=sub_agent_name,
+    )
+    return child.id
+
+
+def test_session_scoped_agent_resolves_to_root_top_level(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A top-level-minted agent resolves to its own conversation, not a child.
+
+    Guards the original unordered ``LIMIT 1`` bug: after named children share
+    the agent_id, the reverse lookup must still return the owning session. For a
+    top-level mint the spawn-tree root IS the mint conversation.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000001",
+        agent_name="orchestrator-top",
+        agent_bundle_location="ag_orchestrator_top/bundle",
+        agent_description=None,
+        title="orchestrator",
+    )
+    mint_id = created.conversation.id
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_a",
+    )
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_b",
+    )
+
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id == mint_id  # top-level mint == its own root
+    # update() shares the same reverse lookup; it must resolve identically.
+    updated = agent_store.update(created.agent.id, "ag_orchestrator_top/bundle2")
+    assert updated is not None
+    assert updated.session_id == mint_id
+
+
+def test_session_scoped_agent_resolves_to_root_child_minted(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A child-minted agent resolves to its spawn-tree root, never ``None``.
+
+    This is the case the reverted ``parent_conversation_id IS NULL`` filter got
+    wrong: a bundle uploaded as a child has a mint whose own
+    ``parent_conversation_id`` is non-null, so that filter matched nothing and
+    returned ``None`` — which would skip the owning-session auth check. Resolving
+    the shared spawn-tree root returns a real, always-visible ancestor instead.
+    """
+    parent = conversation_store.create_conversation(
+        kind="default",
+        title="uploader-parent",
+    )
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000002",
+        agent_name="orchestrator-child",
+        agent_bundle_location="ag_orchestrator_child/bundle",
+        agent_description=None,
+        title="child-minted orchestrator",
+        parent_conversation_id=parent.id,
+    )
+    mint_id = created.conversation.id
+    # The mint itself is a child (non-null parent), so parent-nullness could not
+    # find it; its spawn-tree root is the uploader parent (top-level == own root).
+    mint_conv = conversation_store.get_conversation(mint_id)
+    assert mint_conv is not None
+    assert mint_conv.parent_conversation_id == parent.id
+    assert mint_conv.root_conversation_id == parent.id
+
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_a",
+    )
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_b",
+    )
+
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id is not None  # the #4501 regression: must not be None
+    assert fetched.session_id == parent.id  # the shared spawn-tree root
+
+
+def test_session_scoped_agent_without_children_resolves_to_root(
+    agent_store: SqlAlchemyAgentStore,
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The common case — no named children — resolves to the mint (its own root)."""
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000003",
+        agent_name="solo-agent",
+        agent_bundle_location="ag_solo/bundle",
+        agent_description=None,
+        title="solo",
+    )
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id == created.conversation.id
+
+
+def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
+    """Split-DB: the lookup resolves the root when conversations live in the AP DB.
+
+    ``conversations`` (agent_id + root_conversation_id) is on the AP DB while the
+    agent row is on the Omnigent DB; the reverse lookup must target the AP engine.
+    """
+    omnigent_uri = f"sqlite:///{tmp_path}/omnigent.db"
+    conv_uri = f"sqlite:///{tmp_path}/conversations.db"
+    conversation_store = SqlAlchemyConversationStore(omnigent_uri, conv_uri)
+
+    created = conversation_store.create_session_with_agent(
+        agent_id="a0000000000000000000000000000004",
+        agent_name="orchestrator-split",
+        agent_bundle_location="ag_orchestrator_split/bundle",
+        agent_description=None,
+        title="split orchestrator",
+    )
+    mint_id = created.conversation.id
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_a",
+    )
+    _add_named_child(
+        conversation_store,
+        agent_id=created.agent.id,
+        parent_conversation_id=mint_id,
+        sub_agent_name="worker_b",
+    )
+
+    agent_store = SqlAlchemyAgentStore(omnigent_uri, conv_uri)
+    fetched = agent_store.get(created.agent.id)
+    assert fetched is not None
+    assert fetched.session_id == mint_id
+
+
+# ── User agents ─────────────────────────────────────────────────
+
+_OWNER = "alice@example.com"
+_SHA = "0" * 64
+
+
+@pytest.fixture()
+def clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each new row its own created_at so "newest first" is deterministic."""
+    ticks = iter(range(1_000, 100_000))
+    monkeypatch.setattr(
+        "omnigent.stores.agent_store.sqlalchemy_store.now_epoch", lambda: next(ticks)
+    )
+
+
+def _user_agent(
+    store: SqlAlchemyAgentStore,
+    name: str,
+    *,
+    owner: str | None = _OWNER,
+    copy_of: str | None = None,
+    location_prefix: str | None = None,
+) -> Agent:
+    """Insert a user agent; ``copy_of`` makes it a fork/switch copy sharing that blob."""
+    agent_id = uuid.uuid4().hex
+    prefix = copy_of or location_prefix or agent_id
+    return store.create_user_agent(agent_id, name, f"{prefix}/{_SHA}", owner=owner)
+
+
+def _names(page: PagedList[Agent]) -> list[str]:
+    return [agent.name for agent in page.data]
+
+
+def test_create_user_agent_is_owned_and_not_a_server_agent(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    agent = _user_agent(agent_store, "orion")
+
+    fetched = agent_store.get(agent.id)
+    assert fetched is not None
+    assert (fetched.created_by, fetched.session_id) == (_OWNER, None)
+    # Unused installs are tenant input: no ${VAR} expansion against the server env.
+    assert not fetched.operator_authored
+    # Server-agent reads never return user agents.
+    assert agent_store.get_by_name("orion") is None
+    assert agent_store.list().data == []
+    with pytest.raises(IntegrityError):
+        agent_store.create_user_agent(agent.id, "orion", agent.bundle_location, owner=_OWNER)
+
+
+def test_list_user_agents_is_newest_first_and_owner_only(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    first = _user_agent(agent_store, "first")
+    _user_agent(agent_store, "second")
+    _user_agent(agent_store, "bobs", owner="bob@example.com")
+    agent_store.create(uuid.uuid4().hex, "server-agent", "x/y")
+
+    page = agent_store.list_user_agents(_OWNER)
+
+    assert _names(page) == ["second", "first"]
+    assert (page.has_more, page.last_id) == (False, first.id)
+    assert _names(agent_store.list_user_agents("bob@example.com")) == ["bobs"]
+
+
+def test_list_user_agents_skips_copies_and_keeps_legacy_originals(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    orion = _user_agent(agent_store, "orion")
+    # A fork/switch copy stores the source's bundle_location verbatim.
+    _user_agent(agent_store, "orion (fork 1a2b)", copy_of=orion.id)
+    legacy = agent_store.create_user_agent(
+        "c4ac1f3bb01e4fd6a6e4b50b8b1f2f2a",
+        "atlas",
+        f"ag_c4ac1f3bb01e4fd6a6e4b50b8b1f2f2a/{_SHA}",
+        owner=_OWNER,
+    )
+
+    assert {a.id for a in agent_store.list_user_agents(_OWNER).data} == {orion.id, legacy.id}
+
+
+def test_list_user_agents_lists_every_original_by_id_even_when_names_repeat(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    """Nothing is hidden by name, so every agent stays manageable by its id."""
+    agent_store.create(uuid.uuid4().hex, "polly", "x/y")
+    uploaded = _user_agent(agent_store, "orion")
+    installed = _user_agent(agent_store, "orion")
+    edited_fork = _user_agent(agent_store, "orion (fork 1a2b)")
+    polly = _user_agent(agent_store, "polly")
+
+    assert [a.id for a in agent_store.list_user_agents(_OWNER).data] == [
+        polly.id,
+        edited_fork.id,
+        installed.id,
+        uploaded.id,
+    ]
+
+
+def test_list_user_agents_reads_a_bounded_window(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    orion = _user_agent(agent_store, "orion")
+    copies = [
+        _user_agent(agent_store, f"orion (fork {i})", copy_of=orion.id)
+        for i in range(_USER_AGENT_READ_CAP)
+    ]
+
+    # The 50 newest rows are all copies: nothing to show, but the cursor moves.
+    page = agent_store.list_user_agents(_OWNER)
+    assert (page.data, page.has_more, page.last_id) == ([], True, copies[0].id)
+
+    rest = agent_store.list_user_agents(_OWNER, after=page.last_id)
+    assert ([a.id for a in rest.data], rest.has_more) == ([orion.id], False)
+
+
+def test_list_user_agents_pages_by_limit(agent_store: SqlAlchemyAgentStore, clock: None) -> None:
+    for name in ("a", "b", "c"):
+        _user_agent(agent_store, name)
+
+    page = agent_store.list_user_agents(_OWNER, limit=2)
+    assert (_names(page), page.has_more) == (["c", "b"], True)
+    rest = agent_store.list_user_agents(_OWNER, limit=2, after=page.last_id)
+    assert (_names(rest), rest.has_more) == (["a"], False)
+
+
+def test_list_user_agents_rejects_a_vanished_or_foreign_cursor(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    bobs = _user_agent(agent_store, "bobs", owner="bob@example.com")
+    with pytest.raises(StaleCursorError):
+        agent_store.list_user_agents(_OWNER, after=uuid.uuid4().hex)
+    with pytest.raises(StaleCursorError):
+        agent_store.list_user_agents(_OWNER, after=bobs.id)
+
+
+def test_list_user_agents_without_auth_lists_unowned_rows(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    _user_agent(agent_store, "local-agent", owner=None)
+    assert _names(agent_store.list_user_agents(None)) == ["local-agent"]
+    assert agent_store.list_user_agents(_OWNER).data == []
+
+
+def test_agent_store_defaults_report_user_agents_unsupported(
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A store that doesn't override the user-agent methods keeps working."""
+    assert agent_store.supports_user_agents is True
+    assert AgentStore.supports_user_agents.fget(agent_store) is False  # type: ignore[attr-defined]
+    assert AgentStore.list_user_agents(agent_store, _OWNER).data == []
+    with pytest.raises(NotImplementedError):
+        AgentStore.create_user_agent(agent_store, "x", "n", "x/y", owner=_OWNER)
+    assert agent_store.supports_config_edit is True
+    assert AgentStore.supports_config_edit.fget(agent_store) is False  # type: ignore[attr-defined]
+    agent = _user_agent(agent_store, "editable")
+    with pytest.raises(NotImplementedError):
+        AgentStore.update_configuration(agent_store, agent, "x/y", description=None)
+
+
+@pytest.mark.parametrize("owner", [_OWNER, None])
+def test_update_configuration_description_and_noop(
+    agent_store: SqlAlchemyAgentStore, clock: None, owner: str | None
+) -> None:
+    agent = _user_agent(agent_store, "editable", owner=owner)
+    assert (
+        agent_store.update_configuration(agent, agent.bundle_location, description=None) == agent
+    )
+    updated = agent_store.update_configuration(agent, "new/bundle", description="New text")
+    assert updated is not None
+    assert updated == replace(
+        agent,
+        bundle_location="new/bundle",
+        description="New text",
+        version=2,
+        updated_at=updated.updated_at,
+    )
+    assert updated.updated_at is not None
+    assert agent_store.get(agent.id) == updated
+    assert (
+        agent_store.update_configuration(updated, "new/bundle", description="New text") == updated
+    )
+    cleared = agent_store.update_configuration(updated, "new/bundle", description=None)
+    assert cleared is not None
+    assert cleared.description is None and cleared.version == 3
+    assert cleared.updated_at is not None
+    assert cleared.updated_at > updated.updated_at
+    assert agent_store.get(agent.id) == cleared
+
+
+def test_update_configuration_concurrent_writers_and_deletion(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    agent = _user_agent(agent_store, "editable")
+    ready = Barrier(2)
+
+    def write(location: str) -> Agent | None:
+        ready.wait(timeout=10)
+        return agent_store.update_configuration(agent, location, description=location)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["first/bundle", "second/bundle"]))
+    assert results.count(None) == 1
+    winner = next(result for result in results if result is not None)
+    assert winner.version == 2 and winner.description == winner.bundle_location
+    assert agent_store.get(agent.id) == winner
+    # A stale no-op must fail too, including after an unconditional reinstall.
+    assert agent_store.update_configuration(agent, agent.bundle_location, description=None) is None
+    reinstalled = agent_store.update(agent.id, "reinstalled/bundle")
+    assert reinstalled is not None and reinstalled.version == 3
+    assert agent_store.update_configuration(winner, "stale/bundle", description="stale") is None
+    assert agent_store.get(agent.id) == reinstalled
+    assert agent_store.delete(agent.id)
+    for location in (reinstalled.bundle_location, "deleted/bundle"):
+        assert (
+            agent_store.update_configuration(
+                reinstalled, location, description=reinstalled.description
+            )
+            is None
+        )
+    assert agent_store.get(agent.id) is None
+
+    recreated = agent_store.create_user_agent(
+        agent.id, agent.name, agent.bundle_location, owner=agent.created_by
+    )
+    assert recreated.created_at > agent.created_at
+    assert recreated == replace(agent, created_at=recreated.created_at)
+    for location in (agent.bundle_location, "stale/bundle"):
+        assert agent_store.update_configuration(agent, location, description=None) is None
+    assert agent_store.get(agent.id) == recreated
+    assert (
+        agent_store.update_configuration(recreated, recreated.bundle_location, description=None)
+        == recreated
+    )
+
+
+@pytest.mark.parametrize("change_bundle", [False, True])
+def test_update_configuration_claims_only_the_observed_unowned_user_agent(
+    agent_store: SqlAlchemyAgentStore, change_bundle: bool
+) -> None:
+    agent = _user_agent(agent_store, "legacy", owner=None)
+    location = "new/bundle" if change_bundle else agent.bundle_location
+    claimed = agent_store.update_configuration(
+        agent, location, description=None, created_by=_OWNER
+    )
+    assert claimed is not None and claimed.created_by == _OWNER and claimed.version == 2
+    assert (
+        agent_store.update_configuration(
+            agent, location, description=None, created_by="bob@example.com"
+        )
+        is None
+    )
+    assert (
+        agent_store.update_configuration(
+            claimed, location, description=None, created_by="bob@example.com"
+        )
+        == claimed
+    )
+    edited = agent_store.update_configuration(
+        claimed, location, description="Edited", created_by="bob@example.com"
+    )
+    assert edited is not None and edited.created_by == _OWNER and edited.version == 3
+    assert agent_store.get(agent.id) == edited
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "f" * 32),
+        ("kind", "server"),
+        ("created_by", None),
+        ("version", 99),
+        ("bundle_location", "stale/bundle"),
+    ],
+)
+@pytest.mark.parametrize("noop", [False, True])
+def test_update_configuration_compares_observed_identity_and_revision(
+    agent_store: SqlAlchemyAgentStore, field: str, value: object, noop: bool
+) -> None:
+    agent = _user_agent(agent_store, "editable")
+    expected = replace(agent, **{field: value})
+    location = expected.bundle_location if noop else "new/bundle"
+    assert agent_store.update_configuration(expected, location, description=None) is None
+    assert agent_store.get(agent.id) == agent
+
+
+def test_agent_updates_are_workspace_scoped(agent_store: SqlAlchemyAgentStore) -> None:
+    agent = _user_agent(agent_store, "editable")
+    with workspace_scope(42):
+        assert agent_store.update_configuration(agent, "new/bundle", description=None) is None
+        assert agent_store.update(agent.id, "new/bundle") is None
+        other = agent_store.create_user_agent(
+            agent.id, agent.name, agent.bundle_location, owner=agent.created_by
+        )
+    updated = agent_store.update_configuration(agent, "new/bundle", description="New text")
+    assert updated is not None and updated.version == 2
+    updated = agent_store.update(agent.id, "reinstalled/bundle")
+    assert updated is not None and updated.version == 3
+    with workspace_scope(42):
+        assert agent_store.get(agent.id) == other

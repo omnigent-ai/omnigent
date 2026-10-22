@@ -18,7 +18,13 @@ from typing import Any
 
 import httpx
 
-from ._errors import ToolCallDenied, raise_for_status, require_json_object, response_body
+from ._errors import (
+    OmnigentError,
+    ToolCallDenied,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
 from ._events import (
     ClientTaskCancel,
     CompactionCompleted,
@@ -44,6 +50,7 @@ from ._events import (
     ToolResult,
 )
 from ._sse import parse_sse_stream
+from ._timeouts import _SSE_TIMEOUT
 from ._tool_handler import (
     CompactionEndCtx,
     CompactionStartCtx,
@@ -232,10 +239,26 @@ class ResponsesNamespace:
                 model_override=model_override,
             )
 
-            async with self._http.stream("POST", f"{self._base}/v1/responses", json=body) as resp:
+            async with self._http.stream(
+                "POST",
+                f"{self._base}/v1/responses",
+                json=body,
+                timeout=_SSE_TIMEOUT,
+            ) as resp:
                 if resp.status_code >= 400:
                     await resp.aread()
                     raise_for_status(resp.status_code, response_body(resp))
+                elif 300 <= resp.status_code < 400:
+                    # OmnigentClient follows redirects, so a 3xx here was not
+                    # followable (no Location header, a 304, or a
+                    # caller-supplied client with redirects disabled).
+                    # Parsing its non-SSE body would yield a silent,
+                    # error-free, empty stream — fail loud instead.
+                    raise OmnigentError(
+                        f"stream open returned a 3xx response (status {resp.status_code}) "
+                        "instead of an event stream",
+                        resp.status_code,
+                    )
 
                 async for event in parse_sse_stream(resp.aiter_bytes()):
                     # ── Fire hooks and collect state ──────────

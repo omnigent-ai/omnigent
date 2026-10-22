@@ -209,11 +209,14 @@ async function gzip(data: Uint8Array): Promise<Uint8Array> {
 
   const reader = cs.readable.getReader();
   const chunks: Uint8Array[] = [];
+  // Each read advances the same stream reader.
+  /* oxlint-disable no-await-in-loop */
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
   }
+  /* oxlint-enable no-await-in-loop */
 
   const totalSize = chunks.reduce((sum, c) => sum + c.length, 0);
   const result = new Uint8Array(totalSize);

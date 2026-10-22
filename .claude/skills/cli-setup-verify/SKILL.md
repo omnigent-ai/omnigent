@@ -157,7 +157,7 @@ already has complementary CUJ coverage — use both:
 - **Deeper end-to-end journeys → `tests/e2e/test_journey_*.py`** (first session
   to code, resume/disconnect, fork/explore, file upload, collaboration, …).
   Run a slice with the project's gated runner, e.g.
-  `uv run --frozen --extra dev python -m pytest tests/e2e/test_journey_first_session_to_code.py -q`.
+  `uv run --frozen --group test python -m pytest tests/e2e/test_journey_first_session_to_code.py -q`.
 - **Reusable PTY helpers** live in `tests/e2e/omnigent/_pexpect_harness.py`
   (`spawn_omnigent_run`, `wait_for_ready`, `submit_prompt`, `await_turn_complete`,
   `clean_exit`) and the snapshot comparator in `tests/e2e/omnigent/_snapshot.py`

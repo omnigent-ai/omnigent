@@ -5,6 +5,8 @@
 // items-list states (loading / error / empty / populated), and per-item
 // expand/collapse.
 
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
@@ -28,7 +30,7 @@ const h = vi.hoisted(() => ({
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => {
   // Keep the real key helpers (executionLogTabKey / MAIN_EXECUTION_LOG_KEY) so
   // the panel's entry keys match what initialKey passes in.
-  const actual = await importOriginal<typeof import("@/hooks/useChildSessions")>();
+  const actual = await importOriginal<typeof UseChildSessionsModule>();
   return { ...actual, useChildSessions: () => ({ children: h.children }) };
 });
 
@@ -54,6 +56,7 @@ function mkChild(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
   return {
     id: "conv_child1",
     title: "researcher:auth",
+    task_summary: null,
     tool: "researcher",
     session_name: "auth",
     current_task_status: "completed",
@@ -103,6 +106,8 @@ describe("ExecutionLogsPanel open/close gating", () => {
     renderPanel({ open: true });
     const panel = screen.getByTestId("execution-logs-panel");
     expect(panel).toHaveAttribute("data-state", "open");
+    expect(panel).toHaveClass("shadow-lg");
+    expect(panel).not.toHaveClass("shadow-none");
     expect(screen.getByText("main")).toBeInTheDocument();
   });
 
@@ -110,7 +115,10 @@ describe("ExecutionLogsPanel open/close gating", () => {
     // WHY: when closed the panel collapses (data-state=closed) and skips the
     // dropdown/items entirely — the `!open || !activeEntry` branch.
     renderPanel({ open: false, initialKey: null });
-    expect(screen.getByTestId("execution-logs-panel")).toHaveAttribute("data-state", "closed");
+    const panel = screen.getByTestId("execution-logs-panel");
+    expect(panel).toHaveAttribute("data-state", "closed");
+    expect(panel).toHaveClass("shadow-none");
+    expect(panel).not.toHaveClass("shadow-lg");
     expect(screen.queryByText("No items")).toBeNull();
   });
 

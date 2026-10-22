@@ -1,0 +1,27 @@
+name: Demo Check Policy Test
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/demo-check.js
+      - .github/workflows/demo-check.test.js
+      - .github/workflows/demo-check-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-check-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run demo policy unit test
+        run: node .github/workflows/demo-check.test.js

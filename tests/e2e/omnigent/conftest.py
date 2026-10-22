@@ -18,6 +18,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
+
 # Root of the Omnigent checkout that ships the ``omnigent``
 # package, the example YAMLs, and (in the main checkout) the
 # ``.venv`` with omnigent + pexpect + openai-agents installed.
@@ -135,6 +137,7 @@ def mock_credentials_env(
     # Strip vars that could interfere with the mock path.
     for stale in (
         "ANTHROPIC_API_KEY",
+        "DATABRICKS_HOST",
         "DATABRICKS_TOKEN",
         "CLAUDE_CODE",
         "CLAUDECODE",
@@ -162,15 +165,6 @@ def mock_credentials_env(
 # ── Mock LLM server fixtures ────────────────────────────────
 
 
-def _find_free_port() -> int:
-    """Find a free TCP port by binding to port 0."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 @pytest.fixture(scope="session")
 def mock_llm_server_url(
     tmp_path_factory: pytest.TempPathFactory,
@@ -186,7 +180,7 @@ def mock_llm_server_url(
     :param tmp_path_factory: Pytest temp path factory for logs.
     :yields: The mock server base URL.
     """
-    mock_port = _find_free_port()
+    mock_port = find_free_port()
     mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115
 
@@ -247,6 +241,30 @@ def configure_mock_llm(
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
         json={"key": key, "responses": responses},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def set_fallback_mock_llm(
+    mock_llm_server_url: str,
+    key: str,
+    text: str,
+) -> None:
+    """Set a non-resettable fallback response for a queue key.
+
+    Returned once the regular queue for *key* is exhausted, so a test
+    stays deterministic when the harness makes more model calls than it
+    queued responses for — e.g. a background session-title call racing
+    the user turn for the same keyed queue.
+
+    :param mock_llm_server_url: Mock server base URL.
+    :param key: Queue key (typically the model name).
+    :param text: Fallback response text.
+    """
+    resp = httpx.post(
+        f"{mock_llm_server_url}/mock/set_fallback",
+        json={"key": key, "text": text},
         timeout=5.0,
     )
     resp.raise_for_status()

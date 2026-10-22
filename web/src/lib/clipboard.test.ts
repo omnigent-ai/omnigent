@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { copyText } from "./clipboard";
+import { copyRichText, copyText } from "./clipboard";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -32,7 +32,11 @@ describe("copyText", () => {
     const selectedRange = document.createRange();
     const existingText = document.createTextNode("existing selection");
     const selectionContainer = document.createElement("p");
+    const focusTarget = document.createElement("button");
 
+    focusTarget.textContent = "keep focus";
+    document.body.appendChild(focusTarget);
+    focusTarget.focus();
     selectionContainer.appendChild(existingText);
     document.body.appendChild(selectionContainer);
     selectedRange.selectNodeContents(existingText);
@@ -63,9 +67,6 @@ describe("copyText", () => {
         expect(selectedTextAreas[0]?.selectionStart).toBe(0);
         expect(selectedTextAreas[0]?.selectionEnd).toBe("first line\nsecond line".length);
         expect(document.body.contains(selectedTextAreas[0] ?? null)).toBe(true);
-        // Marked so editable-focus detection ignores it: focusing this helper
-        // must not read as the keyboard opening and hide the iOS native bar.
-        expect(selectedTextAreas[0]?.hasAttribute("data-clipboard-helper")).toBe(true);
 
         const event = new Event("copy", {
           bubbles: true,
@@ -86,7 +87,8 @@ describe("copyText", () => {
     expect(setData).toHaveBeenCalledWith("text/plain", "first line\nsecond line");
     expect(document.querySelector("textarea")).toBeNull();
     expect(document.getSelection()?.rangeCount).toBe(1);
-    expect(document.getSelection()?.getRangeAt(0)).toBe(selectedRange);
+    expect(document.getSelection()?.toString()).toBe("existing selection");
+    expect(document.activeElement).toBe(focusTarget);
   });
 
   it("falls back to selected-textarea copy when async clipboard rejects", async () => {
@@ -115,5 +117,53 @@ describe("copyText", () => {
 
     expect(writeText).toHaveBeenCalledWith("fallback text");
     expect(document.execCommand).toHaveBeenCalledWith("copy");
+  });
+});
+
+describe("copyRichText", () => {
+  it("carries both flavors through the fallback copy event", async () => {
+    const setData = vi.fn();
+
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    vi.spyOn(HTMLTextAreaElement.prototype, "select").mockImplementation(() => {});
+    Object.defineProperty(Document.prototype, "execCommand", {
+      configurable: true,
+      value: vi.fn(() => {
+        const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+        Object.defineProperty(event, "clipboardData", {
+          configurable: true,
+          value: { setData },
+        });
+        document.dispatchEvent(event);
+        return true;
+      }),
+    });
+
+    await expect(
+      copyRichText({ html: "<p><strong>hi</strong></p>", text: "**hi**" }),
+    ).resolves.toBeUndefined();
+
+    expect(setData).toHaveBeenCalledWith("text/plain", "**hi**");
+    expect(setData).toHaveBeenCalledWith("text/html", "<p><strong>hi</strong></p>");
+  });
+
+  it("degrades to a plain-text write when no path can carry the HTML", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    Object.defineProperty(Document.prototype, "execCommand", {
+      configurable: true,
+      value: vi.fn(() => false),
+    });
+
+    await expect(copyRichText({ html: "<p>hi</p>", text: "hi" })).resolves.toBeUndefined();
+
+    expect(writeText).toHaveBeenCalledWith("hi");
   });
 });

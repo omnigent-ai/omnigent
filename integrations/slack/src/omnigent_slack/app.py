@@ -131,6 +131,8 @@ async def run() -> None:
         server_url=settings.server_url,
         auth_manager=auth_manager,
         enrollment_url=enrollment_url,
+        default_agent_id=settings.default_agent_id,
+        default_host_type=settings.default_host_type,
     )
     service = SlackOmnigentService(
         store=store,
@@ -180,7 +182,12 @@ def _register_error_handler(app: AsyncApp, logger: logging.Logger) -> None:
 
     @app.error
     async def _on_error(error: Exception, body: dict[str, Any]) -> None:
-        logger.exception("Unhandled Slack listener error; body_type=%s", body.get("type"))
+        logger.error(
+            "Unhandled Slack listener error: %s; body_type=%s",
+            error,
+            body.get("type"),
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
 
 def register_handlers(app: AsyncApp, service: SlackOmnigentService) -> None:

@@ -3,7 +3,7 @@
 Focused on :func:`require_access_and_level`, which folds ``require_access``
 and ``get_permission_level`` into a single resolution. The behaviour it must
 preserve is the 403-vs-404 distinction, the admin bypass, sub-agent parent
-delegation, and the user-vs-public displayed-level asymmetry — all exercised
+delegation, and the effective direct/public permission level — all exercised
 here against real SQLite-backed stores (no mocks) so the resolution matches
 production exactly.
 """
@@ -12,14 +12,22 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_EDIT,
+    LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
+    delegated_path_allowed,
 )
-from omnigent.server.routes._auth_helpers import require_access_and_level
+from omnigent.server.routes import _auth_helpers
+from omnigent.server.routes._auth_helpers import (
+    can_mutate_session_agent,
+    require_access_and_level,
+    require_agent_owner,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -29,6 +37,20 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 
 ALICE = "alice@test.com"
 BOB = "bob@test.com"
+
+
+def _session_agent(
+    created_by: str | None, session_id: str = "s0000000000000000000000000000001"
+) -> Agent:
+    """Build a session-scoped :class:`Agent` for owner-check tests."""
+    return Agent(
+        id="a0000000000000000000000000000009",
+        created_at=1,
+        name="scoped",
+        bundle_location="ag/loc",
+        session_id=session_id,
+        created_by=created_by,
+    )
 
 
 @pytest.fixture()
@@ -73,7 +95,6 @@ async def test_owner_gets_level_and_conversation(
         "the conversation must be returned so the snapshot can reuse it"
     )
     assert access.conversation.id == conv.id
-    assert access.can_approve is True
 
 
 @pytest.mark.asyncio
@@ -130,54 +151,33 @@ async def test_admin_allowed_and_bypasses_conversation_fetch(
     )
 
     assert access.level == LEVEL_OWNER
-    assert access.can_approve is True
     assert access.conversation is None, (
         "admin path must not fetch the conversation (it bypasses the lookup)"
     )
 
 
 @pytest.mark.asyncio
-async def test_public_grant_allows_but_level_reports_user_grant(
+async def test_public_edit_elevates_displayed_level_without_granting_owner(
     perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
 ) -> None:
-    """Access via a higher public grant; displayed level is the user's own.
+    """The displayed level agrees with authorization after capping a public grant."""
+    from omnigent.server.sharing_settings import PublicSharingMaxLevel, public_sharing_policy_scope
 
-    The regression guard for the combined helper: a low user grant plus a
-    higher ``__public__`` grant must still report the user's own level
-    (matching ``get_permission_level``) while granting access via the
-    public grant (matching ``check_access``).
-    """
     conv = conv_store.create_conversation()
     perm_store.ensure_user(ALICE)
     perm_store.ensure_user(RESERVED_USER_PUBLIC)
     perm_store.grant(ALICE, conv.id, LEVEL_READ)  # user: read
     perm_store.grant(RESERVED_USER_PUBLIC, conv.id, LEVEL_OWNER)  # public: owner
 
-    access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
+    with public_sharing_policy_scope(lambda: PublicSharingMaxLevel.EDIT):
+        access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
+        assert perm_store.get_permission_level(ALICE, conv.id) == LEVEL_EDIT
+        assert not perm_store.check_access(ALICE, conv.id, LEVEL_OWNER)
 
     # Allowed (no raise) because the public grant satisfies EDIT ...
     assert access.conversation is not None
     assert access.conversation.id == conv.id, "must reuse the asked-for session"
-    # ... but the displayed level is Alice's own read grant, unchanged.
-    assert access.level == LEVEL_READ, (
-        f"displayed level must be the user's own read grant, got {access.level}"
-    )
-    assert access.can_approve is False, "public OWNER access must not confer approval authority"
-
-
-@pytest.mark.asyncio
-async def test_delegated_editor_gets_approval_authority(
-    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
-) -> None:
-    """An editor's direct approval capability is returned to snapshot callers."""
-    conv = conv_store.create_conversation()
-    perm_store.ensure_user(ALICE)
-    perm_store.grant(ALICE, conv.id, LEVEL_EDIT, can_approve=True)
-
-    access = await require_access_and_level(ALICE, conv.id, LEVEL_EDIT, perm_store, conv_store)
-
     assert access.level == LEVEL_EDIT
-    assert access.can_approve is True
 
 
 @pytest.mark.asyncio
@@ -205,7 +205,77 @@ async def test_sub_agent_delegates_access_to_parent(
     assert access.conversation.id == child.id, "snapshot reuses the sub-agent row"
     # Displayed level is the direct grant on the sub-agent (none granted).
     assert access.level is None, "displayed level is the sub-agent's own grant, which is None here"
-    assert access.can_approve is True, "sub-agents inherit approval authority from their parent"
+
+
+@pytest.mark.parametrize(
+    "level",
+    [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE],
+    ids=["reader", "editor", "manager"],
+)
+def test_child_agent_mutation_capability_requires_effective_owner(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+) -> None:
+    """An agent creator with inherited non-owner access cannot edit a child."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    parent = conv_store.create_conversation()
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        sub_agent_name="summarizer",
+    )
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, parent.id, level)
+
+    assert not can_mutate_session_agent(
+        ALICE,
+        child.id,
+        _session_agent(created_by=ALICE, session_id=parent.id),
+        perm_store,
+        conv_store,
+        conversation=child,
+    )
+
+
+def test_child_agent_mutation_capability_inherits_owner(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent owner and agent creator may edit the child agent."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    parent = conv_store.create_conversation()
+    child = conv_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        sub_agent_name="summarizer",
+    )
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, parent.id, LEVEL_OWNER)
+
+    assert can_mutate_session_agent(
+        ALICE,
+        child.id,
+        _session_agent(created_by=ALICE, session_id=parent.id),
+        perm_store,
+        conv_store,
+        conversation=child,
+    )
+
+
+def test_agent_mutation_capability_preserves_auth_disabled_mode(
+    conv_store: SqlAlchemyConversationStore,
+) -> None:
+    """The capability stays permissive when no ownership model is configured."""
+    assert can_mutate_session_agent(
+        None,
+        "unresolved-session",
+        _session_agent(created_by=None),
+        None,
+        conv_store,
+    )
 
 
 @pytest.mark.asyncio
@@ -219,7 +289,6 @@ async def test_permissions_disabled_returns_empty_access(
 
     assert access.level is None
     assert access.conversation is None
-    assert access.can_approve is None
 
 
 @pytest.mark.asyncio
@@ -248,3 +317,123 @@ async def test_missing_conversation_raises_404(
         )
 
     assert exc.value.code == ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_access_check_shares_a_single_pool_checkout(
+    perm_store: SqlAlchemyPermissionStore, conv_store: SqlAlchemyConversationStore
+) -> None:
+    """The permission resolve + conversation + metadata reads share one checkout.
+
+    On the per-streamed-event path this check re-runs for a session whose data
+    is stable for the turn, so the pool checkout (plus ``pool_pre_ping``) is the
+    cost that matters. The stores share one engine here, so the read burst must
+    collapse to a single checkout rather than one per store call.
+    """
+    from sqlalchemy import event
+
+    conv = conv_store.create_conversation()
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
+
+    engine = conv_store._engine
+    checkouts: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        checkouts.append(1)
+
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        access = await require_access_and_level(ALICE, conv.id, LEVEL_READ, perm_store, conv_store)
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert access.conversation is not None and access.conversation.id == conv.id
+    assert len(checkouts) == 1, (
+        f"the access-control read burst must share one checkout, got {len(checkouts)}"
+    )
+
+
+# ── require_agent_owner ────────────────────────────────────────────────────────
+
+
+def test_agent_owner_allows_creator(
+    perm_store: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded creator may mutate their session-scoped agent."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    perm_store.ensure_user(ALICE)
+    # No raise == allowed.
+    require_agent_owner(ALICE, _session_agent(created_by=ALICE), perm_store)
+
+
+def test_agent_owner_rejects_non_creator(
+    perm_store: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different user (e.g. a shared editor) is refused with 403."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    perm_store.ensure_user(BOB)
+    with pytest.raises(OmnigentError) as exc:
+        require_agent_owner(BOB, _session_agent(created_by=ALICE), perm_store)
+    assert exc.value.code == ErrorCode.FORBIDDEN
+
+
+def test_agent_owner_admin_bypass(
+    perm_store: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A workspace admin may mutate an agent they do not own."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    perm_store.ensure_user(BOB)
+    perm_store.set_admin(BOB, True)
+    require_agent_owner(BOB, _session_agent(created_by=ALICE), perm_store)
+
+
+def test_agent_owner_disabled_auth_allows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no permission store (auth off), the check is a no-op."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    require_agent_owner(None, _session_agent(created_by=ALICE), None)
+
+
+def test_agent_owner_single_user_allows(
+    perm_store: SqlAlchemyPermissionStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local single-user mode short-circuits to allow (no second identity)."""
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: True)
+    require_agent_owner(None, _session_agent(created_by=None), perm_store)
+
+
+def test_agent_owner_legacy_null_is_admin_only(
+    perm_store: SqlAlchemyPermissionStore,
+    conv_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy row (created_by=None) is admin-only — no session-owner fallback.
+
+    The reverse lookup to an owning session is not dependable (reuse and session
+    deletion), so an unowned agent can only be mutated by an admin; the original
+    owner must re-upload to get a properly owned agent.
+    """
+    monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
+    conv = conv_store.create_conversation()
+    perm_store.ensure_user(ALICE)
+    perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
+
+    agent = _session_agent(created_by=None, session_id=conv.id)
+    # Even the owning session's owner is refused for a NULL row.
+    with pytest.raises(OmnigentError) as exc:
+        require_agent_owner(ALICE, agent, perm_store)
+    assert exc.value.code == ErrorCode.FORBIDDEN
+
+    # An admin may mutate it.
+    perm_store.ensure_user(BOB)
+    perm_store.set_admin(BOB, True)
+    require_agent_owner(BOB, agent, perm_store)
+
+
+def test_delegated_runner_credentials_allow_gateway_only():
+    assert delegated_path_allowed("/v1/mcp/tracker")
+    assert not delegated_path_allowed("/v1/mcp-registry/services/tracker/connection")

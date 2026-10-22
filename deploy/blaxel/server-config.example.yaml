@@ -1,0 +1,15 @@
+sandbox:
+  provider: blaxel
+  server_url: https://omnigent.example.com
+  blaxel:
+    # Optional override for a fixed published tag.
+    # Defaults to the public blaxel/omnigent-host:latest image.
+    # image: blaxel/omnigent-host:TAG
+    env:
+      - OPENAI_API_KEY
+    # region: us-was-1
+    # memory_mb: 4096
+    # Maximum sandbox age, and the bound the launch-token lifetime is
+    # derived from (ttl + 1h). Raise it for managed sessions that must
+    # outlive the 24h default, e.g. 7d.
+    # ttl: 24h

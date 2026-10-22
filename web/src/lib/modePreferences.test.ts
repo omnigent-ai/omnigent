@@ -59,6 +59,11 @@ describe("modePreferences (per-harness options)", () => {
     expect(readHarnessOptions("claude-native")).toEqual({ mode: "plan" });
   });
 
+  it("persists explicit Default selections as empty strings", () => {
+    writeHarnessOption("claude-native", { model: "", effort: "" });
+    expect(readHarnessOptions("claude-native")).toEqual({ model: "", effort: "" });
+  });
+
   it("ignores a null/empty harness on write", () => {
     writeHarnessOption(null, { mode: "auto" });
     writeHarnessOption("", { mode: "auto" });

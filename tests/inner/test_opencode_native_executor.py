@@ -9,15 +9,15 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import opencode_http_transport as transport_mod
-from omnigent.inner.executor import ExecutorError, TurnComplete
-from omnigent.inner.opencode_native_executor import OpenCodeNativeExecutor
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native import http_transport as transport_mod
+from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     OpenCodeNativeBridgeState,
     write_bridge_state,
 )
-from omnigent.opencode_native_client import OpenCodeClient
+from omnigent.harnesses.opencode_native.client import OpenCodeClient
+from omnigent.inner.executor import ExecutorError, TurnComplete
+from omnigent.inner.opencode_native_executor import OpenCodeNativeExecutor
 
 _PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="  # noqa: E501
 _PNG_DATA_URI = f"data:image/png;base64,{_PNG_B64}"
@@ -213,6 +213,97 @@ async def test_enqueue_message_injects_prompt(
     assert prompt_reqs[0][2]["parts"] == [{"type": "text", "text": "steer me"}]
 
 
+async def _run_with_system_prompt(
+    executor: OpenCodeNativeExecutor, content: Any, system_prompt: str
+) -> list[Any]:
+    events: list[Any] = []
+    async for event in executor.run_turn(
+        [{"role": "user", "content": content}], [], system_prompt
+    ):
+        events.append(event)
+    return events
+
+
+def _prompt_system_fields(server: _FakeServer) -> list[Any]:
+    return [r[2].get("system") for r in server.requests if r[1].endswith("/prompt_async")]
+
+
+async def test_run_turn_authored_sends_gated_composed_system(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Authored turns send the gated composed authored + framework text."""
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run_with_system_prompt(
+        executor, "hello", "Be a concise assistant.\n\nFramework note."
+    )
+    assert [type(e) for e in events] == [TurnComplete]
+    assert _prompt_system_fields(fake_server) == ["Be a concise assistant.\n\nFramework note."]
+
+
+async def test_run_turn_framework_only_sends_framework_text_alone(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Framework-only turns send only the framework text — no fabricated fallback."""
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run_with_system_prompt(executor, "hello", "Framework note only.")
+    assert [type(e) for e in events] == [TurnComplete]
+    assert _prompt_system_fields(fake_server) == ["Framework note only."]
+    assert "You are a helpful assistant." not in _prompt_system_fields(fake_server)[0]
+
+
+async def test_run_turn_neither_omits_system_field_entirely(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither authored nor framework text → the system field is omitted."""
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    events = await _run_with_system_prompt(executor, "hello", "")
+    assert [type(e) for e in events] == [TurnComplete]
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert "system" not in prompt_reqs[0][2]
+
+
+async def test_enqueue_before_any_normal_turn_omits_system(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No prior normal turn on this executor → enqueue sends no system field."""
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    assert await executor.enqueue_session_message("k", "steer me") is True
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert "system" not in prompt_reqs[0][2]
+
+
+async def test_enqueue_after_normal_turn_reuses_cached_system(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A promoted queued message reuses the most recent normal turn's system prompt."""
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    await _run_with_system_prompt(executor, "hello", "Be concise.")
+
+    assert await executor.enqueue_session_message("k", "steer me") is True
+
+    assert _prompt_system_fields(fake_server) == ["Be concise.", "Be concise."]
+
+
+async def test_instruction_free_turn_clears_previously_populated_cache(
+    fake_server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later instruction-free normal turn clears a previously cached value."""
+    _seed_state(tmp_path)
+    executor = _executor(tmp_path, monkeypatch)
+    await _run_with_system_prompt(executor, "hello", "Be concise.")
+    await _run_with_system_prompt(executor, "again", "")
+
+    assert await executor.enqueue_session_message("k", "steer me") is True
+
+    prompt_reqs = [r for r in fake_server.requests if r[1].endswith("/prompt_async")]
+    assert "system" not in prompt_reqs[-1][2]
+
+
 def test_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_state(tmp_path)
     executor = _executor(tmp_path, monkeypatch)
@@ -234,8 +325,8 @@ def test_harness_executor_factory_builds_from_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The harness executor factory constructs an executor from the spawn env."""
+    from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR
     from omnigent.inner.opencode_native_harness import _build_opencode_native_executor
-    from omnigent.opencode_native_bridge import OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR
 
     monkeypatch.setenv(OPENCODE_NATIVE_BRIDGE_DIR_ENV_VAR, str(tmp_path))
     assert isinstance(_build_opencode_native_executor(), OpenCodeNativeExecutor)

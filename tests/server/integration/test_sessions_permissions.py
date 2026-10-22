@@ -25,7 +25,7 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.host.frames import HostHelloFrame
-from omnigent.runtime import session_stream
+from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
 from omnigent.server.app import create_app
@@ -92,33 +92,6 @@ def auth_app(
         # the test runner can't flip the mode.
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
     )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """HTTP client wired to the auth-enabled FastAPI app.
-
-    Same lifecycle pattern as the shared ``client`` fixture from
-    ``conftest.py``: starts the harness process manager, yields the
-    client, then tears down DBOS on exit.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 @pytest.fixture()
@@ -317,7 +290,6 @@ async def _grant_permission(
     granter: str,
     target_user: str,
     level: int,
-    can_approve: bool | None = None,
 ) -> httpx.Response:
     """Grant a permission on a session.
 
@@ -326,15 +298,11 @@ async def _grant_permission(
     :param granter: User identity of the granter.
     :param target_user: User to receive the grant.
     :param level: Numeric permission level (1/2/3).
-    :param can_approve: Optional delegated approval capability.
     :returns: The raw httpx response.
     """
-    body: dict[str, Any] = {"user_id": target_user, "level": level}
-    if can_approve is not None:
-        body["can_approve"] = can_approve
     return await client.put(
         f"/v1/sessions/{session_id}/permissions",
-        json=body,
+        json={"user_id": target_user, "level": level},
         headers={"X-Forwarded-Email": granter},
     )
 
@@ -358,6 +326,25 @@ async def _revoke_permission(
         f"/v1/sessions/{session_id}/permissions/{target_user}",
         headers={"X-Forwarded-Email": revoker},
     )
+
+
+async def _leave_session(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    user: str,
+) -> httpx.Response:
+    """Leave a session by revoking your OWN grant ("unshare myself").
+
+    Same endpoint as :func:`_revoke_permission` with the caller as the
+    target — the route allows a self-revoke at read level.
+
+    :param client: The test HTTP client.
+    :param session_id: Session to leave.
+    :param user: User identity giving up their own access.
+    :returns: The raw httpx response.
+    """
+    return await _revoke_permission(client, session_id, revoker=user, target_user=user)
 
 
 async def _list_sessions_as(
@@ -414,7 +401,7 @@ async def test_full_permission_lifecycle(
     3. bryan reassigns corey to read (level 1) via upsert
     4. bryan grants rice edit (level 2) on S1
     5. bryan revokes corey entirely
-    6. bryan tries to revoke own manage -> 403 (self-revoke blocked)
+    6. bryan tries to revoke own owner grant -> 403 (orphan guard)
     7. Verify DB state: only bryan (manage) and rice (edit)
     8. rice lists sessions -> sees S1
     9. corey lists sessions -> sees nothing
@@ -482,18 +469,19 @@ async def test_full_permission_lifecycle(
     # Revoke returns 204 No Content.
     assert resp.status_code == 204, f"revoke failed: {resp.status_code} {resp.text}"
 
-    # Step 6: bryan tries to revoke own manage -> 403
+    # Step 6: bryan tries to revoke his own OWNER grant -> 403
     resp = await _revoke_permission(
         auth_client,
         session_id,
         revoker="bryan",
         target_user="bryan",
     )
-    # Self-revoke of a manage grant is blocked to prevent orphaned
-    # sessions. The route returns 403 (FORBIDDEN).
+    # A self-revoke is allowed in general — it's how a grantee leaves a
+    # shared session. What's blocked is the OWNER doing it, since their
+    # grant is what keeps the session reachable. 403 (FORBIDDEN).
     assert resp.status_code == 403, (
-        f"Expected 403 for self-revoke of manage grant, "
-        f"got {resp.status_code}. If 204, the self-revoke guard "
+        f"Expected 403 for the owner revoking their own grant, "
+        f"got {resp.status_code}. If 204, the owner-grant guard "
         f"is broken and the session could be orphaned."
     )
 
@@ -678,6 +666,63 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
     )
 
 
+async def test_share_workspace_files_requires_manage_and_reflects_in_snapshot(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Exposing the workspace to view-level collaborators is a sharing
+    decision, so PATCHing ``share_workspace_files`` needs manage — the same
+    tier that grants/revokes access. An editor is blocked; a manager can flip
+    it, and the value round-trips through the session snapshot (the contract
+    the share dialog and the file-rail gate both read).
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = s1["id"]
+    # Fresh sessions are unshared: a read grant sees the conversation only.
+    assert s1.get("share_workspace_files") is False
+
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="editor", level=LEVEL_EDIT
+    )
+    await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="manager", level=LEVEL_MANAGE
+    )
+
+    # An editor cannot decide who sees the workspace.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": True},
+        headers={"X-Forwarded-Email": "editor"},
+    )
+    assert resp.status_code == 403, (
+        f"An edit collaborator must not be able to expose the workspace to "
+        f"view-level users. Got {resp.status_code}: {resp.text}"
+    )
+
+    # A manager can, and the snapshot reflects it.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": True},
+        headers={"X-Forwarded-Email": "manager"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["share_workspace_files"] is True
+
+    snap = await auth_client.get(
+        f"/v1/sessions/{session_id}", headers={"X-Forwarded-Email": "manager"}
+    )
+    assert snap.json()["share_workspace_files"] is True
+
+    # Turning it back off round-trips too.
+    resp = await auth_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"share_workspace_files": False},
+        headers={"X-Forwarded-Email": "manager"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["share_workspace_files"] is False
+
+
 # ── Grant edit: can POST events but not manage permissions ───
 
 
@@ -737,133 +782,6 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
         f"user-b with edit grant should be blocked from listing "
         f"permissions. Got {resp.status_code}."
     )
-
-
-async def test_owner_can_delegate_approval_event_authority(
-    auth_client: httpx.AsyncClient,
-) -> None:
-    """Editors need an explicit owner grant before approving owner-run tools."""
-    agent = await create_test_agent(auth_client, user="bryan")
-    session = await _create_session_as(auth_client, agent["id"], "user-a")
-    session_id = session["id"]
-    grant = await _grant_permission(
-        auth_client,
-        session_id,
-        granter="user-a",
-        target_user="user-b",
-        level=LEVEL_EDIT,
-    )
-    assert grant.status_code == 200
-
-    approval = {
-        "type": "approval",
-        "data": {"elicitation_id": "elicit_test", "action": "accept"},
-    }
-    editor_response = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json=approval,
-        headers={"X-Forwarded-Email": "user-b"},
-    )
-    assert editor_response.status_code == 403, editor_response.text
-
-    editor_snapshot = await auth_client.get(
-        f"/v1/sessions/{session_id}",
-        headers={"X-Forwarded-Email": "user-b"},
-    )
-    assert editor_snapshot.status_code == 200, editor_snapshot.text
-    assert editor_snapshot.json()["can_approve"] is False
-    editor_rows = await _list_sessions_as(auth_client, "user-b")
-    assert next(row for row in editor_rows if row["id"] == session_id)["can_approve"] is False
-
-    decline_response = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "approval",
-            "data": {"elicitation_id": "elicit_decline", "action": "decline"},
-        },
-        headers={"X-Forwarded-Email": "user-b"},
-    )
-    assert decline_response.status_code == 202, decline_response.text
-
-    delegated_grant = await _grant_permission(
-        auth_client,
-        session_id,
-        granter="user-a",
-        target_user="user-b",
-        level=LEVEL_EDIT,
-        can_approve=True,
-    )
-    assert delegated_grant.status_code == 200, delegated_grant.text
-    assert delegated_grant.json()["can_approve"] is True
-
-    delegated_snapshot = await auth_client.get(
-        f"/v1/sessions/{session_id}",
-        headers={"X-Forwarded-Email": "user-b"},
-    )
-    assert delegated_snapshot.status_code == 200, delegated_snapshot.text
-    assert delegated_snapshot.json()["can_approve"] is True
-    delegated_rows = await _list_sessions_as(auth_client, "user-b")
-    assert next(row for row in delegated_rows if row["id"] == session_id)["can_approve"] is True
-
-    delegated_response = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json=approval,
-        headers={"X-Forwarded-Email": "user-b"},
-    )
-    assert delegated_response.status_code == 202, delegated_response.text
-
-    revoked_grant = await _grant_permission(
-        auth_client,
-        session_id,
-        granter="user-a",
-        target_user="user-b",
-        level=LEVEL_EDIT,
-        can_approve=False,
-    )
-    assert revoked_grant.status_code == 200, revoked_grant.text
-    assert revoked_grant.json()["can_approve"] is False
-
-    revoked_response = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json=approval,
-        headers={"X-Forwarded-Email": "user-b"},
-    )
-    assert revoked_response.status_code == 403, revoked_response.text
-
-    owner_response = await auth_client.post(
-        f"/v1/sessions/{session_id}/events",
-        json=approval,
-        headers={"X-Forwarded-Email": "user-a"},
-    )
-    assert owner_response.status_code == 202, owner_response.text
-
-
-async def test_manager_cannot_delegate_approval_authority(
-    auth_client: httpx.AsyncClient,
-) -> None:
-    """Sharing managers cannot grant authority over owner credentials."""
-    agent = await create_test_agent(auth_client, user="bryan")
-    session = await _create_session_as(auth_client, agent["id"], "user-a")
-    session_id = session["id"]
-    manager_grant = await _grant_permission(
-        auth_client,
-        session_id,
-        granter="user-a",
-        target_user="user-b",
-        level=LEVEL_MANAGE,
-    )
-    assert manager_grant.status_code == 200
-
-    response = await _grant_permission(
-        auth_client,
-        session_id,
-        granter="user-b",
-        target_user="user-c",
-        level=LEVEL_EDIT,
-        can_approve=True,
-    )
-
-    assert response.status_code == 403, response.text
 
 
 async def test_archive_requires_owner_access(
@@ -1390,8 +1308,46 @@ async def test_non_manager_cannot_revoke_permissions(
         f"permissions. Got {resp.status_code}."
     )
 
+    # ...but the SAME user may revoke THEMSELVES (that's "leave"), which is
+    # the whole point of the read-level self path. If this 403s, the level
+    # choice collapsed back to manage-for-everything.
+    resp = await _revoke_permission(
+        auth_client,
+        session_id,
+        revoker="user-b",
+        target_user="user-b",
+    )
+    assert resp.status_code == 204, (
+        f"user-b should be able to revoke their OWN grant (leave) without "
+        f"manage access. Got {resp.status_code}: {resp.text}"
+    )
+
 
 # ── Session creator auto-grant ───────────────────────────────
+
+
+async def test_session_creator_uses_authoritative_grant_result(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Create must not read back a permission that grant already returned."""
+    from omnigent.server.routes.sessions import routes_core
+
+    owner = "owner@example.com"
+    agent = await create_test_agent(auth_client, user=owner)
+
+    async def fail_readback(*args: object, **kwargs: object) -> int | None:
+        raise AssertionError("create performed a redundant permission readback")
+
+    monkeypatch.setattr(routes_core, "_get_permission_level", fail_readback)
+    resp = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": owner},
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["permission_level"] == LEVEL_OWNER
 
 
 async def test_session_creator_gets_manage_grant(
@@ -1583,17 +1539,20 @@ async def test_self_grant_blocked_at_any_level(
         )
 
 
-# ── Self-revoke blocked (general) ──────────────────────────
+# ── Self-revoke by the OWNER is blocked (orphan guard) ─────
 
 
-async def test_self_revoke_blocked(
+async def test_owner_self_revoke_blocked(
     auth_client: httpx.AsyncClient,
 ) -> None:
-    """The session owner cannot revoke themselves — self-modification is fully blocked.
+    """The session owner cannot revoke themselves — it would orphan the session.
 
-    The existing lifecycle test (step 6) checks self-revoke for the
-    owner. This test verifies the same guard independently and
-    confirms the error message explicitly mentions self-modification.
+    A self-revoke is how a *grantee* leaves a shared session (see
+    ``test_grantee_can_leave_shared_session``), so the route permits it in
+    general. What must stay blocked is the owner doing it: their grant is
+    what keeps the session reachable. The guard that enforces this is the
+    owner-grant check, NOT a blanket self-modification block — this test
+    pins the owner case so relaxing the self-check can't orphan a session.
     """
     agent = await create_test_agent(auth_client, user="bryan")
     s1 = await _create_session_as(auth_client, agent["id"], "bryan")
@@ -1605,19 +1564,163 @@ async def test_self_revoke_blocked(
         revoker="bryan",
         target_user="bryan",
     )
-    # Self-revoke must always be blocked. If 204, the
-    # ``target_user_id == user_id`` guard in revoke_permission
-    # is missing or was removed.
     assert resp.status_code == 403, (
-        f"Self-revoke should return 403, got {resp.status_code}. "
-        f"If 204, the self-modification guard is broken and the "
-        f"session could be orphaned."
+        f"An owner's self-revoke should return 403, got {resp.status_code}. "
+        f"If 204, the owner-grant guard is broken and the session is "
+        f"unreachable."
     )
     body = resp.json()
-    assert "Cannot modify your own permissions" in body["error"]["message"], (
-        f"Expected 'Cannot modify your own permissions' in error "
-        f"message, got {body['error']['message']!r}."
+    assert "own" in body["error"]["message"].lower(), (
+        f"Expected an owner-refusal message, got {body['error']['message']!r}."
     )
+    # The grant survived, so the owner still sees the session.
+    owner_ids = {s["id"] for s in await _list_sessions_as(auth_client, "bryan")}
+    assert session_id in owner_ids, "a refused self-revoke must not drop the owner's grant"
+
+
+# ── Leaving a shared session (self-unshare) ────────────────
+
+
+async def test_grantee_can_leave_shared_session(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A grantee removes their own access via ``DELETE .../permissions/self``.
+
+    The counterpart to the manager-driven revoke: the grantee needs no
+    manage access to give up their own grant, and the session drops out
+    of their list afterwards while the owner keeps it.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "bryan")
+    session_id = s1["id"]
+
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="bryan",
+        target_user="carol",
+        level=LEVEL_READ,
+    )
+    assert grant.status_code == 200, f"grant failed: {grant.text}"
+    carol_ids = {s["id"] for s in await _list_sessions_as(auth_client, "carol")}
+    assert session_id in carol_ids, "shared session should be visible before leaving"
+
+    resp = await _leave_session(auth_client, session_id, user="carol")
+    # Read access is the only requirement — carol has no manage grant, so a
+    # 403 here means the route is gated at the wrong level.
+    assert resp.status_code == 204, f"Leave should return 204, got {resp.status_code}: {resp.text}"
+
+    carol_ids_after = {s["id"] for s in await _list_sessions_as(auth_client, "carol")}
+    assert session_id not in carol_ids_after, (
+        "session should be gone from the leaver's list — the grant row was deleted"
+    )
+    owner_ids = {s["id"] for s in await _list_sessions_as(auth_client, "bryan")}
+    assert session_id in owner_ids, "leaving must not remove the session for its owner"
+    # Access is actually gone, not just hidden from the list.
+    snap = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "carol"},
+    )
+    assert snap.status_code == 404, f"Expected 404 reading a left session, got {snap.status_code}."
+
+
+async def test_owner_cannot_leave_own_session(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """The owner is refused: leaving would orphan the session.
+
+    The owner grant is what keeps a session reachable, so ``/self`` must
+    reject it (the owner archives or deletes instead) — the same
+    orphaning guard the self-revoke block enforces.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "bryan")
+    session_id = s1["id"]
+
+    resp = await _leave_session(auth_client, session_id, user="bryan")
+    assert resp.status_code == 403, (
+        f"Owner leave should return 403, got {resp.status_code}. If 204, "
+        f"the orphaning guard is missing and the session is unreachable."
+    )
+    assert "own" in resp.json()["error"]["message"].lower()
+    # The grant survived, so the owner still sees the session.
+    owner_ids = {s["id"] for s in await _list_sessions_as(auth_client, "bryan")}
+    assert session_id in owner_ids, "a refused leave must not drop the owner's grant"
+
+
+async def test_manager_can_leave_shared_session(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A manage-level grantee may leave — only the owner grant is protected.
+
+    A manager is still a guest on someone else's session, so the
+    orphaning guard must key on :data:`LEVEL_OWNER` rather than on
+    "can manage".
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "bryan")
+    session_id = s1["id"]
+
+    grant = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="bryan",
+        target_user="carol",
+        level=LEVEL_MANAGE,
+    )
+    assert grant.status_code == 200, f"grant failed: {grant.text}"
+
+    resp = await _leave_session(auth_client, session_id, user="carol")
+    assert resp.status_code == 204, (
+        f"A manage-level grantee should be able to leave, got "
+        f"{resp.status_code}: {resp.text}. If 403, the guard is keyed on "
+        f"manage rather than on owner."
+    )
+
+
+async def test_leave_without_access_returns_404(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A user with no grant gets 404 — the same non-leaking shape as any read.
+
+    Leaving requires read access, so an ungranted caller must not be able
+    to distinguish "exists but not mine" from "doesn't exist".
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "bryan")
+
+    resp = await _leave_session(auth_client, s1["id"], user="dave")
+    assert resp.status_code == 404, (
+        f"Expected 404 for a caller with no grant, got {resp.status_code}."
+    )
+
+
+async def test_owner_can_reshare_after_leave(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Leaving records no lasting refusal — a re-grant restores access.
+
+    Leaving deletes only the grant row, so the owner sharing again brings
+    the session back to the leaver's sidebar.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "bryan")
+    session_id = s1["id"]
+
+    await _grant_permission(
+        auth_client, session_id, granter="bryan", target_user="carol", level=LEVEL_READ
+    )
+    assert (await _leave_session(auth_client, session_id, user="carol")).status_code == 204
+    # Leaving twice is idempotent: the second call still authorizes at read
+    # level, which carol no longer has, so it 404s like any other stranger.
+    assert (await _leave_session(auth_client, session_id, user="carol")).status_code == 404
+
+    regrant = await _grant_permission(
+        auth_client, session_id, granter="bryan", target_user="carol", level=LEVEL_READ
+    )
+    assert regrant.status_code == 200, f"re-grant failed: {regrant.text}"
+    carol_ids = {s["id"] for s in await _list_sessions_as(auth_client, "carol")}
+    assert session_id in carol_ids, "re-shared session should reappear for the leaver"
 
 
 # ── Multi-session list with mixed access ───────────────────
@@ -2016,6 +2119,61 @@ async def test_patch_session_requires_edit_access(
     error_msg = resp.json()["error"]["message"]
     assert "owner" in error_msg.lower(), "403 message should mention owner requirement."
     assert f"--fork {session_id}" in error_msg, "403 message should suggest the fork CLI command."
+
+
+@pytest.mark.parametrize(
+    ("caller", "grant_level", "expected_status"),
+    [
+        pytest.param(None, None, 401, id="unauthenticated"),
+        pytest.param("unrelated", None, 404, id="unrelated"),
+        pytest.param("collaborator", LEVEL_READ, 403, id="reader"),
+        pytest.param("collaborator", LEVEL_EDIT, 200, id="editor"),
+        pytest.param("model-owner", None, 200, id="owner"),
+    ],
+)
+async def test_model_override_reset_requires_edit_access(
+    auth_client: httpx.AsyncClient,
+    caller: str | None,
+    grant_level: int | None,
+    expected_status: int,
+) -> None:
+    """Only the owner or an editor may conditionally clear a saved model pick."""
+    owner = "model-owner"
+    owner_headers = {"X-Forwarded-Email": owner}
+    agent = await create_test_agent(auth_client, user=owner)
+    session = await _create_session_as(auth_client, agent["id"], owner)
+    session_path = f"/v1/sessions/{session['id']}"
+    pick = "gpt-5.4-retired"
+    seeded = await auth_client.patch(
+        session_path,
+        json={"model_override": pick, "silent": True},
+        headers=owner_headers,
+    )
+    assert seeded.status_code == 200, seeded.text
+    assert seeded.json()["model_override"] == pick
+    if grant_level is not None:
+        assert caller is not None
+        grant = await _grant_permission(
+            auth_client,
+            session["id"],
+            granter=owner,
+            target_user=caller,
+            level=grant_level,
+        )
+        assert grant.status_code == 200, grant.text
+
+    reset = await auth_client.post(
+        f"{session_path}/model-override/reset",
+        json={"expected_model_override": pick},
+        headers={"X-Forwarded-Email": caller} if caller is not None else {},
+    )
+
+    assert reset.status_code == expected_status, reset.text
+    if expected_status == 200:
+        assert reset.json() == {"reset": True}
+    snapshot = await auth_client.get(session_path, headers=owner_headers)
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["model_override"] == (None if expected_status == 200 else pick)
 
 
 # ── GET /sessions/{id}/items with read access ──────────────
@@ -2569,6 +2727,64 @@ async def test_w7_2_session_scoped_agent_requires_owning_session_access(
     )
 
 
+async def test_fork_switch_binds_session_scoped_target_with_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Forking into a session-scoped custom agent the caller can read succeeds.
+
+    ``POST /v1/sessions/{id}/fork`` runs ``body.agent_id`` through the same
+    ``validate_session_agent`` check as ``POST /v1/sessions``, so corey can
+    fork his own session into a custom agent he also owns.
+    """
+    agent = await create_test_agent(auth_client, name="corey-custom-agent", user="corey")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code == 201, (
+        f"Expected 201 when corey forks into his own custom agent, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    fork_id = resp.json()["id"]
+
+    agent_resp = await auth_client.get(
+        f"/v1/sessions/{fork_id}/agent",
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert agent_resp.status_code == 200, agent_resp.text
+    assert agent_resp.json()["name"] == "corey-custom-agent"
+
+
+async def test_fork_switch_denies_session_scoped_target_without_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Forking into a session-scoped custom agent the caller cannot read is denied.
+
+    Bryan owns the session that owns the custom agent. Corey forks his own
+    session and names Bryan's agent as the target with no grant on Bryan's
+    session, so ``validate_session_agent`` must reject the fork before it is
+    created.
+    """
+    agent = await create_test_agent(auth_client, name="bryan-custom-agent", user="bryan")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork",
+        json={"agent_id": agent["id"]},
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code in (403, 404), (
+        f"Expected 403/404 for a session-scoped target corey cannot read, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+
+    corey_sessions = await _list_sessions_as(auth_client, "corey")
+    assert [s["id"] for s in corey_sessions] == [source["id"]]
+
+
 async def test_create_session_rejects_other_users_host(
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,
@@ -3040,6 +3256,7 @@ async def test_stream_local_single_user_not_tracked(
     try:
         resp = await _end_stream_via_close(session_id, task)
         assert resp.status_code == 200
+        assert resp.headers["x-omnigent-stream-epoch"] == inflight_text.stream_epoch()
         # The stream's own snapshot-on-connect ran AFTER any (buggy)
         # registration would have happened, so a "local" viewer in it
         # proves the attribution filter was dropped from the route.
@@ -3137,3 +3354,145 @@ async def test_stream_presence_spans_subagent_conversations(
         await asyncio.gather(alice_task, return_exceptions=True)
         await root_collector.stop()
         await child_collector.stop()
+
+
+async def test_admin_leave_does_not_orphan_owned_session(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An admin leaving a session they own is refused, not silently applied.
+
+    Admins bypass the access check, so the route reaches the owner guard on
+    the strength of the bypass alone. The guard reads the caller's own grant
+    row — for an admin-owned session that IS the owner grant, so the refusal
+    must still fire rather than deleting the row that keeps it reachable.
+    """
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("admin-leaver", is_admin=True)
+    agent = await create_test_agent(auth_client, user="admin-leaver")
+    s1 = await _create_session_as(auth_client, agent["id"], "admin-leaver")
+    session_id = s1["id"]
+
+    resp = await _leave_session(auth_client, session_id, user="admin-leaver")
+    assert resp.status_code == 403, (
+        f"An admin owner must not be able to leave (it would orphan the "
+        f"session); got {resp.status_code}."
+    )
+    owner_ids = {s["id"] for s in await _list_sessions_as(auth_client, "admin-leaver")}
+    assert session_id in owner_ids, "the admin owner's grant must survive a refused leave"
+
+
+async def test_admin_without_grant_leave_is_noop_not_error(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An admin with no grant on someone else's session: 204, nothing removed.
+
+    The admin bypass carries them through the read gate with no grant row of
+    their own, so the revoke deletes nothing. It must not disturb the owner.
+    """
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("admin-bystander", is_admin=True)
+    agent = await create_test_agent(auth_client, user="bryan")
+    s1 = await _create_session_as(auth_client, agent["id"], "bryan")
+    session_id = s1["id"]
+
+    resp = await _leave_session(auth_client, session_id, user="admin-bystander")
+    assert resp.status_code == 204, (
+        f"expected an idempotent 204 for an admin with no grant, got {resp.status_code}"
+    )
+    owner_ids = {s["id"] for s in await _list_sessions_as(auth_client, "bryan")}
+    assert session_id in owner_ids, "an admin's leave must not touch the owner's grant"
+
+
+async def test_leave_rejects_a_sub_agent_session(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Leaving a sub-agent is refused — its access lives on the parent.
+
+    A child session carries no grant row of its own
+    (``check_session_access`` delegates to the parent), so revoking "the
+    caller's grant" on the child would delete nothing while reporting
+    success, and the row would stay put. Leave must refuse and point at the
+    parent rather than lie.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    parent = await _create_session_as(auth_client, agent["id"], "bryan", title="leave-parent")
+    await _grant_permission(
+        auth_client, parent["id"], granter="bryan", target_user="carol", level=LEVEL_READ
+    )
+    # Carol has read on the parent, so she may parent a child off it.
+    child_resp = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": parent["agent_id"], "parent_session_id": parent["id"]},
+        headers={"X-Forwarded-Email": "carol"},
+    )
+    assert child_resp.status_code == 201, f"child create failed: {child_resp.text}"
+    child_id = child_resp.json()["id"]
+
+    resp = await _leave_session(auth_client, child_id, user="carol")
+    assert resp.status_code == 400, (
+        f"Leaving a sub-agent should be refused with a pointer to the parent, "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # The parent grant is untouched, so carol still sees the shared session.
+    parent_ids = {s["id"] for s in await _list_sessions_as(auth_client, "carol")}
+    assert parent["id"] in parent_ids, "a refused child leave must not touch the parent grant"
+
+
+@pytest.mark.parametrize("bundle_mode", [False, True])
+async def test_shared_parent_readiness_remains_private(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    bundle_mode: bool,
+) -> None:
+    """Read access to a parent does not expose the owner's host telemetry."""
+    from omnigent.stores.host_store import HostStore
+
+    parent = await _create_session_as(auth_client, "ignored", "alice", title="shared-parent")
+    grant = await _grant_permission(
+        auth_client,
+        parent["id"],
+        granter="alice",
+        target_user="bob",
+        level=LEVEL_READ,
+    )
+    assert grant.status_code == 200
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    store.set_host_id(parent["id"], host_id, workspace="/tmp/workspace")
+    store.set_runner_id(parent["id"], "offline-test-runner")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(
+        host_id, "private-host", "alice", configured_harnesses={"jcode": False}
+    )
+    auth_app.state.host_store = hosts
+    if bundle_mode:
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps({"parent_session_id": parent["id"]})},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        name="worker",
+                        executor={"type": "omnigent", "config": {"harness": "jcode"}},
+                    ),
+                    "application/gzip",
+                )
+            },
+            headers={"X-Forwarded-Email": "bob"},
+        )
+    else:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": parent["agent_id"],
+                "parent_session_id": parent["id"],
+                "harness_override": "jcode",
+            },
+            headers={"X-Forwarded-Email": "bob"},
+        )
+    assert response.status_code == 201, response.text
+    assert "harness_not_configured" not in response.text

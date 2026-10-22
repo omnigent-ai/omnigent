@@ -14,6 +14,33 @@ function renderCard(props: Parameters<typeof ToolCard>[0]) {
   return render(createElement(TooltipProvider, null, createElement(ToolCard, props)));
 }
 
+function renderFileToolCard(
+  viewer: {
+    openFile: (path: string) => void;
+    workspaceRoot: string | null;
+    workspaceHome: string | null;
+  },
+  card: { name: string; arguments: Record<string, unknown> },
+) {
+  const ctx = {
+    ...viewer,
+    openGithubTab: () => {},
+    isChangedPath: () => false,
+    conversationId: "c1",
+  };
+  return render(
+    createElement(
+      TooltipProvider,
+      null,
+      createElement(
+        FileViewerContext.Provider,
+        { value: ctx },
+        createElement(ToolCard, { ...card, output: null, state: "output-available" }),
+      ),
+    ),
+  );
+}
+
 describe("formatToolDuration", () => {
   it("formats subsecond, second, minute, and hour durations", () => {
     expect(formatToolDuration(0.042)).toBe("42ms");
@@ -131,62 +158,81 @@ describe("ToolCard rendering", () => {
     // that calls the FileViewer's openFile; clicking it must not toggle the
     // collapsible (stopPropagation).
     const openFile = vi.fn();
-    const ctx = {
-      openFile,
-      isChangedPath: () => false,
-      conversationId: "c1",
-      workspaceRoot: null,
-      workspaceHome: null,
-    };
-    render(
-      createElement(
-        TooltipProvider,
-        null,
-        createElement(
-          FileViewerContext.Provider,
-          { value: ctx },
-          createElement(ToolCard, {
-            name: "sys_os_read",
-            arguments: { path: "src/a.ts" },
-            output: null,
-            state: "output-available",
-          }),
-        ),
-      ),
+    renderFileToolCard(
+      { openFile, workspaceRoot: null, workspaceHome: null },
+      { name: "sys_os_read", arguments: { path: "src/a.ts" } },
     );
     const link = screen.getByRole("link", { name: "src/a.ts" });
     fireEvent.click(link);
     expect(openFile).toHaveBeenCalledWith("src/a.ts");
   });
 
-  it("does not linkify an absolute file path (FileViewer rejects absolute paths)", () => {
-    // WHY: the FileViewer can't resolve absolute paths, so an absolute
-    // sys_os_read path must render as plain text, never a clickable link.
-    const ctx = {
-      openFile: vi.fn(),
-      isChangedPath: () => false,
-      conversationId: "c1",
-      workspaceRoot: null,
-      workspaceHome: null,
-    };
-    render(
-      createElement(
-        TooltipProvider,
-        null,
-        createElement(
-          FileViewerContext.Provider,
-          { value: ctx },
-          createElement(ToolCard, {
-            name: "sys_os_read",
-            arguments: { path: "/etc/hosts" },
-            output: null,
-            state: "output-available",
-          }),
-        ),
-      ),
+  it.each([
+    ["/home/u/ws/src/new.ts", "src/new.ts"],
+    ["/etc/hosts", "/etc/hosts"],
+  ])("opens a Claude Write of %s in the FileViewer as %s", (filePath, opened) => {
+    // WHY: Claude Code's file tools pass an absolute `file_path`; a file the
+    // agent creates must open like a chat file link — workspace-relative when
+    // under the root, host-absolute otherwise.
+    const openFile = vi.fn();
+    renderFileToolCard(
+      { openFile, workspaceRoot: "/home/u/ws", workspaceHome: "/home/u" },
+      { name: "Write", arguments: { file_path: filePath, content: "x" } },
+    );
+    fireEvent.click(screen.getByRole("link", { name: filePath }));
+    expect(openFile).toHaveBeenCalledWith(opened);
+  });
+
+  it("keeps an absolute path plain text until the workspace root is known", () => {
+    // WHY: with no root, inside vs outside the workspace is undecidable.
+    renderFileToolCard(
+      { openFile: vi.fn(), workspaceRoot: null, workspaceHome: null },
+      { name: "sys_os_read", arguments: { path: "/etc/hosts" } },
     );
     expect(screen.queryByRole("link")).toBeNull();
     expect(screen.getByText("/etc/hosts")).toBeInTheDocument();
+  });
+
+  it("soft-wraps panel content by default so long lines never clip", () => {
+    // WHY: a long single-line tool output used to keep `white-space: pre`
+    // and could only be read by scrolling the panel horizontally.
+    const { container } = renderCard({
+      name: "my_tool",
+      arguments: {},
+      output: "y".repeat(2000),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+
+    // Both the Parameters and Output panels default to wrapping.
+    const pres = Array.from(container.querySelectorAll("pre"));
+    expect(pres.length).toBeGreaterThan(1);
+    for (const pre of pres) {
+      expect(pre.className).toContain("whitespace-pre-wrap");
+    }
+  });
+
+  it("word-wrap toggle restores the horizontal-scroll view per panel", () => {
+    // WHY: column-aligned output (tables, diffs) sometimes reads better
+    // unwrapped, so each panel's toggle must flip it back to `pre`.
+    const { container } = renderCard({
+      name: "my_tool",
+      arguments: {},
+      output: "the output",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+
+    const toggles = screen.getAllByRole("button", { name: "Disable word wrap" });
+    expect(toggles.length).toBe(2); // Parameters + Output
+    fireEvent.click(toggles[0]);
+
+    // Only the toggled panel unwraps; the other keeps the default.
+    const wrapped = Array.from(container.querySelectorAll("pre")).filter((pre) =>
+      pre.className.includes("whitespace-pre-wrap"),
+    );
+    expect(wrapped.length).toBe(1);
+    expect(screen.getByRole("button", { name: "Enable word wrap" })).toBeInTheDocument();
   });
 });
 

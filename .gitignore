@@ -1,10 +1,25 @@
+# OCR needs an explicit file exception for tracked GitHub automation.
+# Keep these before generated-file exclusions so those exclusions still apply.
+.*/
+!.github/
+!.github/**
+.github/**/.*/
+
 .venv/
 build/
 dist/
+!examples/extensions/hello-page/src/omnigent_hello_extension/dist/
+!examples/extensions/hello-page/src/omnigent_hello_extension/dist/extension.js
+!examples/extensions/hello-page/src/omnigent_hello_extension/dist/extension.css
 node_modules/
 .pnpm-store/
 .pnpm-debug.log*
 reviews/
+
+# repro/resolve-agent workspace artifact — the machine-readable handoff.
+# Rides in the PR Demo section / CI artifact bundle, never in the diff.
+# Gitignored so a stray `git add` can't sweep it into a PR.
+.omnigent/
 
 # Generated artifact; never committed.
 .pytest_cache/
@@ -21,16 +36,18 @@ omnigent/_build_info.py
 .worktrees/
 .claude/worktrees/
 .tmp*
-.*/
-
-# Exception: track .github/ (CI workflows).
-!.github/
+# Exception: track Storybook configuration.
+!web/.storybook/
+!web/.storybook/**
 
 # Exception: track .claude/skills/ (project-wide dev-time skills for Claude Code).
 # The .*/ rule above would otherwise exclude everything under .claude/.
 !.claude/
 .claude/*
 !.claude/skills/
+
+# Exception: track .oss-scanner/ (OSS Scanner config) despite the .*/ rule above.
+!.oss-scanner/
 
 # Local helper scripts
 run-ap-chat.sh
@@ -66,10 +83,9 @@ output/playwright/
 # tests/e2e_ui/visual/snapshots/ is committed.
 tests/e2e_ui/visual/snapshot_failures/
 
-# web SPA build output, emitted into the server's static dir by
-# `npm run build` / the e2e_ui test fixture. Regenerated on demand;
-# never committed.
+# Web build outputs. Regenerated on demand; never committed.
 omnigent/server/static/web-ui/
+web/storybook-static/
 
 # macOS Finder metadata — never useful to commit.
 .DS_Store
@@ -85,3 +101,6 @@ omnigent/server/static/web-ui/
 # reason — `bundle deploy` must be able to sync it to the app source folder.
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
+web/package-lock.json
+# Generated demo recordings belong in PR evidence or artifacts, not Git.
+recordings/

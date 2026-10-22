@@ -44,6 +44,8 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_meta_text,
     list_skill_resources,
 )
+from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
+from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
@@ -68,6 +70,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
@@ -75,6 +78,8 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "NimbleExtractTool",
+    "NimbleResearchTool",
     "ReadSkillFileTool",
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
@@ -99,6 +104,7 @@ __all__ = [
     "SysTimerCancelTool",
     "SysTimerSetTool",
     "UpdateCommentTool",
+    "WebReadTool",
     "WebSearchTool",
     "any_skill_has_resources",
     "find_skill_by_name",
@@ -113,8 +119,8 @@ __all__ = [
 
 # Factory type: each constructor accepts a config dict and returns
 # a Tool. Callable is used instead of type[Tool] because the base
-# Tool.__init__ does not declare a config parameter — only the
-# web search subclasses do.
+# Tool.__init__ does not declare a config parameter — only some
+# subclasses (web search, nimble research, nimble extract) do.
 _BuiltinFactory = Callable[[dict[str, str]], Tool]
 
 
@@ -246,6 +252,9 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "web_read": lambda config: WebReadTool(config=config),
+    "nimble_research": lambda config: NimbleResearchTool(config=config),
+    "nimble_extract": lambda config: NimbleExtractTool(config=config),
     "upload_file": _create_upload_file,
     "list_files": _create_list_files,
     "download_file": _create_download_file,
@@ -304,11 +313,13 @@ if _hindsight_available():
 # between the reserved-name check and the factory dispatch.
 BUILTIN_NAMES: frozenset[str] = frozenset(_BUILTIN_REGISTRY.keys())
 
-# Subset of names that have a user-facing factory. Used by the
-# onboarding ``list_builtin_tools`` helper, which only lists
-# tools an agent spec can actually enable via
-# ``tools.builtins`` — framework-owned names would just confuse
-# the agent author.
+# Subset of names that have a user-facing factory: the tools an
+# agent spec can actually enable via ``tools.builtins``.
+# The onboarding ``list_builtin_tools`` helper covers the same
+# ground but keeps its own hand-maintained table, because it must
+# not import this package (see that module's docstring), so a new
+# builtin, or a new optional-extra gate, has to be added in both
+# places.
 INSTANTIABLE_BUILTINS: frozenset[str] = frozenset(
     name for name, factory in _BUILTIN_REGISTRY.items() if factory is not None
 )
@@ -349,7 +360,7 @@ def any_skill_has_resources(
     :param skills: The agent's skill list, e.g.
         ``[SkillSpec(name="code-review", ...)]``.
     :returns: ``True`` if at least one skill has a
-        ``skill_dir`` with files in references/, scripts/,
-        or assets/.
+        ``skill_dir`` with files beside SKILL.md, or in
+        references/, scripts/, or assets/.
     """
     return any(list_skill_resources(s) for s in skills)

@@ -27,6 +27,7 @@ from omnigent.runner.tool_dispatch import (
     _NATIVE_RELAY_BUILTIN_TOOLS,
     _execute_browser_tool,
     build_native_relay_tool_schemas,
+    strip_browser_tool_schemas,
 )
 from omnigent.spec.types import AgentSpec
 
@@ -246,7 +247,9 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
     ``browser_*`` schemas on the native relay — because ToolManager
     always registers them, the relay (which filters ToolManager's
     schemas by the union) always emits them. The desktop app runs native
-    sessions that see only the relay, so this is the load-bearing path.
+    sessions that see only the relay, so this is the load-bearing path. The
+    no-renderer mitigation does not dynamically rewrite this session-scoped
+    surface; native calls instead fail promptly when nobody claims them.
     """
     schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1))
     names = {s["name"] for s in schemas if s["name"].startswith("browser_")}
@@ -256,3 +259,189 @@ def test_native_relay_includes_browser_for_bare_spec() -> None:
         if schema["name"].startswith("browser_"):
             assert schema["description"]
             assert schema["parameters"]["type"] == "object"
+
+
+# ── Headless schema stripping ────────────────────────────────────────
+
+
+def test_strip_browser_tool_schemas_drops_nested_and_flat_shapes() -> None:
+    """
+    ``strip_browser_tool_schemas`` removes every ``browser_*`` schema in
+    both supported shapes (nested OpenAI ``{"function": {"name": ...}}``
+    and flat relay ``{"name": ...}``) and keeps everything else. This is
+    the per-turn filter applied to request-driven harnesses when the server
+    says no renderer is subscribed. Native harnesses use a session-scoped
+    relay and therefore retain their browser schemas.
+    """
+    nested_browser = {"type": "function", "function": {"name": "browser_navigate"}}
+    flat_browser = {"name": "browser_snapshot", "description": "", "parameters": {}}
+    nested_other = {"type": "function", "function": {"name": "sys_os_read"}}
+    flat_other = {"name": "load_skill", "description": "", "parameters": {}}
+    malformed = {"type": "function"}
+
+    kept = strip_browser_tool_schemas(
+        [nested_browser, flat_browser, nested_other, flat_other, malformed]
+    )
+    assert kept == [nested_other, flat_other, malformed]
+
+
+def test_strip_browser_tool_schemas_covers_every_browser_name() -> None:
+    """All five ``browser_*`` names are stripped, none survives."""
+    schemas = [{"type": "function", "function": {"name": n}} for n in sorted(_BROWSER_TOOLS)]
+    schemas.append({"type": "function", "function": {"name": "keepme"}})
+    kept = strip_browser_tool_schemas(schemas)
+    assert kept == [{"type": "function", "function": {"name": "keepme"}}]
+
+
+@pytest.mark.asyncio
+async def test_screenshot_preserves_image_bytes_and_all_metadata() -> None:
+    """Browser metadata and the decoded screenshot survive delivery and replay."""
+    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    metadata = {
+        "ok": True,
+        "url": "https://example.com/chart",
+        "note": "Correction: South -30",
+        "dimensions": {"width": 1, "height": 1},
+    }
+    body = {**metadata, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+    client = _RecordingClient(_RecordingResponse(body=body))
+    output = await _execute_browser_tool(
+        "browser_screenshot", {}, server_client=client, conversation_id="image-session"
+    )
+    native = _dynamic_tool_result_payload(json.loads(output))
+    assert native["success"] is True
+    assert [item["type"] for item in native["contentItems"]] == ["inputText", "inputImage"]
+    assert json.loads(native["contentItems"][0]["text"]) == metadata
+    assert native["contentItems"][1]["imageUrl"] == body["data_url"]
+    replay = tool_result_content_blocks(output)
+    assert replay.blocks is not None
+    assert json.loads(replay.blocks[0]["text"]) == metadata
+    assert replay.blocks[1]["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": _TINY_PNG_BASE64,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"ok": False, "error": "No browser open", "data_url": "data:image/png;base64,invalid"},
+        {"ok": True, "data_url": "data:image/png;base64,invalid"},
+        {"ok": True, "data_url": "data:image/svg+xml;base64,PHN2Zy8+"},
+        {"ok": True, "data_url": "https://example.com/image.png"},
+        {"ok": True, "data_url": "data:image/png,percent%20encoded"},
+        {"ok": True, "data_url": 123},
+        {"ok": True, "note": "No screenshot supplied"},
+    ],
+)
+async def test_screenshot_invalid_and_error_results_remain_lossless(
+    body: dict[str, object],
+) -> None:
+    response = _RecordingResponse(body=body)
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    assert output == response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool", ["browser_snapshot", "browser_navigate", "browser_click", "browser_type"]
+)
+async def test_other_browser_results_do_not_interpret_image_shaped_json(tool: str) -> None:
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    response = _RecordingResponse(
+        body={"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}"}
+    )
+    output = await _execute_browser_tool(
+        tool, {}, server_client=_RecordingClient(response), conversation_id="image-session"
+    )
+    assert output == response.text
+
+
+@pytest.mark.asyncio
+async def test_screenshot_history_cap_keeps_metadata_and_explicit_image_omission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.runtime.tool_output as caps
+    from omnigent.runtime.tool_result_replay import tool_result_content_blocks
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    metadata = {"ok": True, "note": "Required late fact: amber"}
+    response = _RecordingResponse(
+        body={"data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **metadata}
+    )
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    # Force only the persisted mirror over its cap; live delivery stays intact.
+    monkeypatch.setattr(caps, "MAX_TOOL_OUTPUT_BYTES", len(output.encode()) - 1)
+    capped = caps.cap_tool_output(output)
+    assert len(capped.encode()) < len(output.encode())
+    replay = tool_result_content_blocks(capped)
+    assert replay.blocks is not None
+    assert json.loads(replay.blocks[0]["text"]) == metadata
+    assert "omitted" in replay.blocks[1]["text"]
+    assert _TINY_PNG_BASE64 not in capped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"error": "No browser"},
+        {"blocked": True},
+        {"cancelled": True},
+        {"result": {"error": "Nested failure"}},
+    ],
+)
+async def test_screenshot_never_overrides_existing_failure_status(
+    status: dict[str, object],
+) -> None:
+    from omnigent.inner.executor import classify_tool_result
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    body = {"ok": True, "data_url": f"data:image/png;base64,{_TINY_PNG_BASE64}", **status}
+    response = _RecordingResponse(body=body)
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(response),
+        conversation_id="image-session",
+    )
+    assert output == response.text
+    assert classify_tool_result(json.loads(output)) == classify_tool_result(body)
+
+
+@pytest.mark.asyncio
+async def test_screenshot_normalizes_base64_without_changing_image_bytes() -> None:
+    from omnigent.inner.codex_executor import _dynamic_tool_result_payload
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    wrapped = "\n".join(
+        _TINY_PNG_BASE64[i : i + 12] for i in range(0, len(_TINY_PNG_BASE64), 12)
+    ).rstrip("=")
+    body = {"ok": True, "data_url": "data:image/png;base64," + wrapped}
+    output = await _execute_browser_tool(
+        "browser_screenshot",
+        {},
+        server_client=_RecordingClient(_RecordingResponse(body=body)),
+        conversation_id="image-session",
+    )
+    assert (
+        _dynamic_tool_result_payload(json.loads(output))["contentItems"][1]["imageUrl"]
+        == "data:image/png;base64," + _TINY_PNG_BASE64
+    )
+    assert body["data_url"] == "data:image/png;base64," + wrapped

@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
+import math
 import os
 import signal
+import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
+# Host-launched runners delegate machine-global stale-process cleanup to the
+# host daemon. CLI-local runners leave this unset and retain standalone cleanup.
+RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR = "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP"
 # Signal the CLI sends to "adopt" a runner: stop watching the parent
 # pid so the runner survives an intentional CLI exit (tmux detach) and
 # keeps serving the web UI. SIGUSR1 is unused elsewhere in the runner.
@@ -19,12 +26,29 @@ RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
+# Exit code of a runner whose tunnel the server refused on credentials before
+# it ever connected, so the launching host reports a sign-in problem rather
+# than a crash. 77 is ``EX_NOPERM`` from sysexits.h.
+RUNNER_AUTH_REJECTED_EXIT_CODE = 77
 # A host-launched runner uses this bearer for its initial server connection,
 # then falls back to its own refreshable auth when the bearer is rejected.
 RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_INITIAL_AUTH_TOKEN"
 # Host-launched runners use their binding token to obtain a short-lived,
 # owner-scoped server bearer instead of resolving the host user's credentials.
 RUNNER_DELEGATED_AUTH_ENV_VAR = "OMNIGENT_RUNNER_DELEGATED_AUTH"
+# Replica-routing key the runner stamps on its tunnel handshake so it
+# co-locates with the host that launched it (value = that host's host_id). The
+# host injects it when spawning the runner; absent for CLI-local runners, which
+# then leave routing to the default.
+RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
+# Canonical harness of the session this runner is being launched for (e.g.
+# "claude-native"), stamped by the host from the launch frame so the runner
+# can start harness-specific prewarms before session init arrives. Absent
+# for CLI-local runners and hosts that predate the stamp.
+RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
+# JSON-encoded ordered shell inventory discovered by the host daemon. The
+# runner uses this exact snapshot for native wrapper terminal declarations.
+RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
@@ -39,6 +63,11 @@ OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
 # gets its own subdirectory. Set by shared-host servers; single-user
 # CLI flows leave it unset (agent sees the project root directly).
 RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
+
+# Set by a launching host for its first-connect watchdog; absent for CLI-local
+# runners, which have no host watching them.
+RUNNER_CONNECT_MARKER_ENV_VAR = "OMNIGENT_RUNNER_CONNECT_MARKER"
+RUNNER_SIGN_IN_PENDING_WAIT_S = 150.0
 
 # Marker env var stamped into every agent-facing environment so any
 # process launched inside an Omnigent agent session can detect it is
@@ -64,6 +93,64 @@ RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     }
 )
+
+
+def touch_connect_marker(env: Mapping[str, str] | None = None) -> None:
+    """Mark a host-launched tunnel connect, if configured.
+
+    Reconnects may touch the same file; failure must not block the tunnel.
+    """
+    source = os.environ if env is None else env
+    path = source.get(RUNNER_CONNECT_MARKER_ENV_VAR)
+    if not path:
+        return
+    try:
+        Path(path).touch()
+    except OSError:
+        # A failed touch only affects the host's diagnostic.
+        logging.getLogger(__name__).warning(
+            "could not touch runner connect marker %s", path, exc_info=True
+        )
+
+
+def sign_in_pending_marker_path(connect_marker: Path) -> Path:
+    """Return the bounded startup-state marker for this exact launch."""
+    return connect_marker.with_suffix(".sign-in-pending")
+
+
+def mark_sign_in_pending(runner_id: str, deadline: float | None) -> None:
+    """Publish or clear a credential-free startup wait beside the connect marker."""
+    configured = os.environ.get(RUNNER_CONNECT_MARKER_ENV_VAR)
+    if not configured:
+        return
+    marker = sign_in_pending_marker_path(Path(configured))
+    try:
+        if deadline is None:
+            marker.unlink(missing_ok=True)
+        else:
+            marker.write_text(json.dumps({"runner_id": runner_id, "deadline": deadline}))
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "could not update runner sign-in marker", exc_info=True
+        )
+
+
+def runner_sign_in_is_pending(connect_marker: Path, runner_id: str) -> bool:
+    """Read an unexpired wait belonging to this unconnected launch, failing closed."""
+    try:
+        if connect_marker.exists():
+            return False
+        with sign_in_pending_marker_path(connect_marker).open() as source:
+            state = json.loads(source.read(512))
+        if not isinstance(state, dict) or state.get("runner_id") != runner_id:
+            return False
+        deadline = state.get("deadline")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return False
+        remaining = deadline - time.monotonic()
+        return math.isfinite(remaining) and 0 < remaining <= RUNNER_SIGN_IN_PENDING_WAIT_S
+    except (OSError, ValueError, OverflowError):
+        return False
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:

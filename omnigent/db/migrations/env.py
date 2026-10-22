@@ -9,6 +9,7 @@ from alembic import context
 from sqlalchemy import Connection, engine_from_config, pool
 
 from omnigent.db import ConversationBase, OmnigentBase
+from omnigent.db.utils import _set_alembic_database_url
 
 config = context.config
 
@@ -38,7 +39,7 @@ target_metadata = [OmnigentBase.metadata, ConversationBase.metadata]
 # Allow overriding the DB URL via environment variable.
 db_url = os.environ.get("OMNIGENT_DB_URL")
 if db_url:
-    config.set_main_option("sqlalchemy.url", db_url)
+    _set_alembic_database_url(config, db_url)
 
 
 def run_migrations_offline() -> None:

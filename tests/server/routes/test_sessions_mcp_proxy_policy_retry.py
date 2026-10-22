@@ -16,24 +16,45 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.server.routes import sessions as sessions_mod
+from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import (
     _handle_mcp_tools_call,
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
 )
-from omnigent.spec.types import PolicyAction
+from omnigent.spec.types import LabelDef, Phase, PolicyAction, StateUpdate, StateUpdateAction
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 # ---------------------------------------------------------------------------
 # Stubs — real types, no MagicMock
 # ---------------------------------------------------------------------------
 
 
-_SESSION_ID = "conv_test_policy_retry"
+_SESSION_ID = "b7e4a955272645eca39ed2d1064af4c9"
+
+
+@pytest.fixture()
+def approval_state(db_uri: str) -> tuple[SqlAlchemyConversationStore, Conversation, PolicyEngine]:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        conversation_id=_SESSION_ID, agent_id="d8bcd98f49134936af9546041ce5a555"
+    )
+    engine = PolicyEngine(
+        policies=[],
+        label_defs={"review": LabelDef()},
+        ask_timeout=30,
+        conversation_id=conv.id,
+        initial_labels={},
+        conversation_store=store,
+    )
+    return store, conv, engine
 
 
 def _make_conversation() -> Conversation:
@@ -74,6 +95,29 @@ class _StubConversationStore:
         if session_id == self.conv.id:
             return self.conv
         return None
+
+
+def _engine_factory_expecting_preload(engine: object):
+    """Return a `_build_policy_engine_from_spec` double that requires the row.
+
+    Every production caller of that wrapper has already loaded the
+    conversation to resolve the spec, and passes it so the builder can skip
+    its own read and confirm the agent binding. A double that merely
+    *accepts* ``conversation=None`` asserts nothing: dropping the preload at
+    the call site leaves every test here green, which is exactly what
+    happened. This one fails if the row does not arrive, so the contract is
+    observed by all seven tests rather than described by none.
+    """
+
+    def _factory(spec, session_id, conversation_store, conversation=None):
+        assert conversation is not None, (
+            "the handler must pass the conversation row it already read; "
+            "without it the builder re-reads and loses the agent-binding check"
+        )
+        assert conversation.id == session_id, (conversation.id, session_id)
+        return engine
+
+    return _factory
 
 
 @dataclass
@@ -121,7 +165,7 @@ class _FixedPolicyEngine:
         :param set_labels: Ignored.
         """
 
-    def apply_state_updates(self, updates: list[Any]) -> None:
+    def apply_state_updates(self, updates: list[Any], *, approved: bool = False) -> None:
         """No-op — state updates are not under test here.
 
         :param updates: Ignored.
@@ -209,7 +253,7 @@ async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        _engine_factory_expecting_preload(deny_engine),
     )
 
     response = await _handle_mcp_tools_call(
@@ -266,7 +310,7 @@ async def test_forged_retry_with_ask_policy_rejects_unknown_elicitation(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        _engine_factory_expecting_preload(ask_engine),
     )
 
     forged_eid = "elicit_FORGED_never_issued"
@@ -318,7 +362,7 @@ async def test_retry_with_allow_policy_falls_through(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: allow_engine,
+        _engine_factory_expecting_preload(allow_engine),
     )
 
     response = await _handle_mcp_tools_call(
@@ -374,7 +418,7 @@ async def test_retry_session_mismatch_still_rejected(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: deny_engine,
+        _engine_factory_expecting_preload(deny_engine),
     )
 
     params = _forged_retry_params()
@@ -432,7 +476,7 @@ async def test_legitimate_retry_with_pending_entry_proceeds(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: ask_engine,
+        _engine_factory_expecting_preload(ask_engine),
     )
 
     eid = "elicit_LEGITIMATE_server_issued"
@@ -533,8 +577,8 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: _FixedPolicyEngine(
-            result=PolicyResult(action=PolicyAction.ALLOW, reason=None)
+        _engine_factory_expecting_preload(
+            _FixedPolicyEngine(result=PolicyResult(action=PolicyAction.ALLOW, reason=None))
         ),
     )
 
@@ -551,6 +595,78 @@ async def test_non_mcp_entry_popped_by_events_handler_on_accept(
             "from_mcp=False entry was NOT popped by events handler — "
             "relay path writes will never be applied."
         )
+    finally:
+        _pending_policy_ask_writes.pop(eid, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval", ["accept", "decline"])
+async def test_duplicate_accept_verdicts_apply_relay_writes_once(
+    monkeypatch: pytest.MonkeyPatch,
+    approval_state: tuple[SqlAlchemyConversationStore, Conversation, PolicyEngine],
+    approval: str,
+) -> None:
+    """Concurrent duplicate accept verdicts must apply writes exactly once.
+
+    A client transport retry of the resolve POST can race its original
+    request (the retry fires while the first is still executing
+    server-side). Both handlers see the stashed entry unless it is
+    claimed atomically before the first ``await`` — and a double apply
+    re-runs non-idempotent ops (e.g. INCREMENT state updates for
+    cost-budget counters).
+    """
+    import asyncio
+
+    from omnigent.server.routes.sessions import _apply_pending_policy_ask_writes
+    from omnigent.spec.types import StateUpdate, StateUpdateAction
+
+    eid = "elicit_DUPLICATE_verdicts"
+    _pending_policy_ask_writes[eid] = _PendingPolicyAskWrites(
+        state_updates=[
+            StateUpdate(
+                key="subagent_cost_ask_approved_usd", action=StateUpdateAction.INCREMENT, value=1
+            )
+        ],
+        set_labels=None,
+        from_mcp=False,
+    )
+
+    store, conv, engine = approval_state
+    monkeypatch.setattr(
+        sessions_mod,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: "fake_spec",
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        _engine_factory_expecting_preload(engine),
+    )
+
+    data = {"elicitation_id": eid, "action": approval}
+    try:
+        await asyncio.gather(
+            _apply_pending_policy_ask_writes(
+                session_id=_SESSION_ID,
+                conv=conv,
+                conversation_store=store,
+                agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+                data=data,
+            ),
+            _apply_pending_policy_ask_writes(
+                session_id=_SESSION_ID,
+                conv=conv,
+                conversation_store=store,
+                agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+                data=data,
+            ),
+        )
+        saved = store.get_conversation(_SESSION_ID)
+        assert saved is not None
+        assert saved.session_state == (
+            {"subagent_cost_ask_approved_usd": 1} if approval == "accept" else {}
+        )
+        assert eid not in _pending_policy_ask_writes
     finally:
         _pending_policy_ask_writes.pop(eid, None)
 
@@ -584,7 +700,7 @@ class _CapturingPolicyEngine:
     def apply_label_writes(self, set_labels: dict[str, str]) -> None:
         """No-op."""
 
-    def apply_state_updates(self, updates: list[Any]) -> None:
+    def apply_state_updates(self, updates: list[Any], *, approved: bool = False) -> None:
         """No-op."""
 
 
@@ -612,7 +728,7 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     monkeypatch.setattr(
         sessions_mod,
         "_build_policy_engine_from_spec",
-        lambda spec, session_id, conversation_store: engine,
+        _engine_factory_expecting_preload(engine),
     )
 
     params = {"name": "sys_os_shell", "arguments": {"command": "echo hi"}}
@@ -630,3 +746,143 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
     assert captured[0].actor == {"run_as": "alice@example.com"}, (
         f"expected actor from runner body, got: {captured[0].actor!r}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_action", "reviewed_transform", "retry_transform", "changed_arguments", "approval"),
+    [
+        (PolicyAction.ASK, {"value": "reviewed"}, {"value": "later"}, False, "accept"),
+        (PolicyAction.ASK, None, {"value": "later"}, False, "accept"),
+        (PolicyAction.ASK, {}, {"value": "later"}, False, "accept"),
+        (PolicyAction.ASK, {"value": "reviewed"}, None, True, "accept"),
+        (PolicyAction.ASK, {"value": "reviewed"}, None, False, "decline"),
+        (PolicyAction.DENY, {"value": "reviewed"}, None, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, {"value": "current"}, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, None, False, "accept"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, {}, False, "accept"),
+    ],
+)
+async def test_retry_dispatches_policy_owned_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    approval_state: tuple[SqlAlchemyConversationStore, Conversation, PolicyEngine],
+    retry_action: PolicyAction,
+    reviewed_transform: dict[str, str] | None,
+    retry_transform: dict[str, str] | None,
+    changed_arguments: bool,
+    approval: str,
+) -> None:
+    """Approval preserves the reviewed call; ALLOW uses the current policy result."""
+    eid = "elicit_reviewed_call"
+    original_arguments = {"value": "original"}
+    dispatched: list[dict[str, Any]] = []
+    store, _conv, engine = approval_state
+    evaluations: list[EvaluationContext] = []
+
+    call_results = iter(
+        [
+            PolicyResult(
+                action=PolicyAction.ASK,
+                data=reviewed_transform,
+                set_labels={"review": "accepted"},
+                state_updates=[
+                    StateUpdate(
+                        key="subagent_cost_ask_approved_usd", action=StateUpdateAction.SET, value=1
+                    )
+                ],
+                deciding_policies=["review"],
+            ),
+            PolicyResult(action=retry_action, data=retry_transform),
+        ]
+    )
+
+    async def evaluate(session_id, spec, store, conv, ctx):
+        evaluations.append(ctx)
+        result = (
+            next(call_results)
+            if ctx.phase == Phase.TOOL_CALL
+            else PolicyResult(action=PolicyAction.ALLOW)
+        )
+        return engine, result
+
+    async def register(*args, **kwargs):
+        return eid
+
+    def execute(request: httpx.Request) -> httpx.Response:
+        dispatched.append(json.loads(request.content))
+        return httpx.Response(200, json={"result": {"output": "ok"}})
+
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "spec")
+    monkeypatch.setattr(orchestration, "_evaluate_policy_with_fresh_engine", evaluate)
+    monkeypatch.setattr(orchestration, "_register_policy_elicitation", register)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(execute), base_url="http://runner.test"
+    ) as runner:
+
+        async def get_runner(*args):
+            return runner
+
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
+
+        async def call(params):
+            response = await _handle_mcp_tools_call(
+                rpc_id=1,
+                session_id=_SESSION_ID,
+                params=params,
+                conversation_store=store,
+                agent_store=_StubAgentStore(),  # type: ignore[arg-type]
+                runner_router=None,
+            )
+            return json.loads(bytes(response.body))
+
+        try:
+            initial = await call({"name": "example__lookup", "arguments": original_arguments})
+            assert "result" in initial, initial
+            assert not dispatched
+            assert store.get_conversation(_SESSION_ID).labels == {}
+            assert store.get_conversation(_SESSION_ID).session_state == {}
+            state = json.loads(initial["result"]["requestState"])
+            state["transformed_arguments"] = {"value": "client"}
+            result = await call(
+                {
+                    "name": "example__lookup",
+                    "arguments": {"value": "changed"} if changed_arguments else original_arguments,
+                    "requestState": json.dumps(state),
+                    "inputResponses": {eid: {"action": approval}},
+                }
+            )
+            rejected = retry_action == PolicyAction.DENY or (
+                retry_action == PolicyAction.ASK and (changed_arguments or approval != "accept")
+            )
+            if rejected:
+                assert "error" in result
+                assert not dispatched
+                assert store.get_conversation(_SESSION_ID).labels == {}
+                if changed_arguments:
+                    assert "do not match" in result["error"]["message"]
+            else:
+                assert "error" not in result
+                transform = (
+                    reviewed_transform if retry_action == PolicyAction.ASK else retry_transform
+                )
+                expected = transform if transform is not None else original_arguments
+                assert len(dispatched) == 1
+                assert dispatched[0]["params"]["arguments"] == expected
+                assert evaluations[-1].request_data == {
+                    "name": "example__lookup",
+                    "arguments": expected,
+                }
+                if retry_action == PolicyAction.ASK:
+                    assert store.get_conversation(_SESSION_ID).labels == {"review": "accepted"}
+                    assert eid not in _pending_policy_ask_writes
+            saved = store.get_conversation(_SESSION_ID)
+            assert saved is not None
+            assert saved.session_state == (
+                {"subagent_cost_ask_approved_usd": 1}
+                if retry_action == PolicyAction.ASK and not rejected
+                else {}
+            )
+            assert "transformed_arguments" not in json.loads(initial["result"]["requestState"])
+        finally:
+            _pending_policy_ask_writes.pop(eid, None)

@@ -1,11 +1,16 @@
 """Browser e2e for bulk session actions in the sidebar.
 
-Selection mode is toggled via the ``data-testid="toggle-selection-mode"``
-button next to the search box. Once active, each conversation row renders
-a checkbox (``SquareCheckBigIcon`` / ``SquareIcon``); clicking the row
-toggles selection instead of navigating. A ``BulkActionBar`` appears at
-the bottom of the sidebar with Archive, Unarchive, Stop, Delete, Select
-all / Deselect all, and Clear (deselect) controls.
+Selection is scoped: the ``data-testid="toggle-selection-mode"`` icon on the
+**Sessions** header selects the flat session list, while the Projects header
+kebab's "Select sessions" item (``data-testid="projects-select-sessions"``)
+selects the sessions nested inside project folders. Once active, each row in
+the targeted scope renders a leading checkbox (``SquareCheckIcon`` /
+``SquareIcon``) and clicking the row toggles selection instead of navigating.
+
+A single-pill ``BulkActionBar`` renders directly under the header of the
+targeted section: an Exit (X) button, an "N selected" count, and icon-only
+Archive + Delete actions (Archive shows by default but is disabled until an
+archivable session is selected; Delete likewise).
 
 These tests drive the full round-trip: enter selection mode → select
 sessions → perform a bulk action → verify the server-side effect is
@@ -48,69 +53,51 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
     resp.raise_for_status()
 
 
-def test_selection_mode_toggle(
+def test_session_header_action_visibility(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Entering selection mode shows checkboxes; exiting hides them and clears selection.
-
-    Verifies:
-    - The toggle button enters selection mode (aria-label flips).
-    - Rows show checkbox icons in selection mode.
-    - Clicking a row in selection mode toggles its selection (no navigation).
-    - The BulkActionBar shows the selection count.
-    - Clicking Clear deselects all but stays in selection mode.
-    - Exiting selection mode (toggle button) hides the bar and checkboxes.
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param seeded_session: ``(base_url, session_id)`` for a pre-created
-        runner-bound session.
-    """
+    """Filter stays visible while Select reveals on hover or keyboard focus."""
     base_url, session_id = seeded_session
-    title = f"e2e-bulk-toggle-{uuid.uuid4().hex[:8]}"
+    title = f"e2e-header-actions-{uuid.uuid4().hex[:8]}"
     _set_title(base_url, session_id, title)
 
+    page.set_viewport_size({"width": 1280, "height": 800})
     page.goto(f"{base_url}/c/{session_id}")
 
-    row = _row_link(page, title)
-    expect(row).to_be_visible()
+    expect(_row_link(page, title)).to_be_visible()
+    sessions_header = page.get_by_role("button", name="Sessions", exact=True)
+    filter_sessions = page.get_by_role("button", name="Filter sessions")
+    new_session = page.get_by_test_id("sessions-new-session")
+    select_sessions = page.get_by_test_id("toggle-selection-mode")
+    actions_wrapper = select_sessions.locator("..").locator("..")
 
-    toggle = page.get_by_test_id("toggle-selection-mode")
-    expect(toggle).to_have_attribute("aria-label", "Select sessions")
+    expect(filter_sessions).to_be_visible()
+    expect(filter_sessions).to_have_css("opacity", "1")
+    expect(actions_wrapper).to_have_css("opacity", "0")
 
-    # Enter selection mode.
-    toggle.click()
-    expect(toggle).to_have_attribute("aria-label", "Exit selection mode")
+    filter_sessions.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
+    page.mouse.move(800, 700)
+    expect(actions_wrapper).to_have_css("opacity", "0")
 
-    # The row's parent <li> should now show a checkbox icon (unchecked square).
-    row_item = row.locator("..")
-    expect(row_item.locator("svg.lucide-square")).to_be_visible()
+    sessions_header.hover()
+    expect(actions_wrapper).to_have_css("opacity", "1")
 
-    # Click the row to select it — should NOT navigate away.
-    row.click()
-    # The checked icon appears instead of the unchecked one.
-    expect(row_item.locator("svg.lucide-square-check")).to_be_visible()
+    page.mouse.move(800, 700)
+    expect(actions_wrapper).to_have_css("opacity", "0")
+    sessions_header.focus()
+    page.keyboard.press("Tab")
+    expect(new_session).to_be_focused()
+    expect(actions_wrapper).to_have_css("opacity", "1")
+    page.keyboard.press("Tab")
+    expect(select_sessions).to_be_focused()
 
-    # BulkActionBar shows "1 selected".
-    expect(page.get_by_text("1 selected")).to_be_visible()
-
-    # Click Clear to deselect all (stays in selection mode).
-    page.get_by_role("button", name="Clear").click()
-    expect(page.get_by_text("None selected")).to_be_visible()
-
-    # Still in selection mode — checkbox icons remain visible (unchecked).
-    expect(row_item.locator("svg.lucide-square")).to_be_visible()
-
-    # Exit selection mode via the toggle button.
-    toggle.click()
-    expect(toggle).to_have_attribute("aria-label", "Select sessions")
-
-    # Checkbox icons should be gone.
-    expect(row_item.locator("svg.lucide-square")).to_have_count(0)
-    expect(row_item.locator("svg.lucide-square-check")).to_have_count(0)
-
-    # BulkActionBar text should be gone.
-    expect(page.get_by_text("None selected")).to_have_count(0)
+    select_sessions.click()
+    expect(page.get_by_role("button", name="Exit selection mode")).to_be_visible()
+    expect(filter_sessions).to_be_visible()
+    filter_sessions.click()
+    expect(page.get_by_test_id("session-filter-all")).to_be_visible()
 
 
 def test_bulk_archive_moves_session_to_archived(
@@ -143,12 +130,9 @@ def test_bulk_archive_moves_session_to_archived(
 
     # Click Archive.
     archive_btn = page.get_by_test_id("bulk-archive")
-    expect(archive_btn).to_be_visible()
+    expect(archive_btn).to_be_enabled()
     archive_btn.click()
 
-    # The selection clears on success (the bar shows "None selected" or
-    # exits selection mode). The row may still be visible if "Show archived"
-    # is toggled, but the server flag must be set.
     # Poll the server to verify the archived flag is durably true.
     deadline = time.monotonic() + 15.0
     archived = False
@@ -200,7 +184,7 @@ def test_bulk_delete_removes_sessions(
 
     # Click Delete — should open confirmation dialog.
     delete_btn = page.get_by_test_id("bulk-delete")
-    expect(delete_btn).to_be_visible()
+    expect(delete_btn).to_be_enabled()
     delete_btn.click()
 
     dialog = page.get_by_role("dialog")
@@ -224,45 +208,3 @@ def test_bulk_delete_removes_sessions(
     assert last_status == 404, (
         f"deleted session should be gone from the store (404), got {last_status}"
     )
-
-
-def test_select_all_and_deselect_all(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """Select all / Deselect all buttons toggle all visible sessions.
-
-    Verifies:
-    - "Select all" checks every visible row (selection count matches).
-    - "Deselect all" unchecks everything (count drops to "None selected").
-
-    :param page: Playwright page fixture (fresh context per test).
-    :param seeded_session: ``(base_url, session_id)`` for a pre-created
-        runner-bound session.
-    """
-    base_url, session_id = seeded_session
-    title = f"e2e-bulk-selectall-{uuid.uuid4().hex[:8]}"
-    _set_title(base_url, session_id, title)
-
-    page.goto(f"{base_url}/c/{session_id}")
-
-    row = _row_link(page, title)
-    expect(row).to_be_visible()
-
-    # Enter selection mode.
-    page.get_by_test_id("toggle-selection-mode").click()
-
-    # Initially none selected.
-    expect(page.get_by_text("None selected")).to_be_visible()
-
-    # Click "Select all".
-    page.get_by_role("button", name="Select all").click()
-    # At least 1 session should be selected (the seeded one).
-    expect(page.get_by_text("None selected")).to_have_count(0)
-    # The button text flips to "Deselect all" when all are selected.
-    deselect_btn = page.get_by_role("button", name="Deselect all")
-    expect(deselect_btn).to_be_visible()
-
-    # Click "Deselect all".
-    deselect_btn.click()
-    expect(page.get_by_text("None selected")).to_be_visible()

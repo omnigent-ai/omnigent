@@ -26,6 +26,12 @@ class Agent:
     :param description: Optional free-text description of the agent.
     :param updated_at: Unix epoch timestamp of the last update, or
         ``None`` if the agent has never been updated.
+    :param created_by: Identity of the user who created (owns) a user agent.
+        Gates agent-code mutation to its owner. ``None`` for server agents
+        and rows created before this field existed; an unowned user agent is
+        admin-only to mutate.
+    :param kind: ``"server"`` for agents the operator registered (built-ins,
+        ``--agent``), ``"user"`` for agents users upload or install.
     """
 
     id: str
@@ -35,7 +41,20 @@ class Agent:
     version: int = 1
     description: str | None = None
     updated_at: int | None = None
-    session_id: str | None = None  # owning conversation id; None for template agents
+    session_id: str | None = None  # a conversation using it; None for server agents
+    created_by: str | None = None
+    kind: str = "server"
+
+    @property
+    def operator_authored(self) -> bool:
+        """Whether the server operator wrote this spec, so ``${VAR}`` may expand.
+
+        Only server agents qualify (built-ins, ``--agent``), which no session
+        uses and no user owns. User agents are tenant input even when no
+        session uses them (an install, or one whose sessions were deleted):
+        expanding their ``${VAR}`` against the server env would leak secrets.
+        """
+        return self.kind == "server" and self.session_id is None and self.created_by is None
 
 
 @dataclass

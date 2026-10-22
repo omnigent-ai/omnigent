@@ -5,7 +5,7 @@ terminal and mirrors its transcript into the Omnigent session via the RPC read
 driver (the read path). This executor is the **write path**: when a turn is
 submitted from the Omnigent web/mobile UI it delivers the user's message by
 TYPING IT INTO the agy TUI pane over tmux
-(:func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`), exactly
+(:func:`omnigent.harnesses.antigravity_native.bridge.inject_user_message_via_tui`), exactly
 like the **claude**/**codex** native bridges drive their vendor panes. agy then
 runs a real model turn and its reply flows back through the read driver.
 
@@ -62,14 +62,14 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_DIR_ENV_VAR,
     ANTIGRAVITY_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     inject_user_message_via_tui,
     is_placeholder_conversation_id,
     read_bridge_state,
 )
-from omnigent.antigravity_native_rpc import (
+from omnigent.harnesses.antigravity_native.rpc import (
     cancel_cascade_steps,
     resolve_language_server_port,
 )
@@ -82,9 +82,10 @@ from omnigent.inner.executor import (
     Message,
     ToolSpec,
     TurnComplete,
+    describe_exception,
 )
 from omnigent.llms.errors import PermanentLLMError
-from omnigent.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
+from omnigent.util.reasoning_effort import ANTIGRAVITY_EFFORTS, validate_effort_or_llm_error
 
 _logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ class AntigravityNativeExecutor(Executor):
         Resolves the cascade id from bridge state (the cascade id IS the
         conversation id), discovers agy's connect-RPC port, and asks agy to
         cancel the running cascade
-        (:func:`omnigent.antigravity_native_rpc.cancel_cascade_steps`).
+        (:func:`omnigent.harnesses.antigravity_native.rpc.cancel_cascade_steps`).
 
         .. note:: **Scope — RUNNING cascades only (live-verified, C3).**
            ``CancelCascadeSteps`` stops an in-flight (generating) cascade — the
@@ -158,7 +159,7 @@ class AntigravityNativeExecutor(Executor):
            (ask-question / command-permission): agy returns HTTP 200 but the
            WAITING step does not transition. A WAITING step is unblocked by
            delivering a DENY through the interaction bridge
-           (:mod:`omnigent.antigravity_native_interactions`), NOT here — this
+           (:mod:`omnigent.harnesses.antigravity_native.interactions`), NOT here — this
            method deliberately does not attempt to handle that case.
 
         :param session_key: Adapter session key. Unused; the native bridge is
@@ -205,7 +206,7 @@ class AntigravityNativeExecutor(Executor):
         Resolves agy's conversation/cascade id (waiting briefly for the runner to
         mint it on the first turn), discovers the connect-RPC port, resolves the
         per-turn model, and delivers the message via ``SendUserCascadeMessage``
-        (:func:`omnigent.antigravity_native_rpc.send_user_cascade_message`), which
+        (:func:`omnigent.harnesses.antigravity_native.rpc.send_user_cascade_message`), which
         agy records as a real ``USER_INPUT`` turn. The assistant reply is mirrored
         back by the RPC read driver, so this yields a single :class:`TurnComplete`
         with no text on success (never a fabricated reply). On any failure it
@@ -231,7 +232,7 @@ class AntigravityNativeExecutor(Executor):
             try:
                 validate_effort_or_llm_error(effort, "antigravity", ANTIGRAVITY_EFFORTS)
             except PermanentLLMError as exc:
-                yield ExecutorError(message=str(exc))
+                yield ExecutorError(message=describe_exception(exc))
                 return
         text = _latest_user_text(messages, self._bridge_dir)
         if not text:
@@ -250,7 +251,7 @@ class AntigravityNativeExecutor(Executor):
         Shared by :meth:`run_turn` (initiating message) and
         :meth:`enqueue_session_message` (mid-turn steering). The turn is injected
         into the agy TUI pane over tmux (bracketed paste + Enter — see
-        :func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`)
+        :func:`omnigent.harnesses.antigravity_native.bridge.inject_user_message_via_tui`)
         rather than delivered over headless ``SendUserCascadeMessage`` RPC.
 
         Typing into the TUI is what gives antigravity-native true parity with
@@ -270,7 +271,7 @@ class AntigravityNativeExecutor(Executor):
         Unlike the RPC path, this needs no cascade id, port, or per-turn model
         resolution up front: the TUI owns its cascade and its selected model, and
         agy mints the cascade on the first typed turn (which the read driver then
-        discovers/binds — see :mod:`omnigent.antigravity_native_reader`).
+        discovers/binds — see :mod:`omnigent.harnesses.antigravity_native.reader`).
 
         :param text: User message text to deliver.
         :returns: ``None`` on success, or a human-readable error string when the
@@ -345,7 +346,7 @@ def _latest_requested_model(steps: list[dict[str, object]]) -> str | None:
     steps from newest to oldest for the most recent ``CORTEX_STEP_TYPE_USER_INPUT``
     step and returns its model enum. The live wire (agy 1.0.10) carries the enum
     as a STRING at ``userInput.userConfig.plannerConfig.planModel`` — the same
-    field :func:`omnigent.antigravity_native_rpc.send_user_cascade_message` sends
+    field :func:`omnigent.harnesses.antigravity_native.rpc.send_user_cascade_message` sends
     as ``cascadeConfig.plannerConfig.planModel``. A TUI-origin step using the
     older ``requestedModel.model`` (dict) shape is supported as a fallback.
     Newest-first because a later ``/model`` switch must win over an earlier turn's
@@ -353,7 +354,7 @@ def _latest_requested_model(steps: list[dict[str, object]]) -> str | None:
     falls back to the recommended catalog entry.
 
     :param steps: Trajectory steps as returned by
-        :func:`omnigent.antigravity_native_rpc.get_trajectory_steps`.
+        :func:`omnigent.harnesses.antigravity_native.rpc.get_trajectory_steps`.
     :returns: The agy model enum string from the latest USER_INPUT step, or
         ``None`` when no USER_INPUT step carries one (e.g. a first turn).
     """
@@ -381,7 +382,7 @@ def _recommended_model(catalog: dict[str, object]) -> str | None:
     a model.
 
     :param catalog: The parsed ``GetAvailableModels`` response as returned by
-        :func:`omnigent.antigravity_native_rpc.get_available_models`.
+        :func:`omnigent.harnesses.antigravity_native.rpc.get_available_models`.
     :returns: The agy model enum string of the recommended entry, or ``None``.
     """
     models = catalog.get("models")

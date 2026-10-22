@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml as _yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
@@ -127,6 +128,7 @@ def _make_inline_agent_yaml(
     return yaml_path
 
 
+@pytest.mark.compat_smoke
 def test_chat_local_starts_server_and_agent_responds(
     mock_llm_server_url: str | None,
     tmp_path: Path,
@@ -206,6 +208,7 @@ def test_chat_local_starts_server_and_agent_responds(
         _stop_local_server(server)
 
 
+@pytest.mark.compat_smoke
 def test_chat_local_accepts_omnigent_yaml_file(
     mock_llm_server_url: str | None,
     tmp_path: Path,
@@ -312,63 +315,5 @@ def test_chat_local_accepts_omnigent_yaml_file(
         )
         text = final_assistant_text(body)
         assert marker in text, f"Expected marker {marker!r} in agent output. Got: {text!r}"
-    finally:
-        _stop_local_server(server)
-
-
-def test_chat_remote_pick_agent(
-    mock_llm_server_url: str | None,
-    tmp_path: Path,
-) -> None:
-    """
-    Remote chat can list and identify agents on a server.
-
-    Tests the remote mode's agent discovery by starting a server with
-    an inline agent and verifying ``_pick_agent`` finds it.
-
-    **What breaks if this fails:**
-    - _pick_agent can't parse server agent listing response.
-    - Agent name extraction broken.
-    """
-    from omnigent.chat import (
-        _pick_agent,
-        _start_local_server,
-        _stop_local_server,
-        _wait_for_server,
-    )
-
-    agent_name = f"pick-agent-probe-{uuid.uuid4().hex[:6]}"
-    model = f"mock-pick-{uuid.uuid4().hex[:6]}"
-
-    yaml_path = _make_inline_agent_yaml(
-        tmp_path, agent_name=agent_name, model=model, mock_llm_server_url=mock_llm_server_url
-    )
-
-    # Set env vars before _start_local_server so the spawned server
-    # subprocess inherits them through child_env = {**os.environ, ...}.
-    os.environ["OPENAI_API_KEY"] = "mock-key"
-    os.environ["OPENAI_BASE_URL"] = f"{mock_llm_server_url}/v1"
-
-    port = find_free_port()
-    server = _start_local_server(yaml_path, port, ephemeral=True)
-    base_url = f"http://127.0.0.1:{port}"
-
-    try:
-        _wait_for_server(port, server)
-
-        # Create a session so _pick_agent can discover the agent name
-        # from GET /v1/sessions (which it uses to list agent names).
-        client = httpx.Client(base_url=base_url, timeout=30.0)
-        _create_runner_bound_session_for_builtin(
-            client,
-            agent_name=agent_name,
-            runner_id=server.runner_id or "",
-        )
-
-        # _pick_agent auto-selects when there's only one agent.
-        picked = _pick_agent(base_url)
-        assert picked == agent_name, (
-            f"Expected _pick_agent to return {agent_name!r}, got {picked!r}."
-        )
     finally:
         _stop_local_server(server)

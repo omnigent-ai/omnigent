@@ -44,6 +44,7 @@ class Account:
     created_at: int | None
     last_login_at: int | None
     has_password: bool
+    account_generation: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,3 +78,4 @@ class AccountToken:
     created_at: int
     expires_at: int
     invited_is_admin: bool
+    account_generation: str | None = None

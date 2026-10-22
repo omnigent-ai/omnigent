@@ -1,0 +1,16 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: omnigent-sandbox-warm-pool
+  namespace: omnigent-sandboxes
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: omnigent-sandbox-warm-pool
+subjects:
+  - kind: ServiceAccount
+    name: omnigent-server
+    namespace: omnigent

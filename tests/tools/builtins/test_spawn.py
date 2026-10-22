@@ -82,8 +82,8 @@ def test_parallel_description_requires_distinct_titles() -> None:
     title_description = schema["function"]["parameters"]["properties"]["title"]["description"]
 
     assert "distinct task-based title" in description
-    assert "Every independent parallel call" in title_description
-    assert "cannot start another concurrent turn" in title_description
+    assert "auto-assigned" in title_description
+    assert "structured name" in title_description
 
 
 # ── Happy paths ───────────────────────────────────────

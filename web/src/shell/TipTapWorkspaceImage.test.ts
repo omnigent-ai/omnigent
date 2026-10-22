@@ -11,10 +11,12 @@
  * mocked, returning a real FileContentResponse-shaped object.
  */
 
+import type * as UseFileContentModule from "@/hooks/useFileContent";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import {
   createWorkspaceImageExtension,
   ImageAwareLink,
@@ -24,7 +26,7 @@ import {
 import type { FileContentResponse } from "@/hooks/useFileContent";
 
 vi.mock("@/hooks/useFileContent", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/hooks/useFileContent")>();
+  const actual = await importOriginal<typeof UseFileContentModule>();
   // Keep the real fileContentToBlob (the decode logic under test); only the
   // network call is faked.
   return { ...actual, fetchFileContent: vi.fn() };
@@ -356,7 +358,7 @@ describe("node view", () => {
     editor = makeEditor(
       '<img src="https://example.com/logo.png" alt="logo" width="200" height="100" />',
     );
-    const img = editor.view.dom.querySelector("img")!;
+    const img = editor.view.dom.querySelector<HTMLImageElement>('img[alt="logo"]')!;
     expect(img.style.width).toBe("200px");
     expect(img.style.height).toBe("100px");
     // The presentational attributes are removed so Preflight can't win.
@@ -372,7 +374,7 @@ describe("node view", () => {
     editor = makeEditor(
       '<img src="https://example.com/logo.png" alt="logo" width="200" height="100" />',
     );
-    const img = editor.view.dom.querySelector("img")!;
+    const img = editor.view.dom.querySelector<HTMLImageElement>('img[alt="logo"]')!;
     expect(img.style.height).toBe("100px");
     // Drop just the height attr; update() must clear the inline style too, or
     // the removed dimension would visually persist.
@@ -385,8 +387,12 @@ describe("node view", () => {
       tr.setNodeMarkup(imagePos, undefined, { ...node.attrs, height: null });
       return true;
     });
-    expect(editor.view.dom.querySelector("img")!.style.height).toBe("");
+    expect(editor.view.dom.querySelector<HTMLImageElement>('img[alt="logo"]')!.style.height).toBe(
+      "",
+    );
     // The other dimension is untouched.
-    expect(editor.view.dom.querySelector("img")!.style.width).toBe("200px");
+    expect(editor.view.dom.querySelector<HTMLImageElement>('img[alt="logo"]')!.style.width).toBe(
+      "200px",
+    );
   });
 });

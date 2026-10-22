@@ -13,13 +13,17 @@ gated e2e test.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
 import types
 from typing import Any
 
 import pytest
 
+from omnigent.inner import copilot_executor
 from omnigent.inner.copilot_executor import (
+    COPILOT_HOST_ENV_VAR,
     CopilotExecutor,
     _accumulate_usage,
     _ambient_github_token,
@@ -44,6 +48,9 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.onboarding import copilot_auth
+from omnigent.runtime.harnesses._executor_adapter import _bridge_one_dispatch
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 
 
 def _user(content: str, session_id: str = "conv1") -> Message:
@@ -335,6 +342,9 @@ def test_usage_without_copilot_cost_omits_cost_usd() -> None:
 def test_ambient_github_token_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # Stub the gh-CLI fallback: this test pins env-var precedence, and the dev
+    # machine running it may well have a real ``gh`` login.
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: None)
     assert _ambient_github_token() is None
     monkeypatch.setenv("GITHUB_TOKEN", "gho_c")
     monkeypatch.setenv("GH_TOKEN", "gho_b")
@@ -342,8 +352,77 @@ def test_ambient_github_token_precedence(monkeypatch: pytest.MonkeyPatch) -> Non
     assert _ambient_github_token() == "gho_a"
 
 
-def test_capabilities() -> None:
+def test_ambient_github_token_falls_back_to_gh_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No token env var but a ``gh auth login`` session: use the gh token.
+
+    Copilot only picks a ``gh`` login up by reading ``oauth_token`` out of
+    ``~/.config/gh/hosts.yml``, which is absent when ``gh`` keeps the token in an
+    OS keychain (the default on macOS) — so a logged-in user looks
+    credential-less and the session fails to authenticate.
+    """
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: "gho_from_gh")
+    assert _ambient_github_token() == "gho_from_gh"
+
+
+def test_ambient_github_token_prefers_env_over_gh_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_env")
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", lambda host=None: "gho_from_gh")
+    assert _ambient_github_token() == "gho_env"
+
+
+def test_gh_cli_token_requested_for_configured_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A GHE user's gh token must be fetched for their host, not github.com."""
+    for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", "acme.ghe.com")
+    seen: list[str | None] = []
+
+    def _fake(host: str | None = None) -> str:
+        seen.append(host)
+        return "gho_ghe"
+
+    monkeypatch.setattr(copilot_auth, "gh_cli_github_token", _fake)
+    assert _ambient_github_token() == "gho_ghe"
+    assert seen == ["acme.ghe.com"]
+
+
+def test_host_env_var_spelling_matches_onboarding() -> None:
+    """The executor spells the CLI's host env var itself (onboarding is lazy-imported)."""
+    assert COPILOT_HOST_ENV_VAR == copilot_auth.COPILOT_HOST_ENV_VAR
+
+
+async def test_github_host_exported_for_bundled_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK has no host parameter, so the GHE host only reaches the bundled
+    CLI as an env var it inherits from us."""
+    _install_fake_copilot(monkeypatch, [[]])
+    monkeypatch.delenv(COPILOT_HOST_ENV_VAR, raising=False)
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
+    ex = CopilotExecutor(github_host="acme.ghe.com")
+    assert ex._github_host == "acme.ghe.com"
+    assert COPILOT_HOST_ENV_VAR not in os.environ, "set at session start, not construction"
+    async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
+        pass
+    assert os.environ[COPILOT_HOST_ENV_VAR] == "acme.ghe.com"
+
+
+async def test_hostless_executor_clears_a_leftover_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hostless executor must not inherit a host another one left in the env."""
+    _install_fake_copilot(monkeypatch, [[]])
+    monkeypatch.setenv(COPILOT_HOST_ENV_VAR, "stale.ghe.com")
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_x")
+    monkeypatch.setattr(copilot_executor, "_AMBIENT_HOST", None)
+    monkeypatch.setattr(copilot_auth, "copilot_github_host", lambda config=None: None)
     ex = CopilotExecutor()
+    assert ex._github_host is None
+    async for _ in ex.run_turn([_user("hi")], tools=[], system_prompt=""):
+        pass
+    assert COPILOT_HOST_ENV_VAR not in os.environ
+
+
+def test_capabilities() -> None:
+    ex = CopilotExecutor(github_token="fixture-token")
     assert ex.supports_streaming() is True
     assert ex.supports_tool_calling() is True
     assert ex.handles_tools_internally() is True
@@ -367,12 +446,75 @@ def test_encode_tool_result_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     assert js.result_type == "success" and "value" in js.text_result_for_llm
 
 
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.asyncio
+async def test_image_tool_dispatch_preserves_text_and_status(
+    monkeypatch: pytest.MonkeyPatch, is_error: bool
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    output = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "Image tool evidence"},
+            {
+                "type": "image",
+                "mimeType": "image/gif",
+                "data": "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+            },
+            {"type": "text", "text": "Trailing detail"},
+        ],
+        is_error=is_error,
+    )
+
+    async def dispatch_tool(**kwargs: object) -> str:
+        assert kwargs["name"] == "image_tool"
+        return output
+
+    ctx: Any = types.SimpleNamespace(dispatch_tool=dispatch_tool)
+
+    async def tool_executor(name: str, args: dict[str, Any]) -> object:
+        return await _bridge_one_dispatch(ctx, "copilot", name, args)
+
+    ex = CopilotExecutor(github_token="fixture-token")
+    ex._tool_executor = tool_executor
+    handler = ex._make_handler("image_tool")
+    result = await handler(types.SimpleNamespace(arguments={}, tool_call_id="image-call"))
+
+    assert result.text_result_for_llm == output
+    assert json.loads(result.text_result_for_llm) == json.loads(output)
+    assert result.result_type == ("failure" if is_error else "success")
+    assert result.error == (result.text_result_for_llm if is_error else None)
+
+
+@pytest.mark.parametrize(
+    ("payload", "result_type"),
+    [
+        ('{"error": "string payload"}', "success"),
+        ({"result": '{"error":"documentation example"}'}, "success"),
+        ({"content": {"blocked": True}}, "success"),
+        ({"cancelled": True}, "success"),
+        ({"cancelled": True, "blocked": True}, "failure"),
+        ({"cancelled": True, "error": "boom"}, "failure"),
+    ],
+)
+def test_encode_tool_result_preserves_ordinary_payload_and_cancellation_behavior(
+    monkeypatch: pytest.MonkeyPatch, payload: object, result_type: str
+) -> None:
+    _install_fake_copilot(monkeypatch)
+
+    result = _encode_tool_result(payload)
+
+    assert result.text_result_for_llm == (
+        payload if isinstance(payload, str) else json.dumps(payload)
+    )
+    assert result.result_type == result_type
+
+
 @pytest.mark.asyncio
 async def test_bridged_tool_handler_routes_to_tool_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_copilot(monkeypatch)
-    ex = CopilotExecutor()
+    ex = CopilotExecutor(github_token="fixture-token")
     seen: list[tuple[str, dict[str, Any]]] = []
 
     async def fake_exec(name: str, args: dict[str, Any]) -> Any:
@@ -392,7 +534,7 @@ async def test_bridged_tool_handler_surfaces_exception_as_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_copilot(monkeypatch)
-    ex = CopilotExecutor()
+    ex = CopilotExecutor(github_token="fixture-token")
 
     async def boom(name: str, args: dict[str, Any]) -> Any:
         raise RuntimeError("kaboom")
@@ -1215,7 +1357,7 @@ async def test_empty_prompt_completes_without_send(monkeypatch: pytest.MonkeyPat
 @pytest.mark.asyncio
 async def test_bridged_tool_handler_no_executor_wired(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_copilot(monkeypatch)
-    ex = CopilotExecutor()  # _tool_executor stays None (single-process / pre-turn)
+    ex = CopilotExecutor(github_token="fixture-token")  # _tool_executor stays None
     handler = ex._make_handler("sys_x")
     result = await handler(types.SimpleNamespace(arguments={}, tool_call_id="c"))
     assert result.result_type == "failure"

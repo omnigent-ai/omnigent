@@ -12,6 +12,7 @@
 
 import { useEffect, useState } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { onHostStatusChanged } from "@/lib/nativeBridge";
 
 // Minimal shape the poller needs from each session: just its id. Both
 // the sidebar `Conversation` list and a single-session snapshot satisfy
@@ -71,6 +72,10 @@ export function useRunnerHealth(
   sessions: RunnerHealthInput[] | undefined,
 ): Map<string, SessionLiveness> {
   const [statusMap, setStatusMap] = useState<Map<string, SessionLiveness>>(new Map());
+  const [hostStatusRevision, setHostStatusRevision] = useState(0);
+
+  // Desktop reconnects should update the badge without waiting for the next poll.
+  useEffect(() => onHostStatusChanged(() => setHostStatusRevision((revision) => revision + 1)), []);
 
   useEffect(() => {
     if (!sessions || sessions.length === 0) {
@@ -130,7 +135,7 @@ export function useRunnerHealth(
       cancelled = true;
       if (timer !== null) clearTimeout(timer);
     };
-  }, [sessions]);
+  }, [sessions, hostStatusRevision]);
 
   return statusMap;
 }

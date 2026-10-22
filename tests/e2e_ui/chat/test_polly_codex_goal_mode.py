@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.conftest import fetch_with_retry
+
 
 def _patch_session_as_polly_codex(page: Page, session_id: str) -> None:
     """Expose the seeded session as top-level Polly on Codex."""
@@ -17,7 +19,7 @@ def _patch_session_as_polly_codex(page: Page, session_id: str) -> None:
             route.continue_()
             return
 
-        response = route.fetch()
+        response = fetch_with_retry(route)
         payload = response.json()
         payload["agent_name"] = "polly"
         payload["harness"] = "codex"
@@ -49,9 +51,10 @@ def test_polly_codex_goal_sends_native_command(
     page.route(f"**/v1/sessions/{session_id}/events", _ack_event)
     page.goto(f"{base_url}/c/{session_id}")
 
-    goal_toggle = page.get_by_test_id("goal-toggle")
+    page.get_by_test_id("composer-attach").click()
+    goal_toggle = page.get_by_test_id("composer-goal-action")
     expect(goal_toggle).to_be_visible(timeout=15_000)
-    expect(goal_toggle).to_have_attribute("aria-label", "Start Codex goal")
+    expect(goal_toggle).to_contain_text("Goal")
     goal_toggle.click()
 
     condition = "Finish the implementation and pass all tests"

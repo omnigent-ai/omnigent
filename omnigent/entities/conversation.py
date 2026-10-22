@@ -8,7 +8,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.inner.native_attachments import (
+    UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
+    reject_authored_framework_notices,
+)
+from omnigent.llms.adapters._content import redact_binary_payloads
 
 # Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -24,6 +28,11 @@ from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTE
 _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )
+
+# Generated titles stay compact by default, while explicit user formats and
+# manually assigned titles have room for structured identifiers.
+DEFAULT_GENERATED_TITLE_MAX_CHARS = 100
+USER_SESSION_TITLE_MAX_CHARS = 200
 
 # ── Conversation ──────────────────────────────────────
 
@@ -95,6 +104,8 @@ class Conversation:
         nested ``by_model`` object. Persisted as a JSON column and
         loaded by the policy engine builder at workflow start. Empty
         dict when no LLM calls have been recorded yet.
+    :param session_todos: Latest native Plan display snapshot, restored after
+        Server restart without invoking the harness or replaying task work.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -102,9 +113,16 @@ class Conversation:
         (alongside the runner-binding primitive of the Alpha
         runner-state design). Both paths validate the value against
         the supported set; invalid values fail with ``invalid_input``.
-    :param model_override: Per-session LLM model override,
-        e.g. ``"claude-opus-4-7"``. ``None`` means use the agent
-        default from the spec's ``llm.model``. Mutable via
+    :param reported_model: The model the harness last REPORTED the
+        session is actually on, verbatim in the harness's own
+        spelling, e.g. ``"claude-opus-4-8[1m]"``. Written only by
+        harness reports (native ``external_model_change`` events or
+        SDK terminal-response usage); never by user picks. The only
+        model value UI surfaces display. ``None`` means no report has
+        arrived yet.
+    :param model_override: Per-session LLM model override — the user's
+        REQUEST, e.g. ``"claude-opus-4-7"``. ``None`` means use the
+        agent default from the spec's ``llm.model``. Mutable via
         ``PATCH /v1/sessions/{id}`` and the REPL's ``/model``
         command. Mirrors the persistence shape of
         ``reasoning_effort`` so the web UI and the TUI stay
@@ -118,6 +136,14 @@ class Conversation:
         ``PATCH /v1/sessions/{id}`` (the web "Cost Optimized"
         toggle). Read by the cost-control advisor pipeline at turn
         start; mirrors the persistence shape of ``model_override``.
+    :param subagent_routing_override: Per-session subagent-routing
+        switch, two-state: ``"on"`` routes native/SDK subagent spawns,
+        and ``"off"`` or ``None`` (unset) both leave them on the parent's
+        model. A session created on Smart Routing is stamped ``"on"`` by
+        the create route, so unset reads as Default and inherits nothing.
+        Mutable via ``PATCH /v1/sessions/{id}`` at any time; read per
+        spawn by the route-subagent relay, so a change takes effect on
+        the next spawn.
     :param harness_override: Per-session harness override for the
         bound agent's brain, e.g. ``"pi"`` or ``"openai-agents"``.
         ``None`` means use the harness declared in the agent spec
@@ -134,6 +160,15 @@ class Conversation:
         allowlisted ``args.harness`` (gated by the sub-agent spec's
         ``executor.config.allowed_harnesses``); that value is set on the
         child's own row, not inherited.
+    :param share_workspace_files: Whether the owner opted into letting
+        people with *view* (read-only) access browse the session's
+        workspace files — the Files/Changes/GitHub-diff surfaces and the
+        file contents behind them. ``False`` (the default) keeps those
+        surfaces edit-only, so a plain read grant shares the conversation
+        without exposing the workspace (which routinely holds secrets like
+        ``.env`` / key files). Set from the share dialog (manage-gated) via
+        ``PATCH /v1/sessions/{id}``; never widens absolute-path browsing,
+        which stays owner-only. See ``designs/SESSIONS_AUTH.md``.
     :param sub_agent_name: For sub-agent sessions (``kind="sub_agent"``),
         the sub-agent type name within the parent's spec tree,
         e.g. ``"summarizer"``. The runner uses this to resolve the
@@ -210,11 +245,17 @@ class Conversation:
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
+    session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
+    inference_snapshot: dict[str, Any] | None = None
+    reported_model: str | None = None
     cost_control_mode_override: str | None = None
+    subagent_routing_override: str | None = None
     harness_override: str | None = None
+    share_workspace_files: bool = False
     sub_agent_name: str | None = None
+    task_summary: str | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     workspace: str | None = None
@@ -224,9 +265,13 @@ class Conversation:
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
     # None = never reported); ``pending_elicitation_count`` is the
-    # outstanding approval-prompt count (None = never written).
+    # outstanding approval-prompt count (None = never written);
+    # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
+    # seconds, None = no live stamp) — carried on the row so a session list
+    # can judge runner liveness without a second connectivity query.
     live_status: str | None = None
     pending_elicitation_count: int | None = None
+    runner_last_seen: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
@@ -234,6 +279,14 @@ class Conversation:
 
 
 # ── Conversation item data types ───────────────────────
+
+
+class StartupInputOptions(BaseModel):
+    """Request options retained only while a startup input awaits delivery."""
+
+    model_override: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    background_titles_enabled: bool = False
 
 
 class MessageData(BaseModel):
@@ -254,6 +307,12 @@ class MessageData(BaseModel):
         turn, e.g. Codex ``turn/completed`` with status
         ``"interrupted"``. Defaults to ``False`` and is omitted from
         serialized payloads in that case.
+    :param stream_message_id: Native live-preview stream finalized by
+        this assistant message. Persisted so reconnect snapshots can
+        suppress delayed preview chunks after the authoritative item.
+    :param user_authored: Confirmed or conservatively preserved user input;
+        prevents legacy content cleanup from hiding literal agent markup.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     role: Literal["user", "assistant"]
@@ -261,7 +320,19 @@ class MessageData(BaseModel):
     content: list[dict[str, Any]]
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
+    user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
+    stream_message_id: str | None = None
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("content")
+    @classmethod
+    def reject_framework_blocks(cls, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reject_authored_framework_notices(content)
+        return content
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
@@ -325,12 +396,16 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param namespace: Tool namespace the model emitted the call under,
+        e.g. ``"container"``. ``None`` for the default namespace. Harnesses
+        that replay history must round-trip it with the call.
     """
 
     agent: str = Field(serialization_alias="model")
     name: str
     arguments: str
     call_id: str
+    namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FunctionCallOutputData(BaseModel):
@@ -340,10 +415,12 @@ class FunctionCallOutputData(BaseModel):
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
     :param output: The tool's string result.
+    :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     call_id: str
     output: str
+    subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ErrorData(BaseModel):
@@ -360,11 +437,25 @@ class ErrorData(BaseModel):
         ``"native_terminal_start_failed"``.
     :param message: Human-readable error message, e.g.
         ``"Native Codex requires the 'codex' CLI on PATH."``.
+    :param level: Rendering level. ``"info"`` renders the banner as a neutral
+        notice (e.g. codex started a fresh thread) rather than a failure;
+        ``None`` / ``"error"`` is the destructive default and is omitted from
+        the wire so existing error items are unchanged.
+    :param title: Optional short headline naming the failure, e.g. ``"Codex can't
+        start until you sign in to Databricks"``. Kept so the card reads the
+        same after a reload as it did live.
+    :param cause: Optional one or two sentences explaining why it failed.
+    :param remediation: Optional concrete next step, e.g. the sign-in link
+        and code; the card offers it as an action.
     """
 
-    source: Literal["llm", "execution", "tool"]
+    source: Literal["llm", "execution", "tool", "harness"]
     code: str
     message: str
+    level: Literal["error", "info"] | None = None
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
     @field_validator("code", "message")
     @classmethod
@@ -404,6 +495,21 @@ class ReasoningData(BaseModel):
     encrypted_content: str | None = None
 
 
+def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:
+    """
+    Build the marker written over a dropped compaction-snapshot payload.
+
+    The payload length is deliberately unused: a compaction row is
+    re-validated on every read, so a length would describe the previous
+    marker on the second pass and the strip would stop being idempotent.
+
+    :param media_type: The block's declared media type, if any.
+    :param _payload_length: Unused.
+    :returns: The replacement text.
+    """
+    return f"[{media_type or 'binary'} content omitted from the compaction snapshot]"
+
+
 class CompactionData(BaseModel):
     """
     Data payload for a compaction summary item.
@@ -426,6 +532,10 @@ class CompactionData(BaseModel):
         e.g. ``"openai/gpt-4o"``.
     :param token_count: Approximate token count of the summary
         text, for budget tracking, e.g. ``342``.
+    :param window_id: Opaque vendor compaction-window identifier. Current
+        Codex writes a UUID string to ``payload.window_id`` on its
+        ``type == "compacted"`` rollout JSONL record; older Codex rollouts
+        used integer counters there.
     """
 
     summary: str
@@ -433,7 +543,31 @@ class CompactionData(BaseModel):
     model: str | None = None
     token_count: int
     compacted_messages: list[dict[str, Any]] | None = None
-    window_id: int | None = None
+    window_id: int | str | None = None
+
+    @field_validator("compacted_messages")
+    @classmethod
+    def strip_binary_payloads(
+        cls,
+        value: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        """
+        Drop base64 payloads from the compaction snapshot.
+
+        Every harness builds the snapshot by copying its vendor transcript
+        verbatim, so a single screenshot turns one compaction item into
+        megabytes of base64 that is stored forever and re-read on every
+        session load. Stripping here rather than in each forwarder covers
+        every producer through one seam. Only newly written rows shrink —
+        a row already on disk keeps its size, and validation runs on the
+        way out, not back into the store.
+
+        :param value: The compacted message list, or ``None``.
+        :returns: The list with binary payloads replaced by a marker,
+            or ``None`` unchanged.
+        """
+        reject_authored_framework_notices(value)
+        return redact_binary_payloads(value, _binary_payload_omitted)
 
 
 class NativeToolData(BaseModel):
@@ -532,6 +666,38 @@ class RoutingDecisionData(BaseModel):
     :param rationale: The router's one-line explanation, shown as muted
         secondary text, e.g. ``"Multi-file refactor needs deep
         reasoning."``.
+    :param harness: Harness the decision applies to, e.g.
+        ``"claude-native"`` or ``"codex"``. ``None`` when the decision
+        picked a model only (no harness dimension).
+    :param scope: What the decision governs — ``"session"`` (auto-harness
+        session routing), ``"turn"`` (per-turn routing), ``"child_session"``
+        (an Omnigent-spawned sub-agent) or ``"native_subagent"`` (a Task /
+        ``spawn_agent`` spawn routed inside the harness). Defaults to
+        ``"turn"`` so rows persisted before this field deserialize.
+    :param decision_id: Router decision identifier, e.g.
+        ``"3f1c…"``. Correlates the transcript item with the routing
+        telemetry event and the child-sessions API row. ``None`` for
+        decisions made before decision ids existed.
+    :param raw_model: The router-vocabulary pick before resolution to a
+        servable catalog id, e.g. ``"gpt-5-6-sol"``. ``None`` when the
+        pick needed no resolution.
+    :param attempted_override: Model the spawning agent asked for and the
+        router overrode, e.g. ``"databricks-gpt-5-5"`` — an LLM-supplied
+        ``args.model`` on a child session, or a native spawn's own
+        ``requested_model``. ``None`` when nothing was asked for, or when
+        the router's pick names the same arm as the ask.
+    :param router_source: Which router produced the decision —
+        ``"databricks-aigw"`` for the external AI-Gateway ``task_v1``
+        service, ``"oss-llm"`` for the built-in judge. Deliberately a
+        plain ``str`` rather than a ``Literal``: a source added later
+        must still round-trip through stored rows and the wire instead
+        of failing validation. ``None`` on rows written before the
+        field existed.
+    :param task_description: Human label of the task/spawn this decision
+        governed, e.g. ``"Research auth flows"`` — what ties a fan-out's
+        decision to its sub-agent when every spawn shares one
+        :attr:`agent` type. ``None`` when the spawn carried none, and on
+        rows written before the field existed.
     """
 
     model: str
@@ -541,6 +707,13 @@ class RoutingDecisionData(BaseModel):
     #: item is being mirrored into the parent's transcript, e.g. ``"claude_code"``.
     #: ``None`` for session-local routing decisions (the usual case).
     agent: str | None = None
+    harness: str | None = None
+    scope: Literal["session", "turn", "child_session", "native_subagent"] = "turn"
+    decision_id: str | None = None
+    raw_model: str | None = None
+    attempted_override: str | None = None
+    router_source: str | None = None
+    task_description: str | None = None
 
     @field_validator("model")
     @classmethod
@@ -591,6 +764,9 @@ class SlashCommandData(BaseModel):
     name: str
     arguments: str
     output: str | None = None
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 ItemData = (
@@ -693,6 +869,15 @@ class NewConversationItem(BaseModel):
     response_id: str
     data: ItemData
     created_by: str | None = None
+    # Deterministic item id for idempotent appends. When set, the store uses
+    # it as the item's id and treats an already-persisted item with this id
+    # as the append's result instead of inserting a duplicate — the retry
+    # contract for at-least-once producers (a transcript forwarder cannot
+    # know whether a timed-out POST committed). Same 32-hex shape the store
+    # mints itself; ``None`` keeps the store-assigned random id.
+    stable_id: str | None = None
+    status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
+    replaces_pending_id: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -703,6 +888,8 @@ class NewConversationItem(BaseModel):
         :raises ValueError: If ``type`` does not match ``data``.
         """
         _validate_type_matches_data(self.type, self.data)
+        if self.stable_id is not None and not re.fullmatch(r"[0-9a-f]{32}", self.stable_id):
+            raise ValueError("stable_id must be a 32-char lowercase hex string")
         return self
 
 
@@ -729,6 +916,10 @@ class ConversationItem(BaseModel):
     created_at: int
     data: ItemData
     created_by: str | None = None
+    # In-process signal only (excluded from every dump / API shape): ``True``
+    # when an idempotent append found this item already persisted under its
+    # ``stable_id``, so the caller can skip a duplicate's side effects.
+    deduplicated: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> ConversationItem:
@@ -762,17 +953,23 @@ class ConversationItem(BaseModel):
 
         :returns: Flat dict, e.g. for an assistant message::
 
-            {"id": "msg_abc", "response_id": "resp_xyz",
-             "type": "message", "status": "completed",
-             "role": "assistant",
-             "content": [{"type": "output_text", "text": "hi"}],
-             "model": "databricks-gpt-5-4"}
+            {
+                "id": "msg_abc",
+                "response_id": "resp_xyz",
+                "type": "message",
+                "status": "completed",
+                "created_at": 1753900000,
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}],
+                "model": "databricks-gpt-5-4",
+            }
         """
         return {
             "id": self.id,
             "response_id": self.response_id,
             "type": self.type,
             "status": self.status,
+            "created_at": self.created_at,
             **self.data.model_dump(exclude_none=True, by_alias=True),
             # created_by is present only for human-authored items;
             # omitted (not null) for agent/tool/system messages so the

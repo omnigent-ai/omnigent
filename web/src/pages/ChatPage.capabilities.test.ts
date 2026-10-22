@@ -1,17 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   effortLevelsForConv,
-  isModelImplicitlySelected,
+  modelPickerKindForConv,
   shouldShowEffortPicker,
   shouldShowModelPicker,
 } from "./ChatPage";
 
-// These pin the label-driven composer capability gates (effort levels, model
-// picker, effort picker) and the model-row implicit-selection match. They
-// fail closed on missing labels, so a refactor that loosens the gate would
-// expose model/effort controls on sessions that can't honor mid-session
-// overrides (codex-native pins its model at launch; non-claude wrappers have
-// no Web UI effort dial).
+// These pin the composer capability gates (effort levels, model picker, effort
+// picker). Wrapper labels are authoritative; the resolved harness is the fallback
+// for any session with no presentation label — chat-first custom Codex agents,
+// and sessions created before their harness was renamed (the ACP-era Devin rows).
+// Label-less sessions on a NON-native harness still fail closed, and so does a
+// label-less sub-agent child.
 
 const NATIVE = "claude-code-native-ui";
 
@@ -26,6 +26,27 @@ describe("effortLevelsForConv", () => {
       "xhigh",
       "max",
     ]);
+  });
+
+  it("returns only the selected model's rungs for devin-native-ui", () => {
+    // WHY: Devin has no --effort flag — effort is a suffix on the model id, and
+    // the rungs are per model. swe-2 has no low/xhigh (`swe-2-low` is a different
+    // Fusion model), so offering them would compose an id Devin resolves back to
+    // the bare family, and the pick would look like it did nothing.
+    const conv = { labels: { "omnigent.wrapper": "devin-native-ui" } };
+    const catalog = [
+      {
+        id: "swe-2",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "medium" },
+          { reasoningEffort: "high" },
+          { reasoningEffort: "max" },
+        ],
+      },
+    ];
+    expect(effortLevelsForConv(conv, catalog, "swe-2")).toEqual(["medium", "high", "max"]);
+    // No catalog yet, or a model with no effort dimension: nothing to offer.
+    expect(effortLevelsForConv(conv)).toEqual([]);
   });
 
   it("returns the base three levels for a non-native wrapper", () => {
@@ -67,11 +88,41 @@ describe("shouldShowModelPicker", () => {
     // pi injects a live model switch into the running Pi process (via the bridge
     // inbox → setModel) and mirrors in-TUI /model picks back to model_override.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "pi-native-ui" } })).toBe(true);
+    // devin mirrors its live model into model_override (the executor types
+    // /model when a routed model changes), like opencode/pi.
+    expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(true);
+  });
+
+  it("shows the picker for generic ACP sessions with a curated catalog", () => {
+    const catalog = [{ id: "gpt-5.4" }, { id: "claude-fable-5" }];
+    expect(shouldShowModelPicker({ labels: {}, harness: "acp" }, catalog)).toBe(true);
+    expect(modelPickerKindForConv({ labels: {}, harness: "acp" }, catalog)).toBe("acp");
+  });
+
+  it("hides the ACP picker until there are models to choose between", () => {
+    const conv = { labels: {}, harness: "acp" };
+    expect(shouldShowModelPicker(conv)).toBe(false);
+    expect(shouldShowModelPicker(conv, [])).toBe(false);
+    expect(shouldShowModelPicker(conv, [{ id: "gpt-5.4" }])).toBe(false);
+  });
+
+  it("keeps an explicit sandbox policy authoritative for SDK and single-model ACP sessions", () => {
+    for (const harness of ["claude-sdk", "acp"]) {
+      const conv = { labels: {}, harness, inferenceConfigured: true };
+      expect(modelPickerKindForConv(conv, [{ id: "private/model" }])).toBe("configured");
+      expect(shouldShowModelPicker(conv, [])).toBe(true);
+    }
   });
 
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
-    // WHY: a loosened gate would pop a non-functional picker on codex-native
-    // (model pinned at launch) and on pre-hydration rows.
+    // A label-less session resolves its wrapper label from the harness
+    // (nativeCodingAgentForHarness), so the negative cases pin harnesses that
+    // map to no picker family.
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);
+    // WHY: a wrapper-looking string is not a resolved harness, and
+    // pre-hydration rows still have no capability evidence.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "codex-native" } })).toBe(false);
     expect(shouldShowModelPicker({ labels: {} })).toBe(false);
     expect(shouldShowModelPicker(null)).toBe(false);
@@ -84,6 +135,14 @@ describe("shouldShowEffortPicker", () => {
     // WHY: delegates to supportsEffortControl — only claude-native exposes a
     // Web UI effort dial.
     expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": NATIVE } })).toBe(true);
+  });
+
+  it("shows effort controls for devin-native (effort is a model-variant suffix)", () => {
+    // WHY: Devin has no --effort flag; effort is a model-variant suffix the
+    // executor recombines and re-applies via /model, so the in-chat dial is live.
+    expect(shouldShowEffortPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(
+      true,
+    );
   });
 
   it("hides effort controls for other wrappers and missing labels", () => {
@@ -119,34 +178,74 @@ describe("shouldShowEffortPicker", () => {
   });
 });
 
-describe("isModelImplicitlySelected", () => {
-  it("matches a tier alias against the bound full spec by suffix", () => {
-    // WHY: with no explicit override, the row whose alias is the suffix of the
-    // bound spec ("anthropic/claude-opus-4-8" → "opus" via includes) lights up
-    // so the user sees which model is actually running.
-    expect(isModelImplicitlySelected("opus", "anthropic/claude-opus-4-8")).toBe(true);
+describe("label-less native sessions (e.g. created before a harness rename)", () => {
+  // The ACP-era Devin rows are the live case: no `omnigent.wrapper` label, while
+  // the snapshot reports the canonical harness and the runner already resolves
+  // them to native and gives them a pane. Without the harness fallback every
+  // label-driven surface reads them as non-native.
+  const oldDevin = { labels: {}, harness: "devin-native" };
+
+  it("resolves a label-less devin session to Devin's picker", () => {
+    expect(modelPickerKindForConv(oldDevin)).toBe("devin");
   });
 
-  it("matches an exact spec equality", () => {
-    // WHY: the identity branch — a fully-qualified id that equals the bound
-    // spec is selected.
-    expect(isModelImplicitlySelected("databricks-gpt-5-4", "databricks-gpt-5-4")).toBe(true);
+  it("gives it Devin's per-model rungs rather than the base ladder", () => {
+    const catalog = [
+      {
+        id: "swe-2",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "max" }],
+      },
+    ];
+    expect(effortLevelsForConv(oldDevin, catalog, "swe-2")).toEqual(["high", "max"]);
   });
 
-  it("matches a path-suffix without a substring false-positive elsewhere", () => {
-    // WHY: the endsWith("/id") branch — the alias is the trailing path segment.
-    expect(isModelImplicitlySelected("sonnet", "anthropic/claude-sonnet")).toBe(true);
+  it("still covers label-less codex, which this replaced a special case for", () => {
+    expect(modelPickerKindForConv({ labels: {}, harness: "codex-native" })).toBe("codex");
   });
 
-  it("returns false when no model is bound (null spec)", () => {
-    // WHY: nothing bound → nothing implicitly selected; guards the early null
-    // return so we don't highlight a row on a fresh session.
-    expect(isModelImplicitlySelected("opus", null)).toBe(false);
+  it("does NOT resolve a label-less sub-agent child", () => {
+    // A child owns no PTY and takes no input, so a native harness alone must not
+    // earn it a picker — the ACP-era children carry no wrapper label either.
+    expect(
+      modelPickerKindForConv({
+        labels: {},
+        harness: "devin-native",
+        parentSessionId: "conv_parent",
+      }),
+    ).toBeNull();
   });
 
-  it("returns false when the alias appears nowhere in the bound spec", () => {
-    // WHY: a non-matching alias must not light up — otherwise two rows could
-    // read as selected.
-    expect(isModelImplicitlySelected("opus", "anthropic/claude-sonnet-4")).toBe(false);
+  it("keeps an explicit label authoritative over the harness", () => {
+    expect(
+      modelPickerKindForConv({
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        harness: "devin-native",
+      }),
+    ).toBe("claude");
+  });
+
+  it("still fails closed for a label-less non-native harness", () => {
+    expect(modelPickerKindForConv({ labels: {}, harness: "openai-agents" })).toBeNull();
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+  });
+});
+
+describe("shouldShowEffortPicker for SDK harnesses (declared effort family)", () => {
+  it("opens the picker for a label-less claude-sdk / codex session with a family", () => {
+    // WHY: the SDK executors already honor the session's reasoning_effort;
+    // only the label-only gate kept the control hidden.
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" }, "anthropic")).toBe(true);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "codex" }, "openai")).toBe(true);
+  });
+
+  it("stays closed with no family, a ladder-less family, or on a sub-agent child", () => {
+    expect(shouldShowEffortPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowEffortPicker({ labels: {}, harness: "openai-agents" }, "none")).toBe(false);
+    expect(
+      shouldShowEffortPicker(
+        { labels: {}, harness: "claude-sdk", parentSessionId: "parent" },
+        "anthropic",
+      ),
+    ).toBe(false);
   });
 });

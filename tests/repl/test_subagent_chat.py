@@ -24,7 +24,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from omnigent_client import OmnigentError
+from omnigent_client import OmnigentError, PaginatedList
 from omnigent_client._sessions import Session as SessionSnapshot
 from omnigent_client._sessions import SessionsNamespace
 from omnigent_ui_sdk.terminal._host import TerminalHost
@@ -35,7 +35,7 @@ from omnigent.repl._repl import (
     _should_discover_subagents,
 )
 from omnigent.server.schemas import SessionStatusEvent
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 
 # ── Host-level: chattability + closed status (B / F2 / F5) ─────────────────
 
@@ -194,8 +194,10 @@ class _DiscoverySessions:
     def __init__(self, by_parent: dict[str, list[dict[str, Any]]]) -> None:
         self._by_parent = by_parent
 
-    async def child_sessions(self, session_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
-        return list(self._by_parent.get(session_id, []))
+    async def child_sessions(
+        self, session_id: str, *, limit: int = 100, after: str | None = None
+    ) -> PaginatedList:
+        return PaginatedList(data=list(self._by_parent.get(session_id, [])), has_more=False)
 
     async def child_sessions_tree(
         self, session_id: str, *, max_depth: int = 3, limit: int = 100

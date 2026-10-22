@@ -50,7 +50,7 @@ _PROMOTE_MSG = "sentinel-promote-91b2 keep this bubble"
 _QUEUE_MSG_A = "sentinel-queue-a-4d1e first of two"
 _QUEUE_MSG_B = "sentinel-queue-b-8c6f second of two"
 
-_COMPOSER_PLACEHOLDER = "Ask the agent anything…"
+_COMPOSER_PLACEHOLDER = "Send a message…"
 
 
 def _user_bubble(page: Page, text: str):

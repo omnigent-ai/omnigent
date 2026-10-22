@@ -17,8 +17,11 @@ the ``live_server`` omnigent backend.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page, expect
 
 # Repo-root-relative path to the Electron setup page. Loading it via file://
@@ -27,16 +30,18 @@ from playwright.sync_api import Page, expect
 _SETUP_PAGE = Path(__file__).resolve().parents[3] / "web" / "electron" / "setup" / "index.html"
 
 # The setup page expects the Electron preload bridge (window.omnigentSetup),
-# which is absent in a plain browser. Stub it: getServerUrl/getRecentServers
-# feed page load, and setServerUrl records the value the page would hand the
-# main process while resolving WITHOUT navigating, so the page stays put for
-# assertions.
+# which is absent in a plain browser. Stub it: reads feed page load, while
+# setServerUrl/copyText record native actions without navigating or touching
+# the system clipboard.
 _PRELOAD_STUB = """
   window.__connectCalls = [];
+  window.__copiedTexts = [];
   window.omnigentSetup = {
     getServerUrl: () => Promise.resolve(""),
-    getRecentServers: () => Promise.resolve([]),
+    getManagedServers: () => Promise.resolve(__MANAGED_SERVERS__),
+    getRecentServers: () => Promise.resolve(__RECENT_SERVERS__),
     setServerUrl: (value) => { window.__connectCalls.push(value); return Promise.resolve(); },
+    copyText: (value) => { window.__copiedTexts.push(value); return Promise.resolve(); },
   };
 """
 
@@ -45,12 +50,19 @@ _PRELOAD_STUB = """
 _DEFAULT_PREFILL = "http://localhost:6767"
 
 
-def _open_setup_page(page: Page) -> None:
+def _open_setup_page(
+    page: Page,
+    recent_servers: Sequence[str] = (),
+    managed_servers: Sequence[str] = (),
+) -> None:
     """Load the setup page with the preload bridge stubbed and prefill settled.
 
     :param page: Playwright page fixture.
     """
-    page.add_init_script(_PRELOAD_STUB)
+    preload = _PRELOAD_STUB.replace(
+        "__MANAGED_SERVERS__", json.dumps(list(managed_servers))
+    ).replace("__RECENT_SERVERS__", json.dumps(list(recent_servers)))
+    page.add_init_script(preload)
     page.goto(_SETUP_PAGE.as_uri())
     # getServerUrl() populates the input asynchronously; wait for that so the
     # per-test fill() below overwrites a settled value rather than racing it.
@@ -74,16 +86,12 @@ def test_bare_workspace_url_connects_without_http_warning(page: Page) -> None:
     expect(page.locator("#err")).to_have_text("")
 
 
-def test_explicit_http_remote_still_warns_then_proceeds(page: Page) -> None:
-    """Explicit ``http://`` to a remote host still warns once, then proceeds.
-
-    The security warning must survive the scheme-default change: a user who
-    types ``http://`` to a remote host is warned on the first click and only
-    connects when they click again.
-    """
+@pytest.mark.parametrize("url", ["http://example.com", "http://example.databricks.com:8080"])
+def test_explicit_http_remote_still_warns_then_proceeds(page: Page, url: str) -> None:
+    """Remote servers that remain on HTTP warn once before connecting."""
     _open_setup_page(page)
 
-    page.fill("#url", "http://example.databricks.com")
+    page.fill("#url", url)
     page.click("#connect")
 
     # First click: warned, not connected.
@@ -93,7 +101,25 @@ def test_explicit_http_remote_still_warns_then_proceeds(page: Page) -> None:
     # Second click on the same value: proceeds past the warning.
     page.click("#connect")
     page.wait_for_function("() => window.__connectCalls.length === 1")
-    assert page.evaluate("() => window.__connectCalls") == ["http://example.databricks.com"]
+    assert page.evaluate("() => window.__connectCalls") == [url]
+
+
+@pytest.mark.parametrize("port", ["", ":80"])
+def test_http_workspace_upgrades_without_warning(page: Page, port: str) -> None:
+    """Standard HTTP workspace URLs connect once with HTTPS and retain the organization."""
+    _open_setup_page(page)
+    url = f"http://example.databricks.com{port}/omnigent?o=123"
+
+    page.fill("#url", url)
+    page.click("#connect")
+
+    page.wait_for_function("() => window.__connectCalls.length === 1")
+    assert page.evaluate("() => window.__connectCalls") == [url]
+    expect(page.locator("#err")).to_have_text("")
+    assert (
+        page.evaluate("url => window.omnigentUrl.normalizeUrl(url)", url)
+        == "https://example.databricks.com/?o=123"
+    )
 
 
 def test_loopback_connects_over_http_without_warning(page: Page) -> None:
@@ -112,6 +138,52 @@ def test_loopback_connects_over_http_without_warning(page: Page) -> None:
     expect(page.locator("#err")).to_have_text("")
 
 
+def test_managed_server_is_offered_without_auto_connecting(page: Page) -> None:
+    """An MDM server is separate from recents and connects with its exact path."""
+    managed_url = "https://mdm.example.com/ml/omnigents"
+    recent_url = "https://recent.example.com/"
+    _open_setup_page(page, [recent_url], [managed_url])
+
+    managed = page.locator("#managed")
+    expect(managed).to_be_visible()
+    expect(managed.locator(".recents-title")).to_have_text("Provided by your organization")
+    managed_button = page.locator("#managed-list .recent-btn")
+    expect(managed_button).to_have_text("mdm.example.com")
+    expect(managed_button).to_have_attribute("title", managed_url)
+
+    # MDM offers a choice; it never connects without the user's click.
+    assert page.evaluate("() => window.__connectCalls") == []
+    expect(page.locator("#recents")).to_be_visible()
+    expect(page.locator("#recents-list .recent-btn")).to_have_text("recent.example.com")
+
+    managed_button.click()
+    page.wait_for_function("() => window.__connectCalls.length === 1")
+    assert page.evaluate("() => window.__connectCalls") == [managed_url]
+    expect(page.locator("#err")).to_have_text("")
+
+
+def test_recent_server_connect_and_copy_actions_are_independent(page: Page) -> None:
+    """The URL connects immediately, while its clipboard icon only copies."""
+    recent_url = "https://dbc-x.cloud.databricks.com/omnigent?o=12345678901234567890"
+    _open_setup_page(page, [recent_url])
+
+    recent = page.locator(".recent-btn")
+    label = "dbc-x.cloud.databricks.com/?o=12345678901234567890"
+    expect(recent).to_have_text(label)
+    expect(recent).to_have_attribute("title", label)
+
+    page.click(".recent-copy")
+    page.wait_for_function("() => window.__copiedTexts.length === 1")
+    assert page.evaluate("() => window.__copiedTexts") == [recent_url]
+    assert page.evaluate("() => window.__connectCalls") == []
+    expect(page.locator(".recent-copy")).to_have_attribute("title", "Copied")
+    expect(page.locator(".recent-copy")).to_have_attribute("data-copied", "true")
+
+    recent.click()
+    page.wait_for_function("() => window.__connectCalls.length === 1")
+    assert page.evaluate("() => window.__connectCalls") == [recent_url]
+
+
 def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
     """The shared url.js (also used by the main process) defaults the scheme.
 
@@ -122,12 +194,15 @@ def test_shared_url_module_defaults_scheme_in_browser(page: Page) -> None:
     """
     _open_setup_page(page)
 
-    # Remote host → https; the guide's /omnigent suffix is preserved.
+    # Remote host → https root while retaining the Databricks organization;
+    # the main process then probes and appends the canonical /omnigent mount.
     assert (
         page.evaluate(
-            "() => window.omnigentUrl.normalizeUrl('dbc-x.cloud.databricks.com/omnigent')"
+            """() => window.omnigentUrl.normalizeUrl(
+              'dbc-x.cloud.databricks.com/omnigent?ignored=yes&o=1965859176160743#page'
+            )"""
         )
-        == "https://dbc-x.cloud.databricks.com/omnigent"
+        == "https://dbc-x.cloud.databricks.com/?o=1965859176160743"
     )
     # Loopback stays http for local dev.
     assert (

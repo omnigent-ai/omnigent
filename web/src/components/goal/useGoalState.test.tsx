@@ -1,10 +1,12 @@
+import type * as GoalApiModule from "@/lib/goalApi";
+
 import { renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getGoal, type Goal } from "@/lib/goalApi";
 import { useGoalState } from "./useGoalState";
 
 vi.mock("@/lib/goalApi", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/goalApi")>();
+  const actual = await importOriginal<typeof GoalApiModule>();
   return { ...actual, getGoal: vi.fn() };
 });
 
@@ -45,5 +47,20 @@ describe("useGoalState", () => {
 
     rerender({ enabled: false });
     expect(result.current.goal).toBeNull();
+  });
+
+  it("reloads the goal when a session becomes reachable again", async () => {
+    mockGetGoal.mockResolvedValueOnce({ goal: GOAL });
+
+    const { result, rerender } = renderHook(({ reachable }) => useGoalState("conv", reachable), {
+      initialProps: { reachable: false },
+    });
+    expect(mockGetGoal).not.toHaveBeenCalled();
+
+    rerender({ reachable: true });
+
+    await waitFor(() => expect(result.current.goal).toEqual(GOAL));
+    expect(mockGetGoal).toHaveBeenCalledTimes(1);
+    expect(mockGetGoal).toHaveBeenCalledWith("conv");
   });
 });

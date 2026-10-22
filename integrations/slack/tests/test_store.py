@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import aiosqlite
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.store import SQLiteStore
 
@@ -58,6 +59,70 @@ async def test_store_user_config_round_trip(tmp_path: Path) -> None:
     assert await store.get_user_config("T1", "U2") is None
 
 
+async def test_store_round_trips_managed_host_type(tmp_path: Path) -> None:
+    # A managed session carries no host id and no workspace path — the server
+    # chooses both — so host_type is the only record of where it runs.
+    store = SQLiteStore(tmp_path / "store.sqlite3")
+    await store.initialize()
+
+    config = UserConfig(agent_id="ag_1", agent_name="Helper", workspace="", host_type="managed")
+    await store.upsert_user_config("T1", "U1", config)
+    assert await store.get_user_config("T1", "U1") == config
+
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_1", "t", owner_user_id="U1", host_type="managed")
+    record = await store.get_session(key)
+    assert record is not None
+    assert record.host_type == "managed"
+    assert record.host_id is None
+
+    # Switching a user back to their own host is recorded as external again.
+    await store.upsert_user_config(
+        "T1", "U1", UserConfig("ag_1", "Helper", "/home/me", host_id="h1")
+    )
+    reread = await store.get_user_config("T1", "U1")
+    assert reread is not None and reread.host_type == "external"
+
+
+async def test_store_adds_host_type_to_a_pre_existing_database(tmp_path: Path) -> None:
+    # A store written before host_type existed keeps the old table shape, and
+    # every query naming the column would fail. initialize() must add it in place
+    # and read existing rows as "external" — the behavior they were saved with.
+    path = tmp_path / "store.sqlite3"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            CREATE TABLE user_configs (
+                team_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                workspace TEXT,
+                host_id TEXT,
+                host_name TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (team_id, user_id)
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO user_configs VALUES ('T1','U1','ag_1','Helper','/ws','h1','H',1,1)"
+        )
+        await db.commit()
+
+    store = SQLiteStore(path)
+    await store.initialize()
+
+    config = await store.get_user_config("T1", "U1")
+    assert config is not None
+    assert config.host_type == "external"
+    assert config.host_id == "h1"
+    # Idempotent: a second initialize on the upgraded file must not fail.
+    await store.initialize()
+    assert await store.get_user_config("T1", "U1") == config
+
+
 async def test_store_claim_event_dedupes(tmp_path: Path) -> None:
     store = SQLiteStore(tmp_path / "store.sqlite3")
     await store.initialize()
@@ -78,3 +143,72 @@ async def test_store_unclaim_event_allows_reclaim(tmp_path: Path) -> None:
     # A no-op without an id, and harmless on an unknown id.
     await store.unclaim_event(None)
     await store.unclaim_event("never-seen")
+
+
+async def test_store_turn_inflight_marker_survives_reopen(tmp_path: Path) -> None:
+    # The marker is what tells a RESTARTED process that a turn was abandoned
+    # mid-stream, so it must persist across closing and reopening the database.
+    path = tmp_path / "store.sqlite3"
+    store = SQLiteStore(path)
+    await store.initialize()
+
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    await store.upsert_session(key, "conv_1", "t", owner_user_id="U1")
+    record = await store.get_session(key)
+    assert record is not None and record.turn_inflight is False
+
+    await store.set_turn_inflight(key, True)
+
+    reopened = SQLiteStore(path)
+    await reopened.initialize()
+    record = await reopened.get_session(key)
+    assert record is not None and record.turn_inflight is True
+
+    await reopened.set_turn_inflight(key, False)
+    record = await reopened.get_session(key)
+    assert record is not None and record.turn_inflight is False
+
+
+async def test_store_adds_turn_inflight_to_a_pre_existing_database(tmp_path: Path) -> None:
+    # A store written before turn_inflight existed keeps the old table shape;
+    # initialize() must add the column in place, reading existing rows as False
+    # (no abandoned turn) and accepting marker writes afterwards.
+    path = tmp_path / "store.sqlite3"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            CREATE TABLE thread_sessions (
+                team_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_ts TEXT NOT NULL,
+                omnigent_session_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                owner_user_id TEXT,
+                host_id TEXT,
+                workspace TEXT,
+                host_type TEXT NOT NULL DEFAULT 'external',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (team_id, channel_id, thread_ts)
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO thread_sessions VALUES "
+            "('T1','C1','100.1','conv_1','t','U1',NULL,NULL,'external',1,1)"
+        )
+        await db.commit()
+
+    store = SQLiteStore(path)
+    await store.initialize()
+
+    key = ThreadKey(team_id="T1", channel_id="C1", thread_ts="100.1")
+    record = await store.get_session(key)
+    assert record is not None
+    assert record.turn_inflight is False
+
+    await store.set_turn_inflight(key, True)
+    record = await store.get_session(key)
+    assert record is not None and record.turn_inflight is True
+    # Idempotent: a second initialize on the upgraded file must not fail.
+    await store.initialize()

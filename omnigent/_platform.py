@@ -18,8 +18,10 @@ import getpass
 import hashlib
 import logging
 import os
+import platform
 import shutil
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
@@ -68,7 +70,12 @@ def _parse_node_version(name: str) -> tuple[int, ...]:
         return ()
 
 
-def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
+def resolve_cli_binary(
+    name: str,
+    *,
+    env_var: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str | None:
     """Resolve a CLI binary that may live off the process ``PATH``.
 
     Checks an optional ``env_var`` override first (an explicit path or a name
@@ -81,12 +88,16 @@ def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
     :param name: The binary name, e.g. ``"codex"`` or ``"claude"``.
     :param env_var: Optional env var holding an override path/name, e.g.
         ``"OMNIGENT_CODEX_PATH"``.
+    :param which: PATH-lookup hook, defaulting to :func:`shutil.which`. The
+        native harness resolvers thread their own test seam through here; the
+        fallback ladder always uses the real filesystem.
     :returns: An absolute path to the executable, or ``None``.
     """
+    which = shutil.which if which is None else which
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
-            resolved = shutil.which(override)
+            resolved = which(override)
             if resolved:
                 return resolved
             if os.access(override, os.X_OK) and os.path.isfile(override):
@@ -100,7 +111,7 @@ def resolve_cli_binary(name: str, *, env_var: str | None = None) -> str | None:
                 override,
                 name,
             )
-    on_path = shutil.which(name)
+    on_path = which(name)
     if on_path is not None:
         return on_path
     for directory in _cli_fallback_dirs():
@@ -119,6 +130,25 @@ IS_POSIX = os.name == "posix"
 IS_LINUX = sys.platform.startswith("linux")
 #: True on macOS specifically (the seatbelt sandbox platform).
 IS_DARWIN = sys.platform == "darwin"
+
+
+def is_wsl() -> bool:
+    """Return whether this Linux process is running under Windows Subsystem for Linux.
+
+    WSL reports itself as Linux to Python, so this deliberately checks the
+    kernel identity rather than relying on :data:`sys.platform`.
+    """
+    if not IS_LINUX:
+        return False
+    try:
+        version = Path("/proc/version").read_text(encoding="utf-8")
+    except OSError:
+        version = ""
+    kernel_identity = " ".join(
+        (version, platform.release(), platform.version(), platform.uname().release)
+    ).lower()
+    return "microsoft" in kernel_identity or "wsl" in kernel_identity
+
 
 #: Non-sensitive Windows environment variables that a spawned omnigent
 #: subprocess needs to function, for env-passthrough allowlists that otherwise
@@ -193,26 +223,92 @@ _KNOWN_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh
 _OFFERED_INTERACTIVE_SHELLS = ("bash", "zsh", "fish")
 
 
+def normalize_interactive_shells(shells: object) -> list[str]:
+    """Return supported shell basenames in input order, without duplicates."""
+    if not isinstance(shells, (list, tuple)):
+        return []
+    normalized: list[str] = []
+    for shell in shells:
+        if (
+            isinstance(shell, str)
+            and shell in _KNOWN_INTERACTIVE_SHELLS
+            and shell not in normalized
+        ):
+            normalized.append(shell)
+    return normalized
+
+
+#: Standard absolute locations for interactive shells, probed when a shell
+#: isn't on ``PATH``. The host daemon snapshots ``PATH`` at spawn; a daemon
+#: launched from a GUI / ``launchd`` / minimal-env context inherits a stripped
+#: ``PATH`` that omits ``/bin`` (or ``/usr/bin``), where the system shells live
+#: — so a bare ``shutil.which("zsh")`` misses them there even though they exist.
+_INTERACTIVE_SHELL_DIRS = ("/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin")
+
+
+def _resolve_interactive_shell(name: str) -> str | None:
+    """Resolve an interactive-shell basename to an executable, off ``PATH`` too.
+
+    Accepts known basenames only. A matching executable absolute ``$SHELL``
+    wins, followed by ``PATH`` and the well-known absolute shell dirs
+    (:data:`_INTERACTIVE_SHELL_DIRS`). This survives the host
+    daemon's frozen/stripped ``PATH`` — the driver of the "only bash offered"
+    bug on GUI/launchd-launched hosts — where the shells exist on disk but not
+    on the daemon's ``PATH``.
+
+    :param name: A shell basename such as ``"zsh"`` or ``"bash"``.
+    :returns: An executable path, or ``None`` when the shell isn't installed.
+    """
+    import shutil
+
+    if name not in _KNOWN_INTERACTIVE_SHELLS or os.path.basename(name) != name:
+        return None
+
+    login_shell = os.environ.get("SHELL", "").strip()
+    if (
+        os.path.isabs(login_shell)
+        and os.path.basename(login_shell) == name
+        and os.path.isfile(login_shell)
+        and os.access(login_shell, os.X_OK)
+    ):
+        return login_shell
+
+    on_path = shutil.which(name)
+    if on_path is not None:
+        return on_path
+    for directory in _INTERACTIVE_SHELL_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def default_interactive_shell() -> str:
     """
     Basename of the user's login shell for an interactive terminal.
 
     Reads ``$SHELL`` and keeps its basename when it names a known shell that
-    resolves on PATH; otherwise falls back to ``"bash"``. Returns a basename
-    (not the absolute ``$SHELL`` path) so it stays PATH-resolvable when the
-    terminal launches under a runner on a different host than the one that read
-    the env.
+    resolves — trusting ``$SHELL``'s own absolute path, then ``PATH``, then the
+    standard shell dirs (:func:`_resolve_interactive_shell`); otherwise falls
+    back to ``"bash"``. Returns a basename for the host inventory; the runner
+    on that host resolves the launch path and honors the same ``$SHELL``.
 
     :returns: A shell basename such as ``"zsh"``, ``"fish"``, or ``"bash"``.
     """
     if IS_WINDOWS:
         # Native tmux/PTY terminals are unsupported on Windows anyway.
         return "bash"
-    import shutil
 
-    name = os.path.basename(os.environ.get("SHELL", "")).strip()
-    if name in _KNOWN_INTERACTIVE_SHELLS and shutil.which(name):
-        return name
+    shell = os.environ.get("SHELL", "").strip()
+    name = os.path.basename(shell)
+    if name in _KNOWN_INTERACTIVE_SHELLS:
+        # ``$SHELL`` is already an absolute executable path — trust it directly
+        # rather than re-resolving its basename against a ``PATH`` that may be
+        # stripped, so the login shell is honored even on a frozen-PATH daemon.
+        if os.path.isabs(shell) and os.path.isfile(shell) and os.access(shell, os.X_OK):
+            return name
+        if _resolve_interactive_shell(name):
+            return name
     return "bash"
 
 
@@ -222,9 +318,10 @@ def installed_interactive_shells() -> list[str]:
 
     The user's login shell (:func:`default_interactive_shell`) comes first — so
     the "New shell" affordance can treat entry ``[0]`` as the click default —
-    followed by any mainstream alternatives (bash/zsh/fish) that resolve on
-    PATH. Always non-empty (the default is always present, and bash is the
-    ultimate fallback).
+    followed by any mainstream alternatives (bash/zsh/fish) that resolve
+    (:func:`_resolve_interactive_shell`, which also probes standard shell dirs
+    off ``PATH``). Always non-empty (the default is always present, and bash is
+    the ultimate fallback).
 
     :returns: Basenames such as ``["zsh", "bash", "fish"]`` — the default first.
     """
@@ -233,10 +330,9 @@ def installed_interactive_shells() -> list[str]:
         # Native tmux/PTY terminals are unsupported on Windows anyway; the lone
         # bash default from above is all we can meaningfully offer.
         return ordered
-    import shutil
 
     for name in _OFFERED_INTERACTIVE_SHELLS:
-        if name not in ordered and shutil.which(name):
+        if name not in ordered and _resolve_interactive_shell(name):
             ordered.append(name)
     return ordered
 

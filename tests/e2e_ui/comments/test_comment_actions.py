@@ -15,7 +15,7 @@ every file type):
   4. ``test_address_all_moves_comments_to_addressed_tab`` — "Address All"
      POSTs to ``/comments/send`` (which marks every open comment addressed and
      dispatches a formatted message to the agent); the Open tab drains and the
-     comments reappear under the Addressed tab.
+     comments reappear under the Sent tab.
   5. ``test_comment_link_opens_same_comment_in_new_browser`` — the per-card
      "Copy link" button writes a deep link to the clipboard; opening that link
      in a fresh browser context lands on the file with the exact comment
@@ -417,11 +417,11 @@ def test_address_all_moves_comments_to_addressed_tab(
     page: Page,
     commented_session: tuple[str, str, str],
 ) -> None:
-    """ "Address All" sends open comments to the agent and moves them to Addressed.
+    """ "Address All" sends open comments to the agent and moves them to Sent.
 
     ``/comments/send`` marks every requested comment ``addressed`` server-side
     and returns a formatted message the SPA dispatches to the agent. The Open
-    tab drains and the comments reappear under the Addressed tab — this is the
+    tab drains and the comments reappear under the Sent tab — this is the
     deterministic, server-side half of the flow (the agent's reply is not
     asserted, only that the comments transitioned).
     """
@@ -431,26 +431,27 @@ def test_address_all_moves_comments_to_addressed_tab(
 
     file_viewer = _open_comments_panel(page, base_url, session_id)
 
-    # Both open comments are listed; the Open tab badge counts 2.
+    # Both open comments are listed; select one before addressing them.
     expect(file_viewer).to_contain_text(_SHORT_BODY)
     expect(file_viewer).to_contain_text("Second open comment for address-all.")
+    file_viewer.get_by_text(_SHORT_BODY).click()
 
     address_all = file_viewer.get_by_role("button", name=re.compile("Address All", re.IGNORECASE))
     expect(address_all).to_be_enabled()
     address_all.click()
 
-    # The Open tab drains once /comments/send marks the comments addressed and
-    # the comments query is invalidated + refetched.
-    expect(file_viewer).to_contain_text("No open comments.", timeout=15_000)
-
-    # The comments moved tabs rather than vanishing: the Addressed tab counts 2.
-    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Addressed"))
+    # The selected comment follows its status transition into Sent.
+    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Sent"))
     expect(addressed_tab).to_contain_text("2")
+    expect(addressed_tab).to_have_class(re.compile("border-primary"))
+    selected_card = file_viewer.locator("div.border-primary").filter(has_text=_SHORT_BODY)
+    expect(selected_card).to_be_visible(timeout=15_000)
 
-    # Opening the Addressed tab shows the now-addressed comments.
-    addressed_tab.click()
+    # Both comments remain available, and a manual tab switch is not undone.
     expect(file_viewer).to_contain_text(_SHORT_BODY)
     expect(file_viewer).to_contain_text("Second open comment for address-all.")
+    file_viewer.get_by_role("button", name=re.compile("Open")).click()
+    expect(file_viewer).to_contain_text("No open comments.")
 
     # REST confirms both comments carry status "addressed".
     comments_resp = httpx.get(

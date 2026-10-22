@@ -13,68 +13,12 @@
   ],
   "schedule": [
     {
-      "date": "2026-07-14",
-      "name": "Edwin He"
-    },
-    {
-      "date": "2026-07-15",
-      "name": "Pat Sukprasert"
-    },
-    {
-      "date": "2026-07-16",
-      "name": "Sabhya Chhabria"
-    },
-    {
-      "date": "2026-07-17",
-      "name": "Serena Ruan"
-    },
-    {
-      "date": "2026-07-20",
-      "name": "Shivam Mittal"
-    },
-    {
-      "date": "2026-07-21",
-      "name": "Tomu Hirata"
-    },
-    {
-      "date": "2026-07-22",
-      "name": "Zeyi (Rice) Fan"
-    },
-    {
-      "date": "2026-07-23",
-      "name": "Aravind Segu"
-    },
-    {
-      "date": "2026-07-24",
-      "name": "Bryan Qiu"
-    },
-    {
-      "date": "2026-07-27",
-      "name": "Daniel Lok"
-    },
-    {
-      "date": "2026-07-28",
-      "name": "Dhruv Gupta"
-    },
-    {
-      "date": "2026-07-29",
-      "name": "Edwin He"
-    },
-    {
-      "date": "2026-07-30",
-      "name": "Pat Sukprasert"
-    },
-    {
-      "date": "2026-07-31",
-      "name": "Sabhya Chhabria"
-    },
-    {
       "date": "2026-08-03",
       "name": "Serena Ruan"
     },
     {
       "date": "2026-08-04",
-      "name": "Shivam Mittal"
+      "name": "Aravind Segu"
     },
     {
       "date": "2026-08-05",
@@ -110,7 +54,7 @@
     },
     {
       "date": "2026-08-17",
-      "name": "Sabhya Chhabria"
+      "name": "Bryan Qiu"
     },
     {
       "date": "2026-08-18",
@@ -118,7 +62,7 @@
     },
     {
       "date": "2026-08-19",
-      "name": "Shivam Mittal"
+      "name": "Daniel Lok"
     },
     {
       "date": "2026-08-20",
@@ -154,7 +98,7 @@
     },
     {
       "date": "2026-09-01",
-      "name": "Sabhya Chhabria"
+      "name": "Dhruv Gupta"
     },
     {
       "date": "2026-09-02",
@@ -162,7 +106,7 @@
     },
     {
       "date": "2026-09-03",
-      "name": "Shivam Mittal"
+      "name": "Edwin He"
     },
     {
       "date": "2026-09-04",
@@ -198,7 +142,7 @@
     },
     {
       "date": "2026-09-16",
-      "name": "Sabhya Chhabria"
+      "name": "Tomu Hirata"
     },
     {
       "date": "2026-09-17",
@@ -206,7 +150,7 @@
     },
     {
       "date": "2026-09-18",
-      "name": "Shivam Mittal"
+      "name": "Zeyi (Rice) Fan"
     },
     {
       "date": "2026-09-21",
@@ -242,7 +186,7 @@
     },
     {
       "date": "2026-10-01",
-      "name": "Sabhya Chhabria"
+      "name": "Aravind Segu"
     },
     {
       "date": "2026-10-02",
@@ -250,7 +194,7 @@
     },
     {
       "date": "2026-10-05",
-      "name": "Shivam Mittal"
+      "name": "Bryan Qiu"
     },
     {
       "date": "2026-10-06",
@@ -286,7 +230,47 @@
     },
     {
       "date": "2026-10-16",
-      "name": "Sabhya Chhabria"
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-10-19",
+      "name": "Dhruv Gupta"
+    },
+    {
+      "date": "2026-10-20",
+      "name": "Edwin He"
+    },
+    {
+      "date": "2026-10-21",
+      "name": "Pat Sukprasert"
+    },
+    {
+      "date": "2026-10-22",
+      "name": "Serena Ruan"
+    },
+    {
+      "date": "2026-10-23",
+      "name": "Tomu Hirata"
+    },
+    {
+      "date": "2026-10-26",
+      "name": "Zeyi (Rice) Fan"
+    },
+    {
+      "date": "2026-10-27",
+      "name": "Aravind Segu"
+    },
+    {
+      "date": "2026-10-28",
+      "name": "Bryan Qiu"
+    },
+    {
+      "date": "2026-10-29",
+      "name": "Daniel Lok"
+    },
+    {
+      "date": "2026-10-30",
+      "name": "Dhruv Gupta"
     }
   ]
 }

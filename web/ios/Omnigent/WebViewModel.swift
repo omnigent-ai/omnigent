@@ -10,6 +10,17 @@ enum WebViewMode: String {
 final class WebViewModel: ObservableObject {
   @Published var currentURL: URL?
   @Published var isLoading = false
+  @Published var isAuthenticating = false
+  /// Covers the previous server's page while the next server is prepared.
+  @Published var hidesPage = false
+  var cancelAuthentication: (() -> Void)?
+  var signOut: (() -> Void)?
+  #if DEBUG
+    /// Set only while a native workspace view is attached; answers with what to expect next.
+    var injectDebugFault: ((DatabricksDebugFault) async -> String)?
+    /// Set only while a native-OIDC connection is attached; answers with what to expect next.
+    var injectOidcDebugFault: ((OidcDebugFault) async -> String)?
+  #endif
   @Published var serverSwitcherHidden = true
 
   /// Whether the native Chat/Terminal switcher should be shown. The web app owns
@@ -87,6 +98,47 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  /// Push the server-picker payload (current origin plus the selectable
+  /// managed/recent servers) to the SPA, which surfaces server selection in
+  /// its sidebar instead of the floating pill. The JS bridge caches the value
+  /// so a later-mounting subscriber still receives it.
+  func emitServerPicker(
+    currentOrigin: String?, managedServers: [String], recentServers: [String], canSignOut: Bool
+  ) {
+    guard
+      let json = Self.serverPickerJSON(
+        currentOrigin: currentOrigin, managedServers: managedServers,
+        recentServers: recentServers, canSignOut: canSignOut)
+    else { return }
+    webView?.evaluateJavaScript("window.__omnigentNativeEmitServerPicker?.(\(json));")
+  }
+
+  /// The picker payload as JSON. `canSignOut` offers the SPA's "Sign out of {server}" item.
+  nonisolated static func serverPickerJSON(
+    currentOrigin: String?, managedServers: [String], recentServers: [String], canSignOut: Bool
+  ) -> String? {
+    guard let currentOrigin else { return nil }
+    struct Payload: Encodable {
+      let currentOrigin: String
+      let managedServers: [String]
+      let recentServers: [String]
+      let canSignOut: Bool
+    }
+    let payload = Payload(
+      currentOrigin: currentOrigin,
+      managedServers: managedServers,
+      recentServers: recentServers,
+      canSignOut: canSignOut
+    )
+    guard let data = try? JSONEncoder().encode(payload) else { return nil }
+    return String(data: data, encoding: .utf8)
+  }
+
+  /// Settle the page's pending `signOutOfServer()` calls.
+  func emitSignOutResult(_ handled: Bool) {
+    webView?.evaluateJavaScript("window.__omnigentNativeEmitSignOutResult?.(\(handled));")
+  }
+
   /// Tell the web app the user tapped a segment in the native switcher.
   func emitViewModeChanged(_ mode: WebViewMode) {
     let script =
@@ -107,7 +159,9 @@ final class WebViewModel: ObservableObject {
     return String(format: "%g", Double(value))
   }
 
-  static func javascriptString(_ value: String) -> String {
+  /// `nonisolated` because it touches no main-actor state — a pure formatter, so
+  /// non-isolated callers (e.g. `WorkspaceChromeScript`) can share it.
+  nonisolated static func javascriptString(_ value: String) -> String {
     guard let data = try? JSONEncoder().encode(value),
       let encoded = String(data: data, encoding: .utf8)
     else {

@@ -42,16 +42,10 @@ def normalize_workspace_url(raw: str) -> str:
 
 # The install command surfaced wherever a Databricks flow is gated on the
 # `databricks` extra (the add-provider menu, `setup --internal-beta`).
-# Matches the README's canonical `uv tool install` path. Dev clones use
-# `uv sync --extra databricks` instead, but the tool install is the path
-# end users actually took. The repo URL sits on its own line: the slug
-# differs per distribution, and inlining it into the hint string would
-# make the line's width — and therefore its ruff formatting — depend on
-# which slug a checkout carries.
-_SOURCE_REPO_URL = "https://github.com/omnigent-ai/omnigent.git"
-DATABRICKS_EXTRA_INSTALL_HINT = (
-    f'uv tool install --force "omnigent[databricks] @ git+{_SOURCE_REPO_URL}"'
-)
+# Matches the README's canonical `uv tool install` path: install from the
+# package index, not git. Dev clones use `uv sync --extra databricks`
+# instead, but the tool install is the path end users actually took.
+DATABRICKS_EXTRA_INSTALL_HINT = 'uv tool install --force "omnigent[databricks]"'
 
 
 def databricks_sdk_installed() -> bool:
@@ -95,7 +89,9 @@ def list_databricks_profiles() -> list[str]:
     try:
         parser.read(_DATABRICKSCFG_PATH)
     except configparser.Error as exc:
-        _logger.debug("Could not parse %s: %s", _DATABRICKSCFG_PATH, exc)
+        # Class-only: configparser errors can embed the offending line, which
+        # in a credentials file may be a token.
+        _logger.debug("Could not parse %s (%s)", _DATABRICKSCFG_PATH, type(exc).__name__)
         return []
     sections = [s for s in parser.sections() if s != "DEFAULT"]
     if parser.defaults():
@@ -134,13 +130,15 @@ def get_workspace_url_for_profile(profile: str) -> str | None:
                 return host.rstrip("/")
 
     try:
-        from omnigent.onboarding.internal_beta import DEFAULT_PROFILES
+        import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
     except ModuleNotFoundError:
         # The internal-beta catalog is intentionally absent from the OSS
         # build; without it there are no bundled-profile fallbacks.
         return None
 
-    for spec in DEFAULT_PROFILES:
+    for spec in internal_beta.DEFAULT_PROFILES:
         if spec.name == profile:
-            return spec.host.rstrip("/")
+            host = spec.host
+            if isinstance(host, str):
+                return host.rstrip("/")
     return None

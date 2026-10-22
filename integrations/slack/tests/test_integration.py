@@ -19,9 +19,16 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
 import respx
 from cryptography.fernet import Fernet
-from fakes import FakeOmnigentServer, RecordingSlackClient, sse_delta, sse_status
+from fakes import (
+    FakeOmnigentServer,
+    RecordingSlackClient,
+    resolve_test_auth,
+    sse_delta,
+    sse_status,
+)
 from omnigent_slack.auth_manager import AuthManager
 from omnigent_slack.models import UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
@@ -57,6 +64,19 @@ async def _configure_user(
             workspace="/home/bot/work",
             host_id="h1",
         ),
+    )
+
+
+async def _configure_managed_user(store: SQLiteStore, team_id: str, user_id: str) -> None:
+    """Configure a user whose sessions run in a server-provisioned sandbox.
+
+    No host id and no workspace: the server chooses both when the session is
+    created.
+    """
+    await store.upsert_user_config(
+        team_id,
+        user_id,
+        UserConfig(agent_id="ag_1", agent_name="debby", workspace="", host_type="managed"),
     )
 
 
@@ -102,8 +122,8 @@ async def _wait_for_stream_stop(
 
 @respx.mock
 async def test_omnigent_command_auth_wall_shows_login_link(tmp_path: Path) -> None:
-    """``/omnigent`` on an auth-enabled server: the bot probes the server, hits the
-    auth wall on the agent listing, starts the device grant, and shows the
+    """``/omnigent`` without a token: the bot discovers the server's login mode,
+    starts the device grant, and shows the
     verification link in the setup modal — no DM."""
     server = FakeOmnigentServer(_SERVER)
     server.auth_required = True
@@ -127,10 +147,9 @@ async def test_omnigent_command_auth_wall_shows_login_link(tmp_path: Path) -> No
         await auth.shutdown()
         await pool.aclose_all()
 
-    # Server side: the bot probed /health and the auth-gated /v1/agents, then
-    # started the device grant when that 401'd.
-    assert "/health" in server.paths("GET")
-    server.assert_request("GET", "/v1/agents")
+    # Login discovery precedes access to any per-user catalog.
+    assert "/v1/me" in server.paths("GET")
+    assert "/v1/agents" not in server.paths("GET")
     server.assert_request("POST", "/oauth/device/authorize")
 
     # Slack side: a modal opened, then updated to the login-waiting screen
@@ -192,7 +211,7 @@ async def test_app_mention_runs_full_turn_and_streams_answer(tmp_path: Path) -> 
 
     store = await _store(tmp_path)
     await _configure_user(store, "T1", "U1")
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 
@@ -220,16 +239,62 @@ async def test_app_mention_runs_full_turn_and_streams_answer(tmp_path: Path) -> 
     assert "Here is the answer." in client.streamed_text
 
 
-# ── Scenario 4: auth wall mid-turn → re-login DM ───────────────────────────────
+# ── Scenario 3b: managed session → create + submit, never a runner launch ──────
 
 
 @respx.mock
-async def test_auth_wall_mid_turn_prompts_relogin(tmp_path: Path) -> None:
-    """When the session already exists and the server returns an auth wall on the
-    stream, the bot reacts by prompting the user to re-login rather than posting a
-    generic failure."""
+async def test_managed_session_turn_never_posts_a_runner_launch(tmp_path: Path) -> None:
+    """A managed session's host is provisioned by the server, so the turn goes
+    create → submit → stream with NO ``POST /v1/hosts/{id}/runners`` in between —
+    and the create carries ``host_type`` without a host id or workspace."""
     server = FakeOmnigentServer(_SERVER)
-    server.auth_required = True  # /health ok, but the stream 401s
+    server.managed_sandboxes_enabled = True
+    server.sandbox_provider = "modal"
+    server.install(respx.mock)
+
+    store = await _store(tmp_path)
+    await _configure_managed_user(store, "T1", "U1")
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
+    service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
+    client = RecordingSlackClient()
+
+    try:
+        await service.handle_app_mention(
+            body={"team_id": "T1", "event_id": "Ev1"},
+            event={"channel": "C1", "ts": "100.1", "user": "U1", "text": "<@B1> review this"},
+            client=client,
+            context={"bot_user_id": "B1"},
+        )
+        await _wait_for_stream_stop(client, service)
+    finally:
+        await service.shutdown()
+        await pool.aclose_all()
+
+    # Server side: the create asks the server to provision the host, and sends
+    # neither a host id nor a workspace (both are a 422 for a managed session).
+    create = server.assert_request(
+        "POST", "/v1/sessions", json_contains={"agent_id": "ag_1", "host_type": "managed"}
+    )
+    assert "host_id" not in create[3]
+    assert "workspace" not in create[3]
+    # No runner launch anywhere, and no host listing to pick one from.
+    assert not any(path.endswith("/runners") for path in server.paths("POST"))
+    assert "/v1/hosts" not in server.paths("GET")
+    # The turn still submitted and streamed — the server queues the first message
+    # until its sandbox launch settles.
+    server.assert_request("POST", f"/v1/sessions/{server.session_id}/events")
+    assert "Here is the answer." in client.streamed_text
+
+
+# ── Scenario 4: auth wall mid-turn → re-login DM ───────────────────────────────
+
+
+@pytest.mark.parametrize("refusal", ["server", "local"])
+@respx.mock
+async def test_auth_wall_mid_turn_prompts_relogin(tmp_path: Path, refusal: str) -> None:
+    """A server auth wall or missing local credentials prompts re-login."""
+    server = FakeOmnigentServer(_SERVER)
+    server.auth_required = refusal == "server"
     server.install(respx.mock)
 
     store = await _store(tmp_path)
@@ -242,7 +307,7 @@ async def test_auth_wall_mid_turn_prompts_relogin(tmp_path: Path) -> None:
     await store.upsert_session(
         key, "conv_1", "Slack: t", owner_user_id="U1", host_id="h1", workspace="/home/bot/work"
     )
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth if refusal == "server" else None)
     setup = _RecordingSetup()
     service = SlackOmnigentService(store=store, pool=pool, setup=setup, server_url=_SERVER)
     client = RecordingSlackClient()
@@ -259,10 +324,11 @@ async def test_auth_wall_mid_turn_prompts_relogin(tmp_path: Path) -> None:
         await service.shutdown()
         await pool.aclose_all()
 
-    # Server side: the existing session was reused (no create/launch) and the
-    # stream was attempted against the auth-walled server.
-    assert f"/v1/sessions/{server.session_id}/stream" in server.paths("GET")
-    assert "/v1/sessions" not in server.paths("POST")
+    if refusal == "local":
+        assert server.paths() == []
+    else:
+        assert f"/v1/sessions/{server.session_id}/stream" in server.paths("GET")
+        assert "/v1/sessions" not in server.paths("POST")
     # Slack side: the bot prompted a re-login rather than a generic failure.
     assert setup.relogin_prompted, "expected prompt_relogin to be called"
 
@@ -287,7 +353,7 @@ async def test_runner_unavailable_triggers_launch_and_retry(tmp_path: Path) -> N
     await store.upsert_session(
         key, "conv_1", "t", owner_user_id="U1", host_id="h1", workspace="/home/bot/work"
     )
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 
@@ -323,7 +389,7 @@ async def test_host_unavailable_on_launch_shows_guidance(tmp_path: Path) -> None
 
     store = await _store(tmp_path)
     await _configure_user(store, "T1", "U1")
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 
@@ -370,7 +436,7 @@ async def test_harness_not_configured_surfaces_curated_message(tmp_path: Path) -
     await store.upsert_session(
         key, "conv_1", "t", owner_user_id="U1", host_id="h1", workspace="/home/bot/work"
     )
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 
@@ -421,7 +487,7 @@ async def test_mid_stream_drop_reconnects_without_double_render(tmp_path: Path) 
     await store.upsert_session(
         key, "conv_1", "t", owner_user_id="U1", host_id="h1", workspace="/home/bot/work"
     )
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 
@@ -474,7 +540,7 @@ async def test_no_delta_turn_recovers_committed_answer(tmp_path: Path) -> None:
     await store.upsert_session(
         key, "conv_1", "t", owner_user_id="U1", host_id="h1", workspace="/home/bot/work"
     )
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 

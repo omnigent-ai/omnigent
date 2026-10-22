@@ -31,6 +31,10 @@
 			</array>
 		</dict>
 	</array>
+	<key>DatabricksOAuthClientID</key>
+	<string>$(DATABRICKS_OAUTH_CLIENT_ID)</string>
+	<key>DatabricksOAuthRedirectURL</key>
+	<string>$(DATABRICKS_OAUTH_REDIRECT_URL)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>LSRequiresIPhoneOS</key>
@@ -48,6 +52,13 @@
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>

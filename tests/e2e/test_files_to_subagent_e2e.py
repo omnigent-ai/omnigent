@@ -19,7 +19,7 @@ live server + runner + mock LLM, mirroring ``test_subagent_autowake_e2e``.
 Excluded from default ``pytest`` runs via ``--ignore=tests/e2e``. Invoke
 with::
 
-    uv run --extra dev python -m pytest \\
+    uv run --group test python -m pytest \\
         tests/e2e/test_files_to_subagent_e2e.py -p no:cacheprovider
 """
 
@@ -77,7 +77,7 @@ def _find_child_session_id(
     while time.monotonic() < deadline:
         resp = http_client.get(
             "/v1/sessions",
-            params={"kind": "sub_agent", "limit": 1000},
+            params={"visibility": "all", "kind": "sub_agent", "limit": 1000},
         )
         resp.raise_for_status()
         for item in resp.json().get("data", []):
@@ -91,7 +91,9 @@ def _find_child_session_id(
         time.sleep(POLL_INTERVAL_S)
     # Diagnostic dump: show the sub_agent list and the parent's items so a
     # missing child (failed dispatch vs. mismatched title) is debuggable.
-    sub_list = http_client.get("/v1/sessions", params={"kind": "sub_agent", "limit": 1000})
+    sub_list = http_client.get(
+        "/v1/sessions", params={"visibility": "all", "kind": "sub_agent", "limit": 1000}
+    )
     parent_snap = http_client.get(f"/v1/sessions/{parent_session_id}")
     raise AssertionError(
         f"No sub-agent child session titled {child_title!r} for parent "

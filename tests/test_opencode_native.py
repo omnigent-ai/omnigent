@@ -15,7 +15,7 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.opencode_native import (
+from omnigent.harnesses.opencode_native.main import (
     LaunchedOpenCodeTerminal,
     PreparedOpenCodeTerminal,
     _create_opencode_session,
@@ -216,14 +216,14 @@ async def test_find_terminal_offline_runner_returns_none() -> None:
 
 
 def test_preflight_local_tools_ok(monkeypatch: pytest.MonkeyPatch) -> None:
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     monkeypatch.setattr(on.shutil, "which", lambda _x: "/usr/bin/tmux")
     on._preflight_local_tools()  # tmux present → no raise
 
 
 def test_preflight_local_tools_missing_tmux_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     monkeypatch.setattr(on.shutil, "which", lambda _x: None)
     with pytest.raises(click.ClickException):
@@ -233,14 +233,14 @@ def test_preflight_local_tools_missing_tmux_raises(monkeypatch: pytest.MonkeyPat
 def test_update_startup_progress_handles_none_and_active() -> None:
     from unittest.mock import Mock
 
-    from omnigent.opencode_native import _update_startup_progress
+    from omnigent.harnesses.opencode_native.main import _update_startup_progress
 
     _update_startup_progress(None, "boot")  # no renderer → no-op branch
     _update_startup_progress(Mock(), "boot")  # active renderer → update branch
 
 
 def test_tmux_reason_tmux_not_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     sock = tmp_path / "s.sock"
     sock.write_text("")
@@ -252,7 +252,7 @@ def test_tmux_reason_tmux_not_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path:
 def test_tmux_reason_none_when_socket_and_tmux_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     sock = tmp_path / "s.sock"
     sock.write_text("")
@@ -261,7 +261,7 @@ def test_tmux_reason_none_when_socket_and_tmux_present(
 
 
 async def test_wait_for_terminal_returns_when_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     term = on.LaunchedOpenCodeTerminal(terminal_id="t", tmux_socket=None, tmux_target=None)
 
@@ -274,7 +274,7 @@ async def test_wait_for_terminal_returns_when_found(monkeypatch: pytest.MonkeyPa
 
 
 async def test_wait_for_terminal_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     async def _never(_client: object, _sid: str) -> None:
         return None
@@ -296,8 +296,8 @@ def test_record_launch_for_fresh_session_persists_current_cwd(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    import omnigent.opencode_native as on
-    from omnigent.opencode_native_state import read_launch_state
+    import omnigent.harnesses.opencode_native.main as on
+    from omnigent.harnesses.opencode_native.state import read_launch_state
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -322,7 +322,7 @@ def test_record_launch_for_fresh_session_swallows_oserror(
     :param tmp_path: Temporary workspace.
     :returns: None.
     """
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     monkeypatch.chdir(tmp_path)
 
@@ -346,7 +346,7 @@ def test_align_no_recorded_state_is_noop(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OMNIGENT_OPENCODE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -372,8 +372,8 @@ def test_align_matching_cwd_is_noop(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    import omnigent.opencode_native as on
-    from omnigent.opencode_native_state import write_launch_state
+    import omnigent.harnesses.opencode_native.main as on
+    from omnigent.harnesses.opencode_native.state import write_launch_state
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OMNIGENT_OPENCODE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -400,8 +400,8 @@ def test_align_switches_to_recorded_cwd(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    import omnigent.opencode_native as on
-    from omnigent.opencode_native_state import write_launch_state
+    import omnigent.harnesses.opencode_native.main as on
+    from omnigent.harnesses.opencode_native.state import write_launch_state
 
     recorded = tmp_path / "recorded"
     current = tmp_path / "current"
@@ -432,8 +432,8 @@ def test_align_cancel_raises(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    import omnigent.opencode_native as on
-    from omnigent.opencode_native_state import write_launch_state
+    import omnigent.harnesses.opencode_native.main as on
+    from omnigent.harnesses.opencode_native.state import write_launch_state
 
     recorded = tmp_path / "recorded"
     current = tmp_path / "current"
@@ -466,8 +466,8 @@ def test_align_missing_recorded_cwd_raises(
     :param tmp_path: Temporary workspace and state root.
     :returns: None.
     """
-    import omnigent.opencode_native as on
-    from omnigent.opencode_native_state import write_launch_state
+    import omnigent.harnesses.opencode_native.main as on
+    from omnigent.harnesses.opencode_native.state import write_launch_state
 
     current = tmp_path / "current"
     missing = tmp_path / "missing"
@@ -499,7 +499,7 @@ def test_prompt_offers_switch_and_cancel_choices(
     :param tmp_path: Temporary recorded/current paths.
     :returns: None.
     """
-    import omnigent.opencode_native as on
+    import omnigent.harnesses.opencode_native.main as on
 
     captured: dict[str, Any] = {}
 
@@ -543,8 +543,8 @@ def test_run_with_remote_server_aligns_cwd_before_daemon_prepare(
 
     import omnigent.chat as chat_mod
     import omnigent.cli as cli_mod
+    import omnigent.harnesses.opencode_native.main as on
     import omnigent.host.identity as identity_mod
-    import omnigent.opencode_native as on
     from omnigent._runner_startup import RunnerStartupProgress
 
     start_dir = tmp_path / "start"
@@ -617,8 +617,8 @@ def test_run_with_remote_server_records_launch_after_create(
 
     import omnigent.chat as chat_mod
     import omnigent.cli as cli_mod
+    import omnigent.harnesses.opencode_native.main as on
     import omnigent.host.identity as identity_mod
-    import omnigent.opencode_native as on
 
     monkeypatch.chdir(tmp_path)
     order: list[str] = []

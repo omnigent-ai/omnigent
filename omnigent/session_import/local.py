@@ -5,27 +5,34 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
+from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
+from typing import get_args
 
-from omnigent.claude_native_bridge import read_transcript_items_from_offset
-from omnigent.codex_native import _CODEX_THREAD_ID_RE, _find_codex_rollout
 from omnigent.entities import NewConversationItem, parse_item_data
-from omnigent.kimi_native_credentials import resolve_user_kimi_home
-from omnigent.kimi_native_forwarder import (
+from omnigent.harnesses.claude_native.bridge import (
+    ClaudeTranscriptItem,
+    read_transcript_items_from_offset,
+)
+from omnigent.harnesses.codex_native.bridge import bridge_root
+from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE
+from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
+from omnigent.harnesses.kimi_native.forwarder import (
     read_kimi_wire_items,
     workdirs_for_kimi_sessions,
 )
-from omnigent.kiro_native_session_forwarder import (
+from omnigent.harnesses.kiro_native.session_forwarder import (
     kiro_cli_sessions_dir,
     parse_kiro_jsonl_line,
 )
-from omnigent.opencode_native_app_server import (
+from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     find_opencode_cli,
 )
-from omnigent.opencode_native_forwarder import opencode_tool_output_text
+from omnigent.harnesses.opencode_native.forwarder import opencode_tool_output_text
 from omnigent.session_import.models import (
     ImportSource,
     LocalSessionImport,
@@ -37,6 +44,27 @@ _OPENCODE_IMPORT_SESSION_ID_RE = re.compile(r"ses_[A-Za-z0-9_-]+")
 _MAX_EXTERNAL_SESSION_ID_LENGTH = 128
 _MAX_RESPONSE_ID_LENGTH = 64
 _OPENCODE_COMMAND_TIMEOUT_SECONDS = 120
+
+# Transcript byte size past which an import is trimmed to the last compaction
+# boundary instead of the full history. Below it the whole transcript imports
+# (cheap, and the full record is useful to browse); above it the file has almost
+# certainly been compacted at least once, so importing every pre-compaction
+# record replays megabytes the live agent no longer sees. Shared by the Claude
+# (``isCompactSummary``) and Codex (``compacted`` record) paths — see
+# docs/session-compaction.md.
+_IMPORT_COMPACT_TRIM_BYTES = 2 * 1024 * 1024
+
+
+def _exceeds_compaction_trim_size(path: Path) -> bool:
+    """Whether a transcript is large enough to trim to its last compaction.
+
+    An unreadable size falls back to ``False`` — import the whole transcript
+    rather than drop history on a failed ``stat``.
+    """
+    try:
+        return path.stat().st_size > _IMPORT_COMPACT_TRIM_BYTES
+    except OSError:
+        return False
 
 
 def _bounded_response_id(response_id: str) -> str:
@@ -59,12 +87,16 @@ def _find_transcript(root: Path, session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
 
 
-def _recent_unique_session_ids(
+def _recent_unique_sessions_with_recency(
     candidates: list[tuple[Path, str]],
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """Return unique session ids ordered from newest transcript to oldest."""
+) -> list[tuple[str, float]]:
+    """Return ``(session_id, recency)`` pairs, newest transcript first.
+
+    ``recency`` is the newest mtime seen for that id, kept so callers can merge
+    sessions across harnesses by a single global recency order.
+    """
     newest_by_id: dict[str, float] = {}
     for path, session_id in candidates:
         try:
@@ -77,7 +109,16 @@ def _recent_unique_session_ids(
         key=lambda session_id: (newest_by_id[session_id], session_id),
         reverse=True,
     )
-    return tuple(ordered[:limit])
+    return [(session_id, newest_by_id[session_id]) for session_id in ordered[:limit]]
+
+
+def _recent_unique_session_ids(
+    candidates: list[tuple[Path, str]],
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """Return unique session ids ordered from newest transcript to oldest."""
+    return tuple(sid for sid, _ in _recent_unique_sessions_with_recency(candidates, limit=limit))
 
 
 def _pi_session_id_from_path(path: Path) -> str | None:
@@ -112,8 +153,14 @@ def _is_safe_opencode_import_session_id(session_id: str) -> bool:
 def _run_opencode_json(
     *arguments: str,
     opencode_path: str | None = None,
+    empty_ok: bool = False,
 ) -> object:
-    """Run one public OpenCode JSON command and decode stdout."""
+    """Run one public OpenCode JSON command and decode stdout.
+
+    With no sessions, ``session list`` prints nothing (exit 0) rather than
+    ``[]``; ``empty_ok`` treats that empty stdout as an empty result instead of
+    an "invalid JSON" error.
+    """
     try:
         cli = find_opencode_cli(opencode_path)
     except OpenCodeCliNotFoundError as exc:
@@ -132,6 +179,8 @@ def _run_opencode_json(
         detail = completed.stderr.strip().splitlines()
         suffix = f": {detail[-1]}" if detail else ""
         raise SessionImportNotFoundError(f"OpenCode command failed{suffix}")
+    if empty_ok and not completed.stdout.strip():
+        return []
     try:
         return json.loads(completed.stdout)
     except ValueError as exc:
@@ -152,12 +201,129 @@ def _qwen_session_locator(path: Path) -> str:
     return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
 
 
-def list_recent_local_session_ids(
+# Codex records the session's origin in ``session_meta.source``. Its own resume
+# picker lists only interactive sources (Cli, VSCode); ``exec`` runs, ``mcp``
+# sessions, and sub-agent / internal threads are automation the user never
+# opened interactively. Match that so recent-import doesn't flood the sidebar
+# with headless ``codex exec`` runs, whose first message is an injected
+# instruction, which is what produced the "many instruction-like titles" report.
+_CODEX_INTERACTIVE_SOURCES = frozenset({"cli", "vscode"})
+
+
+def _codex_rollout_source(path: Path) -> object | None:
+    """Return a Codex rollout's recorded ``session_meta.source``, if present.
+
+    ``session_meta`` is the first record in a rollout, so only the first line is
+    read. Returns the raw value (a string like ``"cli"`` / ``"exec"`` for
+    top-level sources, or a dict for sub-agent / internal ones), or ``None`` when
+    the file is unreadable or predates the ``source`` field.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return None
+    try:
+        record = json.loads(first)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    return payload.get("source") if isinstance(payload, dict) else None
+
+
+def _codex_source_is_interactive(source: object) -> bool:
+    """Whether a Codex session source is one the interactive picker shows.
+
+    Mirrors Codex's resume picker (interactive = ``Cli`` / ``VSCode``). A missing
+    source (very old rollouts predating the field) defaults to interactive so
+    genuine history isn't dropped; any recorded non-interactive value (``exec``,
+    ``mcp``, or a sub-agent / internal object) is excluded.
+    """
+    if source is None:
+        return True
+    return isinstance(source, str) and source.lower() in _CODEX_INTERACTIVE_SOURCES
+
+
+def _unique_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """Keep the first occurrence of each configured storage path."""
+    unique: list[Path] = []
+    for path in paths:
+        if path not in unique:
+            unique.append(path)
+    return tuple(unique)
+
+
+def _codex_native_storage_homes() -> tuple[Path, ...]:
+    """Return private Codex homes under the producer's bridge root."""
+    root = bridge_root()
+    try:
+        bridge_dirs = tuple(root.iterdir())
+    except OSError:
+        return ()
+    homes: list[Path] = []
+    for bridge_dir in bridge_dirs:
+        try:
+            if not bridge_dir.is_dir() or bridge_dir.is_symlink():
+                continue
+            codex_home = bridge_dir / "codex-home"
+            if codex_home.is_dir() and not codex_home.is_symlink():
+                homes.append(codex_home)
+        except OSError:
+            continue
+    return tuple(homes)
+
+
+def _codex_storage_homes(codex_home: Path | None = None) -> tuple[Path, ...]:
+    """Return configured, normal, and native private Codex homes."""
+    if codex_home is not None:
+        return (codex_home,)
+    configured = os.environ.get("CODEX_HOME")
+    normal = Path.home() / ".codex"
+    configured_home = Path(configured).expanduser() if configured else normal
+    return _unique_paths((configured_home, normal, *_codex_native_storage_homes()))
+
+
+def _codex_rollout_paths(home: Path) -> list[Path]:
+    """Return active and archived Codex rollout files in one home."""
+    rollouts: list[Path] = []
+    sessions = home / "sessions"
+    archived_sessions = home / "archived_sessions"
+    if sessions.is_dir():
+        rollouts.extend(path for path in sessions.glob("**/rollout-*.jsonl") if path.is_file())
+    if archived_sessions.is_dir():
+        rollouts.extend(
+            path for path in archived_sessions.glob("rollout-*.jsonl") if path.is_file()
+        )
+    return rollouts
+
+
+def _codex_rollout_session_id(path: Path) -> str | None:
+    """Return the safe thread id encoded at the end of a rollout filename."""
+    session_id = path.stem[-36:]
+    return session_id if _CODEX_THREAD_ID_RE.fullmatch(session_id) else None
+
+
+def _codex_rollout_candidates(
+    homes: Sequence[Path],
+) -> list[tuple[Path, Path, str]]:
+    """Return ``(rollout, home, thread_id)`` candidates across Codex homes."""
+    candidates: list[tuple[Path, Path, str]] = []
+    for home in homes:
+        for path in _codex_rollout_paths(home):
+            session_id = _codex_rollout_session_id(path)
+            if session_id is not None:
+                candidates.append((path, home, session_id))
+    return candidates
+
+
+def _recent_local_sessions_with_recency(
     source: ImportSource,
     *,
     limit: int,
-) -> tuple[str, ...]:
-    """List recent parent session ids for one local harness."""
+) -> list[tuple[str, float]]:
+    """List recent ``(session_id, recency)`` pairs for one local harness, newest first."""
     if source == "claude":
         configured_home = os.environ.get("CLAUDE_CONFIG_DIR")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".claude"
@@ -167,14 +333,14 @@ def list_recent_local_session_ids(
             for path in root.rglob("*.jsonl")
             if "subagents" not in path.parts and path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "qwen":
         configured_home = os.environ.get("QWEN_HOME")
         home = Path(configured_home).expanduser() if configured_home else Path.home() / ".qwen"
         paths = [path for path in (home / "projects").glob("*/chats/*.jsonl") if path.is_file()]
         candidates = [(path, _qwen_session_locator(path)) for path in paths]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "kiro":
         root = kiro_cli_sessions_dir()
@@ -183,7 +349,7 @@ def list_recent_local_session_ids(
             for path in root.glob("*.jsonl")
             if path.is_file() and path.with_suffix(".json").is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "opencode":
         payload = _run_opencode_json(
@@ -192,6 +358,7 @@ def list_recent_local_session_ids(
             "--format",
             "json",
             "--pure",
+            empty_ok=True,
         )
         if not isinstance(payload, list):
             raise SessionImportNotFoundError("OpenCode returned an invalid session list")
@@ -212,7 +379,7 @@ def list_recent_local_session_ids(
             key=lambda session_id: (updated_by_id[session_id], session_id),
             reverse=True,
         )
-        return tuple(ordered[:limit])
+        return [(session_id, float(updated_by_id[session_id])) for session_id in ordered[:limit]]
 
     if source == "pi":
         configured_home = os.environ.get("PI_CODING_AGENT_DIR")
@@ -227,7 +394,7 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").rglob("*.jsonl")
             if path.is_file() and (session_id := _pi_session_id_from_path(path)) is not None
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "kimi":
         home = resolve_user_kimi_home()
@@ -236,28 +403,57 @@ def list_recent_local_session_ids(
             for path in (home / "sessions").glob("*/session_*/agents/main/wire.jsonl")
             if path.is_file()
         ]
-        return _recent_unique_session_ids(candidates, limit=limit)
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     if source == "codex":
-        configured_home = os.environ.get("CODEX_HOME")
-        home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
-        rollouts: list[Path] = []
-        sessions = home / "sessions"
-        archived_sessions = home / "archived_sessions"
-        if sessions.is_dir():
-            rollouts.extend(path for path in sessions.glob("**/rollout-*.jsonl") if path.is_file())
-        if archived_sessions.is_dir():
-            rollouts.extend(
-                path for path in archived_sessions.glob("rollout-*.jsonl") if path.is_file()
-            )
         candidates = []
-        for path in rollouts:
-            session_id = path.stem[-36:]
-            if _CODEX_THREAD_ID_RE.fullmatch(session_id):
-                candidates.append((path, session_id))
-        return _recent_unique_session_ids(candidates, limit=limit)
+        for path, _, session_id in _codex_rollout_candidates(_codex_storage_homes()):
+            # Read the rollout's source (one line) and skip non-interactive
+            # runs (exec / mcp / sub-agent / internal) that Codex itself hides.
+            if not _codex_source_is_interactive(_codex_rollout_source(path)):
+                continue
+            candidates.append((path, session_id))
+        return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
+
+
+def list_recent_local_session_ids(
+    source: ImportSource,
+    *,
+    limit: int,
+) -> tuple[str, ...]:
+    """List recent parent session ids for one local harness, newest first."""
+    return tuple(sid for sid, _ in _recent_local_sessions_with_recency(source, limit=limit))
+
+
+def _normalize_recency(recency: float) -> float:
+    """Fold millisecond timestamps to seconds so harnesses compare on one scale.
+
+    File-based harnesses use mtime (Unix seconds ~1.7e9); OpenCode reports
+    ``updated`` in epoch millis (~1.7e12). Without this a millis timestamp would
+    always outrank a seconds one in a cross-harness merge.
+    """
+    return recency / 1000.0 if recency > 1e12 else recency
+
+
+def list_recent_sessions_across_harnesses(*, limit: int) -> list[tuple[ImportSource, str]]:
+    """Return the ``limit`` most recent sessions across every harness, newest first.
+
+    Unlike calling :func:`list_recent_local_session_ids` per harness (which would
+    yield ``limit`` *each*), this merges all harnesses into one global recency
+    order and keeps the top ``limit`` — so "last N" means N total. A harness with
+    no history or an unavailable CLI is skipped.
+    """
+    scored: list[tuple[float, ImportSource, str]] = []
+    for source in get_args(ImportSource):
+        try:
+            recent = _recent_local_sessions_with_recency(source, limit=limit)
+        except (SessionImportNotFoundError, OSError, ValueError, TypeError):
+            continue
+        scored.extend((_normalize_recency(recency), source, sid) for sid, recency in recent)
+    scored.sort(key=lambda entry: (entry[0], entry[2]), reverse=True)
+    return [(source, sid) for _, source, sid in scored[:limit]]
 
 
 def _claude_workspace(transcript_path: Path) -> str | None:
@@ -274,6 +470,75 @@ def _claude_workspace(transcript_path: Path) -> str | None:
                 if cwd:
                     return cwd
     return None
+
+
+def _claude_native_title(transcript_path: Path) -> str | None:
+    """Return Claude Code's own session title, custom name over AI-generated.
+
+    Claude appends ``custom-title`` (user rename) and ``ai-title`` (generated)
+    lines to the JSONL as they change; the last of each wins. A user's rename
+    beats the AI title.
+    """
+    custom: str | None = None
+    ai: str | None = None
+    try:
+        with transcript_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if "-title" not in line:  # cheap prefilter; the type is custom-title / ai-title
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "custom-title":
+                    value = record.get("customTitle")
+                    if isinstance(value, str) and value.strip():
+                        custom = value.strip()
+                elif record.get("type") == "ai-title":
+                    value = record.get("aiTitle")
+                    if isinstance(value, str) and value.strip():
+                        ai = value.strip()
+    except OSError:
+        return None
+    return custom or ai
+
+
+def _items_from_last_compaction(
+    items: Sequence[ClaudeTranscriptItem],
+) -> Sequence[ClaudeTranscriptItem]:
+    """Slice ``items`` from the last compaction summary onward.
+
+    Claude flags the continuation summary it writes after compacting its own
+    context with ``is_compact_summary`` — the durable compaction boundary (see
+    :mod:`omnigent.harnesses.claude_native.bridge`). The live agent resumes from
+    that summary, not the full transcript, so keeping the summary and everything
+    after it mirrors the agent's working context. Returns ``items`` unchanged
+    when the transcript was never compacted.
+    """
+    last = None
+    for index, item in enumerate(items):
+        if item.is_compact_summary:
+            last = index
+    return items if last is None else items[last:]
+
+
+def _claude_import_item_data(item: ClaudeTranscriptItem) -> dict[str, object]:
+    """Return an item's data, flagging a compaction summary as meta.
+
+    Claude writes a continuation summary after compacting its own context; a
+    large transcript is trimmed to start there, so the summary would otherwise
+    become the sidebar title ("This session is being continued…"). It is durable
+    context replayed to the agent, not a user turn; flag it ``is_meta`` so the
+    title falls through to a real user message (matching Pi's branch summaries).
+    """
+    data = item.data
+    if item.is_compact_summary and isinstance(data, dict) and not data.get("is_meta"):
+        return {**data, "is_meta": True}
+    if item.agent_message_candidate and not data.get("user_authored"):
+        return {**data, "is_meta": True}
+    return data
 
 
 def load_claude_session(
@@ -294,14 +559,21 @@ def load_claude_session(
         0,
         start_line=0,
         agent_name="claude-native-ui",
+        legacy_agent_messages=True,
     )
+    # A large transcript has almost certainly compacted; import only what the
+    # agent would still see (from the last compaction boundary). See
+    # docs/session-compaction.md.
+    source_items: Sequence[ClaudeTranscriptItem] = parsed.items
+    if _exceeds_compaction_trim_size(transcript_path):
+        source_items = _items_from_last_compaction(parsed.items)
     items = tuple(
         NewConversationItem(
             type=item.item_type,
             response_id=item.response_id,
-            data=parse_item_data(item.item_type, item.data),
+            data=parse_item_data(item.item_type, _claude_import_item_data(item)),
         )
-        for item in parsed.items
+        for item in source_items
     )
     if not items:
         raise SessionImportNotFoundError(
@@ -312,6 +584,7 @@ def load_claude_session(
         external_session_id=session_id,
         workspace=_claude_workspace(transcript_path),
         items=items,
+        native_title=_claude_native_title(transcript_path),
     )
 
 
@@ -402,6 +675,9 @@ def _codex_response_item(
                 "arguments": arguments,
                 "call_id": call_id,
             }
+            namespace = payload.get("namespace")
+            if isinstance(namespace, str) and namespace:
+                data["namespace"] = namespace
             normalized_type = "function_call"
     elif item_type in {"function_call_output", "custom_tool_call_output"}:
         call_id = payload.get("call_id")
@@ -418,18 +694,110 @@ def _codex_response_item(
     )
 
 
-def _find_archived_codex_rollout(codex_home: Path, session_id: str) -> Path | None:
-    """Return the newest archived Codex rollout matching a session id."""
-    archived_sessions = codex_home / "archived_sessions"
-    if not archived_sessions.is_dir():
+def _find_codex_rollout_in_homes(
+    homes: Sequence[Path], session_id: str
+) -> tuple[Path, Path] | None:
+    """Return the newest matching Codex rollout and its containing home."""
+    selected: tuple[Path, Path] | None = None
+    selected_mtime = 0.0
+    for path, home, candidate_id in _codex_rollout_candidates(homes):
+        if candidate_id != session_id:
+            continue
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        if selected is None or modified_at > selected_mtime:
+            selected = (path, home)
+            selected_mtime = modified_at
+    return selected
+
+
+def _codex_thread_name_from_index(home: Path, session_id: str) -> str | None:
+    """Return the user's thread rename from ``session_index.jsonl``, if any.
+
+    Renaming a Codex thread appends ``{id, thread_name, updated_at}`` here; it
+    is codex's authoritative rename store and, unlike ``threads.title`` in the
+    state DB, always reflects the rename. Last entry for the id wins.
+    """
+    index = home / "session_index.jsonl"
+    name: str | None = None
+    try:
+        with index.open(encoding="utf-8") as handle:
+            for line in handle:
+                if session_id not in line:  # cheap prefilter before JSON parse
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("id") == session_id:
+                    value = record.get("thread_name")
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+    except OSError:
         return None
-    suffix = f"-{session_id}.jsonl"
-    matches = [
-        path
-        for path in archived_sessions.glob("rollout-*.jsonl")
-        if path.name.endswith(suffix) and path.is_file()
-    ]
-    return max(matches, key=lambda path: path.stat().st_mtime) if matches else None
+    return name
+
+
+def _codex_native_title(home: Path, session_id: str) -> str | None:
+    """Return the user's custom Codex thread title, or None if auto-derived.
+
+    A rename lands in ``session_index.jsonl`` (``thread_name``) — the reliable
+    source — so check that first. As a fallback, ``state_<n>.sqlite``'s
+    ``threads.title`` holds the raw first user message until renamed, so only a
+    title that diverges from ``first_user_message`` is a real custom name;
+    otherwise the first-message synthesis is better.
+    """
+    indexed = _codex_thread_name_from_index(home, session_id)
+    if indexed:
+        return indexed
+
+    def _state_db_version(path: Path) -> int:
+        match = re.search(r"state_(\d+)\.sqlite$", path.name)
+        return int(match.group(1)) if match else -1
+
+    dbs = sorted(home.glob("state_*.sqlite"), key=_state_db_version, reverse=True)
+    for db in dbs:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                row = con.execute(
+                    "SELECT title, first_user_message FROM threads WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        if row is None:
+            continue
+        title = (row[0] or "").strip()
+        first_message = (row[1] or "").strip()
+        return title if title and title != first_message else None
+    return None
+
+
+def _codex_compacted_baseline_items(payload: dict[str, object]) -> list[NewConversationItem]:
+    """Convert a Codex ``compacted`` record's replacement_history into items.
+
+    Codex appends ``{type: "compacted", payload: {replacement_history: [...]}}``
+    after compacting; ``replacement_history`` is the post-compaction context
+    baseline it resumes from (the summary plus any retained messages), each entry
+    response-item shaped. Unsupported entries (e.g. reasoning) parse to ``None``
+    and are skipped, mirroring the ordinary response-item path.
+    """
+    history = payload.get("replacement_history")
+    if not isinstance(history, list):
+        return []
+    baseline: list[NewConversationItem] = []
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        item = _codex_response_item(entry, response_id="codex:compaction")
+        if item is not None:
+            baseline.append(item)
+    return baseline
 
 
 def load_codex_session(
@@ -438,14 +806,15 @@ def load_codex_session(
     codex_home: Path | None = None,
 ) -> LocalSessionImport:
     """Load one Codex session from its local rollout JSONL file."""
-    configured_home = os.environ.get("CODEX_HOME")
-    home = codex_home or (Path(configured_home).expanduser() if configured_home else None)
-    home = home or Path.home() / ".codex"
-    rollout_path = _find_codex_rollout(home, session_id) or _find_archived_codex_rollout(
-        home, session_id
-    )
-    if rollout_path is None:
+    selected = _find_codex_rollout_in_homes(_codex_storage_homes(codex_home), session_id)
+    if selected is None:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} was not found")
+    rollout_path, home = selected
+
+    # Past the size threshold, restart from each compaction boundary so the
+    # import matches what the agent resumes with, dropping the pre-compaction
+    # records it no longer sees. See docs/session-compaction.md.
+    trim_at_compaction = _exceeds_compaction_trim_size(rollout_path)
 
     workspace: str | None = None
     turn_id = "history"
@@ -469,6 +838,17 @@ def load_codex_session(
                 if isinstance(candidate, str) and candidate:
                     turn_id = candidate
                 continue
+            if record.get("type") == "compacted":
+                # replacement_history is the new context baseline; resetting to it
+                # discards prior items so only the last compaction's baseline and
+                # what follows survive (mirrors the terminal agent on resume). A
+                # boundary with no usable baseline is ignored rather than wiping
+                # history to nothing (matches _read_compacted_history's guard).
+                if trim_at_compaction:
+                    baseline = _codex_compacted_baseline_items(payload)
+                    if baseline:
+                        items = baseline
+                continue
             if record.get("type") != "response_item":
                 continue
             item = _codex_response_item(payload, response_id=f"codex:{turn_id}")
@@ -482,6 +862,7 @@ def load_codex_session(
         external_session_id=session_id,
         workspace=workspace,
         items=tuple(items),
+        native_title=_codex_native_title(home, session_id),
     )
 
 
@@ -1189,11 +1570,18 @@ def load_opencode_session(
         )
     workspace_value = info.get("directory") if isinstance(info, dict) else None
     workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    # OpenCode auto-generates a session title (info.title); carry it as the
+    # native title instead of synthesizing from the first message.
+    title_value = info.get("title") if isinstance(info, dict) else None
+    native_title = (
+        title_value.strip() if isinstance(title_value, str) and title_value.strip() else None
+    )
     return LocalSessionImport(
         source="opencode",
         external_session_id=session_id,
         workspace=workspace or None,
         items=items,
+        native_title=native_title,
     )
 
 

@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
 # ---------------------------------------------------------------------------
@@ -36,6 +38,8 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = Any  # type: ignore[explicit-any]
 ToolCallMetadata: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorExtra: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+ExecutorUsage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+CompactedMessages: TypeAlias = list[Message]
 
 # ``enqueue_session_message`` content — arbitrary user-supplied payload
 # (string text or a structured JSON value).
@@ -47,6 +51,22 @@ EnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
 # provider-opaque via this TypeAlias — callers narrow with their own ``cast``
 # or per-event isinstance checks, matching the existing peer-file pattern.
 ProviderStreamItem: TypeAlias = Any  # type: ignore[explicit-any]
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, human-readable description of *exc*.
+
+    ``str(exc)`` is empty for several stdlib exceptions raised without a
+    message (a bare ``RuntimeError()``, ``TimeoutError()``, etc.). Executors
+    that report a failure by ``str(exc)`` then surface a blank error to the
+    operator (issue #4281: "inner executor error: " with no detail). Fall back
+    to ``repr(exc)`` — which always includes the class name — so a failure is
+    never reported without at least naming its type.
+
+    :param exc: The exception to describe.
+    :returns: ``str(exc)`` when non-empty, otherwise ``repr(exc)``.
+    """
+    return str(exc) or repr(exc)
 
 
 @runtime_checkable
@@ -172,7 +192,7 @@ class TurnComplete(ExecutorEvent):
     response: str | None = None
     modified_by_policy: bool = False
     continue_turn: bool = False
-    usage: dict[str, Any] | None = None
+    usage: ExecutorUsage | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
@@ -211,6 +231,16 @@ class ToolCallComplete(ExecutorEvent):
 
 
 @dataclass
+class CompactionStarted(ExecutorEvent):
+    """The harness detected that compaction is about to begin.
+
+    Emitted as soon as the compaction signal is received, before the
+    compacted state is available.  Allows clients to show a progress
+    indicator while compaction is in flight.
+    """
+
+
+@dataclass
 class CompactionComplete(ExecutorEvent):
     """The harness compacted its internal context.
 
@@ -230,7 +260,64 @@ class CompactionComplete(ExecutorEvent):
     summary: str
     token_count: int
     model: str | None = None
-    compacted_messages: list[dict[str, Any]] | None = None
+    compacted_messages: CompactedMessages | None = None
+
+
+@dataclass
+class SubAgentStarted(ExecutorEvent):
+    """A sub-agent the harness agent spawned has begun.
+
+    Surfaced so the runner can mint an Omnigent child session (the web
+    "Subagents" panel lists one row per child). ACP has no standardized
+    sub-agent signal, so a per-dialect ``AcpSubAgentSource`` normalizes an
+    agent's own reporting (e.g. Devin's ``cognition.ai/subagent_*`` ``_meta``)
+    into this event — see :mod:`omnigent.inner.acp_subagents`.
+
+    :param child_key: Stable, per-turn-unique id for the sub-agent, used both to
+        correlate the later :class:`SubAgentCompleted` and as the idempotency
+        key when the child session is minted.
+    :param title: Short human label for the row, e.g. ``"mathutils"``.
+    :param task: The instruction the sub-agent was given, shown on the row.
+    """
+
+    child_key: str
+    title: str
+    task: str = ""
+
+
+@dataclass
+class SubAgentCompleted(ExecutorEvent):
+    """A previously-started sub-agent finished. See :class:`SubAgentStarted`.
+
+    :param child_key: Matches the :attr:`SubAgentStarted.child_key`.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary, shown on the child row.
+    """
+
+    child_key: str
+    ok: bool = True
+    summary: str = ""
+
+
+@dataclass
+class SubAgentToolCall(ExecutorEvent):
+    """A tool call an ACP sub-agent ran, to append to its child transcript.
+
+    Distinct from :class:`ToolCallRequest`, which renders in the *parent* stream:
+    this is a call the sub-agent made inside its delegated work, routed to the
+    sub-agent's own child session by :attr:`child_key`. See
+    :mod:`omnigent.inner.acp_subagents`.
+
+    :param child_key: Matches the owning :attr:`SubAgentStarted.child_key`.
+    :param call_id: The tool call's id, used as the child item's ``call_id``.
+    :param name: Human tool label for the card, e.g. ``"Wrote mathutils.py"``.
+    :param args: The tool's arguments (its raw input).
+    """
+
+    child_key: str
+    call_id: str
+    name: str
+    args: ToolArgs = field(default_factory=dict)
 
 
 @dataclass
@@ -254,10 +341,38 @@ class ExecutorError(ExecutorEvent):
         failures (auth, SDK crash, protocol violation) that would recur.
         Consumed by the omnigent workflow to pick between
         :class:`RetryableLLMError` and :class:`PermanentLLMError`.
+    :param usage: Token usage the executor observed before the turn
+        failed, or ``None`` when nothing was observed. Same shape as
+        :attr:`TurnComplete.usage`. ``context_tokens`` (window fill) is
+        the meaningful field here: a turn that dies after the model
+        call started has already reported its prompt size, and
+        discarding it freezes the context-occupancy meter at the
+        previous turn's value exactly when the session is in trouble.
+    :param preserve_session: The executor is idle and safe to reuse after this
+        failure. Set only when no prompt or tool work remains in progress.
+        Defaults to ``False`` so failed turns receive normal teardown.
+    :param code: Semantic failure code the turn error should carry, e.g.
+        ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
+        fall back to its generic classification of the failure.
+    :param title: Short headline for the error card, e.g. ``"Codex is waiting
+        for a sign-in"``, or ``None``.
+    :param remediation: Concrete next step for the user, e.g. the sign-in link
+        and code, or ``None``.
+    :param undelivered: ``True`` when the failure happened before the harness
+        received the message (a launcher sign-in prompt, a missing bridge, a
+        prompt that never rendered), so the message never reached the
+        transcript and its sender's queued copy is the only record of it.
+        ``False`` (default) once the harness may have accepted it.
     """
 
     message: str
     retryable: bool = False
+    usage: ExecutorUsage | None = None
+    preserve_session: bool = False
+    code: str | None = None
+    title: str | None = None
+    remediation: str | None = None
+    undelivered: bool = False
 
 
 def _close_stream_quietly(stream: Iterator[ProviderStreamItem]) -> None:
@@ -447,6 +562,17 @@ def classify_tool_result(
                 status=ToolCallStatus.BLOCKED,
                 error=str(result.get("reason", "BLOCKED")),
             )
+        image_result = decode_mcp_image_result(result)
+        if image_result is not None:
+            if not image_result.is_error:
+                return ToolResultClassification(status=ToolCallStatus.SUCCESS, error="")
+            text = "\n".join(
+                str(block["text"]) for block in image_result.content if block["type"] == "text"
+            )
+            return ToolResultClassification(
+                status=ToolCallStatus.ERROR,
+                error=text or "MCP tool returned an error",
+            )
         for key in ("content", "result", "output", "text"):
             if key in result:
                 nested = classify_tool_result(
@@ -515,6 +641,14 @@ def classify_tool_result(
 # ---------------------------------------------------------------------------
 
 
+class InjectionDeliveryAmbiguous(Exception):
+    """A live message may already have reached the harness, so it must not be resent.
+
+    :meth:`Executor.enqueue_session_message` raises this when the harness's reply
+    to a submission it may have accepted was lost.
+    """
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -571,7 +705,10 @@ class Executor:
         return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        :raises InjectionDeliveryAmbiguous: The harness may have accepted the message.
+        """
         return False
 
     def supports_live_message_queue(self) -> bool:

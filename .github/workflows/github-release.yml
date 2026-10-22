@@ -1,9 +1,9 @@
 # Create a GitHub Release entry (the `…/releases` page) when a version tag is
 # pushed. This is METADATA ONLY — it does NOT build or publish any installable
-# artifact. PyPI publishing lives in the central secure-release repo
-# (databricks/secure-public-registry-releases-eng → `omnigent` workflow), on
-# hardened runners with OIDC Trusted Publishing and a mandatory dependency
-# scan. Keeping those concerns separate is deliberate (see RELEASING.md):
+# artifact. PyPI publishing lives in a Databricks-internal secure-release repo
+# (its `omnigent` workflow), on hardened runners with OIDC Trusted Publishing
+# and a mandatory dependency scan. Keeping those concerns separate is
+# deliberate (see the maintainer release runbook):
 #
 #   * This job runs NO project or third-party code — no build, no `pip
 #     install`/`npm ci`, no tests. Its only action is SHA-pinned
@@ -65,7 +65,7 @@ jobs:
               echo "skip=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.tag.outputs.skip != 'true'
 
       - name: Draft release with a placeholder body

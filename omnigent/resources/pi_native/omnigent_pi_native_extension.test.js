@@ -32,15 +32,15 @@ const harnesses = [];
 // Build a fresh extension instance with its own temp inbox directory. Each call
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
-function makeHarness({ captureEvents = false } = {}) {
+function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
   const configPath = path.join(inboxDir, "config.json");
   // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
   const config = captureEvents
-    ? { inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
-    : { inboxDir };
+    ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
+    : { inboxDir, bridgeDir: inboxDir };
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -58,11 +58,16 @@ function makeHarness({ captureEvents = false } = {}) {
   }
 
   const handlers = {};
+  const registeredTools = {};
   const pi = {
     on: (name, fn) => {
       handlers[name] = fn;
     },
     registerCommand: () => {},
+    registerTool: (tool) => {
+      registeredTools[tool.name] = tool;
+    },
+    getAllTools: () => existingTools,
     sendUserMessage: () => {},
   };
 
@@ -71,7 +76,7 @@ function makeHarness({ captureEvents = false } = {}) {
   const mod = require(EXT_PATH);
   mod(pi);
 
-  const h = { pi, handlers, inboxDir, postedEvents };
+  const h = { pi, handlers, inboxDir, postedEvents, registeredTools };
   harnesses.push(h);
   return h;
 }
@@ -297,6 +302,130 @@ async function testAgentStartClearsStaleWindow() {
   );
 }
 
+async function testTaskPlanPublishesTodos() {
+  const h = makeHarness({ captureEvents: true });
+  await h.handlers.session_start({}, {});
+  const tool = h.registeredTools.manage_todo_list;
+  assert("registers manage_todo_list", !!tool);
+  assert(
+    "requires a task plan before multi-step work",
+    tool.promptGuidelines.some((guideline) =>
+      guideline.includes(
+        "must call manage_todo_list before using other tools",
+      ),
+    ),
+  );
+
+  const result = await tool.execute("todo-1", {
+    operation: "write",
+    todoList: [
+      {
+        id: 1,
+        title: "Trace rendering",
+        description: "Tracing the shared event path",
+        status: "in-progress",
+      },
+      {
+        id: 2,
+        title: "Run checks",
+        description: "Run focused checks",
+        status: "not-started",
+      },
+    ],
+  });
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "manage_todo_list publishes the shared todo event",
+    JSON.stringify(event && event.data.todos) ===
+      JSON.stringify([
+        {
+          content: "Trace rendering",
+          status: "in_progress",
+          activeForm: "Tracing the shared event path",
+        },
+        {
+          content: "Run checks",
+          status: "pending",
+          activeForm: "Run focused checks",
+        },
+      ]),
+    JSON.stringify(event),
+  );
+  assert(
+    "manage_todo_list persists its current list in tool details",
+    result.details.todos.length === 2 &&
+      result.details.todos[0].status === "in-progress",
+    JSON.stringify(result),
+  );
+
+  const restored = makeHarness({ captureEvents: true });
+  await restored.handlers.session_start(
+    {},
+    {
+      sessionManager: {
+        getBranch: () => [
+          {
+            type: "message",
+            message: {
+              role: "toolResult",
+              toolName: "manage_todo_list",
+              details: { todos: result.details.todos },
+            },
+          },
+        ],
+      },
+    },
+  );
+  const restoredEvent = restored.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "session_start restores and republishes the latest task plan",
+    restoredEvent && restoredEvent.data.todos.length === 2,
+    JSON.stringify(restoredEvent),
+  );
+}
+
+async function testExistingTaskToolIsMirroredWithoutConflict() {
+  const h = makeHarness({
+    captureEvents: true,
+    existingTools: [{ name: "manage_todo_list" }],
+  });
+  await h.handlers.session_start({}, {});
+  assert(
+    "reuses an existing manage_todo_list tool",
+    !h.registeredTools.manage_todo_list,
+  );
+
+  await h.handlers.tool_result(
+    {
+      toolCallId: "external-todo-1",
+      toolName: "manage_todo_list",
+      details: {
+        todos: [
+          {
+            id: 1,
+            title: "Use the shared tool",
+            description: "Using the shared task tool",
+            status: "in-progress",
+          },
+        ],
+      },
+    },
+    {},
+  );
+  const event = h.postedEvents.find(
+    (item) => item.type === "external_session_todos",
+  );
+  assert(
+    "mirrors an existing task tool into the shared todo event",
+    event && event.data.todos[0].content === "Use the shared tool",
+    JSON.stringify(event),
+  );
+}
+
 // The web store only clears its local "streaming" flag when a turn's `idle`
 // status edge carries the same response_id as the `running` edge that opened
 // it. A fresh id per edge left the composer stuck queueing until a tab switch
@@ -344,9 +473,100 @@ async function testRunningIdleShareResponseId() {
   );
 }
 
+async function testSessionStartupDoesNotCompleteATurn() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "saved-native-session" };
+
+  await h.handlers.session_start({}, ctx);
+
+  assert(
+    "starting an idle or resumed session does not report a completed turn",
+    statusEdges(h.postedEvents).length === 0,
+    JSON.stringify(statusEdges(h.postedEvents)),
+  );
+}
+
+async function testSessionStartMarksInputReady() {
+  const h = makeHarness();
+  const marker = path.join(h.inboxDir, "input_ready");
+  assert("input-ready marker is absent before session_start", !fs.existsSync(marker));
+
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+
+  assert(
+    "session_start writes the input-ready marker once the inbox poller is armed",
+    fs.existsSync(marker) && !!h.pi.__omnigentInboxPoller,
+  );
+}
+
+async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
+  const h = makeHarness({ captureEvents: true });
+  const ctx = makeCtx({ idle: true });
+  ctx.sessionManager = { getSessionId: () => "queued-native-session" };
+  const captureFetch = global.fetch;
+  let releaseStartupPatch;
+  const startupPatchPending = new Promise((resolve) => {
+    releaseStartupPatch = resolve;
+  });
+  global.fetch = async (url, opts) => {
+    if (opts.method === "PATCH") await startupPatchPending;
+    return captureFetch(url, opts);
+  };
+  let agentStartPromise;
+  h.pi.sendUserMessage = () => {
+    ctx.isIdle = () => false;
+    agentStartPromise = h.handlers.agent_start({}, ctx);
+  };
+  const payloadPath = path.join(h.inboxDir, "first-prompt.json");
+  fs.writeFileSync(
+    payloadPath,
+    JSON.stringify({ id: "first-prompt", type: "user_message", content: "Run the task" }),
+  );
+  const startup = h.handlers.session_start({}, ctx);
+  try {
+    const deadline = Date.now() + 3000;
+    while (fs.existsSync(payloadPath)) {
+      if (Date.now() > deadline) throw new Error("startup prompt was not consumed by poller");
+      await sleep(20);
+    }
+    if (!agentStartPromise) throw new Error("the queued prompt did not start an agent loop");
+    await agentStartPromise;
+    releaseStartupPatch();
+    await startup;
+
+    const beforeEnd = statusEdges(h.postedEvents);
+    assert(
+      "finishing startup preserves the queued prompt's running turn",
+      beforeEnd.length === 1 && beforeEnd[0].status === "running",
+      JSON.stringify(beforeEnd),
+    );
+
+    await h.handlers.agent_end({ messages: [] }, ctx);
+    const afterEnd = statusEdges(h.postedEvents);
+    assert(
+      "only agent_end completes the queued prompt with the same response_id",
+      afterEnd.length === 2 &&
+        afterEnd[0].status === "running" &&
+        afterEnd[1].status === "idle" &&
+        afterEnd[0].responseId === afterEnd[1].responseId,
+      JSON.stringify(afterEnd),
+    );
+  } finally {
+    releaseStartupPatch();
+    await startup;
+    global.fetch = captureFetch;
+  }
+}
+
 (async () => {
   try {
+    await testSessionStartupDoesNotCompleteATurn();
+    await testSessionStartMarksInputReady();
+    await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
+    await testTaskPlanPublishesTodos();
+    await testExistingTaskToolIsMirroredWithoutConflict();
     await testIdleInterruptDoesNotPoisonNextTurn();
     await testIdleInterruptFallbackNoIsIdle();
     await testMidTurnInterruptStillAborts();

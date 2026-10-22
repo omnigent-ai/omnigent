@@ -135,6 +135,30 @@ async def test_update_patches_by_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_forwards_agent_switch_and_cost_cap() -> None:
+    """``agent_id`` / ``max_cost_usd`` reach the PATCH instead of being dropped.
+
+    The dispatch allowlist is what an agent's ``sys_scheduled_task_update`` call
+    actually travels through, so a field missing from it is silently ignored —
+    the update appears to succeed while changing nothing.
+    """
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps(
+            {
+                "scheduled_task_id": _TASK_ID,
+                "agent_id": "ag_pi",
+                "max_cost_usd": 2.5,
+            }
+        ),
+        server_client=client,
+    )
+    _, _, body = client.calls[0]
+    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
+
+
+@pytest.mark.asyncio
 async def test_delete_by_id() -> None:
     client = _RecordingClient(_Resp(body={"deleted": True, "id": "t1"}))
     await _execute_scheduled_task_tool(
@@ -219,6 +243,8 @@ def test_update_tool_schema_allows_connected_host_changes() -> None:
     properties = schema["properties"]
     assert "workspace" in properties
     assert "host_id" in properties
+    # Switching which agent/harness a task runs is part of the update surface.
+    assert "agent_id" in properties
 
 
 def test_tools_in_dispatch_and_relay_sets() -> None:

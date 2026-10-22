@@ -53,9 +53,10 @@ import asyncio
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.runtime import session_stream
 
 # Delay between a user's last stream disconnecting and their leave
@@ -110,10 +111,12 @@ class _ViewerEntry:
 # tree's ROOT so viewers of different agents/sub-agents in one
 # session share a single viewer list. Module-global, mirroring the
 # subscriber registry in ``omnigent.runtime.session_stream``.
-_viewers: dict[str, dict[str, _ViewerEntry]] = {}
+_viewers: WorkspaceScopedCache[str, dict[str, _ViewerEntry]] = WorkspaceScopedCache()
 
 # (root_conversation_id, user_id) -> pending leave-broadcast timer.
-_pending_leaves: dict[tuple[str, str], asyncio.TimerHandle] = {}
+_pending_leaves: WorkspaceScopedCache[tuple[str, str], asyncio.TimerHandle] = (
+    WorkspaceScopedCache()
+)
 
 _lock = threading.Lock()
 
@@ -125,7 +128,7 @@ def _now_iso() -> str:
     :returns: Timestamp like ``"2026-06-10T17:00:00Z"``, matching
         the convention of :class:`SessionHeartbeatEvent.server_time`.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def snapshot(root_id: str, conversation_id: str) -> dict[str, Any]:
@@ -311,7 +314,9 @@ def _expire_leave(root_id: str, user_id: str) -> None:
     with _lock:
         _pending_leaves.pop((root_id, user_id), None)
         users = _viewers.get(root_id)
-        entry = users.get(user_id) if users is not None else None
+        if users is None:
+            return
+        entry = users.get(user_id)
         if entry is None or entry.connections:
             return
         del users[user_id]
@@ -330,7 +335,8 @@ def reset_for_tests() -> None:
     is visible to every later test in the same process.
     """
     with _lock:
-        timers = list(_pending_leaves.values())
+        # Test reset spans every workspace, so sweep the whole backing.
+        timers = _pending_leaves.all_values()
         _pending_leaves.clear()
         _viewers.clear()
     for timer in timers:

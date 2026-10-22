@@ -8,6 +8,11 @@ Regression coverage for two bugs in the HTML artifact preview
   * #777 — links in a rendered HTML file did not open. The same empty sandbox
     blocked popups/navigation; the fix injects ``<base target="_blank">`` and
     relaxes the sandbox so links open a real new tab.
+  * Same-page ``#fragment`` links escaped to a new window at the host page's
+    URL (a ``srcdoc`` frame resolves fragment-only links against its embedder,
+    and the base target sent them out); they must scroll the preview in place,
+    while a handler the artifact registers on ``window`` afterwards must still
+    be able to cancel such a click.
 
 It also covers the new "Open in new tab" toolbar button, which pops the
 artifact into a blank, app-controlled tab and renders it inside the same
@@ -31,7 +36,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes
 # seeded files into the server process's cwd — the repo root (this file is
@@ -49,9 +54,14 @@ _EXPECTED_SANDBOX = (
 
 _HTML_PATH = "preview_artifact.html"
 
+# Tall filler so the same-page anchor target starts well below the preview fold.
+_FILLER = "\n".join(
+    f"    <p>Filler paragraph {i} providing vertical space.</p>" for i in range(60)
+)
+
 # Self-contained fixture: a script flips a sentinel element from a "blocked"
 # marker to a "ran" marker, and creates a link at runtime. No network needed.
-_HTML_CONTENT = """\
+_HTML_CONTENT = f"""\
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -63,7 +73,15 @@ _HTML_CONTENT = """\
     <p id="js-status">js-blocked</p>
     <a id="static-link" href="https://example.com/static">static link</a>
     <p id="dynamic-link-host"></p>
+    <a id="toc-link" href="#section-3">Jump to section 3</a>
+    <a id="guarded-link" href="#section-3">Guarded jump</a>
+    <a id="relative-link" href="other.html">relative link</a>
     <script>
+      // An artifact handler registered on window after the preview's own script must still
+      // be able to cancel a same-page link, here through the legacy return-false form.
+      window.onclick = function (event) {{
+        return !(event.target && event.target.id === "guarded-link");
+      }};
       // Proof that scripts run (#778).
       document.getElementById("js-status").textContent = "js-ran";
       // A link created at runtime — covered by the injected <base target>.
@@ -73,6 +91,9 @@ _HTML_CONTENT = """\
       a.textContent = "dynamic link";
       document.getElementById("dynamic-link-host").appendChild(a);
     </script>
+{_FILLER}
+    <h2 id="section-3">Section 3</h2>
+    <p>Target of the in-page link.</p>
   </body>
 </html>
 """
@@ -80,6 +101,33 @@ _HTML_CONTENT = """\
 
 def _cleanup_session_workdir(session_id: str) -> None:
     shutil.rmtree(_REPO_ROOT / session_id, ignore_errors=True)
+
+
+def _click_without_popup(
+    page: Page, link: Locator, target: Locator, *, scrolls: bool = True
+) -> None:
+    """Click ``link`` with no new page opening; ``target`` scrolls into view, or stays put."""
+    opened: list[Page] = []
+    pages_before = len(page.context.pages)
+
+    def note_popup(popup: Page) -> None:
+        opened.append(popup)
+
+    page.context.on("page", note_popup)
+    try:
+        link.click()
+        if scrolls:
+            expect(target).to_be_in_viewport()
+        # The click itself would have created a popup; a brief settle catches a late event.
+        page.wait_for_timeout(500)
+        if not scrolls:
+            expect(target).not_to_be_in_viewport()
+    finally:
+        page.context.remove_listener("page", note_popup)
+    assert len(page.context.pages) == pages_before
+    assert not opened, "same-page anchor opened a new window at " + ", ".join(
+        p.url for p in opened
+    )
 
 
 @pytest.fixture
@@ -99,11 +147,11 @@ def seeded_html(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
         _cleanup_session_workdir(session_id)
 
 
-def test_html_preview_runs_scripts_and_targets_links(
+def test_html_preview_links_and_sandboxed_popout(
     page: Page,
     seeded_html: tuple[str, str],
 ) -> None:
-    """HTML preview runs JS (#778) and forces links to open in a new tab (#777)."""
+    """Preview links work inline and in an isolated, sandboxed pop-out."""
     base_url, session_id = seeded_html
     # Keep the viewport wide so the responsive toolbar renders its actions
     # inline (the "Open in new tab" button is found by role, not via overflow).
@@ -134,25 +182,27 @@ def test_html_preview_runs_scripts_and_targets_links(
     # The runtime-created link is present, confirming the script fully executed.
     expect(preview.locator("#dynamic-link")).to_have_text("dynamic link")
 
+    # A same-page ``#fragment`` link must scroll the preview: a srcdoc frame otherwise
+    # resolves it against the host page's URL and the ``_blank`` base target opens it
+    # externally.
+    target = preview.locator("#section-3")
+    expect(target).not_to_be_in_viewport()
+    # The artifact's own ``window.onclick`` (registered after the preview's script) cancels the
+    # guarded link, so nothing scrolls or opens: artifact handlers keep precedence.
+    _click_without_popup(
+        page, preview.get_by_role("link", name="Guarded jump"), target, scrolls=False
+    )
+    _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
+    expect(page).to_have_url(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
-def test_html_preview_open_in_new_tab_button(
-    page: Page,
-    seeded_html: tuple[str, str],
-) -> None:
-    """The "Open in new tab" button pops the artifact into an isolated, sandboxed tab.
-
-    Security regression guard: the artifact must render inside a *sandboxed*
-    (opaque-origin) iframe in an app-controlled blank tab — NOT at the app's own
-    origin (which a ``blob:``/``data:`` URL would do, exposing the app's storage
-    and credentialed API to untrusted artifact JS).
-    """
-    base_url, session_id = seeded_html
-    page.set_viewport_size({"width": 1600, "height": 900})
-    page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
-
-    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(file_viewer).to_be_visible()
-    expect(file_viewer.locator('iframe[title="HTML preview"]')).to_be_visible(timeout=10_000)
+    # Every other link still opens in a new tab (#777), also after a same-page activation:
+    # the handler touches neither the links nor the injected base. A relative one resolves
+    # against the embedder, as before.
+    with page.context.expect_page() as popup_info:
+        preview.get_by_role("link", name="relative link").click()
+    popup = popup_info.value
+    expect(popup).to_have_url(f"{base_url}/c/other.html")
+    popup.close()
 
     open_btn = file_viewer.get_by_role("button", name="Open in new tab")
     expect(open_btn).to_be_visible()
@@ -196,5 +246,12 @@ def test_html_preview_open_in_new_tab_button(
         }"""
     )
     assert parent_access_blocked
+
+    # Same-page links stay inside the popped tab's frame too (its host page is
+    # ``about:blank``, so the fragment would otherwise resolve there).
+    target = preview.locator("#section-3")
+    expect(target).not_to_be_in_viewport()
+    _click_without_popup(page, preview.get_by_role("link", name="Jump to section 3"), target)
+    assert popped.url == "about:blank"
 
     popped.close()

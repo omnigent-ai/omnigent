@@ -65,7 +65,7 @@ export function SlashCommandCard({ kind, name, arguments: args, output }: SlashC
   const trigger = (
     <span
       title={tooltip}
-      className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="flex w-full items-center gap-1.5 py-0.5 text-left text-muted-foreground text-sm transition-colors hover:text-foreground"
       data-testid="slash-command-card"
       data-slash-kind={kind}
     >

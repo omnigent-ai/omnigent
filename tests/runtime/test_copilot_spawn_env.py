@@ -104,6 +104,25 @@ def test_no_auth_prefers_stored_block_over_ambient(
     assert env["HARNESS_COPILOT_GITHUB_TOKEN"] == "gho_stored"
 
 
+def test_github_host_threaded_when_configured(tmp_path: Path) -> None:
+    """A configured GHE host must survive the spawn-env → wrap → executor hop."""
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"copilot": {"github_host": "acme.ghe.com"}})
+    )
+    env = _build_copilot_spawn_env(_make_spec(auth=None))
+    assert env["HARNESS_COPILOT_GITHUB_HOST"] == "acme.ghe.com"
+
+
+def test_github_host_absent_when_unconfigured() -> None:
+    assert "HARNESS_COPILOT_GITHUB_HOST" not in _build_copilot_spawn_env(_make_spec())
+
+
+def test_no_token_anywhere_leaves_token_unset() -> None:
+    """With no token, the wrap must be free to fall back to the harness host's
+    own ``gh`` login rather than receiving an empty value."""
+    assert "HARNESS_COPILOT_GITHUB_TOKEN" not in _build_copilot_spawn_env(_make_spec(auth=None))
+
+
 def test_bundle_dir_threaded(tmp_path: Path) -> None:
     env = _build_copilot_spawn_env(_make_spec(), workdir=tmp_path)
     assert env["HARNESS_COPILOT_BUNDLE_DIR"] == str(tmp_path)

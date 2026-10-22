@@ -3,6 +3,28 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Reuse and design
+
+- Search for and reuse existing helpers before adding code. Refactor an existing
+  implementation if that avoids duplication.
+- Use descriptive names; avoid unexplained abbreviations and single-letter names.
+
+## Test changes
+
+Before adding test setup, read [the test guide](tests/README.md) and
+[primitive catalog](tests/_helpers/README.md), then inspect the nearest scenario.
+Reuse sufficient coverage unchanged or extend a compatible scenario. Keep input
+matrices at the lowest reliable layer; retain E2E for distinct process, transport
+or browser boundaries. Reuse primitives with explicit caller inputs and keep
+faults and assertions in the test. Explain new setup or a separate E2E in the
+PR's Test Plan (Repro uses `evidence`; Resolve uses `test_audit`). Count helper changes in
+test LOC; fewer lines alone do not establish adequate coverage.
+
+- Add a unit test for non-trivial functions, methods, and exported APIs. Add
+  coverage when changed behavior needs it.
+- Run the relevant tests before submitting. Document unrelated pre-existing
+  failures in the PR description.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
@@ -24,7 +46,8 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 
 When you open a pull request, fill in the repo's PR template at
 `.github/pull_request_template.md` (case-sensitive on Linux — note the lowercase
-filename). Keep every section and checkbox row so reviewers can skim them.
+filename). Keep every section and checkbox row so reviewers can skim them,
+except the optional Changelog section as described below.
 
 - **Summary** — what changed and why.
 - **Test Plan** — how you verified it.
@@ -36,17 +59,44 @@ filename). Keep every section and checkbox row so reviewers can skim them.
   each).
 - **Coverage notes** — required if you checked "Manual verification completed"
   or "Not applicable".
+- **Release notes** — choose exactly one Yes/No checkbox and keep both rows.
+  Choose Yes only for outstanding user-facing features, bug fixes, UX changes,
+  and breaking changes. Breaking changes must choose Yes. Features behind a
+  feature flag are eligible only once the flag is enabled for users. Choose No
+  for small fixes or improvements, features behind disabled flags, and internal
+  changes with no user impact. This is the author's recommendation for
+  maintainers curating the release notes.
+- **Changelog** — if Release notes is Yes, write one line describing the change
+  for users, including compatibility impact for breaking changes. If No, delete
+  this section; the complete changelog still credits the PR using its title.
 
 Generate the description from the actual diff and this session's context — lead
 with the motivation, then the change. Don't pass a `--body` that skips these
 sections.
 
+### Demo media
+
+Do not commit screenshots or recordings created only as PR or issue evidence.
+Upload them as GitHub attachments and embed the attachment URLs in the PR's
+Demo section or issue comments. Keep local captures outside the tracked tree,
+and redact private data before uploading.
+
+Commit media only when it serves maintained documentation, product assets, or
+test baselines, not merely to obtain a public demo URL. If attachment upload is
+unavailable, explain the limitation and ask for help instead of committing the
+files as a workaround.
+
 ## Finishing a task
 
 When you finish a task, print instructions to the user on how to test it: the
 commands to run, the inputs to provide, or the steps to reproduce so they can
-verify the result themselves. Don't leave the user guessing how to confirm the
-work — tell them exactly what to do.
+verify the result themselves. Prefer verification that is best performed by a
+human, such as concrete manual behavior checks, rather than only listing unit
+test commands. Don't leave the user guessing how to confirm the work — tell
+them exactly what to do.
+
+To drive the app yourself and prove a user-facing change on every entry point a
+user can reach, start with `feature-map/README.md`, then read the relevant maps and linked skills.
 
 ## Deprecating features
 
@@ -66,6 +116,15 @@ Keep comments short and focused on the code, not on the change history.
   *why* it exists, in terms a future reader needs. Don't reference PR numbers,
   issue numbers, or ticket IDs (e.g. `#1646`, `fixes JIRA-123`); the scenario
   should be clear without chasing external links.
+
+## Database query names
+
+Application stores use `make_named_managed_session_maker` and give every
+session a stable semantic operation name. The session-level name must describe
+the caller's intent rather than repeat SQL syntax; use a nested
+`query_name_scope` only when one transaction needs distinct names for important
+subqueries. Because the named session covers implicit flush and commit, don't
+add an explicit `flush()` only to make a query name observable.
 
 ## Framework-owned instructions
 

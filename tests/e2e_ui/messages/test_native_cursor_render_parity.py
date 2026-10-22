@@ -4,7 +4,7 @@ The native ``cursor-native`` ("Cursor") wrapper is terminal-first: a real
 ``cursor-agent`` CLI runs in the session terminal, the SPA's **Terminal** view
 attaches to that live TUI over a WebSocket, and the SPA's **Chat** view renders
 the SAME canonical transcript (``GET /v1/sessions/{id}/items``) the TUI prints.
-A native forwarder (:mod:`omnigent.cursor_native_forwarder`) tails
+A native forwarder (:mod:`omnigent.harnesses.cursor_native.forwarder`) tails
 ``cursor-agent``'s own chat store and mirrors the transcript back OUT as
 conversation items; web-composer messages are injected INTO the TUI's tmux pane
 by :class:`omnigent.inner.cursor_native_executor.CursorNativeExecutor`. This
@@ -48,7 +48,7 @@ conversation items the SPA renders as bubbles) with no live ``cursor-agent`` and
 no LLM. ``cursor-agent`` has no OpenAI-compatible / custom-endpoint shim (see
 ``omnigent.inner.cursor_harness``), so it cannot be pointed at the mock LLM the
 custom-agent suites use; instead this test seeds a cursor chat store and runs the
-real :func:`omnigent.cursor_native_forwarder.forward_cursor_store_to_session`
+real :func:`omnigent.harnesses.cursor_native.forwarder.forward_cursor_store_to_session`
 against the spawned server, so the mirror→server→web path runs on every PR.
 """
 
@@ -70,7 +70,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from omnigent import cursor_native_forwarder as fwd
+from omnigent.harnesses.cursor_native import forwarder as fwd
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
 # canonical transcript, so parity / dedup / ordering are asserted identically.
@@ -81,6 +81,7 @@ from .test_message_render_parity import (
     _assert_no_duplicate_render,
     _assert_transcript_parity,
     _ensure_chat_view,
+    _select_view_mode,
     _send,
     _turn_prompt,
 )
@@ -146,11 +147,10 @@ def _open_terminal_view(page: Page) -> None:
 
     :param page: The Playwright page, on the session's chat surface.
     """
-    view_mode = page.get_by_role("group", name="View mode")
-    expect(view_mode).to_be_visible(timeout=_TERMINAL_READY_TIMEOUT_MS)
-    terminal_button = view_mode.get_by_role("button", name="Terminal")
-    expect(terminal_button).to_be_visible(timeout=30_000)
-    terminal_button.click()
+    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
+        timeout=_TERMINAL_READY_TIMEOUT_MS
+    )
+    _select_view_mode(page, "Terminal")
 
 
 def _wait_terminal_connected(page: Page) -> None:

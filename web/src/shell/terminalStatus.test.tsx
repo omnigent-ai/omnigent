@@ -1,7 +1,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { type ConnectionState } from "@/components/blocks/TerminalSession";
-import { type TerminalInfo } from "@/hooks/useTerminals";
+import type { ConnectionState } from "@/components/blocks/TerminalSession";
+import type { TerminalInfo } from "@/hooks/useTerminals";
 import { deriveTerminalStatus, TerminalStatusBadge } from "./terminalStatus";
 
 afterEach(() => {

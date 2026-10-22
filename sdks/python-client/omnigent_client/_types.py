@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+def _json_int(value: object) -> int:
+    """Parse an integer-compatible JSON scalar."""
+    if isinstance(value, (bool, int, float, str)):
+        return int(value)
+    raise TypeError(f"expected a JSON number or numeric string, got {type(value).__name__}")
+
+
 @dataclass
 class ConversationRef:
     """Reference to a conversation, as returned on response objects."""
@@ -82,11 +89,11 @@ class Response:
         usage_raw = data.get("usage")
         usage = (
             Usage(
-                input_tokens=int(usage_raw.get("input_tokens", 0)),
-                output_tokens=int(usage_raw.get("output_tokens", 0)),
-                total_tokens=int(usage_raw.get("total_tokens", 0)),
+                input_tokens=_json_int(usage_raw.get("input_tokens", 0)),
+                output_tokens=_json_int(usage_raw.get("output_tokens", 0)),
+                total_tokens=_json_int(usage_raw.get("total_tokens", 0)),
                 context_tokens=(
-                    int(usage_raw["context_tokens"])
+                    _json_int(usage_raw["context_tokens"])
                     if usage_raw.get("context_tokens") is not None
                     else None
                 ),
@@ -109,13 +116,14 @@ class Response:
             if isinstance(inc_raw, dict)
             else None
         )
+        output_raw = data.get("output", [])
         return cls(
             id=str(data.get("id", "")),
             status=str(data.get("status", "")),
             model=str(data.get("model", "")),
-            output=data.get("output", []) if isinstance(data.get("output"), list) else [],
-            created_at=int(data.get("created_at", 0)),
-            completed_at=int(data["completed_at"])
+            output=output_raw if isinstance(output_raw, list) else [],
+            created_at=_json_int(data.get("created_at", 0)),
+            completed_at=_json_int(data["completed_at"])
             if data.get("completed_at") is not None
             else None,
             previous_response_id=(
@@ -150,7 +158,7 @@ class Agent:
             id=str(data.get("id", "")),
             name=str(data.get("name", "")),
             description=str(data["description"]) if data.get("description") is not None else None,
-            created_at=int(data.get("created_at", 0)),
+            created_at=_json_int(data.get("created_at", 0)),
         )
 
 
@@ -169,8 +177,8 @@ class File:
         return cls(
             id=str(data.get("id", "")),
             filename=str(data.get("filename", "")),
-            bytes=int(data.get("bytes", 0)),
-            created_at=int(data.get("created_at", 0)),
+            bytes=_json_int(data.get("bytes", 0)),
+            created_at=_json_int(data.get("created_at", 0)),
         )
 
 
@@ -210,7 +218,7 @@ class Conversation:
         return cls(
             id=str(data.get("id", "")),
             title=str(data["title"]) if data.get("title") is not None else None,
-            created_at=int(data.get("created_at", 0)),
+            created_at=_json_int(data.get("created_at", 0)),
             labels=labels,
         )
 
@@ -227,8 +235,9 @@ class PaginatedList:
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> PaginatedList:
         """Parse a paginated list from a JSON dict."""
+        items_raw = data.get("data", [])
         return cls(
-            data=data.get("data", []) if isinstance(data.get("data"), list) else [],
+            data=items_raw if isinstance(items_raw, list) else [],
             first_id=str(data["first_id"]) if data.get("first_id") is not None else None,
             last_id=str(data["last_id"]) if data.get("last_id") is not None else None,
             has_more=bool(data.get("has_more", False)),

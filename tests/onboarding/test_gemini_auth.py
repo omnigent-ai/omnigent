@@ -121,6 +121,21 @@ def test_missing_file_not_detected(tmp_path: Path) -> None:
     assert ga.gemini_auth_has_credential(tmp_path / "nope.json") is False
 
 
+def test_gemini_api_key_detected_without_oauth_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """agy 1.1.13+ can authenticate directly from the ambient Gemini key."""
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    assert ga.gemini_auth_has_credential(tmp_path / "nope.json") is True
+    assert ga.gemini_login_detected() is True
+
+
+def test_blank_gemini_api_key_not_detected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whitespace is not a usable API key."""
+    monkeypatch.setenv("GEMINI_API_KEY", "  ")
+    assert ga.gemini_login_detected() is False
+
+
 def test_non_json_file_not_detected(tmp_path: Path) -> None:
     """A non-JSON file reads as not-logged-in."""
     p = tmp_path / "oauth_creds.json"

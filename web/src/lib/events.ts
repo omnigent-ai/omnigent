@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -8,7 +9,17 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
-import type { ErrorInfo, ModelUsage, RememberScope, Response, SandboxLaunchStage } from "./types";
+import type { RoutingDecisionExtras } from "./routingDecision";
+import type {
+  AgyPermission,
+  BackgroundTaskInfo,
+  CodexPersistMode,
+  ErrorInfo,
+  ModelUsage,
+  RememberScope,
+  Response,
+  SandboxLaunchStage,
+} from "./types";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -59,6 +70,8 @@ export interface ResponseCompleted {
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  /** Where the failure originated, when supplied by the server. */
+  source?: string;
 }
 
 /** `response.incomplete` — stopped early. */
@@ -168,6 +181,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
   /**
@@ -245,6 +259,13 @@ export interface ElicitationRequest {
    */
   allowAllEdits?: boolean;
   /**
+   * Producer-supplied extra (eligible claude-native tool prompts): when
+   * true, the ApprovalCard offers "Approve & switch to auto mode" —
+   * accepting with ``allow_auto_mode`` echoes a session-scoped
+   * ``setMode(auto)`` in the hook decision.
+   */
+  allowAutoMode?: boolean;
+  /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
    * supports a persistent "don't ask again" allow rule (everything
@@ -260,6 +281,10 @@ export interface ElicitationRequest {
    * where the allow rule is meaningful.
    */
   rememberScope?: RememberScope | null;
+  /** Codex-native MCP approval persistence modes advertised by the request. */
+  codexPersistModes?: CodexPersistMode[];
+  /** Optional Antigravity action description and advertised persist pattern. */
+  agyPermission?: AgyPermission | null;
 }
 
 /**
@@ -272,6 +297,20 @@ export interface ElicitationRequest {
 export interface ElicitationResolved {
   type: "elicitation_resolved";
   elicitationId: string;
+  /**
+   * Verdict the prompt was resolved with, when the server knows it
+   * (answered on another surface: native terminal popup, another tab,
+   * the approve page). Absent when the resolution carried no verdict,
+   * e.g. a tool-result auto-resolve.
+   */
+  action?: "accept" | "decline" | "cancel";
+  /**
+   * Why the prompt resolved without a verdict, when the server knows:
+   * `"unanswered"` means the hook stopped waiting (a severed poll never
+   * re-parked, the ask timed out) before anyone answered, so the prompt
+   * is gone rather than decided. Never present alongside `action`.
+   */
+  reason?: "unanswered";
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */
@@ -287,7 +326,25 @@ export interface NativeToolCall {
 /** The final assistant message from `output_item.done` (type `message`). */
 export interface MessageDone {
   type: "message_done";
-  content: Array<Record<string, unknown>>;
+  content: Record<string, unknown>[];
+  itemId: string;
+  responseId: string;
+  /** Native live-preview stream finalized by this item. */
+  messageId?: string;
+}
+
+/**
+ * A persisted reasoning item from `output_item.done` (type `reasoning`).
+ * Produced with no preceding reasoning deltas by native transcript
+ * mirrors (e.g. claude-native thinking blocks); delta-streaming
+ * harnesses may also publish it after the streamed section.
+ */
+export interface ReasoningDone {
+  type: "reasoning_done";
+  /** Joined raw reasoning text from the item's `content` blocks. */
+  text: string;
+  /** Joined summary text from the item's `summary` blocks. */
+  summary: string;
   itemId: string;
   responseId: string;
 }
@@ -328,6 +385,8 @@ export interface SlashCommand {
  */
 export interface RoutingDecision {
   type: "routing_decision";
+  /** Routing identity (harness, scope, decision id …); absent on legacy rows. */
+  routing?: RoutingDecisionExtras;
   /** Model id the router chose, e.g. `databricks-claude-opus-4-8`. */
   model: string;
   /** `true` when the brain ran on `model`; `false` = "would have picked". */
@@ -400,6 +459,13 @@ export interface ErrorEvent {
 /** `response.compaction.in_progress` — server started compacting. */
 export interface CompactionInProgress {
   type: "compaction_in_progress";
+  /**
+   * Unix epoch seconds when the server first saw this compaction in
+   * progress. Stable across the repeated progress events a long compaction
+   * emits, so the elapsed counter can anchor to the true start — including
+   * after a page reload. Absent when the emitter doesn't track it.
+   */
+  startedAtS?: number;
 }
 
 /** `response.compaction.completed` — compaction finished successfully. */
@@ -458,8 +524,25 @@ export interface SessionStatusEvent {
   status: "idle" | "launching" | "running" | "waiting" | "failed";
   responseId?: string;
   backgroundTaskCount?: number;
-  /** Structured failure detail; only present when `status === "failed"`. */
-  error?: { code: string; message: string };
+  /**
+   * Per-shell detail behind `backgroundTaskCount`, so the UI can name each
+   * running shell. Rides alongside an authoritative count on the `Stop` edge;
+   * absent when the edge carries no detail.
+   */
+  backgroundTasks?: BackgroundTaskInfo[];
+  /**
+   * Short phrase naming what a still-`running` session is parked on, e.g.
+   * "permission prompt". Terminal-backed agents can block on a dialog the
+   * web UI does not mirror; this says why nothing is moving. Absent when
+   * the session is not parked.
+   */
+  blockedOn?: string;
+  /**
+   * Structured failure detail; only present when `status === "failed"`.
+   * Carries the optional `title` / `cause` / `remediation` fields when the
+   * runner classified the failure (see `ErrorInfo`).
+   */
+  error?: ErrorInfo;
 }
 
 /**
@@ -505,6 +588,19 @@ export interface SessionModelEvent {
 }
 
 /**
+ * `session.title` — session rename from a claude-native session.
+ *
+ * Emitted by the Omnigent server when the claude-native forwarder observes a
+ * `/rename` typed inside the Claude Code terminal. Carries the operator's
+ * new title so the session list stops showing the auto-generated one.
+ */
+export interface SessionTitleEvent {
+  type: "session_title";
+  conversationId: string;
+  title: string;
+}
+
+/**
  * `session.reasoning_effort` — active thinking-level switch from a native
  * session.
  *
@@ -532,8 +628,32 @@ export interface SessionCollaborationModeEvent {
 }
 
 /**
- * `session.agent_changed` — the session's bound agent was switched in
- * place (switch-agent route).
+ * `session.permission_mode` — active claude-native permission-mode switch.
+ *
+ * Emitted when the web picker switches the mode, and when the Claude
+ * forwarder sees the pane's footer change (a shift+tab pressed in the TUI).
+ */
+export interface SessionPermissionModeEvent {
+  type: "session_permission_mode";
+  conversationId: string;
+  permissionMode: string;
+}
+
+/**
+ * `session.codex_approval_mode` — active codex-native approval/sandbox switch.
+ *
+ * Emitted when the web picker switches the mode, and when the Codex forwarder
+ * sees a `thread/settings/updated` (a `/permissions` change made in the TUI).
+ */
+export interface SessionCodexApprovalModeEvent {
+  type: "session_codex_approval_mode";
+  conversationId: string;
+  approvalMode: string;
+}
+
+/**
+ * `session.agent_changed`: the session's bound agent changed (e.g. its
+ * MCP servers were edited).
  *
  * The harness may have changed family (e.g. claude-sdk → claude-native),
  * which flips the session's message lifecycle: native sessions defer
@@ -559,17 +679,17 @@ export interface SessionAgentChangedEvent {
  * Each todo item has:
  * - `content`: the task description string
  * - `status`: `"pending"` | `"in_progress"` | `"completed"`
- * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`).
- *   Shown by the TodoPanel under in-progress items when distinct from `content`.
+ * - `activeForm`: present-continuous form of the task (e.g. `"Running tests"`),
+ *   the present-continuous label for an in-progress item when distinct from `content`.
  */
 export interface SessionTodosEvent {
   type: "session_todos";
   conversationId: string;
-  todos: Array<{
+  todos: {
     content: string;
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
-  }>;
+  }[];
 }
 
 /**
@@ -599,6 +719,8 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
+  provider?: string;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */
@@ -773,20 +895,6 @@ export interface SessionTerminalActivityEvent {
 }
 
 /**
- * `session.skills` — the session's runner-owned skills just resolved
- * (the server's background fetch populated its per-session skills cache).
- * Skills are fetched off the snapshot hot path, so the snapshot serves
- * an empty list until the fetch lands; this event is the "skills are
- * ready, re-read the snapshot" nudge. Consumers refetch the session
- * snapshot and apply its now-populated `skills` to fill the composer's
- * slash-command menu. Carries no payload beyond the conversation id.
- */
-export interface SessionSkillsEvent {
-  type: "session_skills";
-  conversationId: string;
-}
-
-/**
  * `session.model_options` — a runner-owned native model catalog just resolved.
  * Consumers refetch the session snapshot and apply its now-populated options.
  */
@@ -839,6 +947,25 @@ export interface SessionSupersededEvent {
 }
 
 /**
+ * `session.btw_sidechat` — a transient side-chat answer from `/btw` command.
+ *
+ * Broadcast-only (never persisted, no SSE replay). The answer appears in a
+ * dismissable overlay near the composer — not as a persisted message — and
+ * Escape closes it. Nothing persists; a reload drops it.
+ */
+export interface SessionBtwSidechatEvent {
+  type: "session_btw_sidechat";
+  /** The conversation this side-chat was spawned in. */
+  conversationId: string;
+  /** The original `/btw` question text. */
+  question: string;
+  /** The assistant's answer. */
+  answer: string;
+  /** True when the answer was truncated (user should check the terminal for full response). */
+  truncated: boolean;
+}
+
+/**
  * `browser.action_request` — the agent's `browser_*` tool asks the desktop shell
  * to run a browser action against this conversation's WebContentsView. Every
  * renderer sees the event, but the relay (`useBrowserAgentRelay`) claims it first
@@ -876,6 +1003,7 @@ export type StreamEvent =
   | RoutingDecision
   | TerminalCommandEvent
   | MessageDone
+  | ReasoningDone
   | OutputFileDone
   | RetryEvent
   | ErrorEvent
@@ -889,8 +1017,11 @@ export type StreamEvent =
   | SessionStatusEvent
   | SessionUsageEvent
   | SessionModelEvent
+  | SessionTitleEvent
   | SessionReasoningEffortEvent
   | SessionCollaborationModeEvent
+  | SessionPermissionModeEvent
+  | SessionCodexApprovalModeEvent
   | SessionAgentChangedEvent
   | SessionTodosEvent
   | SessionTerminalPendingEvent
@@ -905,7 +1036,7 @@ export type StreamEvent =
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
-  | SessionSkillsEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
+  | SessionBtwSidechatEvent
   | BrowserActionRequestEvent;

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from fastapi import FastAPI
@@ -777,7 +777,7 @@ def test_daily_cost_recorded_for_owned_session_without_a_policy(app: FastAPI, st
     regression that re-added the gate would leave ``get_daily_cost`` at 0.0.
     """
     conversation_store = stores[0]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     sid = _seed_session(stores, owner=ALICE, title="no-policy session")
     resp = TestClient(app).post(
         f"/v1/sessions/{sid}/events",
@@ -801,7 +801,7 @@ def test_daily_cost_tracks_display_cost_not_policy_cost(app: FastAPI, stores) ->
     the rollup would over-report the daily total by the gate's mid-turn lead.
     """
     conversation_store = stores[0]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     sid = _seed_session(stores, owner=ALICE, title="cost split session")
     resp = TestClient(app).post(
         f"/v1/sessions/{sid}/events",
@@ -836,7 +836,7 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
     cumulative spend on the child, and asserts the owner's daily total rises.
     """
     conversation_store, _agent_store, _permission_store = stores
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
 
     # Parent session — owned by Alice.
     parent_id = _seed_session(stores, owner=ALICE, title="parent session")
@@ -861,3 +861,28 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
 
     # Sub-agent spend must appear in Alice's daily rollup via the root fallback.
     assert conversation_store.get_daily_cost(ALICE, today) == pytest.approx(0.75)
+
+
+def test_projects_changed_event_forwards_to_client(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """A ``projects_changed`` discovery event reaches the connected client.
+
+    Project rows aren't sessions, so the watch-set diff can never surface a
+    project create/rename/delete made in another client; the stream must
+    forward the discovery event as its own frame for the client to refresh its
+    projects cache. A regression here leaves other open clients (another tab,
+    the mobile app) showing a stale folder name until a full reload.
+    ``fast_rescan`` shrinks the heartbeat cadence so a dropped forward fails
+    fast on exhausted heartbeats instead of blocking.
+    """
+    s1 = _seed_session(stores, owner=ALICE, title="watched")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        # A project mutation elsewhere announces on Alice's discovery channel.
+        sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
+        frame = _recv_until(ws, {"projects_changed"})
+        assert frame["type"] == "projects_changed"

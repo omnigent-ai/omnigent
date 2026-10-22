@@ -13,6 +13,7 @@ import {
   Loader2Icon,
   Maximize2Icon,
   Minimize2Icon,
+  WrapTextIcon,
   XCircleIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -35,16 +36,11 @@ import {
   formatToolRunLabel,
   formatToolTitle,
 } from "@/lib/toolTitle";
-import { useFileViewer } from "@/shell/FileViewerContext";
+import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 
 const OUTPUT_PREVIEW_LINE_LIMIT = 80;
 const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
-
-/**
- * Tools whose `args.path` field is a workspace file path that the user
- * should be able to click to open in the FileViewer.
- */
-const FILE_PATH_TOOLS = new Set(["sys_os_read", "sys_os_write", "sys_os_edit"]);
 
 /**
  * If the string is valid JSON, return its 2-space-indented form.
@@ -186,17 +182,14 @@ export function ToolCard({
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
 
-  // When this is a file-path tool and we're inside AppShell, make the path
-  // in the trigger row a clickable link that opens the FileViewer.
+  // Link a file tool's path to the FileViewer, resolved like chat file links.
   const openFile = useFileViewer();
-  const rawPath =
-    FILE_PATH_TOOLS.has(name) &&
-    typeof args.path === "string" &&
-    args.path.length > 0 &&
-    !args.path.startsWith("/") // FileViewer rejects absolute paths
-      ? args.path
-      : null;
-  const onBodyClick = openFile && rawPath ? () => openFile(rawPath) : undefined;
+  const { root, home } = useWorkspacePaths();
+  const linkPath =
+    title.filePath === undefined
+      ? null
+      : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
+  const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
 
   return (
     <Collapsible defaultOpen={false} className="group not-prose w-full">
@@ -244,9 +237,9 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
     <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground">
-        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-chat transition-colors hover:text-foreground">
         <span>{label}</span>
+        <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
       <CollapsibleContent className="mt-1 ml-2 space-y-1 border-l pl-3 pt-1 pb-0 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {tools.map((item) => {
@@ -318,7 +311,7 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-xs transition-colors hover:text-foreground"
+      className="flex w-full cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-chat transition-colors hover:text-foreground"
     >
       <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
       <span className="min-w-0 flex-1 truncate">
@@ -400,17 +393,45 @@ function CodePanel({
   copyText: string;
   copyLabel: string;
 }) {
+  // Soft-wrap long lines by default so the panel never needs horizontal
+  // scrolling to read; the toggle restores the scrolling view for when
+  // column alignment matters (same affordance as chat code blocks).
+  const [wrap, setWrap] = useState(true);
   return (
-    <CodeBlock code={text} language="json">
+    <CodeBlock code={text} language="json" wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
         </CodeBlockTitle>
         <CodeBlockActions>
+          <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
           <CopyTextButton label={copyLabel} text={copyText} />
         </CodeBlockActions>
       </CodeBlockHeader>
     </CodeBlock>
+  );
+}
+
+function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
+  const label = wrap ? "Disable word wrap" : "Enable word wrap";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          aria-label={label}
+          aria-pressed={wrap}
+          className={cn("size-6 text-muted-foreground", wrap && "text-foreground")}
+          onClick={onToggle}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+          componentId="diagnostics.tool.toggle_wrap"
+        >
+          <WrapTextIcon className="size-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -438,7 +459,7 @@ function OutputSection({ output }: { output: string }) {
         )}
       </div>
       {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-xs sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between">
           <span className="min-w-0">
             {isExpanded ? "Showing full output" : "Previewing output"} (
             {formatOutputStats(isExpanded ? preview : collapsedPreview)})
@@ -449,6 +470,7 @@ function OutputSection({ output }: { output: string }) {
             size="xs"
             type="button"
             variant="outline"
+            componentId="diagnostics.tool.toggle_expanded"
           >
             {isExpanded ? (
               <Minimize2Icon className="size-3" />
@@ -466,7 +488,7 @@ function OutputSection({ output }: { output: string }) {
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
     <div className="rounded-md border border-dashed bg-muted/30 p-3">
-      <div className="flex items-center gap-2 text-muted-foreground text-sm">
+      <div className="flex items-center gap-2 text-muted-foreground text-ui">
         <Loader2Icon className="size-4 animate-spin text-info" />
         <span>
           Waiting for output
@@ -490,7 +512,7 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
     message = "Tool did not return output before the response failed.";
   }
   return (
-    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-sm">
+    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-muted-foreground text-ui">
       {message}
     </div>
   );
@@ -544,6 +566,7 @@ function CopyTextButton({ text, label }: CopyTextButtonProps) {
           size="icon-xs"
           type="button"
           variant="ghost"
+          componentId="diagnostics.tool.copy"
         >
           <Icon className="size-3.5" />
         </Button>

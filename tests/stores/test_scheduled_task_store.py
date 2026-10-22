@@ -52,6 +52,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         timezone="America/Los_Angeles",
         model_override="claude-opus-4-7",
         reasoning_effort="high",
+        permission_mode="acceptEdits",
         workspace="/home/alice/repo",
         host_id=_uid("host_abc123"),
     )
@@ -65,6 +66,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.timezone == "America/Los_Angeles"
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
+    assert task.permission_mode == "acceptEdits"
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -89,6 +91,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     )
     assert task.model_override is None
     assert task.reasoning_effort is None
+    assert task.permission_mode is None
     assert task.workspace is None
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -149,6 +152,58 @@ def test_update_host_id_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
     assert updated is not None
     assert updated.execution_target == "connected_host"
     assert updated.host_id == _uid("host_xyz")
+
+
+def test_execution_target_managed_sandbox_round_trips(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A managed_sandbox task persists and reads back, and update can switch it."""
+    created = store.create(
+        scheduled_task_id=_uid("st_managed"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        execution_target="managed_sandbox",
+    )
+    assert created.execution_target == "managed_sandbox"
+    assert store.get(_uid("st_managed")).execution_target == "managed_sandbox"
+    # Switch back to connected_host via update.
+    switched = store.update(_uid("st_managed"), execution_target="connected_host")
+    assert switched is not None
+    assert switched.execution_target == "connected_host"
+
+
+def test_update_workspace_explicit_null_clears_it(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(workspace=None)`` clears the workspace; omitting it leaves it.
+
+    Regression for the managed-switch round-trip: clearing a pinned workspace
+    must be possible so switching a task to managed execution (which unpins both
+    host and workspace) doesn't strand a workspace-without-host.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_ws"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        workspace="/repo",
+        host_id=_uid("h"),
+    )
+    # Omitting workspace leaves it unchanged.
+    unchanged = store.update(_uid("st_ws"), name="renamed")
+    assert unchanged is not None and unchanged.workspace == "/repo"
+    # Explicit None clears both host and workspace (the managed-switch shape).
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    assert cleared is not None
+    assert cleared.workspace is None
+    assert cleared.host_id is None
 
 
 def test_update_state_reads_back(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -372,6 +427,64 @@ def test_update_changes_fields_and_stamps_updated_at(store: SqlAlchemyScheduledT
     assert updated.last_run_at == 1700000000
     assert updated.last_run_conversation_id == _uid("conv_x")
     assert updated.updated_at is not None
+
+
+def test_update_rebinds_agent_and_keeps_run_history(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """``update(agent_id=...)`` switches the harness without touching past runs.
+
+    This is what makes an in-place harness switch preferable to recreating the
+    task: the run rows stay attached to the same task id.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_rebind"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_old"),
+        timezone="UTC",
+    )
+    store.create_run(
+        run_id=_uid("sr_old"),
+        scheduled_task_id=_uid("st_rebind"),
+        status="succeeded",
+        scheduled_at=100,
+        conversation_id=_uid("conv_old"),
+        fired_at=101,
+        finished_at=102,
+    )
+
+    updated = store.update(_uid("st_rebind"), agent_id=_uid("ag_new"))
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_new")
+    assert updated.updated_at is not None
+    reread = store.get(_uid("st_rebind"))
+    assert reread is not None and reread.agent_id == _uid("ag_new")
+
+    runs, _ = store.list_runs(_uid("st_rebind"))
+    assert [r.id for r in runs] == [_uid("sr_old")]
+    # The completed run keeps the conversation it actually ran in.
+    assert runs[0].conversation_id == _uid("conv_old")
+
+
+def test_update_omitting_agent_id_leaves_the_binding_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """An ordinary edit must never silently retarget the harness."""
+    store.create(
+        scheduled_task_id=_uid("st_keepagent"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        user_id="u",
+        agent_id=_uid("ag_keep"),
+        timezone="UTC",
+    )
+    updated = store.update(_uid("st_keepagent"), name="renamed")
+    assert updated is not None
+    assert updated.agent_id == _uid("ag_keep")
 
 
 def test_update_noop_leaves_updated_at_none(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -630,6 +743,65 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
     fetched = store.get(_uid("st_clear_host"))
     assert fetched is not None
     assert fetched.host_id is None
+
+
+def test_update_overrides_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Passing ``None`` for an override clears it to NULL (set→agent default).
+
+    Covers the security-relevant case: a task launched with
+    ``permission_mode="bypassPermissions"`` must be resettable to the agent
+    default through the same edit-then-save path the dialog uses (control reset
+    to Default → the API sends an explicit ``null``). Same for model/effort.
+    """
+    store.create(
+        scheduled_task_id=_uid("st_clear_ovr"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="bypassPermissions",
+    )
+    updated = store.update(
+        _uid("st_clear_ovr"),
+        model_override=None,
+        reasoning_effort=None,
+        permission_mode=None,
+    )
+    assert updated is not None
+    assert updated.model_override is None
+    assert updated.reasoning_effort is None
+    assert updated.permission_mode is None
+    fetched = store.get(_uid("st_clear_ovr"))
+    assert fetched is not None
+    assert fetched.permission_mode is None
+
+
+def test_update_omitting_overrides_leaves_them_unchanged(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting the override params does NOT clear them (sentinel = unchanged)."""
+    store.create(
+        scheduled_task_id=_uid("st_keep_ovr"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        model_override="opus",
+        reasoning_effort="high",
+        permission_mode="acceptEdits",
+    )
+    # Update name only — the overrides must be untouched.
+    updated = store.update(_uid("st_keep_ovr"), name="renamed")
+    assert updated is not None
+    assert updated.model_override == "opus"
+    assert updated.reasoning_effort == "high"
+    assert updated.permission_mode == "acceptEdits"
 
 
 def test_update_last_run_conversation_id_can_be_cleared_to_null(

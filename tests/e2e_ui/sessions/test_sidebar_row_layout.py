@@ -2,8 +2,9 @@
 
 The sidebar keeps row actions absolutely positioned so hidden controls do not
 consume title width. A desktop hover reveals those controls and reserves space
-for them, while the session list remains scrollable without visible scrollbar
-chrome. This test checks the real browser geometry that jsdom cannot measure.
+for them, while the session list scrolls behind a thin, always-reserved
+scrollbar gutter. This test checks the real browser geometry that jsdom cannot
+measure.
 """
 
 from __future__ import annotations
@@ -63,8 +64,8 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
     # with equal 8px insets, matching the other sidebar rows.
     assert _padding(link) == {"left": 8, "right": 8}
 
-    # The list still scrolls, but browser scrollbar chrome is intentionally
-    # suppressed so it does not consume a large strip of sidebar width.
+    # The list scrolls behind a thin, always-reserved gutter: narrow enough not
+    # to claim a strip of sidebar width, and stable so the thumb cannot reflow rows.
     scrollbar_width = row.evaluate(
         """element => {
             let ancestor = element.parentElement;
@@ -78,7 +79,7 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
             return null;
         }"""
     )
-    assert scrollbar_width == "none"
+    assert scrollbar_width == "thin"
 
     # Hovering reveals both actions and shortens only the right side of the
     # title surface. The tooltip carries metadata without adding a second row.
@@ -86,4 +87,4 @@ def test_session_row_uses_full_title_width_until_actions_are_revealed(
     expect(row.get_by_test_id("quick-pin-conversation")).to_be_visible()
     expect(row.get_by_test_id("conversation-actions")).to_be_visible()
     expect(page.get_by_test_id("session-tooltip-content")).to_be_visible()
-    assert _padding(link) == {"left": 8, "right": 56}
+    assert _padding(link) == {"left": 8, "right": 80}

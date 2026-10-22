@@ -3,13 +3,13 @@
 Routes: ``/v1/sessions/{session_id}/policies[/{policy_id}]``
 
 The session policies router is only mounted when ``create_app`` receives
-a ``policy_store``. These tests provide their own app/client that include it.
+a ``policy_store``. These tests use the shared policy app with a route-only client.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -17,34 +17,10 @@ import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
-
-
-@pytest.fixture()
-def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
-    """Build a FastAPI app that includes the policy store."""
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        policy_store=SqlAlchemyPolicyStore(db_uri),
-    )
 
 
 @pytest_asyncio.fixture()
@@ -255,3 +231,104 @@ async def test_delete_session_policy(client: httpx.AsyncClient, session_id: str)
     # Verify it's gone from the session policies
     get_resp = await client.get(f"/v1/sessions/{session_id}/policies/{pid}")
     assert get_resp.status_code == 404
+
+
+# ── Telemetry ─────────────────────────────────────────────────────────
+
+
+async def test_create_session_policy_emits_telemetry(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """``POST /v1/sessions/{id}/policies`` emits a ``PolicyRegisteredEvent`` with scope='session'."""  # noqa: E501
+    from omnigent.telemetry.events import PolicyRegisteredEvent
+
+    with patch("omnigent.server.routes.session_policies._tel_emit") as mock_emit:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies",
+            json=_policy_payload(),
+        )
+    assert resp.status_code == 200
+
+    mock_emit.assert_called_once()
+    event = mock_emit.call_args[0][0]
+    assert isinstance(event, PolicyRegisteredEvent)
+    assert event.scope == "session"
+    assert event.session_id == session_id
+    assert event.handler == "https://example.com/policies/eval"
+    assert event.policy_type == "url"
+
+
+async def test_create_session_policy_no_telemetry_on_error(
+    client: httpx.AsyncClient, session_id: str
+) -> None:
+    """``POST /v1/sessions/{id}/policies`` does not emit telemetry when the request fails."""
+    with patch("omnigent.server.routes.session_policies._tel_emit") as mock_emit:
+        # Duplicate name → 409 before the emit block is reached.
+        await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload(name="dup"))
+        mock_emit.reset_mock()
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/policies", json=_policy_payload(name="dup")
+        )
+    assert resp.status_code == 409
+    mock_emit.assert_not_called()
+
+
+# ── Audit logging ─────────────────────────────────────────────────────
+
+
+async def test_create_session_policy_logs_audit(
+    client: httpx.AsyncClient,
+    session_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``POST /v1/sessions/{id}/policies`` emits an audit log line."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.session_policies"):
+        resp = await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    assert resp.status_code == 200
+    pid = resp.json()["id"]
+    assert "session_policies/create" in caplog.text
+    assert pid in caplog.text
+    assert session_id in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_update_session_policy_logs_audit(
+    client: httpx.AsyncClient,
+    session_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``PATCH /v1/sessions/{id}/policies/{pid}`` emits an audit log line."""
+    import logging
+
+    create_resp = await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    pid = create_resp.json()["id"]
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.session_policies"):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}/policies/{pid}", json={"name": "renamed"}
+        )
+    assert resp.status_code == 200
+    assert "session_policies/update" in caplog.text
+    assert pid in caplog.text
+    assert session_id in caplog.text
+    assert "(single-user)" in caplog.text
+
+
+async def test_delete_session_policy_logs_audit(
+    client: httpx.AsyncClient,
+    session_id: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``DELETE /v1/sessions/{id}/policies/{pid}`` emits an audit log line."""
+    import logging
+
+    create_resp = await client.post(f"/v1/sessions/{session_id}/policies", json=_policy_payload())
+    pid = create_resp.json()["id"]
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.session_policies"):
+        resp = await client.delete(f"/v1/sessions/{session_id}/policies/{pid}")
+    assert resp.status_code == 200
+    assert "session_policies/delete" in caplog.text
+    assert pid in caplog.text
+    assert session_id in caplog.text
+    assert "(single-user)" in caplog.text

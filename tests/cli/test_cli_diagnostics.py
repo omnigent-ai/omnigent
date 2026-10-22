@@ -9,8 +9,11 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 import pytest
 
+from omnigent import chat as chat_module
+from omnigent import cli as cli_module
 from omnigent import cli_diagnostics
 
 
@@ -252,6 +255,39 @@ def test_log_cli_error_hint_uses_original_stderr_when_redirected(
     )
 
 
+def test_stale_host_hint_recommends_generic_stop_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tunnel rejection recovery should stop stale Omnigent processes."""
+    terminal_stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", terminal_stderr)
+
+    cli_diagnostics.print_stale_host_hint()
+
+    hint = terminal_stderr.getvalue()
+    assert "runner tunnel rejection (HTTP 401)" in hint
+    assert "stale host processes" in hint
+    assert "`omnigent stop`" in hint
+    assert "existing Omnigent host instances" in hint
+    assert "omnigent setup" not in hint
+
+
+def test_stale_host_hint_names_configured_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Under a wrapper deployment the hint suggests the wrapper, not naked `omnigent`."""
+    terminal_stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", terminal_stderr)
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    cli_diagnostics.print_stale_host_hint()
+
+    hint = terminal_stderr.getvalue()
+    assert "`isaac omni stop`" in hint
+    # The naked binary token must not be suggested when it would be refused.
+    assert "`omnigent stop`" not in hint
+
+
 def test_redirect_stderr_to_log_retargets_existing_logging_stderr_handlers(
     isolated_cli_diagnostics: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -480,6 +516,66 @@ async def test_slash_command_exceptions_reach_cli_log(
     )
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_hint", "explicit_agent"),
+    [
+        (
+            httpx.ConnectError("connection refused"),
+            "Check the URL, your network connection",
+            False,
+        ),
+        (httpx.InvalidURL("invalid proxy"), "HTTP proxy settings", True),
+        (
+            httpx.ReadTimeout("read timed out"),
+            "failed before a response arrived (ReadTimeout)",
+            True,
+        ),
+        (401, "Sign in with `isaac omni login https://server.example`", False),
+    ],
+)
+def test_main_reports_discovery_failure_without_runner_recovery_hint(
+    failure: httpx.HTTPError | httpx.InvalidURL | int,
+    expected_hint: str,
+    explicit_agent: bool,
+    isolated_cli_diagnostics: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Real run dispatch renders discovery failures without unrelated runner advice."""
+    del isolated_cli_diagnostics
+    server_url = "https://server.example"
+    requests: list[str] = []
+
+    def _get(url: str, **_kwargs: object) -> httpx.Response:
+        requests.append(url)
+        if not isinstance(failure, int):
+            raise failure
+        return httpx.Response(failure, request=httpx.Request("GET", url))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+    monkeypatch.setattr(cli_module, "_load_global_config", dict)
+    argv = ["omnigent", "run", "--server", server_url, "-p", "hi"]
+    if explicit_agent:
+        argv.extend(["--agent", "scribe"])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_module.main()
+
+    assert excinfo.value.code == 1
+    assert requests == [f"{server_url}/v1/me", f"{server_url}/v1/agents"]
+    output = capsys.readouterr().err
+    assert "Error: " in output
+    assert server_url in output
+    assert expected_hint in output
+    assert "stale host processes" not in output
+    assert "runner tunnel rejection" not in output
+    assert "Traceback" not in output
+
+
 def test_safe_mtime_returns_zero_for_vanished_file(tmp_path: Path) -> None:
     """A file present at glob time but gone before stat resolves to 0.0, not a raise."""
     real = tmp_path / "cli-real.log"
@@ -504,3 +600,251 @@ def test_prune_old_logs_survives_file_vanishing_mid_sort(
 
     surviving = [p for p in real if p.exists()]
     assert len(surviving) == cli_diagnostics.MAX_LOG_FILES  # newest kept, oldest pruned
+
+
+def test_suppresses_recovery_hint_for_import_errors() -> None:
+    """
+    A missing dependency (ImportError / ModuleNotFoundError) is never fixed by
+    stopping stale hosts, so the recovery hint must be withheld.
+    """
+    assert cli_diagnostics.suppresses_recovery_hint(ImportError("no module")) is True
+    assert (
+        cli_diagnostics.suppresses_recovery_hint(
+            ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+        )
+        is True
+    )
+
+
+def test_suppresses_recovery_hint_honors_marker_attribute() -> None:
+    """
+    Any exception may opt out of the recovery hint by carrying the marker
+    attribute — this keeps ``cli_diagnostics`` decoupled from the modules that
+    raise server-startup / dependency errors.
+    """
+
+    class _Marked(Exception):
+        omnigent_suppress_recovery_hint = True
+
+    assert getattr(_Marked, cli_diagnostics.SUPPRESS_RECOVERY_HINT_ATTR) is True
+    assert cli_diagnostics.suppresses_recovery_hint(_Marked()) is True
+
+
+def test_local_server_startup_error_suppresses_hint() -> None:
+    """
+    The real ``LocalServerStartupError`` carries the marker, so a crashed
+    background server does not trigger the misleading stale-host hint.
+    """
+    from omnigent.host.local_server import LocalServerStartupError
+
+    err = LocalServerStartupError("server failed to start")
+    assert cli_diagnostics.suppresses_recovery_hint(err) is True
+
+
+def test_does_not_suppress_hint_for_ordinary_errors() -> None:
+    """
+    Ordinary errors (including a plain ClickException) keep the recovery
+    hint — a stale host process remains a plausible cause for those.
+    """
+    import click
+
+    assert cli_diagnostics.suppresses_recovery_hint(RuntimeError("boom")) is False
+    assert cli_diagnostics.suppresses_recovery_hint(click.ClickException("bad")) is False
+
+
+def test_suppresses_hint_for_usage_errors() -> None:
+    """A parse-time ``click.UsageError`` (unknown command, bad flag) is never a
+    tunnel rejection, so the ``omnigent stop`` hint is withheld."""
+    import click
+
+    unknown_command = click.UsageError("No such command 'x'.")
+    assert cli_diagnostics.suppresses_recovery_hint(unknown_command) is True
+    assert cli_diagnostics.suppresses_recovery_hint(click.BadParameter("bad")) is True
+    assert cli_diagnostics.suppresses_recovery_hint(click.NoSuchOption("--bogus")) is True
+
+
+def test_main_reports_unknown_command_without_recovery_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main()`` on a mistyped subcommand exits 2 with Click's usage error and
+    no stale-host recovery hint."""
+    import contextlib
+    import io
+
+    import click
+
+    import omnigent.cli as cli
+
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+
+    def _unknown_command(*_args: object, **_kwargs: object) -> None:
+        raise click.UsageError("No such command 'copilto'.")
+
+    monkeypatch.setattr(cli, "cli", _unknown_command)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "copilto"])
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert excinfo.value.code == 2
+    output = stderr.getvalue()
+    assert "No such command 'copilto'." in output
+    assert "stale host processes" not in output
+
+
+def test_daemon_exit_error_carries_server_log_tail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Foreground acceptance, part 1: when the daemon dies before its server is
+    ready, ``_discover_local_server_url`` must embed the failed spawn's log
+    tail — the actionable cause (e.g. the Postgres-driver install command)
+    lives there, and the CLI process never saw the subprocess's own error.
+    The tail is attributed via the daemon's failure record: recorded writer
+    PID must match the dead daemon's PID.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.cli as cli
+    from omnigent.host import local_server
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    failed_log = log_dir / "server-20260101-000000-000000.log"
+    failed_log.write_text(
+        "Traceback (most recent call last):\n"
+        "ModuleNotFoundError: Database backend 'postgresql+psycopg' needs the "
+        "PostgreSQL driver 'psycopg', which is not installed. Install it with "
+        "one of:\n    pip install 'omnigent[postgres]'\n"
+    )
+    # The daemon (this process, in the test) recorded the failing log before
+    # dying; the CLI finds the dead daemon's record carrying the same PID.
+    local_server._record_server_startup_failure(failed_log)
+    import os
+
+    monkeypatch.setattr(
+        cli, "_find_daemon_record", lambda target: SimpleNamespace(pid=os.getpid())
+    )
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
+
+    from omnigent.host.local_server import LocalServerStartupError
+
+    with pytest.raises(LocalServerStartupError) as excinfo:
+        cli._discover_local_server_url(timeout=1.0)
+
+    message = str(excinfo.value)
+    assert "daemon exited before its Omnigent server became ready" in message
+    assert "Server log" in message
+    assert "omnigent[postgres]" in message  # the actionable cause, inline
+
+
+def test_daemon_exit_error_omits_tail_without_attributable_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    No failure record (or one from a different attempt) must yield the plain
+    pointer error — never some other log presented as this attempt's cause.
+    """
+    from types import SimpleNamespace
+
+    import omnigent.cli as cli
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    log_dir = tmp_path / "logs" / "server"
+    log_dir.mkdir(parents=True)
+    # A fresh log exists (e.g. a concurrent dedicated server) but no failure
+    # record ties it to the daemon attempt that just died.
+    (log_dir / "server-20260101-000000-000000.log").write_text("unrelated humming server\n")
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: SimpleNamespace(pid=12345))
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: None)
+    monkeypatch.setattr(cli, "_host_daemon_alive", lambda: False)
+
+    from omnigent.host.local_server import LocalServerStartupError
+
+    with pytest.raises(LocalServerStartupError) as excinfo:
+        cli._discover_local_server_url(timeout=1.0)
+
+    message = str(excinfo.value)
+    assert "daemon exited before its Omnigent server became ready" in message
+    assert "unrelated humming server" not in message
+    assert "Last 50 lines" not in message
+
+
+def test_redact_secrets_scrubs_url_userinfo() -> None:
+    """
+    The public redaction wrapper must scrub URL userinfo — the exact shape a
+    migration error embeds (``omnigent debug db-upgrade '<full uri>'``) —
+    while leaving the host/db part readable for diagnostics.
+    """
+    text = (
+        "run omnigent debug db-upgrade "
+        "'postgresql+psycopg://user:hunter2@db.example:5432/omnigent'"
+    )
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    assert "hunter2" not in scrubbed
+    assert "://user:" not in scrubbed  # whole userinfo gone, not just password
+    assert "db.example:5432/omnigent" in scrubbed  # target stays readable
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "p/ss",  # '/' inside the password — SQLAlchemy accepts this shape
+        "p@ss",  # '@' inside the password
+        "p@s/s@x",  # both, repeatedly
+    ],
+)
+def test_redact_secrets_scrubs_passwords_containing_separators(password: str) -> None:
+    """
+    Passwords may legally contain ``/`` and ``@``; the userinfo redaction must
+    anchor on the *last* ``@`` of the token so no fragment of such a password
+    survives into the surfaced text.
+    """
+    text = f"connect to postgresql+psycopg://user:{password}@db.example:5432/omnigent failed"
+    scrubbed = cli_diagnostics.redact_secrets(text)
+    for fragment in ("ss", "s/s", password):
+        assert f"{fragment}@db.example" not in scrubbed  # no password fragment survives
+    assert "user:" not in scrubbed
+    assert "@db.example:5432/omnigent" in scrubbed  # target stays readable
+    assert "[REDACTED]@db.example" in scrubbed
+
+
+def test_main_surfaces_install_command_on_stderr_without_recovery_hint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    Foreground acceptance, part 2 (top-level ``main()``): the terminal output
+    for a daemon-startup failure must contain the corrective install command
+    and must NOT contain the stale-host recovery hint — `omnigent stop`
+    cannot install a missing dependency.
+    """
+    import contextlib
+    import io
+
+    import omnigent.cli as cli
+    from omnigent.host.local_server import LocalServerStartupError
+
+    # Keep the test hermetic: no diagnostics log files, no update check.
+    monkeypatch.setattr("omnigent.cli_diagnostics.setup_cli_logging", lambda argv: None)
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise LocalServerStartupError(
+            "The local daemon exited before its Omnigent server became ready.\n"
+            "  Last 50 lines:\n"
+            "  ModuleNotFoundError: ... pip install 'omnigent[postgres]' ..."
+        )
+
+    monkeypatch.setattr(cli, "cli", _boom)
+    monkeypatch.setattr(sys, "argv", ["omnigent", "run"])
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr), pytest.raises(SystemExit) as excinfo:
+        cli.main()
+
+    assert excinfo.value.code == 1
+    output = stderr.getvalue()
+    assert "omnigent[postgres]" in output  # corrective command reaches the terminal
+    assert "stale host processes" not in output  # no misleading recovery hint

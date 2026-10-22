@@ -17,41 +17,63 @@ from the DB so a host connected to replica B reads back as
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import os
 import secrets
+import weakref
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_session_id,
+)
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
+    CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
-    HostModelOptionsFrame,
+    HostRefreshHarnessesFrame,
     HostStoreSecretFrame,
+    classify_launch_refusal,
     encode_host_frame,
+    optional_str_bool_map,
+    workspace_missing_message,
 )
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
     ui_install_key,
     ui_installable_harnesses,
 )
-from omnigent.process_logging import env_truthy
 from omnigent.runner.identity import token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
+from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_launch import (
+    LAUNCH_TIMEOUT_ENV_VAR,
+    host_absent_error,
+    resolve_host_launch,
+    resolve_launch_timeout_s,
+)
+from omnigent.server.routes._workspace_validation import (
+    _is_windows_absolute_path,
+    restore_host_filesystem_url_path,
+)
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
@@ -59,7 +81,31 @@ from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
 
-_LAUNCH_RESULT_TIMEOUT_S = 30.0
+# Managed `/hosts/{host_id}` requests are slice-keyed to the host-owning replica;
+# self-hosted servers are single-replica. The database CAS remains the fallback.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_runner_launch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_runner_launch_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+
+def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
+    """Keep detached launch cleanup alive and report failures."""
+    _runner_launch_cleanup_tasks.add(task)
+
+    def _done(completed: asyncio.Task[None]) -> None:
+        _runner_launch_cleanup_tasks.discard(completed)
+        if not completed.cancelled() and (error := completed.exception()) is not None:
+            _logger.warning(
+                "Detached runner launch cleanup failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+
+
 # Per-call timeout for host.list_dir round-trips. Listing is a single
 # scandir + sort on the host side; 5s is generous for transient
 # network slowness without making the picker feel hung.
@@ -80,10 +126,67 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 # headroom) keeps a genuine slow install from timing out at the server while
 # the host is still succeeding — a "504 but actually installed" outcome.
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
-# Env var that opts a deployment into the UI harness-install feature (default
-# off). Named once here and shared by the route (this file) and the /v1/info
-# flag in app.py so the two reads can never diverge on a typo.
-HARNESS_INSTALL_ENABLED_ENV = "OMNIGENT_HARNESS_INSTALL_ENABLED"
+# A refresh only probes local CLI state; keep the UI responsive if a host stalls.
+_REFRESH_HARNESSES_TIMEOUT_S = 30.0
+
+
+# ``/v1/hosts/{id}/*`` routes share the wrong-replica-vs-offline classification
+# with the runner-launch and import paths; the one implementation lives in
+# ``_host_launch`` so the sites can't drift.
+_host_absent_error = host_absent_error
+
+
+# The harness-setup frames (install_harness, store_secret, detect_credentials,
+# model_options) first shipped in the 0.7.0 host daemon; older daemons drop them
+# without replying. ``_require_harness_setup_support`` explains the version floor.
+_HARNESS_SETUP_MIN_HOST_VERSION = (0, 7, 0)
+
+
+def _release_tuple(version: str) -> tuple[int, int, int] | None:
+    """Parse the release component of a reported version, PEP 440 style.
+
+    Handles every shape omnigent has shipped — ``"0.6.0"``, ``"0.6.0rc1"``,
+    ``"0.13.0.dev0"`` — so a prerelease of an old daemon is still judged
+    against the floor rather than falling through as unparseable.
+
+    :param version: Hello-reported version.
+    :returns: The release tuple padded to ``(major, minor, patch)``, or
+        ``None`` when the version isn't PEP 440 at all.
+    """
+    try:
+        release = Version(version).release
+    except InvalidVersion:
+        return None
+    padded = (*release, 0, 0, 0)[:3]
+    return (padded[0], padded[1], padded[2])
+
+
+def _require_harness_setup_support(host_conn: HostConnection, action: str) -> None:
+    """Reject fast when the daemon predates the harness-setup frames.
+
+    Pre-0.7.0 daemons have no handler for these frames and drop them without
+    replying, so forwarding one can only end in a timeout misread as an
+    unresponsive host. The floor is a version check, not a capability token:
+    the frames predate ``HostHelloFrame.capabilities``, and released
+    0.15.x/0.16.x daemons advertise tokens without a harness-setup entry while
+    serving them. Unparseable versions stay permissive.
+
+    :param host_conn: Live host connection (carries the hello).
+    :param action: Human phrase for the rejected action, e.g.
+        ``"storing harness credentials"``; lands in the error detail.
+    :raises HTTPException: 409 with an update-the-host hint when too old.
+    """
+    hello = host_conn.hello
+    release = _release_tuple(hello.version)
+    if release is None or release >= _HARNESS_SETUP_MIN_HOST_VERSION:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"host '{hello.name}' runs omnigent {hello.version}, which does not "
+            f"support {action} — update omnigent on the host and retry"
+        ),
+    )
 
 
 async def _proxy_model_options(
@@ -93,33 +196,28 @@ async def _proxy_model_options(
     harness: str,
 ) -> dict[str, Any]:
     """Ask a host for the model catalog it would use for a new session."""
-    request_id = secrets.token_hex(8)
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[dict[str, Any]] = loop.create_future()
-    host_conn.pending_model_options[request_id] = future
-    frame = encode_host_frame(
-        HostModelOptionsFrame(request_id=request_id, harness=harness),
-    )
+    from omnigent.server.routes._host_model_options import request_host_model_options
+
     try:
-        try:
-            host_registry.send_text(host_conn, frame)
-        except ConnectionError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"host '{host_conn.host_id}' connection lost",
-            ) from exc
-        try:
-            return await asyncio.wait_for(future, timeout=_MODEL_OPTIONS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not resolve model options within "
-                    f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
-                ),
-            ) from exc
-    finally:
-        host_conn.pending_model_options.pop(request_id, None)
+        return await request_host_model_options(
+            host_registry=host_registry,
+            host_conn=host_conn,
+            harness=harness,
+            timeout_s=_MODEL_OPTIONS_TIMEOUT_S,
+        )
+    except ConnectionError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"host '{host_conn.host_id}' connection lost",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"host '{host_conn.host_id}' did not resolve model options within "
+                f"{_MODEL_OPTIONS_TIMEOUT_S:.0f}s"
+            ),
+        ) from exc
 
 
 async def _proxy_list_dir(
@@ -180,7 +278,7 @@ async def _proxy_list_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_LIST_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -240,7 +338,7 @@ async def _proxy_create_dir(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_CREATE_DIR_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -274,7 +372,10 @@ async def _proxy_install_harness(
     :param harness: The UI harness identifier to install, e.g. ``"claude"``.
     :returns: Dict with the result fields: ``status`` (``"ok"`` /
         ``"failed"``), ``configured_harnesses`` (the refreshed readiness map or
-        ``None``), ``error`` (string or ``None``).
+        ``None``), ``version`` (the installed CLI version or ``None``),
+        ``gateway_inference`` (the refreshed per-harness
+        AI-Gateway-backed inference map or ``None``), ``error`` (string or
+        ``None``).
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = secrets.token_hex(8)
@@ -298,7 +399,7 @@ async def _proxy_install_harness(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_INSTALL_HARNESS_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -310,6 +411,41 @@ async def _proxy_install_harness(
         # Cleanup runs on every path so a cancelled caller doesn't
         # leave an orphan in the pending dict.
         host_conn.pending_installs.pop(request_id, None)
+
+
+async def _proxy_refresh_harnesses(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+) -> dict[str, Any]:
+    """Forward a forced harness-readiness probe and await its result."""
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_harness_refreshes[request_id] = future
+    try:
+        try:
+            host_registry.send_text(
+                host_conn,
+                encode_host_frame(HostRefreshHarnessesFrame(request_id=request_id)),
+            )
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost",
+            ) from exc
+        try:
+            return await asyncio.wait_for(future, timeout=_REFRESH_HARNESSES_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not respond to refresh_harnesses "
+                    f"within {_REFRESH_HARNESSES_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_harness_refreshes.pop(request_id, None)
 
 
 # The credential write is local keychain/file I/O on the host — fast, unlike the
@@ -334,7 +470,8 @@ async def _proxy_store_secret(
     :param host_registry: Server-side registry; used to enqueue the frame.
     :param host_conn: Live host connection.
     :param frame: The store-secret frame to forward (carries the secret).
-    :returns: Dict with ``status`` / ``configured_harnesses`` / ``error``.
+    :returns: Dict with ``status`` / ``configured_harnesses`` /
+        ``gateway_inference`` / ``error``.
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = frame.request_id
@@ -351,7 +488,7 @@ async def _proxy_store_secret(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -393,7 +530,7 @@ async def _proxy_detect_credentials(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_STORE_SECRET_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise HTTPException(
                 status_code=504,
                 detail=(
@@ -440,6 +577,20 @@ class StoreHarnessCredentialRequest(BaseModel):
     default_model: str | None = None
     wire_api: str | None = None
     env_var: str | None = None
+
+
+class HostModelOptionsResponse(BaseModel):
+    """Pre-launch model choices resolved by a host harness.
+
+    ``error`` carries the host's reason for an empty catalog — a probe that
+    failed on the host is not a transport failure, so the request still
+    succeeds and the picker can say WHY it is empty instead of a generic
+    "Models unavailable".
+    """
+
+    models: list[dict[str, Any]]
+    routable_models: list[str]
+    error: str | None = None
 
 
 class LaunchRunnerRequest(BaseModel):
@@ -531,6 +682,7 @@ def create_hosts_router(
     permission_store: PermissionStore | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    feature_flags: FeatureFlags | None = None,
 ) -> APIRouter:
     """Build the router for host REST endpoints.
 
@@ -551,8 +703,11 @@ def create_hosts_router(
         :func:`omnigent.server.app.create_app` always supplies it.
     :param agent_cache: Agent-spec cache used to read the agent's
         ``os_env.cwd`` boundary. Paired with ``agent_store``.
+    :param feature_flags: Immutable deployment release-feature snapshot.
+        When omitted, resolves ``OMNIGENT_FEATURES`` at router construction.
     :returns: A FastAPI router with host endpoints.
     """
+    flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
     @router.get("/hosts")
@@ -563,7 +718,10 @@ def create_hosts_router(
         information for online hosts.
 
         :param request: The incoming request (for auth).
-        :returns: ``{"hosts": [...]}`` with host details.
+        :returns: ``{"hosts": [...]}`` with host details — ``host_id``,
+            ``name``, ``owner``, ``status``, ``sandbox_provider``,
+            ``configured_harnesses``, and ``gateway_inference`` (``None`` when
+            no connected host has reported it to this replica).
         """
         # require_user: unauthenticated callers 401. user_id is None
         # only when auth is disabled entirely — there the single-user
@@ -601,6 +759,12 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    # Held in memory from the host's connect handshake, not the
+                    # hosts row. ``None`` means this replica has no report yet —
+                    # emitted as-is so a client can tell "unknown" from "not
+                    # gateway-backed".
+                    "gateway_inference": host_registry.gateway_inference(host.host_id),
+                    "interactive_shells": host_registry.interactive_shells(host.host_id),
                 }
             )
         return {"hosts": result}
@@ -612,7 +776,8 @@ def create_hosts_router(
         :param request: The incoming request (for auth).
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
-        :returns: Host details dict.
+        :returns: Host details dict — the ``list_hosts`` fields (including
+            ``gateway_inference``, ``None`` when unreported) plus ``runners``.
         :raises HTTPException: 404 if the host does not exist.
         """
         # require_user: with an auth provider configured, an
@@ -639,6 +804,10 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            # Same semantics as list_hosts: reported on connect and held in
+            # memory, so ``None`` is "no report on this replica yet".
+            "gateway_inference": host_registry.gateway_inference(host.host_id),
+            "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
         }
 
@@ -647,12 +816,16 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> HostModelOptionsResponse:
         """Return pre-launch model choices resolved by the selected host.
 
         A preview of the host's ambient default catalog, not a binding
         snapshot: launch re-resolves with the session's agent spec, and the
         in-session picker reflects that launch snapshot once the runner is up.
+
+        :raises HTTPException: 404 when the host is unknown, 403 when not the
+            owner, 409 when offline or the host daemon is too old to list model
+            options, 502 on host-side failure, 504 on timeout.
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
@@ -662,7 +835,8 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
             host_registry=host_registry,
@@ -675,7 +849,21 @@ def create_hosts_router(
                 detail=str(result.get("error") or "host model-options lookup failed"),
             )
         models = result.get("models")
-        return {"models": models if isinstance(models, list) else []}
+        routable = result.get("routable_models")
+        error = result.get("error")
+        return HostModelOptionsResponse(
+            models=(
+                [model for model in models if isinstance(model, dict)]
+                if isinstance(models, list)
+                else []
+            ),
+            # Every id the harness's endpoint routes: the picker names one
+            # row per model, while a launch takes an exact id.
+            routable_models=(
+                [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
+            ),
+            error=error if isinstance(error, str) and error else None,
+        )
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
@@ -717,6 +905,19 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        if agent_store is not None and agent_cache is not None:
+            from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+
+            await asyncio.to_thread(
+                require_session_registry_mcp_support,
+                target.conv,
+                conn.hello.capabilities,
+                component="host",
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+            )
+        set_current_session_id(body.session_id)
+        add_audit_attrs(session_id=body.session_id, host_id=host_id)
 
         # W6: validate the requested workspace against the agent's
         # os_env.cwd sandbox boundary BEFORE binding — the same check
@@ -751,70 +952,24 @@ def create_hosts_router(
                 body.session_id,
             )
 
-        # Optional git worktree: when the caller asks to branch, create a
-        # worktree off the validated source repo and bind the runner to
-        # the worktree path instead (the fork-resume path; mirrors
-        # POST /v1/sessions). Created BEFORE the atomic runner bind so a
-        # lost CAS or a failed launch can roll it back, leaving no orphan
-        # worktree on the host.
-        git_branch: str | None = None
-        # CreatedWorktree | None — set ONLY when Omnigent creates a worktree
-        # (create mode). Left None in bind mode so the rollback below never
-        # force-removes the user's pre-existing worktree.
-        worktree = None
         if body.git is not None:
-            from omnigent.host.git_worktree import (
-                WorktreeError,
-                validate_branch_name,
-            )
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
-            # Shared by both modes — the host never runs git in bind mode, so
-            # the server is the only gate on the name there.
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
-            if body.git.existing_worktree:
-                # Binding to a pre-existing worktree: no worktree is created,
-                # but record its branch so the sidebar shows it and the opt-in
-                # delete flow can offer to remove it.
-                git_branch = body.git.branch_name
-            else:
-                from omnigent.server.routes._host_worktree import (
-                    WorktreeHostUnavailableError,
-                    WorktreeProxyError,
-                    create_worktree_on_host,
-                )
+        # Resolve the harness before creating host-side state.
+        harness: str | None = None
+        if agent_store is not None and agent_cache is not None:
+            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
-                try:
-                    worktree = await create_worktree_on_host(
-                        host_registry=host_registry,
-                        host_conn=conn,
-                        repo_path=workspace,
-                        branch_name=body.git.branch_name,
-                        base_branch=body.git.base_branch,
-                    )
-                except WorktreeHostUnavailableError as exc:
-                    # Host offline / unresponsive — infra, not user input.
-                    raise HTTPException(status_code=409, detail=exc.message) from exc
-                except WorktreeProxyError as exc:
-                    # Host-reported git failure (dup branch, bad base, not a
-                    # repo) — user-correctable input.
-                    raise HTTPException(status_code=400, detail=exc.message) from exc
-                workspace = worktree.worktree_path
-                git_branch = worktree.branch
+        git_branch: str | None = None
+        worktree = None
 
         async def _rollback_worktree() -> None:
-            """
-            Best-effort removal of the worktree created above.
-
-            Called when the runner bind or launch fails after the
-            worktree was created, so a failed request leaves no orphan
-            worktree (and no orphan branch) on the host. Never raises —
-            a cleanup failure is logged and the original error still
-            propagates.
-            """
+            """Remove a worktree created by this request."""
             if worktree is None:
                 return
             from omnigent.server.routes._host_worktree import (
@@ -828,7 +983,7 @@ def create_hosts_router(
                     host_conn=conn,
                     worktree_path=worktree.worktree_path,
                     branch=worktree.branch,
-                    delete_branch=True,
+                    delete_branch=body.git is None or not body.git.existing_branch,
                 )
             except WorktreeProxyError:
                 _logger.warning(
@@ -839,68 +994,176 @@ def create_hosts_router(
                 )
 
         async def _rollback_failed_launch() -> None:
-            """
-            Undo a failed launch *after* the runner was atomically bound.
-
-            Fully unbinds the session — NULLs ``runner_id`` plus the
-            ``host_id`` / ``workspace`` / ``git_branch`` persisted by the
-            ``set_host_id`` call below — and rolls back any worktree
-            created for this launch. Clearing the binding (not just
-            ``runner_id``) keeps the DB consistent with the host's actual
-            state: the worktree is gone, so the row must not keep pointing
-            at it, and a retry that omits a worktree starts from a clean
-            slate rather than inheriting a stale ``git_branch`` (which
-            ``set_host_id`` cannot clear). ``POST /hosts/{id}/runners`` only
-            binds a previously-unbound clone (the fork-resume picker), so a
-            full unbind restores the true pre-call state. Used only on the
-            post-bind failure paths; the lost-CAS path must NOT clear the
-            binding because it belongs to the concurrent winner, not us.
-            """
+            """Clear state created by a failed runner launch."""
+            _logger.error(
+                "Runner launch failed; clearing binding",
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=body.session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                ),
+            )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
-            await _rollback_worktree()
+            try:
+                if worktree is not None or (body.git is not None and body.git.existing_worktree):
+                    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+                    previous_root = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    if previous_root is None:
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            body.session_id,
+                            {WORKTREE_ROOT_LABEL_KEY: previous_root},
+                        )
+            finally:
+                await _rollback_worktree()
 
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
 
-        # Atomic bind (UPDATE ... WHERE runner_id IS NULL): only one
-        # concurrent launch can bind an unbound session; a second (or an
-        # already-bound session) gets False. Closes the TOCTOU.
-        bound = await asyncio.to_thread(
-            conversation_store.set_runner_id,
-            body.session_id,
-            runner_id,
-        )
-        if not bound:
-            await _rollback_worktree()
-            raise HTTPException(
-                status_code=400,
-                detail="session already has a runner bound",
-            )
-        # Persist the validated, canonical workspace (the worktree path
-        # when a worktree was created) alongside host_id, plus git_branch
-        # when branching, so the conversation row satisfies
-        # ck_conversations_workspace_required_for_host. ``workspace`` is the
-        # realpath returned by validate_workspace (W6), or body.workspace
-        # verbatim only in non-production wiring without an agent cache.
-        await asyncio.to_thread(
-            conversation_store.set_host_id,
-            body.session_id,
-            host_id,
-            workspace,
-            git_branch,
-        )
+        launch_lock = _runner_launch_locks.setdefault(body.session_id, asyncio.Lock())
+        waited_for_launch = launch_lock.locked()
+        async with launch_lock:
+            if waited_for_launch:
+                current = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    body.session_id,
+                )
+                if current is None:
+                    raise HTTPException(status_code=404, detail="session not found")
+                if current.runner_id is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="session already has a runner bound",
+                    )
 
+            if body.git is not None:
+                if body.git.existing_worktree:
+                    git_branch = body.git.branch_name
+                else:
+                    from omnigent.server.routes._host_worktree import (
+                        WorktreeHostUnavailableError,
+                        WorktreeProxyError,
+                        create_worktree_on_host,
+                    )
+
+                    try:
+                        worktree = await create_worktree_on_host(
+                            host_registry=host_registry,
+                            host_conn=conn,
+                            repo_path=workspace,
+                            branch_name=body.git.branch_name,
+                            base_branch=body.git.base_branch,
+                            existing_branch=body.git.existing_branch,
+                        )
+                    except WorktreeHostUnavailableError as exc:
+                        raise HTTPException(status_code=409, detail=exc.message) from exc
+                    except WorktreeProxyError as exc:
+                        raise HTTPException(status_code=400, detail=exc.message) from exc
+                    workspace = worktree.workspace or worktree.worktree_path
+                    git_branch = worktree.branch
+
+            try:
+                await host_registry.admit_launch(
+                    conn,
+                    body.session_id,
+                    allow_unbound=True,
+                    transfer_from_host_id=target.conv.host_id,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
+
+            bound = await asyncio.to_thread(
+                conversation_store.set_runner_id,
+                body.session_id,
+                runner_id,
+            )
+            if not bound:
+                await _rollback_worktree()
+                raise HTTPException(
+                    status_code=400,
+                    detail="session already has a runner bound",
+                )
+
+            async def persist_binding() -> None:
+                """Record cleanup identity before making the new binding visible."""
+                if worktree is not None:
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        worktree_root_fingerprint,
+                    )
+
+                    root = worktree.worktree_path
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        body.session_id,
+                        {WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(root)},
+                    )
+                elif body.git is not None and body.git.existing_worktree:
+                    from omnigent.server.routes._host_worktree import (
+                        WORKTREE_ROOT_LABEL_KEY,
+                        recorded_worktree_root,
+                    )
+
+                    fingerprint = target.conv.labels.get(WORKTREE_ROOT_LABEL_KEY)
+                    if (
+                        fingerprint is not None
+                        and recorded_worktree_root(workspace, fingerprint) is None
+                    ):
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        )
+                await asyncio.to_thread(
+                    conversation_store.set_host_id,
+                    body.session_id,
+                    host_id,
+                    workspace,
+                    git_branch,
+                )
+
+            persist_task = asyncio.create_task(persist_binding())
+            try:
+                await asyncio.shield(persist_task)
+            except BaseException as exc:
+
+                async def _settle_and_rollback() -> None:
+                    with contextlib.suppress(BaseException):
+                        _ = await persist_task
+                    await _rollback_failed_launch()
+
+                if isinstance(exc, asyncio.CancelledError):
+                    cleanup_task = asyncio.create_task(_settle_and_rollback())
+                    _track_runner_launch_cleanup(cleanup_task)
+                else:
+                    await _settle_and_rollback()
+                raise
+
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=body.session_id,
+                runner_id=runner_id,
+                operation="launch",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
 
-        # Resolve the agent's harness so the host can refuse an
-        # unconfigured one before spawning (mirrors POST /v1/sessions).
-        # None — no agent cache wired, or no resolvable agent — skips
-        # the host-side check.
-        harness: str | None = None
-        if agent_store is not None and agent_cache is not None:
-            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -908,6 +1171,13 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                inference_config=(
+                    target.conv.inference_snapshot["runtime_config"]
+                    if target.conv.inference_snapshot
+                    else None
+                ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
         try:
@@ -920,22 +1190,32 @@ def create_hosts_router(
                 detail="host connection was replaced",
             ) from None
 
+        launch_timeout_s = resolve_launch_timeout_s()
         try:
             result = await asyncio.wait_for(
                 future,
-                timeout=_LAUNCH_RESULT_TIMEOUT_S,
+                timeout=launch_timeout_s,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             conn.pending_launches.pop(request_id, None)
             await _rollback_failed_launch()
             raise HTTPException(
                 status_code=504,
-                detail="host did not respond to launch request",
+                detail=(
+                    f"host did not respond to launch request within "
+                    f"{launch_timeout_s:g}s (raise {LAUNCH_TIMEOUT_ENV_VAR} "
+                    f"if this launch needs longer)"
+                ),
             ) from None
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
-            if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            refusal_code = classify_launch_refusal(
+                result.get("error_code"),
+                result.get("error"),
+                workspace,
+            )
+            if refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action
                 # (`omnigent setup` on the host machine). Surface the
@@ -944,11 +1224,22 @@ def create_hosts_router(
                     f"host failed to launch runner: {result.get('error')}",
                     code=ErrorCode.HARNESS_NOT_CONFIGURED,
                 )
+            if refusal_code == WORKSPACE_MISSING_ERROR_CODE:
+                # Rebuild the message from the authorized, canonical
+                # workspace rather than reflecting arbitrary host output.
+                raise OmnigentError(
+                    f"host failed to launch runner: {workspace_missing_message(workspace)}",
+                    code=ErrorCode.WORKSPACE_MISSING,
+                )
             raise HTTPException(
                 status_code=502,
                 detail=f"host failed to launch runner: {result.get('error')}",
             )
 
+        # The runner is bound to a session carried in the body (not the request
+        # path); the middleware promotes a bag session_id to the audit row's
+        # session_id column. Host is an attribute.
+        add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
         return {
             "runner_id": runner_id,
             "status": "launching",
@@ -1028,10 +1319,10 @@ def create_hosts_router(
             504 (timeout), 502 (host I/O).
         """
         # FastAPI's :path converter strips the leading slash from
-        # the URL match. Re-add it unless the path is tilde-prefixed
-        # (~/foo stays tilde-prefixed; /Users/x becomes Users/x → /Users/x).
-        if not path.startswith("~"):
-            path = "/" + path
+        # the URL match. Re-add it for POSIX paths; leave tilde,
+        # Windows drive-letter, and UNC paths alone (prefixing /
+        # would turn C:/Users/me into /C:/Users/me).
+        path = restore_host_filesystem_url_path(path)
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,
@@ -1087,7 +1378,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
@@ -1170,7 +1461,7 @@ def create_hosts_router(
             )
         # Absolute or tilde-prefixed only — the host needs a path it can
         # resolve on its own; a relative path has no stable meaning here.
-        if not path.startswith(("/", "~")):
+        if not (path.startswith(("/", "~", "\\\\")) or _is_windows_absolute_path(path)):
             raise HTTPException(
                 status_code=400,
                 detail="path must be absolute or tilde-prefixed",
@@ -1178,7 +1469,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         result = await _proxy_create_dir(
             host_registry=host_registry,
@@ -1206,6 +1497,53 @@ def create_hosts_router(
             "path": result.get("path"),
         }
 
+    @router.post("/hosts/{host_id}/harnesses/refresh")
+    async def refresh_host_harnesses(
+        request: Request,
+        host_id: str,
+    ) -> dict[str, Any]:
+        """Force an immediate full harness-readiness probe on a host."""
+        if not flags.enabled(Feature.HARNESS_INSTALL):
+            raise HTTPException(status_code=404, detail="not found")
+
+        user_id = require_user(request, auth_provider)
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "refreshing harness readiness")
+        if CAP_REFRESH_HARNESSES not in conn.hello.capabilities:
+            raise OmnigentError(
+                (
+                    f"host '{conn.hello.name}' does not support immediate harness refresh; "
+                    "use the latest readiness reported by the host"
+                ),
+                code=ErrorCode.REFRESH_UNSUPPORTED,
+            )
+
+        result = await _proxy_refresh_harnesses(
+            host_registry=host_registry,
+            host_conn=conn,
+        )
+        if result.get("status") == "failed":
+            raise HTTPException(
+                status_code=502,
+                detail=f"host readiness refresh failed: {result.get('error') or 'unknown error'}",
+            )
+
+        refreshed_gateway = optional_str_bool_map(result, "gateway_inference")
+        if refreshed_gateway is not None:
+            host_registry.record_gateway_inference(host.host_id, refreshed_gateway)
+        return {
+            "configured_harnesses": result.get("configured_harnesses") or {},
+            "gateway_inference": refreshed_gateway,
+        }
+
     @router.post("/hosts/{host_id}/harnesses/{harness}/install")
     async def install_host_harness(
         request: Request,
@@ -1221,8 +1559,8 @@ def create_hosts_router(
         may install onto it. Scoped to the UI-installable allowlist (claude,
         codex, pi, opencode, qwen) — curl/brew and interactive-auth harnesses
         are refused. The whole route is gated behind
-        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` (default off): when disabled it
-        returns 404 so the feature is invisible until opted in.
+        ``harness_install`` in ``OMNIGENT_FEATURES`` (default off): when
+        disabled it returns 404 so the feature is invisible until opted in.
 
         Concurrent requests for the same (host, harness) coalesce onto one
         in-flight install so a double-click can't fire two global npm installs.
@@ -1231,16 +1569,20 @@ def create_hosts_router(
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
         :param harness: Harness identifier to install, e.g. ``"claude"``.
         :returns: ``{"object": "harness_install", "harness": ...,
-            "configured_harnesses": {...}}`` — the host's refreshed readiness
-            map so the UI can flip the badge without a reconnect.
+            "configured_harnesses": {...}, "version": str | None,
+            "gateway_inference": {...} | None}``
+            — the host's refreshed readiness map so the UI can flip the badge
+            without a reconnect, plus its refreshed gateway-inference map
+            (``None`` when the host didn't report one).
         :raises HTTPException: 404 when the feature is disabled or the host is
             unknown, 400 when the harness is not UI-installable, 403 when the
-            caller is not the host owner, 409 when the host is offline, 502 on
-            a host-side install failure, 504 on host timeout.
+            caller is not the host owner, 409 when the host is offline or its
+            daemon is too old to install harnesses, 502 on a host-side install
+            failure, 504 on host timeout.
         """
-        # Feature flag (default off): a disabled route is indistinguishable
-        # from a non-existent one, so the feature is fully dark until opted in.
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        # A disabled route is indistinguishable from a non-existent one, so
+        # the feature is fully dark until the deployment opts in.
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist (400) is checked before the ownership check (403) so error
@@ -1264,7 +1606,8 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "UI-driven harness installs")
 
         # Coalesce concurrent installs of the same harness FAMILY onto one
         # in-flight request so a double-click (or `codex` + `codex-native`, which
@@ -1299,10 +1642,23 @@ def create_hosts_router(
                 detail=f"host install failed: {result.get('error') or 'unknown error'}",
             )
 
+        # An install can flip gateway backing (a freshly installed CLI now
+        # resolves the workspace gateway), so take the map the host just
+        # recomputed instead of waiting for its next readiness push.
+        # Decoded through the same tolerant reader the tunnel path uses: this
+        # is a host-supplied reply body, so a non-mapping is "unknown", not a
+        # 500 out of ``dict(...)``.
+        installed_gateway = optional_str_bool_map(result, "gateway_inference")
+        if installed_gateway is not None:
+            host_registry.record_gateway_inference(host.host_id, installed_gateway)
+
         return {
             "object": "harness_install",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
+            "version": result.get("version"),
+            # Passed through as-is: ``None`` is "unknown", not "none backed".
+            "gateway_inference": installed_gateway,
         }
 
     @router.post("/hosts/{host_id}/harnesses/{harness}/credential")
@@ -1318,7 +1674,7 @@ def create_hosts_router(
         Backs the Web UI setup dialog's "Add a credential" action so a user can
         configure a Claude / Codex / Pi credential on a connected host without a
         terminal. Owner-scoped, allowlisted, and gated behind
-        ``OMNIGENT_HARNESS_INSTALL_ENABLED`` exactly like the install route
+        ``harness_install`` release feature exactly like the install route
         (404 when disabled). The host daemon does the write with the same
         non-interactive core the ``omnigent setup`` wizard uses.
 
@@ -1333,14 +1689,16 @@ def create_hosts_router(
         :param harness: Harness being configured, e.g. ``"claude"``.
         :param body: The credential payload (kind + secret / gateway / adopt).
         :returns: ``{"object": "harness_credential", "harness": ...,
-            "configured_harnesses": {...}}`` — refreshed readiness so the UI can
-            flip the badge without a reconnect.
+            "configured_harnesses": {...}, "gateway_inference": {...} | None}``
+            — refreshed readiness so the UI can flip the badge without a
+            reconnect, plus the refreshed gateway-inference map (``None`` when
+            the host didn't report one).
         :raises HTTPException: 404 when disabled or host unknown, 400 when the
             harness isn't UI-configurable or the body is invalid, 403 when not
-            the owner, 409 when offline, 502 on host-side failure, 504 on
-            timeout.
+            the owner, 409 when offline or the host daemon is too old to store
+            credentials, 502 on host-side failure, 504 on timeout.
         """
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         # Allowlist before ownership (403) so error codes can't enumerate
@@ -1366,7 +1724,8 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "storing harness credentials")
 
         frame = HostStoreSecretFrame(
             request_id=secrets.token_hex(8),
@@ -1398,10 +1757,20 @@ def create_hosts_router(
                 detail=f"host credential write failed: {result.get('error') or 'unknown error'}",
             )
 
+        # Pointing a family at the workspace gateway is exactly what this write
+        # does, so record the recomputed map now rather than on the host's next
+        # readiness push.
+        # Same tolerant decode as the install route above.
+        written_gateway = optional_str_bool_map(result, "gateway_inference")
+        if written_gateway is not None:
+            host_registry.record_gateway_inference(host.host_id, written_gateway)
+
         return {
             "object": "harness_credential",
             "harness": harness,
             "configured_harnesses": result.get("configured_harnesses") or {},
+            # Passed through as-is: ``None`` is "unknown", not "none backed".
+            "gateway_inference": written_gateway,
         }
 
     @router.get("/hosts/{host_id}/credentials/detected")
@@ -1421,9 +1790,10 @@ def create_hosts_router(
         :param host_id: Host identifier.
         :returns: ``{"object": "detected_credentials", "credentials": [...]}``.
         :raises HTTPException: 404 when disabled or host unknown, 403 when not
-            the owner, 409 when offline, 502/504 on host failure/timeout.
+            the owner, 409 when offline or the host daemon is too old to detect
+            credentials, 502/504 on host failure/timeout.
         """
-        if not env_truthy(os.environ.get(HARNESS_INSTALL_ENABLED_ENV)):
+        if not flags.enabled(Feature.HARNESS_INSTALL):
             raise HTTPException(status_code=404, detail="not found")
 
         user_id = require_user(request, auth_provider)
@@ -1436,7 +1806,8 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
+        _require_harness_setup_support(conn, "detecting existing credentials")
 
         result = await _proxy_detect_credentials(host_registry=host_registry, host_conn=conn)
         return {
@@ -1464,7 +1835,7 @@ def create_hosts_router(
         :param path: Absolute path inside the repo on the host to list
             worktrees for, e.g. ``"/Users/alice/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
-            is_main, detached}, ...]}`` (main first).
+            is_main, detached, updated_at?}, ...]}`` (main first).
         :raises HTTPException: 404 if host not found, 403 if not owned
             by caller, 409 if host is offline/unresponsive, 400 on path
             validation or a non-git path.
@@ -1492,7 +1863,7 @@ def create_hosts_router(
 
         conn = host_registry.get(host.host_id)
         if conn is None:
-            raise HTTPException(status_code=409, detail="host is offline")
+            raise _host_absent_error(host)
 
         try:
             worktrees = await list_worktrees_on_host(

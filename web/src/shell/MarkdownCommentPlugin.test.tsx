@@ -21,7 +21,7 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import StarterKit from "@tiptap/starter-kit";
+import { StarterKit } from "@tiptap/starter-kit";
 import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";

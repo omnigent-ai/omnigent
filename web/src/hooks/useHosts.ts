@@ -1,5 +1,13 @@
-import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -20,13 +28,21 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
+  /**
+   * Whether each harness family's launch on this host resolves an
+   * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
+   * "codex": false}`. Smart Routing's apply layer only works on gateway-backed
+   * inference. `null`/absent (or a missing key) means unknown — an older host
+   * or server — and must not gate anything away; only an explicit `false` does.
+   */
+  gateway_inference?: Record<string, boolean> | null;
 }
 
 interface HostsResponse {
   hosts: Host[];
 }
 
-async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -84,26 +100,122 @@ async function fetchHostModelOptions(
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const body = (await res.json()) as { models?: NativeModelOption[] };
-  return body.models ?? [];
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // Non-JSON error body — keep the status-line detail.
+    }
+    throw new Error(detail);
+  }
+  const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
+  const models = body.models ?? [];
+  // Backward compatibility with servers that encoded probe failure in a 200.
+  if (models.length === 0 && body.error) throw new Error(body.error);
+  return models;
 }
 
+// A shared request may start from an inactive observer while another needs retries.
+const modelCatalogPollers = new WeakMap<QueryClient, Map<string, number>>();
+
 /** Model choices available before launch, resolved on the selected host. */
-export function useHostModelOptions(hostId: string | null, harness: string, enabled = true) {
-  return useQuery({
+export function useHostModelOptions(
+  hostId: string | null,
+  harness: string,
+  enabled = true,
+  { poll = true }: { poll?: boolean } = {},
+) {
+  const queryClient = useQueryClient();
+  const canRefresh = enabled && hostId !== null && poll;
+  const pollerKey = JSON.stringify([hostId, harness]);
+  // Only committed selections participate; suspended renders leave retries alone.
+  useLayoutEffect(() => {
+    if (!canRefresh) return;
+    let pollers = modelCatalogPollers.get(queryClient);
+    if (!pollers) {
+      pollers = new Map();
+      modelCatalogPollers.set(queryClient, pollers);
+    }
+    pollers.set(pollerKey, (pollers.get(pollerKey) ?? 0) + 1);
+    return () => {
+      const remaining = (pollers.get(pollerKey) ?? 1) - 1;
+      if (remaining > 0) pollers.set(pollerKey, remaining);
+      else pollers.delete(pollerKey);
+      if (pollers.size === 0) modelCatalogPollers.delete(queryClient);
+    };
+  }, [queryClient, pollerKey, canRefresh]);
+  const query = useQuery({
     queryKey: ["host-model-options", hostId, harness],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
-    staleTime: 30_000,
-    retry: false,
+    // Poll the active picker for provider changes; inactive harnesses can
+    // fetch eagerly without periodic refreshes or background retries.
+    staleTime: 15_000,
+    refetchInterval: canRefresh ? 15_000 : false,
+    ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
+    // Retry boot-probe races while any picker uses this catalog. Persistent
+    // failures surface after bounded backoff (~22 s).
+    retry: (failureCount) =>
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+    retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
+  const previouslyRefreshing = useRef(canRefresh);
+  const { isError, isFetching, refetch } = query;
+  useEffect(() => {
+    const becameSelected = canRefresh && !previouslyRefreshing.current;
+    previouslyRefreshing.current = canRefresh;
+    // Retry failed prefetches on selection without restarting exhausted retries.
+    if (becameSelected && isError && !isFetching) void refetch();
+  }, [canRefresh, isError, isFetching, refetch]);
+  return query;
 }
 
-interface InstallHarnessResult {
+export interface InstallHarnessResult {
   object: "harness_install";
   harness: string;
   configured_harnesses: Record<string, boolean | string>;
+  version: string | null;
+  gateway_inference: Record<string, boolean> | null;
+}
+
+async function responseDetail(res: Response): Promise<string> {
+  let detail = `${res.status} ${res.statusText}`;
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    if (typeof body.detail === "string" && body.detail) detail = body.detail;
+  } catch {
+    // Non-JSON error body — keep the status-line detail.
+  }
+  return detail;
+}
+
+export interface RefreshHarnessesResult {
+  configured_harnesses: Record<string, boolean | string>;
+  gateway_inference: Record<string, boolean> | null;
+}
+
+/** Force the selected host to refresh harness readiness. */
+export async function refreshHarnessesOnHost(hostId: string): Promise<RefreshHarnessesResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/refresh`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as RefreshHarnessesResult;
+}
+
+export async function installHarnessOnHost(
+  hostId: string,
+  harness: string,
+): Promise<InstallHarnessResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as InstallHarnessResult;
 }
 
 /**
@@ -134,23 +246,7 @@ export function useInstallHarness(hostId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationKey: installHarnessMutationKey(hostId),
-    mutationFn: async (harness: string): Promise<InstallHarnessResult> => {
-      const res = await authenticatedFetch(
-        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
-      );
-      if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const err = (await res.json()) as { detail?: string };
-          if (typeof err.detail === "string" && err.detail) detail = err.detail;
-        } catch {
-          // Non-JSON error body — keep the status-line detail.
-        }
-        throw new Error(detail);
-      }
-      return (await res.json()) as InstallHarnessResult;
-    },
+    mutationFn: (harness: string) => installHarnessOnHost(hostId, harness),
     onSuccess: (result) => {
       // Patch the refreshed readiness into every ["hosts", …] cache entry
       // (filtered + unfiltered) so the badge updates immediately. This lives at
@@ -160,7 +256,13 @@ export function useInstallHarness(hostId: string) {
       // observer's per-call callbacks, which the later mutate() overwrites.
       queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
         hosts?.map((h) =>
-          h.host_id === hostId ? { ...h, configured_harnesses: result.configured_harnesses } : h,
+          h.host_id === hostId
+            ? {
+                ...h,
+                configured_harnesses: result.configured_harnesses,
+                gateway_inference: result.gateway_inference,
+              }
+            : h,
         ),
       );
     },
@@ -205,7 +307,7 @@ export interface StoreCredentialInput {
   env_var?: string;
 }
 
-interface StoreCredentialResult {
+export interface StoreCredentialResult {
   object: "harness_credential";
   harness: string;
   configured_harnesses: Record<string, boolean | string>;
@@ -233,16 +335,7 @@ export function useStoreCredential(hostId: string) {
           body: JSON.stringify(body),
         },
       );
-      if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const err = (await res.json()) as { detail?: string };
-          if (typeof err.detail === "string" && err.detail) detail = err.detail;
-        } catch {
-          // Non-JSON error body — keep the status-line detail.
-        }
-        throw new Error(detail);
-      }
+      if (!res.ok) throw new Error(await responseDetail(res));
       return (await res.json()) as StoreCredentialResult;
     },
     // This mutation-level onSuccess patches the ["hosts"] cache (badge flip) and
@@ -290,6 +383,37 @@ export function useDetectedCredentials(hostId: string | null | undefined, enable
       return Array.isArray(body.credentials) ? body.credentials : [];
     },
     enabled: enabled && !!hostId,
+    staleTime: 30_000,
+  });
+}
+
+export interface HarnessStartup {
+  command: string;
+  resolved_path: string | null;
+  command_source: "env" | "config" | "default";
+  arg_count: number;
+  /** Null when an older host reports only the count. */
+  args?: string[] | null;
+  configured_command?: string | null;
+  configured_args?: string[] | null;
+  environment?: {
+    inherit: boolean;
+    variables: Record<string, string>;
+    unset: string[];
+  } | null;
+}
+
+export function useHarnessStartup(hostId: string, harness: string) {
+  return useQuery({
+    queryKey: ["harness-startup", hostId, harness],
+    queryFn: async (): Promise<HarnessStartup> => {
+      const res = await authenticatedFetch(
+        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/startup`,
+      );
+      if (!res.ok) throw new ApiError("Couldn't load launch settings", res.status, null);
+      return (await res.json()) as HarnessStartup;
+    },
+    retry: false,
     staleTime: 30_000,
   });
 }

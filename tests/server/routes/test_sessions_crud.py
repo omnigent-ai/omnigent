@@ -8,17 +8,29 @@ the stores.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import signal
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
+from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
+from omnigent.runner import create_runner_app
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.spec.types import AgentSpec
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
+from tests.runner.helpers import NullServerClient
 
 
 @pytest_asyncio.fixture()
@@ -108,6 +120,42 @@ async def test_delete_session(
     assert body["deleted"] is True
 
 
+async def test_delete_session_survives_blob_delete_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing attachment blob delete is logged; the session is still deleted."""
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_ids = [
+        file_store.create(f"f{i}.txt", 1, "text/plain", session_id=session_id).id for i in range(3)
+    ]
+    attempted: list[str] = []
+
+    def flaky_delete(self: LocalArtifactStore, key: str) -> None:
+        del self
+        attempted.append(key)
+        if key == file_ids[0]:
+            raise RuntimeError("Barnacle 500")
+
+    with (
+        patch.object(LocalArtifactStore, "delete", flaky_delete),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert sorted(attempted) == sorted(file_ids)
+    assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 404
+    assert f"Failed to delete attachment blob {file_ids[0]} for session" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
     resp = await client.delete("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
@@ -129,6 +177,33 @@ async def test_delete_running_session_attempts_stop(
         mock_stop.assert_awaited_once()
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_delete_idle_session_with_background_tasks_attempts_stop(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """An idle session with live background shells is still stopped.
+
+    Regression test: the sidebar rollup deliberately reads such a session
+    as ``idle`` — the turn ended and it takes a new message immediately —
+    so a stop gate keyed on that rollup alone would skip the runner and
+    leave the shells running past the delete.
+    """
+    mock_stop = AsyncMock(return_value=True)
+    sessions_module._session_status_cache[session_id] = "idle"
+    sessions_module._session_background_task_count_cache[session_id] = 1
+    try:
+        with patch.object(sessions_module, "_stop_session_via_runner", mock_stop):
+            resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+        mock_stop.assert_awaited_once()
+        assert mock_stop.await_args is not None
+        assert mock_stop.await_args.args[0] == session_id
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
 
 
 async def test_delete_idle_parent_stops_running_child(
@@ -226,6 +301,139 @@ async def test_delete_proceeds_when_stop_fails(
         sessions_module._session_status_cache.pop(session_id, None)
 
 
+async def test_delete_session_calls_full_runner_teardown(
+    client: httpx.AsyncClient,
+    session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Server-side delete calls DELETE /v1/sessions/{id} on the runner.
+
+    The old code called DELETE /v1/sessions/{id}/resources — the partial
+    cleanup endpoint — which left session caches and the live comment relay
+    alive after deletion. Full runner teardown must be invoked instead so
+    nothing outlives the session.
+    """
+    deleted_paths: list[str] = []
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            deleted_paths.append(request.url.path)
+        return httpx.Response(200, json={"deleted": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_capture),
+        base_url="http://runner",
+    )
+
+    async def _get_runner(session_id: str) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr(
+        sessions_module,
+        "_get_runner_client_for_resource_access",
+        _get_runner,
+    )
+    try:
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+    finally:
+        await fake_runner.aclose()
+
+    assert deleted_paths == [f"/v1/sessions/{session_id}"], (
+        f"server-side delete should call full runner teardown, got: {deleted_paths}"
+    )
+
+
+@pytest.mark.posix_only
+async def test_delete_session_reaps_child_that_ignores_sigterm(
+    client: httpx.AsyncClient,
+    session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nested delete deadlines allow forced exit after the full SIGTERM grace period."""
+    ready_file = tmp_path / "child-ready"
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        opencode_path=sys.executable,
+        verify_version=False,
+    )
+    child_code = (
+        "import signal, sys, time\n"
+        "from pathlib import Path\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "Path(sys.argv[1]).touch()\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        server, "build_argv", lambda: [sys.executable, "-c", child_code, str(ready_file)]
+    )
+    readiness_started = asyncio.Event()
+
+    async def parked_readiness() -> None:
+        while not ready_file.exists():
+            await asyncio.sleep(0.01)
+        readiness_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "_wait_until_ready", parked_readiness)
+
+    async def parked_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        await server.start()
+        raise AssertionError("startup should be cancelled")
+
+    runner_app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=parked_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    runner_transport = httpx.ASGITransport(app=runner_app)
+
+    async def dispatch(request: httpx.Request) -> httpx.Response:
+        # ASGITransport does not enforce HTTP timeouts itself.
+        try:
+            return await asyncio.wait_for(
+                runner_transport.handle_async_request(request),
+                timeout=request.extensions["timeout"]["read"],
+            )
+        except TimeoutError as exc:
+            raise httpx.ReadTimeout("runner cleanup timed out", request=request) from exc
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(dispatch), base_url="http://runner", timeout=30.0
+    ) as runner_client:
+
+        async def get_runner(session_id: str) -> httpx.AsyncClient:
+            return runner_client
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client_for_resource_access", get_runner)
+        create_request = asyncio.create_task(
+            runner_client.post(
+                "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_cleanup"}
+            )
+        )
+        try:
+            await asyncio.wait_for(readiness_started.wait(), timeout=5.0)
+            process = server.process
+            assert process is not None
+            with caplog.at_level(logging.WARNING):
+                response = await client.delete(f"/v1/sessions/{session_id}")
+            assert response.status_code == 200
+            assert process.returncode == -signal.SIGKILL
+            assert server.process is None
+            assert "did not finish within" not in caplog.text
+            assert "Runner cleanup failed" not in caplog.text
+        finally:
+            create_request.cancel()
+            if server.process is not None and server.process.poll() is None:
+                server.process.kill()
+                await asyncio.to_thread(server.process.wait, 5)
+            await asyncio.gather(create_request, return_exceptions=True)
+
+
 # ── PATCH /v1/sessions/{id} ─────────────────────────────────────────
 
 
@@ -240,6 +448,20 @@ async def test_patch_session_title(
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 200
+
+
+async def test_patch_session_title_enforces_user_limit(
+    client: httpx.AsyncClient,
+    session_id: str,
+) -> None:
+    """Manual titles accept 200 characters and reject 201."""
+    accepted = "x" * USER_SESSION_TITLE_MAX_CHARS
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": accepted})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == accepted
+
+    resp = await client.patch(f"/v1/sessions/{session_id}", json={"title": accepted + "x"})
+    assert resp.status_code == 422, resp.text
 
 
 async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
@@ -277,8 +499,8 @@ async def test_list_projects_returns_names_sorted(
     assert resp.status_code == 200
     # Label-only projects (no first-class row) list with id=None, sorted by name.
     assert resp.json() == [
-        {"id": None, "name": "Customer X"},
-        {"id": None, "name": "Sprint 42"},
+        {"id": None, "name": "Customer X", "icon": None},
+        {"id": None, "name": "Sprint 42", "icon": None},
     ]
 
 
@@ -414,6 +636,67 @@ async def test_patch_session_pins_and_unpins(
     assert user_key not in conv.labels
 
 
+async def test_archiving_clears_the_callers_pin(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """Archiving a session drops the caller's own pin: a pinned row shouldn't
+    linger if the session is later unarchived. Only the requester's per-user key
+    is cleared."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    user_key = pinned_label_key(None)
+
+    # Pin, then archive.
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.pinned": "1721760000000"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get(user_key) == "1721760000000"
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"archived": True},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.archived is True
+    assert user_key not in conv.labels
+
+
+async def test_archiving_wins_over_a_same_request_pin(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """A single PATCH carrying both ``archived: true`` and a pin is
+    contradictory; archive is authoritative. The pin-clear runs after the label
+    upsert, so the session ends up archived and unpinned, not re-pinned."""
+    from omnigent.stores.conversation_store import pinned_label_key
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    user_key = pinned_label_key(None)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"archived": True, "labels": {"omnigent.pinned": "1721760000000"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.archived is True
+    assert user_key not in conv.labels
+
+
 async def test_patch_rejects_client_supplied_per_user_pin_key(
     client: httpx.AsyncClient,
     session_id: str,
@@ -435,6 +718,83 @@ async def test_patch_rejects_client_supplied_per_user_pin_key(
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
     assert "omnigent.pinned.bob@example.com" not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_sandbox_labels(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """The ``omnigent.sandbox.*`` namespace is server-internal — the server
+    writes these labels (e.g. the repository a relaunch re-clones) and re-reads
+    them to rebuild the runner's workspace. A client seed would forge that
+    reconstruction state (e.g. redirect the relaunch clone), so every key under
+    the prefix — the known ones and an unenumerated future key — must be rejected
+    and nothing persisted."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    for key in (
+        "omnigent.sandbox.agent",
+        "omnigent.sandbox.repo",
+        "omnigent.sandbox.future",
+    ):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {key: "code-reviewer"}},
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+        conv = conv_store.get_conversation(session_id)
+        assert conv is not None
+        assert key not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_side_chat_thread_id_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.codex_native.subagent_thread_id`` records the Codex thread a
+    ``/side`` child forwards follow-up turns onto. The server writes it and later
+    re-reads the child's own copy to drive ``turn/start``, so a client seed would
+    redirect another session's follow-up into an attacker-chosen thread. It must
+    be rejected and nothing persisted."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.codex_native.subagent_thread_id": "thread_evil"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "omnigent.codex_native.subagent_thread_id" not in conv.labels
+
+
+async def test_patch_rejects_client_supplied_archived_at_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.archived_at`` is stamped by the server on the archive
+    transition only. A client write would forge the retention clock (including
+    on shared sessions the caller does not own), so it must be rejected and
+    nothing persisted."""
+    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    for value in ("1000", ""):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {ARCHIVED_AT_LABEL_KEY: value}},
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert ARCHIVED_AT_LABEL_KEY not in conv.labels
 
 
 async def test_list_sessions_pinned_filter(
@@ -464,3 +824,18 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+async def test_patch_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """The cleanup identity must remain server-owned after creation."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}}
+    )
+    assert response.status_code == 400, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels

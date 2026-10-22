@@ -29,11 +29,11 @@ interface FilesPanelDrawerProps {
    */
   onFileSelect: (path: string) => void;
   /**
-   * Lifted Changed/Explore tab state. Lifted to AppShell so the
-   * choice survives drawer open/close cycles.
+   * Which scope the drawer renders: false = full folder tree, true =
+   * changed-files-only flat list. Fixed by the FAB entry that opened it
+   * (Files vs Changes) — the drawer has no in-panel scope switch.
    */
   flatView: boolean;
-  onFlatViewChange: (flatView: boolean) => void;
   /**
    * Lifted hidden-files toggle state. Lifted to AppShell so the
    * eye-icon choice survives inline→drawer transitions.
@@ -53,7 +53,6 @@ export function FilesPanelDrawer({
   onClose,
   onFileSelect,
   flatView,
-  onFlatViewChange,
   showHidden,
   onShowHiddenChange,
   sort,
@@ -89,8 +88,8 @@ export function FilesPanelDrawer({
       style={{ width: panelWidth }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
-        "fixed inset-0 z-50 shadow-lg",
-        open ? "translate-x-0" : "translate-x-full",
+        "fixed inset-0 z-50",
+        open ? "translate-x-0 shadow-lg" : "translate-x-full shadow-none",
         "md:relative md:inset-auto md:z-auto md:shadow-none md:translate-x-0 md:shrink-0",
         open ? "md:border-border md:border-l" : "md:w-0 md:border-l-0",
       )}
@@ -111,7 +110,6 @@ export function FilesPanelDrawer({
         <FilesPanel
           onFileSelect={onFileSelect}
           flatView={flatView}
-          onFlatViewChange={onFlatViewChange}
           showHidden={showHidden}
           onShowHiddenChange={onShowHiddenChange}
           sort={sort}

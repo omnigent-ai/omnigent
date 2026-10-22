@@ -20,6 +20,7 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import { parseEvent } from "./sse";
 import type { Response } from "./types";
 
 function makeResponse(opts?: {
@@ -73,6 +74,35 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("does not adopt lifecycle notice ids as the parent stream identity", () => {
+    const blocks = reduce([
+      {
+        type: "native_tool_call",
+        toolType: "subagent_activity",
+        data: {},
+        itemId: "notice_1",
+        responseId: "subagent_returned",
+      },
+      { type: "text_delta", delta: "Before identity\n" },
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "parent",
+        itemId: "tool_1",
+        responseId: "parent_turn",
+      },
+      { type: "text_delta", delta: "After identity\n" },
+    ]);
+
+    expect(blocks[0]?.ctx.responseId).toBe("subagent_returned");
+    expect(
+      blocks.filter((block) => block.type === "text_chunk").map((block) => block.ctx.responseId),
+    ).toEqual(["", "parent_turn"]);
+  });
+
   it("every block ctx.responseId is the active response id from response.created", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_xyz" }) },
@@ -416,6 +446,91 @@ describe("BlockStream — reasoning", () => {
     expect(startIdx).toBeGreaterThanOrEqual(0);
     expect(chunkIdx).toBeGreaterThanOrEqual(0);
     expect(startIdx).toBeLessThan(chunkIdx);
+  });
+
+  it("reasoning_done with no prior deltas renders a settled reasoning block", () => {
+    // A native transcript mirror (claude-native thinking blocks) persists
+    // the thought as a reasoning item with NO reasoning deltas ever
+    // streamed. The item must render as one settled ReasoningBlock, under
+    // the item's own response id, before the answer that follows.
+    const blocks = reduce([
+      {
+        type: "reasoning_done",
+        text: "the user wants the token verbatim",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_native_1",
+      },
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "TOKEN" }],
+        itemId: "it_m1",
+        responseId: "resp_native_1",
+      },
+    ]);
+
+    const types = blockTypes(blocks);
+    const blockIdx = types.indexOf("reasoning_block");
+    const doneIdx = types.indexOf("text_done");
+    expect(blockIdx).toBeGreaterThanOrEqual(0);
+    expect(doneIdx).toBeGreaterThan(blockIdx);
+
+    const block = blocks[blockIdx] as ReasoningBlock;
+    expect(block.reasoningText).toBe("the user wants the token verbatim");
+    expect(block.ctx.itemId).toBe("it_r1");
+    expect(block.ctx.responseId).toBe("resp_native_1");
+  });
+
+  it("reasoning_done after streamed deltas is deduped (no double render)", () => {
+    // Delta-streaming harnesses may publish the persisted reasoning item
+    // after the deltas already painted the thought. The item must not
+    // re-render the same text as a trailing ReasoningBlock — mirrors
+    // message_done's "deltas already produced the text" dedup.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "plan the answer\n" },
+      { type: "text_delta", delta: "Answer" },
+      {
+        type: "reasoning_done",
+        text: "plan the answer\n",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_1",
+      },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const types = blockTypes(blocks);
+    expect(types).toContain("reasoning_chunk");
+    expect(types).not.toContain("reasoning_block");
+  });
+
+  it("reasoning_done while a streamed section is open closes it without re-rendering", () => {
+    // The item arrives before any text closed the section: it marks the
+    // section's end. Chunks streamed, so no trailing ReasoningBlock.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "thinking hard\n" },
+      {
+        type: "reasoning_done",
+        text: "thinking hard\n",
+        summary: "",
+        itemId: "it_r1",
+        responseId: "resp_1",
+      },
+      { type: "text_delta", delta: "Answer" },
+      { type: "message_done", content: [], itemId: "", responseId: "" },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const types = blockTypes(blocks);
+    expect(types).toContain("reasoning_chunk");
+    expect(types).not.toContain("reasoning_block");
+    const chunks = blocks.filter((b): b is ReasoningChunk => b.type === "reasoning_chunk");
+    expect(chunks.map((c) => c.text).join("")).toContain("thinking hard");
   });
 
   it("interleaved text→reasoning→text closes each text section (no orphan, no concatenation)", () => {
@@ -1277,6 +1392,81 @@ describe("BlockStream — terminal lifecycles", () => {
     }
   });
 
+  it.each([
+    {
+      previousModel: null,
+      previousId: "",
+      failureModel: "polly",
+      code: "executor_error",
+      source: undefined,
+    },
+    {
+      previousModel: "codex-native-ui",
+      previousId: "resp_other",
+      failureModel: "polly",
+      code: "ValueError",
+      source: "harness",
+    },
+    {
+      previousModel: "polly",
+      previousId: "resp_failed",
+      failureModel: "",
+      code: "executor_error",
+      source: undefined,
+    },
+  ])(
+    "names a turn failure from its response identity ($previousId, $failureModel, $code)",
+    ({ previousModel, previousId, failureModel, code, source }) => {
+      const events: StreamEvent[] = previousModel
+        ? [
+            {
+              type: "response_created",
+              response: makeResponse({ responseId: previousId, model: previousModel }),
+            },
+          ]
+        : [];
+      events.push({
+        type: "response_failed",
+        ...(source ? { source } : {}),
+        response: {
+          ...makeResponse({ responseId: "resp_failed", status: "failed", model: failureModel }),
+          error: {
+            code,
+            message: "The executor stopped before producing output.",
+          },
+        },
+      });
+
+      const error = reduce(events).find((block) => block.type === "error");
+      expect(error).toMatchObject({
+        code,
+        source: source ?? "",
+        message: "The executor stopped before producing output.",
+        title: "Polly ran into an error during this turn.",
+      });
+    },
+  );
+
+  it("names a runner failure without id or model using the active turn", () => {
+    const failure = parseEvent("response.failed", {
+      source: "harness",
+      response: {
+        status: "failed",
+        error: { code: "RuntimeError", message: "Harness stopped." },
+      },
+    });
+    expect(failure).not.toBeNull();
+    const blocks = reduce([
+      { type: "response_in_progress", response: makeResponse({ model: "release-reviewer" }) },
+      failure!,
+    ]);
+    expect(blocks.find((block) => block.type === "error")).toMatchObject({
+      title: "Release-reviewer ran into an error during this turn.",
+      message: "Harness stopped.",
+      ctx: { responseId: "resp_1" },
+    });
+  });
+
   it("failure without error does not emit ErrorBlock", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },
@@ -1295,14 +1485,18 @@ describe("BlockStream — terminal lifecycles", () => {
 describe("BlockStream — status events", () => {
   it("error event → ErrorBlock with both message and code", () => {
     const blocks = reduce([
-      { type: "response_created", response: makeResponse() },
+      { type: "response_created", response: makeResponse({ model: "polly" }) },
       {
         type: "error",
         source: "llm",
         toolName: null,
         error: { code: "llm_auth_failed", message: "API key invalid" },
       },
-      { type: "response_failed", response: makeResponse({ status: "failed" }) },
+      { type: "response_failed", response: makeResponse({ status: "failed", model: "polly" }) },
+      {
+        type: "response_created",
+        response: makeResponse({ responseId: "resp_switched", model: "codex-native-ui" }),
+      },
     ]);
 
     const err = blocks.find((b) => b.type === "error");
@@ -1311,8 +1505,37 @@ describe("BlockStream — status events", () => {
       expect(err.message).toBe("API key invalid");
       expect(err.code).toBe("llm_auth_failed");
       expect(err.source).toBe("llm");
+      expect(err.title).toBe("Polly ran into an error during this turn.");
     }
   });
+
+  it.each(["error", "response_failed"] as const)(
+    "does not label a delayed %s with a different response's agent",
+    (type) => {
+      const error = { code: "RuntimeError", message: "The old turn failed." };
+      const delayed: StreamEvent =
+        type === "error"
+          ? { type, source: "execution", toolName: null, error, responseId: "resp_old" }
+          : {
+              type,
+              response: {
+                ...makeResponse({ responseId: "resp_old", status: "failed", model: "" }),
+                error,
+              },
+            };
+      const blocks = reduce([
+        {
+          type: "response_created",
+          response: makeResponse({ responseId: "resp_new", model: "polly" }),
+        },
+        delayed,
+      ]);
+
+      const errorBlock = blocks.find((block) => block.type === "error");
+      expect(errorBlock).toMatchObject(error);
+      expect(errorBlock?.title).toBeUndefined();
+    },
+  );
 
   it("output_item.done error event preserves persisted ids", () => {
     const blocks = reduce([
@@ -1373,6 +1596,23 @@ describe("BlockStream — status events", () => {
 
     expect(blockTypes(blocks)).toContain("compaction_loading");
     expect(blockTypes(blocks)).not.toContain("compaction");
+  });
+
+  it("compaction_in_progress threads the server start time onto the block", () => {
+    // The server anchors started_at to the FIRST progress report of a
+    // compaction, so the spinner's elapsed counter can survive
+    // re-announcements and page reloads.
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse() },
+      { type: "compaction_in_progress", startedAtS: 1_700_000_000 },
+      { type: "response_completed", response: makeResponse() },
+    ]);
+
+    const loading = blocks.find((b) => b.type === "compaction_loading");
+    expect(loading).toBeDefined();
+    if (loading && loading.type === "compaction_loading") {
+      expect(loading.startedAtS).toBe(1_700_000_000);
+    }
   });
 
   it("compaction_completed event → CompactionBlock (done marker)", () => {
@@ -1653,5 +1893,101 @@ describe("BlockStream — interrupt (Stop) finalizes in-flight content", () => {
     );
     expect(done1).toBeGreaterThanOrEqual(0);
     expect(start2).toBeGreaterThan(done1);
+  });
+});
+
+describe("BlockStream — native turn start (session.status running)", () => {
+  it("stamps reducer blocks with the turn id from a running status edge", () => {
+    // A native harness emits no `response.created`, so without this the
+    // reasoning block carries an empty response id and groups into its own
+    // bubble — splitting the turn away from its committed items, which is
+    // what kept the "Worked for" fold from forming live on codex.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "Planning the run" },
+      { type: "text_delta", delta: "Answer" },
+    ]);
+
+    expect(blocks.length).toBeGreaterThan(0);
+    for (const b of blocks) {
+      expect(b.ctx.responseId).toBe("codex_t1");
+    }
+  });
+
+  it("re-stamps on the next turn's running edge", () => {
+    // The id must track the CURRENT turn: adopt-if-unset would leave turn
+    // 2's reasoning under turn 1's id, splitting it into the wrong bubble.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "first turn" },
+      { type: "session_status", conversationId: "conv_1", status: "idle", responseId: "codex_t1" },
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t2",
+      },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "second turn" },
+    ]);
+
+    const t2 = blocks.filter((b) => b.ctx.responseId === "codex_t2");
+    expect(t2.length).toBeGreaterThan(0);
+    const secondTurnText = t2
+      .filter((b): b is ReasoningChunk => b.type === "reasoning_chunk")
+      .map((c) => c.text)
+      .join("");
+    // (Chunks flush on a size threshold, so compare on the leading word.)
+    expect(secondTurnText).toContain("second");
+    expect(secondTurnText).not.toContain("first");
+  });
+
+  it("ignores a bare running edge with no turn id", () => {
+    // The PTY-activity relay publishes running/idle with no response id;
+    // adopting that would wipe the turn id mid-stream.
+    const blocks = reduce([
+      {
+        type: "session_status",
+        conversationId: "conv_1",
+        status: "running",
+        responseId: "codex_t1",
+      },
+      { type: "session_status", conversationId: "conv_1", status: "running" },
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "still turn one" },
+    ]);
+
+    for (const b of blocks) {
+      expect(b.ctx.responseId).toBe("codex_t1");
+    }
+  });
+});
+
+describe("BlockStream — naming a turn already in flight", () => {
+  it("adopts the id without sealing an already-open reasoning section", () => {
+    // Codex opens reasoning ~2s BEFORE the running edge names the turn.
+    // Closing on adopt would split one thought into two reasoning panels.
+    const blocks = reduce([
+      { type: "reasoning_started" },
+      { type: "reasoning_delta", delta: "weighing options" },
+      { type: "session_status", conversationId: "c", status: "running", responseId: "codex_t1" },
+      { type: "reasoning_delta", delta: " and continuing" },
+      { type: "text_delta", delta: "Answer" },
+    ]);
+
+    // Exactly one reasoning section was opened for the whole thought.
+    expect(blocks.filter((b) => b.type === "reasoning_start")).toHaveLength(1);
   });
 });

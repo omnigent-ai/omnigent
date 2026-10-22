@@ -99,13 +99,13 @@ describe("findPmRangeForComment", () => {
     expect(result).toEqual({ from: 600, to: 603 });
   });
 
-  it("returns the first occurrence when two identical strings are within the ±500 window", () => {
-    // Both "Hello"s are within 500 chars of each other; searchFrom collapses
-    // to 0 and indexOf returns the first match regardless of the hint.
+  it("uses the nearest occurrence when two identical strings are within the search window", () => {
+    // A short selection can repeat nearby. The stored offset must win over the
+    // first match so the comment re-attaches to the selected occurrence.
     const text = "Hello, world! Hello, universe!";
     const doc = makeDoc(text);
     const result = findPmRangeForComment(doc, makeComment("Hello", 14), text);
-    expect(result).toEqual({ from: 0, to: 5 });
+    expect(result).toEqual({ from: 14, to: 19 });
   });
 
   it("falls back to the first occurrence when hint window misses", () => {
@@ -178,13 +178,13 @@ describe("computeSelectionData", () => {
     expect(result).toEqual({ start_index: 600, end_index: 603, anchor_content: "foo" });
   });
 
-  it("returns the first occurrence when duplicate strings are within the ±500 window", () => {
-    // Both "foo"s are close together; the search window starts at 0 and
-    // indexOf always finds the first match.
+  it("uses the nearest occurrence when duplicate strings are within the search window", () => {
+    // Selecting the later short duplicate must not re-attach the comment to
+    // the earlier identical text.
     const text = "foo bar foo baz";
     const doc = makeDoc(text);
     const result = computeSelectionData(8, 11, doc, text);
-    expect(result).toEqual({ start_index: 0, end_index: 3, anchor_content: "foo" });
+    expect(result).toEqual({ start_index: 8, end_index: 11, anchor_content: "foo" });
   });
 
   it("falls back to proportional indices when anchor_content is not in rawContent verbatim", () => {

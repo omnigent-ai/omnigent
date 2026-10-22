@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
@@ -58,6 +58,89 @@ afterEach(() => {
 });
 
 describe("BrowserPane cold-start (no view yet)", () => {
+  it("does not claim that the agent navigates user-created tabs", () => {
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" agentBrowser={false} />);
+    expect(screen.getByText("Enter a URL above to get started.")).toBeInTheDocument();
+    expect(screen.queryByText(/the agent will open pages here too/)).toBeNull();
+  });
+
+  it("restores a tab's URL and navigation state from its existing native view", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "https://example.com/tab-two",
+        canGoBack: true,
+        canGoForward: false,
+      }),
+    });
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+        "https://example.com/tab-two",
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
+    await waitFor(() =>
+      expect(bridge.browserSetActive).toHaveBeenCalledWith("browser-tab:conv_a:two"),
+    );
+    cleanup();
+    expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
+  });
+
+  it("reattaches the retained page without navigating when its rail is reopened", async () => {
+    let fireActive: ((p: { conversationId: string | null }) => void) | undefined;
+    const bridge = installBridge({
+      onBrowserHostActiveChanged: vi.fn((cb) => {
+        fireActive = cb;
+        return () => {};
+      }),
+      browserSetActive: vi.fn(async (conversationId: string | null) => {
+        // The real shell broadcasts null when detaching, without destroying the page.
+        fireActive?.({ conversationId });
+        return { ok: true };
+      }),
+      browserHasView: vi.fn().mockResolvedValue({
+        exists: true,
+        url: "https://example.com",
+        canGoBack: false,
+        canGoForward: false,
+      }),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_hidden" active />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_hidden"));
+
+    rerender(<BrowserPane conversationId="conv_hidden" active={false} />);
+
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null));
+    const resizeCount = bridge.browserResize.mock.calls.length;
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+    });
+    expect(bridge.browserResize).toHaveBeenCalledTimes(resizeCount);
+
+    rerender(<BrowserPane conversationId="conv_hidden" active />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenLastCalledWith("conv_hidden"));
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("https://example.com");
+    expect(bridge.browserHasView).toHaveBeenCalledTimes(1);
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("reports native view-cap failures instead of silently leaving a blank tab", async () => {
+    installBridge({
+      browserOpenOrNavigate: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "browser view cap reached — close one" }),
+    });
+    render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+    const address = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(address, { target: { value: "example.com" } });
+    fireEvent.keyDown(address, { key: "Enter" });
+    expect(await screen.findByRole("alert")).toHaveTextContent("browser view cap reached");
+    expect(address).toHaveValue("example.com");
+  });
+
   it("renders the URL bar in the empty state so the first page is reachable", async () => {
     render(<BrowserPane conversationId="conv_a" />);
 
@@ -117,6 +200,53 @@ describe("BrowserPane cold-start (no view yet)", () => {
   });
 });
 
+describe("BrowserPane retained-view lifecycle", () => {
+  it("does not reattach a view closed while the pane is hidden", async () => {
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "http://localhost:5173" }),
+      onBrowserViewClosed: vi.fn((cb) => {
+        fireClosed = cb;
+        return () => {};
+      }),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_closed" />);
+    await waitFor(() => expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_closed"));
+    rerender(<BrowserPane conversationId="conv_closed" active={false} />);
+    act(() => fireClosed?.({ conversationId: "conv_closed", reason: "user" }));
+    bridge.browserSetActive.mockClear();
+
+    rerender(<BrowserPane conversationId="conv_closed" />);
+    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(bridge.browserSetActive).not.toHaveBeenCalled();
+    expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+  });
+
+  it("ignores an existence probe that arrives after the view was closed", async () => {
+    let resolveProbe: ((r: { exists: boolean; url: string }) => void) | undefined;
+    let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
+    const bridge = installBridge({
+      browserHasView: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveProbe = resolve;
+          }),
+      ),
+      onBrowserViewClosed: vi.fn((cb) => {
+        fireClosed = cb;
+        return () => {};
+      }),
+    });
+    render(<BrowserPane conversationId="conv_closed" />);
+    act(() => fireClosed?.({ conversationId: "conv_closed", reason: "user" }));
+    await act(async () => resolveProbe?.({ exists: true, url: "http://localhost:5173" }));
+
+    expect(screen.getByRole("button", { name: "Reload" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue("");
+    expect(bridge.browserSetActive).not.toHaveBeenCalled();
+  });
+});
+
 describe("BrowserPane design-mode toggle", () => {
   it("renders the design-mode toggle in the toolbar", async () => {
     render(<BrowserPane conversationId="conv_dm1" />);
@@ -132,7 +262,7 @@ describe("BrowserPane design-mode toggle", () => {
     expect(screen.getByRole("button", { name: /enter design mode/i })).toBeDisabled();
   });
 
-  it("calls enable then disable IPC as it toggles, once a view is active", async () => {
+  it("calls enable then disable IPC as it toggles, and disables on unmount", async () => {
     let fireCreated: ((p: { conversationId: string }) => void) | undefined;
     const bridge = installBridge({
       onBrowserViewCreated: vi.fn((cb: (p: { conversationId: string }) => void) => {
@@ -141,7 +271,7 @@ describe("BrowserPane design-mode toggle", () => {
       }),
     });
 
-    render(<BrowserPane conversationId="conv_dm3" />);
+    const { unmount } = render(<BrowserPane conversationId="conv_dm3" />);
     await screen.findByRole("textbox", { name: /address bar/i });
 
     // Activate a view so the toggle is enabled.
@@ -167,10 +297,34 @@ describe("BrowserPane design-mode toggle", () => {
       "aria-pressed",
       "false",
     );
+    screen.getByRole("button", { name: /enter design mode/i }).click();
+    await waitFor(() => {
+      expect(bridge.browserEnableDesignMode).toHaveBeenCalledTimes(2);
+    });
+    unmount();
+    expect(bridge.browserDisableDesignMode).toHaveBeenCalledTimes(2);
   });
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
+  it("opens a manually typed localhost preview through the user navigation path", async () => {
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(bar, { target: { value: "localhost:5273/preview" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        "browser-tab:conv_preview:two",
+        "http://localhost:5273/preview",
+        undefined,
+        { force: true },
+      ),
+    );
+    expect(bar).toHaveValue("http://localhost:5273/preview");
+  });
+
   /** Render the pane, activate a view (so toolbar buttons enable), and return
    *  the bridge + handles to the captured event callbacks. */
   async function renderActive(conversationId: string, overrides: Record<string, unknown> = {}) {

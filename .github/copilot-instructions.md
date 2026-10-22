@@ -4,6 +4,7 @@
 
 Every pull request that introduces a new feature **must** include at least one
 end-to-end (e2e) test covering the happy-path behaviour of that feature.
+For frontend-only changes, follow **Frontend Test Coverage** below instead.
 
 - E2E tests live under `tests/e2e/`.
 - If a PR adds new user-facing functionality and does not add or update an e2e
@@ -50,14 +51,17 @@ Most backend areas mirror their source directory under `tests/`:
 
 ## Frontend Test Coverage
 
-A pull request that changes behaviour under `web/` should add or update a
-**colocated Vitest unit test** — a `*.test.ts` or `*.test.tsx` file beside the
-component or module it touches. If a behaviour change ships without one, flag it.
+A pull request that changes behaviour under `web/` should have meaningful
+coverage. Prefer a **colocated Vitest unit test** — a `*.test.ts` or `*.test.tsx`
+file beside the component or module it touches. Credit existing tests when
+they already cover the change; otherwise name the uncovered behaviour and
+the smallest suitable test.
 
-- A change to user-facing UI behaviour additionally needs a Playwright test
-  under `tests/e2e_ui/`. That requirement is already enforced by the
-  `E2E UI Required` status check, so do not re-flag it here — focus the review
-  on the colocated unit test.
+- Use a Playwright test under `tests/e2e_ui/` when browser behaviour or a
+  full user flow cannot be adequately covered by unit or component tests.
+  Explain what the browser test uniquely verifies. Extend existing coverage
+  where practical; do not require a new or modified E2E test for every UI
+  behaviour change, or duplicate the same assertions at both layers.
 - A UI / frontend PR should also include a **video or images** in the `Demo`
   section of the PR description (with the "UI / frontend change" box checked).
   If a UI PR has an empty Demo section, flag it as a request for a screenshot

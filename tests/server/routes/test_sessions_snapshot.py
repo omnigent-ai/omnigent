@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
+from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.native.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+)
 from omnigent.server.routes import sessions as _sessions_mod
+from omnigent.server.routes._sessions.helpers import _truncate_error_message_label
+from omnigent.server.routes._sessions.orchestration import _build_session_response
 from omnigent.server.routes.sessions import (
     _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
@@ -18,25 +29,14 @@ from omnigent.server.routes.sessions import (
     _publish_subtree_cost_to_ancestors,
     _truncate_label,
 )
+from omnigent.server.schemas import SessionResponse
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-
-
-async def _drain_runner_skills(session_id: str) -> None:
-    """Pump the loop until the snapshot's background skills fetch lands.
-
-    Skills are now eventual-consistent (``[]`` on the first poll,
-    populated on a later one), so tests must wait for the fetch.
-    """
-    for _ in range(100):
-        if session_id in _sessions_mod._runner_skills_cache:
-            return
-        await asyncio.sleep(0)
 
 
 async def _drain_model_options(session_id: str) -> None:
     """Pump the loop until the background native model-options fetch lands.
 
-    Runner model options are eventual-consistent like skills: the first
+    Runner model options are eventually consistent: the first
     snapshot returns ``[]`` and starts the runner query; a later snapshot
     serves the cache.
     """
@@ -69,6 +69,47 @@ def test_model_options_wire_skips_malformed_rows_not_the_catalog() -> None:
         ]
     )
     assert [option["id"] for option in options] == ["opus"]
+
+
+def test_snapshot_metadata_resolvers_ignore_malformed_agent_ids() -> None:
+    """A wrapped UUID bind error degrades optional snapshot metadata to unknown."""
+
+    class _MalformedAgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            raise StatementError(
+                "invalid agent id",
+                {"agent_id": agent_id},
+                ValueError("expected a UUID"),
+                False,
+            )
+
+    conv = Conversation(
+        id="legacy_session",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="legacy_session",
+        agent_id="legacy_agent",
+    )
+    agent_store = _MalformedAgentStore()
+    agent_cache = object()
+
+    assert (
+        _sessions_mod._resolve_llm_model(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        is None
+    )
+    assert (
+        _sessions_mod._resolve_harness(
+            conv,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+        )
+        is None
+    )
 
 
 class _ConversationStore:
@@ -108,11 +149,13 @@ class _ConversationStore:
         after: str | None = None,
         kind: str | None = "default",
         root_conversation_id: str | None = None,
+        include_archived: bool = False,
     ) -> PagedList[Conversation]:
         """Return the spawn tree sharing ``root_conversation_id``.
 
         ``load_session_usage`` walks the tree via this method to sum a
-        parent's subtree usage. With an explicit graph, return every
+        parent's subtree usage, and passes ``include_archived=True`` —
+        archived conversations still hold spend. With an explicit graph, return every
         conversation sharing the root; otherwise synthesize the single
         childless conversation the legacy tests expect.
         """
@@ -253,6 +296,7 @@ async def test_session_snapshot_uses_child_spec_metadata(
         ),
     }
     conv_store = _ConversationStore([], conversations=conversations)
+    cache_loads: list[bool] = []
 
     class _AgentStore:
         @staticmethod
@@ -261,13 +305,20 @@ async def test_session_snapshot_uses_child_spec_metadata(
             return type(
                 "StoredAgent",
                 (),
-                {"id": agent_id, "name": "advisor-row", "bundle_location": "bundle"},
+                {
+                    "id": agent_id,
+                    "name": "advisor-row",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": True,
+                },
             )()
 
     class _AgentCache:
         @staticmethod
-        def load(agent_id: str, bundle_location: str) -> Any:
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = False) -> Any:
             assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            cache_loads.append(expand_env)
             return type("LoadedAgent", (), {"spec": parent_spec})()
 
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
@@ -289,9 +340,188 @@ async def test_session_snapshot_uses_child_spec_metadata(
     assert parent.agent_name == "advisor"
     assert parent.llm_model == "openai-codex/gpt-5.6-sol:high"
     assert parent.context_window == 200_000
+    assert parent.harness == "codex"
     assert child.agent_name == "executor"
     assert child.llm_model == "openai-codex/gpt-5.6-sol:medium"
     assert child.context_window == 100_000
+    assert child.harness == "codex"
+    assert cache_loads == [True, True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_unresolvable_sub_agent_warns_and_reports_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A child session whose ``sub_agent_name`` no longer resolves in the
+    parent bundle publishes the PARENT's identity, model and context window,
+    and warns.
+
+    Reporting the parent is long-standing: this path already retained the
+    parent spec and published its name, model and context window on a miss.
+    What the snapshot did not do was say so. The warning is the new part, and
+    it is what makes this the same answer the runner-side consumers of
+    ``_find_spec_by_name`` give across a separate process boundary.
+
+    Both halves are asserted: the warning must be emitted AND the parent's
+    values must be published — a silent fallback satisfies neither.
+
+    :param monkeypatch: Pytest monkeypatch, used to stub runner lookups.
+    :param caplog: Pytest log capture, used to confirm the unresolved
+        sub-agent is reported rather than passed over in silence.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="advisor",
+        executor=ExecutorSpec(
+            config={"harness": "codex"},
+            model="openai-codex/gpt-5.6-sol:high",
+            context_window=200_000,
+        ),
+        # No sub_agents: "executor" (recorded on the child conversation row)
+        # cannot resolve — simulates a spec edit removing the sub-agent
+        # after the child session was created.
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_advisor",
+            kind="sub_agent",
+            sub_agent_name="executor",
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            assert agent_id == "ag_advisor"
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "advisor-row",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": True,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+            assert (agent_id, bundle_location) == ("ag_advisor", "bundle")
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+        child = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_child",
+            agent_store=_AgentStore(),  # type: ignore[arg-type]
+            agent_cache=_AgentCache(),  # type: ignore[arg-type]
+        )
+
+    assert "'executor'" in caplog.text and "did not resolve" in caplog.text, (
+        f"The unresolved sub-agent must be warned about; got {caplog.text!r}."
+    )
+    # The PARENT spec is what the session actually runs on, so it is what the
+    # snapshot reports: the spec's own name ("advisor"), not the agent ROW's
+    # name ("advisor-row") and not the recorded child name ("executor").
+    assert child.agent_name == "advisor"
+    assert child.llm_model == "openai-codex/gpt-5.6-sol:high"
+    assert child.context_window == 200_000
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A native sub-agent's CLI-chosen name never resolves in the parent spec.
+
+    Claude Code names its Task sub-agents (``general-purpose``, ``Explore``) and
+    Codex its spawned agents; the parent spec doesn't list them, so the parent's
+    identity is the expected answer and is not worth a warning on every snapshot.
+    """
+    parent_spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(config={"harness": "claude-native"}, model="claude-sonnet"),
+    )
+    conversations = {
+        "conv_parent": Conversation(
+            id="conv_parent",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            agent_id="ag_claude",
+        ),
+        "conv_child": Conversation(
+            id="conv_child",
+            created_at=1,
+            updated_at=1,
+            root_conversation_id="conv_parent",
+            parent_conversation_id="conv_parent",
+            agent_id="ag_claude",
+            kind="sub_agent",
+            sub_agent_name="general-purpose",
+            labels={"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        ),
+    }
+    conv_store = _ConversationStore([], conversations=conversations)
+
+    class _AgentStore:
+        @staticmethod
+        def get(agent_id: str) -> Any:
+            return type(
+                "StoredAgent",
+                (),
+                {
+                    "id": agent_id,
+                    "name": "claude-native-ui",
+                    "bundle_location": "bundle",
+                    "session_id": None,
+                    "operator_authored": False,
+                },
+            )()
+
+    class _AgentCache:
+        @staticmethod
+        def load(agent_id: str, bundle_location: str, *, expand_env: bool = True) -> Any:
+            return type("LoadedAgent", (), {"spec": parent_spec})()
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes._sessions.orchestration"):
+        child = await _get_session_snapshot(
+            conv_store,  # type: ignore[arg-type]
+            "conv_child",
+            agent_store=_AgentStore(),  # type: ignore[arg-type]
+            agent_cache=_AgentCache(),  # type: ignore[arg-type]
+        )
+
+    assert "did not resolve" not in caplog.text
+    assert child.agent_name == "claude-native-ui"
+    assert child.labels.get("omnigent.ui") is None
+    assert child.llm_model == "claude-sonnet"
 
 
 @pytest.mark.asyncio
@@ -371,6 +601,105 @@ async def test_session_snapshot_surfaces_runner_exit_report_as_failed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
+@pytest.mark.parametrize("live_status", ["failed", "running"])
+async def test_session_snapshot_existing_failure_survives_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, live_status: str
+) -> None:
+    """A saved failure cause outlives the exit report; an interrupted turn still takes it."""
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "30cc5cfcaab3427698d56838f8b636cd"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_exit_after_failure",
+        agent_id="synthetic-agent",
+        live_status=None if cached else live_status,
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    if cached:
+        monkeypatch.setitem(sessions_module._session_status_cache, session_id, live_status)
+    else:
+        monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record(conv.runner_id, "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if live_status == "failed"
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
+async def test_session_snapshot_scopes_existing_failure_to_owning_runner(
+    monkeypatch: pytest.MonkeyPatch, owner_matches: bool
+) -> None:
+    """A failed cause owned by a prior runner yields to the current runner's exit.
+
+    When a session is rebound to a new runner that then dies before connecting,
+    the snapshot surfaces that runner's startup failure instead of the previous
+    runner's stale cause; a cause owned by the current runner still survives.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "4d9f2c1b7a0e4d5e8c1f2a3b4c5d6e7f"
+    original = {"code": "native_turn_error", "message": "Synthetic provider rejection"}
+    owner_runner = "runner_current" if owner_matches else "runner_previous"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_current",
+        agent_id="synthetic-agent",
+        live_status="failed",
+        labels={
+            "omnigent.last_task_error_code": original["code"],
+            "omnigent.last_task_error_message": original["message"],
+            "omnigent.last_task_error_runner_id": owner_runner,
+        },
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+    reports = RunnerExitReports()
+    reports.record("runner_current", "Synthetic runner exit", owner=None)
+
+    snapshot = await _get_session_snapshot(
+        store,
+        session_id,
+        runner_exit_reports=reports,  # type: ignore[arg-type]
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == (
+        original
+        if owner_matches
+        else {"code": "runner_failed_to_start", "message": "Synthetic runner exit"}
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error() -> None:
     """
     A terminal/runtime failure captured from ``session.status`` survives reload.
@@ -408,6 +737,93 @@ async def test_session_snapshot_surfaces_status_error_labels_as_last_task_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED",
+        'API Error: 429 {"error": {"code": "insufficient_quota"}}',
+        "HTTP 429: billing_hard_limit_reached",
+        "API Error: 429: Your credit balance is too low to access the API.",
+    ],
+)
+@pytest.mark.parametrize(
+    ("stored_code", "expected_code"),
+    [
+        ("native_turn_error", "rate_limit_exceeded"),
+        ("codex_turn_error", "rate_limit_exceeded"),
+        ("codex_reauth_required", "codex_reauth_required"),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
+    message: str,
+    stored_code: str,
+    expected_code: str,
+) -> None:
+    """Failures saved without a rate-limit code become retryable on reload."""
+    session_id = "319c3d34a4ab4e6d983872bf898a19b4"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": stored_code,
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_rate_limit", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == stored_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ('API Error: 499 {"error_code":"CANCELLED","message":""}', "transient_upstream_error"),
+        (
+            'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+            'version 2.1.280 or newer is required."}',
+            "client_update_required",
+        ),
+    ],
+)
+async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+    message: str,
+    expected_code: str,
+) -> None:
+    """Failures saved as generic native errors pick up the new codes on reload."""
+    session_id = "7c1f0a52d3b94e6c8a5d2e9f4b6a1c30"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={
+            "omnigent.last_task_error_code": "native_turn_error",
+            "omnigent.last_task_error_message": message,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_native_error", message)],
+        conversations={session_id: conv},
+    )
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.last_task_error == {"code": expected_code, "message": message}
+    assert conv.labels["omnigent.last_task_error_code"] == "native_turn_error"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     """A session whose runner has no exit report is not marked failed.
 
@@ -439,6 +855,98 @@ async def test_session_snapshot_no_exit_report_stays_unfailed() -> None:
     # No report for runner_live → no forced failure, no synthetic error.
     assert snapshot.status != "failed"
     assert snapshot.last_task_error is None
+
+
+_RUNNER_EXIT_ERROR = "runner process exited with code 254"
+
+
+async def _snapshot_after_runner_exit(
+    monkeypatch: pytest.MonkeyPatch, *, live_status: str, connection_source: str = "replica"
+) -> SessionResponse:
+    """Snapshot a session whose runner connected to this server, then reported an exit.
+
+    :param monkeypatch: Used to stamp the runner's liveness and to keep the
+        snapshot from probing a leaked process-wide runner client.
+    :param live_status: The session's persisted ``live_status``, e.g. ``"idle"``.
+    :returns: The session snapshot read while the exit report is still held.
+    """
+    from omnigent.server import session_live_state
+    from omnigent.server.host_registry import RunnerExitReports
+
+    session_id = "2d7a5c9e1b3f4a6c8e0d1f2a3b4c5d6e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        runner_id="runner_ran",
+        live_status=live_status,
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    _use_runner_client(monkeypatch, None)
+    if connection_source == "replica":
+        monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
+    else:
+        monkeypatch.delitem(session_live_state._last_liveness_stamp, "runner_ran", raising=False)
+    reports = RunnerExitReports()
+    reports.record(
+        "runner_ran",
+        _RUNNER_EXIT_ERROR,
+        owner=None,
+        had_connected=True if connection_source == "host" else None,
+    )
+
+    return await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        runner_exit_reports=reports,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
+async def test_session_snapshot_idle_session_of_connected_runner_ignores_exit_report(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_source: str,
+) -> None:
+    """An idle session whose runner connected is not repainted failed by the exit report.
+
+    When the host dies after its runner ran, ``_on_runner_exited`` leaves the
+    idle session idle (no work was lost). The snapshot must agree while the
+    report is held, instead of showing a crash banner on every reload.
+    """
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status="idle", connection_source=connection_source
+    )
+
+    assert snapshot.status == "idle"
+    assert snapshot.last_task_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_status", ["running", "waiting", "failed"])
+@pytest.mark.parametrize("connection_source", ["replica", "host"])
+async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_connected_runner(
+    monkeypatch: pytest.MonkeyPatch, live_status: str, connection_source: str
+) -> None:
+    """A session caught mid-turn (or already failed) still surfaces the exit report.
+
+    The host dying interrupts in-flight work, so the liveness stamp that spares
+    an idle session must not hide the crash cause from these.
+    """
+    snapshot = await _snapshot_after_runner_exit(
+        monkeypatch, live_status=live_status, connection_source=connection_source
+    )
+
+    assert snapshot.status == "failed"
+    assert snapshot.last_task_error == {
+        "code": "runner_failed_to_start",
+        "message": _RUNNER_EXIT_ERROR,
+    }
 
 
 @pytest.mark.asyncio
@@ -491,15 +999,518 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     # Still "running" from the cached value.
     assert snapshot2.status == "running"
     # Status is server-cached, so only the FIRST snapshot queries the
-    # runner for status; the second hits the cache. (Skills are
-    # runner-owned and fetched every snapshot via ``/skills`` — the
-    # runner caches them per session — so filter those out here.)
-    status_calls = [u for u in fake_client.get_calls if not u.endswith("/skills")]
+    # runner for status; the second hits the cache.
+    status_calls = fake_client.get_calls
     assert len(status_calls) == 1, (
         f"Expected 1 runner status GET (cache hit on second call), "
         f"got {len(status_calls)}. If 2, the cache "
         f"wasn't populated after the first query."
     )
+
+
+class _HangingRunnerClient:
+    """Fake runner whose status GET never answers, like a stalled runner behind a live tunnel."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.Future()
+
+
+class _NotFoundRunnerClient:
+    """Fake runner that does not know the session."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+class _GatedRunnerClient:
+    """Fake runner whose status GET blocks until released, so callers provably overlap."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.arrived = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        self.arrived.set()
+        await self.release.wait()
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+
+def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_skips_runner_status_probe_when_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``include_live_status=False`` reports cached/persisted status without probing.
+
+    Runner-owned session reads pass the flag because the probe targets the
+    very runner waiting on this response.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "3db1c2a4e5f60718293a4b5c6d7e8f90"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _RunningRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RunningRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    trimmed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        include_live_status=False,
+    )
+    assert runner_client.get_calls == []
+    assert trimmed.status == "idle"
+
+    # Same cold cache without the flag: the probe fires and reports.
+    full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert full.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A runner that never answers costs one bounded probe, then none until the backoff ends.
+
+    The tunnel transport ignores httpx timeouts, so an unanswered probe used to
+    hold every snapshot of the session until the runner spoke or its tunnel
+    dropped, and nothing was cached, so the next snapshot waited again.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "0a4d2f9c6b1e4e8f9c3a7d5b2e1f0a9c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    # One probe, cut off at the budget; the second snapshot skipped it entirely.
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "no answer within 0.05s" in warnings[0].getMessage()
+    assert "skipping it for 30s" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe() -> None:
+    """Callers racing on a cold status cache await one shared in-flight probe.
+
+    The runner's answer is gated on an event the test controls, so the second
+    caller provably attaches while the first probe is still in flight; the pass
+    cannot come from two probes merely running back to back.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "4e8b6d3a0f5c4c2d9a7e9b6f5c3d4e1a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    # One yield schedules `second` onto the shared probe; only then may it finish.
+    await asyncio.sleep(0)
+    runner_client.release.set()
+
+    assert await asyncio.gather(first, second) == ["running", "running"]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
+    assert _mod._runner_status_probe_inflight.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_cancelled_caller_does_not_abort_shared_status_probe() -> None:
+    """Cancelling one caller's snapshot leaves the shared probe running for the rest."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "5f9c7e4b1a2d4d3e8b0f1c9d6e5a7b2c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    runner_client.release.set()
+
+    assert await second == "running"
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_resumes_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the backoff has elapsed the next snapshot probes the runner again."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1b5e3a0d7c2f4f9a8d4b6e3c2f0a1b8d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_BACKOFF_S", 0.0)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_asks_again_after_non_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that does not know the session yet is asked again on the next snapshot.
+
+    A freshly bound runner answers 404 until session init lands; that answer is
+    cheap, so it must not put the session in the slow-probe backoff.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "2c6f4b1e8d3a4a0b9e5c7f4d3a1b2c9e"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _NotFoundRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    assert len(runner_client.get_calls) == 2
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _SlowNotFoundRunnerClient:
+    """Fake runner that answers 404 only after a delay: stalled, and without the session."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.sleep(self.delay_s)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_slow_non_200_probe_enters_backoff(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-200 that took longer than the slow threshold is treated like a failed probe."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "6a0d8f5c2b7e4e4f9c1a3b8d7e6f5a4b"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_SLOW_S", 0.01)
+    runner_client = _SlowNotFoundRunnerClient(delay_s=0.05)
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 1
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "HTTP 404 after" in warnings[0].getMessage()
+
+
+class _SwitchableRunnerClient:
+    """Fake runner that hangs until told to answer 200."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.answer = False
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        if self.answer:
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "idle"})
+        await asyncio.Future()
+        return None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_doubles_per_slow_probe_and_resets_on_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive slow probes double the skip window up to the cap; a prompt answer clears it."""
+    import time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "7b1e9a6d3c8f4f5a0d2b4c9e8f7a6b5c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _SwitchableRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    def _window_s() -> float:
+        return _mod._runner_status_probe_backoff.get(session_id).skip_until - time.monotonic()
+
+    def _expire_window() -> None:
+        _mod._runner_status_probe_backoff.get(session_id).skip_until = time.monotonic() - 1.0
+
+    expected_windows = [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+    for failures, expected in enumerate(expected_windows, start=1):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        entry = _mod._runner_status_probe_backoff.get(session_id)
+        assert entry.failures == failures
+        assert abs(_window_s() - expected) < 2.0, (failures, _window_s())
+        _expire_window()
+    assert len(runner_client.get_calls) == len(expected_windows)
+
+    runner_client.answer = True
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.status == "idle"
+    assert _mod._session_status_cache.get(session_id) == "idle"
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _MalformedRunnerClient:
+    """Fake runner whose 200 carries a body that is not a JSON object."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=200, json=lambda: ["not", "an", "object"])
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_malformed_200_probe_fails_softly_for_every_waiter(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 200 without a status object is a failed probe, not an exception every waiter sees."""
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "8c2f0b7e4d9a4a6b1e3c5d0f9a8b7c6d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _MalformedRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first, second = await asyncio.gather(
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+        )
+
+    assert (first.status, second.status) == ("idle", "idle")
+    assert len(runner_client.get_calls) == 1
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "malformed body" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_is_discarded_when_the_runner_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skip window recorded against one runner does not silence probes of its replacement."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "9d3a1c8f6b5e4e7d0f2a4b6c8e1d3f5a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    stalled = _HangingRunnerClient()
+
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    assert await orchestration._probe_runner_live_status(stalled, session_id, "runner_old") is None  # type: ignore[arg-type]
+    assert _mod._runner_status_probe_backoff.get(session_id).runner_id == "runner_old"
+
+    class _HealthyRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    replacement = _HealthyRunnerClient()
+    status = await orchestration._probe_runner_live_status(replacement, session_id, "runner_new")  # type: ignore[arg-type]
+
+    assert status == "running"
+    assert replacement.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the real tunnel an unanswered probe ends at the budget with nothing in flight."""
+    import time
+
+    import httpx
+
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    session_id = "3d7a5c2f9e4b4b1c8f6d8a5e4b2c3d0f"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.1)
+    registry = TunnelRegistry()
+    registry.register(
+        "runner_one",
+        _IdleWS(),
+        HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[]),
+    )
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    try:
+        started = time.monotonic()
+        snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        elapsed = time.monotonic() - started
+    finally:
+        await runner_client.aclose()
+
+    assert snapshot.status == "idle"
+    assert elapsed < 1.0
+    tunnel = registry.get("runner_one")
+    assert tunnel is not None
+    assert tunnel.in_flight == {}
+    assert _mod._runner_status_probe_backoff.get(session_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_uses_persisted_status_after_server_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recycled server keeps a native turn running from its durable status.
+
+    Native harness injection returns before the external turn completes, so the
+    runner's generic session endpoint can report ``idle`` while Codex is still
+    working. After a server restart clears the in-memory status cache, the
+    conversation row is the surviving relay truth and must win over that probe.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "bef42153ba7a4f2cb35350dc23b27c93"
+    _mod._session_status_cache.pop(session_id, None)
+
+    class _IdleRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            raise AssertionError("persisted running status must avoid the idle runner probe")
+
+    runner_client = _IdleRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        live_status="running",
+    )
+
+    try:
+        snapshot = await _get_session_snapshot(
+            _ConversationStore([], conversations={session_id: conv}),  # type: ignore[arg-type]
+            session_id,
+        )
+    finally:
+        _mod._session_status_cache.pop(session_id, None)
+
+    assert snapshot.status == "running"
+    status_calls = runner_client.get_calls
+    assert status_calls == []
 
 
 @pytest.mark.asyncio
@@ -547,8 +1558,6 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
 
     class _FakeResponse:
         status_code = 200
@@ -572,7 +1581,15 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         def __init__(self) -> None:
             self.resolved_for: list[str] = []
 
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            # Mirrors the real router: callers hand over the row they already
+            # authorized so it need not re-read the conversation.
+            del conversation
             self.resolved_for.append(conversation_id)
             return RoutedRunner(runner_id="runner_test", client=fake_client)  # type: ignore[arg-type]
 
@@ -600,75 +1617,9 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         "instead of synthesizing a default status"
     )
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("3ce755917a74a49f0c8feaf50f058ed9")
     assert fake_client.get_calls == [
         "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9",
-        "/v1/sessions/3ce755917a74a49f0c8feaf50f058ed9/skills",
     ]
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_includes_skills_from_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    Skills are runner-owned: the snapshot's ``skills`` field is
-    populated from the bound runner's ``GET /v1/sessions/{id}/skills``
-    (discovered against the runner's filesystem), so the web composer
-    can list them in its slash-command menu.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: dict[str, object]) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-    class _FakeRunnerClient:
-        def __init__(self) -> None:
-            self.get_calls: list[str] = []
-
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse(
-                    {
-                        "skills": [
-                            {"name": "triage-issues", "description": "Triage issues."},
-                            {"name": "mlflow-bug", "description": "File an MLflow bug."},
-                        ]
-                    }
-                )
-            return _FakeResponse({"status": "idle"})
-
-    fake_client = _FakeRunnerClient()
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-    # First poll returns [] and kicks the background fetch; a later poll serves them.
-    first = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6dc1e933ea5626723a7c79af592a4dc8",
-    )
-    assert first.skills == []
-    await _drain_runner_skills("6dc1e933ea5626723a7c79af592a4dc8")
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6dc1e933ea5626723a7c79af592a4dc8",
-    )
-
-    assert "/v1/sessions/6dc1e933ea5626723a7c79af592a4dc8/skills" in fake_client.get_calls
-    assert [s.name for s in snapshot.skills] == ["triage-issues", "mlflow-bug"]
-    assert snapshot.skills[0].description == "Triage issues."
 
 
 @pytest.mark.asyncio
@@ -696,8 +1647,6 @@ async def test_session_snapshot_includes_model_options_from_runner(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -715,9 +1664,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -769,7 +1716,7 @@ async def test_session_snapshot_includes_model_options_from_runner(
         session_id,
     )
 
-    assert f"/v1/sessions/{session_id}/codex-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
     assert snapshot.model_options[0].displayName == "GPT-5.5"
     assert [
@@ -787,17 +1734,20 @@ async def test_session_snapshot_includes_model_options_from_runner(
 async def test_kiro_session_snapshot_loads_runner_model_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """An older runner without the unified route still fills the picker.
+
+    The fake runner 404s ``/model-options`` (it predates the unified
+    route), so the server's loader must drop to the legacy harness-named
+    route and serve its rows — the compat lane until 0.11.0.
+    """
     from omnigent.server.routes import sessions as _mod
 
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
     class _FakeResponse:
-        status_code = 200
-
-        def __init__(self, payload: dict[str, object]) -> None:
+        def __init__(self, payload: dict[str, object], status_code: int = 200) -> None:
+            self.status_code = status_code
             self._payload = payload
 
         def json(self) -> dict[str, object]:
@@ -810,8 +1760,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             del timeout
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
+            if url.endswith("/model-options"):
+                return _FakeResponse({"detail": "Not Found"}, status_code=404)
             if url.endswith("/kiro-model-options"):
                 return _FakeResponse(
                     {
@@ -854,6 +1804,8 @@ async def test_kiro_session_snapshot_loads_runner_model_catalog(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
+    # The unified route was tried first, then the legacy alias filled in.
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert f"/v1/sessions/{session_id}/kiro-model-options" in fake_client.get_calls
     assert [model.id for model in snapshot.model_options] == ["provider-latest"]
     assert snapshot.model_options[0].model_dump()["description"] == (
@@ -872,8 +1824,6 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -892,9 +1842,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
-            if url.endswith("/claude-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
@@ -939,7 +1887,7 @@ async def test_claude_session_snapshot_loads_launch_time_model_aliases(
     await _drain_model_options(session_id)
     snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
 
-    assert f"/v1/sessions/{session_id}/claude-model-options" in fake_client.get_calls
+    assert f"/v1/sessions/{session_id}/model-options" in fake_client.get_calls
     assert [(m.id, m.displayName) for m in snapshot.model_options] == [
         ("opus", "Opus 4.10"),
         ("haiku", "Haiku 4.5"),
@@ -963,8 +1911,6 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._pushed_model_options_cache.clear()
@@ -983,8 +1929,6 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
             return _FakeResponse({"status": "idle"})
 
     fake_client = _FakeRunnerClient()
@@ -1045,23 +1989,13 @@ async def test_session_snapshot_serves_pi_model_options_from_extension_push(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_serves_static_cursor_model_options(
+async def test_session_snapshot_fetches_live_cursor_model_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Cursor-native model options are a curated *static* catalog, served directly.
-
-    Unlike codex (live runner ``model/list``), cursor's catalog never changes
-    per session, so the snapshot returns it on the FIRST read with no runner
-    round-trip and no background fetch. Serving it directly (not through the
-    runner-backed cache) is what keeps the picker from blanking on a
-    ``refresh_state`` snapshot — the regression behind the effort-change bug.
-    """
+    """Cursor options are fetched from the runner and cached for later snapshots."""
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
 
@@ -1079,8 +2013,18 @@ async def test_session_snapshot_serves_static_cursor_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
+            if url.endswith("/model-options"):
+                return _FakeResponse(
+                    {
+                        "models": [
+                            {
+                                "id": "provider-latest",
+                                "displayName": "Provider Latest",
+                                "isDefault": True,
+                            }
+                        ]
+                    }
+                )
             return _FakeResponse({"status": "idle"})
 
     fake_client = _FakeRunnerClient()
@@ -1102,40 +2046,41 @@ async def test_session_snapshot_serves_static_cursor_model_options(
         conversations={"4747fb03a3b45bb1f96bf130f4d704e5": conv},
     )
 
-    # First snapshot already carries the full catalog — no kick-and-empty.
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        "4747fb03a3b45bb1f96bf130f4d704e5",
+    )
+    assert first.model_options == []
+
+    await _drain_model_options("4747fb03a3b45bb1f96bf130f4d704e5")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "4747fb03a3b45bb1f96bf130f4d704e5",
     )
 
-    # No runner round-trip for cursor model options (served statically).
-    assert not any("model-options" in url for url in fake_client.get_calls)
-    ids = [m.id for m in snapshot.model_options]
-    assert "claude-opus-4-6" in ids and "gpt-5.2" in ids and "composer-2.5" in ids
-    # base-id namespace only — no flattened effort variants leak through.
-    assert not any("-high" in i or "-xhigh" in i for i in ids)
-    # The cache must stay untouched — that's what makes it refresh_state-proof.
-    assert "4747fb03a3b45bb1f96bf130f4d704e5" not in _mod._model_options_cache
+    assert [m.id for m in snapshot.model_options] == ["provider-latest"]
+    assert snapshot.model_options[0].displayName == "Provider Latest"
+    assert "/v1/sessions/4747fb03a3b45bb1f96bf130f4d704e5/model-options" in fake_client.get_calls
+    assert "4747fb03a3b45bb1f96bf130f4d704e5" in _mod._model_options_cache
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_refresh_state_reloads_model_options(
+@pytest.mark.parametrize("wrapper_name", ["cursor", "codex"])
+async def test_snapshot_refresh_scopes_cached_options_to_cursor(
     monkeypatch: pytest.MonkeyPatch,
+    wrapper_name: str,
 ) -> None:
     """
-    ``refresh_state=True`` pierces stale runner-backed Codex catalogs.
+    ``refresh_state=True`` retains only Cursor's previous picker options.
 
-    Browser reloads pass this flag so an AP-process cache warmed by an older
-    bug or older Codex response does not keep driving the model picker after
-    refresh. The first refreshed snapshot must not serve the stale cached row;
-    once the background runner read lands, a later snapshot serves the live
-    catalog.
+    Browser reloads and effort changes can request a refresh while the runner
+    catalog fetch is still in flight. The previous catalog remains available
+    for Cursor until the live response replaces it; Codex retains its existing
+    drop-on-refresh behavior.
     """
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     _mod._model_options_cache["3626053dfa9668a8604cc06e0b590ae0"] = [
@@ -1163,20 +2108,13 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(
                     {
                         "models": [
                             {
                                 "id": "fresh-model",
-                                "model": "fresh-provider-model",
                                 "displayName": "Fresh Model",
-                                "defaultReasoningEffort": "high",
-                                "supportedReasoningEfforts": [
-                                    {"reasoningEffort": "high", "description": "High"}
-                                ],
                                 "isDefault": True,
                             }
                         ]
@@ -1195,7 +2133,10 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
         root_conversation_id="3626053dfa9668a8604cc06e0b590ae0",
         agent_id="087b7cb7ac30abf4debfaa578d052ec6",
         labels={
-            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: getattr(
+                _mod,
+                f"_{wrapper_name.upper()}_NATIVE_WRAPPER_LABEL_VALUE",
+            ),
         },
     )
     conv_store = _ConversationStore(
@@ -1208,21 +2149,243 @@ async def test_session_snapshot_refresh_state_reloads_model_options(
         "3626053dfa9668a8604cc06e0b590ae0",
         refresh_state=True,
     )
-    # Refresh must not echo the stale cached row. If this is "stale-model",
-    # browser reloads would not recover after the server-side cache shape is fixed.
-    assert [m.id for m in refreshed.model_options] == []
+    expected_during_refresh = ["stale-model"] if wrapper_name == "cursor" else []
+    assert [m.id for m in refreshed.model_options] == expected_during_refresh
     await _drain_model_options("3626053dfa9668a8604cc06e0b590ae0")
     snapshot = await _get_session_snapshot(
         conv_store,  # type: ignore[arg-type]
         "3626053dfa9668a8604cc06e0b590ae0",
     )
 
-    assert (
-        "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/codex-model-options"
-        in fake_client.get_calls
-    )
+    assert "/v1/sessions/3626053dfa9668a8604cc06e0b590ae0/model-options" in fake_client.get_calls
     assert [m.id for m in snapshot.model_options] == ["fresh-model"]
     assert snapshot.model_options[0].displayName == "Fresh Model"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_serves_cached_model_options_while_runner_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The cached catalog outlives runner death so asleep pickers stay filled.
+
+    A model/effort change is valid while the runner is down (the PATCH
+    persists and applies at the next wake), so a browser reload of an
+    asleep session must not blank the model picker: relay teardown only
+    marks the catalog stale, and a ``refresh_state`` snapshot that resolves
+    no runner client keeps serving the cached rows.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_offline_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            if url.endswith("/model-options"):
+                return _FakeResponse({"models": [{"id": "gpt-5.5", "displayName": "GPT-5.5"}]})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+
+    # Runner death: the relay's exit path invalidates, then later snapshots
+    # resolve no runner client at all.
+    _mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=True, drop_model_options=False
+    )
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+
+    refreshed = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        refresh_state=True,
+    )
+    assert [m.id for m in refreshed.model_options] == ["gpt-5.5"]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_refetches_stale_model_options_after_relaunch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A stale catalog serves immediately, then converges on the live one.
+
+    After runner death marks the cache stale, the first snapshot with a
+    relaunched runner must not blank the picker: it serves the old rows
+    while a background re-fetch runs, and once that lands a later snapshot
+    serves the runner's current catalog.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_stale_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeRunnerClient:
+        def __init__(self) -> None:
+            self.model_id = "old-model"
+
+        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
+            if url.endswith("/model-options"):
+                return _FakeResponse({"models": [{"id": self.model_id}]})
+            return _FakeResponse({"status": "idle"})
+
+    fake_client = _FakeRunnerClient()
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: fake_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+
+    _mod._invalidate_runner_backed_snapshot_state(
+        session_id, cancel_inflight=True, drop_model_options=False
+    )
+    fake_client.model_id = "new-model"
+
+    stale = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert [m.id for m in stale.model_options] == ["old-model"]
+    # The cache already holds this session, so ``_drain_model_options``
+    # would return immediately — wait on the re-fetch task instead.
+    for _ in range(100):
+        if session_id not in _mod._model_options_inflight:
+            break
+        await asyncio.sleep(0)
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert [m.id for m in snapshot.model_options] == ["new-model"]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_fills_cold_claude_catalog_from_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cold cache with no runner falls back to the session's host.
+
+    A server restart while a claude-native session sleeps empties the
+    in-memory catalog and there is no runner to refill it. The snapshot
+    then asks the session's host — the same pre-launch source the
+    new-session picker uses — so the model picker refills without a wake.
+    Host rows are stale-marked so the next live runner replaces them with
+    its launch-exact catalog.
+    """
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "conv_host_catalog"
+    _mod._session_status_cache.clear()
+    _mod._model_options_cache.clear()
+    _mod._model_options_inflight.clear()
+    _mod._model_options_stale.discard(session_id)
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: None)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+    host_queries: list[str] = []
+
+    async def _fake_host_options(host_id: str) -> list[dict[str, object]] | None:
+        host_queries.append(host_id)
+        return [{"id": "opus", "displayName": "Opus"}]
+
+    monkeypatch.setattr(_mod, "_host_model_options_via_registry", _fake_host_options)
+
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="host_abc",
+        labels={
+            _mod._CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _mod._CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
+        },
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+
+    first = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert first.model_options == []
+    await _drain_model_options(session_id)
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+    )
+    assert host_queries == ["host_abc"]
+    assert [m.id for m in snapshot.model_options] == ["opus"]
+    assert session_id in _mod._model_options_stale
 
 
 @pytest.mark.asyncio
@@ -1240,8 +2403,6 @@ async def test_session_snapshot_retries_empty_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1278,9 +2439,7 @@ async def test_session_snapshot_retries_empty_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return _FakeResponse(self._codex_payloads.pop(0))
             return _FakeResponse({"status": "idle"})
 
@@ -1317,9 +2476,7 @@ async def test_session_snapshot_retries_empty_model_options(
     # Two codex-model-options calls means the empty catalog was not cached;
     # one call would recreate the missing-picker regression.
     assert (
-        fake_client.get_calls.count(
-            "/v1/sessions/a17f935755fe66e4a0f42878eee28820/codex-model-options"
-        )
+        fake_client.get_calls.count("/v1/sessions/a17f935755fe66e4a0f42878eee28820/model-options")
         == 2
     )
     assert [m.id for m in snapshot.model_options] == ["gpt-5.5"]
@@ -1341,8 +2498,6 @@ async def test_session_snapshot_retries_503_model_options(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
     _mod._model_options_cache.clear()
     _mod._model_options_inflight.clear()
     monkeypatch.setattr(_mod, "_MODEL_OPTIONS_RETRY_DELAYS_S", (0.0,))
@@ -1392,9 +2547,7 @@ async def test_session_snapshot_retries_503_model_options(
 
         async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
             self.get_calls.append(url)
-            if url.endswith("/skills"):
-                return _FakeResponse({"skills": []})
-            if url.endswith("/codex-model-options"):
+            if url.endswith("/model-options"):
                 return self._codex_responses.pop(0)
             return _FakeResponse({"status": "idle"})
 
@@ -1431,155 +2584,11 @@ async def test_session_snapshot_retries_503_model_options(
     # Two calls proves the transient 503 did not terminate discovery; one
     # call would leave the cache cold forever until another snapshot request.
     assert (
-        fake_client.get_calls.count(
-            "/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/codex-model-options"
-        )
+        fake_client.get_calls.count("/v1/sessions/a5cf1ddab988dcc43e643401b70c56d0/model-options")
         == 2
     )
     assert [m.id for m in snapshot.model_options] == ["gpt-5.4"]
     assert snapshot.model_options[0].defaultReasoningEffort == "medium"
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_publishes_skills_event_when_fetch_resolves(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    The background runner-skills fetch publishes ``session.skills`` once
-    it populates the cache, so a connected client is nudged to re-read
-    the now-warm snapshot. Without this push the slash-command menu stays
-    empty until the next bind (the bug that motivated this event): the
-    first snapshot poll serves ``[]`` and the web query does not poll.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: dict[str, object]) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> dict[str, object]:
-            return self._payload
-
-    class _FakeRunnerClient:
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                return _FakeResponse(
-                    {"skills": [{"name": "triage-issues", "description": "Triage issues."}]}
-                )
-            return _FakeResponse({"status": "idle"})
-
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-
-    # Capture session-stream publishes by rebinding the module's
-    # ``session_stream`` reference to a recorder. Rebinding the name in
-    # the sessions module's namespace (not patching ``publish`` through
-    # the shared module singleton) keeps the mock from leaking into other
-    # tests — see omnigent-testing rule 14.
-    published: list[dict[str, object]] = []
-
-    class _RecordingStream:
-        @staticmethod
-        def publish(conversation_id: str, event: dict[str, object]) -> None:
-            published.append({"conversation_id": conversation_id, **event})
-
-    monkeypatch.setattr(_mod, "session_stream", _RecordingStream)
-
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-    # First poll serves [] and kicks the background fetch.
-    first = await _get_session_snapshot(conv_store, "38aed2dc1dc1b08dbbaa1cf9592d7ae5")  # type: ignore[arg-type]
-    assert first.skills == []
-    await _drain_runner_skills("38aed2dc1dc1b08dbbaa1cf9592d7ae5")
-
-    # Exactly one session.skills event for this session was published when
-    # the fetch resolved. A missing event means the push regressed and the
-    # menu would stay empty; a duplicate means it fired more than once per
-    # resolve.
-    skills_events = [
-        e
-        for e in published
-        if e.get("type") == "session.skills"
-        and e.get("conversation_id") == "38aed2dc1dc1b08dbbaa1cf9592d7ae5"
-    ]
-    assert len(skills_events) == 1, (
-        f"Expected exactly 1 session.skills publish on fetch resolve, "
-        f"got {len(skills_events)}: {published}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_skills_empty_without_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    With no runner bound (neither router nor singleton resolves a
-    client), skills come back ``[]`` rather than crashing — discovery
-    is runner-owned and there is nothing to query.
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-    monkeypatch.setattr(
-        "omnigent.runtime.get_runner_client",
-        lambda: None,
-    )
-    monkeypatch.setattr(
-        "omnigent.runtime.get_runner_router",
-        lambda: None,
-    )
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "6222f438412b74067ff5915857f79312",
-    )
-
-    assert snapshot.skills == []
-
-
-@pytest.mark.asyncio
-async def test_session_snapshot_skills_empty_on_malformed_runner_payload(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A malformed ``/skills`` payload (items missing ``name``/``description``,
-    or a non-JSON body) must not break the snapshot — skills fall back to
-    ``[]`` (the documented best-effort contract).
-    """
-    from omnigent.server.routes import sessions as _mod
-
-    _mod._session_status_cache.clear()
-
-    class _FakeResponse:
-        def __init__(self, payload: object) -> None:
-            self.status_code = 200
-            self._payload = payload
-
-        def json(self) -> object:
-            return self._payload
-
-    class _FakeRunnerClient:
-        async def get(self, url: str, timeout: float = 5.0) -> _FakeResponse:
-            if url.endswith("/skills"):
-                # Items missing the required name/description keys.
-                return _FakeResponse({"skills": [{"oops": "no name"}]})
-            return _FakeResponse({"status": "idle"})
-
-    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: _FakeRunnerClient())
-    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
-
-    snapshot = await _get_session_snapshot(
-        conv_store,  # type: ignore[arg-type]
-        "21ad0587558979245a26b40ebe2638ef",
-    )
-
-    assert snapshot.skills == []
 
 
 @pytest.mark.asyncio
@@ -1594,8 +2603,6 @@ async def test_session_snapshot_prefers_router_over_singleton(
     from omnigent.server.routes import sessions as _mod
 
     _mod._session_status_cache.clear()
-    _mod._runner_skills_cache.clear()
-    _mod._runner_skills_inflight.clear()
 
     class _Response:
         def __init__(self, status: str) -> None:
@@ -1618,7 +2625,14 @@ async def test_session_snapshot_prefers_router_over_singleton(
     singleton_client = _Client("idle")
 
     class _FakeRouter:
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            """Mirrors the real router's already-authorized-row parameter."""
+            del conversation_id, conversation
             return RoutedRunner(runner_id="runner_test", client=router_client)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
@@ -1637,11 +2651,8 @@ async def test_session_snapshot_prefers_router_over_singleton(
     )
 
     assert snapshot.status == "running"
-    # Status is synchronous; the skills GET is now a background fetch.
-    await _drain_runner_skills("1cef6d7d1ef0c577c6ccfc690e5bc8ed")
     assert router_client.get_calls == [
         "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed",
-        "/v1/sessions/1cef6d7d1ef0c577c6ccfc690e5bc8ed/skills",
     ]
     assert singleton_client.get_calls == [], (
         "singleton should not have been queried when the router resolved a client"
@@ -1989,7 +3000,96 @@ def test_truncate_label_empty_string() -> None:
     assert _truncate_label("") == ""
 
 
+# ── _truncate_error_message_label ────────────────────────────────────────────
+
+_REJECTED_TUNNEL_ERROR = (
+    "error: runner tunnel rejected by server (HTTP 401 persisted across 3 attempts); "
+    "run `omnigent login https://omnigent.example.com/omnigent` to re-authenticate"
+)
+_TRACEBACK_LINES = (
+    "Traceback (most recent call last):",
+    *(f'  File "/venv/site-packages/pkg/module_{n}.py", line {n}, in call' for n in range(10)),
+    "asyncio.exceptions.CancelledError",
+)
+
+
+def _runner_exit_report(summary: str, *tail_lines: str) -> str:
+    """Build a host runner-exit report: summary, log-tail heading, tail lines."""
+    return "\n".join([summary, RUNNER_LOG_TAIL_HEADING, *tail_lines])
+
+
+def test_truncate_error_message_label_keeps_runner_exit_cause() -> None:
+    """A long runner-exit report keeps its summary and the tail's last line."""
+    summary = "runner process exited with code 1 (log on host: ~/logs/runner-a1.log)"
+    report = _runner_exit_report(summary, *_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR)
+    assert len(report) > _LABEL_VALUE_MAX_LEN
+
+    result = _truncate_error_message_label(report)
+
+    # The traceback is dropped; the line naming the cause survives whole.
+    assert result == f"{summary}\n…\n{_REJECTED_TUNNEL_ERROR}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
+
+
+def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
+    """An oversized last line is trimmed so the summary's start still fits."""
+    report = _runner_exit_report(
+        "runner process exited with code 1 (log on host: ~/x.log)", "error: " + "y" * 400
+    )
+
+    result = _truncate_error_message_label(report)
+
+    assert len(result) == _LABEL_VALUE_MAX_LEN
+    assert result.startswith("runner process exited with code 1")
+    assert "…\n…\nerror: yyy" in result
+    assert result.endswith("y…")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("Runner MCP execute failed: " + "x" * 300, id="no-log-tail"),
+        pytest.param(_runner_exit_report("x" * 300, ""), id="empty-log-tail"),
+    ],
+)
+def test_truncate_error_message_label_head_truncates_other_messages(message: str) -> None:
+    """Without a runner log tail line to keep, the message keeps its head."""
+    assert _truncate_error_message_label(message) == _truncate_label(message)
+
+
+def test_truncate_error_message_label_short_report_unchanged() -> None:
+    """A report that fits the column is stored verbatim, log tail included."""
+    report = _runner_exit_report("runner process exited with code 1", "error: boom")
+    assert _truncate_error_message_label(report) == report
+
+
 # ── _persist_session_status_error_labels ─────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("response_id", "names", "expected"),
+    [
+        ("failed_turn", ["claude-native-ui"], "claude-native-ui"),
+        ("failed_turn", ["claude-native-ui", "codex-native-ui"], None),
+        ("other_turn", ["claude-native-ui"], None),
+        (None, ["claude-native-ui"], None),
+    ],
+)
+def test_status_error_identity_requires_an_unambiguous_response(
+    response_id: str | None, names: list[str], expected: str | None
+) -> None:
+    from omnigent.entities import MessageData
+    from omnigent.server.routes._sessions.helpers import _response_agent_name_from_store
+
+    items = [
+        SimpleNamespace(
+            response_id="failed_turn",
+            data=MessageData(role="assistant", agent=name, content=[]),
+        )
+        for name in names
+    ]
+    store = SimpleNamespace(list_items=lambda *args, **kwargs: SimpleNamespace(data=items))
+    assert _response_agent_name_from_store(store, "session", response_id) == expected
 
 
 @pytest.mark.asyncio
@@ -2018,6 +3118,37 @@ async def test_persist_error_labels_truncates_long_message() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path) -> None:
+    """A host's runner-exit report still names its cause once stored.
+
+    The live failure event carries the whole report, but a reloaded session
+    shows the stored label, so the runner's final error line must survive it.
+    """
+    from omnigent.host.connect import _runner_exit_error
+    from omnigent.server.schemas import ErrorDetail
+
+    log_path = tmp_path / "runner.log"
+    log_path.write_text("\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR]) + "\n")
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_failed_to_start", message=_runner_exit_error(1, log_path))
+    assert len(error.message) > _LABEL_VALUE_MAX_LEN
+
+    await _persist_session_status_error_labels(
+        "d397345925f08ea06e7303c01686efff", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    stored = captured["d397345925f08ea06e7303c01686efff"]["omnigent.last_task_error_message"]
+    assert len(stored) <= _LABEL_VALUE_MAX_LEN
+    assert stored.startswith("runner process exited with code 1")
+    assert stored.endswith(f"\n…\n{_REJECTED_TUNNEL_ERROR}")
+
+
+@pytest.mark.asyncio
 async def test_persist_error_labels_short_message_stored_verbatim() -> None:
     """A short failure message is stored without modification."""
     from omnigent.server.schemas import ErrorDetail
@@ -2042,3 +3173,329 @@ async def test_persist_error_labels_short_message_stored_verbatim() -> None:
         captured["d6e1678fb446a1cf5a892e0df60aaba3"]["omnigent.last_task_error_code"]
         == "runner_error"
     )
+
+
+# ── _runner_reject_detail ────────────────────────────────────────────────────
+
+
+def test_runner_reject_detail_combines_error_code_and_detail() -> None:
+    """The runner's own ``{error, detail}`` shape reads as ``code: detail``."""
+    import httpx
+
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    resp = httpx.Response(
+        503,
+        request=httpx.Request("POST", "http://runner/v1/sessions/conv_x/events"),
+        json={"error": "harness_spawn_failed", "detail": "harness spawn failed (see log)"},
+    )
+    assert _runner_reject_detail(resp) == "harness_spawn_failed: harness spawn failed (see log)"
+
+
+def test_runner_reject_detail_falls_back_through_code_body_and_status() -> None:
+    """Each degraded body shape still yields a non-empty reason.
+
+    The reason becomes the user-visible ``last_task_error``, so an
+    error-code-only body, a non-JSON body, and an empty body must each
+    produce something better than a bare "failed".
+    """
+    import httpx
+
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    req = httpx.Request("POST", "http://runner/v1/sessions/conv_x/events")
+
+    code_only = httpx.Response(501, request=req, json={"error": "not_implemented"})
+    assert _runner_reject_detail(code_only) == "not_implemented"
+
+    non_json = httpx.Response(400, request=req, text="bad request body")
+    assert _runner_reject_detail(non_json) == "bad request body"
+
+    empty = httpx.Response(503, request=req)
+    assert _runner_reject_detail(empty) == "runner returned status 503"
+
+
+def test_runner_reject_detail_tolerates_status_only_response_fake() -> None:
+    """A fake exposing only ``status_code`` degrades to the status line.
+
+    Runner-client stubs across the server tests return lightweight fakes
+    without ``json()``; the helper must not raise on them.
+    """
+    from omnigent.server.routes.sessions import _runner_reject_detail
+
+    class _Fake:
+        status_code = 503
+
+    assert _runner_reject_detail(_Fake()) == "runner returned status 503"  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_persist_and_project_structured_error_round_trip() -> None:
+    """Structured title/cause/remediation survive persist → project.
+
+    A classified failure stores its friendly fields as labels, and
+    ``_last_task_error_from_labels`` projects them back so a reload renders the
+    same clear card instead of just code + message.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(
+        code="required_terminal_exited",
+        message="Claude Code can't run as root\n\n...diagnostics...",
+        title="Claude Code can't run as root",
+        cause="The agent terminal exited immediately because Claude Code refuses ...",
+        remediation="Run the host as a non-root user (uid != 0).",
+    )
+    await _persist_session_status_error_labels(
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
+    )  # type: ignore[arg-type]
+
+    labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
+    projected = _last_task_error_from_labels(labels)
+    assert projected == {
+        "agent_name": "claude-native-ui",
+        "code": "required_terminal_exited",
+        "message": "Claude Code can't run as root\n\n...diagnostics...",
+        "title": "Claude Code can't run as root",
+        "cause": "The agent terminal exited immediately because Claude Code refuses ...",
+        "remediation": "Run the host as a non-root user (uid != 0).",
+    }
+
+
+@pytest.mark.asyncio
+async def test_persist_error_labels_clears_stale_structured_fields() -> None:
+    """An unclassified failure must not inherit a prior failure's title/cause.
+
+    The label store is upsert-only, so every persist writes all structured keys
+    (empty when absent). An error with no title/cause/remediation therefore
+    projects back to just code + message.
+    """
+    from omnigent.server.routes.sessions import _last_task_error_from_labels
+    from omnigent.server.schemas import ErrorDetail
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _MockStore:
+        def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
+            captured[session_id] = updates
+
+    error = ErrorDetail(code="runner_error", message="turn setup failed")
+    await _persist_session_status_error_labels(
+        "bb22cc33dd44ee55ff66778899001122", error, _MockStore()
+    )  # type: ignore[arg-type]
+
+    labels = captured["bb22cc33dd44ee55ff66778899001122"]
+    # All structured keys are written empty so a stale value can't leak.
+    assert labels["omnigent.last_task_error_title"] == ""
+    assert labels["omnigent.last_task_error_cause"] == ""
+    assert labels["omnigent.last_task_error_remediation"] == ""
+    assert labels["omnigent.last_task_error_agent_name"] == ""
+    assert _last_task_error_from_labels(labels) == {
+        "code": "runner_error",
+        "message": "turn setup failed",
+    }
+
+
+def _side_chat_child(
+    *,
+    runner_id: str | None,
+    parent_id: str | None = "parent",
+    nickname: str = "Side chat",
+    wrapper: str = "codex-native-ui-subagent",
+    kind: str = "sub_agent",
+) -> Any:
+    """A conversation row shaped like a codex ``/side`` child."""
+    labels: dict[str, str] = {"omnigent.wrapper": wrapper}
+    if nickname:
+        labels["omnigent.codex_native.agent_nickname"] = nickname
+    return SimpleNamespace(
+        kind=kind,
+        labels=labels,
+        parent_conversation_id=parent_id,
+        runner_id=runner_id,
+    )
+
+
+class _ParentStore:
+    """A conversation store that returns one canned parent row."""
+
+    def __init__(self, parent: Any) -> None:
+        self._parent = parent
+
+    def get_conversation(self, conversation_id: str) -> Any:
+        return self._parent
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_sealed_on_runner_divergence() -> None:
+    """A resumed/relaunched host gives the parent a fresh ``runner_id`` while the
+    side-chat child keeps its birth one. The divergence means the ephemeral fork's
+    owning runner is gone, so the child seals read-only."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    child = _side_chat_child(runner_id="runner-birth")
+    store = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
+    assert await _codex_side_chat_fork_sealed(child, store) is True  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_not_sealed_when_runner_matches() -> None:
+    """A plain page reload keeps the same live runner, so parent and child agree
+    and the still-reachable fork stays sendable."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    child = _side_chat_child(runner_id="runner-birth")
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
+    assert await _codex_side_chat_fork_sealed(child, store) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_seal_only_applies_to_side_chats() -> None:
+    """The seal is gated to the ``/side`` nickname. An ordinary codex sub-agent
+    (durable, not an ephemeral fork) with a diverged runner must NOT be sealed —
+    and a non-codex row is ignored entirely."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    diverged = _ParentStore(SimpleNamespace(runner_id="runner-resumed"))
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert await _codex_side_chat_fork_sealed(ordinary, diverged) is False  # type: ignore[arg-type]
+
+    not_codex = _side_chat_child(
+        runner_id="runner-birth", wrapper="claude-code-native-ui-subagent"
+    )
+    assert await _codex_side_chat_fork_sealed(not_codex, diverged) is False  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_side_chat_fork_not_sealed_without_reliable_signal() -> None:
+    """Missing signals can't prove the fork is gone, so the child stays sendable:
+    a child with no runner_id, no parent link, or a parent that has no runner_id
+    (never diverged) is not sealed."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _codex_side_chat_fork_sealed,
+    )
+
+    live_parent = _ParentStore(SimpleNamespace(runner_id="runner-birth"))
+
+    no_child_runner = _side_chat_child(runner_id=None)
+    assert await _codex_side_chat_fork_sealed(no_child_runner, live_parent) is False  # type: ignore[arg-type]
+
+    no_parent_link = _side_chat_child(runner_id="runner-birth", parent_id=None)
+    assert await _codex_side_chat_fork_sealed(no_parent_link, live_parent) is False  # type: ignore[arg-type]
+
+    parent_no_runner = _ParentStore(SimpleNamespace(runner_id=None))
+    child = _side_chat_child(runner_id="runner-birth")
+    assert await _codex_side_chat_fork_sealed(child, parent_no_runner) is False  # type: ignore[arg-type]
+
+    missing_parent = _ParentStore(None)
+    assert await _codex_side_chat_fork_sealed(child, missing_parent) is False  # type: ignore[arg-type]
+
+
+async def test_snapshot_does_not_query_runner_skills_or_publish_skill_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as mod
+
+    mod._session_status_cache.clear()
+    calls: list[str] = []
+    published: list[dict[str, object]] = []
+
+    class Runner:
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            calls.append(url)
+            assert not url.endswith("/skills")
+
+            class Response:
+                status_code = 200
+
+                def json(self) -> dict[str, str]:
+                    return {"status": "idle"}
+
+            return Response()
+
+    class Stream:
+        @staticmethod
+        def publish(session_id: str, event: dict[str, object]) -> None:
+            published.append(event)
+
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: Runner())
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+    monkeypatch.setattr(mod, "session_stream", Stream)
+    snapshot = await _get_session_snapshot(_ConversationStore([]), "session-menu-independent")  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    assert "skills" not in snapshot.model_dump()
+    assert "skills_status" not in snapshot.model_dump()
+    assert all(not url.endswith("/skills") for url in calls)
+    assert all(event.get("type") != "session.skills" for event in published)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_status", "online", "lost"),
+    [
+        ("dead", False, True),
+        ("unknown", False, True),
+        ("alive", False, False),
+        (None, False, False),
+        ("dead", True, False),
+    ],
+)
+async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
+    monkeypatch: pytest.MonkeyPatch, host_status: str | None, online: bool, lost: bool
+) -> None:
+    """Only the launching host can prove an offline runner is gone; no reply proves nothing."""
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _status(_conn: Any, _registry: Any, _runner_id: str) -> str | None:
+        return host_status
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
+    monkeypatch.setattr("omnigent.runner.routing.routing_host_id", lambda _c, _s: "host-1")
+    registry = SimpleNamespace(get=lambda host_id: object() if host_id == "host-1" else None)
+    router = SimpleNamespace(runner_is_online=lambda _runner_id: online)
+    store = _ParentStore(SimpleNamespace(runner_id="runner-birth"))  # parent not relaunched yet
+    child = _side_chat_child(runner_id="runner-birth")
+
+    assert await orchestration._codex_side_chat_fork_lost(child, store, router, registry) is lost  # type: ignore[arg-type]
+
+    ordinary = _side_chat_child(runner_id="runner-birth", nickname="reviewer")
+    assert (
+        await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
+    )  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("agent", [CODEX_NATIVE_CODING_AGENT, CLAUDE_NATIVE_CODING_AGENT])
+@pytest.mark.parametrize("ownership", ["root", "mirror", "explicit_child"])
+def test_native_terminal_fallback_respects_child_ownership(agent, ownership: str) -> None:
+    parent_id = None if ownership == "root" else "parent"
+    labels = {}
+    if ownership == "mirror":
+        labels = {"omnigent.wrapper": agent.wrapper_label + "-subagent"}
+    elif ownership == "explicit_child":
+        labels = {"omnigent.wrapper": agent.wrapper_label, "omnigent.ui": "terminal"}
+    conversation = Conversation(
+        id="session",
+        root_conversation_id=parent_id or "session",
+        parent_conversation_id=parent_id,
+        agent_id="agent",
+        created_at=0,
+        updated_at=0,
+        labels=labels,
+    )
+    response = _build_session_response(conversation, [], "running", agent_name=agent.agent_name)
+    assert response.labels.get("omnigent.ui") == (None if ownership == "mirror" else "terminal")
+    assert conversation.labels == labels

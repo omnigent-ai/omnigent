@@ -20,24 +20,13 @@ existing tests (real ``SqlAlchemyPermissionStore`` so
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from pathlib import Path
-
 import httpx
 import pytest
-import pytest_asyncio
-from fastapi import FastAPI
 
-from omnigent.runtime.agent_cache import AgentCache
-from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.artifact_store.local import LocalArtifactStore
-from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
-from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.conftest import ControllableMockClient
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -70,57 +59,6 @@ def _seed_session(db_uri: str, *, with_agent: bool = False) -> str:
 
 
 pytestmark = pytest.mark.asyncio
-
-
-# ── Fixtures ─────────────────────────────────────────────────────────────────
-
-
-@pytest.fixture()
-def auth_app(
-    runtime_init: None,
-    db_uri: str,
-    tmp_path: Path,
-) -> FastAPI:
-    """App with permission store enabled (auth active)."""
-    from omnigent.server.auth import UnifiedAuthProvider
-
-    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifact_store,
-        agent_cache=AgentCache(
-            artifact_store=artifact_store,
-            cache_dir=tmp_path / "cache",
-        ),
-        comment_store=SqlAlchemyCommentStore(db_uri),
-        permission_store=SqlAlchemyPermissionStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
-    )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the auth-enabled app."""
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 # ── Tests ────────────────────────────────────────────────────────────────────

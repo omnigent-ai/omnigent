@@ -1,5 +1,5 @@
 // Tests for the Scheduled tasks page (`/tasks`): list rendering, the
-// Active/Paused filter + search, the Paused badge/dimming, the New task
+// Active/Paused filter + search, the Paused badge/dimming, the New automation
 // manual create action, and the pause/delete row actions dispatching the
 // mutation hooks.
 //
@@ -60,8 +60,10 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     updatedAt: 2,
     modelOverride: null,
     reasoningEffort: null,
+    permissionMode: null,
     workspace: null,
     hostId: null,
+    executionTarget: "connected_host",
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -165,7 +167,7 @@ describe("TasksPage list", () => {
     expect(screen.getByText("No automations yet")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Create a task to run an agent session automatically on a recurring schedule.",
+        "Create an automation to run an agent session automatically on a recurring schedule.",
       ),
     ).toBeInTheDocument();
     expect(screen.queryByTestId("tasks-filter-all")).toBeNull();
@@ -260,6 +262,7 @@ describe("filtering + search", () => {
     ]);
     renderPage();
     expect(screen.getAllByTestId("scheduled-task-row")).toHaveLength(2);
+    expect(screen.getByLabelText("Filter automations")).toBeInTheDocument();
     expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
 
     fireEvent.click(screen.getByTestId("tasks-filter-paused"));
@@ -285,11 +288,13 @@ describe("filtering + search", () => {
   });
 });
 
-describe("New task button", () => {
-  it("opens the manual create dialog directly (no dropdown)", () => {
+describe("New automation button", () => {
+  it("reads 'New automation' and opens the manual create dialog directly (no dropdown)", () => {
     setTasks([]);
     renderPage();
-    fireEvent.click(screen.getByTestId("new-task-button"));
+    const button = screen.getByTestId("new-task-button");
+    expect(button).toHaveTextContent("New automation");
+    fireEvent.click(button);
     expect(screen.getByTestId("manual-dialog-open")).toBeInTheDocument();
   });
 
@@ -315,7 +320,7 @@ describe("suggestion prefill", () => {
     expect(dialog.getAttribute("data-initial-prompt")).toContain("Review recent email");
   });
 
-  it("opens EMPTY from the plain 'New task' button (no prefill)", () => {
+  it("opens EMPTY from the plain 'New automation' button (no prefill)", () => {
     setTasks([]);
     renderPage();
     fireEvent.click(screen.getByTestId("new-task-button"));

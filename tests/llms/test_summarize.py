@@ -2,7 +2,34 @@
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.llms.summarize import build_summarization_input
+
+
+@pytest.mark.parametrize("last_role", ["user", "assistant"])
+def test_summarization_renders_notices_without_extra_user_turns(last_role: str) -> None:
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
+    content = [
+        {"type": "input_text", "text": "inspect image"},
+        framework_notice_block(dimensions),
+    ]
+    messages = [{"role": "user", "content": content}]
+    if last_role == "assistant":
+        messages.append({"role": "assistant", "content": "answer"})
+
+    result = build_summarization_input(messages)
+
+    assert result[0] == {
+        "role": "system",
+        "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
+    }
+    assert result[1] == {"role": "user", "content": content[:1]}
+    assert result[-1]["role"] == "user"
+    assert len(result) == (4 if last_role == "assistant" else 2)
+    assert len(content) == 2
 
 
 def test_build_summarization_input_appends_trigger_when_last_role_is_assistant() -> None:

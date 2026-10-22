@@ -7,6 +7,9 @@ description: >-
   after this action returns — the only secret here is the model key.
 
 inputs:
+  model:
+    description: Provider-configured model id.
+    required: true
   workdir:
     description: >-
       Repo checkout dir relative to the workspace (`.` when checked out at the
@@ -34,20 +37,21 @@ inputs:
     description: Model API key (referenced by the provider config, used to scan output).
     required: true
   claude-code-version:
-    description: "@anthropic-ai/claude-code npm version to install."
+    description: "Optional exact Claude Code version override; defaults to the shared harness pin."
     required: false
-    default: 2.1.212
+    default: ""
 
 runs:
   using: composite
   steps:
     - name: Set up uv
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # This action also runs from repositories checked out below the workspace root.
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
       with:
         enable-cache: true
 
     - name: Cache virtualenv
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ inputs.workdir }}/.venv
         key: venv-${{ runner.os }}-${{ hashFiles(format('{0}/.python-version', inputs.workdir)) }}-${{ hashFiles(format('{0}/uv.lock', inputs.workdir)) }}
@@ -55,31 +59,23 @@ runs:
     - name: Install dependencies
       shell: bash
       working-directory: ${{ inputs.workdir }}
-      run: uv sync --extra all --extra dev
+      # Current callers are tools-less prose/JSON agents; repository checks never run.
+      run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      shell: bash
-      env:
-        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
-      run: |
-        set -euo pipefail
-        # Install outside the checked-out tree: a repo-root package.json would
-        # otherwise capture this bare `npm install` and hoist it there, leaving
-        # this dir's node_modules empty.
-        CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-        mkdir -p "$CC_CLI_DIR"
-        cd "$CC_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+      with:
+        harness: claude
+        version: ${{ inputs.claude-code-version }}
 
     - name: Write Omnigent provider config
       shell: bash
       env:
         GATEWAY_BASE_URL: ${{ inputs.gateway-base-url }}
+        OMNIGENT_AGENT_MODEL: ${{ inputs.model }}
       run: |
         set -euo pipefail
+        : "${OMNIGENT_AGENT_MODEL:?Set the action model input}"
         mkdir -p "$HOME/.omnigent"
         python3 -c "
         import pathlib, os, json
@@ -89,7 +85,7 @@ runs:
             'anthropic': {
                 'base_url': gw + '/anthropic',
                 'api_key_ref': 'env:LLM_API_KEY',
-                'models': {'default': 'databricks-claude-opus-4-8'},
+                'models': {'default': os.environ['OMNIGENT_AGENT_MODEL']},
             }}}}
         pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(json.dumps(cfg, indent=2))
         "

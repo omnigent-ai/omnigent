@@ -15,10 +15,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pexpect
 import pytest
 
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec._omnigent_compat import OMNIGENT_HARNESSES
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests._helpers.live_server import isolated_process_env
 from tests.e2e._harness_probes import (
     HARNESS_IDS,
     HARNESS_PROBES,
@@ -30,7 +34,8 @@ from tests.e2e.omnigent._pexpect_harness import (
     spawn_omnigent_run,
     strip_ansi,
 )
-from tests.e2e.omnigent.conftest import configure_mock_llm
+from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
+from tests.e2e.omnigent.test_run_omnigent_resumption import _daemon_log_tails
 
 _PROMPT_TEMPLATE = (
     "Reply with exactly the identifier between <answer> tags, but omit the tags: "
@@ -75,21 +80,33 @@ def test_run_harness_without_agent_live_repl_round_trip(
     marker = f"{probe.marker}_RUN_HARNESS_WITHOUT_AGENT"
     prompt = _PROMPT_TEMPLATE.format(marker=marker)
 
-    # claude-code issues a warmup/title call before the turn that consumes one
-    # queued response, so the turn call needs another; queue a few markers.
-    responses = [{"text": marker}] * (4 if probe.harness == "claude-sdk" else 1)
+    # A background session-title generator races the user turn for this same
+    # keyed queue, so the call count per run is not fixed. The fallback answers
+    # every call with the marker, so whichever wins, the turn still renders it.
     configure_mock_llm(
         mock_llm_server_url,
-        responses,
+        [{"text": marker}],
         key=model,
     )
+    set_fallback_mock_llm(mock_llm_server_url, model, marker)
 
-    # claude-sdk speaks the Anthropic wire, not OPENAI_*. Point it at the mock
-    # and pass a static gateway token via ANTHROPIC_AUTH_TOKEN (Authorization:
-    # Bearer) -- the docs-sanctioned custom-gateway auth. ANTHROPIC_API_KEY
-    # (x-api-key) would trigger claude-code's external-key validation, which
-    # the mock cannot satisfy ("Invalid API key").
-    env = dict(mock_credentials_env)
+    # A fresh HOME alone still inherits the worker's shared config and daemon
+    # registry. Own all three so earlier CLI tests cannot change this startup.
+    home = tmp_path / "home"
+    config_home = home / ".omnigent"
+    config_home.mkdir(parents=True)
+    (config_home / "config.yaml").write_text("auth:\n  type: api_key\n", encoding="utf-8")
+    env = isolated_process_env(
+        home,
+        {
+            "OMNIGENT_CONFIG_HOME": str(config_home),
+            "OMNIGENT_SKIP_ONBOARD": "1",
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+        },
+        base_env=mock_credentials_env,
+    )
+    # Claude uses the Anthropic wire. Gateway bearer auth avoids external-key
+    # validation, which the mock server cannot satisfy.
     if probe.harness == "claude-sdk":
         env["ANTHROPIC_BASE_URL"] = mock_llm_server_url
         env["ANTHROPIC_AUTH_TOKEN"] = "mock-key"
@@ -113,13 +130,23 @@ def test_run_harness_without_agent_live_repl_round_trip(
         # launcher reached the model and rendered the reply.
         child.expect(marker, timeout=_COMPLETION_TIMEOUT)
         output = strip_ansi(child.before or "") + marker
+    except (pexpect.EOF, pexpect.TIMEOUT) as exc:
+        pytest.fail(
+            f"[{probe.harness}] CLI failed before returning {marker!r}: {type(exc).__name__}\n"
+            f"CLI output:\n{strip_ansi(child.before or '')}\n"
+            f"Runtime logs:\n{_daemon_log_tails(home)}"
+        )
     finally:
         # Drive the exit. The one-shot process does not always terminate
         # promptly under CI load (shutdown/teardown lag — parked tasks,
         # session-log write), so clean_exit sends ``/quit`` and force-kills as
         # a fallback rather than blocking on EOF. Teardown cleanliness is not
         # asserted (it is a known CI-load flake; see clean_exit's docstring).
-        clean_exit(child, timeout=_EXIT_TIMEOUT)
+        try:
+            clean_exit(child, timeout=_EXIT_TIMEOUT)
+        finally:
+            _, survivors = reap_leaked_omnigent_processes(config_home)
+            assert not survivors, f"Test runtime processes survived cleanup: {survivors}"
 
     assert marker in output, (
         f"[{probe.harness}] marker {marker!r} missing from REPL output; "
@@ -225,6 +252,20 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``devin-native`` is excluded for the union of both reasons, like
+    ``hermes-native``: it is a terminal-first TUI launched via ``omni devin``
+    (tmux pane + bridge dir), not ``omnigent run --harness devin-native``, AND it
+    wraps the own-auth ``devin`` CLI (``devin auth login`` writes its own
+    credential file), so its spawn env carries no gateway/profile probe vars for
+    this matrix to drive. Its coverage is the dedicated devin-native
+    bridge/forwarder/executor unit tests plus the Devin picker e2e_ui suite.
+
+    Builtin ACP CLI harnesses (every row of ``ACP_CLI_HARNESSES``) are excluded
+    for the same reason as ``goose``: each wraps an own-auth vendor CLI, so its
+    spawn env carries no gateway/profile probe vars for this matrix to drive.
+    Their shared wiring is covered by ``tests/test_acp_cli_harnesses.py`` and
+    the ``tests/inner/test_acp_executor.py`` suite.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "acp",
@@ -246,5 +287,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "kimi-native",
         "hermes",
         "hermes-native",
+        "devin-native",
+        *ACP_CLI_HARNESSES,
     }
     assert {probe.harness for probe in HARNESS_PROBES} == expected_live_harnesses

@@ -13,6 +13,20 @@ Omnigent identity against it.
 
 ## Setup
 
+**The quick path — create the app from the manifest.** At
+[api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From
+an app manifest** → pick the workspace → paste
+[`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml). That sets
+Socket Mode, Interactivity, the default scopes and events below, and the
+`/omnigent` command in one step. For Databricks web-auth, uncomment
+`users:read` and `users:read.email` in the manifest before pasting it. A
+manifest cannot mint tokens, so finish with the two steps from the manifest
+header — generate a `connections:write` app-level token (**Basic Information →
+App-Level Tokens**) and **Install to Workspace** for the bot token — then
+continue from step 5.
+
+Doing it by hand instead:
+
 1. Create a Slack app with Socket Mode **and** Interactivity enabled (Socket
   Mode delivers the interactive button/modal payloads — no request URL needed).
 2. Add the OAuth scopes and event subscriptions listed under **Required scopes**
@@ -30,7 +44,9 @@ Omnigent identity against it.
 
 ## Required scopes
 
-The bot uses two tokens, each carrying different scopes.
+The bot uses two tokens, each carrying different scopes. These are mirrored in
+[`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml) — change both
+together.
 
 ### Bot token scopes (`OMNIGENT_SLACK_BOT_TOKEN`, `xoxb-…`)
 
@@ -96,8 +112,8 @@ while it's already up is a no-op that reports the existing process.
 ### Configuration
 
 All configuration (the two Slack tokens, `OMNIGENT_SERVER_URL`, and the
-optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`)
-comes from **real environment variables** — the bot does **not** read a `.env`
+optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`
+/ the setup defaults below) comes from **real environment variables** — the bot does **not** read a `.env`
 file itself. For local dev, either export the vars, or launch under a tool that
 injects a `.env` — e.g. `uv run --env-file .env omni integration slack`, or
 `export $(grep -v '^#' .env | xargs)` before running. In production the
@@ -138,9 +154,59 @@ URL to enter):
 The choice is saved per `(Slack workspace, user)`. After that, mentioning the
 bot (or DMing it) starts a session on the configured server.
 
+### Operator-set setup defaults (optional)
+
+A team standardized on one agent — or on the managed sandbox — can pre-select
+step 2's choices for everyone, so a new user submits the modal instead of
+making two decisions they have no opinion on:
+
+| Variable | Effect |
+| --- | --- |
+| `OMNIGENT_SLACK_DEFAULT_AGENT_ID` | Opens the **Agent** menu on this agent id. |
+| `OMNIGENT_SLACK_DEFAULT_HOST_TYPE` | Only `managed` — opens the **Host** menu on the server-provisioned sandbox. |
+
+Either variable may be left unset or blank for no default; any other non-blank
+value for `OMNIGENT_SLACK_DEFAULT_HOST_TYPE` fails at startup.
+
+Set them in the bot's environment like every other variable (see
+**Configuration** above); `.env.example` carries the same notes.
+
+Both are pre-selections, nothing more. The modal still opens, still shows the
+full menus, and still has to be submitted — either choice can be changed, and
+what the user submits is what is saved.
+
+Availability is checked per user, each time the modal is rendered, against the
+agents and hosts that user's own login can see. A default that isn't on offer
+— an agent id missing from their menu, or `managed` on a server that provisions
+no sandbox — leaves **that** menu blank and says so in the modal. A different
+agent or host is never substituted, and a valid default in the other menu is
+still applied.
+
+The modal distinguishes what it actually established from what it could not
+check. A server that can't be reached is a login/retry failure as before, not
+an "unavailable default"; a capability probe that fails says the check didn't
+complete, not that the server provisions no sandboxes; and an agent past the
+menu's 100-option cap is reported as missing from the menu, not from the
+server.
+
+There is deliberately **no** default for a specific external host id. On an
+authenticated server `/v1/hosts` is owner-scoped, so one user's host is not
+listed for anyone else and could not be pre-selected in a menu that never
+lists it. Servers with authentication disabled share the reserved `local`
+owner across callers and are unsupported by this integration.
+
 ## Authentication
 
-For Omnigent servers with authentication enabled, each Slack user logs in with
+The Slack integration supports accounts, OIDC, and Databricks Apps deployments
+with per-user delegated credentials. For Databricks Apps, set
+`OMNIGENT_SLACK_SERVER_AUTH=databricks` and use the delegated-token setup below.
+Anonymous servers and ordinary header/proxy deployments without delegated-token
+enrollment are unsupported: user operations require an individual delegated
+token even if the target server would accept them without one. Before upgrading
+an unsupported deployment, configure a supported authentication flow, then have
+each Slack user complete `/omnigent` setup again.
+Accounts deployments must also enable the device grant described below.
+Each Slack user logs in with
 their own Omnigent identity — no Omnigent credential ever passes through Slack.
 Login happens inside the single `/omnigent` configuration modal, not a separate
 command.
@@ -161,11 +227,14 @@ otherwise the `/oauth/*` routes are absent and accounts-mode login can't
 complete. If the server sets `OMNIGENT_DEVICE_CLIENT_SECRET`, set the same
 value as the bot's `OMNIGENT_DEVICE_CLIENT_SECRET` so only this authorized
 socket server can drive the device flow.
-- `oidc` **mode** → the server's **cli-login ticket flow** (`/auth/cli-login` +
-`/auth/cli-poll`). The modal shows a login link; the user signs in at *your
-IdP* in their browser. The server hands back its session JWT — the same token
-a browser session gets. There is **no device grant and no refresh token**: the
-session lasts its normal TTL (default 8h), after which the user logs in again.
+- `oidc` **mode** → the server's **PKCE-bound cli-login ticket flow**
+(`/auth/cli-login` + `/auth/cli-poll`). The modal shows a login link and
+confirmation code; the user signs in at *your IdP* in their browser, then
+explicitly approves the request on the server's consent page (checking the
+code matches). The server hands back its session JWT — the same
+token a browser session gets. There is **no device grant and no refresh token**:
+the session lasts its normal TTL (default 8h), after which the user logs in
+again.
 - `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
 header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
 per-user login the auto-detect flow can drive. Two options:
@@ -173,8 +242,8 @@ per-user login the auto-detect flow can drive. Two options:
     `OMNIGENT_SLACK_SERVER_AUTH=databricks` and the bot enrolls each user
     through a web page it serves as its own Databricks App — see
     [Databricks Apps web-auth](#databricks-apps-web-auth) below.
-  - Otherwise run the server in `accounts`/`oidc` mode, or place the bot behind
-    the same identity proxy.
+  - Otherwise run the server in `accounts`/`oidc` mode. A shared identity proxy
+    alone does not provide the individual delegated credentials this bot needs.
 
 Either way the flow is the same from Slack's side:
 
@@ -293,11 +362,11 @@ This integration is a **separate package** (`omnigent-slack`) with heavy deps
 (slack_bolt, aiohttp) kept out of the core `omnigent` install. It resolves as an
 editable path dep of the root `omnigent` package via the `slack` extra (see
 `[tool.uv.sources]` in the root `pyproject.toml`), and shares the root's dev
-tooling (ruff, mypy, pytest) and config rather than carrying its own. Work on it
+tooling (Ruff, Pyrefly, pytest) and config rather than carrying its own. Work on it
 from the repo-root env:
 
 ```bash
-# From the repo root — add the slack extra to your existing extras:
-uv sync --extra slack       # e.g. --extra all --extra dev --extra slack
-uv run omni integration slack
+# From the repo root — install the Slack capability and contributor tooling:
+uv sync --extra slack --group dev
+uv run --no-sync omni integration slack
 ```

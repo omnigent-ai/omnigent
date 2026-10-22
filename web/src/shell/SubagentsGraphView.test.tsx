@@ -1,3 +1,5 @@
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +33,7 @@ vi.mock("./SubagentsGraphView", () => ({
 }));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/useChildSessions")>()),
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
 }));
 
@@ -65,6 +67,7 @@ const useSessionMock = vi.mocked(useSession);
 function childInfo(overrides: Partial<ChildSessionInfo> & { id: string }): ChildSessionInfo {
   return {
     title: null,
+    task_summary: null,
     tool: null,
     session_name: null,
     current_task_status: null,
@@ -83,7 +86,7 @@ function mockChildTree(tree: Record<string, ChildSessionInfo[]>) {
   }));
 }
 
-function defaultSession() {
+function defaultSession(): ReturnType<typeof useSession> {
   return {
     session: {
       id: "conv_root",
@@ -99,6 +102,7 @@ function defaultSession() {
       permissionLevel: 4,
       parentSessionId: null,
       subAgentName: null,
+      kind: "default",
     },
     isLoading: false,
     error: null,
@@ -135,7 +139,7 @@ function leaf(id: string, overrides: Partial<TreeNode> = {}): TreeNode {
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
-  useSessionMock.mockReturnValue(defaultSession() as ReturnType<typeof useSession>);
+  useSessionMock.mockReturnValue(defaultSession());
 });
 
 afterEach(cleanup);
@@ -246,7 +250,7 @@ describe("activityDotClassName (shared list/graph palette)", () => {
   // color the dot from the same ``activityDotClassName``, so the rendered dot
   // is identical in both views.
   it("classifies list and graph identically for each status", () => {
-    const cases: Array<{ child: ChildSessionInfo; expected: string }> = [
+    const cases: { child: ChildSessionInfo; expected: string }[] = [
       {
         child: childInfo({ id: "launching", current_task_status: "launching" }),
         expected: "bg-session-active/70",
@@ -556,6 +560,52 @@ describe("buildTree", () => {
     expect(tree.children[1].label).toBe("titled");
     expect(tree.children[2].label).toBe("tooled");
     expect(tree.children[3].label).toBe("c4");
+  });
+
+  it("prefers the server-resolved tool label over session_name for native sub-agent children", () => {
+    const map = new Map<string, ChildSessionInfo[]>();
+    map.set("root", [
+      // Claude Task child: session_name is the opaque correlation id; the
+      // server resolves the Task description into `tool`, which must win.
+      childInfo({
+        id: "c1",
+        title: "rpw-published:debug-lead:a09d1dd1d8dbc0151",
+        session_name: "a09d1dd1d8dbc0151",
+        tool: "Investigate flaky auth test",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+      // Same wrapper without a resolved `tool`: falls back to title, not
+      // the opaque session_name.
+      childInfo({
+        id: "c2",
+        title: "general-purpose:b7c2e9f4a1d3c5e60",
+        session_name: "b7c2e9f4a1d3c5e60",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+      // Codex native sub-agent children take the same path.
+      childInfo({
+        id: "c3",
+        title: "worker:thread-4",
+        session_name: "thread-4",
+        tool: "Summarize release notes",
+        labels: { "omnigent.wrapper": "codex-native-ui-subagent" },
+      }),
+      // User-added rows keep the generic label path.
+      childInfo({
+        id: "c4",
+        title: "ui:claude:my-agent",
+        session_name: "my-agent",
+        tool: "should-not-win",
+        labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      }),
+    ]);
+
+    const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
+
+    expect(tree.children[0].label).toBe("Investigate flaky auth test");
+    expect(tree.children[1].label).toBe("general-purpose:b7c2e9f4a1d3c5e60");
+    expect(tree.children[2].label).toBe("Summarize release notes");
+    expect(tree.children[3].label).toBe("my-agent");
   });
 
   it("passes through last_message_preview", () => {

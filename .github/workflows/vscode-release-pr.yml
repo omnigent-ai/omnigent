@@ -57,7 +57,7 @@ jobs:
 
       # Full history + tags so we can find the previous vscode-v* tag and
       # harvest the PRs merged since it.
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -170,11 +170,16 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          DRAFTER_MODEL: ${{ vars.OMNIGENT_CI_FAST_ANTHROPIC_MODEL }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           if [ -z "${LLM_API_KEY:-}" ] || [ -z "${GATEWAY_BASE_URL:-}" ]; then
             echo "::warning::No LLM credentials — keeping the CHANGELOG placeholder."
+            exit 0
+          fi
+          if [ -z "${DRAFTER_MODEL:-}" ]; then
+            echo "::warning::Repository variable OMNIGENT_CI_FAST_ANTHROPIC_MODEL is empty — keeping the CHANGELOG placeholder."
             exit 0
           fi
           echo "::add-mask::${LLM_API_KEY}"
@@ -204,7 +209,7 @@ jobs:
 
           url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
           payload = json.dumps({
-              "model": "databricks-claude-sonnet-4-6",
+              "model": os.environ["DRAFTER_MODEL"],
               "max_tokens": 1024,
               "temperature": 0,
               "messages": [

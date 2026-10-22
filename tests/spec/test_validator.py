@@ -90,6 +90,37 @@ def test_llm_arbitrary_extra_passes_validation() -> None:
     assert result.valid
 
 
+def test_reasoning_effort_invalid_value_rejected() -> None:
+    """An unknown ``executor.reasoning_effort`` fails validation up front.
+
+    A spec that validates must never be rejected later at session create, so an
+    out-of-vocabulary value is caught here rather than when a session is made.
+    """
+    spec = _minimal_spec(
+        executor=ExecutorSpec(
+            config={"harness": "claude-sdk"},
+            model="openai/gpt-5.4",
+            reasoning_effort="hihg",
+        ),
+    )
+    result = validate(spec)
+    assert not result.valid
+    assert any("executor.reasoning_effort" in e.path for e in result.errors)
+
+
+def test_reasoning_effort_valid_value_ok() -> None:
+    """A known ``executor.reasoning_effort`` validates cleanly."""
+    spec = _minimal_spec(
+        executor=ExecutorSpec(
+            config={"harness": "claude-sdk"},
+            model="openai/gpt-5.4",
+            reasoning_effort="high",
+        ),
+    )
+    result = validate(spec)
+    assert result.valid
+
+
 def test_valid_input_modalities() -> None:
     spec = _minimal_spec(
         interaction=InteractionConfig(
