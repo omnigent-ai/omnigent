@@ -88,6 +88,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
+from omnigent.server.event_loop_watchdog import monitor_event_loop
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -1852,7 +1853,8 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         try:
-            yield
+            with monitor_event_loop():
+                yield
         finally:
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()

@@ -558,7 +558,7 @@ def debug_event(
 def _stack_trace(record: logging.LogRecord) -> str | None:
     if record.exc_info:
         return "".join(traceback.format_exception(*record.exc_info))
-    return record.exc_text or None
+    return record.exc_text or getattr(record, "captured_stack_trace", None)
 
 
 def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:

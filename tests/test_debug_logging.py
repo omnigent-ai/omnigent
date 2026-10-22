@@ -358,7 +358,8 @@ def test_record_to_row_shape_and_coercions() -> None:
     }
 
 
-def test_record_to_row_redacts_token_like_text_fields() -> None:
+@pytest.mark.parametrize("captured_stack", [False, True])
+def test_record_to_row_redacts_token_like_text_fields(captured_stack: bool) -> None:
     secret = "aB3" + "xY7" * 12
     try:
         raise ValueError(f"credential={secret}")
@@ -376,6 +377,9 @@ def test_record_to_row_redacts_token_like_text_fields() -> None:
             func="do_it",
         )
     record.attributes = {"upstream_response": secret, "attempt": 3}
+    if captured_stack:
+        record.exc_info = None
+        record.captured_stack_trace = f'File "{secret}.py", line 1, in blocking_call'
 
     row = dl.record_to_row(record, source="runner")
 
