@@ -46,6 +46,7 @@ from omnigent_client._http import is_loopback_url
 from omnigent_client._sessions import Session as SessionSnapshot
 from rich.console import Console
 
+from omnigent._runner_startup import runner_startup_progress
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
@@ -76,6 +77,7 @@ from omnigent.process_logging import (
     open_process_log_file,
     process_log_dir_reference,
 )
+from omnigent.remote_launch import REMOTE_LAUNCH_MESSAGE
 from omnigent.session_host import get_session_host, route_session_request, set_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
@@ -714,9 +716,15 @@ def _remote_headers(
     # source per branch), then merge the workspace-routing header.
     headers: dict[str, str] = {}
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
+    from omnigent.util.proxy_bearer import read_proxy_bearer
+
     if token and (token := token.strip()):
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
+    elif server_url and (proxy_bearer := read_proxy_bearer(server_url)):
+        # 1b. A managed sandbox host behind an authenticating front door: the
+        # launcher-refreshed proxy bearer (see omnigent.util.proxy_bearer).
+        headers["Authorization"] = f"Bearer {proxy_bearer}"
     elif server_url:
         from omnigent.cli_auth import load_token
 
@@ -799,9 +807,8 @@ class _DatabricksTokenAuth(httpx.Auth):
         """
         :param server_url: Remote server URL for looking up stored
             OIDC tokens, e.g. ``"http://localhost:6767"``.
-        :param session_id: The single session this client drives; its
-            requests are pinned to that session's host replica. ``None``
-            for a hostless / local client.
+        :param session_id: Session whose traffic is pinned to its host replica.
+            Discovery requests use the default workspace routing.
         """
         self._server_url = server_url
         self._session_id = session_id
@@ -856,16 +863,15 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
-        # Workspace routing (empty when none recorded); independent of the
-        # credential branch below. On a host-sharded deployment, also pin the
-        # turn/resource/stream traffic for this client's session to the replica
-        # holding its runner tunnel — the slice key is the session's host_id,
-        # from the session→host map. An unsharded server has no sharding layer,
-        # so no key.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
-            session_host = get_session_host(self._session_id) if self._session_id else None
+            session_path = f"{httpx.URL(self._server_url).path.rstrip('/')}/v1/sessions/"
+            session_host = (
+                get_session_host(self._session_id)
+                if self._session_id and request.url.path.startswith(session_path)
+                else None
+            )
             request.headers.update(
                 databricks_request_headers(
                     self._server_url,
@@ -1914,7 +1920,7 @@ def _stop_headless_session(*, base_url: str, session_id: str) -> None:
     # Teardown must never turn a completed run into a failed one.
     try:
         _stop_session_on_server(base_url=base_url, session_id=session_id)
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -2597,11 +2603,12 @@ async def _query_sessions_once(
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
     if launch_host_id is not None and agent is not None:
         # The server launches and binds the host's runner itself.
-        bound = await client.sessions.create_from_agent_id(
-            agent.id,
-            workspace=os.getcwd(),
-            host_id=launch_host_id,
-        )
+        with runner_startup_progress(initial_message=REMOTE_LAUNCH_MESSAGE):
+            bound = await client.sessions.create_from_agent_id(
+                agent.id,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
         set_session_host(bound.id, launch_host_id)
     elif runner_id is None:
         raise RuntimeError(
@@ -2650,7 +2657,7 @@ async def _stop_launched_session(client: OmnigentClient, session_id: str) -> Non
     # Teardown must never turn a completed run into a failed one.
     try:
         await client.sessions.post_event(session_id, {"type": "stop_session", "data": {}})
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -2842,7 +2849,7 @@ async def _run_bound_turn(
     try:
         async with asyncio.timeout(_LOOP_TIMEOUT_S):
             await _drain_extra_turns()
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "headless -p timed out after %.0fs waiting for session %s to complete",
             _LOOP_TIMEOUT_S,
@@ -3324,6 +3331,15 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
+        if source.is_file() and isinstance(raw.get("instructions"), str):
+            from omnigent.inner.loader import _resolve_instructions
+
+            instructions = _resolve_instructions(raw["instructions"], source.parent)
+            if instructions is not None and instructions != raw["instructions"]:
+                # A newline marks one-line file contents as inline text on reload.
+                if instructions and "\n" not in instructions:
+                    instructions += "\n"
+                raw["instructions"] = instructions
         _apply_overrides_to_raw(raw, overrides)
         target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent

@@ -16,6 +16,16 @@
 //                                  the labels the selected PR's repository offers.
 //   useUpdatePullRequestLabels   — POST /resources/github/labels
 //                                  add / remove labels on the selected PR.
+//   usePullRequestMergeOptions   — GET /resources/github/merge-options
+//                                  the merge methods the selected PR's repository allows.
+//   useMergePullRequest          — POST /resources/github/merge
+//                                  merge the selected PR at the head the panel showed.
+//   useDisablePullRequestAutoMerge — POST /resources/github/disable-auto-merge
+//                                  turn off the selected PR's auto-merge.
+//   usePullRequestReviewCandidates — GET /resources/github/reviewers
+//                                  the users and teams a review can be requested from.
+//   useUpdatePullRequestReviewers — POST /resources/github/reviewers
+//                                  request reviews / withdraw pending requests.
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
@@ -38,7 +48,7 @@ import {
 /** One CI check the PR ran, bucketed for the checks summary. */
 export interface PullRequestCheckRun {
   name: string;
-  bucket: "passing" | "failing" | "pending";
+  bucket: "passing" | "failing" | "pending" | "cancelled" | "skipped";
   /** Link to the run on the provider or external CI, or null when unknown. */
   url: string | null;
 }
@@ -47,6 +57,9 @@ export interface PullRequestChecks {
   passing: number;
   failing: number;
   pending: number;
+  /** Absent on older hosts. */
+  cancelled?: number;
+  skipped?: number;
   total: number;
   /** Per-check details (job names) for the hover breakdown. */
   runs: PullRequestCheckRun[];
@@ -87,6 +100,16 @@ export interface PullRequestLabel {
   description: string | null;
 }
 
+/** A `gh pr merge` method. */
+export type PullRequestMergeMethod = "merge" | "squash" | "rebase";
+
+/** Auto-merge enabled on a PR; the method is GitHub's upper-case name, e.g. "SQUASH". */
+export interface PullRequestAutoMerge {
+  merge_method: string | null;
+  enabled_by: string | null;
+  enabled_at: string | null;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -116,6 +139,11 @@ export interface PullRequest {
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */
   labels?: PullRequestLabel[];
+  /** GitHub's `mergeStateStatus`, e.g. "CLEAN" or "BLOCKED"; null when unreported.
+   *  Absent from older hosts and providers that don't report it. */
+  merge_state_status?: string | null;
+  /** Null when auto-merge is off; absent when the host can't report it. */
+  auto_merge?: PullRequestAutoMerge | null;
 }
 
 export interface PullRequestRepo {
@@ -153,6 +181,10 @@ export interface PullRequestCapabilities {
   linked_pr_diff: boolean;
   /** The PR's labels can be added and removed; absent from older hosts. */
   label_editing?: boolean;
+  /** The PR can be merged from the panel; absent from older hosts. */
+  merging?: boolean;
+  /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
+  reviewer_editing?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -661,20 +693,34 @@ export interface PullRequestRepoLabels {
   has_more: boolean;
 }
 
+/** GET or POST one of the selected PR's editable resources, e.g. `labels`. */
+async function fetchPullRequestEditResource<T>(
+  conversationId: string,
+  resource: "labels" | "reviewers" | "merge-options" | "merge" | "disable-auto-merge",
+  request: { prUrl: string } | { body: unknown },
+): Promise<T> {
+  const path = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}`;
+  const response =
+    "prUrl" in request
+      ? await authenticatedFetch(`${path}${prQuery(request.prUrl)}`)
+      : await authenticatedFetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request.body),
+        });
+  if (response.status === 503 && (await isRunnerUnavailable503(response))) {
+    throw new RunnerOfflineError();
+  }
+  if (!response.ok) throw await errorFromResponse(response);
+  return (await response.json()) as T;
+}
+
 /** The labels the selected PR's repository offers, for the label picker. */
 export function usePullRequestRepoLabels(conversationId: string, prUrl: string, enabled: boolean) {
   return useQuery({
     queryKey: ["github-labels", conversationId, prUrl],
-    queryFn: async (): Promise<PullRequestRepoLabels> => {
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/labels${prQuery(prUrl)}`,
-      );
-      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
-        throw new RunnerOfflineError();
-      }
-      if (!response.ok) throw await errorFromResponse(response);
-      return (await response.json()) as PullRequestRepoLabels;
-    },
+    queryFn: () =>
+      fetchPullRequestEditResource<PullRequestRepoLabels>(conversationId, "labels", { prUrl }),
     enabled,
     retry: false,
     // A repository's label set rarely changes while the picker is in use.
@@ -717,31 +763,207 @@ export function useUpdatePullRequestLabels(conversationId: string) {
     mutationKey: pullRequestLabelsMutationKey(conversationId),
     // One edit at a time, in click order, so GitHub and the cache end in the last state shown.
     scope: { id: `github-labels-${conversationId}` },
-    mutationFn: async (change: PullRequestLabelChange) => {
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/labels`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            pr_url: change.prUrl,
-            add: change.add.map((label) => label.name),
-            remove: change.remove.map((label) => label.name),
-          }),
+    mutationFn: (change: PullRequestLabelChange) =>
+      fetchPullRequestEditResource<{ labels: PullRequestLabel[] }>(conversationId, "labels", {
+        body: {
+          pr_url: change.prUrl,
+          add: change.add.map((label) => label.name),
+          remove: change.remove.map((label) => label.name),
         },
-      );
-      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
-        throw new RunnerOfflineError();
-      }
-      if (!response.ok) throw await errorFromResponse(response);
-      return (await response.json()) as { labels: PullRequestLabel[] };
-    },
+      }),
     onSuccess: async ({ labels }, change) => {
       // A poll that started before the edit landed would bring the old labels back.
       await queryClient.cancelQueries({ queryKey: infoKey });
       queryClient.setQueriesData<NormalizedPullRequestInfo>({ queryKey: infoKey }, (info) =>
         info?.pr && info.selected_pr_url === change.prUrl
           ? { ...info, pr: { ...info.pr, labels } }
+          : info,
+      );
+    },
+    onError: () => queryClient.invalidateQueries({ queryKey: infoKey }),
+  });
+}
+
+export interface PullRequestMergeOptions {
+  object: "session.github.merge_options";
+  /** The methods the repository allows, in display order. */
+  methods: PullRequestMergeMethod[];
+  /** The method to preselect; null when the repository allows none. */
+  default: PullRequestMergeMethod | null;
+}
+
+/** The merge methods the selected PR's repository allows, for the Merge button and dialog. */
+export function usePullRequestMergeOptions(
+  conversationId: string,
+  prUrl: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["github-merge-options", conversationId, prUrl],
+    queryFn: () =>
+      fetchPullRequestEditResource<PullRequestMergeOptions>(conversationId, "merge-options", {
+        prUrl,
+      }),
+    enabled,
+    retry: false,
+    // A repository's merge settings rarely change while the panel is open.
+    staleTime: 5 * 60_000,
+  });
+}
+
+interface PullRequestMergeResult {
+  object: "session.github.pr_merge";
+  pr_url: string;
+}
+
+export interface PullRequestMergeRequest {
+  prUrl: string;
+  mergeMethod: PullRequestMergeMethod;
+  /** The head commit the panel showed; GitHub refuses the merge if the branch moved. */
+  expectedHead: string;
+}
+
+/**
+ * Merge the selected PR through the runner or host fallback. A merge can't be
+ * undone, so nothing shows it as merged until the refetched info says so.
+ */
+export function useMergePullRequest(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["github-merge", conversationId],
+    scope: { id: `github-merge-${conversationId}` },
+    mutationFn: (request: PullRequestMergeRequest) =>
+      fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "merge", {
+        body: {
+          pr_url: request.prUrl,
+          merge_method: request.mergeMethod,
+          expected_head: request.expectedHead,
+        },
+      }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
+  });
+}
+
+/** Turn off the selected PR's auto-merge; the refetched info shows the result. */
+export function useDisablePullRequestAutoMerge(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: ["github-disable-auto-merge", conversationId],
+    mutationFn: (prUrl: string) =>
+      fetchPullRequestEditResource<PullRequestMergeResult>(conversationId, "disable-auto-merge", {
+        body: { pr_url: prUrl },
+      }),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] }),
+  });
+}
+
+/** A user or team a review can be requested from. */
+export interface PullRequestReviewCandidate {
+  /** A user's login or a team's slug. */
+  login: string;
+  kind: "user" | "team";
+  /** Display name, or null when the provider has none. */
+  name: string | null;
+}
+
+export interface PullRequestReviewCandidates {
+  object: "list";
+  /** Users, then teams, each sorted by login. */
+  data: PullRequestReviewCandidate[];
+  /** The repository has more candidates than the host lists. */
+  has_more: boolean;
+}
+
+/** The users and teams a review of the selected PR can be requested from. */
+export function usePullRequestReviewCandidates(
+  conversationId: string,
+  prUrl: string,
+  enabled: boolean,
+) {
+  return useQuery({
+    queryKey: ["github-reviewers", conversationId, prUrl],
+    queryFn: () =>
+      fetchPullRequestEditResource<PullRequestReviewCandidates>(conversationId, "reviewers", {
+        prUrl,
+      }),
+    enabled,
+    retry: false,
+    // Repository collaborators rarely change while the picker is in use.
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** Who a review is requested from or withdrawn for. */
+export type PullRequestReviewerTarget = Pick<PullRequestReviewer, "login" | "kind">;
+
+/** One reviewer edit: request reviews from `add`, withdraw the requests of `remove`. */
+export interface PullRequestReviewerChange {
+  prUrl: string;
+  add: PullRequestReviewerTarget[];
+  remove: PullRequestReviewerTarget[];
+}
+
+/** Mutation key of {@link useUpdatePullRequestReviewers}, for reading pending edits. */
+export function pullRequestReviewersMutationKey(conversationId: string) {
+  return ["github-reviewers-update", conversationId] as const;
+}
+
+/** Identity of a reviewer; GitHub logins and team slugs are case-insensitive. */
+export function pullRequestReviewerKey(reviewer: PullRequestReviewerTarget): string {
+  return `${reviewer.kind}:${reviewer.login.toLowerCase()}`;
+}
+
+/** Apply a reviewer edit as the provider will: requested reviewers become pending. */
+export function applyPullRequestReviewerChange(
+  reviewers: readonly PullRequestReviewer[],
+  change: Pick<PullRequestReviewerChange, "add" | "remove">,
+): PullRequestReviewer[] {
+  const removed = new Set(change.remove.map(pullRequestReviewerKey));
+  const added = new Map(change.add.map((target) => [pullRequestReviewerKey(target), target]));
+  const kept = reviewers
+    .filter((reviewer) => !removed.has(pullRequestReviewerKey(reviewer)))
+    .map((reviewer) =>
+      added.has(pullRequestReviewerKey(reviewer))
+        ? { ...reviewer, state: "PENDING" as const }
+        : reviewer,
+    );
+  const present = new Set(kept.map(pullRequestReviewerKey));
+  const appended = [...added]
+    .filter(([key]) => !present.has(key))
+    .map(([, target]) => ({ ...target, state: "PENDING" as const }));
+  return [...kept, ...appended];
+}
+
+/**
+ * Request and withdraw reviews on the selected PR through the runner or host
+ * fallback. Like {@link useUpdatePullRequestLabels}, edits run one at a time; a
+ * success writes the PR's resulting reviewers into the info cache, and a failure
+ * refetches it.
+ */
+export function useUpdatePullRequestReviewers(conversationId: string) {
+  const queryClient = useQueryClient();
+  const infoKey = ["github-info", conversationId];
+  return useMutation({
+    mutationKey: pullRequestReviewersMutationKey(conversationId),
+    scope: { id: `github-reviewers-${conversationId}` },
+    mutationFn: (change: PullRequestReviewerChange) =>
+      fetchPullRequestEditResource<{ reviewers: PullRequestReviewer[] }>(
+        conversationId,
+        "reviewers",
+        {
+          body: {
+            pr_url: change.prUrl,
+            add: change.add.map(({ login, kind }) => ({ login, kind })),
+            remove: change.remove.map(({ login, kind }) => ({ login, kind })),
+          },
+        },
+      ),
+    onSuccess: async ({ reviewers }, change) => {
+      // A poll that started before the edit landed would bring the old reviewers back.
+      await queryClient.cancelQueries({ queryKey: infoKey });
+      queryClient.setQueriesData<NormalizedPullRequestInfo>({ queryKey: infoKey }, (info) =>
+        info?.pr && info.selected_pr_url === change.prUrl
+          ? { ...info, pr: { ...info.pr, reviewers } }
           : info,
       );
     },

@@ -692,6 +692,7 @@ def test_run_launches_a_runner_on_this_machines_host(
 
                 if interactive:
                     pexpect = pytest.importorskip("pexpect")
+                    pyte = pytest.importorskip("pyte")
                     config = host.home / ".omnigent" / "config.yaml"
                     config.write_text(
                         config.read_text()
@@ -723,6 +724,7 @@ def test_run_launches_a_runner_on_this_machines_host(
                         try:
                             child.expect(r"Ctrl.C exit")
                             child.send("hi\r")
+                            child.expect_exact("Waiting for this machine to start your agent...")
                             child.expect(marker)
                             poll_until(
                                 lambda: any(
@@ -739,6 +741,11 @@ def test_run_launches_a_runner_on_this_machines_host(
                             assert child.exitstatus == 0
                         finally:
                             child.close(force=True)
+                    screen = pyte.Screen(120, 40)
+                    pyte.Stream(screen).feed((tmp_path / "repl.log").read_bytes().decode("utf-8"))
+                    visible = "\n".join(screen.display)
+                    assert marker in visible
+                    assert "Waiting for this machine" not in visible
                 else:
                     proc = _run_cli(
                         host.home,
@@ -754,6 +761,8 @@ def test_run_launches_a_runner_on_this_machines_host(
                     output = proc.stdout + proc.stderr
                     assert proc.returncode == 0, output + host.log_path.read_text()
                     assert marker in proc.stdout, output
+                    assert "Waiting for this machine to start your agent..." in proc.stderr
+                    assert "Waiting for this machine" not in proc.stdout
 
                 sessions = client.get(
                     "/v1/sessions", params={"visibility": "all", "limit": 10}

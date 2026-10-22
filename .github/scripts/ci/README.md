@@ -37,7 +37,22 @@ accepts an explicitly skipped result. Older workflows without selection jobs
 can finish their original checks. Check-run IDs order retries, so a queued
 retry cannot be hidden by an older success with a completion timestamp.
 
-Dependabot also requires successful consumer jobs and completed workflows.
+For automatic Dependabot updates, Maintainer Approval checks policy eligibility
+without waiting for CI. Merge Ready validates the security scan, advisory
+inventory, successful consumer jobs and completed workflows for the current
+head and main. The scheduled worker repeats those evidence checks before merging.
+Human approval retains the existing manual path; required CI still applies.
+
+Granting an automatic exemption first resets Merge Ready to pending so results
+from the older gate logic cannot authorize a merge. Concurrent evaluations use
+the dependency evidence validator. Approval completion refreshes that
+status, as do scan/test completions and hold/waiver label changes. The worker
+can refresh approval and dispatch Merge Ready after cooldown expiry or registry
+recovery, with at most three dispatches per PR head in 24 hours and no duplicate
+dispatch while a refresh is running. Neither gate waits for the other's success.
+In report mode, only the separate approval check requires a human review;
+Merge Ready retains its ordinary CI behavior. Human approval can also pass
+when the dependency parser is unavailable.
 
 To inspect the current selected browser cases without starting a server:
 

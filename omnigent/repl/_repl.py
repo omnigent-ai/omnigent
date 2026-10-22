@@ -18,6 +18,7 @@ import sys
 import tempfile
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
+from datetime import UTC
 from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
 
 from omnigent_client import (
@@ -50,6 +51,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
+from omnigent_ui_sdk.terminal import StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -72,7 +74,11 @@ from rich.text import Text
 from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.remote_launch import no_online_runner_message, resolve_remote_launch_host
+from omnigent.remote_launch import (
+    REMOTE_LAUNCH_MESSAGE,
+    no_online_runner_message,
+    resolve_remote_launch_host,
+)
 from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
@@ -1792,12 +1798,19 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
-        session = await self._client.sessions.create_from_agent_id(
-            agent.id,
-            reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
-            host_id=launch_host_id,
-        )
+        progress_host = self._host if launch_host_id is not None else None
+        if progress_host is not None:
+            progress_host.output(StreamLive(Text(REMOTE_LAUNCH_MESSAGE)))
+        try:
+            session = await self._client.sessions.create_from_agent_id(
+                agent.id,
+                reasoning_effort=self._reasoning_effort,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
+        finally:
+            if progress_host is not None:
+                progress_host.clear_streamed_text()
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
         if launch_host_id is not None:
@@ -2422,7 +2435,7 @@ class _SessionsChatReplAdapter:
                         self._turn_done.wait(),
                         timeout=1.0,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     snap = await self._client.sessions.get(session_id)
                     if snap.status in ("idle", "failed"):
                         self._turn_done.set()
@@ -2502,7 +2515,7 @@ class _SessionsChatReplAdapter:
                         self._turn_done.wait(),
                         timeout=1.0,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     snap = await self._client.sessions.get(session_id)
                     if snap.status in ("idle", "failed"):
                         self._turn_done.set()
@@ -5526,7 +5539,7 @@ async def _cmd_switch(
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from rich.table import Table
     from rich.text import Text
@@ -5546,7 +5559,7 @@ async def _cmd_switch(
             table.add_column("Created", style="dim")
             for i, s in enumerate(sessions_list, 1):
                 when = (
-                    datetime.fromtimestamp(s.created_at, tz=timezone.utc)
+                    datetime.fromtimestamp(s.created_at, tz=UTC)
                     .astimezone()
                     .strftime("%b %d %H:%M")
                 )
@@ -6321,7 +6334,7 @@ def _build_github_issue_url(
     from urllib.parse import quote
 
     session_line = f"`{session_id}`" if session_id else "not started"
-    timestamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     what_happened = description if description else "<!-- Describe what went wrong -->"
 
     info_lines = [
@@ -8840,7 +8853,7 @@ async def _run_bang_command(
     timed_out = False
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=_BANG_TIMEOUT_S)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
         proc.kill()
         out_b, err_b = await proc.communicate()

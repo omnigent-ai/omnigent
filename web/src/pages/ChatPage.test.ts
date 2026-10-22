@@ -1354,10 +1354,11 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw (claude-native) and /side (codex-native) are gated off by default,
-    // so both are excluded here.
+    // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => !["/btw", "/side", "/mcp"].includes(name),
+      ),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
@@ -1380,6 +1381,13 @@ describe("buildSlashCommandMap", () => {
     // On when the session is claude-native.
     expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
       BUILTIN_SLASH_COMMANDS["/btw"],
+    );
+  });
+
+  it("includes /mcp only for a started session", () => {
+    expect(buildSlashCommandMap([], true, true)["/mcp"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false, "/", false, true)["/mcp"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/mcp"],
     );
   });
 
@@ -1430,9 +1438,11 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw and /side are gated off.
+    // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => !["/btw", "/side", "/mcp"].includes(name),
+      ),
       "/triage-issues",
       "/mlflow-bug",
     ]);

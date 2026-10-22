@@ -38,7 +38,7 @@ import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -95,7 +95,7 @@ def _pi_entry_timestamp() -> str:
 
     :returns: Timestamp string, e.g. ``"2026-06-25T08:00:00.000Z"``.
     """
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _synthetic_pi_entry_id(
@@ -569,7 +569,7 @@ def pi_resume_session_path(session_dir: Path, external_session_id: str) -> Path:
     existing = _find_pi_session_file(session_dir, external_session_id)
     if existing is not None:
         return existing
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%f")[:-3] + "Z"
+    stamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%f")[:-3] + "Z"
     return session_dir / f"{stamp}_{external_session_id}.jsonl"
 
 

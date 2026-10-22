@@ -953,12 +953,16 @@ class ConversationItem(BaseModel):
 
         :returns: Flat dict, e.g. for an assistant message::
 
-            {"id": "msg_abc", "response_id": "resp_xyz",
-             "type": "message", "status": "completed",
-             "created_at": 1753900000,
-             "role": "assistant",
-             "content": [{"type": "output_text", "text": "hi"}],
-             "model": "databricks-gpt-5-4"}
+            {
+                "id": "msg_abc",
+                "response_id": "resp_xyz",
+                "type": "message",
+                "status": "completed",
+                "created_at": 1753900000,
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}],
+                "model": "databricks-gpt-5-4",
+            }
         """
         return {
             "id": self.id,

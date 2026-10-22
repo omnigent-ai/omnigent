@@ -1428,6 +1428,21 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.error).toBe("managed sandbox launch failed: spend limit reached");
   });
 
+  it("keeps an action_required frame and what it asks the user to do", () => {
+    const out = parse("session.sandbox_status", {
+      type: "session.sandbox_status",
+      conversation_id: "conv_abc",
+      stage: "action_required",
+      error: null,
+      provider: "arclet",
+      details: "Refresh your dbcert on your laptop.",
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as SessionSandboxStatusEvent;
+    expect(ev.stage).toBe("action_required");
+    expect(ev.details).toBe("Refresh your dbcert on your laptop.");
+  });
+
   it("drops frames with an unknown stage", () => {
     // A bogus stage must not render a bogus step — the snapshot
     // re-seeds the indicator on the next load.

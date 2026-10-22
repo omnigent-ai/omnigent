@@ -23,7 +23,7 @@ import {
   Grid2X2Icon,
   MoreHorizontalIcon,
   PanelRightCloseIcon,
-  PanelRightOpenIcon,
+  PanelRightIcon,
   PencilIcon,
   Trash2Icon,
 } from "lucide-react";
@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/context-menu";
 import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
 import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
+import { GridDropOverlay, type GridDropTarget } from "./GridDropTargets";
 import { gridTitle, useGridSessions } from "./GridSessionsContext";
 
 export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
@@ -252,7 +253,11 @@ export function RearrangeableGrid({
     },
   };
   const grids = useGridSessions()!;
-  const [draggedTitle, setDraggedTitle] = useState<string | null>(null);
+  const [dragged, setDragged] = useState<{ id: string; title: string } | null>(null);
+  const rearrangeTargetId =
+    dragged && sessionIds.length === 2 && sessionIds.includes(dragged.id)
+      ? sessionIds.find((id) => id !== dragged.id)
+      : undefined;
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
@@ -262,46 +267,38 @@ export function RearrangeableGrid({
     <DndContext
       sensors={sensors}
       autoScroll={false}
-      collisionDetection={(args) =>
-        args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)
-      }
+      collisionDetection={(args) => {
+        if (!args.pointerCoordinates) return closestCenter(args);
+        const edges = pointerWithin({
+          ...args,
+          droppableContainers: args.droppableContainers.filter(
+            (target) => target.data.current?.type === "session-grid",
+          ),
+        });
+        return edges.length ? edges : pointerWithin(args);
+      }}
       accessibility={{
         screenReaderInstructions: {
           draggable:
             "Press Space to pick up this conversation, then use the arrow keys to choose another cell. Press Space again to swap positions, or Escape to cancel.",
         },
       }}
-      onDragStart={({ active }) => setDraggedTitle(active.data.current?.title ?? "Session")}
-      onDragCancel={() => setDraggedTitle(null)}
+      onDragStart={({ active, activatorEvent }) => {
+        // Keep Escape on the drag handle instead of a cell's autofocused terminal.
+        if (activatorEvent.target instanceof HTMLElement)
+          activatorEvent.target.closest("button")?.focus();
+        setDragged({ id: String(active.id), title: active.data.current?.title ?? "Session" });
+      }}
+      onDragCancel={() => setDragged(null)}
       onDragEnd={({ active, over }) => {
-        setDraggedTitle(null);
-        if (over) grids.swapPanes(String(active.id), String(over.id));
+        setDragged(null);
+        if (!over) return;
+        const target = over.data.current as GridDropTarget | undefined;
+        if (target?.type === "session-grid")
+          grids.swapPanes(String(active.id), target.targetId, target.edge);
+        else grids.swapPanes(String(active.id), String(over.id));
       }}
     >
-      <header className="flex h-9 shrink-0 items-center gap-2 px-2">
-        {onOpenSidebar && (
-          <SidebarOpenButton
-            size="icon-sm"
-            onOpenSidebar={onOpenSidebar}
-            componentId="grid.open_sidebar"
-          />
-        )}
-        <Grid2X2Icon className="size-4 shrink-0" />
-        <h1 className="truncate text-ui font-medium">{gridTitle(grid)}</h1>
-        <span className="flex-1" />
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
-          aria-expanded={workspace.open}
-          onClick={() => {
-            setMaximized(false);
-            setWorkspace((previous) => ({ ...previous, open: !previous.open }));
-          }}
-        >
-          {workspace.open ? <PanelRightCloseIcon /> : <PanelRightOpenIcon />}
-        </Button>
-      </header>
       <div
         ref={container}
         className="relative flex min-h-0 min-w-0 flex-1"
@@ -311,28 +308,64 @@ export function RearrangeableGrid({
           ref={(node) => {
             node?.toggleAttribute("inert", maximized);
           }}
-          className="grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
-          data-testid="session-grid"
+          className="flex min-h-0 min-w-0 flex-1 flex-col pt-[var(--mac-titlebar-height,0px)]"
         >
-          {gridPanes(layout).map(({ sessionId, area }) => (
-            <GridSessionPane
-              key={sessionId}
-              sessionId={sessionId}
-              area={area}
-              selected={sessionId === activeSessionId}
-              onActivate={() => setSelectedSessionId(sessionId)}
-              workspaceTarget={workspaceTarget}
-              workspacePanel={workspacePanel}
-              onOpenWorkspace={() => openWorkspace(sessionId)}
-            />
-          ))}
+          <header className="flex h-12 shrink-0 items-center gap-2 px-4 py-3">
+            {onOpenSidebar && (
+              <SidebarOpenButton
+                size="icon-sm"
+                onOpenSidebar={onOpenSidebar}
+                componentId="grid.open_sidebar"
+              />
+            )}
+            <Grid2X2Icon className="size-4 shrink-0" />
+            <h1 className="truncate text-ui">{gridTitle(grid)}</h1>
+            <span className="flex-1" />
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
+              // aria-expanded={workspace.open}
+              onClick={() => {
+                setMaximized(false);
+                setWorkspace((previous) => ({ ...previous, open: !previous.open }));
+              }}
+              className="text-muted-foreground hover:text-foreground border-none"
+            >
+              {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
+            </Button>
+          </header>
+          <div
+            className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
+            data-testid="session-grid"
+          >
+            {gridPanes(layout).map(({ sessionId, area }) => (
+              <GridSessionPane
+                key={sessionId}
+                sessionId={sessionId}
+                area={area}
+                selected={sessionId === activeSessionId}
+                onActivate={() => setSelectedSessionId(sessionId)}
+                workspaceTarget={workspaceTarget}
+                workspacePanel={workspacePanel}
+                onOpenWorkspace={() => openWorkspace(sessionId)}
+              />
+            ))}
+            {rearrangeTargetId && typeof layout !== "string" && (
+              <GridDropOverlay
+                targetId={rearrangeTargetId}
+                edges={layout.axis === "columns" ? ["top", "bottom"] : ["left", "right"]}
+                edgeOnly
+              />
+            )}
+          </div>
         </div>
         <div ref={setWorkspaceTarget} className="contents" data-testid="grid-workspace-panel" />
       </div>
       <DragOverlay dropAnimation={null}>
-        {draggedTitle && (
+        {dragged && (
           <div className="w-fit max-w-72 truncate rounded-md border bg-background px-2 py-1 text-ui shadow-md">
-            {draggedTitle}
+            {dragged.title}
           </div>
         )}
       </DragOverlay>
@@ -389,7 +422,7 @@ export function GridWorkspace({
       "This grid isn’t saved on this device. Open a session and drag another session into it to create a grid.";
   return (
     <section
-      className="flex min-h-0 min-w-0 flex-1 flex-col pt-[var(--mac-titlebar-height,0px)]"
+      className="flex min-h-0 min-w-0 flex-1 flex-col"
       aria-label="Session grid"
       onDragOver={preventLinkDrop}
       onDropCapture={preventLinkDrop}

@@ -3,6 +3,7 @@ import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions"
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
   ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxUnsupportedAgents: vi.fn(() => ({ unsupported: new Map(), prefetch: vi.fn() })),
   useSandboxModelOptions: vi.fn(() => ({
     data: {
       configured: false,
@@ -33,7 +34,7 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
@@ -56,7 +57,11 @@ import {
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
-import { useSandboxModelOptions, type SandboxModelOptions } from "@/hooks/useSandboxModelOptions";
+import {
+  useSandboxModelOptions,
+  useSandboxUnsupportedAgents,
+  type SandboxModelOptions,
+} from "@/hooks/useSandboxModelOptions";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -697,6 +702,14 @@ describe("sandbox repository helpers", () => {
     // Embedded fragment/whitespace belongs in the branch input, not here.
     ["https://github.com/org/repo#main", false],
     ["https://github.com/org/a repo", false],
+    // Embedded credentials: the server refuses these so a token never lands
+    // in a session label or Pod spec, and refusing here keeps it out of the
+    // create request too.
+    ["https://user:token@github.com/org/repo", false],
+    ["https://token@github.com/org/repo", false],
+    ["git@user:token@github.com:org/repo", false],
+    // A host with only slashes for a path is what the server calls unusable.
+    ["https://github.com//", false],
   ])("isValidSandboxRepoUrl(%j) === %j", (url, expected) => {
     expect(isValidSandboxRepoUrl(url)).toBe(expected);
   });
@@ -1204,6 +1217,10 @@ function setupLandingMocks() {
     isLoading: false,
     error: null,
   } as unknown as ReturnType<typeof useSandboxModelOptions>);
+  vi.mocked(useSandboxUnsupportedAgents).mockReturnValue({
+    unsupported: new Map(),
+    prefetch: vi.fn(),
+  });
   vi.mocked(useSkills).mockReset();
   vi.mocked(useSkills).mockImplementation(
     ({ target, enabled = true, starting = false }) =>
@@ -1288,6 +1305,24 @@ function mockClaudeModels(
   );
 }
 
+function LandingNavigationProbe() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="landing-location">
+        {location.pathname + location.search + location.hash}
+      </output>
+      <button type="button" onClick={() => navigate("?debug=1")}>
+        Change unrelated query
+      </button>
+      <button type="button" onClick={() => navigate("?prompt=Another+request")}>
+        Open another prompt link
+      </button>
+    </>
+  );
+}
+
 function renderLanding(
   infoOverrides: Partial<ServerInfo> = {},
   route = "/",
@@ -1326,6 +1361,7 @@ function renderLanding(
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
+            <LandingNavigationProbe />
             {onRender ? (
               <Profiler id="landing" onRender={onRender}>
                 <NewChatLandingScreen />
@@ -1346,6 +1382,75 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
     (key) => key.textContent ?? "",
   );
 }
+
+describe("prompt URL handoff", () => {
+  beforeEach(setupLandingMocks);
+
+  it("prefills prompt without starting a session", () => {
+    const prompt = 'src/example.ts\nExplain a + b & fix "λ" <script> as plain text';
+    renderLanding({}, `/?${new URLSearchParams({ prompt, o: "123" })}#composer`);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(prompt);
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?o=123#composer");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves unrelated query parameters while consuming prompt", () => {
+    renderLanding({}, "/?prompt=Linked&task=Unrelated");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("does not treat task as a prompt parameter", () => {
+    renderLanding({}, "/?task=Unrelated");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("keeps edits when unrelated query parameters change", () => {
+    renderLanding({}, "/?prompt=Initial");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Edited by the user" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Change unrelated query" }));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Edited by the user");
+    fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Another request");
+  });
+
+  it("overrides an old draft with a new link, then restores subsequent edits", () => {
+    const first = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Old draft" },
+    });
+    first.unmount();
+    const linked = renderLanding({}, "/?prompt=Linked+request", undefined, true);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked request");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Revised link" },
+    });
+    linked.unmount();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Revised link");
+  });
+
+  it.each(["", "   ", "\n\t"])("ignores an empty prompt (%j) without erasing a draft", (prompt) => {
+    const first = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep my draft" },
+    });
+    first.unmount();
+    renderLanding({}, `/?${new URLSearchParams({ prompt })}`);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep my draft");
+  });
+
+  it("preserves a deployment prefix and project context", () => {
+    renderLanding({}, "/omnigent/?project=docs&prompt=Review+this&o=123#composer");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Review this");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent(
+      "/omnigent/?project=docs&o=123#composer",
+    );
+  });
+});
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
 /** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */
@@ -8838,6 +8943,25 @@ describe("NewChatLandingScreen attachments", () => {
     );
   });
 
+  it.each([
+    {
+      policy: { extensions: [".gz", ".har"], all_types: false },
+      offered: [".gz", ".har"],
+      withheld: [".zip"],
+    },
+    // No accept filter at all: every file can be picked.
+    { policy: { extensions: [".zip"], all_types: true }, offered: null, withheld: [] },
+  ])("offers the server's filesystem attachment types in the file picker", (expected) => {
+    renderLanding({ filesystem_attachments: expected.policy });
+    const accept = screen.getByTestId("new-chat-landing-file-input").getAttribute("accept");
+    if (expected.offered === null) {
+      expect(accept).toBeNull();
+      return;
+    }
+    expect(accept?.split(",")).toEqual(expect.arrayContaining(expected.offered));
+    for (const extension of expected.withheld) expect(accept).not.toContain(extension);
+  });
+
   it("keeps the supported files from a mixed drop and names the rejected one", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
@@ -11647,6 +11771,161 @@ describe("managed sandbox gateway preview", () => {
       expect(body.reasoning_effort).toBeUndefined();
     },
   );
+
+  it.each([
+    [
+      "the provider's reason",
+      "No models are available for Codex.",
+      "No models are available for Codex.",
+    ],
+    [
+      "a default reason",
+      undefined,
+      "No models are available for Codex. Ask an admin to enable model access.",
+    ],
+  ])("blocks launch with %s when no model can serve the harness", (_label, error, shown) => {
+    preview({ ...catalog, status: "unsupported", models: [], ...(error ? { error } : {}) });
+    renderGatewaySandbox();
+    selectAgent("a2");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(shown);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
+
+  it("hides the provider label and Default when no model can serve the harness", () => {
+    preview({
+      ...catalog,
+      status: "unsupported",
+      models: [],
+      error: "No models are available for Codex.",
+    });
+    renderGatewaySandbox();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-model-default")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "No models are available for Codex.",
+    );
+  });
+
+  it("keeps Default launchable when the latest preview request failed", async () => {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data: { ...catalog, status: "unsupported", models: [] },
+      isLoading: false,
+      isError: true,
+      error: new Error("Gateway down"),
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a2");
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a2");
+    expect(body.model_override).toBeUndefined();
+  });
+
+  it("disables a row its cached preview rules out and prefetches shown rows", async () => {
+    preview();
+    const prefetch = vi.fn();
+    vi.mocked(useSandboxUnsupportedAgents).mockReturnValue({
+      unsupported: new Map([["a2", null]]),
+      prefetch,
+    });
+    renderGatewaySandbox();
+    selectAgent("a1");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(prefetch).toHaveBeenLastCalledWith(expect.arrayContaining(["a1", "a2"]));
+    const row = screen.getByTestId("new-chat-landing-agent-a2");
+    expect(row).toHaveAttribute("aria-disabled", "true");
+    fireEvent.focus(row);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "No models are available for Codex. Ask an admin to enable model access.",
+    );
+  });
+
+  it("names the picked brain harness when it is what has no models", () => {
+    preview({ ...catalog, status: "unsupported", models: [] });
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_polly", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    renderGatewaySandbox();
+    selectAgent("a_polly");
+    expect(screen.getByRole("alert")).toHaveTextContent("No models are available for Polly.");
+    openAgentConfig("a_polly");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-codex"));
+    closeMenu();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "No models are available for Codex. Ask an admin to enable model access.",
+    );
+  });
+
+  it("never grays out an agent row, only harness rows", () => {
+    preview();
+    const prefetch = vi.fn();
+    vi.mocked(useSandboxUnsupportedAgents).mockReturnValue({
+      unsupported: new Map([
+        ["a2", null],
+        ["a_polly", null],
+      ]),
+      prefetch,
+    });
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      testAgent("a_polly", "polly", { display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    renderGatewaySandbox();
+    selectAgent("a1");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-a2")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    // Polly can switch to a working brain, so its row (and Edit) stays usable.
+    expect(screen.getByTestId("new-chat-landing-agent-a_polly")).not.toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-config-a_polly")).toBeVisible();
+    expect(prefetch).toHaveBeenLastCalledWith(expect.not.arrayContaining(["a_polly"]));
+  });
+
+  it("prefetches harness rows when the picker opens by hotkey", async () => {
+    preview();
+    const prefetch = vi.fn();
+    vi.mocked(useSandboxUnsupportedAgents).mockReturnValue({ unsupported: new Map(), prefetch });
+    renderGatewaySandbox();
+    expect(prefetch).not.toHaveBeenCalled();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(prefetch).toHaveBeenCalledWith(expect.arrayContaining(["a1", "a2"])),
+    );
+    expect(prefetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the picker usable while the selected agent's catalog loads", () => {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      error: null,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+    renderGatewaySandbox();
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    openAgentModels("a2");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Loading models…",
+    );
+    closeMenu();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "waiting" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
 
   it("waits for the selected harness's catalog without probing a host", () => {
     mockHosts([]);

@@ -17,7 +17,8 @@ one on this machine's connected host.
   server registrations take precedence over same-named user registrations.
 - `runner-lifecycle`: adopt a matching online runner or launch on this machine's
   suitable connected host. One-shots stop only the runner they launched;
-  interactive host-launched runners remain host-managed.
+  interactive host-launched runners remain host-managed. Launch progress clears
+  when the request finishes or fails; one-shot progress stays on stderr.
 - `existing-session`: resume uses the existing session's agent; fork copies the
   source without a catalog picker. Headless fork is rejected.
 - `errors`: empty catalogs, unknown names, unreachable servers, authentication,
@@ -50,7 +51,9 @@ coverage requires `pexpect`; a skipped variant is not proof.
    error lists choices and creates no session.
 3. Connect this machine's host with no matching runner online. Exercise both
    interactive and one-shot launches; verify the selected registration, host,
-   workspace, reply and runner ownership after exit.
+   workspace, reply and runner ownership after exit. Confirm the waiting message
+   appears during launch and clears before the reply in a terminal. Redirected
+   one-shot stderr keeps the progress line; stdout contains only the reply.
 4. Resume or fork an existing session and verify its original agent is used.
    Within the REPL, `/new` keeps that agent's ID and harness, including unnamed
    uploads, without inheriting a previous launch's routing header. If no runner

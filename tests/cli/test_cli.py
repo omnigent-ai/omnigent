@@ -2456,6 +2456,26 @@ def test_server_explicit_config_overrides_omnigent_config_env(
     bind_probe.assert_called_once_with("127.0.0.1", 44771)
 
 
+@pytest.mark.parametrize("authority", [False, 123, [], {}, "", " ", "x" * 129])
+def test_server_rejects_invalid_preference_authority(monkeypatch, tmp_path, authority):
+    import json
+
+    import uvicorn.server
+
+    config = tmp_path / "invalid.yaml"
+    config.write_text("shared_preferences_authority_id: " + json.dumps(authority) + "\n")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    run = Mock()
+    monkeypatch.setattr(uvicorn.server.Server, "run", run)
+    result = CliRunner().invoke(
+        cli,
+        ["server", "-c", str(config), "--host", "127.0.0.1", "--port", "0", "--no-open"],
+    )
+    assert result.exit_code == 1
+    assert "Invalid shared_preferences_authority_id" in result.output
+    run.assert_not_called()
+
+
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

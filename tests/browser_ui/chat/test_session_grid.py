@@ -30,7 +30,9 @@ def _drag_session(page: Page, session_id: str, target_id: str, edge: str) -> Non
     expect(page.get_by_test_id("grid-drop-ghost")).to_have_count(0)
 
 
-def _move_cell(page: Page, session_id: str, target_id: str, *, cancel: bool = False) -> None:
+def _move_cell(
+    page: Page, session_id: str, target_id: str, *, cancel: bool = False, edge: str | None = None
+) -> None:
     title = page.locator(f'[data-grid-session="{session_id}"]').get_by_role(
         "button", name=re.compile("^Move ")
     )
@@ -39,12 +41,44 @@ def _move_cell(page: Page, session_id: str, target_id: str, *, cancel: bool = Fa
     page.mouse.move(box["x"] + 40, box["y"] + box["height"] / 2)
     page.mouse.down()
     page.mouse.move(box["x"] + 50, box["y"] + box["height"] / 2)
-    page.locator(f'[data-grid-session="{target_id}"]').hover()
-    expect(page.get_by_test_id("grid-move-ghost")).to_be_visible()
+    target = page.locator(f'[data-grid-session="{target_id}"]')
+    if page.locator("[data-grid-session]").count() > 2:
+        expect(page.get_by_test_id("grid-drop-targets")).to_have_count(0)
+    else:
+        expect(page.locator("[data-grid-drop-edge]")).to_have_count(2)
+    if edge:
+        grid_box = page.get_by_test_id("session-grid").bounding_box()
+        source_box = page.locator(f'[data-grid-session="{session_id}"]').bounding_box()
+        assert grid_box and source_box
+        # Reach the grid boundary on the dragged cell's side, not the other cell.
+        point = {
+            "x": source_box["x"] + source_box["width"] / 2,
+            "y": source_box["y"] + source_box["height"] / 2,
+        }
+        dimension, coordinate = ("height", "y") if edge in ("top", "bottom") else ("width", "x")
+        point[coordinate] = grid_box[coordinate] + (
+            grid_box[dimension] - 4 if edge in ("right", "bottom") else 4
+        )
+        page.mouse.move(**point)
+    else:
+        target.hover()
+    ghost = page.get_by_test_id("grid-drop-ghost" if edge else "grid-move-ghost")
+    expect(ghost).to_be_visible()
+    if edge:
+        grid_box = page.get_by_test_id("session-grid").bounding_box()
+        ghost_box = ghost.bounding_box()
+        assert grid_box and ghost_box
+        expected = dict(grid_box)
+        dimension, coordinate = ("height", "y") if edge in ("top", "bottom") else ("width", "x")
+        expected[dimension] /= 2
+        if edge in ("right", "bottom"):
+            expected[coordinate] += expected[dimension]
+        for key in expected:
+            assert ghost_box[key] == pytest.approx(expected[key], abs=1)
     if cancel:
         page.keyboard.press("Escape")
     page.mouse.up()
-    expect(page.get_by_test_id("grid-move-ghost")).to_have_count(0)
+    expect(ghost).to_have_count(0)
 
 
 def test_session_grid_drag_persist_live_updates_and_close(
@@ -181,7 +215,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_nav.get_by_role("link").click(button="right")
         page.get_by_role("menuitem", name="Rename", exact=True).click()
         rename.fill("Research monitor")
-        page.get_by_role("heading", name="Research grid", exact=True).click()
+        page.get_by_role("heading", name="Research grid · 2 sessions", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
         page.get_by_role("button", name="Expand grid workspace").click()
@@ -195,6 +229,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
             workspace.get_by_text(f"notes-{index}.md", exact=True).click()
             expect(workspace.get_by_test_id("file-viewer")).to_contain_text(f"Workspace {index}")
             expect(page).to_have_url(grid_url)
+        header = (
+            page.get_by_role("region", name="Session grid", exact=True).locator("header").first
+        )
+        header_box = header.bounding_box()
+        panel_box = workspace.bounding_box()
+        assert header_box and panel_box
+        assert panel_box["y"] == 0
+        assert panel_box["height"] == page.viewport_size["height"]
+        assert abs(header_box["x"] + header_box["width"] - panel_box["x"]) < 2
         page.screenshot(path=str(artifacts / "shared-workspace.png"))
         first_cell = page.locator('[data-grid-session="grid-0"]')
         first_cell.get_by_text("Transcript 0", exact=True).click()
@@ -226,6 +269,30 @@ def test_session_grid_drag_persist_live_updates_and_close(
                 "data-state", "connected"
             )
         connections = dict(terminal_connections)
+        _move_cell(page, "grid-0", "grid-1", edge="top", cancel=True)
+        assert first_cell.evaluate("node => node.style.gridArea") == original_area
+        for edge, axis, order in [
+            ("top", "rows", ["grid-0", "grid-1"]),
+            ("right", "columns", ["grid-1", "grid-0"]),
+            ("bottom", "rows", ["grid-1", "grid-0"]),
+            ("left", "columns", ["grid-0", "grid-1"]),
+        ]:
+            _move_cell(page, "grid-0", "grid-1", edge=edge)
+            first_box, other_box = first_cell.bounding_box(), other_cell.bounding_box()
+            assert first_box and other_box
+            if axis == "rows":
+                assert first_box["x"] == other_box["x"]
+                assert first_box["y"] != other_box["y"]
+            else:
+                assert first_box["y"] == other_box["y"]
+                assert first_box["x"] != other_box["x"]
+            saved = page.evaluate("""() => JSON.parse(localStorage.getItem(
+                `omnigent:session-grids:${location.origin}:local`))[0].layout""")
+            assert saved == {"axis": axis, "children": order}
+            expect(page).to_have_url(grid_url)
+            expect(first_cell).to_have_attribute("data-instance", "preserved")
+            assert terminal_connections == connections
+            page.screenshot(path=str(artifacts / f"two-sessions-{edge}.png"))
         first_cell.locator(".xterm-helper-textarea").click()
         page.keyboard.type("first")
         expect(first_cell).to_have_attribute("data-active", "true")
@@ -273,6 +340,8 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert grid_box and panel_box
         assert abs(panel_box["width"] - grid_box["width"]) < 2
         assert abs(panel_box["height"] - grid_box["height"]) < 2
+        assert panel_box["y"] == 0
+        assert header.evaluate("node => !!node.closest('[inert]')")
         page.screenshot(path=str(artifacts / "workspace-maximized-in-grid.png"))
         first_workspace.get_by_role("button", name="Exit full screen", exact=True).click()
         workspace.get_by_role("separator").focus()
@@ -297,6 +366,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
         assert workspace.bounding_box()["width"] == saved_width
         page.get_by_role("button", name="Collapse grid workspace").click()
+        assert header.bounding_box()["width"] > header_box["width"]
         _drag_session(page, "grid-2", "grid-0", "bottom")
         for index in range(3):
             expect(

@@ -1458,6 +1458,35 @@ def test_zip_submitted_as_an_image_block_still_uses_a_file_reference(
     assert list(workspace.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("block_type", "data_key", "mime", "filename"),
+    [
+        # A text type delivered as a file must not be pasted into the turn.
+        ("input_file", "file_data", "text/plain", "server.log"),
+        ("input_image", "image_url", "image/png", "trace.gz"),
+    ],
+)
+def test_recorded_filesystem_delivery_uses_a_file_reference(
+    tmp_path: Path, block_type: str, data_key: str, mime: str, filename: str
+) -> None:
+    """A block the server delivers as a file reaches Codex by path, whatever its type."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    payload = b"line one\nline two\n"
+    block = {
+        "type": block_type,
+        data_key: f"data:{mime};base64," + base64.b64encode(payload).decode(),
+        "filename": filename,
+        "delivery": "filesystem",
+    }
+
+    items = _content_to_input_items([block], tmp_path)
+
+    expected = attachment_cache_dir(tmp_path) / filename
+    assert items == [{"type": "text", "text": f"[Attached: {expected}]"}]
+    assert expected.read_bytes() == payload
+
+
 def test_input_file_zip_is_materialized_without_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

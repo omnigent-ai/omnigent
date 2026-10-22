@@ -771,6 +771,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // step — the snapshot re-seeds the indicator on the next load.
     if (
       stage !== "provisioning" &&
+      stage !== "action_required" &&
       stage !== "cloning" &&
       stage !== "starting" &&
       stage !== "connecting" &&
@@ -785,6 +786,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       stage,
       error: typeof data.error === "string" ? data.error : null,
       provider: typeof data.provider === "string" ? data.provider : undefined,
+      details: typeof data.details === "string" ? data.details : null,
     } satisfies SessionSandboxStatusEvent;
   }
   if (eventType === "session.mcp_startup") {
