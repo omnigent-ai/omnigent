@@ -11,7 +11,9 @@ from omnigent.harnesses.pi_native.bridge import refresh_config_auth_headers
 
 _logger = logging.getLogger(__name__)
 
-PI_AUTH_REFRESH_INTERVAL_S = 300.0
+# Revisit cached tokens within the SDK's 40-second renewal margin;
+# stored OIDC tokens have a wider 90-second margin.
+PI_AUTH_REFRESH_INTERVAL_S = 30.0
 PI_AUTH_REFRESH_TIMEOUT_S = 30.0
 
 
@@ -57,6 +59,10 @@ async def supervise_pi_auth_refresh(
                 headers = databricks_request_headers(server_url, bearer_token=token)
                 refresh_config_auth_headers(bridge_dir, headers)
                 failing = False
+            else:
+                # A managed mint can latch a temporary refusal without raising.
+                # Re-resolve on the next interval so that latch cannot stick.
+                factory = None
         except Exception as error:  # noqa: BLE001 — best-effort; keep headers, retry
             factory = None
             if not failing:  # Provider messages can embed secrets: log the type only.
