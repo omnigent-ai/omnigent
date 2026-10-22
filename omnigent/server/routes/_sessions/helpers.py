@@ -311,6 +311,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
@@ -10376,6 +10377,105 @@ def _derive_terminal_launch_args_from_spec(
     return None
 
 
+# Each native harness's launch args for the cross-harness "full access" stance;
+# keep in sync with the web permission presets in web/src/lib/nativeHarnessModes.ts.
+_FULL_ACCESS_LAUNCH_ARGS: Final[dict[str, tuple[str, ...]]] = {
+    _CLAUDE_NATIVE_HARNESS: ("--permission-mode", "bypassPermissions"),
+    _CODEX_NATIVE_HARNESS: ("--sandbox", "danger-full-access", "--ask-for-approval", "never"),
+    _CURSOR_NATIVE_HARNESS: ("--yolo",),
+    _ANTIGRAVITY_NATIVE_HARNESS: ("--dangerously-skip-permissions",),
+}
+_SPEC_PERMISSION_STANCE_KEYS: Final = ("permission_mode", "exec_mode", "yolo")
+
+
+def _codex_launch_args_full_access(args: Sequence[str]) -> bool:
+    """Return whether Codex launch args run with no sandbox and no approval prompts."""
+    from omnigent.harnesses.codex_native.app_server import _codex_resume_permission_params
+
+    try:
+        params = _codex_resume_permission_params(args)
+    except ValueError:
+        return False
+    full_access = (
+        params.get("sandbox") == "danger-full-access"
+        or params.get("permissions") == ":danger-full-access"
+    )
+    return full_access and params.get("approvalPolicy") == "never"
+
+
+def _session_runs_with_full_access(conv: Conversation, harness: str | None) -> bool:
+    """
+    Return whether a native session currently runs without approval prompts.
+
+    Live permission labels (set by a running-session switch or a mode change
+    observed in the TUI) win over the launch args the session started with.
+    Cursor and Antigravity record no live mode, so their launch args decide.
+
+    :param conv: The session row, e.g. a Codex parent spawning a sub-agent.
+    :param harness: The session's resolved harness, e.g. ``"codex-native"``.
+    :returns: ``True`` only for the harness's full-access stance.
+    """
+    labels = conv.labels or {}
+    args = conv.terminal_launch_args or []
+    if harness == _CLAUDE_NATIVE_HARNESS:
+        live_mode = labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        if live_mode:
+            return live_mode == "bypassPermissions"
+        from omnigent.harnesses.claude_native.bridge import _args_request_bypass_permissions
+
+        return _args_request_bypass_permissions(tuple(args))
+    if harness == _CODEX_NATIVE_HARNESS:
+        live_mode = labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
+        if live_mode:
+            return live_mode == "full-access"
+        if labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
+            return True
+        return _codex_launch_args_full_access(args)
+    if harness == _CURSOR_NATIVE_HARNESS:
+        from omnigent.harnesses.cursor_native.permissions import cursor_launch_args_enable_yolo
+
+        return cursor_launch_args_enable_yolo(list(args))
+    if harness == _ANTIGRAVITY_NATIVE_HARNESS:
+        return "--dangerously-skip-permissions" in args
+    return False
+
+
+def _inherited_full_access_launch_args(
+    parent: Conversation | None,
+    *,
+    resolve_parent_harness: Callable[[Conversation], str | None],
+    child_harness: str | None,
+    child_spec: AgentSpec | None,
+) -> list[str] | None:
+    """
+    Return launch args that carry a full-access parent's stance to its child.
+
+    A child spawned by a parent that runs without approval prompts would
+    otherwise stop on prompts nobody is watching for. Inheritance applies only
+    when the child's spec declares no permission stance of its own, so an
+    explicit spec choice (e.g. ``yolo: false``) still wins.
+
+    :param parent: The parent session row, or ``None`` for a top-level create.
+    :param resolve_parent_harness: Resolves the parent's harness, e.g. to
+        ``"codex-native"``; called only when the child could inherit.
+    :param child_harness: The child's harness, e.g. ``"claude-native"``.
+    :param child_spec: The child's trusted spec; ``None`` skips inheritance.
+    :returns: The child's full-access launch args, e.g.
+        ``["--permission-mode", "bypassPermissions"]``, or ``None``.
+    """
+    if parent is None or child_spec is None or child_harness is None:
+        return None
+    full_access_args = _FULL_ACCESS_LAUNCH_ARGS.get(child_harness)
+    if full_access_args is None or any(
+        child_spec.executor.config.get(key) not in (None, "")
+        for key in _SPEC_PERMISSION_STANCE_KEYS
+    ):
+        return None
+    if not _session_runs_with_full_access(parent, resolve_parent_harness(parent)):
+        return None
+    return list(full_access_args)
+
+
 def _native_subagent_wrapper_labels_from_spec(sub_spec: AgentSpec) -> dict[str, str]:
     """
     Resolve terminal-first wrapper labels from an already-loaded sub-spec.
@@ -12114,6 +12214,7 @@ __all__ = [
     "_handle_mcp_tools_list",
     "_host_model_options_via_registry",
     "_if_none_match_matches",
+    "_inherited_full_access_launch_args",
     "_invalidate_runner_backed_snapshot_state",
     "_is_claude_native_subagent",
     "_is_codex_native_subagent",

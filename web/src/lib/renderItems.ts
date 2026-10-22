@@ -21,6 +21,7 @@ import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 
 import type {
   AnyBlock,
+  ElicitationBlock,
   ErrorBlock,
   MessageContentBlock,
   NativeToolBlock,
@@ -161,6 +162,8 @@ export type RenderItem =
       codexPersistModes?: CodexPersistMode[];
       agyPermission?: AgyPermission | null;
     };
+
+export type ElicitationRenderItem = Extract<RenderItem, { kind: "elicitation" }>;
 
 /** A bubble cluster. The page maps over these. */
 export type Bubble =
@@ -1660,29 +1663,7 @@ function buildAssistantItems(
     }
 
     if (b.type === "elicitation") {
-      items.push({
-        kind: "elicitation",
-        ...(b.nativeDelivery ? { nativeDelivery: b.nativeDelivery } : {}),
-        itemId: b.ctx.itemId,
-        elicitationId: b.elicitationId,
-        targetSessionId: b.targetSessionId,
-        message: b.message,
-        phase: b.phase,
-        policyName: b.policyName,
-        contentPreview: b.contentPreview,
-        requestedSchema: b.requestedSchema,
-        url: b.url,
-        status: b.status,
-        response: b.response,
-        askUserQuestion: b.askUserQuestion,
-        exitPlanMode: b.exitPlanMode,
-        codexCommand: b.codexCommand,
-        allowAllEdits: b.allowAllEdits,
-        allowAutoMode: b.allowAutoMode,
-        rememberScope: b.rememberScope,
-        codexPersistModes: b.codexPersistModes,
-        agyPermission: b.agyPermission,
-      });
+      items.push(elicitationRenderItem(b));
       i += 1;
       continue;
     }
@@ -1695,6 +1676,33 @@ function buildAssistantItems(
   }
 
   return items;
+}
+
+/** Map an elicitation block to the render item its approval card consumes. */
+export function elicitationRenderItem(b: ElicitationBlock): ElicitationRenderItem {
+  return {
+    kind: "elicitation",
+    ...(b.nativeDelivery ? { nativeDelivery: b.nativeDelivery } : {}),
+    itemId: b.ctx.itemId,
+    elicitationId: b.elicitationId,
+    targetSessionId: b.targetSessionId,
+    message: b.message,
+    phase: b.phase,
+    policyName: b.policyName,
+    contentPreview: b.contentPreview,
+    requestedSchema: b.requestedSchema,
+    url: b.url,
+    status: b.status,
+    response: b.response,
+    askUserQuestion: b.askUserQuestion,
+    exitPlanMode: b.exitPlanMode,
+    codexCommand: b.codexCommand,
+    allowAllEdits: b.allowAllEdits,
+    allowAutoMode: b.allowAutoMode,
+    rememberScope: b.rememberScope,
+    codexPersistModes: b.codexPersistModes,
+    agyPermission: b.agyPermission,
+  };
 }
 
 function trailingLiveToolCallIds(

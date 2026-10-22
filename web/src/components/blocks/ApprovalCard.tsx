@@ -56,7 +56,7 @@ import {
 } from "@/lib/askUserQuestion";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
-import type { RenderItem } from "@/lib/renderItems";
+import type { ElicitationRenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
@@ -918,7 +918,7 @@ export function ElicitationCard({
   item,
   onSubmit,
 }: {
-  item: Extract<RenderItem, { kind: "elicitation" }>;
+  item: ElicitationRenderItem;
   onSubmit?: SubmitApprovalFn;
 }) {
   // A sub-agent's prompt is mirrored into its ancestors' streams with

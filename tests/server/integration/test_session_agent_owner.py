@@ -131,8 +131,17 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
         {"permission_mode": "default"},
         {"labels": {"omnigent.codex_native.bypass_sandbox": "1"}},
         {"labels": {"omnigent.codex_native.bypass_sandbox": "0"}},
+        {"labels": {"omnigent.claude_native.permission_mode": "bypassPermissions"}},
+        {"labels": {"omnigent.codex_native.approval_mode": "full-access"}},
     ],
-    ids=["launch-args", "permission-mode", "sandbox-bypass", "sandbox-enforced"],
+    ids=[
+        "launch-args",
+        "permission-mode",
+        "sandbox-bypass",
+        "sandbox-enforced",
+        "claude-permission-label",
+        "codex-approval-label",
+    ],
 )
 async def test_only_owner_can_update_terminal_launch_args(
     auth_client: httpx.AsyncClient, level: int, change: dict[str, object]
@@ -158,7 +167,10 @@ async def test_only_owner_can_update_terminal_launch_args(
     assert response.status_code == 200, response.text
     assert response.json()["terminal_launch_args"] == ["--verbose"]
     assert response.json()["title"] == "Owner title"
-    assert "omnigent.codex_native.bypass_sandbox" not in response.json()["labels"]
+    labels = response.json()["labels"]
+    assert "omnigent.codex_native.bypass_sandbox" not in labels
+    assert "omnigent.claude_native.permission_mode" not in labels
+    assert "omnigent.codex_native.approval_mode" not in labels
     response = await auth_client.patch(path, json={"title": "Changed title"}, headers=shared)
     assert response.status_code == (403 if level == LEVEL_READ else 200), response.text
     response = await auth_client.patch(
@@ -171,6 +183,11 @@ async def test_only_owner_can_update_terminal_launch_args(
     assert response.status_code == 200, response.text
     response = await auth_client.get(path, headers=owner)
     assert response.json()["terminal_launch_args"] == []
+    new_labels = change.get("labels")
+    if isinstance(new_labels, dict):
+        response = await auth_client.patch(path, json={"labels": new_labels}, headers=owner)
+        assert response.status_code == 200, response.text
+        assert new_labels.items() <= response.json()["labels"].items()
     for value in ("1", "0"):
         response = await auth_client.patch(
             path,

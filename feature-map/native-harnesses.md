@@ -24,7 +24,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
-  the answer reaches the harness.
+  the answer reaches the harness. A sub-agent's card also docks below its
+  parent's terminal in Terminal view.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
@@ -103,7 +104,11 @@ without a session ID to resume.
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
 child to delegate again to check nested ownership; completed children remain
-visible while the runner idles.
+visible while the runner idles. A child of a full-access parent, including one
+added from the Agents panel, starts in its harness's full-access mode unless its
+spec declares a permission stance or the create request passes launch args.
+Smart Routing (`auto`) children do not inherit it. Changing the parent's mode
+later does not change children it already started.
 
 **Native Gemini setup:** run `omni setup` → Antigravity → Configure native agy
 API key / gateway. If existing providers conflict, choose the Gemini default

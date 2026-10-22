@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -280,6 +281,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _handle_advise_models_mcp,
     _HostRunnerStopAttempt,
+    _inherited_full_access_launch_args,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
@@ -11736,6 +11738,19 @@ async def _create_session_from_existing_agent(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+    # A child of a full-access parent keeps that stance unless its own spec or
+    # the request chose one; otherwise it stops on prompts nobody expects.
+    if validated_launch_args is None and _parent_for_routing is not None:
+        validated_launch_args = await asyncio.to_thread(
+            _inherited_full_access_launch_args,
+            _parent_for_routing,
+            resolve_parent_harness=functools.partial(
+                _native_pane_harness, agent_store=agent_store, agent_cache=agent_cache
+            ),
+            child_harness=selected_harness,
+            child_spec=sub_spec if body.sub_agent_name else own_spec,
+        )
+
     if reasoning_effort is None:
         effort_spec: AgentSpec | None = sub_spec if sub_spec is not None else own_spec
         spec_effort = effort_spec.executor.reasoning_effort if effort_spec is not None else None
@@ -12093,6 +12108,7 @@ def _create_session_from_bundle(
     inference_model: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
+    parent: Conversation | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -12123,6 +12139,8 @@ def _create_session_from_bundle(
         owner. ``None`` in single-user mode.
     :param agent_store: Store holding the uploader's agents. ``None``
         gives every upload its own row.
+    :param parent: The caller-authorized parent row for a child upload;
+        ``None`` leaves the child to its spec's permission stance.
     :returns: Response with the new session id.
     :raises OmnigentError: If bundle validation or agent insert
         integrity checks fail, or the parent session vanished
@@ -12158,6 +12176,15 @@ def _create_session_from_bundle(
                 f"invalid terminal_launch_args in bundled child spec: {exc}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+        if terminal_launch_args is None:
+            terminal_launch_args = _inherited_full_access_launch_args(
+                parent,
+                resolve_parent_harness=functools.partial(
+                    _native_pane_harness, agent_store=agent_store
+                ),
+                child_harness=_spec_harness(spec),
+                child_spec=spec,
+            )
         metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
     elif metadata.terminal_launch_args is None:
         # Top-level bundle create (the ``omnigent run <dir>`` shape): honor the

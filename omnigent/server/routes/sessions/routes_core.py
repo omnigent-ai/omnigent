@@ -1285,6 +1285,7 @@ def register_core_routes(
                 inference_model,
                 created_by=user_id,
                 agent_store=agent_store,
+                parent=parent_conv,
             )
         session_created(
             result.session_id,
@@ -2556,11 +2557,19 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        # Live permission-mode labels decide what a session's sub-agents inherit.
         set_launch_args = (
             body.terminal_launch_args is not None
             or body.permission_mode is not None
             or body.approval_mode is not None
-            or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
+            or any(
+                key in (body.labels or {})
+                for key in (
+                    _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+                    _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
+                    _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
+                )
+            )
         )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {

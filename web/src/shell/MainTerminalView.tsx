@@ -192,7 +192,8 @@ export function MainTerminalView({
 
   return (
     // The terminal sits below the title bar and fills the remaining main
-    // column. The ConnectionIndicator band renders just below this wrapper.
+    // column. In the main view, ChatPage renders the sub-agent approval dock
+    // and the ConnectionIndicator band below this wrapper.
     <div
       ref={setSurfaceElement}
       data-testid="main-terminal-view"

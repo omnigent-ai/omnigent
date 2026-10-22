@@ -63,7 +63,12 @@ import {
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
-import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import {
+  type Bubble,
+  type ElicitationRenderItem,
+  type RenderItem,
+  bubblesEqual,
+} from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
@@ -284,17 +289,15 @@ export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bub
   return [...committed.slice(0, insertAt), ...pending, ...committed.slice(insertAt)];
 }
 
-type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
-
 // A pending elicitation is unanswered — only these float to the bottom.
-function isPendingElicitation(item: RenderItem): item is ElicitationItem {
+function isPendingElicitation(item: RenderItem): item is ElicitationRenderItem {
   return item.kind === "elicitation" && item.status === "pending";
 }
 
 // Pending elicitation cards float to the bottom of the chat. Collect them in
 // document order — oldest first, so the newest sits last, closest to composer.
-export function collectPendingElicitations(bubbles: Bubble[]): ElicitationItem[] {
-  const pending: ElicitationItem[] = [];
+export function collectPendingElicitations(bubbles: Bubble[]): ElicitationRenderItem[] {
+  const pending: ElicitationRenderItem[] = [];
   for (const bubble of bubbles) {
     if (bubble.kind !== "assistant") continue;
     for (const item of bubble.items) {

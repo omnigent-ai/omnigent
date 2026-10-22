@@ -22,13 +22,20 @@ Top-level / self-resolved creates use the same helper with
 answer an ApprovalCard), so only the spec's EXPLICIT declarations
 translate and the codex-native / cursor-native headless default bypass
 does not apply. The ``*_without_headless_defaults`` tests pin that mode.
+
+``_inherited_full_access_launch_args`` carries a full-access parent's stance
+to a child whose spec declares none, translated into the child's harness flags.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from omnigent.server.routes.sessions import _derive_terminal_launch_args_from_spec
+from omnigent.entities import Conversation
+from omnigent.server.routes.sessions import (
+    _derive_terminal_launch_args_from_spec,
+    _inherited_full_access_launch_args,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 
 
@@ -376,3 +383,204 @@ def test_claude_native_permission_mode_translates_without_headless_defaults() ->
         "--permission-mode",
         "bypassPermissions",
     ]
+
+
+_CODEX_FULL_ACCESS_PRESET = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+
+def _parent(args: list[str], labels: dict[str, str] | None = None) -> Conversation:
+    """Build a parent session row with the given launch args and live labels."""
+    return Conversation(
+        id="conv_parent",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_parent",
+        labels=dict(labels or {}),
+        terminal_launch_args=args,
+    )
+
+
+def _inherited(
+    parent: Conversation | None,
+    parent_harness: str | None,
+    child_config: dict[str, object] | None = None,
+    child_harness: str | None = "claude-native",
+) -> list[str] | None:
+    child_spec = _spec_with_config(child_config or {"harness": child_harness or ""})
+    return _inherited_full_access_launch_args(
+        parent,
+        resolve_parent_harness=lambda _parent: parent_harness,
+        child_harness=child_harness,
+        child_spec=child_spec,
+    )
+
+
+@pytest.mark.parametrize(
+    ("child_harness", "expected"),
+    [
+        ("claude-native", ["--permission-mode", "bypassPermissions"]),
+        ("codex-native", _CODEX_FULL_ACCESS_PRESET),
+        ("cursor-native", ["--yolo"]),
+        ("antigravity-native", ["--dangerously-skip-permissions"]),
+        ("kimi-native", None),
+        ("omnigent", None),
+    ],
+)
+def test_full_access_parent_maps_to_child_harness_flags(
+    child_harness: str, expected: list[str] | None
+) -> None:
+    """A Full access Codex parent's stance is expressed in the child's own flags.
+
+    Codex children get the Full access preset, not the bypass flag, matching
+    what forking a bypassed session keeps.
+    """
+    parent = _parent(list(_CODEX_FULL_ACCESS_PRESET))
+    assert _inherited(parent, "codex-native", child_harness=child_harness) == expected
+
+
+_CLAUDE_MODE = "omnigent.claude_native.permission_mode"
+_CODEX_MODE = "omnigent.codex_native.approval_mode"
+_CODEX_BYPASS = "omnigent.codex_native.bypass_sandbox"
+
+
+@pytest.mark.parametrize(
+    ("parent_harness", "args", "labels", "full_access"),
+    [
+        ("claude-native", ["--permission-mode", "bypassPermissions"], {}, True),
+        ("claude-native", ["--permission-mode=bypassPermissions"], {}, True),
+        ("claude-native", ["--dangerously-skip-permissions"], {}, True),
+        (
+            "claude-native",
+            ["--permission-mode", "bypassPermissions", "--permission-mode", "default"],
+            {},
+            False,
+        ),
+        ("claude-native", [], {}, False),
+        (
+            "claude-native",
+            ["--permission-mode", "bypassPermissions"],
+            {_CLAUDE_MODE: "default"},
+            False,
+        ),
+        ("claude-native", [], {_CLAUDE_MODE: "bypassPermissions"}, True),
+        ("codex-native", _CODEX_FULL_ACCESS_PRESET, {}, True),
+        ("codex-native", ["-s", "danger-full-access", "-a", "never"], {}, True),
+        ("codex-native", ["--sandbox=danger-full-access", "--ask-for-approval=never"], {}, True),
+        (
+            "codex-native",
+            ["-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"'],
+            {},
+            True,
+        ),
+        ("codex-native", ["-c", 'default_permissions=":danger-full-access"'], {}, True),
+        (
+            "codex-native",
+            ["-c", 'default_permissions=":danger-full-access"', "-a", "on-request"],
+            {},
+            False,
+        ),
+        (
+            "codex-native",
+            ["--sandbox", "read-only", "-a", "never", "-c", 'sandbox_mode="danger-full-access"'],
+            {},
+            False,
+        ),
+        (
+            "codex-native",
+            [*_CODEX_FULL_ACCESS_PRESET, "-c", 'approval_policy="on-request"'],
+            {},
+            True,
+        ),
+        (
+            "codex-native",
+            ["--approve-for-me", *_CODEX_FULL_ACCESS_PRESET],
+            {},
+            False,
+        ),
+        ("codex-native", ["--yolo"], {}, True),
+        ("codex-native", ["--sandbox", "danger-full-access"], {}, False),
+        ("codex-native", ["--ask-for-approval", "never"], {}, False),
+        ("codex-native", [], {}, False),
+        ("codex-native", _CODEX_FULL_ACCESS_PRESET, {_CODEX_MODE: "ask-for-approval"}, False),
+        ("codex-native", [], {_CODEX_MODE: "full-access"}, True),
+        ("codex-native", [], {_CODEX_BYPASS: "1"}, True),
+        ("codex-native", [], {_CODEX_MODE: "ask-for-approval", _CODEX_BYPASS: "1"}, False),
+        ("cursor-native", ["--yolo"], {}, True),
+        ("cursor-native", ["-f"], {}, True),
+        ("cursor-native", ["--yolo=false"], {}, False),
+        ("antigravity-native", ["--dangerously-skip-permissions"], {}, True),
+        ("antigravity-native", [], {}, False),
+        ("omnigent", ["--dangerously-skip-permissions"], {}, False),
+        (None, ["--dangerously-skip-permissions"], {}, False),
+    ],
+)
+def test_parent_full_access_detection(
+    parent_harness: str | None, args: list[str], labels: dict[str, str], full_access: bool
+) -> None:
+    """Only a parent that runs without approval prompts passes its stance on.
+
+    Live permission labels from a running-session switch win over launch args.
+    """
+    inherited = _inherited(_parent(list(args), labels), parent_harness)
+    assert inherited == (["--permission-mode", "bypassPermissions"] if full_access else None)
+
+
+@pytest.mark.parametrize(
+    "stance",
+    [{"permission_mode": "default"}, {"yolo": "False"}, {"exec_mode": "workspace"}],
+)
+def test_child_spec_stance_wins_over_inherited_full_access(stance: dict[str, str]) -> None:
+    """A child spec that declares its own permission stance keeps it."""
+    parent = _parent(list(_CODEX_FULL_ACCESS_PRESET))
+    config: dict[str, object] = {"harness": "claude-native", **stance}
+    assert _inherited(parent, "codex-native", child_config=config) is None
+
+
+def test_empty_child_spec_stance_is_undeclared() -> None:
+    """An empty spec value declares no stance, as in launch-arg derivation."""
+    parent = _parent(list(_CODEX_FULL_ACCESS_PRESET))
+    config: dict[str, object] = {"harness": "claude-native", "permission_mode": ""}
+    assert _inherited(parent, "codex-native", child_config=config) == [
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+
+
+def test_inheritance_needs_parent_spec_and_child_harness() -> None:
+    """Top-level creates and unresolved children inherit nothing."""
+    parent = _parent(list(_CODEX_FULL_ACCESS_PRESET))
+    assert _inherited(None, "codex-native") is None
+    assert _inherited(parent, "codex-native", child_harness=None) is None
+    assert (
+        _inherited_full_access_launch_args(
+            parent,
+            resolve_parent_harness=lambda _parent: "codex-native",
+            child_harness="claude-native",
+            child_spec=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "child_config",
+    [{"harness": "omnigent"}, {"harness": "claude-native", "permission_mode": "default"}],
+    ids=["unmapped-child-harness", "child-spec-stance"],
+)
+def test_parent_harness_is_resolved_only_when_child_can_inherit(
+    child_config: dict[str, object],
+) -> None:
+    """Creates whose child cannot inherit skip the parent's agent lookup."""
+
+    def resolve_parent_harness(_parent: Conversation) -> str:
+        raise AssertionError("parent harness resolved for a child that cannot inherit")
+
+    assert (
+        _inherited_full_access_launch_args(
+            _parent(list(_CODEX_FULL_ACCESS_PRESET)),
+            resolve_parent_harness=resolve_parent_harness,
+            child_harness=str(child_config["harness"]),
+            child_spec=_spec_with_config(child_config),
+        )
+        is None
+    )

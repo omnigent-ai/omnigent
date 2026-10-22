@@ -411,6 +411,7 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_mcp_tools_list as _handle_mcp_tools_list,
     _host_model_options_via_registry as _host_model_options_via_registry,
     _if_none_match_matches as _if_none_match_matches,
+    _inherited_full_access_launch_args as _inherited_full_access_launch_args,
     _invalidate_runner_backed_snapshot_state as _invalidate_runner_backed_snapshot_state,
     _is_claude_native_subagent as _is_claude_native_subagent,
     _is_codex_native_subagent as _is_codex_native_subagent,
