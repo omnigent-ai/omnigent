@@ -1368,7 +1368,7 @@ def test_dispatch_insert_failure_rolls_back_schedule(
     store: SqlAlchemyScheduledTaskStore, duplicate_occurrence: bool
 ) -> None:
     from sqlalchemy import event
-    from sqlalchemy.exc import StatementError
+    from sqlalchemy.exc import IntegrityError, StatementError
 
     from omnigent.db.db_models import SqlScheduledTaskRun
 
@@ -1388,7 +1388,7 @@ def test_dispatch_insert_failure_rolls_back_schedule(
     if duplicate_occurrence:
         event.listen(SqlScheduledTaskRun, "before_insert", insert_duplicate)
     try:
-        with pytest.raises(StatementError):
+        with pytest.raises(IntegrityError if duplicate_occurrence else StatementError):
             store.claim_scheduled_run(
                 task,
                 now=task.next_run_at,
@@ -1661,7 +1661,7 @@ def test_cursor_reset_commits_bounded_pages_and_can_resume(store, monkeypatch):
     tasks = []
     for workspace in (31, 32):
         with workspace_scope(workspace):
-            for index in range(3):
+            for index in range(4):
                 tasks.append(_due_task(store, f"reset-{index}"))
     with store._session_immediate("test_paused_cursor") as session:
         session.execute(
@@ -1670,7 +1670,15 @@ def test_cursor_reset_commits_bounded_pages_and_can_resume(store, monkeypatch):
             .values(state=encode_scheduled_task_state("paused"))
         )
     original = sqlalchemy_store.run_write_transaction
+    original_cursor_after = store._cursor_after
+    cursor_bounds = []
     pages = 0
+
+    def record_cursor(columns, cursor):
+        cursor_bounds.append(cursor)
+        return original_cursor_after(columns, cursor)
+
+    monkeypatch.setattr(store, "_cursor_after", record_cursor)
 
     def fail_second_page(maker, operation, callback):
         nonlocal pages
@@ -1689,7 +1697,13 @@ def test_cursor_reset_commits_bounded_pages_and_can_resume(store, monkeypatch):
             remaining.append(store.get(task.id).next_run_at)
     assert remaining.count(None) == 2
     store.reset_dispatch_cursors()
+    task_keys = sorted((task.next_run_at, task.workspace_id, task.id) for task in tasks)
+    # Resume after committed pages, using the original timestamps even after
+    # they are cleared. Each state starts its own scan from the beginning.
+    assert cursor_bounds == [task_keys[3], task_keys[5], task_keys[7]]
+    cursor_bounds.clear()
     store.reset_dispatch_cursors()
+    assert cursor_bounds == []
     for task in tasks:
         with workspace_scope(task.workspace_id):
             assert store.get(task.id).next_run_at is None

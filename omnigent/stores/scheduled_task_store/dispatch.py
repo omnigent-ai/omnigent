@@ -98,5 +98,8 @@ class ScheduledTaskDispatchStore(Protocol):
         Executors use an unexpired lease. Reconcilers use ``expired=True`` only
         after checking whether the prompt was sent: preserve a started run,
         otherwise fail it. Never infer prompt delivery solely from lease expiry.
+
+        Deleting a task prevents future claims; it does not cancel an existing
+        claim. Startup and recovery may still record progress for that run.
         """
         ...

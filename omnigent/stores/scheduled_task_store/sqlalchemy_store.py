@@ -6,6 +6,7 @@ import builtins
 import logging
 import uuid
 from collections.abc import Callable
+from functools import partial
 from typing import Any
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
@@ -803,35 +804,49 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
     def reset_dispatch_cursors(self) -> None:
         """Clear saved schedules in bounded transactions before starting legacy timers."""
+
+        def write(
+            session: Session, *, state: int, cursor: DispatchCursor | None
+        ) -> DispatchCursor | None:
+            columns = (
+                SqlScheduledTask.next_run_at,
+                SqlScheduledTask.workspace_id,
+                SqlScheduledTask.id,
+            )
+            stmt = (
+                select(*columns)
+                .where(
+                    SqlScheduledTask.state == state,
+                    SqlScheduledTask.next_run_at.is_not(None),
+                )
+                .order_by(*columns)
+                .limit(self._cleanup_batch_size)
+                .with_for_update()
+            )
+            if cursor is not None:
+                stmt = stmt.where(self._cursor_after(columns, cursor))
+            rows = list(session.execute(stmt).tuples())
+            if not rows:
+                return None
+            session.execute(
+                update(SqlScheduledTask)
+                .where(tuple_(*columns[1:]).in_([(row[1], row[2]) for row in rows]))
+                .values(next_run_at=None)
+            )
+            next_run_at, workspace_id, task_id = rows[-1]
+            assert next_run_at is not None
+            return (next_run_at, workspace_id, task_id)
+
         for state in SCHEDULED_TASK_STATE.values():
-
-            def write(session: Session, state: int = state) -> bool:
-                columns = (SqlScheduledTask.workspace_id, SqlScheduledTask.id)
-                keys = list(
-                    session.execute(
-                        select(*columns)
-                        .where(
-                            SqlScheduledTask.state == state,
-                            SqlScheduledTask.next_run_at.is_not(None),
-                        )
-                        .order_by(SqlScheduledTask.next_run_at, *columns)
-                        .limit(self._cleanup_batch_size)
-                        .with_for_update()
-                    ).tuples()
+            cursor: DispatchCursor | None = None
+            while True:
+                cursor = run_write_transaction(
+                    self._session_immediate,
+                    "reset_dispatch_cursor_page",
+                    partial(write, state=state, cursor=cursor),
                 )
-                if not keys:
-                    return False
-                session.execute(
-                    update(SqlScheduledTask)
-                    .where(tuple_(*columns).in_(keys))
-                    .values(next_run_at=None)
-                )
-                return True
-
-            while run_write_transaction(
-                self._session_immediate, "reset_dispatch_cursor_page", write
-            ):
-                pass
+                if cursor is None:
+                    break
 
     def list_uninitialized_tasks(
         self, *, after: TaskCursor | None = None, limit: int = 100
