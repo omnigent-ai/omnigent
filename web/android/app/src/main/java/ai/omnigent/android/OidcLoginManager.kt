@@ -150,9 +150,7 @@ class OidcLoginManager {
                     authLog("cli-login -> ${if (ticket != null) "ticket ok" else "FAILED"}")
                     if (ticket == null) {
                         postCurrent {
-                            onTicketFailure(
-                                IllegalStateException("Ticket request rejected"),
-                            )
+                            onTicketFailure(LegacyTicketFailure.Refused())
                         }
                     } else {
                         postCurrent {
@@ -258,7 +256,7 @@ class OidcLoginManager {
                 if (isUpgradeRequiredErrorResponse(responseCode) { conn.errorStream }) {
                     throw UpgradeRequiredException()
                 }
-                return null
+                throw LegacyTicketFailure.HttpStatus(responseCode)
             }
             val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
             val id = json.optString("ticket").ifEmpty { return null }
