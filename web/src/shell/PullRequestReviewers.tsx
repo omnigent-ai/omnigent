@@ -37,6 +37,12 @@ import {
   type PullRequestReviewerChange,
   type PullRequestReviewerTarget,
 } from "@/hooks/usePullRequests";
+import {
+  PULL_REQUEST_CHIP_CLASS,
+  PULL_REQUEST_SECTION_ACTION_CLASS,
+  PullRequestChipAction,
+  PullRequestSectionHeader,
+} from "./PullRequestSection";
 
 const REVIEWER_STATE_META: Record<
   PullRequestReviewer["state"],
@@ -104,14 +110,14 @@ function PullRequestReviewerRow({
   const stateLabel = edit ? REVIEWER_EDIT_LABEL[edit] : state.label;
   const subject = reviewerSubject(reviewer);
   const pending = reviewer.state === "PENDING";
-  const ActionIcon = pending ? XIcon : RotateCwIcon;
 
   return (
     <li
       aria-label={`${subject}: ${stateLabel}`}
       aria-busy={edit ? true : undefined}
       className={cn(
-        "inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-md border border-border bg-muted/20 px-2 py-1 text-xs",
+        PULL_REQUEST_CHIP_CLASS,
+        "rounded-md",
         edit && "border-dashed",
         edit === "withdrawing" && "opacity-60",
       )}
@@ -135,19 +141,16 @@ function PullRequestReviewerRow({
         <span>{stateLabel}</span>
       </span>
       {onToggle && !edit && (
-        <button
-          type="button"
-          aria-label={
+        <PullRequestChipAction
+          label={
             pending
               ? `Withdraw review request from ${subject}`
               : `Re-request review from ${subject}`
           }
           title={pending ? "Withdraw review request" : "Re-request review"}
+          icon={pending ? XIcon : RotateCwIcon}
           onClick={onToggle}
-          className="-mr-1 shrink-0 rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-        >
-          <ActionIcon aria-hidden className="size-3" />
-        </button>
+        />
       )}
     </li>
   );
@@ -235,7 +238,7 @@ function PullRequestReviewerPicker({
           variant="ghost"
           size="icon-xs"
           aria-label="Request reviewers"
-          className="text-muted-foreground"
+          className={PULL_REQUEST_SECTION_ACTION_CLASS}
         >
           <PlusIcon aria-hidden className="size-3.5" />
         </Button>
@@ -389,24 +392,22 @@ export function PullRequestReviewers({
 
   return (
     <section className="space-y-1.5" aria-labelledby="pull-request-reviewers-heading">
-      <div className="flex items-center gap-1">
-        <h3
-          id="pull-request-reviewers-heading"
-          className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
-        >
-          Reviewers
-        </h3>
-        {editPrUrl && (
-          <PullRequestReviewerPicker
-            conversationId={conversationId}
-            prUrl={editPrUrl}
-            author={author}
-            requested={requested}
-            edits={edits}
-            onToggle={toggle}
-          />
-        )}
-      </div>
+      <PullRequestSectionHeader
+        id="pull-request-reviewers-heading"
+        title="Reviewers"
+        action={
+          editPrUrl && (
+            <PullRequestReviewerPicker
+              conversationId={conversationId}
+              prUrl={editPrUrl}
+              author={author}
+              requested={requested}
+              edits={edits}
+              onToggle={toggle}
+            />
+          )
+        }
+      />
       {shown.length === 0 ? (
         <p className="text-ui text-muted-foreground">No reviewers assigned.</p>
       ) : (
