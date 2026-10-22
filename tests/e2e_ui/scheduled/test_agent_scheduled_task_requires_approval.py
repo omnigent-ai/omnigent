@@ -13,6 +13,8 @@ import os
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -33,6 +35,7 @@ _PROMPT = "Summarize yesterday's activity."
 _CREATE_REPLY = "Created the daily automation."
 _UPDATE_REPLY = "Paused the automation."
 _TURN_TIMEOUT_MS = 90_000
+_BROWSER_ZONE = "America/Los_Angeles"
 _RECORD_HOLD_MS = 2_500
 
 _AGENT_YAML = """\
@@ -278,3 +281,49 @@ def test_agent_scheduled_task_update_requires_approval(
     )
     row = _open_task_row(page, base_url, task_name)
     expect(row.get_by_test_id("task-paused-pill")).to_be_visible()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.browser_context_args(timezone_id=_BROWSER_ZONE)
+def test_agent_created_automation_runs_at_browser_local_time(
+    request: pytest.FixtureRequest,
+    mock_llm_server_url: str,
+    scheduling_session: tuple[str, str, str, str],
+) -> None:
+    """A chat-created daily 9:00 AM automation with no named zone fires at 9:00 AM local."""
+    base_url, session_id, model, task_name = scheduling_session
+    _script_tool_call(
+        mock_llm_server_url,
+        model,
+        "sys_scheduled_task_create",
+        {
+            "name": task_name,
+            "prompt": _PROMPT,
+            "rrule": _RRULE,
+            "agent_id": _schedulable_agent_id(base_url),
+        },
+        _CREATE_REPLY,
+    )
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}")
+    assert page.evaluate("Intl.DateTimeFormat().resolvedOptions().timeZone") == _BROWSER_ZONE
+
+    outcome = _drive_gated_turn(
+        page,
+        f"Create an automation named '{task_name}' that summarizes yesterday's "
+        "activity every day at 9:00 AM.",
+        _CREATE_REPLY,
+        lambda: None,
+    )
+    assert outcome == "approval"
+    _open_task_row(page, base_url, task_name)
+
+    (task,) = _tasks_named(base_url, task_name)
+    next_run_local = datetime.fromisoformat(task["next_run_at"]).astimezone(
+        ZoneInfo(_BROWSER_ZONE)
+    )
+    assert (next_run_local.hour, next_run_local.minute) == (9, 0), (
+        f"automation asked for 9:00 AM from a {_BROWSER_ZONE} browser next runs at "
+        f"{next_run_local:%H:%M %Z} local (stored timezone={task['timezone']!r}, "
+        f"next_run_at={task['next_run_at']})"
+    )

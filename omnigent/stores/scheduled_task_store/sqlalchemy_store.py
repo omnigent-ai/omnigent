@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import builtins
+import json
 from typing import Any
+from zoneinfo import ZoneInfo
 
+import zstandard
 from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
+from omnigent.db.compression import decode
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
     SqlScheduledTask,
@@ -23,6 +27,7 @@ from omnigent.db.enum_codecs import (
     encode_scheduled_task_run_status,
     encode_scheduled_task_state,
 )
+from omnigent.db.preferences import select_preference_value, upsert_preference
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -30,11 +35,28 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
+
+_DEFAULT_TIMEZONE_KEY = "scheduled_task_default_timezone"
+
+
+def _decode_timezone(raw: bytes | str | memoryview | None) -> str | None:
+    """Return a stored zone only if it still names a valid IANA timezone."""
+    if raw is None:
+        return None
+    try:
+        timezone = json.loads(decode(raw, max_decoded_bytes=1024) or "null")
+        if not isinstance(timezone, str):
+            return None
+        ZoneInfo(timezone)
+    except (ValueError, KeyError, OSError, zstandard.ZstdError):
+        return None
+    return timezone
 
 
 def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
@@ -378,6 +400,32 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_task", write)
+
+    def get_default_timezone(self, user_id: str | None) -> str | None:
+        """Read the user's recorded zone; an invalid stored value reads as unset."""
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+        with self._session("read_default_timezone") as session:
+            raw = session.scalar(
+                select_preference_value(preference_user_id, _DEFAULT_TIMEZONE_KEY)
+            )
+            return _decode_timezone(raw)
+
+    def set_default_timezone(self, user_id: str | None, timezone: str) -> None:
+        """Upsert the user's zone, skipping the write when it is unchanged."""
+        if self.get_default_timezone(user_id) == timezone:
+            return
+
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            upsert_preference(
+                session,
+                dialect=self._engine.dialect.name,
+                user_id=RESERVED_USER_LOCAL if user_id is None else user_id,
+                key=_DEFAULT_TIMEZONE_KEY,
+                value=json.dumps(timezone),
+            )
+
+        run_write_transaction(self._session_immediate, "save_default_timezone", write)
 
     # ── Runs ─────────────────────────────────────────────────────
 

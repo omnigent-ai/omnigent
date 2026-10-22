@@ -531,6 +531,36 @@ def test_delete_missing_returns_false(store: SqlAlchemyScheduledTaskStore) -> No
     assert store.delete(_uid("st_missing")) is False
 
 
+# ── default timezone ─────────────────────────────────────────────────────────
+
+
+def test_default_timezone_is_per_user_and_ignores_unusable_stored_values(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """The recorded zone round-trips per user; an unusable stored value reads as unset."""
+    from sqlalchemy import update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlPreference
+
+    assert store.get_default_timezone(None) is None
+    store.set_default_timezone(None, "America/Chicago")
+    store.set_default_timezone("alice@example.com", "Asia/Tokyo")
+    store.set_default_timezone(None, "America/Los_Angeles")
+    assert store.get_default_timezone(None) == "America/Los_Angeles"
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+    assert store.get_default_timezone("bob@example.com") is None
+
+    for stored in ('"Not/A_Zone"', '"America"', "42", "not json"):
+        with Session(store._engine) as session:
+            session.execute(
+                update(SqlPreference).where(SqlPreference.user_id == "local").values(value=stored)
+            )
+            session.commit()
+        assert store.get_default_timezone(None) is None, stored
+    assert store.get_default_timezone("alice@example.com") == "Asia/Tokyo"
+
+
 # ── runs ──────────────────────────────────────────────────────────────────────
 
 

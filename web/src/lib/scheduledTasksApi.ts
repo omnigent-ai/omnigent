@@ -1,4 +1,4 @@
-// Hand-written client for the six `/v1/scheduled-tasks` endpoints, mirroring
+// Hand-written client for the `/v1/scheduled-tasks` endpoints, mirroring
 // `omnigent/server/routes/scheduled_tasks.py`. Follows the same conventions as
 // the sibling `sessionsApi.ts`: requests go through the Vite `/v1` proxy, the
 // wire is snake_case while the TS surface is camelCase, and non-OK responses
@@ -10,6 +10,7 @@
 // at fire time; supply them only as a validated pair.
 
 import { authenticatedFetch } from "./identity";
+import { resolvedLocalTimezone } from "./timezones";
 
 /** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
 export type ScheduledTaskState = "active" | "paused";
@@ -279,7 +280,8 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
 
 /**
  * Create a scheduled task. Only the fields the user actually set are sent, so
- * the server applies its own defaults (`timezone` → UTC) and the optional
+ * the server applies its own defaults (`timezone` → the owner's recorded
+ * default zone, else UTC) and the optional
  * host/workspace pair is omitted entirely when unset (server resolves the
  * connected host at fire time).
  */
@@ -303,6 +305,25 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
     body: JSON.stringify(body),
   });
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+/**
+ * Record the browser's IANA zone as the caller's default for tasks created
+ * without one, such as by an agent tool. Skipped when the zone is unknown, so a
+ * UTC fallback never replaces another device's zone. Failures are ignored.
+ */
+export async function reportLocalTimezone(): Promise<void> {
+  const timezone = resolvedLocalTimezone();
+  if (timezone === null) return;
+  try {
+    await authenticatedFetch("/v1/scheduled-tasks/default-timezone", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ timezone }),
+    });
+  } catch {
+    // The next app load retries.
+  }
 }
 
 /**

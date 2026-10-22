@@ -80,7 +80,10 @@ class SysScheduledTaskCreateTool(Tool):
                             "type": "string",
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Omit it unless the user names "
+                                "a zone; do not infer one from the host or environment. "
+                                "An omitted zone uses the user's local timezone as "
+                                "reported by their web client, or UTC if none is known."
                             ),
                         },
                         "model_override": {

@@ -62,7 +62,8 @@ class CreateScheduledTaskRequest(BaseModel):
     prompt: str
     rrule: str
     agent_id: str
-    timezone: str = "UTC"
+    # Omitted or null: the owner's recorded default zone (see PUT .../default-timezone), else UTC.
+    timezone: str | None = None
     model_override: str | None = None
     reasoning_effort: str | None = None
     # Native-harness permission mode (Claude Code), e.g. "acceptEdits". The fire
@@ -91,6 +92,14 @@ class CreateScheduledTaskRequest(BaseModel):
         ):
             raise ValueError(_MANAGED_SANDBOX_WITH_HOST_MSG)
         return self
+
+
+class SetDefaultTimezoneRequest(BaseModel):
+    """Body for ``PUT /v1/scheduled-tasks/default-timezone``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timezone: str
 
 
 class UpdateScheduledTaskRequest(BaseModel):
@@ -212,7 +221,7 @@ def _validate_timezone_or_400(timezone: str) -> None:
     """Raise a 400 ``OmnigentError`` if *timezone* is not a valid IANA timezone."""
     try:
         ZoneInfo(timezone)
-    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+    except (ZoneInfoNotFoundError, KeyError, ValueError, OSError) as exc:
         raise OmnigentError(
             f"invalid timezone {timezone!r}: must be a valid IANA timezone name",
             code=ErrorCode.INVALID_INPUT,
@@ -370,8 +379,12 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
+        owner_id = None if owner == RESERVED_USER_LOCAL else owner
         await _validate_rrule_or_400(body.rrule)
-        _validate_timezone_or_400(body.timezone)
+        timezone = body.timezone
+        if timezone is None:
+            timezone = store.get_default_timezone(owner_id) or "UTC"
+        _validate_timezone_or_400(timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
             request,
@@ -384,7 +397,6 @@ def create_scheduled_tasks_router(
             permission_mode=permission_mode,
             execution_target=body.execution_target,
         )
-        owner_id = None if owner == RESERVED_USER_LOCAL else owner
         bound = await _bind_agent(agent, owner_id)
         try:
             task = store.create(
@@ -394,7 +406,7 @@ def create_scheduled_tasks_router(
                 rrule=body.rrule,
                 user_id=owner_id,
                 agent_id=bound.id,
-                timezone=body.timezone,
+                timezone=timezone,
                 model_override=model_override,
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
@@ -416,6 +428,20 @@ def create_scheduled_tasks_router(
             task,
             next_run_at=scheduler.next_run_at(task.id) if scheduler is not None else None,
         )
+
+    @router.put("/scheduled-tasks/default-timezone")
+    async def set_default_timezone(
+        request: Request,
+        body: SetDefaultTimezoneRequest,
+    ) -> dict[str, str]:
+        """Record the caller's local zone for tasks created without one, e.g. by an agent."""
+        owner = _owner(request)
+        _validate_timezone_or_400(body.timezone)
+        store.set_default_timezone(
+            None if owner == RESERVED_USER_LOCAL else owner,
+            body.timezone,
+        )
+        return {"timezone": body.timezone}
 
     @router.get("/scheduled-tasks")
     async def list_scheduled_tasks(request: Request) -> dict[str, list[dict[str, Any]]]:

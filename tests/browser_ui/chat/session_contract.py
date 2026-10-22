@@ -436,6 +436,11 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
     contract.json(f"/v1/hosts/{handle.host_id}/mcp-servers", {"mcp_servers": []})
     contract.json("/v1/projects", empty)
     contract.json("/v1/projects/order", {"ordered_project_ids": None, "sort_mode": "alphabetical"})
+    contract.json(
+        "/v1/scheduled-tasks/default-timezone",
+        lambda request: request.post_data_json,
+        method="PUT",
+    )
     contract.json("/v1/extensions", empty)
     contract.json(
         "/v1/harnesses",

@@ -104,6 +104,11 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
     browser_contract.json(
         "/v1/projects/order", {"ordered_project_ids": None, "sort_mode": "alphabetical"}
     )
+    browser_contract.json(
+        "/v1/scheduled-tasks/default-timezone",
+        lambda request: request.post_data_json,
+        method="PUT",
+    )
     browser_contract.json("/v1/harnesses", {"data": [], "setup_steps": {}})
     browser_contract.json("/v1/sessions/projects", [])
     browser_contract.json(
