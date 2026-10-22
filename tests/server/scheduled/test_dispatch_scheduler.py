@@ -271,6 +271,61 @@ async def test_cancelled_renewal_finishes_before_the_next_lease_update(store, mo
         await asyncio.gather(renewal, return_exceptions=True)
 
 
+@pytest.mark.parametrize("cancel_caller", [False, True])
+@pytest.mark.parametrize("failure", [RuntimeError, StartupLeaseLost])
+async def test_lease_write_failure_after_cancellation_is_logged_once(
+    store, monkeypatch, caplog, cancel_caller, failure
+):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    error = failure("lease write failed")
+
+    def failing_write(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        raise error
+
+    monkeypatch.setattr(store, "renew_starting_run", failing_write)
+    caller = asyncio.create_task(lease.check())
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if cancel_caller:
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+        writes = list(lease._writes)
+        release.set()
+        if not cancel_caller:
+            with pytest.raises(failure):
+                await asyncio.wait_for(caller, 10)
+        await asyncio.wait_for(asyncio.gather(*writes, return_exceptions=True), 10)
+        records = [r for r in caplog.records if r.name.endswith("dispatch_scheduler")]
+        if cancel_caller and failure is RuntimeError:
+            assert len(records) == 1
+            assert records[0].levelno == logging.ERROR
+            assert run.id in records[0].message
+            assert records[0].exc_info[1] is error
+        else:
+            assert records == []
+        assert store.list_runs(task.id)[0] == [run]
+    finally:
+        release.set()
+        caller.cancel()
+        await asyncio.gather(caller, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*list(lease._writes), return_exceptions=True), 10)
+
+
 @pytest.mark.parametrize("operation", ["renew", "attach", "finish"])
 async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
     store, monkeypatch, operation
@@ -339,7 +394,8 @@ async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
 
 
 @pytest.mark.parametrize(
-    "interruption", ["lease_loss", "renewal_timeout", "stop", "executor_error"]
+    "interruption",
+    ["lease_loss", "renewal_timeout", "stop", "executor_error", "running_executor_error"],
 )
 async def test_interrupted_executor_stops_and_leaves_run_recoverable(
     store, monkeypatch, caplog, interruption
@@ -363,7 +419,9 @@ async def test_interrupted_executor_stops_and_leaves_run_recoverable(
         leases.append(lease)
         entered.set()
         try:
-            if interruption == "executor_error":
+            if interruption == "running_executor_error":
+                await lease.finish("running")
+            if interruption in {"executor_error", "running_executor_error"}:
                 raise RuntimeError("executor could not complete startup")
             await asyncio.Event().wait()
         finally:
@@ -388,8 +446,9 @@ async def test_interrupted_executor_stops_and_leaves_run_recoverable(
         assert all(startup.cancelled() or startup.exception() is None for startup in startups)
         assert scheduler._startups == {}
         run = store.list_runs(task.id)[0][0]
-        assert run.status == "starting"
-        assert run.lease_expires_at is not None
+        expected_status = "running" if interruption == "running_executor_error" else "starting"
+        assert run.status == expected_status
+        assert (run.lease_expires_at is None) == (expected_status == "running")
         records = [
             record for record in caplog.records if record.name.endswith("dispatch_scheduler")
         ]
@@ -407,7 +466,9 @@ async def test_interrupted_executor_stops_and_leaves_run_recoverable(
                 asyncio.gather(*list(leases[0]._writes), return_exceptions=True), 10
             )
             assert store.list_runs(task.id)[0][0] == run
-        if interruption == "executor_error":
+        if interruption in {"executor_error", "running_executor_error"}:
+            assert f"status={expected_status}" in records[0].message
+            assert "recovery" not in records[0].message
             assert "executor could not complete startup" in caplog.text
             assert records[0].levelno == logging.ERROR
             assert records[0].exc_info is not None
