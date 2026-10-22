@@ -10,6 +10,8 @@ from omnigent.entities import ScheduledTask, ScheduledTaskRun
 # Ordered exactly like the due-task and expired-startup indexes.
 DispatchCursor = tuple[int, int, str]
 TaskCursor = tuple[int, str]
+# Resume both the task scan and an unfinished page scan within that task.
+DeletedTaskCursor = tuple[int, str, tuple[int, str] | None]
 
 
 @runtime_checkable
@@ -33,9 +35,9 @@ class ScheduledTaskDispatchStore(Protocol):
     ) -> list[ScheduledTask]: ...
 
     def purge_deleted_tasks(
-        self, *, after: TaskCursor | None = None, limit: int = 100
-    ) -> TaskCursor | None:
-        """Clean one bounded page of retained deleted tasks; return the next scan cursor."""
+        self, *, after: DeletedTaskCursor | None = None, limit: int = 100
+    ) -> DeletedTaskCursor | None:
+        """Clean bounded run pages, returning progress within and across deleted tasks."""
         ...
 
     def initialize_next_run_at(self, task: ScheduledTask, next_run_at: int) -> bool:
@@ -69,7 +71,11 @@ class ScheduledTaskDispatchStore(Protocol):
     def renew_starting_run(
         self, run_id: str, *, now: Callable[[], float], lease_seconds: int
     ) -> ScheduledTaskRun | None:
-        """Read now after locking; renew only an unexpired startup."""
+        """Renew only an unexpired startup, reading now after locking.
+
+        Returns the current row even if no renewal occurred. Callers must check
+        status and lease expiry; a non-None result alone does not confirm renewal.
+        """
         ...
 
     def list_expired_starting_runs(

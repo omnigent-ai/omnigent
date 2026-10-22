@@ -1363,18 +1363,42 @@ def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, e
     assert store.list_runs(task.id)[0] == []
 
 
-def test_dispatch_insert_failure_rolls_back_schedule(store: SqlAlchemyScheduledTaskStore) -> None:
+@pytest.mark.parametrize("duplicate_occurrence", [False, True])
+def test_dispatch_insert_failure_rolls_back_schedule(
+    store: SqlAlchemyScheduledTaskStore, duplicate_occurrence: bool
+) -> None:
+    from sqlalchemy import event
     from sqlalchemy.exc import StatementError
 
-    task = _due_task(store)
-    with pytest.raises(StatementError):
-        store.claim_scheduled_run(
-            task,
-            now=task.next_run_at,
-            next_run_at=task.next_run_at + 3600,
-            host_id="not-a-uuid",
-            lease_seconds=120,
+    from omnigent.db.db_models import SqlScheduledTaskRun
+
+    def insert_duplicate(mapper, connection, run):
+        connection.execute(
+            SqlScheduledTaskRun.__table__.insert().values(
+                workspace_id=run.workspace_id,
+                id=_uid("conflicting_run"),
+                scheduled_task_id=run.scheduled_task_id,
+                scheduled_at=run.scheduled_at,
+                status=run.status,
+                trigger_key=run.trigger_key,
+            )
         )
+
+    task = _due_task(store)
+    if duplicate_occurrence:
+        event.listen(SqlScheduledTaskRun, "before_insert", insert_duplicate)
+    try:
+        with pytest.raises(StatementError):
+            store.claim_scheduled_run(
+                task,
+                now=task.next_run_at,
+                next_run_at=task.next_run_at + 3600,
+                host_id=task.host_id if duplicate_occurrence else "not-a-uuid",
+                lease_seconds=120,
+            )
+    finally:
+        if duplicate_occurrence:
+            event.remove(SqlScheduledTaskRun, "before_insert", insert_duplicate)
     assert store.get(task.id) == task
     assert store.list_runs(task.id)[0] == []
 
@@ -1716,13 +1740,17 @@ def test_interrupted_history_cleanup_resumes_without_losing_live_claim(store, mo
             return original(task_id, after=after)
 
         monkeypatch.setattr(store, "_purge_deleted_task_page", fail_second_page)
-        with pytest.raises(RuntimeError, match="cleanup interrupted"):
-            store.delete(task.id)
+        assert store.delete(task.id)
         assert store.get(task.id).state == "deleted"
         assert len(store.list_runs(task.id)[0]) == 6
     # The background retry crosses workspace boundaries, but preserves the live run.
-    for _ in range(5):
-        store.purge_deleted_tasks(limit=1)
+    cursor = None
+    for _ in range(10):
+        cursor = store.purge_deleted_tasks(after=cursor, limit=1)
+        if cursor is None:
+            break
+    else:
+        pytest.fail("Cleanup did not complete its scan")
     with workspace_scope(31):
         assert store.list_runs(task.id)[0] == [run]
         store.transition_starting_run(run, now=lambda: task.next_run_at, status="failed")
@@ -1737,3 +1765,87 @@ def test_dispatch_support_rejects_d1(store, monkeypatch):
     )
     with pytest.raises(NotImplementedError, match="multi-statement transactions"):
         store.check_dispatch_support()
+
+
+@pytest.mark.parametrize("fired_at_present", [False, True])
+def test_deleted_running_claim_expires_without_a_read(store, monkeypatch, fired_at_present):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+    from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    task = _due_task(store)
+    scheduled = task.next_run_at
+    fired = scheduled + 60
+    run = store.claim_scheduled_run(
+        task, now=fired, next_run_at=fired + 3600, host_id=None, lease_seconds=120
+    )
+    store.transition_starting_run(run, now=lambda: fired, status="running")
+    if not fired_at_present:
+        with store._session_immediate("test_missing_dispatch_time") as session:
+            session.execute(
+                update(SqlScheduledTaskRun)
+                .where(SqlScheduledTaskRun.id == run.id)
+                .values(fired_at=None)
+            )
+    age_from = fired if fired_at_present else scheduled
+    monkeypatch.setattr(
+        sqlalchemy_store, "now_epoch", lambda: age_from + STALE_RUN_MAX_AGE_SECONDS - 1
+    )
+    assert store.delete(task.id)
+    assert store.list_runs(task.id)[0][0].status == "running"
+    monkeypatch.setattr(
+        sqlalchemy_store, "now_epoch", lambda: age_from + STALE_RUN_MAX_AGE_SECONDS
+    )
+    store.purge_deleted_tasks()
+    failed = store.list_runs(task.id)[0][0]
+    assert failed.status == "failed"
+    assert failed.error_code == "incomplete"
+    assert failed.finished_at == age_from + STALE_RUN_MAX_AGE_SECONDS
+    assert store.update_run(run.id, status="succeeded", finished_at=failed.finished_at) is None
+    cursor = None
+    for _ in range(3):
+        cursor = store.purge_deleted_tasks(after=cursor)
+    assert store.get(task.id) is None
+    assert store.list_runs(task.id)[0] == []
+
+
+def test_deleted_cleanup_pages_past_live_claims_across_tasks(store, monkeypatch):
+    monkeypatch.setattr(store, "_cleanup_batch_size", 2)
+    retained = []
+    for workspace in (31, 32):
+        with workspace_scope(workspace):
+            task = _due_task(store, "retained")
+            for index in range(3):
+                task = store.get(task.id)
+                store.claim_scheduled_run(
+                    task,
+                    now=task.next_run_at,
+                    next_run_at=task.next_run_at + 3600,
+                    host_id=None,
+                    lease_seconds=120,
+                )
+            for index in range(3):
+                store.create_run(
+                    _uid(f"finished-{index}"),
+                    task.id,
+                    "succeeded",
+                    task.next_run_at + 7200 + index,
+                )
+            # Simulate an interruption just after committing the deletion marker.
+            store.update(task.id, state="deleted")
+            retained.append((workspace, task.id))
+    cursor = None
+    for _ in range(20):
+        cursor = store.purge_deleted_tasks(after=cursor, limit=1)
+        if cursor is None:
+            break
+    else:
+        pytest.fail("Cleanup did not progress past retained claims")
+    for workspace, task_id in retained:
+        with workspace_scope(workspace):
+            assert store.get(task_id).state == "deleted"
+            runs, _ = store.list_runs(task_id)
+            assert len(runs) == 3
+            assert all(run.status == "starting" for run in runs)

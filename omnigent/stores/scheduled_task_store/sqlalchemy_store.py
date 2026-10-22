@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import builtins
+import logging
 import uuid
 from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
@@ -34,9 +36,19 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.server.scheduled.run_reconciler import (
+    STALE_RUN_ERROR_CODE,
+    STALE_RUN_MAX_AGE_SECONDS,
+)
 from omnigent.server.scheduled.schedule import next_scheduled_time, scheduled_trigger_key
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
-from omnigent.stores.scheduled_task_store.dispatch import DispatchCursor, TaskCursor
+from omnigent.stores.scheduled_task_store.dispatch import (
+    DeletedTaskCursor,
+    DispatchCursor,
+    TaskCursor,
+)
+
+_logger = logging.getLogger(__name__)
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
@@ -435,10 +447,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         removed = run_write_transaction(self._session_immediate, "delete_task", write)
         cursor = None
-        while True:
-            cursor = self._purge_deleted_task_page(scheduled_task_id, after=cursor)
-            if cursor is None:
-                return removed
+        try:
+            while True:
+                cursor = self._purge_deleted_task_page(scheduled_task_id, after=cursor)
+                if cursor is None:
+                    break
+        except Exception:
+            # Deletion already committed; the retained row lets maintenance retry.
+            _logger.exception("History cleanup deferred for deleted task %s", scheduled_task_id)
+        return removed
 
     def _purge_deleted_task_page(
         self, task_id: str, *, after: tuple[int, str] | None = None
@@ -461,7 +478,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .with_for_update()
             )
             if after is not None:
-                stmt = stmt.where(tuple_(*columns) > after)
+                stmt = stmt.where(self._cursor_after(columns, after))
             runs = list(session.scalars(stmt))
             if not runs:
                 remaining = session.scalar(
@@ -476,16 +493,33 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     session.delete(task)
                 return None
             cursor = (runs[-1].scheduled_at, runs[-1].id)
+            timestamp = now_epoch()
+            stale_before = timestamp - STALE_RUN_MAX_AGE_SECONDS
             for run in runs:
-                if run.trigger_key is None or run.status not in _UNFINISHED_CLAIM_STATUSES:
+                age_from = run.fired_at if run.fired_at is not None else run.scheduled_at
+                stale_running = (
+                    run.status == encode_scheduled_task_run_status("running")
+                    and age_from <= stale_before
+                )
+                if run.trigger_key is not None and stale_running:
+                    # Apply the read-time backstop under the row lock; the next
+                    # sweep removes the failed record like any other finished run.
+                    run.status = encode_scheduled_task_run_status("failed")
+                    run.finished_at = timestamp
+                    run.error_code = STALE_RUN_ERROR_CODE
+                    run.error = (
+                        "scheduled run did not reach a terminal state within "
+                        f"{STALE_RUN_MAX_AGE_SECONDS}s"
+                    )
+                elif run.trigger_key is None or run.status not in _UNFINISHED_CLAIM_STATUSES:
                     session.delete(run)
             return cursor
 
         return run_write_transaction(self._session_immediate, "purge_deleted_task_page", write)
 
     def purge_deleted_tasks(
-        self, *, after: TaskCursor | None = None, limit: int = 100
-    ) -> TaskCursor | None:
+        self, *, after: DeletedTaskCursor | None = None, limit: int = 100
+    ) -> DeletedTaskCursor | None:
         """Retry one page of interrupted deletions; retain unfinished runs for recovery."""
         if limit < 1:
             raise ValueError("The deleted-task cleanup page size must be at least 1.")
@@ -497,16 +531,32 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     SqlScheduledTask.state == encode_scheduled_task_state("deleted"),
                     SqlScheduledTask.next_run_at.is_(None),
                 )
-                .order_by(*columns)
+                .order_by(
+                    *(
+                        columns
+                        if self._engine.dialect.name == "mysql"
+                        else (SqlScheduledTask.next_run_at, *columns)
+                    )
+                )
                 .limit(limit)
             )
             if after is not None:
-                stmt = stmt.where(tuple_(*columns) > after)
+                task_key = after[:2]
+                stmt = stmt.where(
+                    self._cursor_after(columns, task_key, inclusive=after[2] is not None)
+                )
             tasks = list(session.execute(stmt).tuples())
         for workspace_id, task_id in tasks:
             with workspace_scope(workspace_id):
-                self._purge_deleted_task_page(task_id)
-        return (tasks[-1][0], tasks[-1][1]) if len(tasks) == limit else None
+                run_cursor = (
+                    after[2]
+                    if after is not None and after[:2] == (workspace_id, task_id)
+                    else None
+                )
+                next_run_cursor = self._purge_deleted_task_page(task_id, after=run_cursor)
+            if next_run_cursor is not None:
+                return (workspace_id, task_id, next_run_cursor)
+        return (tasks[-1][0], tasks[-1][1], None) if len(tasks) == limit else None
 
     # ── Runs ─────────────────────────────────────────────────────
 
@@ -729,6 +779,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
     # ── Database scheduler ───────────────────────────────────────
 
+    def _cursor_after(
+        self, columns: tuple[Any, ...], cursor: tuple[Any, ...], *, inclusive: bool = False
+    ) -> ColumnElement[bool]:
+        """MySQL needs scalar ranges to seek past a composite cursor."""
+        if self._engine.dialect.name != "mysql":
+            return tuple_(*columns) >= cursor if inclusive else tuple_(*columns) > cursor
+        return or_(
+            *(
+                and_(
+                    *(columns[previous] == cursor[previous] for previous in range(index)),
+                    column >= cursor[index]
+                    if inclusive and index == len(columns) - 1
+                    else column > cursor[index],
+                )
+                for index, column in enumerate(columns)
+            )
+        )
+
     def configure_dispatch(self, enabled: bool) -> None:
         """Select cursor maintenance before serving requests, using the app's release flag."""
         self._dispatch_enabled = enabled
@@ -779,11 +847,17 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                     SqlScheduledTask.state == encode_scheduled_task_state("active"),
                     SqlScheduledTask.next_run_at.is_(None),
                 )
-                .order_by(*columns)
+                .order_by(
+                    *(
+                        columns
+                        if self._engine.dialect.name == "mysql"
+                        else (SqlScheduledTask.next_run_at, *columns)
+                    )
+                )
                 .limit(limit)
             )
             if after is not None:
-                stmt = stmt.where(tuple_(*columns) > after)
+                stmt = stmt.where(self._cursor_after(columns, after))
             return [_to_entity(row) for row in session.scalars(stmt)]
 
     def check_dispatch_support(self) -> None:
@@ -843,7 +917,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .limit(limit)
             )
             if after is not None:
-                stmt = stmt.where(tuple_(*columns) > after)
+                stmt = stmt.where(self._cursor_after(columns, after))
             return [_to_entity(row) for row in session.scalars(stmt)]
 
     def claim_scheduled_run(
@@ -958,7 +1032,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .limit(limit)
             )
             if after is not None:
-                stmt = stmt.where(tuple_(*columns) > after)
+                stmt = stmt.where(self._cursor_after(columns, after))
             return [_run_to_entity(row) for row in session.scalars(stmt)]
 
     def transition_starting_run(
@@ -972,11 +1046,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         error: str | None = None,
         error_code: str | None = None,
     ) -> ScheduledTaskRun | None:
-        """Transition a matching startup lease; never overwrite a renewed/terminal run.
-
-        For expired leases, the caller must first establish whether dispatch
-        happened. Cleanup must preserve any session whose prompt was sent.
-        """
+        """Transition only a matching startup lease."""
         if status not in {"starting", "running", "failed", "skipped"}:
             raise ValueError("invalid startup transition")
         if status == "starting" and (expired or conversation_id is None):

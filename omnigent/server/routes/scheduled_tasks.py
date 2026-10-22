@@ -36,7 +36,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -407,9 +407,15 @@ def create_scheduled_tasks_router(
                 host_id=body.host_id,
                 execution_target=body.execution_target,
             )
-        except Exception:
+        except Exception as exc:
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+            if isinstance(exc, RRuleSearchError):
+                raise OmnigentError(
+                    "Could not calculate the next run within the schedule search limit. "
+                    "Try a simpler recurrence rule.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -658,10 +664,16 @@ def create_scheduled_tasks_router(
             updated = store.update(scheduled_task_id, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-        except Exception:
+        except Exception as exc:
             # The task never bound the copy, so nothing else uses it.
             if new_copy is not None:
                 agent_store.delete(new_copy.id)
+            if isinstance(exc, RRuleSearchError):
+                raise OmnigentError(
+                    "Could not calculate the next run within the schedule search limit. "
+                    "The task was not changed. Try a simpler recurrence rule.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
         if scheduler is not None:
@@ -682,7 +694,7 @@ def create_scheduled_tasks_router(
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
-        store.delete(scheduled_task_id)
+        await asyncio.to_thread(store.delete, scheduled_task_id)
         scheduler = _scheduler(request)
         if scheduler is not None:
             scheduler.remove(scheduled_task_id)

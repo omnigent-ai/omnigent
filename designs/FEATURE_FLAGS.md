@@ -59,3 +59,5 @@ for Claude working-status acceptance and kill-switch verification.
 5. Roll back with `-feature_name` and redeploy the same image. For runner
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
+
+Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.

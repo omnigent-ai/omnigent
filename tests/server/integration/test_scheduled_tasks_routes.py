@@ -996,6 +996,83 @@ async def test_delete_removes_task(
             assert response.status_code == 404
 
 
+async def test_delete_cleanup_failure_still_returns_success_off_event_loop(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+):
+    import threading
+
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    request_thread = threading.get_ident()
+    cleanup_threads = []
+
+    def fail_cleanup(self, task_id, *, after=None):
+        cleanup_threads.append(threading.get_ident())
+        raise RuntimeError("cleanup interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyScheduledTaskStore, "_purge_deleted_task_page", fail_cleanup)
+        response = await auth_client.delete(
+            f"/v1/scheduled-tasks/{created['id']}", headers=_headers()
+        )
+    assert response.status_code == 200, response.text
+    assert cleanup_threads and request_thread not in cleanup_threads
+    assert auth_app.state.scheduled_task_scheduler.job_count == 0
+    assert (
+        await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    ).status_code == 404
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    assert store.get(created["id"]).state == "deleted"
+    store.purge_deleted_tasks()
+    assert store.get(created["id"]) is None
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_schedule_search_failure_returns_400_and_rolls_back(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+    operation,
+):
+    from omnigent.server.scheduled.rrule import RRuleSearchError
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store = auth_app.state.scheduled_task_scheduler._store
+    store.configure_dispatch(True)
+    existing = None
+    if operation == "update":
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        ).json()
+        existing = store.get(created["id"])
+
+    def fail_actual_schedule(*args):
+        raise RRuleSearchError("search budget exceeded")
+
+    monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", fail_actual_schedule)
+    if operation == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+        )
+    else:
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{existing.id}",
+            json={"rrule": "FREQ=DAILY;BYHOUR=12"},
+            headers=_headers(),
+        )
+    assert response.status_code == 400, response.text
+    assert "schedule search limit" in response.text
+    if existing is None:
+        assert store.list() == []
+    else:
+        assert store.get(existing.id) == existing
+
+
 async def test_other_users_task_is_not_visible(
     auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:

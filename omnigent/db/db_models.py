@@ -1580,7 +1580,7 @@ class SqlScheduledTaskRun(OmnigentBase):
         ``conversations.id``). ``None`` before dispatch, or after the referenced
         conversation is deleted (application-owned SET-NULL; no DB foreign key).
     :param status: Lifecycle state —
-        ``scheduled``/``running``/``succeeded``/``failed``/``skipped``. Stored
+        ``scheduled``/``starting``/``running``/``succeeded``/``failed``/``skipped``. Stored
         as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_RUN_STATUS); the store converts to/from the string name
         at the row↔entity boundary.
@@ -1621,7 +1621,7 @@ class SqlScheduledTaskRun(OmnigentBase):
     scheduled_task_id: Mapped[str] = mapped_column(Uuid16, nullable=False)
     # Relates to conversations.id. No DB foreign key; app nulls on delete.
     conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
-    # SCHEDULED_TASK_RUN_STATUS int code; 6 is reserved for starting.
+    # SCHEDULED_TASK_RUN_STATUS int code; 6 represents starting.
     status: Mapped[int] = mapped_column(SmallInteger)
     scheduled_at: Mapped[int] = mapped_column(BigInteger)
     fired_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
