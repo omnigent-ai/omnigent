@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import uuid
 from unittest.mock import AsyncMock
@@ -337,7 +338,9 @@ async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
         await asyncio.wait_for(asyncio.gather(*list(lease._writes), return_exceptions=True), 10)
 
 
-@pytest.mark.parametrize("interruption", ["lease_loss", "stop", "executor_error"])
+@pytest.mark.parametrize(
+    "interruption", ["lease_loss", "renewal_timeout", "stop", "executor_error"]
+)
 async def test_interrupted_executor_stops_and_leaves_run_recoverable(
     store, monkeypatch, caplog, interruption
 ):
@@ -345,8 +348,19 @@ async def test_interrupted_executor_stops_and_leaves_run_recoverable(
     clock = FakeClock(task.next_run_at)
     entered = asyncio.Event()
     exited = asyncio.Event()
+    renewal_blocked = asyncio.Event()
+    release = threading.Event()
+    leases = []
+    loop = asyncio.get_running_loop()
+    original_renew = store.renew_starting_run
+
+    def hanging_renewal(*args, **kwargs):
+        loop.call_soon_threadsafe(renewal_blocked.set)
+        assert release.wait(10)
+        return original_renew(*args, **kwargs)
 
     async def fire(task, lease):
+        leases.append(lease)
         entered.set()
         try:
             if interruption == "executor_error":
@@ -362,6 +376,11 @@ async def test_interrupted_executor_stops_and_leaves_run_recoverable(
         await asyncio.wait_for(entered.wait(), 10)
         if interruption == "lease_loss":
             monkeypatch.setattr(store, "renew_starting_run", lambda *args, **kwargs: None)
+        elif interruption == "renewal_timeout":
+            monkeypatch.setattr(store, "renew_starting_run", hanging_renewal)
+            clock.advance(119)
+            await asyncio.wait_for(renewal_blocked.wait(), 10)
+            clock.advance(1)
         elif interruption == "stop":
             await asyncio.wait_for(scheduler.stop(), 10)
         await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
@@ -371,10 +390,34 @@ async def test_interrupted_executor_stops_and_leaves_run_recoverable(
         run = store.list_runs(task.id)[0][0]
         assert run.status == "starting"
         assert run.lease_expires_at is not None
+        records = [
+            record for record in caplog.records if record.name.endswith("dispatch_scheduler")
+        ]
+        if interruption in {"lease_loss", "renewal_timeout"}:
+            assert len(records) == 1
+            assert records[0].levelno == logging.WARNING
+            assert records[0].exc_info is None
+            assert "Startup lease lost" in records[0].message
+        if interruption == "renewal_timeout":
+            # The executor stops while the database thread is still blocked.
+            assert not release.is_set()
+            assert leases[0]._writes
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(*list(leases[0]._writes), return_exceptions=True), 10
+            )
+            assert store.list_runs(task.id)[0][0] == run
         if interruption == "executor_error":
             assert "executor could not complete startup" in caplog.text
+            assert records[0].levelno == logging.ERROR
+            assert records[0].exc_info is not None
     finally:
+        release.set()
         await scheduler.stop()
+        for lease in leases:
+            await asyncio.wait_for(
+                asyncio.gather(*list(lease._writes), return_exceptions=True), 10
+            )
 
 
 @pytest.mark.parametrize("blocked_at", ["ownership", "claim"])
@@ -557,7 +600,7 @@ async def test_lease_expiring_while_waiting_for_row_lock_is_not_revived(
 
 @pytest.mark.parametrize("bootstrap", [False, True])
 @pytest.mark.parametrize("failure", ["validation", "calculation", "unexpected"])
-async def test_schedule_search_failure_preserves_cursor_and_retries(
+async def test_schedule_search_failure_preserves_next_run_at_and_retries(
     store, monkeypatch, bootstrap, failure
 ) -> None:
     from sqlalchemy import update

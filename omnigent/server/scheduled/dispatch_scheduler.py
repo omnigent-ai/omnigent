@@ -327,12 +327,18 @@ class PersistentTaskScheduler:
                     finished.result()
                 if heartbeat in done:
                     await fire
+            except StartupLeaseLost:
+                _logger.warning(
+                    "Startup lease lost for run %s; stopping local startup work. "
+                    "Any unfinished startup remains available for recovery",
+                    run.id,
+                )
             except Exception:
-                # Outcome may be ambiguous (e.g. prompt accepted before a DB
-                # error). Stop renewals and let the fire-path reconciler inspect it.
+                # Outcome may be ambiguous; recovery inspects the run after its lease expires.
                 _logger.exception(
                     "Startup interrupted for run %s; stopping local startup work and lease "
-                    "renewals. Recovery will check any unfinished startup after its lease expires",
+                    "renewals. Any unfinished startup remains available for recovery "
+                    "after lease expiry",
                     run.id,
                 )
             finally:
@@ -347,7 +353,7 @@ class PersistentTaskScheduler:
             _logger.warning(
                 "on_fire returned while run %s still has status 'starting'; "
                 "no final startup outcome was recorded. "
-                "Recovery will check this run after its lease expires",
+                "This run remains available for recovery after its lease expires",
                 lease.run.id,
             )
 
