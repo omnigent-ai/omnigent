@@ -1404,6 +1404,10 @@ let queryClient: QueryClient | null = null;
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 
+// Latest status each binding's own stream delivered, keyed by its controller so a
+// late event from a replaced binding cannot reach the new one.
+const liveStatusByBinding = new WeakMap<AbortController, SessionStatus>();
+
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
@@ -1798,14 +1802,10 @@ const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
-// After the stream reconnects, `reconcileActiveSessionStatus` runs once
-// immediately — but a server that just restarted may not have reprocessed the
-// in-flight turn's completion yet, so that read can see a stale "running" and
-// leave the tab on "Working…" until the 60s periodic reconcile. These short
-// catch-up delays re-read status a few times over the first ~20s so a status
-// that settles right after reconnect is reflected in seconds, not up to a
-// minute. Each call is guarded + idempotent (see reconcileActiveSessionStatus).
-export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as const;
+// The snapshot read on each stream open can carry a stale status that the stream
+// never replays, so re-read it at these delays instead of waiting for the 60s
+// reconcile. Each re-read is guarded and idempotent (reconcileActiveSessionStatus).
+export const STREAM_OPEN_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as const;
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -5199,19 +5199,22 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
  *
  * A stream pump can keep receiving heartbeats while missing a lifecycle event.
  * Periodically re-read durable status, discarding a snapshot if any semantic
- * stream event arrives during the fetch.
+ * stream event arrives during the fetch. `raiseOnly` reads only while the
+ * screen shows idle and applies only a running result.
  */
 async function reconcileActiveSessionStatus(
   id: string,
   controller: AbortController,
   set: Setter,
   get: Getter,
+  raiseOnly = false,
 ): Promise<void> {
   if (
     queryClient === null ||
     controller.signal.aborted ||
     conversationRegistry.getActive()?.id !== id ||
-    get().abortController !== controller
+    get().abortController !== controller ||
+    (raiseOnly && get().sessionStatus !== "idle")
   ) {
     return;
   }
@@ -5255,6 +5258,7 @@ async function reconcileActiveSessionStatus(
   ) {
     return;
   }
+  if (raiseOnly && session.status !== "running") return;
   set((s) => {
     const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
@@ -5820,39 +5824,40 @@ export async function startStreamPump(
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
   let statusReconcileInFlight = false;
-  // Shared by the periodic reconcile and the post-reconnect catch-up burst so
-  // reconciliations stay serialized: a catch-up tick that straddles a slow
-  // snapshot fetch (or the periodic tick) is skipped rather than issuing a
-  // duplicate concurrent backfill.
-  const runGuardedStatusReconcile = (): void => {
+  // Serializes periodic and catch-up reconciles; an overlapping tick is skipped.
+  const runGuardedStatusReconcile = (raiseOnly = false): void => {
     if (statusReconcileInFlight) return;
     statusReconcileInFlight = true;
-    void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+    void reconcileActiveSessionStatus(id, controller, set, get, raiseOnly).finally(() => {
       statusReconcileInFlight = false;
     });
   };
   const statusReconcileTimer =
     typeof window === "undefined"
       ? null
-      : window.setInterval(runGuardedStatusReconcile, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
-  // Pending post-reconnect catch-up timers. Tracked so each reconnect cancels
-  // the previous burst before scheduling a new one — otherwise recurring
-  // reconnects (the ~5-min ingress recycle) would accumulate timers on the
-  // long-lived controller. Cleared on teardown in the outer `finally`.
+      : window.setInterval(
+          () => runGuardedStatusReconcile(),
+          ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
+        );
+  // Each open replaces the prior burst so recurring reconnects cannot pile up timers.
   let catchupTimers: number[] = [];
   const clearCatchupTimers = (): void => {
     for (const timer of catchupTimers) window.clearTimeout(timer);
     catchupTimers = [];
   };
-  // Re-read at each catch-up delay, replacing any prior burst: the full status if asked
-  // (on screen only) and, while a launch shows, its stage on screen or not.
-  const scheduleStatusCatchup = (withStatus: boolean): void => {
+  // Re-read status (on screen only) and any shown launch stage at each delay.
+  // First-open status re-reads only raise idle to running, and stop once the
+  // latest live edge reports any other status.
+  const scheduleStatusCatchup = (reconnecting: boolean): void => {
     if (typeof window === "undefined") return;
     clearCatchupTimers();
-    catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
+    catchupTimers = STREAM_OPEN_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
       window.setTimeout(() => {
         if (controller.signal.aborted || isConversationDisposed(id)) return;
-        if (withStatus) runGuardedStatusReconcile();
+        const liveStatus = liveStatusByBinding.get(controller);
+        if (reconnecting || liveStatus === undefined || liveStatus === "running") {
+          runGuardedStatusReconcile(!reconnecting);
+        }
         const launch = get().sandboxStatus;
         if (launch !== null && launch.stage !== "failed") void reconcileLaunchStatus(id, set, get);
       }, delayMs),
@@ -6053,19 +6058,9 @@ export async function startStreamPump(
         );
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
-          // reconcileOnReconnect can read a stale "running" when the server
-          // just restarted and hasn't reprocessed the turn's completion yet,
-          // stranding the tab on "Working…" until the 60s periodic reconcile.
-          // Re-read status a few times over the next ~20s so a status that
-          // settles shortly after reconnect clears in seconds. Guarded +
-          // idempotent, and scoped to the active conversation by
-          // reconcileActiveSessionStatus itself.
-          scheduleStatusCatchup(true);
-        } else {
-          // A launch's `ready` sent before this first open subscribed is in no snapshot
-          // read yet, so re-read its stage over the next ~20 s while it still shows.
-          scheduleStatusCatchup(false);
         }
+        // Open-time snapshots can miss a status or launch stage set before subscribe; re-read both.
+        scheduleStatusCatchup(reconnecting);
         let reason = await pumpPromise;
 
         // Presence or host changes abort only the attempt; a live outer
@@ -6648,6 +6643,7 @@ export async function pumpStreamEvents(
         // edge's adoption and cleanup (e.g. of a "Compacting…" spinner) see it.
         flush();
       },
+      (status) => liveStatusByBinding.set(controller, status),
     ),
     id,
     ignoredMessages,
@@ -8721,10 +8717,14 @@ async function* tapSessionEvents(
   conversationId: string,
   onElicitationResolved?: (elicitationId: string) => void,
   beforeTurnEdge?: () => void,
+  onOwnStatus?: (status: SessionStatus) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+      if (event.type === "session_status" && event.conversationId === conversationId) {
+        onOwnStatus?.(event.status);
+      }
     }
     if (event.type === "session_status" || event.type === "session_interrupted") {
       beforeTurnEdge?.();
