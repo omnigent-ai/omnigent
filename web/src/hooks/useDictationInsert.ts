@@ -98,6 +98,10 @@ export function useDictationInsert(
   replaceInterim: (text: string) => void;
   /** Report that the composer has been focused, so its caret is real. */
   noteFocus: () => void;
+  /** Pin the pending interim where it sits, without touching the draft. A
+   *  draft kept after an accepted send (a failed fork) then stays the user's,
+   *  so the next take appends instead of lifting the retained words out. */
+  commitPending: () => void;
 } {
   // The draft as last seen. Refreshed on every render so external changes
   // win, and written on insert so a second transcript in the same batch
@@ -202,6 +206,13 @@ export function useDictationInsert(
     replaceInterim: useCallback((text: string) => insert(text, false), [insert]),
     noteFocus: useCallback(() => {
       focusedRef.current = true;
+    }, []),
+    commitPending: useCallback(() => {
+      const mine = producedRef.current;
+      // Settle ownership only: drop the revisable region but keep the text and
+      // tail, so the words already on screen can't be sliced out by a later
+      // take. Released as usual once the draft changes under us.
+      if (mine?.region) producedRef.current = { ...mine, region: null };
     }, []),
   };
 }

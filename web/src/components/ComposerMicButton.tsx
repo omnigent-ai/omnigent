@@ -8,7 +8,15 @@ import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ForwardedRef,
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -17,6 +25,7 @@ interface SpeechRecognitionLike {
   lang: string;
   start: () => void;
   stop: () => void;
+  abort: () => void;
   addEventListener: (type: string, listener: (event: Event) => void) => void;
   removeEventListener: (type: string, listener: (event: Event) => void) => void;
 }
@@ -92,21 +101,30 @@ export interface ComposerMicButtonProps {
   onVoiceDiscard?: () => void;
 }
 
+export interface ComposerMicButtonHandle {
+  /** End the current take, preserving dictated text without flushing a trailing
+   *  utterance into the just-cleared composer. No-op when idle. */
+  endTake: () => void;
+}
+
 /** getUserMedia permission failures, distinct from transport failures. */
 const isPermissionError = (error: unknown): boolean =>
   error instanceof DOMException &&
   (error.name === "NotAllowedError" || error.name === "SecurityError");
 
-export const ComposerMicButton = ({
-  onTranscript,
-  className,
-  onInterim,
-  disabled,
-  lang = getDefaultDictationLang(),
-  enableHotkey = false,
-  onVoiceStart,
-  onVoiceDiscard,
-}: ComposerMicButtonProps) => {
+function ComposerMicButtonImpl(
+  {
+    onTranscript,
+    className,
+    onInterim,
+    disabled,
+    lang = getDefaultDictationLang(),
+    enableHotkey = false,
+    onVoiceStart,
+    onVoiceDiscard,
+  }: ComposerMicButtonProps,
+  ref: ForwardedRef<ComposerMicButtonHandle>,
+) {
   // Web Speech is primary whenever the browser has the constructor
   // (Chrome/Safari, unchanged behavior); with no constructor at all
   // (Firefox) takes use server dictation when GET /v1/info advertises it.
@@ -143,6 +161,10 @@ export const ComposerMicButton = ({
   // Set by the Esc handler so late results after a discard don't repopulate the
   // composer the parent just reverted. Cleared on the next start.
   const discardingRef = useRef(false);
+  // Set by endTake when a server take is still mid-handshake (session not yet
+  // attached): toggleServer sees it once start resolves and discards the
+  // just-opened session instead of recording into the cleared composer.
+  const endPendingRef = useRef(false);
   // Synced prop ref so the recognition result handler (closure over the
   // mount-time effect) can drop late events when the composer goes
   // disabled mid-utterance.
@@ -365,9 +387,10 @@ export const ComposerMicButton = ({
     if (session) {
       sessionRef.current = null;
       const tail = (await session.stop()).trim();
-      if (!disabledRef.current) {
-        // A non-empty tail supersedes the pending interim via
-        // onTranscript; an empty one just clears the interim region.
+      if (!disabledRef.current && !discardingRef.current) {
+        // A non-empty tail supersedes the pending interim via onTranscript; an
+        // empty one just clears the interim region. discardingRef suppresses the
+        // tail when the take was ended on send while this stop was in flight.
         if (tail) onTranscriptRef.current(tail);
         else onInterimRef.current?.("");
       }
@@ -378,6 +401,7 @@ export const ComposerMicButton = ({
     try {
       // Snapshot point: let the parent record the text so Esc can revert to it.
       discardingRef.current = false;
+      endPendingRef.current = false;
       interimRef.current = "";
       setConnecting(true);
       onVoiceStartRef.current?.();
@@ -413,23 +437,38 @@ export const ComposerMicButton = ({
           setIsListening(false);
         },
       });
+      if (endPendingRef.current) {
+        // The take was ended (e.g. a Send tap) while the socket was still
+        // connecting. Discard the session we just opened instead of attaching
+        // it, so it can't record into the composer the parent already cleared.
+        endPendingRef.current = false;
+        next.cancel();
+        setConnecting(false);
+        serverBusyRef.current = false;
+        return;
+      }
       sessionRef.current = next;
       setError(null);
       setIsListening(true);
     } catch (startError) {
-      reportError(
-        startError instanceof DictationBusyError
-          ? "Voice input is busy. Please try again shortly."
-          : isPermissionError(startError)
-            ? "Microphone access denied. Allow access and try again."
-            : "Voice input isn't available on this device.",
-      );
+      // Stay silent if the user already ended this take mid-handshake (a Send
+      // tap set endPendingRef); the toast would warn about a take they dropped.
+      if (!endPendingRef.current) {
+        reportError(
+          startError instanceof DictationBusyError
+            ? "Voice input is busy. Please try again shortly."
+            : isPermissionError(startError)
+              ? "Microphone access denied. Allow access and try again."
+              : "Voice input isn't available on this device.",
+        );
+      }
       setIsListening(false);
     }
-    // Reached only by the start path (the stop branch returns earlier), so this
-    // clears the handshake spinner on both success and failure.
+    // Reached only by the start path (the stop branch returns earlier). Clear
+    // the handshake spinner and reconcile endPendingRef on success and failure.
     setConnecting(false);
     serverBusyRef.current = false;
+    endPendingRef.current = false;
   }, [reportError]);
   toggleServerRef.current = toggleServer;
 
@@ -463,6 +502,41 @@ export const ComposerMicButton = ({
       transitionRef.current = false;
     }
   }, [isListening, Ctor, serverAvailable, toggleServer]);
+
+  // End an in-progress take without flushing a trailing utterance into the
+  // composer the parent just cleared on send. discardingRef drops a result that
+  // lands after teardown; the next take clears it (like the Esc discard).
+  const endTake = useCallback(() => {
+    const session = sessionRef.current;
+    if (session) {
+      sessionRef.current = null;
+      serverBusyRef.current = false;
+      discardingRef.current = true;
+      session.cancel();
+      setIsListening(false);
+      return;
+    }
+    // No session yet: the take is mid-handshake or mid-stop. discardingRef drops
+    // the late result or trailing tail in either case. endPendingRef only matters
+    // on the start path, which cancels the resolved session and clears the
+    // connecting spinner (so the button isn't idle-looking while it still rejects
+    // taps); the stop path returns before reading it, so the flag is inert there.
+    if (serverBusyRef.current) {
+      endPendingRef.current = true;
+      discardingRef.current = true;
+      return;
+    }
+    if (!isListening && !transitionRef.current) return;
+    try {
+      // abort() discards buffered audio; discardingRef drops a final that still
+      // fires before the abort lands.
+      discardingRef.current = true;
+      recognitionRef.current?.abort();
+    } catch {
+      // Already stopping — the end event will reconcile state.
+    }
+  }, [isListening]);
+  useImperativeHandle(ref, () => ({ endTake }), [endTake]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // whenever dictation could run (Web Speech OR the server path) and the
@@ -561,4 +635,7 @@ export const ComposerMicButton = ({
       )}
     </Button>
   );
-};
+}
+
+export const ComposerMicButton = forwardRef(ComposerMicButtonImpl);
+ComposerMicButton.displayName = "ComposerMicButton";
