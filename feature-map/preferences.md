@@ -3,8 +3,8 @@
 Users can save local model and harness defaults, override them for a project,
 and choose how an individual session runs. Native startup arguments also come
 from local configuration. Shared workspace preferences have a resolver
-and an opt-in server API for durable edits and conflicts. Automatic client sync
-and shared/machine scope controls are not available through the CLI or UI yet.
+and an opt-in server API for durable edits and conflicts. The cloud CLI explicitly saves or imports a portable snapshot. Later edits stay
+local; automatic client sync and shared/machine scope controls remain deferred.
 
 ## Sub-features
 
@@ -24,6 +24,11 @@ and shared/machine scope controls are not available through the CLI or UI yet.
   distinct across shared, machine, project, and session scopes.
 - `shared-operations`: opt-in server API; read/save all four groups, retry an
   edit, remove a preference, inspect competing edits, and resolve them explicitly.
+
+- `configuration-copy`: review, save, show and import model defaults, harness
+  selection/arguments and launcher plugin opt-outs; preserve local-only values.
+- `configuration-onboarding`: offer save/import once per interactive login
+  context; declining is remembered and headless startup never prompts.
 
 ## How to get to it (user POV)
 
@@ -53,8 +58,16 @@ resolution, identity, and limits. These endpoints do not adopt preferences into
 launchers or turn on sync. Embedded apps opt in with `create_app(preference_store=...)`;
 omitting an auth provider uses the reserved `local` user namespace.
 
-**Shared scope controls:** the CLI and UI do not yet offer importing/reimporting
-preferences, saving shared or machine defaults, removing a machine override,
+**Cloud configuration CLI:** `omnigent config cloud --server URL show`, `save`,
+`import`, and `onboard`. Save/import show a preview and require confirmation
+(`--yes` accepts explicitly). A launcher can supply `--plugin-opt-outs PATH`
+before the subcommand to include its existing JSON preferences. `onboard` is an
+interactive launcher hook; OSS startup does not invoke it automatically. See the
+[configuration guide](../docs/cloud-configuration.md). Isaac startup remains a
+separate Universe integration.
+
+**Shared scope controls:** the CLI and UI do not yet offer automatic following,
+saving machine overrides, removing a machine override,
 resolving conflicts, or continuing with temporary defaults. The API above can
 save shared defaults and resolve conflicts. Add CLI/UI routes and their journey
 tests here as those controls are implemented.
@@ -97,6 +110,28 @@ uv run --no-sync pytest tests/test_config.py tests/test_harness_startup_config.p
   Composer recipes for the actual settings, terminal, new-session, in-session,
   fork, and mobile surfaces. Their results do not establish shared-preference
   persistence or isolation across machines.
+
+**Configuration copy (own environment, real CLI and HTTP server):**
+
+```sh
+uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py \
+  -k configuration --reruns 0 -q
+uv run --no-sync pytest tests/test_configuration_profile.py \
+  tests/server/test_preference_requests.py --reruns 0 -q
+```
+
+The process journey saves from one isolated home, imports into another, restarts
+the server and imports a later revision. Check that host commands and credentials
+remain local, ordered arguments and opt-outs copy, backups exist, and local edits
+do not follow automatically. The component matrix covers decline, malformed
+files, stale cloud/login/local previews, write failure recovery, harness aliases,
+one-time prompts and noninteractive no-network startup. Managed authentication,
+Isaac startup and plugin housekeeping require the Universe integration recipe.
+
+For a human check, use two temporary `OMNIGENT_CONFIG_HOME` directories against
+an isolated enabled server. Save a model from A, decline import in B and confirm
+B is unchanged, then accept. Edit A again and confirm B only changes after another
+save/import. `show` should contain no provider credentials or harness commands.
 
 **Shared scopes (component coverage only):**
 
@@ -149,13 +184,15 @@ observed results, any mocked services, and remaining entry-point gaps.
 
 ## Gotchas
 
-- Before broad activation, design receipt retention/compaction and bounded
+- The older per-setting operations API needs receipt retention/compaction and bounded
   account-deletion batches. At 10,000 consumed operations, new edits and conflict
-  resolutions stop permanently; reads and identical retries still work.
-- Request parsing currently has no route-specific body-size or rate limit.
-  Add these before broad activation; the value cap applies after JSON parsing.
+  resolutions stop permanently; reads and identical retries still work. The
+  configuration snapshot uses one bounded row and has no receipt history.
+- Requests have bounded bodies and worker admission. Managed rollout and task
+  ownership still require deployment wiring; the OSS process recipe does not
+  validate managed authentication or MySQL concurrency.
 - Managed deployment, Universe wiring, Arclet startup, automatic outbox/reconnect,
-  import/rollback, and native plugin isolation remain unverified follow-ups.
+  and native plugin isolation remain unverified follow-ups.
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.
 - `config list` displays user and project defaults under their file paths;
@@ -174,3 +211,12 @@ observed results, any mocked services, and remaining entry-point gaps.
   also separate from the future preference-import flow.
 - Resolver tests and feature-map contract checks do not prove browser behavior,
   native policy enforcement, remote provisioning, or sync convergence.
+
+- Snapshot import replaces the included portable settings; missing model/default
+  values clear those settings. An absent plugin block leaves opt-outs unchanged.
+  Launcher `disable_all` freezes automatic management; it does not disable all
+  installed plugins.
+- Arguments copy verbatim: review them for credentials and machine-specific paths.
+  File writes are individually atomic with backups and best-effort rollback.
+  Concurrent external config writers and process death between two files are not
+  a cross-file transaction; stop other configuration edits while importing.

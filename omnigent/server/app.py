@@ -102,6 +102,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -1376,6 +1377,7 @@ def create_app(
     host_sharded: bool = False,
     *,
     preference_store: PreferenceStore | None = None,
+    preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -3571,7 +3573,7 @@ def create_app(
 
     if preference_store is not None:
         app.include_router(
-            create_preferences_router(preference_store, auth_provider),
+            create_preferences_router(preference_store, auth_provider, policy=preference_policy),
             prefix="/v1",
             tags=["preferences"],
         )

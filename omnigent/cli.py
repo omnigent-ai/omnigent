@@ -66,6 +66,7 @@ from omnigent.config import (
     load_local_config,
     resolve_effective_config,
 )
+from omnigent.configuration_commands import cloud as _configuration_cloud
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
     DAEMON_CONFIG_SIG_ENV_VAR,
@@ -11703,6 +11704,9 @@ def config_grp() -> None:
       set    Set one or more defaults (KEY=VALUE).
       unset  Remove one or more defaults.
     """
+
+
+config_grp.add_command(_configuration_cloud)
 
 
 @config_grp.command("list")
