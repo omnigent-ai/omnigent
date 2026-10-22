@@ -60,6 +60,7 @@ from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
+    global_pi_agent_dir,
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
@@ -2579,6 +2580,7 @@ class PiExecutor(Executor):
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
+                global_agent_dir=global_pi_agent_dir(),
             )
             from omnigent.inner.pi_gateway import pi_gateway_extension_args
 

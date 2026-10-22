@@ -87,71 +87,45 @@ def test_prepare_managed_pi_agent_dir_deep_merges_nested_overlay(tmp_path: Path)
     }
 
 
-def test_prepare_managed_pi_agent_dir_links_global_entries_except_unshared(
-    tmp_path: Path,
-) -> None:
-    """MCP config, skills and other user entries are linked; Omnigent-owned state is not."""
+def test_prepare_managed_pi_agent_dir_links_only_packages_and_mcp(tmp_path: Path) -> None:
+    """MCP config/auth and install trees are linked; other user entries stay out."""
     global_agent = tmp_path / "global-agent"
-    for directory in ("skills/review", "extensions", "npm", "sessions", "tmp"):
+    for directory in ("npm", "git", "skills/review"):
         (global_agent / directory).mkdir(parents=True)
-    shared_files = ("mcp.json", "mcp-auth.json", "AGENTS.md", "keybindings.json")
-    unshared_files = (
-        "auth.json",
-        "oauth.json",
-        "models-store.json",
-        "mcp.log",
-        "crashes.json",
-        "pi-debug.log",
-    )
-    for name in (*shared_files, *unshared_files, "settings.json", "models.json"):
+    for name in ("mcp.json", "mcp-auth.json", "AGENTS.md", "SYSTEM.md", "APPEND_SYSTEM.md"):
         (global_agent / name).write_text("{}", encoding="utf-8")
-
     managed = tmp_path / "managed"
     managed.mkdir()
-    (managed / "models.json").write_text('{"providers": {}}', encoding="utf-8")
 
     prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
 
-    for name in (*shared_files, "skills", "extensions", "npm"):
-        assert (managed / name).is_symlink(), name
-        assert (managed / name).resolve() == (global_agent / name).resolve()
-    for name in (*unshared_files, "sessions", "tmp"):
+    for name in ("npm", "git", "mcp.json", "mcp-auth.json"):
+        assert (managed / name).readlink() == global_agent / name
+    for name in ("skills", "AGENTS.md", "SYSTEM.md", "APPEND_SYSTEM.md"):
         assert not (managed / name).exists(), name
-    assert not (managed / "models.json").is_symlink()
-    assert (managed / "models.json").read_text(encoding="utf-8") == '{"providers": {}}'
     assert not (managed / "settings.json").is_symlink()
 
 
-def test_prepare_managed_pi_agent_dir_keeps_existing_managed_entries(
-    tmp_path: Path,
-) -> None:
-    """A relaunch reuses whatever the managed dir already holds, dangling links included."""
+def test_prepare_managed_pi_agent_dir_replaces_stale_links_on_reuse(tmp_path: Path) -> None:
+    """A resumed session drops links to a previous root or removed sources."""
+    previous_root = tmp_path / "previous-agent"
+    previous_root.mkdir()
+    (previous_root / "mcp.json").write_text("{}", encoding="utf-8")
     global_agent = tmp_path / "global-agent"
     global_agent.mkdir()
-    (global_agent / "keybindings.json").write_text("{}", encoding="utf-8")
     (global_agent / "mcp.json").write_text("{}", encoding="utf-8")
+    (global_agent / "mcp-auth.json").write_text("{}", encoding="utf-8")
 
     managed = tmp_path / "managed"
     managed.mkdir()
-    (managed / "keybindings.json").write_text('{"managed": true}', encoding="utf-8")
-    dangling_target = tmp_path / "removed-mcp.json"
-    (managed / "mcp.json").symlink_to(dangling_target)
+    (managed / "mcp.json").symlink_to(previous_root / "mcp.json")
+    (managed / "mcp-auth.json").symlink_to(tmp_path / "removed-auth.json")
+    (managed / "git").symlink_to(global_agent / "git", target_is_directory=True)
+    (managed / "npm").mkdir()
 
     prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
 
-    assert not (managed / "keybindings.json").is_symlink()
-    assert (managed / "keybindings.json").read_text(encoding="utf-8") == '{"managed": true}'
-    assert (managed / "mcp.json").readlink() == dangling_target
-
-
-def test_prepare_managed_pi_agent_dir_without_global_dir(tmp_path: Path) -> None:
-    """A user who never ran ``pi`` gets settings only and no links."""
-    managed = tmp_path / "managed"
-
-    prepare_managed_pi_agent_dir(
-        managed,
-        overlay={"retry": {"enabled": True}},
-        global_agent_dir=tmp_path / "missing-global",
-    )
-
-    assert sorted(entry.name for entry in managed.iterdir()) == ["settings.json"]
+    assert (managed / "mcp.json").readlink() == global_agent / "mcp.json"
+    assert (managed / "mcp-auth.json").readlink() == global_agent / "mcp-auth.json"
+    assert not (managed / "git").is_symlink() and not (managed / "git").exists()
+    assert not (managed / "npm").is_symlink() and (managed / "npm").is_dir()

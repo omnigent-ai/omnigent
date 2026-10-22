@@ -4154,9 +4154,10 @@ def test_provider_launch_scopes_picker_via_enabled_models(
     Provider-qualified refs distinguish managed models from built-in entries.
     Users can still toggle the picker back to the full catalog.
     """
-    monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
-    )
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    (global_dir / "mcp.json").write_text('{"mcpServers": {"custom": {}}}', encoding="utf-8")
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -4177,6 +4178,7 @@ def test_provider_launch_scopes_picker_via_enabled_models(
         "omnigent/claude-sonnet-4-6",
     ]
     assert settings["defaultThinkingLevel"] is None
+    assert (agent_dir / "mcp.json").resolve() == (global_dir / "mcp.json").resolve()
 
 
 @pytest.mark.parametrize("kind", ["key", "gateway"])
@@ -4192,7 +4194,6 @@ def test_setup_single_model_preserves_picker_scope(
     prior_scope: list[str] | None,
 ) -> None:
     """Selecting a default in setup must not replace existing Pi picker preferences."""
-    from omnigent.inner import pi_settings
     from omnigent.onboarding.configure_models import (
         build_gateway_provider_entry,
         build_key_provider_entry,
@@ -4224,7 +4225,7 @@ def test_setup_single_model_preserves_picker_scope(
         global_settings["enabledModels"] = prior_scope
     global_file = global_dir / "settings.json"
     global_file.write_text(json.dumps(global_settings), encoding="utf-8")
-    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
 
     provider = creds.resolve_pi_native_provider(model=override, config_loader=lambda: config)
     assert provider is not None
@@ -4256,7 +4257,7 @@ def test_provider_launch_without_curated_set_does_not_scope(
     global_settings = {"enabledModels": prior_scope} if prior_scope is not None else {}
     global_file = global_dir / "settings.json"
     global_file.write_text(json.dumps(global_settings), encoding="utf-8")
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://gateway.example/anthropic",
