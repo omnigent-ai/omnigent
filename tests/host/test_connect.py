@@ -856,6 +856,7 @@ async def test_handle_launch_spawns_subprocess(
     from omnigent.config import save_global_config
     from omnigent.host.frames import decode_host_frame, encode_host_frame
     from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+    from omnigent.preference_sync import SharedPreferenceKey
     from tests._helpers.polling import poll_until_async
     from tests.test_preference_client import MODEL, transport
 
@@ -869,6 +870,9 @@ async def test_handle_launch_spawns_subprocess(
         async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as client:
             await local.sync(client)
             local.enqueue(MODEL, "shared")
+            local.enqueue(
+                SharedPreferenceKey(kind="harness_args", name="pi-native"), ["--base", "shared"]
+            )
             await local.sync(client)
     monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, "/another/session.json")
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", PREFERENCE_SNAPSHOT_ENV)
@@ -909,8 +913,12 @@ async def test_handle_launch_spawns_subprocess(
                 sys.executable,
                 "-c",
                 "import json, pathlib, time; from omnigent.config import load_effective_config; "
+                "from omnigent.preference_arguments import adopted_arguments; "
                 f"result = pathlib.Path({str(child_result)!r}); "
-                "result.write_text(json.dumps(load_effective_config())); "
+                "config = load_effective_config(); "
+                "config['launch_args'] = adopted_arguments("
+                "'pi-native', pathlib.Path.cwd(), ['--session']); "
+                "result.write_text(json.dumps(config)); "
                 "time.sleep(10)",
             ],
             **kwargs,
@@ -958,6 +966,9 @@ async def test_handle_launch_spawns_subprocess(
         await poll_until_async(child_result.exists, timeout_s=10, interval_s=0.05)
         child_config = json.loads(child_result.read_text())
         assert child_config["model"] == ("shared" if preference_mode == "shared" else "legacy")
+        assert child_config["launch_args"] == (
+            ["--base", "shared", "--session"] if preference_mode == "shared" else ["--session"]
+        )
         assert (PREFERENCE_SNAPSHOT_ENV in spawned_env) == (preference_mode == "shared")
     finally:
         _cleanup_host(host)

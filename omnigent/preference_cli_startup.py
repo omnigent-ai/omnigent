@@ -71,3 +71,12 @@ def resolve_cli_preferences(
 def temporary_preferences_option(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
     if value:
         ctx.meta["temporary_preferences"] = True
+
+
+def cli_preferences_adopted() -> bool:
+    """Whether this invocation already resolved a frozen workspace choice."""
+    context = click.get_current_context(silent=True)
+    return context is not None and any(
+        key.startswith("preferences:") and isinstance(value, PreferenceLaunch)
+        for key, value in context.meta.items()
+    )

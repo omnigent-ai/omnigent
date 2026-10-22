@@ -9,6 +9,7 @@ at startup; browser controls and managed startup remain separate. Pending edits
 retry on host reconnect without polling between messages.
 Native Claude/Codex sessions also apply plugin toggles in private settings.
 Native startup applies adopted model defaults and retains known-unavailable choices.
+Saved native arguments are applied once by the runner, including browser launches.
 
 ## Sub-features
 
@@ -41,6 +42,8 @@ Native startup applies adopted model defaults and retains known-unavailable choi
   independently in concurrent sessions, and retain unavailable selections with warnings.
 - `shared-models`: apply the frozen model at native startup; retain an unavailable
   choice and show a startup error instead of replacing it with a default.
+- `shared-arguments`: preserve ordered argument defaults on CLI and browser
+  launches, append explicit session arguments once, and respect an explicit empty list.
 
 ## How to get to it (user POV)
 
@@ -136,7 +139,8 @@ uv run --no-sync pytest tests/test_preference_startup.py \
 ```
 
 The host scenario decodes the wire frame, builds the real launch environment,
-and spawns a Python child that loads effective defaults. The server scenario
+and spawns a Python child that loads effective defaults and composes saved native
+arguments before explicit session arguments. The server scenario
 covers multipart metadata through SQL to the outbound frame. The native matrix
 checks temporary intent in all twelve adapters' multipart requests using simulated
 HTTP. Those checks do not prove vendor model/plugin application or availability UI.
@@ -173,7 +177,11 @@ uv run --no-sync pytest tests/test_config.py tests/test_harness_startup_config.p
 - `launch-choice`: CLI dispatch tests check explicit choices and Pi argument
   ordering. The native startup tests check Claude/Codex pass-through arguments
   remain unmerged until the runner, so the configured base is applied once.
-  These are component checks, not real vendor-terminal launches.
+  Adopted launches defer this merge to the runner for all native adapters, so
+  browser launches use the same defaults. The harness-startup matrix checks
+  repeated flags, explicit empty lists and legacy compatibility; the existing
+  native sandbox/launch matrix also checks saved arguments reach the terminal
+  spec. These are component checks, not real vendor-terminal launches.
 - `inspect-host-defaults`, `session-choice`: use the linked Native harnesses and
   Composer recipes for the actual settings, terminal, new-session, in-session,
   fork, and mobile surfaces. Their results do not establish shared-preference

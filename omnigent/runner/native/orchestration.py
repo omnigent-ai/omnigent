@@ -74,6 +74,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
+from omnigent.preference_arguments import adopted_arguments
 from omnigent.preference_models import adopted_model, adopted_model_args, reject_model_substitution
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
@@ -1610,6 +1611,12 @@ async def _auto_create_opencode_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "opencode-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
+    )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     # Seed the token the shared ``serve-mcp`` reads at boot (idempotent) so the
@@ -2581,6 +2588,12 @@ async def _auto_create_pi_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "pi-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
+    )
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     # Drop stale payloads so a relaunched Pi process can't replay them.
@@ -3054,6 +3067,12 @@ async def _auto_create_cursor_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "cursor-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
+    )
     # Canonicalize the workspace (resolve symlinks / trailing slashes) so the
     # cursor TUI's cwd and the forwarder hash the SAME path — cursor keys its
     # chat store dir on ``md5(cwd)``, and a mismatch would hide the store.
@@ -3345,6 +3364,12 @@ async def _auto_create_goose_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "goose-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
+    )
     workspace = os.path.realpath(str(launch_config.workspace))
     goose_command = resolve_goose_executable()
     # GOOSE_MODE=smart_approve so Goose prompts in its TUI before sensitive tools
@@ -3545,6 +3570,12 @@ async def _auto_create_hermes_terminal(
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
         server_client=server_client,
+    )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "hermes-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     hermes_command = resolve_hermes_executable()
@@ -3781,6 +3812,12 @@ async def _auto_create_kiro_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "kiro-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
+    )
     workspace_path = launch_config.workspace
     if not workspace_path.exists():
         raise RuntimeError(f"Kiro workspace does not exist for session {session_id!r}.")
@@ -3948,6 +3985,12 @@ async def _auto_create_devin_terminal(
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
         server_client=server_client,
+    )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "devin-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
     )
     workspace_path = launch_config.workspace
     if not workspace_path.exists():
@@ -4300,6 +4343,12 @@ async def _auto_create_qwen_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "qwen-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
+    )
     workspace = os.path.realpath(str(launch_config.workspace))
     qwen_command = resolve_qwen_executable()
     # Resume the qwen TUI's own history on re-launch (resume / runner restart) so
@@ -4600,6 +4649,12 @@ async def _auto_create_kimi_terminal(
     launch_config = await _pi_native_launch_config(
         session_id=session_id,
         server_client=server_client,
+    )
+    launch_config = dataclasses.replace(
+        launch_config,
+        terminal_launch_args=adopted_arguments(
+            "kimi-native", launch_config.workspace, launch_config.terminal_launch_args
+        ),
     )
     workspace = os.path.realpath(str(launch_config.workspace))
     kimi_command = resolve_kimi_executable()
@@ -6695,6 +6750,10 @@ async def _auto_create_antigravity_terminal(
                 f"Invalid terminal_launch_args for Antigravity session {session_id!r}."
             )
         terminal_launch_args = tuple(raw_launch_args)
+
+    terminal_launch_args = tuple(
+        adopted_arguments("antigravity-native", workspace, list(terminal_launch_args)) or ()
+    )
 
     # agy's real (discovered) conversation id, persisted by a prior run's
     # forwarder. Present → resume; absent → fresh launch (the forwarder

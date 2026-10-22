@@ -385,3 +385,65 @@ def test_native_cli_persists_raw_args_not_config_merged(
     # Raw pass-through only — NOT the config-merged ("codex", "--", "userarg")
     # or ("--", "userarg") that a second merge on the runner would double.
     assert captured["args"] == ("userarg",)
+
+
+@pytest.mark.parametrize(
+    "harness",
+    [
+        "pi",
+        "cursor",
+        "goose",
+        "hermes",
+        "kiro",
+        "devin",
+        "qwen",
+        "kimi",
+        "opencode",
+        "antigravity",
+    ],
+)
+@pytest.mark.parametrize("base_args", [["--repeat", "base", "--repeat", "second"], []])
+def test_adopted_cli_to_runner_arguments_apply_once(harness, base_args, tmp_path, monkeypatch):
+    import click
+
+    from omnigent.cli import _resolve_harness_startup_args
+    from omnigent.preference_arguments import adopted_arguments
+    from omnigent.preference_cli_startup import resolve_cli_preferences
+    from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV, PreferenceLaunch
+    from omnigent.preference_sync import (
+        PreferenceNamespace,
+        SharedPreferenceEntry,
+        SharedPreferenceKey,
+    )
+    from tests._helpers.preferences import preference_snapshot
+
+    canonical = f"{harness}-native"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    path = preference_snapshot(
+        tmp_path / "snapshot",
+        identity=PreferenceNamespace(authority_id="test", user_id="alice", workspace_id="team"),
+        shared=[
+            SharedPreferenceEntry(
+                key=SharedPreferenceKey(kind="harness_args", name=canonical),
+                version=1,
+                value=base_args,
+            )
+        ],
+    )
+    launch = PreferenceLaunch.model_validate_json(path.read_bytes())
+
+    async def prepare(_server):
+        return launch
+
+    monkeypatch.setattr("omnigent.preference_cli_startup.prepare_server_preferences", prepare)
+    explicit = ("--repeat", "session")
+    with click.Context(click.Command(harness), info_name=harness):
+        resolved = resolve_cli_preferences({"server": "http://test"}, {})
+        submitted = _resolve_harness_startup_args(resolved.config, canonical, explicit)
+        assert submitted == explicit
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+    assert adopted_arguments(canonical, tmp_path, list(submitted)) == [*base_args, *explicit]
+    # A browser supplies only its explicit args and reaches the same runner boundary.
+    assert adopted_arguments(canonical, tmp_path, None) == base_args
+    monkeypatch.delenv(PREFERENCE_SNAPSHOT_ENV)
+    assert adopted_arguments(canonical, tmp_path, list(explicit)) == list(explicit)

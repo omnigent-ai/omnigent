@@ -11373,6 +11373,10 @@ def _resolve_harness_startup_args(
     :returns: The combined arg tuple: config base + CLI pass-through.
     """
     from omnigent.harness_startup_config import resolve_harness_args
+    from omnigent.preference_cli_startup import cli_preferences_adopted
+
+    if cli_preferences_adopted():
+        return cli_args
 
     return tuple(resolve_harness_args(harness, cli_args, cfg=cfg))
 

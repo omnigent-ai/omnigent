@@ -1358,11 +1358,38 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
     stub_launch(tmp_path, monkeypatch)
     if adopted:
         from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
-        from tests.test_preference_models import model_snapshot
+        from omnigent.preference_sync import (
+            PreferenceNamespace,
+            SharedPreferenceEntry,
+            SharedPreferenceKey,
+        )
+        from tests._helpers.preferences import preference_snapshot
 
         monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
         monkeypatch.setenv(
-            PREFERENCE_SNAPSHOT_ENV, str(model_snapshot(tmp_path / "preferences", "portable"))
+            PREFERENCE_SNAPSHOT_ENV,
+            str(
+                preference_snapshot(
+                    tmp_path / "preferences",
+                    identity=PreferenceNamespace(
+                        authority_id="test", user_id="alice", workspace_id="team"
+                    ),
+                    shared=[
+                        SharedPreferenceEntry(
+                            key=SharedPreferenceKey(kind="model", name="model"),
+                            version=1,
+                            value="portable",
+                        ),
+                        SharedPreferenceEntry(
+                            key=SharedPreferenceKey(
+                                kind="harness_args", name=f"{terminal_name}-native"
+                            ),
+                            version=1,
+                            value=["--preference-test", "base"],
+                        ),
+                    ],
+                )
+            ),
         )
         if terminal_name == "devin":
             monkeypatch.setattr(
@@ -1429,6 +1456,8 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
     assert captured["parent_os_env"] is agent_os_env
     if adopted:
         spec = captured["spec"]
+        assert spec.args.count("--preference-test") == 1
+        assert spec.args[spec.args.index("--preference-test") + 1] == "base"
         if terminal_name == "goose":
             assert spec.env["GOOSE_MODEL"] == "portable"
         else:
