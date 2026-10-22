@@ -64,7 +64,8 @@ class PortableConfiguration(ProtocolModel):
                 if not isinstance(settings, Mapping):
                     raise ValueError(f"Local harness configuration is not a mapping: {name}")
                 if settings.get("args") is not None:
-                    arguments[name] = settings["args"]
+                    key = PreferenceKey(PreferenceKind.HARNESS_ARGS, name)
+                    arguments[key.name] = settings["args"]
         elif harness is None or isinstance(harness, str):
             default = harness
         else:

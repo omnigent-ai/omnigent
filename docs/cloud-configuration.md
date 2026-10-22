@@ -4,6 +4,8 @@ Save a portable snapshot from an existing machine, then review and import it
 on another. Later edits stay local until you explicitly save and import again.
 The server must enable preference storage with a stable
 `shared_preferences_authority_id`; use your normal server login.
+Use a trusted HTTPS server outside local loopback tests: the CLI uses the normal
+credential resolver, which can fall back to ambient Databricks credentials.
 
 ```sh
 omnigent config cloud --server "$SERVER_URL" save
@@ -42,7 +44,8 @@ leaves local opt-outs alone. A snapshot without an opt-out block also leaves
 local opt-outs unchanged.
 
 `onboard` offers save/import once per interactive server/login context and
-remembers a decline. It does nothing without both input and output terminals.
+remembers a decline. With a server selected, it does nothing without both input
+and output terminals. A missing server still produces a configuration error.
 Explicit `save` and `import` always remain available. OSS startup does not call
 this hook automatically; managed launcher integration is separate.
 
@@ -58,3 +61,15 @@ revision. Saves include the current identity and expected revision, reject stale
 changes, and do not accumulate history. Portable JSON is limited to 12,000 bytes;
 the PUT body is limited to 16,000 bytes. The existing preferences table needs no
 new session column or migration.
+
+Imports rewrite YAML formatting and comments, and replace symlinked files with
+regular files. Backups retain the original bytes, including any credentials;
+they use mode 0600 and remain until you remove them. Imported files also use mode
+0600. The local `configuration_import` receipt lets managed launchers preserve
+imported defaults during their configuration reconciliation.
+
+The current format rejects unknown fields; future additions need a compatible
+protocol/version transition. Older or disabled servers return 404. Request
+validation errors use a short `detail` string; streaming request bodies are not
+described in OpenAPI. See the [shared API limits](shared-preferences-api.md#storage-and-limits)
+for admission behavior shared by both APIs.

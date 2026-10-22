@@ -84,17 +84,29 @@ def test_invalid_local_values_cannot_be_saved_as_missing_defaults(config):
         PortableConfiguration.from_config(config)
 
 
-def test_imported_arguments_preserve_alias_commands_at_launch_resolution():
+@pytest.mark.parametrize(
+    "entries",
+    [
+        {"claude": {"args": ["--verbose"]}},
+        {"claude": {"args": ["--verbose"]}, "claude-sdk": {"args": ["--debug"]}},
+        {"claude-sdk": {"args": ["--debug"]}, "claude": {"args": []}},
+        {"claude": {"args": ["--verbose"]}, "claude-sdk": {"command": "/source/claude"}},
+    ],
+)
+def test_imported_arguments_preserve_alias_commands_at_launch_resolution(entries):
     from omnigent.harness_startup_config import resolve_harness_config
 
-    configuration = PortableConfiguration.from_config(
-        {"harness": {"claude": {"args": ["--verbose"]}}}
-    )
+    source = {"harness": entries}
+    _, source_overrides = resolve_harness_config(source)
+    configuration = PortableConfiguration.from_config(source)
     applied = configuration.apply_to(
         {"harness": {"claude": {"command": "/local/claude", "args": ["old"]}}}
     )
     _, overrides = resolve_harness_config(applied)
-    assert overrides["claude-sdk"] == {"command": "/local/claude", "args": ["--verbose"]}
+    assert overrides["claude-sdk"] == {
+        "command": "/local/claude",
+        "args": source_overrides["claude-sdk"]["args"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -185,12 +197,23 @@ def test_reviewed_import_and_recovery(tmp_path, monkeypatch, scenario):
             assert plugins.read_bytes() == plugin_original
 
 
-def test_saving_without_plugin_file_keeps_existing_plugin_preferences(tmp_path, monkeypatch):
+@pytest.mark.parametrize("oversized", [False, True])
+def test_saving_without_plugin_file_keeps_existing_plugin_preferences(
+    tmp_path, monkeypatch, oversized
+):
     import omnigent.configuration_commands as commands
 
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    (tmp_path / "config.yaml").write_text("model: new\nproviders:\n  private: local-only\n")
-    plugins = PluginOptOuts(opted_out=["lite"], disable_all=True)
+    local = {"model": "new", "providers": {"private": "local-only"}}
+    if oversized:
+        local["harness"] = {"codex-native": {"args": ["x" * 11000]}}
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(local))
+    plugins = PluginOptOuts(
+        opted_out=[f"plugin-{number:03d}-" + "p" * 100 for number in range(20)]
+        if oversized
+        else ["lite"],
+        disable_all=True,
+    )
     snapshot = ConfigurationSnapshot(
         identity=PreferenceNamespace(authority_id="a", user_id="u", workspace_id="1"),
         revision=1,
@@ -200,6 +223,7 @@ def test_saving_without_plugin_file_keeps_existing_plugin_preferences(tmp_path, 
     async def request(server, operation=None):
         if operation is None:
             return snapshot
+        assert not oversized, "Oversized snapshots must be rejected before upload"
         assert operation.configuration.plugin_opt_outs == plugins
         assert operation.configuration.model == "new"
         assert "local-only" not in operation.model_dump_json()
@@ -209,7 +233,23 @@ def test_saving_without_plugin_file_keeps_existing_plugin_preferences(tmp_path, 
 
     monkeypatch.setattr(commands, "_request", request)
     result = CliRunner().invoke(cloud, ["--server", "http://local", "save", "--yes"])
-    assert result.exit_code == 0, result.output
+    if oversized:
+        assert result.exit_code == 1 and "exceeds 12000 bytes" in result.output
+    else:
+        assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("userinfo", ["user", "user:password", ":password", ""])
+def test_cloud_rejects_url_userinfo_before_contacting_server(tmp_path, monkeypatch, userinfo):
+    import omnigent.configuration_commands as commands
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        commands, "_request", lambda *_args: pytest.fail("invalid URL must not be contacted")
+    )
+    result = CliRunner().invoke(cloud, ["--server", f"https://{userinfo}@example.test", "show"])
+    assert result.exit_code == 1
+    assert "without credentials" in result.output
 
 
 @pytest.mark.parametrize("interactive", [True, False])

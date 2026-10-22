@@ -114,7 +114,7 @@ def cloud(ctx: click.Context, server: str | None, plugin_opt_outs: Path | None) 
     if (
         parsed.scheme not in ("http", "https")
         or not parsed.netloc
-        or parsed.username
+        or parsed.username is not None
         or parsed.fragment
     ):
         raise ValueError("Use the server API URL without credentials or fragment")
