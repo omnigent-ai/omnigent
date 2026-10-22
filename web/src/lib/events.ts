@@ -721,6 +721,8 @@ export interface SessionSandboxStatusEvent {
   error: string | null;
   /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
   provider?: string;
+  /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
+  details?: string | null;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */

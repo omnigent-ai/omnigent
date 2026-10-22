@@ -112,24 +112,27 @@ def test_blocked_reason_reaches_the_live_working_indicator(
     expect(working).to_be_hidden(timeout=10_000)
 
 
-def test_dbcert_banner_follows_the_arclet_launch(
+def test_action_banner_follows_the_launch(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """A launch that reports ``dbcert_missing`` warns until it moves on."""
+    """A launch that reports ``action_required`` shows its details until it moves on."""
     chat = chat_session_contract
     chat.set_health(runner_online=False, host_online=True)
     chat.update_session(
         created_at=time.time(),
         host_id=None,
         workspace=None,
-        sandbox_status={"stage": "dbcert_missing", "provider": "arclet"},
+        sandbox_status={
+            "stage": "action_required",
+            "provider": "arclet",
+            "details": "Refresh your dbcert on your laptop.",
+        },
     )
     page.goto(chat.url)
     chat.wait_for_stream()
-    banner = page.get_by_role("status").filter(has_text="hasn't received your dbcert")
+    banner = page.get_by_role("status").filter(has_text="Refresh your dbcert on your laptop.")
     expect(banner).to_be_visible(timeout=20_000)
-    expect(banner).to_contain_text("click dbcert in the Arca Companion menu on your laptop")
 
     # The dbcert arrives. Like the server, update the snapshot as well as the stream.
     chat.update_session(sandbox_status={"stage": "provisioning", "provider": "arclet"})

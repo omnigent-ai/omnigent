@@ -5654,6 +5654,18 @@
       "SandboxStatus": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nCarried on the session snapshot only while the session's\nbackground sandbox launch is in flight or has failed; `None`\nfor sessions without a managed launch and once the launch\nsucceeds (the session then looks like any host-bound session).",
         "properties": {
+          "details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the user needs to do when `stage == \"action_required\"`, e.g. `\"Refresh your dbcert on your laptop.\"`. `None` otherwise.",
+            "title": "Details"
+          },
           "error": {
             "anyOf": [
               {
@@ -5679,10 +5691,10 @@
             "title": "Provider"
           },
           "stage": {
-            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox; `dbcert_missing` while it also lacks its owner's dbcert) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
+            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox; `action_required` while it also needs the user to act) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
             "enum": [
               "provisioning",
-              "dbcert_missing",
+              "action_required",
               "cloning",
               "starting",
               "connecting",
@@ -8267,6 +8279,19 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What the user needs to do when `stage == \"action_required\"`, e.g. `\"Refresh your dbcert on your laptop.\"`. `None` otherwise. Category: **transient** (SSE-only). On reconnect, clients seed the progress indicator from the session snapshot's `sandbox_status` field, which is populated by `_session_sandbox_status_cache` at snapshot build time.",
+            "title": "Details"
+          },
           "error": {
             "anyOf": [
               {
@@ -8277,7 +8302,7 @@
               }
             ],
             "default": null,
-            "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise. Category: **transient** (SSE-only). On reconnect, clients seed the progress indicator from the session snapshot's `sandbox_status` field, which is populated by `_session_sandbox_status_cache` at snapshot build time.",
+            "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise.",
             "title": "Error"
           },
           "provider": {
@@ -8310,7 +8335,7 @@
             "description": "The launch stage just entered, e.g. `\"provisioning\"` \u2014 see `SandboxStatus` for the full pipeline order.",
             "enum": [
               "provisioning",
-              "dbcert_missing",
+              "action_required",
               "cloning",
               "starting",
               "connecting",

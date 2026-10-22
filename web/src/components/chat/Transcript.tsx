@@ -26,7 +26,7 @@ import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
 import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
-import { ArcletDbcertBanner, DbcertBanner } from "@/components/DbcertBanner";
+import { DbcertBanner } from "@/components/DbcertBanner";
 import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
@@ -34,7 +34,11 @@ import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
+import {
+  RunnerStartingIndicator,
+  McpStartupIndicator,
+  SandboxActionBanner,
+} from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
   type ConversationScroller,
@@ -434,11 +438,11 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs and dbcert warnings, siblings of Conversation. */}
+        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
         <FloatingBannerStack>
           <StreamBudgetBanner />
           <DbcertBanner conversationId={conversationId} hostId={hostId} />
-          <ArcletDbcertBanner />
+          <SandboxActionBanner />
         </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
         {!isMobileViewport && (

@@ -2012,12 +2012,12 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal. ``dbcert_missing`` is a warning while
-# provisioning, from deployments that can tell: the sandbox (a Databricks
-# Arclet) hasn't received its owner's dbcert, so its host may not connect.
+# ``failed`` are terminal. ``action_required`` is a warning while
+# provisioning: the user needs to do something, described by the status's
+# ``details``, before the sandbox's host can connect.
 SandboxLaunchStage = Literal[
     "provisioning",
-    "dbcert_missing",
+    "action_required",
     "cloning",
     "starting",
     "connecting",
@@ -2037,8 +2037,8 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox; ``dbcert_missing``
-        while it also lacks its owner's dbcert) → ``cloning``
+        ``provisioning`` (creating the sandbox; ``action_required``
+        while it also needs the user to act) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
@@ -2048,11 +2048,15 @@ class SandboxStatus(BaseModel):
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Refresh your dbcert on your laptop."``.
+        ``None`` otherwise.
     """
 
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
 
 
 class NativeUsageBaseline(BaseModel):
@@ -3647,6 +3651,9 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Refresh your dbcert on your laptop."``.
+        ``None`` otherwise.
 
     Category: **transient** (SSE-only). On reconnect, clients seed the
     progress indicator from the session snapshot's ``sandbox_status``
@@ -3659,6 +3666,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
 
 
 class McpServerStartup(BaseModel):

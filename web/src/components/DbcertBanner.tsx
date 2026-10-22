@@ -1,5 +1,5 @@
 import { AlertTriangleIcon, XIcon } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useHostDbcert } from "@/hooks/useHostDbcert";
 import {
@@ -8,9 +8,7 @@ import {
   hasDbcertRefreshBridge,
   refreshDbcert,
 } from "@/lib/nativeBridge";
-import type { SandboxStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { useChatStore } from "@/store/chatStore";
 
 /**
  * Warns that the dbcert on this session's host has expired and
@@ -113,49 +111,17 @@ export function LaptopDbcertBanner({
   );
 }
 
-/**
- * Warns while a managed Arclet's launch reports `dbcert_missing`: the Arclet
- * hasn't received its owner's dbcert, so its host may not connect. Only a
- * warning, since the launch keeps going, and it leaves once the launch moves
- * on. It says how to refresh the dbcert on the laptop, where Arca Companion
- * copies it from.
- */
-export function ArcletDbcertBanner() {
-  const status = useChatStore((s) => s.sandboxStatus);
-  // Each launch report is a new object, so a dismissal hides only the report it was shown for:
-  // a later warning shows again, and so does one in another session.
-  const [dismissed, setDismissed] = useState<ReadonlySet<SandboxStatus>>(() => new Set());
-  if (status?.stage !== "dbcert_missing" || dismissed.has(status)) return null;
-  return (
-    <DbcertRefreshBanner
-      message="Your Arclet hasn't received your dbcert yet, so its host may not connect."
-      detail={
-        <>
-          To refresh it, click dbcert in the Arca Companion menu on your laptop, or run{" "}
-          <code className="font-mono">dbcert</code> there. Arca Companion then copies it to your
-          Arclet.
-        </>
-      }
-      onDismiss={() => setDismissed((current) => new Set(current).add(status))}
-    />
-  );
-}
-
 function DbcertRefreshBanner({
   message,
-  detail,
-  running = false,
-  error = null,
+  running,
+  error,
   onRefresh,
   onDismiss,
 }: {
   message: string;
-  /** A second line, e.g. how to refresh the dbcert somewhere else. */
-  detail?: ReactNode;
-  running?: boolean;
-  error?: string | null;
-  /** Omitted when the banner can't refresh the dbcert itself. */
-  onRefresh?: () => void;
+  running: boolean;
+  error: string | null;
+  onRefresh: () => void;
   onDismiss: () => void;
 }) {
   return (
@@ -172,7 +138,6 @@ function DbcertRefreshBanner({
       <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
       <div className="min-w-0 flex-1">
         <p>{message}</p>
-        {detail && <p className="mt-0.5 opacity-80">{detail}</p>}
         {running && (
           <p className="mt-0.5 opacity-80">
             Opening browser sign-in. Complete sign-in to refresh your dbcert.
@@ -180,20 +145,17 @@ function DbcertRefreshBanner({
         )}
         {error && <p className="mt-0.5 opacity-80">{error}</p>}
       </div>
-      {onRefresh && (
-        <button
-          type="button"
-          disabled={running}
-          onClick={onRefresh}
-          className={cn(
-            "shrink-0 rounded-md border border-amber-400 px-2 py-0.5 font-medium",
-            "hover:bg-amber-200 disabled:opacity-60",
-            "dark:border-amber-700 dark:hover:bg-amber-900",
-          )}
-        >
-          {running ? "Refreshing…" : error ? "Try again" : "Refresh dbcert"}
-        </button>
-      )}
+      <button
+        type="button"
+        disabled={running}
+        onClick={onRefresh}
+        className={cn(
+          "shrink-0 rounded-md border border-amber-400 px-2 py-0.5 font-medium hover:bg-amber-200 disabled:opacity-60",
+          "dark:border-amber-700 dark:hover:bg-amber-900",
+        )}
+      >
+        {running ? "Refreshing…" : error ? "Try again" : "Refresh dbcert"}
+      </button>
       <button
         type="button"
         onClick={onDismiss}

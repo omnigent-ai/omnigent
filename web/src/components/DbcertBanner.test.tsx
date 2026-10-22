@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ArcletDbcertBanner, DbcertBanner, LaptopDbcertBanner } from "./DbcertBanner";
+import { DbcertBanner, LaptopDbcertBanner } from "./DbcertBanner";
 import type * as HostModule from "@/lib/host";
 import { isDatabricksWorkspace } from "@/lib/host";
 import type * as HostDbcertModule from "@/lib/hostDbcert";
@@ -10,9 +10,6 @@ import {
   readHostDbcertExpiry,
   startHostDbcertRefresh,
 } from "@/lib/hostDbcert";
-import type { SandboxStatus } from "@/lib/types";
-import { bindConversationForTest, handleSessionEvent } from "@/store/chatStore";
-import { conversationRegistry } from "@/store/conversationRegistry";
 
 const NOW = Date.UTC(2026, 9, 18, 21);
 const EXPIRED = Date.UTC(2026, 9, 18, 20, 8, 15);
@@ -397,84 +394,4 @@ describe("LaptopDbcertBanner", () => {
       expect(desktopCheck).toHaveBeenCalledTimes(verifying ? 1 : 0);
     },
   );
-});
-
-describe("ArcletDbcertBanner", () => {
-  const MISSING: SandboxStatus = { stage: "dbcert_missing", error: null, provider: "arclet" };
-
-  /** Put *conversationId* on screen, seeded with *sandboxStatus* when given. */
-  function showSession(conversationId: string, sandboxStatus?: SandboxStatus | null) {
-    act(() => {
-      bindConversationForTest(
-        conversationId,
-        sandboxStatus === undefined ? undefined : { sandboxStatus },
-      );
-    });
-  }
-
-  /** Deliver a launch report on the session's own stream, as the server does. */
-  function report(conversationId: string, stage: "dbcert_missing" | "provisioning") {
-    act(() =>
-      handleSessionEvent(
-        { type: "session_sandbox_status", conversationId, stage, error: null, provider: "arclet" },
-        conversationId,
-      ),
-    );
-  }
-
-  afterEach(() => {
-    cleanup();
-    conversationRegistry.clear();
-    bindConversationForTest(null);
-  });
-
-  it("says how to refresh a dbcert the Arclet hasn't received", () => {
-    showSession("conv_a", MISSING);
-    render(<ArcletDbcertBanner />);
-    const warning = screen.getByRole("status");
-    expect(warning).toHaveTextContent(/hasn't received your dbcert/i);
-    expect(warning).toHaveTextContent(/click dbcert in the Arca Companion menu on your laptop/i);
-    expect(screen.queryByRole("button", { name: "Refresh dbcert" })).toBeNull();
-  });
-
-  it.each([
-    ["no launch", null],
-    ["a launch that has its dbcert", { stage: "provisioning", error: null }],
-    ["a failed launch", { stage: "failed", error: "managed host did not come online" }],
-  ] as const)("stays hidden for %s", (_label, status) => {
-    showSession("conv_a", status);
-    render(<ArcletDbcertBanner />);
-    expect(screen.queryByRole("status")).toBeNull();
-  });
-
-  it("goes away once the launch moves on", () => {
-    showSession("conv_a", MISSING);
-    render(<ArcletDbcertBanner />);
-    report("conv_a", "provisioning");
-    expect(screen.queryByRole("status")).toBeNull();
-  });
-
-  it("keeps each session's dismissal", () => {
-    showSession("conv_a");
-    report("conv_a", "dbcert_missing");
-    render(<ArcletDbcertBanner />);
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(screen.queryByRole("status")).toBeNull();
-    showSession("conv_b");
-    report("conv_b", "dbcert_missing");
-    expect(screen.getByRole("status")).toHaveTextContent(/hasn't received your dbcert/i);
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    showSession("conv_a");
-    expect(screen.queryByRole("status")).toBeNull();
-  });
-
-  it("shows a later warning in the same session after a dismissal", () => {
-    showSession("conv_a");
-    report("conv_a", "dbcert_missing");
-    render(<ArcletDbcertBanner />);
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    report("conv_a", "provisioning");
-    report("conv_a", "dbcert_missing");
-    expect(screen.getByRole("status")).toHaveTextContent(/hasn't received your dbcert/i);
-  });
 });

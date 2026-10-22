@@ -5487,7 +5487,7 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, "failed", reason)
         return
 
-    def _on_stage(stage: str) -> None:
+    def _on_stage(stage: str, details: str | None = None) -> None:
         """Relay the wake's launch-pipeline stage to the session's progress surface.
 
         Without it the wake shows the single ``"provisioning"`` band that
@@ -5495,8 +5495,11 @@ async def _run_managed_wake(
         is already re-execing. resume_managed_host may invoke this from the
         worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
         thread-safe.
+
+        :param stage: The stage just entered, e.g. ``"starting"``.
+        :param details: What the user needs to do, for ``"action_required"``.
         """
-        _publish_sandbox_status(session_id, stage)
+        _publish_sandbox_status(session_id, stage, details=details)
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight

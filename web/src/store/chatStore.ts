@@ -7650,7 +7650,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation(
         event.stage === "ready"
           ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
-          : { sandboxStatus: { stage: event.stage, error: event.error, provider: event.provider } },
+          : {
+              sandboxStatus: {
+                stage: event.stage,
+                error: event.error,
+                provider: event.provider,
+                details: event.details,
+              },
+            },
       );
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.

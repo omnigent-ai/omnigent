@@ -1,4 +1,5 @@
-import { Loader2Icon, WifiOffIcon } from "lucide-react";
+import { AlertTriangleIcon, Loader2Icon, WifiOffIcon, XIcon } from "lucide-react";
+import { useState } from "react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -9,6 +10,51 @@ import { cn } from "@/lib/utils";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { useChatStore } from "@/store/chatStore";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+
+/**
+ * Warns while a managed launch reports `action_required`: the user needs to do
+ * something, which the launch's `details` describe, before the sandbox's host
+ * can connect. Only a warning, since the launch keeps going, and it leaves once
+ * the launch moves on. Styled like `DbcertBanner`, which it sits beside in the
+ * transcript's `FloatingBannerStack`.
+ */
+export function SandboxActionBanner() {
+  const status = useChatStore((s) => s.sandboxStatus);
+  // Each launch report is a new object, so a dismissal hides only the report it was shown for:
+  // a later warning shows again, and so does one in another session.
+  const [dismissed, setDismissed] = useState<ReadonlySet<SandboxStatus>>(() => new Set());
+  if (status?.stage !== "action_required" || !status.details || dismissed.has(status)) {
+    return null;
+  }
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className={cn(
+        "pointer-events-auto flex max-w-2xl items-center gap-2.5 rounded-xl",
+        "px-3.5 py-2 text-ui shadow-lg",
+        "border border-amber-300 bg-amber-100 text-amber-900",
+        "dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-100",
+        "animate-in fade-in-0 slide-in-from-top-1 duration-200",
+      )}
+    >
+      <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
+      <p className="min-w-0 flex-1">{status.details}</p>
+      <button
+        type="button"
+        onClick={() => setDismissed((current) => new Set(current).add(status))}
+        aria-label="Dismiss"
+        className={cn(
+          "-mr-1 shrink-0 rounded p-0.5 text-amber-900/60",
+          "hover:bg-amber-200 hover:text-amber-900",
+          "dark:text-amber-100/60 dark:hover:bg-amber-900 dark:hover:text-amber-100",
+        )}
+      >
+        <XIcon className="size-4" aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
 
 /**
  * Failure band for a managed-sandbox session whose background launch
