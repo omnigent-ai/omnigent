@@ -187,7 +187,7 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
 
 
 _SPEND_LIMIT_ERROR = (
-    'API Error: 403 {"error":{"type":"permission_error",'
+    'Please run /login · API Error: 403 {"error":{"type":"permission_error",'
     '"message":"Synthetic spend limit reached"}}'
 )
 _MAIN_API_ERROR: dict[str, object] = {
@@ -349,6 +349,8 @@ async def test_api_error_survives_next_turn_opening_before_stop_failure(
     assert context["detail_source"] == "explicit_api_error"
     assert context["native_record_id"] == "main-error"
     assert context["native_agent_role"] == "session_agent"
+    assert context["http_status"] == 403
+    assert context["provider_error_type"] == "permission_error"
 
 
 @pytest.mark.asyncio
@@ -646,7 +648,14 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
     assert "omnigent-event-post-id" not in str(attrs)
 
 
-def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "text",
+    [
+        "API Error: 400 is an example of the response.",
+        'Please run /login · API Error: 403 Budget "example" has reached its limit.',
+    ],
+)
+def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path, text: str) -> None:
     path = tmp_path / "session.jsonl"
     path.write_text(
         json.dumps(
@@ -655,7 +664,7 @@ def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path) -> 
                 "uuid": "prose",
                 "message": {
                     "role": "assistant",
-                    "content": "API Error: 400 is an example of the response.",
+                    "content": text,
                 },
             }
         )
@@ -663,6 +672,7 @@ def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path) -> 
     )
     _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
     assert items[0].failure_context is None
+    assert items[0].data["content"][0]["text"] == text
 
 
 def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Path) -> None:
