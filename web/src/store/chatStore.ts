@@ -4476,7 +4476,11 @@ function sessionBindingPatch(
   session: Session,
   state: Pick<
     ConversationState,
-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+    | "mcpStartupLaunch"
+    | "sessionModelSeeded"
+    | "llmModel"
+    | "sessionModelOverride"
+    | "sandboxActionDismissed"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
@@ -4501,6 +4505,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "sandboxActionDismissed"
   | "startupPending"
   | "mcpStartup"
   | "mcpStartupLaunch"
@@ -4537,6 +4542,9 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    // A reload that shows the launch moved on ends the dismissal of its last warning.
+    sandboxActionDismissed:
+      session.sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null,
     // "ready" with saved inputs left: a native first input awaits its transcript
     // receipt, and the server still saves new messages behind it.
     startupPending:

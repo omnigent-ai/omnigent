@@ -7454,6 +7454,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
     });
 
+    it.each([
+      ["clears it when the launch moved on", "provisioning", null],
+      ["keeps it while the launch still asks", "action_required", "Sign in."],
+    ] as const)(
+      "a reloaded snapshot of a dismissed warning %s",
+      async (_label, stage, dismissed) => {
+        useChatStore.setState({
+          conversationId: "conv_abc",
+          sandboxStatus: { stage: "action_required", error: null, details: "Sign in." },
+          sandboxActionDismissed: "Sign in.",
+        });
+        fetchMock.mockImplementation(() =>
+          mockResponse({
+            id: "conv_abc",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: {},
+            sandbox_status: {
+              stage,
+              error: null,
+              details: stage === "action_required" ? "Sign in." : null,
+            },
+          }),
+        );
+        await useChatStore.getState().refreshSessionState("conv_abc");
+        expect(useChatStore.getState().sandboxStatus?.stage).toBe(stage);
+        expect(useChatStore.getState().sandboxActionDismissed).toBe(dismissed);
+      },
+    );
+
     it("advances the provisioning indicator through launch stages", () => {
       useChatStore.setState({
         sandboxStatus: { stage: "provisioning", error: null },

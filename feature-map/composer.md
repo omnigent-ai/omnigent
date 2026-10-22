@@ -91,8 +91,8 @@ and steers messages while the agent is busy.
   renewal. States: valid, invalid, checking, skipped, refreshing, failed, and
   CLI not installed.
 - `launch-action-required`: while a managed launch needs the user to do
-  something, such as an Arclet waiting for its owner's dbcert, the session page
-  shows a yellow banner with the deployment's instructions. Provisioning
+  something, such as an Arclet waiting for its owner's dbcert, the session's chat
+  transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
@@ -150,8 +150,9 @@ and steers messages while the agent is busy.
   without waiting for verification or opening sign-in. Later launches check again.
 - On a deployment whose launches report that the user needs to act, such as
   Databricks' managed Arclets, start a managed session whose launch needs you,
-  e.g. an Arclet whose owner's dbcert hasn't arrived. The session page keeps
-  showing **Provisioning sandbox…** and adds a yellow banner saying what to do.
+  e.g. an Arclet whose owner's dbcert hasn't arrived. The session's chat
+  transcript keeps showing **Provisioning sandbox…** and adds a yellow banner
+  saying what to do. The terminal view doesn't show it.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
@@ -441,7 +442,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/shell/NewChatDialog.test.tsx` and
   `web/src/components/DbcertBanner.test.tsx` cover leaving during a check, late
   results after skipping, retry, dismissal, check errors, and older shells.
-- **`launch-action-required`, session page:**
+- **`launch-action-required`, session chat transcript:**
   `tests/browser_ui/chat/test_status_indicators.py::test_action_banner_follows_the_launch`
   shows the snapshot's instructions in the banner and clears it when the stream
   moves on. Component tests in `web/src/pages/ChatIndicators.test.tsx` cover
