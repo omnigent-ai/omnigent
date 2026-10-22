@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from unittest.mock import Mock
 from urllib.parse import parse_qs
@@ -393,7 +393,7 @@ async def test_permission_denied_retry_after_controls_outbox_and_shared_cooldown
     )
     assert config is not None
     clock = [110.0]
-    wall_clock = datetime(2026, 10, 2, 12, 0, 0, 250000, tzinfo=timezone.utc)
+    wall_clock = datetime(2026, 10, 2, 12, 0, 0, 250000, tzinfo=UTC)
 
     class FrozenDateTime(datetime):
         @classmethod
