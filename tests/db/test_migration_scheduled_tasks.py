@@ -655,6 +655,8 @@ def test_dispatch_downgrade_refuses_out_of_range_timestamps(
 
 @pytest.mark.parametrize("dialect", ["sqlite", "postgresql", "mysql", "cockroachdb"])
 def test_dispatch_downgrade_requires_live_connection(dialect: str) -> None:
+    if dialect == "cockroachdb":
+        pytest.importorskip("sqlalchemy_cockroachdb")
     config = _build_alembic_config(f"{dialect}://")
     config.output_buffer = StringIO()
     with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
