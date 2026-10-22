@@ -9,7 +9,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import click
 import httpx
@@ -24,6 +24,7 @@ from omnigent.configuration_profile import (
     PluginOptOuts,
     PortableConfiguration,
 )
+from omnigent.util.server_url import ServerUrl
 
 _ROUTE = "/v1/preferences/configuration"
 
@@ -61,7 +62,13 @@ def _local(plugin_path: Path | None) -> PortableConfiguration:
 async def _request(
     server: str, operation: ConfigurationSave | None = None
 ) -> ConfigurationSnapshot:
+    from omnigent.cli_auth import store_databricks_org_id
     from omnigent.runner._entry import _make_auth_token_factory
+
+    resolved = ServerUrl.from_api_base(server)
+    if resolved.is_workspace_hosted and resolved.org_id is not None:
+        store_databricks_org_id(resolved.api_base, resolved.org_id)
+    server = resolved.api_base
 
     factory = _make_auth_token_factory(
         server_url=server, _allow_initial_token=False, _allow_delegated_mint=False
@@ -100,7 +107,7 @@ def cloud(ctx: click.Context, server: str | None, plugin_opt_outs: Path | None) 
     config = load_global_config()
     if not isinstance(config, dict):
         raise ValueError("Local configuration must be a mapping")
-    selected = server or config.get("server")
+    selected = server or os.environ.get("OMNIGENT_SERVER") or config.get("server")
     if not isinstance(selected, str):
         raise ValueError("Set --server or configure a server first")
     parsed = urlsplit(selected)
@@ -108,10 +115,18 @@ def cloud(ctx: click.Context, server: str | None, plugin_opt_outs: Path | None) 
         parsed.scheme not in ("http", "https")
         or not parsed.netloc
         or parsed.username
-        or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("Use the server API URL without credentials, query or fragment")
+        raise ValueError("Use the server API URL without credentials or fragment")
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if query and (
+        set(query) != {"o"}
+        or len(query["o"]) != 1
+        or not query["o"][0].isascii()
+        or not query["o"][0].isdecimal()
+        or not ServerUrl(selected).is_workspace_hosted
+    ):
+        raise ValueError("Only the numeric ?o= workspace selector is supported")
     ctx.obj = (selected.rstrip("/"), plugin_opt_outs)
 
 
@@ -234,15 +249,12 @@ def import_configuration(options: tuple[str, Path | None], yes: bool) -> None:
     click.echo("Imported. Later changes require an explicit save and import.")
 
 
-@cloud.command("onboard")
-@click.pass_context
-def onboard(ctx: click.Context) -> None:
-    """Offer cloud save/import once per login on interactive startup."""
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        return
-    from omnigent.cli_auth import _load_entry, load_databricks_org_id
+def onboarding_marker(server: str) -> Path:
+    """Locate this login's prompt receipt without contacting the server."""
+    from omnigent.cli_auth import _load_entry
 
-    server, _ = ctx.obj
+    resolved = ServerUrl.from_api_base(server)
+    server = resolved.api_base
     entry = _load_entry(server) or {}
     account = {key: entry.get(key) for key in ("user_id", "auth_type", "workspace_host", "org_id")}
     if not entry.get("user_id"):
@@ -259,9 +271,23 @@ def onboard(ctx: click.Context) -> None:
         }
     )
     digest = hashlib.sha256(
-        json.dumps([server, load_databricks_org_id(server), account], sort_keys=True).encode()
+        json.dumps([server, resolved.org_id, account], sort_keys=True).encode()
     ).hexdigest()
-    marker = global_config_path().parent / "configuration-import-prompts" / (digest + ".json")
+    return global_config_path().parent / "configuration-import-prompts" / (digest + ".json")
+
+
+@cloud.command("onboard")
+@click.option("--check", is_flag=True, hidden=True)
+@click.pass_context
+def onboard(ctx: click.Context, check: bool) -> None:
+    """Offer cloud save/import once per login on interactive startup."""
+    if not check and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+        return
+    server, _ = ctx.obj
+    marker = onboarding_marker(server)
+    if check:
+        click.echo("complete" if marker.exists() else "pending")
+        return
     if marker.exists():
         return
     snapshot = asyncio.run(_request(server))
@@ -278,4 +304,7 @@ def onboard(ctx: click.Context) -> None:
             )
         except click.Abort:
             click.echo("Configuration left unchanged.")
-    _write_private(marker, json.dumps({"identity": snapshot.identity.model_dump()}).encode())
+    _write_private(
+        onboarding_marker(server),
+        json.dumps({"identity": snapshot.identity.model_dump()}).encode(),
+    )

@@ -239,3 +239,66 @@ def test_onboarding_is_one_time_and_noninteractive_startup_is_idle(
         cloud.main(["--server", "http://local", "onboard"], standalone_mode=False)
     assert len(calls) == (1 if interactive else 0)
     assert not (tmp_path / "config.yaml").exists()
+
+
+def test_launcher_can_check_onboarding_without_network_and_env_selects_server(
+    tmp_path, monkeypatch
+):
+    import omnigent.configuration_commands as commands
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_SERVER", "http://configured")
+    monkeypatch.setattr(
+        commands, "_request", lambda *_args: pytest.fail("unexpected network request")
+    )
+    runner = CliRunner()
+    result = runner.invoke(cloud, ["onboard", "--check"])
+    assert result.exit_code == 0 and result.output.strip() == "pending"
+    marker = commands.onboarding_marker("http://configured")
+    marker.parent.mkdir(parents=True)
+    marker.write_text("{}")
+    result = runner.invoke(cloud, ["onboard", "--check"])
+    assert result.exit_code == 0 and result.output.strip() == "complete"
+    monkeypatch.setenv("OMNIGENT_API_KEY", "another-login")
+    result = runner.invoke(cloud, ["onboard", "--check"])
+    assert result.exit_code == 0 and result.output.strip() == "pending"
+
+
+async def test_workspace_selector_uses_normal_auth_and_routing(tmp_path, monkeypatch):
+    import httpx
+
+    import omnigent.configuration_commands as commands
+    import omnigent.runner._entry as entry
+    from omnigent.cli_auth import (
+        load_databricks_org_id,
+        open_server_client,
+        store_databricks_org_id,
+    )
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    base = "https://workspace.example/api/2.0/omnigent"
+    store_databricks_org_id(base, "111")
+    identity = PreferenceNamespace(authority_id="a", user_id="u", workspace_id="222")
+
+    def token_factory(**options):
+        assert options["server_url"] == base
+        assert load_databricks_org_id(base) == "222"
+        return lambda: "test-token"
+
+    def respond(request):
+        assert str(request.url) == base + "/v1/preferences/configuration"
+        assert request.headers["X-Databricks-Org-Id"] == "222"
+        assert request.headers["Authorization"] == "Bearer test-token"
+        return httpx.Response(200, json=ConfigurationSnapshot(identity=identity).model_dump())
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", token_factory)
+    monkeypatch.setattr(
+        commands,
+        "open_server_client",
+        lambda *args, **kwargs: open_server_client(
+            *args, **kwargs, transport=httpx.MockTransport(respond)
+        ),
+    )
+    result = await commands._request(base + "?o=222")
+    assert result.identity == identity
+    assert commands.onboarding_marker(base + "?o=222") == commands.onboarding_marker(base)
