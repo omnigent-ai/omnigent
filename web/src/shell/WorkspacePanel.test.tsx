@@ -372,7 +372,7 @@ describe("WorkspacePanel surface presentation", () => {
     view.unmount();
     renderWorkspace({ selectedFilePath: "a.txt", openFiles: ["a.txt"] });
     expect(screen.getByTestId("uploads-tray-stub")).toBeTruthy();
-    expect(screen.queryByTestId("upload-root-stub")).toBeNull();
+    expect(screen.getByTestId("upload-root-stub").closest(".invisible")).not.toBeNull();
   });
   it("offers unpinned pages in + without requiring shell or browser support", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
@@ -856,18 +856,18 @@ describe("WorkspacePanel content area", () => {
       selectedFilePath: null,
     });
     const panel = screen.getByTestId("files-panel-stub");
-    expect(panel.parentElement).not.toHaveClass("invisible");
+    expect(panel.closest(".invisible")).toBeNull();
 
     rerender({ selectedFilePath: "src/App.tsx" });
     // The viewer owns the slot; the scope panel stays mounted (same node, so
     // tree state survives) inside an invisible wrapper.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel.parentElement).toHaveClass("invisible");
+    expect(panel.closest(".invisible")).not.toBeNull();
 
     rerender({ selectedFilePath: null });
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel.parentElement).not.toHaveClass("invisible");
+    expect(panel.closest(".invisible")).toBeNull();
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
@@ -956,7 +956,7 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ selectedTerminalKey: termKey });
     expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
-    expect(panel.parentElement).toHaveClass("invisible");
+    expect(panel.closest(".invisible")).not.toBeNull();
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
