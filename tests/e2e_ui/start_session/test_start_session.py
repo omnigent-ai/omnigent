@@ -3745,3 +3745,189 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
         with httpx.Client() as client:
             seeded = create_native_session(client, base_url, harness="codex")
         _run_in_fresh_loop(drive(base_url, seeded["session_id"]))
+
+
+def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path):
+    """Real SPA journeys; controller/create transport is stubbed and asserted."""
+    import httpx
+
+    from tests._helpers.live_server import isolated_local_server
+    from tests._helpers.native_session import create_native_session
+
+    async def drive(base_url, session_id):
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(slow_mo=150)
+            page = await browser.new_page(
+                viewport={"width": 1280, "height": 900},
+                record_video_dir=str(tmp_path / "video"),
+                record_video_size={"width": 1280, "height": 900},
+            )
+            creates = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=creates
+            )
+            info = json.loads(_managed_info_body())
+            info.update(
+                databricks_features=False,
+                sandbox_provider="static",
+                sandbox_providers=["static"],
+                enabled_connections=["github"],
+                sandbox_provider_capabilities={
+                    "static": {
+                        "reusable_hosts": True,
+                        "session_workspaces": True,
+                        "multi_repo": True,
+                    }
+                },
+            )
+            host = {
+                "host_id": "host_static",
+                "name": "My static sandbox",
+                "owner": "e2e",
+                "status": "online",
+                "sandbox_provider": "static",
+                "sandbox_attached": True,
+                "sandbox_id": "box-1",
+                "configured_harnesses": {"claude-native": True},
+            }
+            repos = [
+                {
+                    "full_name": f"example/{name}",
+                    "clone_url": f"https://github.com/example/{name}.git",
+                    "default_branch": "main",
+                    "private": False,
+                }
+                for name in ("api", "web")
+            ]
+            await page.route("**/v1/info", lambda route: route.fulfill(json=info))
+            await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": [host]}))
+            await page.route(
+                "**/v1/hosts/sandboxes?provider=static",
+                lambda route: route.fulfill(
+                    json={
+                        "sandboxes": [
+                            {
+                                "sandbox_id": "box-1",
+                                "name": "My static sandbox",
+                                "state": "running",
+                            }
+                        ],
+                    }
+                ),
+            )
+            await page.route(
+                "**/v1/connections/github/repos",
+                lambda route: route.fulfill(
+                    json={
+                        "connected": True,
+                        "repos": repos,
+                    }
+                ),
+            )
+            await page.route(
+                "**/v1/connections/github/repos/*/*/branches*",
+                lambda route: route.fulfill(
+                    json={
+                        "connected": True,
+                        "branches": ["main", "release", "fix/login"],
+                    }
+                ),
+            )
+
+            await page.route(
+                "**/v1/hosts/host_static/harnesses/claude-native/model-options",
+                lambda route: route.fulfill(
+                    json={"models": [{"id": "sonnet", "displayName": "Sonnet"}]}
+                ),
+            )
+
+            async def submit(message, expected):
+                await page.get_by_test_id("new-chat-landing-input").fill(message)
+                await page.get_by_test_id("new-chat-landing-submit").click()
+                await poll_until_async(lambda: len(creates) == expected)
+                await expect(page).to_have_url(re.compile(rf"/c/{session_id}$"))
+                await page.goto(f"{base_url}/")
+
+            async def add_repo(name):
+                await page.get_by_test_id("new-chat-landing-repo-select").click()
+                await page.get_by_role("option", name=f"example/{name}").click()
+
+            try:
+                await page.goto(f"{base_url}/")
+                await page.get_by_test_id("new-chat-landing-host-chip").click()
+                await page.get_by_test_id("new-chat-landing-host-host_static").click()
+                await page.get_by_test_id("new-chat-landing-repo-chip").click()
+                await add_repo("api")
+                await expect(
+                    page.get_by_role("checkbox", name="Create worktrees")
+                ).not_to_be_checked()
+                await expect(
+                    page.get_by_role("combobox", name="Branch for example/api")
+                ).to_contain_text("Shared folder")
+                await page.screenshot(path=str(tmp_path / "shared-checkout.png"))
+                await page.keyboard.press("Escape")
+                await submit("Investigate the API using its shared checkout", 1)
+                assert creates[-1]["sandbox_workspace"] == {
+                    "repositories": [repos[0]["clone_url"]],
+                    "create_worktrees": False,
+                }
+
+                await page.get_by_test_id("new-chat-landing-repo-chip").click()
+                await page.get_by_role("combobox", name="Branch for example/api").click()
+                await page.get_by_role("option", name="release", exact=True).click()
+                await add_repo("web")
+                await page.get_by_role("combobox", name="Branch for example/web").click()
+                await page.get_by_placeholder("Search or enter a branch…").fill(
+                    "feature/new-navigation"
+                )
+                await page.get_by_role("option", name="Use “feature/new-navigation”").click()
+                await page.screenshot(path=str(tmp_path / "per-repo-branches.png"))
+                await page.keyboard.press("Escape")
+                await submit("Update the web UI against the API release branch", 2)
+                assert creates[-1]["sandbox_workspace"] == {
+                    "repositories": [
+                        repos[0]["clone_url"] + "#release",
+                        repos[1]["clone_url"] + "#feature/new-navigation",
+                    ],
+                    "create_worktrees": False,
+                }
+                assert [body["host_id"] for body in creates] == ["host_static", "host_static"]
+                assert all(
+                    body.get("git") is None and body.get("workspace") is None for body in creates
+                )
+
+                await page.get_by_test_id("new-chat-landing-host-chip").click()
+                await page.get_by_test_id("new-chat-landing-sandbox-option").click()
+                await page.get_by_test_id("new-chat-landing-repo-chip").click()
+                for name in ("api", "web"):
+                    await page.get_by_role("combobox", name=f"Branch for example/{name}").click()
+                    await page.get_by_role("option", name="Shared folder", exact=True).click()
+                await page.get_by_role("checkbox", name="Create worktrees").check()
+                await expect(
+                    page.get_by_role("combobox", name="Branch for example/api")
+                ).to_contain_text("New worktree")
+                await page.screenshot(path=str(tmp_path / "new-worktrees.png"))
+                await page.keyboard.press("Escape")
+                await submit("Start fresh worktrees in a new static sandbox", 3)
+                assert creates[-1]["host_type"] == "managed"
+                assert creates[-1]["sandbox_workspace"] == {
+                    "repositories": [repo["clone_url"] for repo in repos],
+                    "create_worktrees": True,
+                }
+                assert "workspaces" not in creates[-1]
+                await page.set_viewport_size({"width": 390, "height": 844})
+                await page.get_by_test_id("sidebar-scrim").click(position={"x": 380, "y": 400})
+                await page.get_by_test_id("new-chat-landing-repo-chip").click()
+                await expect(page.get_by_role("checkbox", name="Create worktrees")).to_be_visible()
+                assert await page.evaluate(
+                    "document.documentElement.scrollWidth <= window.innerWidth"
+                )
+                await page.screenshot(path=str(tmp_path / "mobile-repositories.png"))
+            finally:
+                await page.context.close()
+                await browser.close()
+
+    with isolated_local_server(tmp_path / "server") as base_url:
+        with httpx.Client() as client:
+            seeded = create_native_session(client, base_url, harness="codex")
+        _run_in_fresh_loop(drive(base_url, seeded["session_id"]))

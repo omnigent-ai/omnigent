@@ -1240,3 +1240,36 @@ def test_session_response_status_rejects_unknown_value() -> None:
 
     with pytest.raises(ValidationError):
         SessionResponse(id="conv_x", agent_id="ag_x", status="launching", created_at=0)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"workspace": "/work"},
+        {"workspaces": []},
+        {"git": {"branch_name": "new"}},
+        {"parent_session_id": "conv_parent"},
+    ],
+)
+def test_sandbox_workspace_rejects_ambiguous_create(fields):
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValueError, match="sandbox_workspace"):
+        SessionCreateRequest(agent_id="a", host_id="host", sandbox_workspace={}, **fields)
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        {"repositories": ["/work"]},
+        {"repositories": ["https://github.com/org/repo#bad..branch"]},
+        {"repositories": ["https://github.com/org/repo", "https://github.com/org/repo#main"]},
+        {"create_worktrees": "false"},
+        {"unexpected": True},
+    ],
+)
+def test_sandbox_workspace_validates_repository_choices(selection):
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValueError):
+        SessionCreateRequest(agent_id="a", host_id="host", sandbox_workspace=selection)

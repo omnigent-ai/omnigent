@@ -2785,7 +2785,9 @@ async def test_fork_switch_denies_session_scoped_target_without_access(
     assert [s["id"] for s in corey_sessions] == [source["id"]]
 
 
+@pytest.mark.parametrize("workspace_fields", [{"workspace": "/tmp"}, {"sandbox_workspace": {}}])
 async def test_create_session_rejects_other_users_host(
+    workspace_fields,
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,
     db_uri: str,
@@ -2829,7 +2831,7 @@ async def test_create_session_rejects_other_users_host(
         json={
             "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75",
             "host_id": "f54bb9272002938a3a934bfcb6bb228a",
-            "workspace": "/tmp",
+            **workspace_fields,
         },
         headers={"X-Forwarded-Email": "bob@example.com"},
     )

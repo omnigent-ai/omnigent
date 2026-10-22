@@ -230,13 +230,104 @@ sequenceDiagram
 
 ## Workspace policy
 
-The controller can choose an existing checkout, a per-session worktree, or
-another directory. Omnigent only needs the chosen path to start the session's
-runner there; being a static sandbox does not require a particular policy.
-Today users can choose directories and use the existing worktree settings.
-A controller-driven per-session workspace policy still needs an integration at
-session startup that requests and uses that path. `start_host` alone cannot
-provide this: a running host can serve many new sessions without starting again.
+Providers can opt into repository choices in **New session** by advertising
+`SandboxCapabilities(reusable_hosts=True, session_workspaces=True)` (and
+`multi_repo=True` for several repositories). This works with saved boxes and
+newly created static sandboxes. Discovery-only providers can support it too.
+Without this capability, the existing directory picker and launch paths remain
+unchanged.
+
+The searchable branch picker accepts existing branches and typed branch names:
+
+| Per-repo choice | Create worktrees | Controller behavior |
+| --- | --- | --- |
+| No branch | Off | Reuse the shared checkout |
+| No branch | On | Allocate a fresh branch and worktree for this session |
+| Explicit branch | Either | Use that branch in a worktree; create the branch if absent |
+
+The toggle applies only to repositories without an explicit branch. No repos
+means the controller's default workspace. Multiple repositories share a parent
+working directory chosen by the controller; one repo can start directly in its
+checkout/worktree. A branch already checked out elsewhere must be reused safely
+or rejected by the controller, never silently force-checked out.
+
+### Additive session API
+
+`POST /v1/sessions` accepts an optional `sandbox_workspace` object. This adds no
+endpoint or database column. It is mutually exclusive with `workspace`,
+`workspaces`, and `git`, and only applies to top-level sessions.
+
+```json
+{
+  "agent_id": "ag_example",
+  "host_id": "saved-host-id",
+  "sandbox_workspace": {
+    "repositories": [
+      "https://github.com/example/api.git#release",
+      "https://github.com/example/web.git#feature/navigation"
+    ],
+    "create_worktrees": false
+  }
+}
+```
+
+For a new static sandbox, replace `host_id` with `host_type: "managed"` and
+`sandbox_provider`. The server provisions an empty sandbox through the existing
+provider, then prepares this session's workspace before launching its runner.
+
+### Controller hook
+
+```python
+def prepare_session_workspace(
+    self,
+    sandbox_id: str,
+    *,
+    session_id: str,
+    repos: Sequence[RepoWorkspace],
+    create_worktrees: bool = False,
+) -> str:
+    # Delegate to your controller and return its absolute working directory.
+    ...
+```
+
+The launcher has the authenticated owner and current credential resolver bound
+before this call. The controller must authorize that owner for the box and the
+repositories. Its adapter owns HTTP details, timeouts, cached clones, Git
+operations, concurrency, directory layout, and cleanup. Requests for the same
+`session_id` should be idempotent; requests for different sessions must preserve
+other sessions' checkouts. The branch list comes from the existing GitHub
+connection; pasted URLs and typed branches work when that list is unavailable.
+
+```mermaid
+sequenceDiagram
+    participant U as New session picker
+    participant O as Omnigent
+    participant C as Provider controller
+    participant H as Existing host
+    U->>O: Create session with host and repository choices
+    O->>O: Authorize host owner and validate capability
+    O->>C: prepare_session_workspace with owner and session ID
+    C->>C: Reuse clones and prepare selected worktrees
+    C-->>O: Absolute working directory
+    O->>H: Validate directory against agent boundary
+    O->>O: Persist session with host ID and directory
+    O->>H: Launch runner in that directory
+```
+
+A saved host is authorized before any controller call; its returned directory
+uses the existing host filesystem and agent-boundary checks. Workspace
+preparation on a saved box is awaited by session creation; new-box creation
+keeps the existing background launch flow. Preparation errors stop runner launch.
+A box created before a preparation failure remains saved for reuse.
+
+Resume uses the stored directory without preparing another worktree. These
+controller-owned workspaces do not set the generic `git_branch` cleanup marker;
+Omnigent does not delete the controller's worktrees. Controllers should reclaim
+abandoned preparations if session persistence fails after a directory is made.
+
+This picker is currently in **New session**. **Clone session** retains its
+existing directory/worktree choices and does not call this new hook. Multipart
+agent-bundle uploads, automations, and child sessions do not gain this contract.
 
 ## Try it
 

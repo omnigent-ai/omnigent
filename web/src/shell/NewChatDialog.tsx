@@ -235,6 +235,7 @@ import {
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
+import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
@@ -1151,48 +1152,65 @@ function SandboxRepoBranchSelect({
   value,
   defaultBranch,
   onChange,
+  allowCustom = false,
+  unselectedLabel,
 }: {
   fullName: string;
   value: string;
   defaultBranch: string | null;
   onChange: (branch: string) => void;
+  allowCustom?: boolean;
+  unselectedLabel?: string;
 }): ReactNode {
   const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const typedBranch = search.trim();
   const { data, isPending } = useQuery({
     queryKey: ["github-branches", fullName],
     queryFn: () => fetchGithubBranches(fullName),
     staleTime: 5 * 60_000,
   });
   const branches = data?.connected ? data.branches : [];
-  const defaultLabel = defaultBranch ? `Default (${defaultBranch})` : "Default branch";
+  const defaultLabel =
+    unselectedLabel ?? (defaultBranch ? `Default (${defaultBranch})` : "Default branch");
   // Options: the fetched branches minus the default (represented by the
   // empty-value sentinel). Include the current value even before the list
   // loads (e.g. a draft-restored branch) so the trigger label always
   // resolves to a real option.
-  const options = branches.filter((b) => b !== defaultBranch);
+  const options = branches.filter((b) => allowCustom || b !== defaultBranch);
   if (value !== "" && !options.includes(value)) {
     options.unshift(value);
   }
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setSearch("");
+      }}
+    >
       <PopoverTrigger asChild>
         <button
           type="button"
           role="combobox"
           aria-expanded={open}
           aria-label={`Branch for ${fullName}`}
-          className={COMBOBOX_TRIGGER_CLASS}
+          className={cn(COMBOBOX_TRIGGER_CLASS, "h-8 gap-1.5 px-2 text-xs")}
           data-testid="new-chat-landing-repo-branch-select"
         >
           <GitBranchIcon className="size-3.5 shrink-0 opacity-60" />
-          <span className="truncate">{value === "" ? defaultLabel : value}</span>
+          <span className="truncate" title={value || defaultLabel}>
+            {value === "" ? defaultLabel : value}
+          </span>
           <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
         <Command>
           <CommandInput
-            placeholder="Search branches…"
+            placeholder={allowCustom ? "Search or enter a branch…" : "Search branches…"}
+            value={search}
+            onValueChange={setSearch}
             data-testid="new-chat-landing-repo-branch-search"
           />
           <CommandList>
@@ -1221,6 +1239,19 @@ function SandboxRepoBranchSelect({
                   {b}
                 </CommandItem>
               ))}
+              {allowCustom && typedBranch && !options.includes(typedBranch) && (
+                <CommandItem
+                  value={`Use ${typedBranch}`}
+                  onSelect={() => {
+                    onChange(typedBranch);
+                    setOpen(false);
+                    setSearch("");
+                  }}
+                >
+                  <PlusIcon className="size-3.5" />
+                  Use “{typedBranch}”
+                </CommandItem>
+              )}
             </CommandGroup>
           </CommandList>
         </Command>
@@ -2141,6 +2172,7 @@ interface LandingDraft {
   sandboxSelected: boolean;
   sandboxProvider: string | null;
   sandboxRepoSelections: LastSandboxRepo[];
+  sandboxCreateWorktrees: boolean;
   workspace: string;
   branchName: string;
   autoSeededBranch: string;
@@ -2554,16 +2586,29 @@ export function NewChatLandingScreen() {
   const [sandboxRepoSelections, setSandboxRepoSelections] = useState<LastSandboxRepo[]>(
     () => restoredDraft?.sandboxRepoSelections ?? readLastSandboxRepos(),
   );
+  const [sandboxCreateWorktrees, setSandboxCreateWorktrees] = useState(
+    () => restoredDraft?.sandboxCreateWorktrees ?? false,
+  );
+  const workspaceHost = !sandboxSelected
+    ? hosts?.find((host) => host.host_id === selectedHostId)
+    : undefined;
   // Whether the launch provider clones several repos (server-declared per
   // provider via /v1/info). A single-repo provider caps the picker at one, so
   // it reads as a plain single-repo picker and never offers a multi-repo menu.
   // Falls back to the server's default provider when none is picked yet, which
   // is what the launch will use.
-  const effectiveSandboxProvider =
-    sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const effectiveSandboxProvider = workspaceHost?.sandbox_attached
+    ? workspaceHost.sandbox_provider
+    : (sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null));
+  const sandboxSessionWorkspaces =
+    (sandboxSelected || workspaceHost?.sandbox_attached === true) &&
+    info !== "loading" &&
+    effectiveSandboxProvider != null &&
+    info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.session_workspaces === true;
+  const repositoryWorkspaceSelected = sandboxSelected || sandboxSessionWorkspaces;
   const sandboxMultiRepo =
     info !== "loading" &&
-    effectiveSandboxProvider !== null &&
+    effectiveSandboxProvider != null &&
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
   // Append a repo (deduped by URL — adding one already picked is a no-op),
@@ -2764,6 +2809,7 @@ export function NewChatLandingScreen() {
     sandboxSelected,
     sandboxProvider,
     sandboxRepoSelections,
+    sandboxCreateWorktrees,
     workspace,
     branchName,
     autoSeededBranch,
@@ -3137,7 +3183,7 @@ export function NewChatLandingScreen() {
   // managed sandbox — the sandbox create path doesn't provision a runner for a
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
-  const pendingAgentAllowedOnTarget = !sandboxSelected;
+  const pendingAgentAllowedOnTarget = !repositoryWorkspaceSelected;
   // A configured agent absent from templates and the first 30 Mine sessions
   // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
@@ -4619,7 +4665,8 @@ export function NewChatLandingScreen() {
   // Existing git worktrees of the picked directory's repo, for the
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
-  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const worktreesEnabled =
+    !repositoryWorkspaceSelected && selectedHostId !== null && workspaceTrimmed !== "";
   const {
     data: hostWorktrees,
     isLoading: hostWorktreesLoading,
@@ -5031,7 +5078,7 @@ export function NewChatLandingScreen() {
   // whose `git worktree list` is slow must not hold the start, so it only
   // drives the chip's loading state and the worktree control.
   const workspaceStartLoading =
-    !sandboxSelected &&
+    !repositoryWorkspaceSelected &&
     (hostsLoading ||
       info === "loading" ||
       (projectParam !== "" &&
@@ -5137,7 +5184,10 @@ export function NewChatLandingScreen() {
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
+    (sandboxSelected
+      ? sandboxRepoValid
+      : selectedHost?.status === "online" &&
+        (sandboxSessionWorkspaces ? sandboxRepoValid : workspaceValid)) &&
     !creating;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
@@ -5154,15 +5204,15 @@ export function NewChatLandingScreen() {
           ? "Loading session configuration…"
           : pickerSelectionError || sandboxCatalogError
             ? (pickerSelectionError ?? sandboxCatalogError)
-            : sandboxSelected && sandboxRepoOverCap
+            : repositoryWorkspaceSelected && sandboxRepoOverCap
               ? `This sandbox provider clones at most ${maxSandboxRepos} ${
                   maxSandboxRepos === 1 ? "repository" : "repositories"
                 } — remove the extras`
-              : sandboxSelected && !sandboxRepoValid
+              : repositoryWorkspaceSelected && !sandboxRepoValid
                 ? "Please enter a valid repository URL"
                 : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
                   ? "Selected host is unavailable. Reconnect it or choose another host."
-                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                  : !repositoryWorkspaceSelected && (!selectedHostId || !workspaceValid)
                     ? "Please choose a host and working directory"
                     : configuredAgentUnavailable && selectedAgent == null
                       ? "This project's configured agent is unavailable — pick an agent to continue"
@@ -5860,7 +5910,9 @@ export function NewChatLandingScreen() {
                 // The repos to clone in parallel; the agent starts in the one
                 // repo, or the parent that holds them all. Empty = empty
                 // sandbox workspace.
-                workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                ...(!sandboxSessionWorkspaces
+                  ? { workspaces: composeSandboxWorkspaces(sandboxRepoSelections) }
+                  : {}),
                 // On a `project_id` create an ABSENT (path) workspace would be
                 // default-filled with the config's path workspace, which a
                 // managed create rejects — pin an explicit null (explicit
@@ -5899,6 +5951,16 @@ export function NewChatLandingScreen() {
                       ? null
                       : undefined,
               }),
+          ...(sandboxSessionWorkspaces
+            ? {
+                workspace: null,
+                git: null,
+                sandbox_workspace: {
+                  repositories: composeSandboxWorkspaces(sandboxRepoSelections),
+                  create_worktrees: sandboxCreateWorktrees,
+                },
+              }
+            : {}),
           // Native-wrapper labels + codex bypass + the born-filed project
           // label (see `createLabels` above).
           // Smart Routing sends none of these: the bound agent is only a
@@ -6083,7 +6145,7 @@ export function NewChatLandingScreen() {
         }
       }
       // Sandbox creates have no user-picked workspace to remember.
-      if (!sandboxSelected) addRecent(workspaceTrimmed);
+      if (!repositoryWorkspaceSelected) addRecent(workspaceTrimmed);
       // Remember the launched harness so the picker promotes it out of "More"
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
@@ -6352,7 +6414,7 @@ export function NewChatLandingScreen() {
           data-testid="new-chat-landing-composer-surface"
         >
           {/* Keep the tray mounted while the execution target changes. */}
-          {sandboxSelected && (
+          {repositoryWorkspaceSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
@@ -6387,7 +6449,11 @@ export function NewChatLandingScreen() {
                     <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </PopoverTrigger>
-                <PopoverContent align="start" className="w-96 p-3">
+                <PopoverContent
+                  align="start"
+                  collisionPadding={16}
+                  className="w-96 max-w-[calc(100vw-2rem)] p-3"
+                >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <span className="text-sm font-medium text-foreground">
@@ -6445,6 +6511,14 @@ export function NewChatLandingScreen() {
                                 fullName={repo.full_name}
                                 value={sel.branch}
                                 defaultBranch={repo.default_branch}
+                                allowCustom={sandboxSessionWorkspaces}
+                                unselectedLabel={
+                                  sandboxSessionWorkspaces
+                                    ? sandboxCreateWorktrees
+                                      ? "New worktree"
+                                      : "Shared folder"
+                                    : undefined
+                                }
                                 onChange={(b) => setSandboxRepoBranch(sel.url, b)}
                               />
                             </div>
@@ -6453,7 +6527,13 @@ export function NewChatLandingScreen() {
                               type="text"
                               value={sel.branch}
                               onChange={(e) => setSandboxRepoBranch(sel.url, e.target.value)}
-                              placeholder="branch"
+                              placeholder={
+                                sandboxSessionWorkspaces
+                                  ? sandboxCreateWorktrees
+                                    ? "New worktree"
+                                    : "Shared folder"
+                                  : "branch"
+                              }
                               aria-label={`Branch for ${name}`}
                               className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
                             />
@@ -6555,17 +6635,56 @@ export function NewChatLandingScreen() {
                         </div>
                       </>
                     )}
-                    <p className="text-sm text-muted-foreground">
-                      {maxSandboxRepos > 1
-                        ? "Cloned into the sandbox at startup. Several repos are cloned side by side and the agent starts in the parent that holds them; pick one and it starts directly inside it. Leave empty for a blank workspace."
-                        : "Cloned into the sandbox at startup as the working directory. Leave empty for a blank workspace."}
-                    </p>
+                    {sandboxSessionWorkspaces ? (
+                      <div className="mt-1 border-t border-border pt-3">
+                        <div className="flex items-center gap-2">
+                          <Checkbox
+                            id="sandbox-create-worktrees"
+                            checked={sandboxCreateWorktrees}
+                            onCheckedChange={(checked) =>
+                              setSandboxCreateWorktrees(checked === true)
+                            }
+                          />
+                          <label
+                            htmlFor="sandbox-create-worktrees"
+                            className="cursor-pointer text-sm"
+                          >
+                            Create worktrees
+                          </label>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                aria-label="About sandbox worktrees"
+                                className="text-muted-foreground"
+                              >
+                                <CircleHelpIcon className="size-3.5" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-72">
+                              Off: reuse each repository's shared checkout. On: request a new branch
+                              and worktree. A chosen branch always uses a worktree. Existing clones
+                              are reused.
+                            </TooltipContent>
+                          </Tooltip>
+                        </div>
+                        <p className="mt-1 pl-6 text-xs text-muted-foreground">
+                          For repos without a branch
+                        </p>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        {maxSandboxRepos > 1
+                          ? "Cloned into the sandbox at startup. Several repos are cloned side by side and the agent starts in the parent that holds them; pick one and it starts directly inside it. Leave empty for a blank workspace."
+                          : "Cloned into the sandbox at startup as the working directory. Leave empty for a blank workspace."}
+                      </p>
+                    )}
                   </div>
                 </PopoverContent>
               </Popover>
             </ComposerWorkspaceBar>
           )}
-          {!sandboxSelected && (
+          {!repositoryWorkspaceSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"

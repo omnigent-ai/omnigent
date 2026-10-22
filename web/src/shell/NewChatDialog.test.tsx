@@ -7707,65 +7707,105 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
   });
 
-  it("adds a GitHub repo from the picker with a branch", async () => {
-    // enabled_connections has github + a connected /repos response → the picker renders
-    // inside the repo chip and drives the same URL/branch state as the
-    // free-text fields.
-    authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (url === "/v1/connections/github/repos") {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({
-            connected: true,
-            repos: [
-              {
-                full_name: "octo/hello",
-                clone_url: "https://github.com/octo/hello.git",
-                default_branch: "main",
-                private: false,
-                pushed_at: "2026-07-28T00:00:00Z",
-              },
-            ],
-          }),
-        } as unknown as Response);
+  it.each([false, true])(
+    "adds a GitHub repo and supports controller branch choices (%s)",
+    async (sessionWorkspaces) => {
+      // enabled_connections has github + a connected /repos response → the picker renders
+      // inside the repo chip and drives the same URL/branch state as the
+      // free-text fields.
+      authenticatedFetchMock.mockImplementation(((input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url === "/v1/connections/github/repos") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({
+              connected: true,
+              repos: [
+                {
+                  full_name: "octo/hello",
+                  clone_url: "https://github.com/octo/hello.git",
+                  default_branch: "main",
+                  private: false,
+                  pushed_at: "2026-07-28T00:00:00Z",
+                },
+              ],
+            }),
+          } as unknown as Response);
+        }
+        if (url.startsWith("/v1/connections/github/repos/octo/hello/branches")) {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ connected: true, branches: ["main", "dev"] }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response);
+      }) as unknown as typeof authenticatedFetch);
+
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        enabled_connections: ["github"],
+        sandbox_provider: "static",
+        sandbox_provider_capabilities: {
+          static: { reusable_hosts: true, session_workspaces: sessionWorkspaces },
+        },
+      });
+      await waitFor(() =>
+        expect(
+          screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
+        ).toContain("New static sandbox"),
+      );
+
+      fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+      // Open the "Add repository" combobox, filter by typing, then pick the repo.
+      fireEvent.click(await screen.findByTestId("new-chat-landing-repo-select"));
+      fireEvent.change(await screen.findByTestId("new-chat-landing-repo-search"), {
+        target: { value: "hello" },
+      });
+      fireEvent.click(await screen.findByRole("option", { name: /octo\/hello/ }));
+
+      // Picking the repo adds it as a row; the chip reflects the single pick using
+      // the server's clone-dir naming.
+      const row = await screen.findByTestId("new-chat-landing-repo-row");
+      expect(row.textContent).toContain("octo/hello");
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello");
+
+      // The row's branches load into a searchable branch combobox; open it, wait
+      // for the async list, then choosing one updates the chip label.
+      fireEvent.click(await screen.findByTestId("new-chat-landing-repo-branch-select"));
+      fireEvent.click(await screen.findByRole("option", { name: "dev" }));
+      expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello#dev");
+      if (sessionWorkspaces) {
+        fireEvent.click(screen.getByTestId("new-chat-landing-repo-branch-select"));
+        fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-search"), {
+          target: { value: "feature/new-ui" },
+        });
+        fireEvent.click(await screen.findByRole("option", { name: "Use “feature/new-ui”" }));
+        fireEvent.click(screen.getByRole("checkbox", { name: "Create worktrees" }));
+        fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+          target: { value: "Implement the change" },
+        });
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+        await waitFor(() =>
+          expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(
+            true,
+          ),
+        );
+        const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+        expect(JSON.parse((init as RequestInit).body as string)).toMatchObject({
+          host_type: "managed",
+          workspace: null,
+          git: null,
+          sandbox_workspace: {
+            repositories: ["https://github.com/octo/hello.git#feature/new-ui"],
+            create_worktrees: true,
+          },
+        });
+        expect(JSON.parse((init as RequestInit).body as string).workspaces).toBeUndefined();
+      } else {
+        expect(screen.queryByRole("checkbox", { name: "Create worktrees" })).toBeNull();
       }
-      if (url.startsWith("/v1/connections/github/repos/octo/hello/branches")) {
-        return Promise.resolve({
-          ok: true,
-          json: async () => ({ connected: true, branches: ["main", "dev"] }),
-        } as unknown as Response);
-      }
-      return Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response);
-    }) as unknown as typeof authenticatedFetch);
-
-    renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
-        "New Sandbox",
-      ),
-    );
-
-    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
-    // Open the "Add repository" combobox, filter by typing, then pick the repo.
-    fireEvent.click(await screen.findByTestId("new-chat-landing-repo-select"));
-    fireEvent.change(await screen.findByTestId("new-chat-landing-repo-search"), {
-      target: { value: "hello" },
-    });
-    fireEvent.click(await screen.findByRole("option", { name: /octo\/hello/ }));
-
-    // Picking the repo adds it as a row; the chip reflects the single pick using
-    // the server's clone-dir naming.
-    const row = await screen.findByTestId("new-chat-landing-repo-row");
-    expect(row.textContent).toContain("octo/hello");
-    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello");
-
-    // The row's branches load into a searchable branch combobox; open it, wait
-    // for the async list, then choosing one updates the chip label.
-    fireEvent.click(await screen.findByTestId("new-chat-landing-repo-branch-select"));
-    fireEvent.click(await screen.findByRole("option", { name: "dev" }));
-    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("hello#dev");
-  });
+    },
+  );
 
   it("hides the GitHub repo picker when the GitHub App is disabled", async () => {
     renderLanding({ managed_sandboxes_enabled: true, enabled_connections: [] });

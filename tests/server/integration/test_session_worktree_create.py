@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import httpx
@@ -93,6 +93,7 @@ async def register_worktree_host(
         ``_HostCapture`` whose ``.create`` / ``.remove`` lists accumulate
         the create- and remove-worktree frames the host received.
     """
+    app.state.host_store = HostStore(db_uri)
     conns: list[HostConnection] = []
 
     def _register(
@@ -101,7 +102,19 @@ async def register_worktree_host(
         create_error: str | None = None,
         workspace: str | None = None,
         capabilities: list[str] | None = None,
+        static_sandbox: bool = False,
     ) -> _HostCapture:
+        if static_sandbox:
+            HostStore(db_uri).register_managed_host(
+                host_id=_HOST_ID,
+                name="wt-host",
+                user_id=RESERVED_USER_LOCAL,
+                token="test-token",
+                provider="modal",
+                sandbox_id="static-box",
+                token_expires_at=2_000_000_000,
+                sandbox_attached=True,
+            )
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
@@ -637,3 +650,85 @@ async def test_registry_create_persists_overrides_and_worktree_atomically(
     assert initial["labels"] == stored.labels
     assert stored.labels["omnigent.mcp_service.tracker"] == "1"
     assert stored.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(workspace)
+
+
+@pytest.mark.parametrize("create_worktrees", [False, True])
+async def test_controller_workspaces_reuse_host_and_persist_session_directory(
+    app, client, register_worktree_host, create_worktrees, db_uri
+):
+    """Per-repo choices reach the owner-bound controller, never generic git cleanup."""
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.server.helpers import FakeSandboxLauncher
+
+    store = SqlAlchemyConversationStore(db_uri)
+    cap = register_worktree_host(static_sandbox=True)
+    calls = []
+
+    class Controller(FakeSandboxLauncher):
+        @property
+        def capabilities(self):
+            return replace(super().capabilities, session_workspaces=True, multi_repo=True)
+
+        def bind_principal(self, principal):
+            self.principal = principal
+
+        def prepare_session_workspace(self, sandbox_id, *, session_id, repos, create_worktrees):
+            calls.append((self.principal, sandbox_id, session_id, repos, create_worktrees))
+            return f"/work/sessions/{session_id}"
+
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            provider="modal",
+            server_url="https://example.com",
+            token_ttl_s=3600,
+            launcher_factory=lambda: Controller(reusable_hosts=True),
+        )
+    )
+    agent = await create_test_agent(client, name="static-workspaces")
+    for _ in range(2):
+        response = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "host_id": _HOST_ID,
+                "sandbox_workspace": {
+                    "repositories": [
+                        "https://github.com/org/api#feature/new",
+                        "https://github.com/org/ui",
+                    ],
+                    "create_worktrees": create_worktrees,
+                },
+            },
+        )
+        assert response.status_code == 201, response.text
+        body = response.json()
+        assert body["workspace"] == f"/work/sessions/{body['id']}"
+        assert body["host_id"] == _HOST_ID
+        stored = store.get_conversation(body["id"])
+        assert stored.git_branch is None
+        assert calls[-1][:3] == (RESERVED_USER_LOCAL, "static-box", body["id"])
+        assert [repo.branch for repo in calls[-1][3]] == ["feature/new", None]
+        assert calls[-1][4] == create_worktrees
+        assert cap.launches[-1].workspace == body["workspace"]
+        await client.get(f"/v1/sessions/{body['id']}")
+    assert calls[0][2] != calls[1][2]
+    assert len(calls) == 2
+    assert cap.create == [] and cap.remove == []
+
+
+async def test_controller_workspace_rejects_ordinary_host_before_provider_call(
+    client, register_worktree_host
+):
+    register_worktree_host()
+    agent = await create_test_agent(client, name="ordinary-host")
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "sandbox_workspace": {},
+        },
+    )
+    assert response.status_code == 400
+    assert "saved static sandbox" in response.text

@@ -957,6 +957,29 @@ class SandboxHostLauncher(SandboxLifecycle):
         does nothing for providers using only deployment credentials.
         """
 
+    def prepare_session_workspace(
+        self,
+        sandbox_id: str,
+        *,
+        session_id: str,
+        repos: Sequence[_sandbox_types.RepoWorkspace],
+        create_worktrees: bool = False,
+    ) -> str:
+        """Prepare and return an absolute working directory for a new session.
+
+        Opt in with ``session_workspaces`` and ``reusable_hosts``. A repository
+        with an explicit branch uses a worktree, selecting an existing branch
+        or creating it if absent. Without a branch, ``create_worktrees`` chooses
+        a fresh branch/worktree; otherwise reuse the shared checkout. An empty
+        list requests the sandbox's default directory.
+
+        The controller owns authorization, cached clones, layout, locking,
+        branch conflicts, and cleanup. Make retries for the same session ID
+        idempotent. The authenticated principal and credentials are bound
+        before this call. Resume uses the persisted path without calling again.
+        """
+        raise self._capability_error("prepare a session workspace")
+
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
 

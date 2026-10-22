@@ -954,6 +954,8 @@ class ManagedSandboxDeployment:
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
                 if launcher.capabilities.reusable_hosts:
                     caps[config.provider]["reusable_hosts"] = True
+                    if launcher.capabilities.session_workspaces:
+                        caps[config.provider]["session_workspaces"] = True
                 if not config.managed_launch_supported:
                     continue
                 from omnigent.inference_config import parse_inference_config

@@ -195,6 +195,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SandboxWorkspaceRequest,
     SessionCreateRequest,
     SessionEventInput,
     SessionForkRequest,
@@ -505,6 +506,7 @@ def register_core_routes(
         sandbox_provider: str | None,
         workspaces: list[str],
         requested_host_id: str | None = None,
+        sandbox_workspace: SandboxWorkspaceRequest | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -639,6 +641,7 @@ def register_core_routes(
             agent_store=agent_store,
             agent_id=agent_id,
             host_id=requested_host_id,
+            sandbox_workspace=sandbox_workspace,
         )
         _start_managed_launch_task(
             session_id,
@@ -1072,6 +1075,7 @@ def register_core_routes(
                     sandbox_provider=body.sandbox_provider,
                     workspaces=body.managed_repo_workspaces(),
                     requested_host_id=body.requested_host_id,
+                    sandbox_workspace=body.sandbox_workspace,
                 )
         finally:
             # Push the new session to this user's other open tabs (see the

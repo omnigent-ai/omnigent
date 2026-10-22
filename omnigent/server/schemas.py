@@ -1501,6 +1501,23 @@ _MAX_MANAGED_WORKSPACES = 10
 _MANAGED_HOST_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
+class SandboxWorkspaceRequest(BaseModel):
+    """Controller-owned repository layout for a new static sandbox session."""
+
+    model_config = {"extra": "forbid"}
+    repositories: list[str] = Field(default_factory=list, max_length=_MAX_MANAGED_WORKSPACES)
+    create_worktrees: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def _check_repositories(self) -> Self:
+        from omnigent.server.managed_hosts import parse_repo_workspace
+
+        repos = [parse_repo_workspace(value) for value in self.repositories]
+        if len({repo.url for repo in repos}) != len(repos):
+            raise ValueError("select each repository only once")
+        return self
+
+
 class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
@@ -1675,6 +1692,7 @@ class _SessionCreateRequestBase(BaseModel):
     sandbox_provider: str | None = None
     workspace: str | None = None
     workspaces: list[str] | None = None
+    sandbox_workspace: SandboxWorkspaceRequest | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
@@ -1683,6 +1701,21 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+
+    @model_validator(mode="after")
+    def _check_sandbox_workspace(self) -> Self:
+        if self.sandbox_workspace is not None:
+            if self.workspace is not None or self.workspaces is not None or self.git is not None:
+                raise ValueError(
+                    "sandbox_workspace cannot be combined with workspace, workspaces, or git"
+                )
+            if self.parent_session_id is not None:
+                raise ValueError("sandbox_workspace is only supported for top-level sessions")
+            if self.host_type != "managed" and self.host_id is None:
+                raise ValueError(
+                    "sandbox_workspace requires an existing host_id or host_type=managed"
+                )
+        return self
 
     @model_validator(mode="after")
     def _check_startup_input(self) -> Self:
