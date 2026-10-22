@@ -948,7 +948,7 @@ def mirror_applied_codex_settings(bridge_dir: Path, applied: Mapping[str, str]) 
 def _upsert_top_level_config_key(
     config_path: Path,
     key: str,
-    value: str,
+    value: str | dict[str, object],
     *,
     mutate_document: Callable[[MutableMapping[str, object]], None] | None = None,
 ) -> bool:
@@ -968,7 +968,7 @@ def _upsert_top_level_config_key(
 
     :param config_path: The ``config.toml`` to rewrite (created if missing).
     :param key: Top-level key to upsert, e.g. ``"model"``.
-    :param value: String value to record, e.g. ``"gpt-5.6-luna"``.
+    :param value: String or table to record at the top level.
     :param mutate_document: Optional extra mutation of the parsed document,
         applied before serializing; used by the model writer to clamp a stale
         effort. Only top-level keys are visible to it.
@@ -982,7 +982,7 @@ def _upsert_top_level_config_key(
     try:
         existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
         document = tomlkit.parse(existing)
-        if key in document:
+        if key in document or isinstance(value, dict):
             document[key] = value
             output = tomlkit.dumps(document)
         else:

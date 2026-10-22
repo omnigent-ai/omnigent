@@ -118,7 +118,8 @@ def _composer_pane(draft: str = "") -> str:
 
 
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
-    settings_path = Path(args[args.index("--settings") + 1])
+    settings_index = len(args) - 1 - args[::-1].index("--settings")
+    settings_path = Path(args[settings_index + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
 
 
@@ -14063,3 +14064,36 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+def test_shared_plugins_are_private_invocation_settings(tmp_path, monkeypatch):
+    from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+    from tests.spec.test_skill_sources import _claude_home_with_plugin
+    from tests.test_preference_plugins import plugin_snapshot
+
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="toolkit", marketplace="source", skill="check", enabled=True
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    before = (home / ".claude/settings.json").read_bytes()
+    for name, enabled in [("one", False), ("two", True)]:
+        path = plugin_snapshot(tmp_path / name, "claude", {"toolkit@source": enabled})
+        monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+        bridge = tmp_path / name / "bridge"
+        bridge.mkdir()
+        args = augment_claude_args((), bridge_dir=bridge, workspace=workspace)
+        assert _load_invocation_settings(args)["enabledPlugins"] == {"toolkit@source": enabled}
+    explicit = augment_claude_args(
+        ("--settings", '{"enabledPlugins":{"toolkit@source":false}}'),
+        bridge_dir=bridge,
+        workspace=workspace,
+    )
+    assert _load_invocation_settings(explicit)["enabledPlugins"]["toolkit@source"] is False
+    assert (home / ".claude/settings.json").read_bytes() == before
+    filtered = augment_claude_args(
+        (), bridge_dir=bridge, workspace=workspace, skills_filter="none"
+    )
+    assert "enabledPlugins" not in _load_invocation_settings(filtered)

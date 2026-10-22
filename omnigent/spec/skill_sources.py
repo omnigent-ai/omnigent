@@ -389,6 +389,10 @@ def _enabled_plugin_keys(ctx: SkillSourceContext) -> set[str]:
                 # real bool from a weaker-precedence tier).
                 if isinstance(value, bool):
                     state[key] = value
+    if ctx.is_native:
+        from omnigent.preference_plugins import claude_plugin_overlay
+
+        state.update(claude_plugin_overlay(ctx).enabled)
     enabled = {key for key, on in state.items() if on}
     # Managed (policy) plugins are force-enabled at the highest precedence and
     # cannot be overridden by a user/project enabledPlugins toggle, so union

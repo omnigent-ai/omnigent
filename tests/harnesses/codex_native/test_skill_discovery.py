@@ -109,3 +109,95 @@ def test_installed_plugin_survives_marketplace_failure(
     assert selected_version() == "local"
     config.write_text("")
     assert selected_version() is None
+
+
+def test_shared_plugins_isolated_through_real_app_server_startup(tmp_path):
+    import json
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    from tests._helpers.live_server import isolated_process_env
+    from tests.test_preference_plugins import plugin_snapshot
+
+    codex = os.environ.get("OMNIGENT_CODEX_PATH") or shutil.which("codex")
+    if not codex:
+        pytest.skip("Codex CLI required for the real plugin-loading contract")
+    source, workspace, marketplace = (
+        tmp_path / name for name in ("source", "workspace", "market")
+    )
+    source.mkdir()
+    workspace.mkdir()
+    install_codex_plugin(
+        codex,
+        source,
+        workspace,
+        marketplace,
+        marketplace_name="preferences-lab",
+        plugin_name="preferences-check",
+        skill_name="check",
+    )
+    before = (source / "config.toml").read_bytes()
+    script = """
+import asyncio, json, os, sys
+from pathlib import Path
+from omnigent.harnesses.codex_native.app_server import (
+    CodexNativeAppServer, CodexAppServerClient, _allocate_loopback_port,
+)
+async def run():
+    root = Path(sys.argv[2])
+    app = CodexNativeAppServer(codex_path=sys.argv[1], socket_path=root / "socket",
+        codex_home=root / "codex", env=dict(os.environ), config_overrides=[],
+        cwd=Path(sys.argv[3]), bridge_dir=root / "bridge", trust_project=True,
+        listen_url=f"ws://127.0.0.1:{_allocate_loopback_port()}")
+    app.bridge_dir.mkdir()
+    await app.start()
+    try:
+        client = CodexAppServerClient(ws_url=app.listen_url, client_name="preference-test")
+        await client.connect()
+        try:
+            response = await client.request(
+                "skills/list", {"cwds": [sys.argv[3]], "forceReload": True},
+            )
+            print(json.dumps(response))
+        finally:
+            await client.close()
+    finally:
+        await app.close()
+asyncio.run(run())
+"""
+
+    def launch(enabled):
+        root = tmp_path / str(enabled)
+        snapshot = plugin_snapshot(root, "codex", {"preferences-check@preferences-lab": enabled})
+        environment = isolated_process_env(
+            root / "home",
+            {
+                "CODEX_HOME": str(source),
+                "OMNIGENT_PREFERENCE_SNAPSHOT": str(snapshot),
+                "OMNIGENT_CODEX_PATH": codex,
+            },
+            base_env={"PATH": os.environ["PATH"]},
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, codex, str(root), str(workspace)],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        response = json.loads(result.stdout.splitlines()[-1])
+        skills = [skill for entry in response["result"]["data"] for skill in entry["skills"]]
+        active = [
+            skill
+            for skill in skills
+            if skill.get("enabled") is True and "/plugins/cache/" in skill.get("path", "")
+        ]
+        assert bool(active) is enabled, skills
+        assert all("preferences-check" in skill["path"] for skill in active)
+        return root
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        roots = list(pool.map(launch, [True, False]))
+    assert len(roots) == 2
+    assert (source / "config.toml").read_bytes() == before

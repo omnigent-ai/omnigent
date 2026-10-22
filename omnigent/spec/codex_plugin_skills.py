@@ -45,11 +45,15 @@ def _skill_roots(root: Path, paths: object) -> list[Path]:
     return sorted(roots)
 
 
-def _inventory_plugins(codex_home: Path, cwd: Path | None) -> list[object] | None:
+def _inventory_plugins(
+    codex_home: Path, cwd: Path | None, *, codex_path: str | None = None
+) -> list[object] | None:
     """Return the installed entries of ``codex plugin list --json``, or ``None`` if unreadable."""
     from omnigent.inner.codex_executor import _find_codex_cli
 
-    if (codex_path := _find_codex_cli()) is None:
+    if codex_path is None:
+        codex_path = _find_codex_cli()
+    if codex_path is None:
         _log.debug("Codex plugin inventory unavailable: codex CLI not found")
         return None
     try:

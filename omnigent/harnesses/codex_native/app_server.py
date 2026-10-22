@@ -2183,6 +2183,18 @@ class CodexNativeAppServer:
             self.developer_instructions,
             use_current_base=compose_profile_instructions,
         )
+        if not minimal_config:
+            from omnigent.preference_plugins import apply_codex_plugin_overlay
+
+            overlay = await asyncio.to_thread(
+                apply_codex_plugin_overlay,
+                self.codex_home,
+                config_source,
+                self.cwd,
+                codex_path=self.codex_path,
+            )
+            for warning in overlay.warnings:
+                _logger.warning("%s", warning)
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,

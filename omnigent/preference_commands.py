@@ -154,13 +154,32 @@ def discard(operation_id: UUID) -> None:
 
 
 @preferences.command("import")
+@click.option(
+    "--plugins",
+    multiple=True,
+    type=click.Choice(["claude", "codex"]),
+    help="Also preview explicit plugin toggles from this machine’s native user config.",
+)
 @click.argument("source", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def preview(source: Path) -> None:
+def preview(source: Path, plugins: tuple[str, ...]) -> None:
     """Preview portable YAML defaults. Save stdout to a plan, then use `apply PLAN`."""
     config = yaml.safe_load(source.read_text())
     if not isinstance(config, dict):
         raise ValueError("Import source must be a YAML mapping")
-    _print(_connection().workspace().preview_config(config).model_dump(mode="json"))
+    from omnigent.preference_plugins import import_plugin_values
+    from omnigent.preference_workspace import preview_import
+    from omnigent.preferences import preferences_from_config
+
+    workspace = _connection().workspace()
+    snapshot = workspace.client.cached()
+    if snapshot is None:
+        raise ValueError("Synchronize before previewing an import")
+    values = {**preferences_from_config(config), **import_plugin_values(plugins)}
+    _print(
+        preview_import(
+            snapshot, installation_id=workspace.installation_id, values=values
+        ).model_dump(mode="json")
+    )
 
 
 @preferences.command("restore")

@@ -7,6 +7,7 @@ and an opt-in server API for durable edits and conflicts. Explicit shared/machin
 the CLI. Connected CLI launches and user-owned hosts adopt cached/shared defaults
 at startup; browser controls and managed startup remain separate. Pending edits
 retry on host reconnect without polling between messages.
+Native Claude/Codex sessions also apply plugin toggles in private settings.
 
 ## Sub-features
 
@@ -35,6 +36,8 @@ retry on host reconnect without polling between messages.
   frozen handoff; reconnect retries pending edits with bounded jitter.
 - `shared-cli`: connect to an authenticated workspace, inspect shared/machine values,
   preview/apply an import or restore, retry edits and resolve conflicts.
+- `shared-plugins`: import explicit native user toggles, apply installed plugins
+  independently in concurrent sessions, and retain unavailable selections with warnings.
 
 ## How to get to it (user POV)
 
@@ -86,6 +89,12 @@ new CLI sessions follow the workspace. An unused workspace requires an import or
 warning; a fresh machine offers Retry or `omnigent --temporary-preferences COMMAND`.
 A deployment can opt new machines into discovery with `OMNIGENT_SHARED_PREFERENCES=1`;
 the default is off. See the [startup guide](../docs/shared-preferences-startup.md).
+
+**Shared plugins:** add `--plugins claude --plugins codex` to the import preview
+to include explicit native user toggles. After adoption, native sessions use
+private settings for installed plugins. Missing plugins remain requested and
+produce a warning; installation stays local. See the
+[plugin guide](../docs/shared-preferences-plugins.md).
 
 ## Driving it with the repro environment
 
@@ -155,10 +164,9 @@ uv run --no-sync pytest tests/test_preferences.py tests/test_config.py --reruns 
 The matrix checks precedence for all four groups, explicit disabled plugins
 and empty argument lists, removal of overrides, and rejection of mismatched
 workspace/account/machine contexts. The YAML-to-launch test checks source
-explanations, project precedence, and unchanged files. No real client currently
-adopts these layers. Before activation, add cross-machine, restart, conflict,
-offline, native-plugin, and managed-startup journeys with explicit coverage for
-each user entry point.
+explanations, project precedence, and unchanged files. CLI and host launches adopt
+these layers through the startup recipe above. Before activation, complete browser,
+managed-startup and per-harness availability journeys for each user entry point.
 
 **Shared operations (own environment, real server processes):**
 
@@ -167,7 +175,24 @@ uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reru
 ```
 
 The CLI scenario also crosses separate command processes: connect, preview/apply
-a portable YAML import, set/remove a machine override, and restore the import.
+a portable YAML/native-plugin import, set/remove a machine override, and restore
+the import. Native toggles require the explicit `--plugins` options.
+
+**Shared plugins (own environment):**
+
+```sh
+uv run --no-sync pytest tests/test_preference_plugins.py \
+  tests/harnesses/claude_native/test_claude_native_bridge.py::test_shared_plugins_are_private_invocation_settings \
+  tests/harnesses/codex_native/test_skill_discovery.py::test_shared_plugins_isolated_through_real_app_server_startup --reruns 0 -q -rs
+```
+
+The Codex journey requires the native CLI. It installs a local fixture, starts
+two real app-server child processes with opposite saved toggles, reads each
+loaded skill catalog and checks the original global config remains unchanged.
+No provider/model is called. Claude checks invocation settings, project/session
+and managed precedence, missing-plugin intent and hermetic filtering; it does
+not execute a vendor model or prove Claude loaded the plugin. Run the shared
+operations recipe above for the actual CLI import and restore transport.
 
 The server scenario drives two isolated CLI servers sharing a SQLite database through actual
 HTTP requests (or another isolated backend via `OMNIGENT_TEST_DB_URI`). It checks
@@ -237,7 +262,7 @@ the correctness scenarios above.
   resolutions stop permanently; reads and identical retries still work.
 - Request parsing currently has no route-specific body-size or rate limit.
   Add these before broad activation; the value cap applies after JSON parsing.
-- Managed deployment, Universe wiring, Arclet startup, native plugin isolation,
+- Managed deployment, Universe wiring, Arclet startup, SDK plugin consumers,
   and per-harness model availability remain unverified follow-ups. Startup adoption
   carries portable intent; each adapter must still apply and report its capabilities.
 - `--global` means this machine's user YAML, not a shared workspace write.
@@ -253,8 +278,8 @@ the correctness scenarios above.
   `default`, only selects the default; per-harness fields stay user-owned.
 - Startup commands and credentials stay local. Selecting a harness or copying
   its arguments does not install the binary or make referenced paths available.
-- Read-only plugin inventory is not proof that enable/disable preferences can
-  be applied independently in concurrent workspaces. Session import review is
-  also separate from the future preference-import flow.
+- Read-only plugin inventory alone is not proof of independent enable/disable
+  choices; use the native-plugin startup recipe. Session import review remains
+  separate from the preference-import flow.
 - Resolver tests and feature-map contract checks do not prove browser behavior,
   native policy enforcement, remote provisioning, or sync convergence.

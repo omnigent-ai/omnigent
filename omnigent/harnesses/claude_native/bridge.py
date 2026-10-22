@@ -2813,6 +2813,33 @@ def augment_claude_args(
     )
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
+    if skills_filter == "all":
+        from dataclasses import replace
+
+        from omnigent.preference_plugins import claude_plugin_overlay
+        from omnigent.spec.skill_sources import skill_source_context_from_env
+
+        roots = tuple(path for path in (workspace, bundle_dir) if path is not None)
+        plugin_context = replace(
+            skill_source_context_from_env(roots=roots, harness="claude-native"), is_native=True
+        )
+        overlay = claude_plugin_overlay(plugin_context)
+        settings_arg = _arg_value(claude_args, "--settings")
+        if overlay.enabled and settings_arg:
+            settings_text = settings_arg
+            if not settings_arg.lstrip().startswith("{"):
+                settings_file = Path(settings_arg).expanduser()
+                if not settings_file.is_absolute() and workspace is not None:
+                    settings_file = workspace / settings_file
+                settings_text = settings_file.read_text()
+            session_settings = json.loads(settings_text)
+            if not isinstance(session_settings, dict):
+                raise ValueError("Claude session settings must be a JSON object")
+            overlay = claude_plugin_overlay(plugin_context, session_settings=session_settings)
+        if overlay.enabled:
+            hook_settings["enabledPlugins"] = overlay.enabled
+        for warning in overlay.warnings:
+            _logger.warning("%s", warning)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
     args.extend(

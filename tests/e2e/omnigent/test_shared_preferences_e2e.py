@@ -273,7 +273,14 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri):
     arguments = ("--config", str(config), "--database-uri", db_uri)
     home = tmp_path / "cli-home"
     home.mkdir()
-    environment = isolated_process_env(home, {}, base_env={"PATH": os.environ["PATH"]})
+    native = home / "claude"
+    native.mkdir()
+    (native / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"review@local-market": False}})
+    )
+    environment = isolated_process_env(
+        home, {"CLAUDE_CONFIG_DIR": str(native)}, base_env={"PATH": os.environ["PATH"]}
+    )
     source = tmp_path / "source.yaml"
     source.write_text(
         "model: imported-model\nharness:\n  default: pi-native\n"
@@ -296,8 +303,15 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri):
         before = json.loads(cli("show"))
         assert before["shared"]["entries"] == [] and before["pending"] == []
         plan = tmp_path / "plan.json"
-        plan.write_text(cli("import", str(source)))
+        plan.write_text(cli("import", str(source), "--plugins", "claude"))
         assert "private-command" not in plan.read_text()
+        changes = json.loads(plan.read_text())["changes"]
+        plugin = next(
+            change["operation"]
+            for change in changes
+            if change["operation"]["key"]["kind"] == "plugin"
+        )
+        assert plugin["value"] is False and plugin["key"]["name"]["source"] == "local-market"
         cli("apply", str(plan))
         cli("set", "--scope", "machine", "model", '"experiment"')
         shown = json.loads(cli("show"))
