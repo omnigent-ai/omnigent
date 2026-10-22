@@ -55,6 +55,54 @@ def paired_bootstrap(
     )
 
 
+def paired_ratio_bootstrap(
+    baseline: Mapping[str, tuple[float, float]],
+    arm: Mapping[str, tuple[float, float]],
+    *,
+    reps: int = 10_000,
+    seed: int = 7,
+) -> Paired | None:
+    """
+    Bootstrap the difference of two pooled ratios by resampling cases.
+
+    Each value is ``(numerator, denominator)`` summed over a case's runs, such
+    as invented and named commands. A resample draws cases with replacement and
+    compares ``sum(numerator) / sum(denominator)`` for each arm; resamples where
+    either denominator is zero are skipped.
+
+    :param baseline: Per-case ``(numerator, denominator)`` for the baseline.
+    :param arm: The same for the compared arm.
+    :param reps: Bootstrap resamples.
+    :param seed: Fixed so reports are reproducible.
+    :returns: ``None`` when either arm's denominator is zero over all shared cases.
+    """
+    shared = sorted(set(baseline) & set(arm))
+
+    def ratio(values: Mapping[str, tuple[float, float]], chosen: Sequence[str]) -> float | None:
+        denominator = sum(values[case][1] for case in chosen)
+        return sum(values[case][0] for case in chosen) / denominator if denominator else None
+
+    base_all, arm_all = ratio(baseline, shared), ratio(arm, shared)
+    if base_all is None or arm_all is None:
+        return None
+    rng = random.Random(seed)
+    deltas = []
+    for _ in range(reps):
+        sample = rng.choices(shared, k=len(shared))
+        base, compared = ratio(baseline, sample), ratio(arm, sample)
+        if base is not None and compared is not None:
+            deltas.append(compared - base)
+    deltas.sort()
+    return Paired(
+        cases=len(shared),
+        baseline=base_all,
+        arm=arm_all,
+        delta=arm_all - base_all,
+        low=deltas[int(0.025 * len(deltas))],
+        high=deltas[int(0.975 * len(deltas)) - 1],
+    )
+
+
 def cohen_kappa(a: Sequence[bool], b: Sequence[bool]) -> float | None:
     """Cohen's kappa for two binary raters over the same items; ``None`` if undefined."""
     if len(a) != len(b) or not a:

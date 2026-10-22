@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -394,15 +395,35 @@ def _graded_path(out: Path, harness: str, arm: str) -> Path:
     return out / "graded" / f"{harness}__{arm}.jsonl"
 
 
+class _LazyGatewayClient:
+    """An OpenAI client that resolves gateway credentials on first use.
+
+    A regrade that reuses every stored judge verdict then needs no credentials.
+    """
+
+    def __init__(self, profile: str | None) -> None:
+        self._profile = profile
+        self._client: Any = None
+        self._lock = threading.Lock()
+
+    def __getattr__(self, name: str) -> Any:
+        with self._lock:
+            if self._client is None:
+                from openai import OpenAI
+
+                from tests.harness_bench.runtime_env import resolve_bench_env
+
+                env = resolve_bench_env(self._profile).base_env
+                self._client = OpenAI(
+                    base_url=env["OPENAI_BASE_URL"], api_key=env["OPENAI_API_KEY"]
+                )
+        return getattr(self._client, name)
+
+
 def _make_judges(specs: list[str], profile: str | None) -> list[Judge]:
     if not specs:
         return []
-    from openai import OpenAI
-
-    from tests.harness_bench.runtime_env import resolve_bench_env
-
-    env = resolve_bench_env(profile).base_env
-    client = OpenAI(base_url=env["OPENAI_BASE_URL"], api_key=env["OPENAI_API_KEY"])
+    client = _LazyGatewayClient(profile)
     judges: list[Judge] = []
     for spec in specs:
         name, sep, model = spec.partition("=")
@@ -522,6 +543,8 @@ def read_graded(out: Path) -> list[GradedRun]:
                     findings=raw["findings"],
                     yaml_blocks=raw["yaml_blocks"],
                     yaml_invalid=raw["yaml_invalid"],
+                    commands_named=raw.get("commands_named", 0),
+                    commands_invented=raw.get("commands_invented", 0),
                 )
             )
     return runs

@@ -31,7 +31,7 @@ from dev.evals.omnigent_guide.labeling import human_agreement, write_blind_sampl
 from dev.evals.omnigent_guide.record import INFRA_ERROR, CriterionResult, GradedRun, RunRecord
 from dev.evals.omnigent_guide.referee import Referee, Surface
 from dev.evals.omnigent_guide.report import per_case, render_markdown, write_report
-from dev.evals.omnigent_guide.stats import cohen_kappa, paired_bootstrap
+from dev.evals.omnigent_guide.stats import cohen_kappa, paired_bootstrap, paired_ratio_bootstrap
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -212,6 +212,8 @@ def test_grade_runs_combines_code_and_judges(referee: Referee, tmp_path: Path) -
     assert graded[0].triggered and graded[0].score == 1.0 and not graded[0].fabricated
     assert graded[1].score == 0.0 and graded[1].fabricated
     assert graded[0].criteria[0].judges == {"fake": True}
+    assert (graded[0].commands_named, graded[0].commands_invented) == (1, 0)
+    assert (graded[1].commands_named, graded[1].commands_invented) == (1, 1)
 
 
 def test_judge_reply_parsing() -> None:
@@ -242,6 +244,7 @@ def _graded(
     fabricated: bool = False,
     status: str = "completed",
     run: int = 0,
+    commands: tuple[int, int] = (0, 0),
 ) -> GradedRun:
     record = RunRecord(
         case_id=case_id, harness="openai-agents", arm=arm, run_index=run, status=status, answer="x"
@@ -254,7 +257,11 @@ def _graded(
         skills_loaded=[],
         triggered=bool(score),
         criteria=[crit],
-        findings=[{"kind": "command", "counts": True}] if fabricated else [],
+        findings=[{"kind": "command", "text": "omnigent session list", "counts": True}]
+        if fabricated
+        else [],
+        commands_named=commands[0],
+        commands_invented=commands[1],
     )
 
 
@@ -280,13 +287,13 @@ def _cases(*ids: str, negative: str | None = None) -> dict[str, SimpleNamespace]
 def test_report_pairs_arms_by_case_and_drops_infra_errors(tmp_path: Path) -> None:
     cases = _cases("q1", "q2", negative="n1")
     runs = [
-        _graded("a0", "q1", 0, fabricated=True),
+        _graded("a0", "q1", 0, fabricated=True, commands=(2, 1)),
         _graded("a0", "q2", 0),
         _graded("a0", "n1", 0),
-        _graded("a3", "q1", 1),
-        _graded("a3", "q2", 1),
+        _graded("a3", "q1", 1, commands=(3, 0)),
+        _graded("a3", "q2", 1, commands=(1, 0)),
         _graded("a3", "n1", 1),
-        _graded("a3", "q2", 0, status=INFRA_ERROR, run=1),
+        _graded("a3", "q2", 0, status=INFRA_ERROR, run=1, commands=(5, 5)),
     ]
 
     report = write_report(runs, cases, tmp_path, baseline="a0")  # type: ignore[arg-type]
@@ -295,8 +302,18 @@ def test_report_pairs_arms_by_case_and_drops_infra_errors(tmp_path: Path) -> Non
     assert per_case(runs[3:], cases)["score"] == {"q1": 1.0, "q2": 1.0}  # type: ignore[arg-type]
     assert data["arms"]["a3"]["infra_errors"] == 1
     assert data["arms"]["a3"]["false_loads"] == 1.0
+    # Per answer, a0 names a command half the time; per command, half of a0's are invented.
+    assert data["arms"]["a0"]["names_commands"] == 0.5
+    assert data["arms"]["a0"]["invented_share"] == 0.5
+    assert data["arms"]["a3"]["invented_share"] == 0.0
+    assert data["arms"]["a0"]["invented_commands"] == {
+        "by_group": {"session": 1},
+        "total": 1,
+        "without_help_check": 1,
+    }
     (row,) = data["comparisons"]
     assert row["score"]["delta"] == 1.0 and row["fabricated"]["delta"] == -0.5
+    assert row["invented_share"]["delta"] == -0.5
     assert data["agreement"]["j1 vs j2 (checked)"]["items"] == 6
     assert "| a3 vs a0 | +100 pp" in render_markdown(report)
 
@@ -312,6 +329,13 @@ def test_stats_helpers() -> None:
     )
     assert cohen_kappa([True, False, True, False], [True, False, True, False]) == 1.0
     assert cohen_kappa([True, True], [True, True]) is None
+    # Pooled ratios: 2 of 4 named commands invented, then 1 of 10.
+    ratio = paired_ratio_bootstrap(
+        {"a": (2, 4), "b": (0, 0)}, {"a": (1, 6), "b": (0, 4)}, reps=500
+    )
+    assert ratio is not None and (ratio.baseline, ratio.arm) == (0.5, 0.1)
+    assert ratio.low <= ratio.delta <= ratio.high
+    assert paired_ratio_bootstrap({"a": (0, 0)}, {"a": (1, 2)}) is None
 
 
 def test_blind_sample_hides_arms_and_round_trips(tmp_path: Path) -> None:

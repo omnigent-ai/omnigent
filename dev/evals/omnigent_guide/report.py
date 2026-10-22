@@ -12,7 +12,7 @@ from typing import Any
 
 from dev.evals.omnigent_guide.cases import Case
 from dev.evals.omnigent_guide.record import INFRA_ERROR, GradedRun
-from dev.evals.omnigent_guide.stats import agreement, paired_bootstrap
+from dev.evals.omnigent_guide.stats import agreement, paired_bootstrap, paired_ratio_bootstrap
 
 #: Per-case metrics, each a mean over that case's runs.
 METRICS = ("score", "score_completed", "fabricated", "loaded", "yaml_invalid")
@@ -126,6 +126,44 @@ def per_case(runs: Sequence[GradedRun], cases: Mapping[str, Case]) -> dict[str, 
     return {m: {cid: fmean(v) for cid, v in b.items()} for m, b in buckets.items()}
 
 
+def invented_commands(runs: Sequence[GradedRun]) -> dict[str, Any]:
+    """Invented subcommands by command group, and how many came without any ``--help`` check."""
+    groups: Counter[str] = Counter()
+    total = unchecked = 0
+    for run in runs:
+        found = [f for f in run.findings if f.get("counts") and f.get("kind") == "command"]
+        if not found:
+            continue
+        checked = any(
+            _HELP_RE.search(str(c.get("arguments") or "")) for c in run.record.tool_calls
+        )
+        for finding in found:
+            # The referee stops at the first unknown word, so a third word means a real group.
+            parts = str(finding.get("text", "")).split()
+            groups[parts[1] if len(parts) > 2 else "(top level)"] += 1
+            total += 1
+            unchecked += not checked
+    return {
+        "by_group": dict(groups.most_common()),
+        "total": total,
+        "without_help_check": unchecked,
+    }
+
+
+def command_counts(
+    runs: Sequence[GradedRun], cases: Mapping[str, Case]
+) -> dict[str, tuple[int, int]]:
+    """``{case_id: (invented commands, named commands)}`` summed over an arm's runs."""
+    counts: dict[str, tuple[int, int]] = {}
+    for run in runs:
+        case = cases[run.record.case_id]
+        if run.record.status == INFRA_ERROR or not case.should_trigger:
+            continue
+        invented, named = counts.get(case.id, (0, 0))
+        counts[case.id] = (invented + run.commands_invented, named + run.commands_named)
+    return counts
+
+
 def _arm_summary(
     runs: Sequence[GradedRun], cases: Mapping[str, Case], version: str = ""
 ) -> dict[str, Any]:
@@ -142,6 +180,7 @@ def _arm_summary(
 
     positives = sorted({r.record.case_id for r in pos})
     negatives = sorted({r.record.case_id for r in neg})
+    named = sum(r.commands_named for r in pos)
     return {
         "runs": len(runs),
         "infra_errors": len(runs) - len(ok),
@@ -149,6 +188,11 @@ def _arm_summary(
         "score": mean_of(metrics["score"], positives),
         "score_completed": mean_of(metrics["score_completed"], positives),
         "fabricated": mean_of(metrics["fabricated"], positives),
+        # An answer that names more commands has more chances to invent one,
+        # so the per-answer rate above needs the per-command rate beside it.
+        "names_commands": (sum(r.commands_named > 0 for r in pos) / len(pos)) if pos else None,
+        "invented_share": (sum(r.commands_invented for r in pos) / named) if named else None,
+        "invented_commands": invented_commands(pos),
         "loaded": mean_of(metrics["loaded"], positives),
         "false_loads": mean_of(metrics["loaded"], negatives),
         "yaml_invalid": mean_of(metrics["yaml_invalid"], positives),
@@ -217,6 +261,7 @@ def write_report(
                 for arm, rs in sorted(arm_runs.items())
             }
             metrics = {arm: per_case(rs, cases) for arm, rs in arm_runs.items()}
+            counts = {arm: command_counts(rs, cases) for arm, rs in arm_runs.items()}
             comparisons = []
             # Explicit pairs replace the default of every arm against the baseline.
             wanted = pairs or [f"{arm}:{baseline}" for arm in sorted(arm_runs) if arm != baseline]
@@ -228,6 +273,8 @@ def write_report(
                 for metric in ("score", "score_completed", "fabricated", "loaded"):
                     result = paired_bootstrap(metrics[base][metric], metrics[arm][metric])
                     row[metric] = result.to_json() if result else None
+                share = paired_ratio_bootstrap(counts[base], counts[arm])
+                row["invented_share"] = share.to_json() if share else None
                 comparisons.append(row)
             per_cluster: dict[str, dict[str, float]] = defaultdict(dict)
             for arm, m in metrics.items():
@@ -270,10 +317,12 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             lines += [
                 f"### {split} split, {harness}",
                 "",
-                "| Arm | Cases | Pass rate | Pass rate, completed turns | Fabricated "
+                "| Arm | Cases | Pass rate | Pass rate, completed turns "
+                "| Answers with an invented name | Answers naming a command "
+                "| Named commands that don't exist "
                 "| Turn failed on a bad tool call | Guide loaded | Loaded on near misses "
                 "| Invalid YAML | Tokens | Infra errors |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
             for arm, s in data["arms"].items():
                 tokens = "—" if s["tokens"] is None else f"{s['tokens'] / 1000:.1f}k"
@@ -283,6 +332,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                     _pct(s["score"]),
                     _pct(s["score_completed"]),
                     _pct(s["fabricated"]),
+                    _pct(s["names_commands"]),
+                    _pct(s["invented_share"]),
                     _pct(s["invented_tool"]),
                     _pct(s["loaded"]),
                     _pct(s["false_loads"]),
@@ -295,8 +346,9 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                 lines += [
                     "",
                     "| Arm vs baseline | Pass rate Δ [95% CI] | Completed turns Δ [95% CI] "
-                    "| Fabricated Δ [95% CI] | Guide loaded Δ [95% CI] |",
-                    "| --- | --- | --- | --- | --- |",
+                    "| Answers with an invented name Δ [95% CI] "
+                    "| Named commands that don't exist Δ [95% CI] | Guide loaded Δ [95% CI] |",
+                    "| --- | --- | --- | --- | --- | --- |",
                 ]
                 for row in data["comparisons"]:
                     cells = [
@@ -304,6 +356,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
                         _delta(row["score"]),
                         _delta(row["score_completed"]),
                         _delta(row["fabricated"]),
+                        _delta(row.get("invented_share")),
                         _delta(row["loaded"]),
                     ]
                     lines.append("| " + " | ".join(cells) + " |")

@@ -133,6 +133,7 @@ def grade_runs(
                 ).items():
                     if cid in by_id:
                         by_id[cid].judges[judge.name] = verdict
+        named, invented = cli_counts(review)
         graded.append(
             GradedRun(
                 record=record,
@@ -145,9 +146,33 @@ def grade_runs(
                 ],
                 yaml_blocks=review.yaml_blocks,
                 yaml_invalid=review.yaml_invalid,
+                commands_named=named,
+                commands_invented=invented,
             )
         )
     return graded
+
+
+_CLI_KINDS = frozenset({"command", "option"})
+
+
+def cli_counts(review: Review) -> tuple[int, int]:
+    """
+    Distinct ``omnigent`` commands an answer names, and how many do not exist.
+
+    A real command counts once however it is invoked; an invocation with an
+    invented subcommand or flag counts as its own command. A name that only a
+    newer build has, or that the answer itself negates, is named but not invented.
+    """
+    invented = {f.text for f in review.fabrications if f.kind in _CLI_KINDS}
+    newer = {
+        f.text.split(": ", 1)[1]
+        for f in review.findings
+        if f.kind == "version_mismatch" and f.text.split(": ", 1)[0] in _CLI_KINDS
+    }
+    negated = {f.text for f in review.findings if f.kind in _CLI_KINDS and f.negated}
+    valid = {"omnigent " + " ".join(path) for path, _ in review.commands}
+    return len(valid | newer | negated | invented), len(invented)
 
 
 def _run_check(

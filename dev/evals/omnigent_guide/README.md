@@ -42,7 +42,10 @@ it, using facts `referee_probe.py` reads from that build:
   the linked ref), and omnigent.ai links (against the site's page list).
 
 The fabrication rate is the share of answers with at least one claim that
-does not exist in that build. Mentions the answer itself negates ("there is no
+does not exist in that build. An answer that names more commands has more
+chances to invent one, so the report also gives the share of answers that name
+an `omnigent` command and the share of named commands that do not exist,
+pooled over all answers. Mentions the answer itself negates ("there is no
 `omnigent schedule` command") do not count. Two near cases are reported
 separately: a real key name in the wrong place (for example a single-file key
 in a bundle `config.yaml`) counts as invalid config, and a name that only the

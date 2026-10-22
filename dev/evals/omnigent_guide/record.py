@@ -100,6 +100,8 @@ class GradedRun:
     :param findings: Referee findings (claims that do not exist in the build).
     :param yaml_blocks: Agent-config YAML blocks or files the answer contained.
     :param yaml_invalid: How many of those failed to load cleanly.
+    :param commands_named: Distinct ``omnigent`` commands the answer names.
+    :param commands_invented: How many of those do not exist in the build.
     """
 
     record: RunRecord
@@ -109,6 +111,8 @@ class GradedRun:
     findings: list[dict[str, Any]] = field(default_factory=list)
     yaml_blocks: int = 0
     yaml_invalid: int = 0
+    commands_named: int = 0
+    commands_invented: int = 0
 
     @property
     def score(self) -> float | None:
