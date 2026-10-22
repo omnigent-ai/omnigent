@@ -102,7 +102,7 @@ class StartupLease:
         self, operation: Callable[[], ScheduledTaskRun | None], *, renewing: bool = False
     ) -> None:
         async def apply() -> None:
-            async with self._lock:
+            try:
                 with workspace_scope(self.run.workspace_id):
                     run = await asyncio.to_thread(operation)
                 if run is None or (
@@ -119,9 +119,12 @@ class StartupLease:
                         "check the run."
                     )
                 self.run = run
+            finally:
+                self._lock.release()
 
-        # Cancelling the caller cannot stop a database thread. Keep its lock and
-        # refresh the snapshot before allowing the next write to use it.
+        # Waiting callers can cancel. Once acquired, the shielded write owns the
+        # lock until its database call and snapshot update finish.
+        await self._lock.acquire()
         write = asyncio.create_task(apply())
         self._writes.add(write)
         write.add_done_callback(self._write_done)

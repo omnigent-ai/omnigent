@@ -270,6 +270,73 @@ async def test_cancelled_renewal_finishes_before_the_next_lease_update(store, mo
         await asyncio.gather(renewal, return_exceptions=True)
 
 
+@pytest.mark.parametrize("operation", ["renew", "attach", "finish"])
+async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
+    store, monkeypatch, operation
+):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    committed = asyncio.Event()
+    queued = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = store.renew_starting_run
+    calls = []
+
+    def slow_reply(*args, **kwargs):
+        calls.append("renew")
+        updated = original(*args, **kwargs)
+        loop.call_soon_threadsafe(committed.set)
+        assert release.wait(10)
+        return updated
+
+    async def waiting_write():
+        queued.set()
+        if operation == "renew":
+            await lease.check()
+        elif operation == "attach":
+            await lease.attach_session("cancelled-session")
+        else:
+            await lease.finish("running")
+
+    monkeypatch.setattr(store, "renew_starting_run", slow_reply)
+    renewal = asyncio.create_task(lease.check())
+    waiter = None
+    try:
+        await asyncio.wait_for(committed.wait(), 10)
+        expected = store.list_runs(task.id)[0][0]
+        waiter = asyncio.create_task(waiting_write())
+        await asyncio.wait_for(queued.wait(), 10)
+        waiter.cancel()
+        renewal.cancel()
+        for caller in (waiter, renewal):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 10)
+        clock.advance(100)
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*list(lease._writes)), 10)
+        assert calls == ["renew"]
+        assert lease.run == store.list_runs(task.id)[0][0] == expected
+        # Completion of the cancelled in-flight write must also release the lock.
+        await asyncio.wait_for(lease.finish("running"), 10)
+        assert lease.run.status == "running"
+    finally:
+        release.set()
+        for caller in (renewal, waiter):
+            if caller is not None:
+                caller.cancel()
+                await asyncio.gather(caller, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(*list(lease._writes), return_exceptions=True), 10)
+
+
 @pytest.mark.parametrize("interruption", ["lease_loss", "stop", "executor_error"])
 async def test_interrupted_executor_stops_and_leaves_run_recoverable(
     store, monkeypatch, caplog, interruption

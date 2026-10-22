@@ -40,7 +40,8 @@ scheduler cancels local startups and prevents further polling until it is starte
 again. A database request already running in a worker thread can still commit:
 a claim may be left for recovery, or a renewal may delay recovery until its new
 deadline. Lease writes stay serialized until their database calls finish and
-update the local run snapshot, even if their callers were cancelled.
+update the local run snapshot, even if their callers were cancelled. Writes still
+waiting for the lease lock are cancelled without making a database call.
 
 By default, every host is eligible. Deployments that assign hosts to replicas
 supply an `owns_host` callback, including ownership of derived sandbox host IDs.
