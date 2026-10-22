@@ -612,6 +612,14 @@ Cross-harness journeys:
   afterwards never appears, and a follow-up in the same session completes. The
   harness bench does not register opencode-native, so its interrupt probe does
   not apply.
+- **`launch-web` / `steer`, Claude submit certainty (component checks):**
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_unobserved_user_draft_has_uncertain_delivery`
+  checks an Enter whose pasted draft was never observed.
+  `tests/inner/test_claude_native_executor.py::test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_ambiguous`
+  and `tests/inner/test_claude_native_executor.py::test_enqueue_uncertain_submit_does_not_request_automatic_replay`
+  cover initial web turns and live steering. Uncertain delivery preserves the
+  terminal and cannot trigger automatic replay. These use a controlled tmux
+  boundary; they do not establish live vendor or browser behavior.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
