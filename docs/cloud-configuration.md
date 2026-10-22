@@ -30,10 +30,12 @@ A launcher can include its existing plugin preferences:
 
 ```sh
 omnigent config cloud --server "$SERVER_URL" \
-  --plugin-opt-outs "$HOME/.config/llm-cli/plugin-optout.json" save
+  --plugin-opt-outs "$PLUGIN_PREFERENCES_FILE" save
 ```
 
-Use the same option for import. The JSON contains `opted_out` (bare plugin names)
+Set `PLUGIN_PREFERENCES_FILE` to the file supplied by your launcher and use the
+same option for import. Omnigent does not install or manage those plugins.
+The JSON contains `opted_out` (bare plugin names)
 and `disable_all` (freeze automatic plugin management, leaving installed files
 alone). Without this option, save preserves existing cloud opt-outs and import
 leaves local opt-outs alone. A snapshot without an opt-out block also leaves

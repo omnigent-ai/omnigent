@@ -63,8 +63,8 @@ omitting an auth provider uses the reserved `local` user namespace.
 (`--yes` accepts explicitly). A launcher can supply `--plugin-opt-outs PATH`
 before the subcommand to include its existing JSON preferences. `onboard` is an
 interactive launcher hook; OSS startup does not invoke it automatically. See the
-[configuration guide](../docs/cloud-configuration.md). Isaac startup remains a
-separate Universe integration.
+[configuration guide](../docs/cloud-configuration.md). Automatic prompting and
+plugin management by an external launcher require a separate integration.
 
 **Shared scope controls:** the CLI and UI do not yet offer automatic following,
 saving machine overrides, removing a machine override,
@@ -126,7 +126,8 @@ remain local, ordered arguments and opt-outs copy, backups exist, and local edit
 do not follow automatically. The component matrix covers decline, malformed
 files, stale cloud/login/local previews, write failure recovery, harness aliases,
 one-time prompts and noninteractive no-network startup. Managed authentication,
-Isaac startup and plugin housekeeping require the Universe integration recipe.
+external launcher startup and plugin housekeeping require that launcher's
+integration recipe.
 
 For a human check, use two temporary `OMNIGENT_CONFIG_HOME` directories against
 an isolated enabled server. Save a model from A, decline import in B and confirm
