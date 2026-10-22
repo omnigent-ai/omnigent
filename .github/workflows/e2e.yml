@@ -12,7 +12,7 @@ name: E2E Tests
 #                       runs entirely against the in-process mock LLM (no
 #                       secrets), so fork PRs run it directly here just like
 #                       ci.yml, with no fork-e2e/** mirror (#802 removed the
-#                       credential setup). The four shard checks are required by
+#                       credential setup). The eight shard checks are required by
 #                       merge-ready.yml.
 
 on:
@@ -41,7 +41,7 @@ on:
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per shard (-n flag). Default 2 keeps per-shard concurrency low so the 4 shards * 2 workers = 8 concurrent gateway calls stays below the nightly's pain point (20 concurrent triggered 429s)."
+        description: "Number of pytest workers per shard (-n flag). Default 2 runs up to 16 workers across 8 shards."
         required: false
         default: "2"
 
@@ -111,15 +111,14 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           RUN_TESTS: ${{ steps.scope.outputs.e2e }}
-          NUM_SHARDS: "4"
+          NUM_SHARDS: "8"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   e2e:
     # Sharded matrix: each shard runs ~1/N of the set, under the wallclock
-    # budget where CrowdStrike kills long jobs (#426). max-parallel:4 runs
+    # budget where CrowdStrike kills long jobs (#426). max-parallel:8 runs
     # all shards concurrently so one wedged shard can't block the others.
-    # -n 2 per shard => 4 x 2 = 8 concurrent gateway calls, below the
-    # nightly's 429 pain point; drop -n before max-parallel if rate-limited.
+    # Two pytest workers per shard allow up to 16 concurrent test workers.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
@@ -131,7 +130,7 @@ jobs:
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       # Shards from `setup` (deterministic node-ID split); [] when skipped.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
