@@ -18,6 +18,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from tests.budgets import budget
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -170,4 +172,5 @@ async def test_lifespan_starts_periodic_metrics_otel_publisher(
             if thread.name == "omnigent-event-loop-watchdog"
         ]
         assert len(watchdogs) == 1
+    watchdogs[0].join(timeout=budget(3))
     assert not watchdogs[0].is_alive()

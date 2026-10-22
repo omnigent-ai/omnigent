@@ -97,6 +97,8 @@ The server starts a dedicated watchdog thread while its ASGI lifespan is serving
 It checks a one-second event-loop heartbeat and emits `server_event_loop_stalled`
 at WARNING when that heartbeat has not advanced for five seconds. Reports are
 limited to one per minute per app lifespan, including across separate stalls.
+Capture failures also consume this cooldown to limit repeated errors; samples
+discarded because the heartbeat recovered do not.
 The thread does not depend on the event loop or its default executor, so it can
 sample a blocking call before the loop recovers. Startup and shutdown are not
 monitored. If the watchdog thread cannot start, the server continues serving
@@ -106,7 +108,7 @@ The warning includes `stalled_s`, `threshold_s`, `loop_thread_id`, and
 `report_interval_s` attributes. The message stays on one line; the sampled stack
 is stored once in the debug-log table's `stack_trace` column, carried by the log
 record's `captured_stack_trace` field. It contains at most 64 frames and 8,192
-characters including the header and omission marker. Frames are innermost first,
+UTF-8 bytes including the header and omission marker. Frames are innermost first,
 and truncation preserves whole lines and ends with `... older frames omitted ...`.
 Source lines and local variables are not collected. This is a process-level
 event, so correlate by `hostname` and `client_time`, not by session ID.
@@ -124,6 +126,8 @@ LIMIT 100;
 ```
 
 The watchdog is diagnostic only: it neither closes tunnels nor restarts tasks.
+Context exit waits at most 0.1 seconds for its thread. A logging handler stuck
+holding its lock can still delay other shutdown logging or `logging.shutdown()`.
 A native extension holding the GIL, or a process that cannot be scheduled, can
 also prevent the watchdog thread from running. No sample does not establish
 that the loop was healthy. After a process-wide pause (such as SIGSTOP, CPU

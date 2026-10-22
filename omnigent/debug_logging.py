@@ -45,6 +45,8 @@ from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.version import VERSION
 
+CAPTURED_STACK_TRACE_FIELD = "captured_stack_trace"
+
 # ── environment contract ────────────────────────────────────────────────────
 # The insert endpoint carries the table (in its path) and the workspace id (in
 # its host), so only four values are needed. See config_from_env.
@@ -558,7 +560,7 @@ def debug_event(
 def _stack_trace(record: logging.LogRecord) -> str | None:
     if record.exc_info:
         return "".join(traceback.format_exception(*record.exc_info))
-    return record.exc_text or getattr(record, "captured_stack_trace", None)
+    return record.exc_text or getattr(record, CAPTURED_STACK_TRACE_FIELD, None)
 
 
 def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:

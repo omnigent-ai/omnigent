@@ -16,6 +16,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.server import event_loop_watchdog as watchdog
+from tests.budgets import budget
 
 
 @pytest.fixture
@@ -41,12 +42,14 @@ async def test_captures_blocking_stack_rate_limits_and_recovers(stall_records) -
     private_request_content = "private-request-body-canary"
     threads_before = set(threading.enumerate())
     with watchdog.monitor_event_loop(
-        stall_threshold_s=0.1, sample_interval_s=0.01, report_interval_s=0.4
+        stall_threshold_s=budget(0.5),
+        sample_interval_s=budget(0.05),
+        report_interval_s=budget(0.8),
     ):
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(budget(0.6))
         assert stall_records.empty()
         # Synchronous Queue.get deliberately blocks this loop until the watchdog logs.
-        first = stall_records.get(timeout=3)
+        first = stall_records.get(timeout=budget(3))
         row = record_to_row(first, source="server")
         assert row["event_name"] == "server_event_loop_stalled"
         assert "test_captures_blocking_stack_rate_limits_and_recovers" in row["stack_trace"]
@@ -55,31 +58,45 @@ async def test_captures_blocking_stack_rate_limits_and_recovers(stall_records) -
         assert row["stack_trace"] not in row["message"]
         assert private_request_content not in str(row)
         assert first.attributes["loop_thread_id"] == threading.get_ident()
-        assert first.attributes["stalled_s"] >= 0.1
-        with pytest.raises(queue.Empty):
-            stall_records.get(timeout=0.15)
-        second = stall_records.get(timeout=3)
-        assert second.created - first.created >= 0.39
+        assert first.attributes["stalled_s"] >= budget(0.5) - 0.001
+        second = stall_records.get(timeout=budget(3))
+        assert second.created - first.created >= budget(0.79)
         # Async waiting allows heartbeats to resume; a healthy idle loop stays quiet.
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(budget(1.4))
         assert stall_records.empty()
-        third = stall_records.get(timeout=3)
+        third = stall_records.get(timeout=budget(3))
         assert third.event_name == "server_event_loop_stalled"
         threads = set(threading.enumerate()) - threads_before
         watchdog_threads = [t for t in threads if t.name == "omnigent-event-loop-watchdog"]
         assert len(watchdog_threads) == 1
+    watchdog_threads[0].join(timeout=budget(3))
     assert not watchdog_threads[0].is_alive()
     with pytest.raises(queue.Empty):
-        stall_records.get(timeout=0.15)
+        stall_records.get(timeout=budget(0.15))
 
 
 @pytest.mark.asyncio
-async def test_watchdog_stops_when_serving_raises(stall_records) -> None:
+async def test_watchdog_stops_when_serving_raises(stall_records, monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+    scheduled_heartbeats: list[asyncio.TimerHandle] = []
+    call_later = loop.call_later
+
+    def track_timer(delay, callback, *args, **kwargs):
+        handle = call_later(delay, callback, *args, **kwargs)
+        if callback.__name__ == "heartbeat":
+            scheduled_heartbeats.append(handle)
+        return handle
+
+    monkeypatch.setattr(loop, "call_later", track_timer)
     with pytest.raises(RuntimeError, match="serving failed"):
-        with watchdog.monitor_event_loop(stall_threshold_s=0.03, sample_interval_s=0.005):
+        with watchdog.monitor_event_loop(
+            stall_threshold_s=budget(0.03), sample_interval_s=budget(0.005)
+        ):
             raise RuntimeError("serving failed")
+    assert len(scheduled_heartbeats) == 1
+    assert scheduled_heartbeats[0].cancelled()
     with pytest.raises(queue.Empty):
-        stall_records.get(timeout=0.1)
+        stall_records.get(timeout=budget(0.1))
 
 
 @pytest.mark.asyncio
@@ -96,10 +113,12 @@ async def test_capture_failure_does_not_disable_watchdog(stall_records, monkeypa
 
     monkeypatch.setattr(watchdog, "_capture_stack", fail_once)
     with watchdog.monitor_event_loop(
-        stall_threshold_s=0.03, sample_interval_s=0.005, report_interval_s=0.05
+        stall_threshold_s=budget(0.03),
+        sample_interval_s=budget(0.005),
+        report_interval_s=budget(0.05),
     ):
-        assert stall_records.get(timeout=3).levelno == logging.ERROR
-        assert stall_records.get(timeout=3).event_name == "server_event_loop_stalled"
+        assert stall_records.get(timeout=budget(3)).levelno == logging.ERROR
+        assert stall_records.get(timeout=budget(3)).event_name == "server_event_loop_stalled"
 
 
 @pytest.mark.asyncio
@@ -111,21 +130,21 @@ async def test_discarded_capture_does_not_suppress_next_stall(stall_records, mon
     def delay_first_capture(thread_id: int) -> str:
         if not capture_started.is_set():
             capture_started.set()
-            if not finish_capture.wait(timeout=3):
+            if not finish_capture.wait(timeout=budget(3)):
                 raise RuntimeError("Test did not release the first capture")
         return capture(thread_id)
 
     monkeypatch.setattr(watchdog, "_capture_stack", delay_first_capture)
     with watchdog.monitor_event_loop(
-        stall_threshold_s=0.1, sample_interval_s=0.01, report_interval_s=60
+        stall_threshold_s=budget(0.1), sample_interval_s=budget(0.01), report_interval_s=budget(60)
     ):
         try:
-            assert capture_started.wait(timeout=3)
+            assert capture_started.wait(timeout=budget(3))
             # Resume heartbeats while capture is in progress, making its snapshot stale.
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(budget(0.05))
         finally:
             finish_capture.set()
-        record = stall_records.get(timeout=3)
+        record = stall_records.get(timeout=budget(3))
         assert record.event_name == "server_event_loop_stalled"
 
 
@@ -138,7 +157,7 @@ async def test_thread_start_failure_does_not_prevent_serving(stall_records, monk
     monkeypatch.setattr(watchdog, "threading", threading_proxy)
 
     with watchdog.monitor_event_loop():
-        record = stall_records.get(timeout=1)
+        record = stall_records.get(timeout=budget(1))
         assert record.event_name == "server_event_loop_watchdog_failed"
         assert "can't start new thread" in str(record.exc_info[1])
     thread.join.assert_not_called()
@@ -153,31 +172,41 @@ async def test_shutdown_does_not_wait_for_blocked_logging(monkeypatch) -> None:
     def blocked_warning(*args, **kwargs) -> None:
         logging_threads.append(threading.current_thread())
         logging_started.set()
-        release_logging.wait(timeout=3)
+        release_logging.wait(timeout=budget(3))
 
     monkeypatch.setattr(watchdog._logger, "warning", blocked_warning)
     try:
-        with watchdog.monitor_event_loop(stall_threshold_s=0.03, sample_interval_s=0.005):
-            assert logging_started.wait(timeout=3)
+        with watchdog.monitor_event_loop(
+            stall_threshold_s=budget(0.03), sample_interval_s=budget(0.005)
+        ):
+            assert logging_started.wait(timeout=budget(3))
             shutdown_started = monotonic()
-        assert monotonic() - shutdown_started < 1
+        assert monotonic() - shutdown_started < budget(1)
         assert not release_logging.is_set()
     finally:
         release_logging.set()
         for thread in logging_threads:
-            thread.join(timeout=3)
+            thread.join(timeout=budget(3))
             assert not thread.is_alive()
 
 
 @pytest.mark.parametrize(
-    ("frame_count", "filename_length", "truncated"),
-    [(100, 10, True), (100, 140, True), (100, 1000, True), (1, 9000, True), (3, 10, False)],
+    ("frame_count", "filename", "truncated"),
+    [
+        (100, "x" * 10, True),
+        (100, "x" * 140, True),
+        (100, "x" * 1000, True),
+        (1, "x" * 9000, True),
+        (3, "x" * 10, False),
+        (100, "路径" * 100, True),
+        (1, "路径" * 2000, True),
+    ],
 )
-def test_stack_capture_is_bounded(monkeypatch, frame_count, filename_length, truncated) -> None:
+def test_stack_capture_is_bounded(monkeypatch, frame_count, filename, truncated) -> None:
     frame = None
     for index in range(frame_count):
         frame = SimpleNamespace(
-            f_code=SimpleNamespace(co_filename="x" * filename_length, co_name=f"call_{index}"),
+            f_code=SimpleNamespace(co_filename=filename, co_name=f"call_{index}"),
             f_lineno=index,
             f_back=frame,
         )
@@ -188,12 +217,15 @@ def test_stack_capture_is_bounded(monkeypatch, frame_count, filename_length, tru
     assert stack.endswith("\n")
     frame_lines = stack.splitlines()[1:-1] if truncated else stack.splitlines()[1:]
     assert len(frame_lines) <= 64
-    assert all(re.fullmatch(r'  File "x+", line \d+, in call_\d+', line) for line in frame_lines)
-    if filename_length < 8192:
+    assert all(
+        re.fullmatch(rf'  File "{re.escape(filename)}", line \d+, in call_\d+', line)
+        for line in frame_lines
+    )
+    if len(filename.encode("utf-8")) < 8192:
         assert frame_lines[0].endswith(f"in call_{frame_count - 1}")
     if not truncated:
         assert len(frame_lines) == frame_count
-    assert len(stack) <= 8192
+    assert len(stack.encode("utf-8")) <= 8192
 
 
 @pytest.mark.parametrize("threshold", [0, -1, float("inf"), float("nan"), 0.5])

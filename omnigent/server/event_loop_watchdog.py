@@ -1,4 +1,9 @@
-"""Capture the serving event loop's stack while it is unresponsive."""
+"""Capture the serving event loop's stack while it is unresponsive.
+
+Tunnel diagnostics measure scheduling delay after a coroutine resumes. This
+heartbeat instead publishes progress under a lock for sampling by another thread
+while the loop is blocked, independently of any connection's lifecycle.
+"""
 
 from __future__ import annotations
 
@@ -11,18 +16,18 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from time import monotonic
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import CAPTURED_STACK_TRACE_FIELD, debug_event
 
 _logger = logging.getLogger(__name__)
 _MAX_STACK_FRAMES = 64
-_MAX_STACK_CHARS = 8192
+_MAX_STACK_BYTES = 8192
 
 
 def _capture_stack(thread_id: int) -> str:
     """Return bounded frame locations, without reading source lines or locals."""
     header = "Stack (innermost frame first):\n"
     omission_marker = "  ... older frames omitted ...\n"
-    remaining_chars = _MAX_STACK_CHARS - len(header) - len(omission_marker)
+    remaining_bytes = _MAX_STACK_BYTES - len(header) - len(omission_marker)
     frame = sys._current_frames().get(thread_id)
     lines: list[str] = []
     try:
@@ -31,10 +36,11 @@ def _capture_stack(thread_id: int) -> str:
                 f'  File "{frame.f_code.co_filename}", line {frame.f_lineno}, '
                 f"in {frame.f_code.co_name}\n"
             )
-            if len(line) > remaining_chars:
+            line_bytes = len(line.encode("utf-8", errors="replace"))
+            if line_bytes > remaining_bytes:
                 break
             lines.append(line)
-            remaining_chars -= len(line)
+            remaining_bytes -= line_bytes
             frame = frame.f_back
         if frame is not None:
             lines.append(omission_marker)
@@ -102,7 +108,7 @@ def monitor_event_loop(
                             loop_thread_id=loop_thread_id,
                             report_interval_s=report_interval_s,
                         ),
-                        "captured_stack_trace": stack,
+                        CAPTURED_STACK_TRACE_FIELD: stack,
                     },
                 )
             except Exception:
@@ -127,6 +133,6 @@ def monitor_event_loop(
         stopped.set()
         if heartbeat_handle is not None:
             heartbeat_handle.cancel()
-        # A blocked log handler must not hold up server shutdown.
+        # Don't wait for a watchdog stuck in its own log call.
         if thread.ident is not None:
             thread.join(timeout=0.1)
