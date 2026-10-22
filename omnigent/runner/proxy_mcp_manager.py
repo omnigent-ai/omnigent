@@ -22,7 +22,6 @@ When to use each implementation:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
@@ -387,7 +386,7 @@ class ProxyMcpManager:
                     request_generation,
                     timeout_seconds=_SERVER_RECONNECT_WAIT_S,
                 )
-            except asyncio.TimeoutError as reconnect_exc:
+            except TimeoutError as reconnect_exc:
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
                     f"{self._session_id!r} lost its server and no replacement "

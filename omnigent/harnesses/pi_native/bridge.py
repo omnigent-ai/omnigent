@@ -343,6 +343,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
+    usage_baseline: dict[str, int] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -360,6 +361,8 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
+    :param usage_baseline: Server-recorded own-session cumulative tokens,
+        excluding child sessions; ``None`` retains local-only restoration.
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -372,11 +375,23 @@ def write_extension_files(
         "authHeaders": auth_headers or {},
         "tools": tools or [],
     }
+    if usage_baseline is not None:
+        payload["usageBaseline"] = usage_baseline
     # A marker left by a previous Pi process would report this launch ready early.
     (bridge_dir / _INPUT_READY_FILE).unlink(missing_ok=True)
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())
     return extension_path(bridge_dir), config_path(bridge_dir)
+
+
+def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path | None:
+    """Atomically replace owner-only startup instructions, or remove stale text."""
+    path = bridge_dir / "agent_instructions.md"
+    if instructions is None:
+        path.unlink(missing_ok=True)
+        return None
+    _atomic_text(path, instructions)
+    return path
 
 
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:

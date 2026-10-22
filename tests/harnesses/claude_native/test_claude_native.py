@@ -431,7 +431,11 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
-            "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
+            "ANTHROPIC_CUSTOM_HEADERS": (
+                "x-databricks-use-coding-agent-mode: true\n"
+                "Databricks-Custom-Coding-Agent: claude-code\n"
+                "Databricks-Custom-Client-Surfaces: omnigent, ug"
+            ),
             # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
             # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
             # negotiates the anthropic-beta set with the gateway and keeps MCP
@@ -8584,6 +8588,39 @@ def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
     assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
+def test_provider_config_for_native_claude_attributes_a_unity_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider on the Unity Gateway adds attribution after the user's own headers."""
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Team: search")
+    base_url = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {"base_url": base_url, "auth_command": "my-cli print-token"},
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+
+    assert cfg is not None
+    assert cfg.env == {
+        "ANTHROPIC_BASE_URL": base_url,
+        "ANTHROPIC_CUSTOM_HEADERS": (
+            "X-Team: search\n"
+            "Databricks-Custom-Coding-Agent: claude-code\n"
+            "Databricks-Custom-Client-Surfaces: omnigent"
+        ),
+    }
+
+
 def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
 
@@ -11707,6 +11744,11 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     assert config is not None
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
     assert config.env["CLAUDE_CODE_USE_GATEWAY"] == "1"
+    assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        "x-databricks-use-coding-agent-mode: true",
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent",
+    ]
     assert config.api_key_helper is not None
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
     # Model comes from the catalog default (stubbed by _stub_catalog_default).
@@ -11734,7 +11776,10 @@ def test_connect_fallback_prefers_ucode_state(
         agents={
             "claude": UcodeAgentState(
                 model="system.ai.claude-sonnet-4-6",
-                env={"ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic"},
+                env={
+                    "ANTHROPIC_BASE_URL": "https://ws.example/serving-endpoints/anthropic",
+                    "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/0.1.0 claude/2.1.0",
+                },
             )
         },
     )
@@ -11746,6 +11791,12 @@ def test_connect_fallback_prefers_ucode_state(
     # ucode's base URL + discovered model win over the hand-built defaults.
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/serving-endpoints/anthropic"
     assert config.model == "system.ai.claude-sonnet-4-6"
+    # ug's own header lines survive, and the route is attributed to it.
+    assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        "User-Agent: ucode/0.1.0 claude/2.1.0",
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent, ug",
+    ]
     # But the bearer is still our own broker command, not ucode's.
     assert config.api_key_helper is not None
     assert "omnigent.host.databricks_credential token" in config.api_key_helper

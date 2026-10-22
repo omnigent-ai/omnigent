@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DbcertBanner } from "./DbcertBanner";
+import { DbcertBanner, LaptopDbcertBanner } from "./DbcertBanner";
 import type * as HostModule from "@/lib/host";
 import { isDatabricksWorkspace } from "@/lib/host";
 import type * as HostDbcertModule from "@/lib/hostDbcert";
@@ -16,6 +16,7 @@ const EXPIRED = Date.UTC(2026, 9, 18, 20, 8, 15);
 const EXPIRED_LATER = Date.UTC(2026, 9, 18, 20, 30);
 const RENEWED = Date.UTC(2026, 9, 19, 17);
 const desktopRefresh = vi.fn();
+const desktopCheck = vi.fn();
 const desktopFeatures = vi.fn();
 interface TestHost {
   host_id: string;
@@ -79,12 +80,14 @@ beforeEach(() => {
   vi.mocked(readHostDbcertExpiry).mockReset().mockResolvedValue(EXPIRED);
   vi.mocked(startHostDbcertRefresh).mockReset().mockResolvedValue(true);
   desktopRefresh.mockReset().mockResolvedValue({ ok: true });
+  desktopCheck.mockReset().mockResolvedValue({ ok: true, valid: true });
   desktopFeatures
     .mockReset()
     .mockResolvedValue({ databricksInternalFeatures: true, canRefreshDbcert: true });
   (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
     kind: "electron",
     refreshDbcert: desktopRefresh,
+    checkDbcert: desktopCheck,
     getDesktopFeatures: desktopFeatures,
   };
 });
@@ -197,7 +200,8 @@ describe("DbcertBanner", () => {
     await settle();
     expect(desktopRefresh).toHaveBeenCalledOnce();
     expect(startHostDbcertRefresh).not.toHaveBeenCalled();
-    expect(screen.getByText(/Finish the sign-in/)).toBeTruthy();
+    expect(desktopRefresh).toHaveBeenCalledWith();
+    expect(screen.getByText(/Opening browser sign-in/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty("disabled", true);
     await settle(4_000);
     expect(screen.queryByText(/has expired/)).toBeNull();
@@ -306,4 +310,88 @@ describe("DbcertBanner", () => {
     expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
     expect(screen.queryByText(/Couldn't refresh it from here/)).toBeNull();
   });
+});
+
+describe("LaptopDbcertBanner", () => {
+  it("waits for an explicit refresh and verifies the laptop without querying a host", async () => {
+    const onReady = vi.fn();
+    render(
+      <StrictMode>
+        <LaptopDbcertBanner onReady={onReady} onDismiss={vi.fn()} />
+      </StrictMode>,
+    );
+    await settle();
+    expect(
+      screen.getByText("Your laptop's dbcert is missing or expired. Refresh it, then try again."),
+    ).toBeTruthy();
+    expect(desktopRefresh).not.toHaveBeenCalled();
+    expect(desktopCheck).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+    await settle();
+    expect(desktopRefresh).toHaveBeenCalledOnce();
+    expect(desktopCheck).toHaveBeenCalledOnce();
+    expect(desktopRefresh).toHaveBeenCalledWith({ skipArcaSync: true });
+    expect(onReady).toHaveBeenCalledOnce();
+    expect(readHostDbcertExpiry).not.toHaveBeenCalled();
+    expect(startHostDbcertRefresh).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: "canceled sign-in",
+      renewal: { ok: false, error: "Sign-in canceled" },
+      status: { ok: true, valid: true },
+      error: "Sign-in canceled",
+    },
+    {
+      name: "renewal that leaves an invalid certificate",
+      renewal: { ok: true },
+      status: { ok: true, valid: false },
+      error: "Your laptop's dbcert is still invalid after sign-in. Try refreshing it again.",
+    },
+    {
+      name: "failed verification",
+      renewal: { ok: true },
+      status: { ok: false, error: "Couldn't check your laptop's dbcert. Try again." },
+      error: "Couldn't check your laptop's dbcert. Try again.",
+    },
+  ])("keeps $name blocked and allows retry", async ({ renewal, status, error }) => {
+    const onReady = vi.fn();
+    desktopRefresh.mockResolvedValue(renewal);
+    desktopCheck.mockResolvedValue(status);
+    render(<LaptopDbcertBanner onReady={onReady} onDismiss={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+    await settle();
+    expect(onReady).not.toHaveBeenCalled();
+    expect(screen.getByText(error)).toBeTruthy();
+    expect(desktopCheck).toHaveBeenCalledTimes(renewal.ok ? 1 : 0);
+    desktopRefresh.mockResolvedValue({ ok: true });
+    desktopCheck.mockResolvedValue({ ok: true, valid: true });
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    await settle();
+    expect(onReady).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])(
+    "ignores results after unmount (verification pending=%s)",
+    async (verifying) => {
+      const onReady = vi.fn();
+      let finish!: (result: { ok: true; valid?: boolean }) => void;
+      const pending = verifying ? desktopCheck : desktopRefresh;
+      pending.mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const view = render(<LaptopDbcertBanner onReady={onReady} onDismiss={vi.fn()} />);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+      await settle();
+      expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty("disabled", true);
+      view.unmount();
+      finish(verifying ? { ok: true, valid: true } : { ok: true });
+      await settle();
+      expect(onReady).not.toHaveBeenCalled();
+      expect(desktopCheck).toHaveBeenCalledTimes(verifying ? 1 : 0);
+    },
+  );
 });

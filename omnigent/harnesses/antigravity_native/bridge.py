@@ -183,9 +183,8 @@ class AntigravityNativeBridgeState:
         There is intentionally no durable read cursor. The retired transcript
         forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
         mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
-        driver that superseded it (:mod:`omnigent.harnesses.antigravity_native.reader`) keeps
-        an *in-memory* seen-set only and is recreated per session by the runner, so
-        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        driver uses an in-memory seen-set within a run and stable item source ids
+        for server-side deduplication across restarts. Legacy ``forwarded_step_index`` /
         ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
         ignored on read.
 
@@ -766,7 +765,9 @@ _AGY_FEEDBACK_SURVEY_SETTING = "showFeedbackSurvey"
 _AGY_MODEL_PROVIDER_SETTING = "modelProvider"
 
 
-def ensure_agy_feedback_survey_disabled(home: Path) -> None:
+def ensure_agy_feedback_survey_disabled(
+    home: Path, *, launch_env: dict[str, str] | None = None
+) -> None:
     """
     Disable agy's feedback survey in the launch HOME's ``settings.json``.
 
@@ -788,6 +789,7 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
     :param home: The HOME agy launches under (the per-session isolated home, or
         the real home when the harness runs agy under it). Settings live at
         ``<home>/.gemini/antigravity-cli/settings.json``.
+    :param launch_env: Resolved child environment; None uses the current process.
     :returns: None.
     """
     # resolve() follows a symlinked settings.json (e.g. a dotfiles-managed file) to
@@ -838,7 +840,8 @@ def ensure_agy_feedback_survey_disabled(home: Path) -> None:
             return
         data = loaded
     desired: dict[str, object] = {_AGY_FEEDBACK_SURVEY_SETTING: False}
-    if (os.environ.get("GEMINI_API_KEY") or "").strip():
+    environment = os.environ if launch_env is None else launch_env
+    if (environment.get("GEMINI_API_KEY") or "").strip():
         desired[_AGY_MODEL_PROVIDER_SETTING] = "gemini"
     provider_removed = False
     current_provider = data.get(_AGY_MODEL_PROVIDER_SETTING)

@@ -126,6 +126,10 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
 
+- [Remote agent launch](./remote-agent-launch.md) covers registered-agent
+  discovery and selection through `omnigent run --server`, interactive and
+  one-shot host launch, existing-session boundaries, and failure diagnostics.
+
 - [Composer](./composer.md) covers the session and new-session composers,
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
@@ -135,7 +139,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
 - [Preferences and config defaults](./preferences.md) covers local user/project
   defaults, invocation overrides, related settings surfaces, and the boundary
-  between the shared-preference foundation and user journeys not yet available.
+  between explicit cloud save/import, the shared-preference foundation, and
+  deferred automatic following.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.
@@ -172,7 +177,8 @@ map an area, remove it here in the same change.
   terminal journeys are mapped)
 - Approvals, permission cards, and the inbox: `tests/e2e_ui/approvals/` (only
   native edit-tool approvals are mapped)
-- Sub-agents and the agent info popover: `tests/e2e_ui/agents/`
+- Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
+  discovery and idle-runner performance are mapped in Native harnesses)
 - Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
 - Comments: `tests/e2e_ui/comments/`
 - Sharing and session permissions: `tests/e2e_ui/collaboration/`
@@ -199,7 +205,8 @@ map an area, remove it here in the same change.
   `omnigent diagnose`, `omnigent debug`, `omnigent usage` (config defaults are
   mapped; credential configuration and the other commands remain unmapped)
 - Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`
-- Running agents and servers: `omnigent run`, `omnigent start`, `omnigent stop`,
+- Other running-agent and server workflows: `omnigent run` (local/native modes),
+  `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,
   `omnigent import`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,

@@ -523,6 +523,7 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_harness_elicitation_resolved_by_id as _signal_harness_elicitation_resolved_by_id,
     _spec_config_flag_explicitly_disabled as _spec_config_flag_explicitly_disabled,
     _spec_harness as _spec_harness,
+    _start_managed_launch_task as _start_managed_launch_task,
     _stop_session_host_runner as _stop_session_host_runner,
     _stored_file_to_resource as _stored_file_to_resource,
     _stream_live_events as _stream_live_events,
@@ -603,7 +604,12 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_OFFLINE_HOLD_S as HOST_OFFLINE_HOLD_S,
+    HOST_OFFLINE_RECHECK_S as HOST_OFFLINE_RECHECK_S,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
+    _MID_TURN_STATUSES as _MID_TURN_STATUSES,
+    _host_row_offline as _host_row_offline,
+    set_relay_host_offline_probe as set_relay_host_offline_probe,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
     _stop_host_runner_intentionally as _stop_host_runner_intentionally,

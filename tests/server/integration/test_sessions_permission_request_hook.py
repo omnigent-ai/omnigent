@@ -3329,7 +3329,7 @@ async def _subscribe_into(
         async with asyncio.timeout(timeout_s):
             async for event in session_stream.subscribe(session_id):
                 sink.append(event)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return
 
 

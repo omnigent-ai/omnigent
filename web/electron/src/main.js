@@ -4844,6 +4844,9 @@ function registerIpc() {
       canExtendArca: enabled,
       canRefreshDbcert: enabled,
       arcaPreviewRecovery: true,
+      // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
+      // v10 values); the SPA hides the toolbar button everywhere else.
+      chromeCookieImport: process.platform === "darwin",
     };
   });
 
@@ -4925,18 +4928,63 @@ function registerIpc() {
   // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
   // Companion then copies it to the user's boxes. Same gates as arca-extend.
   // Clicks from several windows share one sign-in.
+  let dbcertPreflight = null;
+  let dbcertGeneration = 0;
   let dbcertRefresh = null;
-  ipcMain.handle("omnigent:dbcert-refresh", async (event) => {
+  ipcMain.handle("omnigent:dbcert-refresh", async (event, options) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("dbcert-refresh is only available to a connected server page");
     }
     if (!canExtendArca(event)) {
       return { ok: false, error: "dbcert refresh is not enabled for this server." };
     }
-    dbcertRefresh ??= arca.runDbcertRefresh().finally(() => {
-      dbcertRefresh = null;
-    });
-    return dbcertRefresh;
+    if (!dbcertRefresh) {
+      const refresh = {
+        renewal: arca.runDbcertRefresh({ skipArcaSync: true }).then((result) => {
+          if (result.ok) {
+            dbcertGeneration += 1;
+            dbcertPreflight = null;
+          }
+          return result;
+        }),
+        sync: null,
+      };
+      refresh.renewal = refresh.renewal.finally(() => {
+        if (!refresh.sync && dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+      dbcertRefresh = refresh;
+    }
+    const refresh = dbcertRefresh;
+    if (options?.skipArcaSync === true) return refresh.renewal;
+    refresh.sync ??= refresh.renewal
+      .then((result) => (result.ok ? arca.runDbcertArcaSync() : result))
+      .finally(() => {
+        if (dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+    return refresh.sync;
+  });
+
+  const checkCurrentDbcert = () => {
+    if (!dbcertPreflight) {
+      const generation = dbcertGeneration;
+      const pending = arca
+        .checkDbcert()
+        .then((result) => (generation === dbcertGeneration ? result : checkCurrentDbcert()))
+        .finally(() => {
+          if (dbcertPreflight === pending) dbcertPreflight = null;
+        });
+      dbcertPreflight = pending;
+    }
+    return dbcertPreflight;
+  };
+  ipcMain.handle("omnigent:dbcert-check", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-check is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert checks are not enabled for this server." };
+    }
+    return checkCurrentDbcert();
   });
 
   // Push a status ping when a host child connects or exits on its own (no
@@ -4950,6 +4998,7 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+    getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
     getAgentContextForEvent: (event, sourceHostId) => ({
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,

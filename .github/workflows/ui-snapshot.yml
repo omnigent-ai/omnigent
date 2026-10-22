@@ -71,6 +71,9 @@ env:
 jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Cheap pre-flight (no container/build): does this PR touch anything that can
   # change the render? The heavy job below is `if`-gated on it, so non-UI PRs
@@ -101,7 +104,8 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          if [ "$DEPENDENCY" = true ] && [ "$UI_SCOPE" != dependency ]; then
+          # Dependency-only PRs skip only when the scope rules out the web UI.
+          if [ "$DEPENDENCY" = true ] && { [ "$UI_SCOPE" = none ] || [ "$UI_SCOPE" = sidecar ]; }; then
             echo "ui=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

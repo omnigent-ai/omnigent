@@ -12664,6 +12664,97 @@ async def test_native_message_persisted_when_runner_offline(
     assert snap["status"] == "failed"
 
 
+async def _post_native_message(client: httpx.AsyncClient, sid: str) -> httpx.Response:
+    return await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+
+async def test_native_message_to_hostless_gone_runner_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A message to a session whose host-less runner is gone is refused.
+
+    A runner bound without a host ran in a local terminal; once it's gone
+    nothing can relaunch it. The server refuses with a resume command and
+    records nothing, so the client keeps the message.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    sid = session["id"]
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(sid, "runner_local_terminal")
+
+    resp = await _post_native_message(client, sid)
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert f"claude --resume {sid}" in error["message"]
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert not [i for i in items if i["type"] in {"message", "error"}], items
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "idle"
+
+
+@pytest.mark.parametrize("case", ["side_chat", "sub_agent", "exit_report"])
+async def test_native_message_to_gone_runner_still_persisted_when_recoverable(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """
+    Side chats, sub-agents, and runners with an exit report keep the failed turn.
+
+    Their failure is recorded rather than refused: side chats and sub-agents
+    recover through their parent, and an exit report explains the failure.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+
+    agent = await create_test_agent(client)
+    labels = {"omnigent.wrapper": "claude-code-native-ui"}
+    store = SqlAlchemyConversationStore(db_uri)
+    if case == "sub_agent":
+        parent = await _create_session(client, agent["id"], labels=labels)
+        sid = store.create_conversation(
+            kind="sub_agent",
+            title="coder:child",
+            parent_conversation_id=parent["id"],
+            agent_id=agent["id"],
+            labels=labels,
+        ).id
+    else:
+        if case == "side_chat":
+            labels = {**labels, "omnigent.side_chat": "1"}
+        sid = (await _create_session(client, agent["id"], labels=labels))["id"]
+    assert store.set_runner_id(sid, "runner_local_terminal")
+    if case == "exit_report":
+        monkeypatch.setattr(
+            RunnerExitReports, "get", lambda self, runner_id: "runner process exited with code 1"
+        )
+
+    resp = await _post_native_message(client, sid)
+    assert "No host can restart" not in resp.text
+    # A sub-agent's send also tries to wake its runner-less parent, which answers 503.
+    assert resp.status_code == (503 if case == "sub_agent" else 202), resp.text
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    errors = [i for i in items if i["type"] == "error"]
+    assert len(errors) == 1, items
+    assert errors[0]["code"] == "runner_failed_to_start"
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "failed"
+
+
 async def test_runner_re_tunnelled_to_sibling_returns_wrong_replica(
     client: httpx.AsyncClient,
     db_uri: str,

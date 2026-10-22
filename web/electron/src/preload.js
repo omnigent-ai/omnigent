@@ -151,7 +151,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
    * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
    */
-  refreshDbcert: () => ipcRenderer.invoke("omnigent:dbcert-refresh"),
+  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
+  /** Check the laptop's dbcert without starting sign-in. */
+  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
@@ -373,6 +375,33 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
+  /**
+   * Inspect the user's local Google Chrome profiles for cookies in the site
+   * tree the conversation's view is currently on. Metadata only (profile name +
+   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * @param {string} conversationId
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   */
+  browserChromeCookiePreview: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
+  /**
+   * Copy ONLY that site's cookies out of one Chrome profile into the
+   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
+   * first import shows a system approval prompt. `expectedHost` must still match
+   * the view's site.
+   * @param {string} conversationId
+   * `scope` is the site tree to copy (the page's host or a parent domain); main
+   * rejects anything that isn't an ancestor of the page.
+   * @param {{ profileId: string, expectedHost: string, scope?: string }} args
+   * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
+   */
+  browserChromeCookieImport: (conversationId, args) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-import", {
+      conversationId,
+      profileId: args?.profileId,
+      expectedHost: args?.expectedHost,
+      scope: args?.scope,
+    }),
   /**
    * Subscribe to the real url of a view as it navigates (redirects, links,
    * back/forward) so the URL bar stays honest. Returns an unsubscribe.

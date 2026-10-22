@@ -4013,3 +4013,102 @@ def test_resume_command_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -
     assert result.exit_code == 0, result.output
     assert seen == ["https://dbc-x.cloud.databricks.com/omnigent"]
     assert captured["server"] == _expand_marker("https://dbc-x.cloud.databricks.com/omnigent")
+
+
+_ACCOUNT_SERVER = "https://acct.example.com/api/2.0/omnigent"
+
+
+def _select_workspace(monkeypatch: pytest.MonkeyPatch, org_id: str) -> None:
+    """Pin the CLI to *org_id* the way ``?o=`` resolution does."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, f"{_ACCOUNT_SERVER}?o={org_id}")
+
+
+def test_ensure_host_daemon_spawns_one_pinned_daemon_per_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two workspaces behind one account host get two daemons, each pinned to its own."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    captured: dict[str, object] = {}
+    killed: list[int] = []
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append(pid))
+
+    _select_workspace(monkeypatch, "111")
+    _ensure_host_daemon(_ACCOUNT_SERVER)
+    _select_workspace(monkeypatch, "222")
+    _ensure_host_daemon(_ACCOUNT_SERVER)
+
+    calls = captured["calls"]
+    assert isinstance(calls, list)
+    assert [proc.env[PINNED_DATABRICKS_ORG_ENV_VAR] for proc in calls] == [
+        f"{_ACCOUNT_SERVER}?o=111",
+        f"{_ACCOUNT_SERVER}?o=222",
+    ]
+    assert cli._find_daemon_record(f"{_ACCOUNT_SERVER}?o=111") is not None
+    assert cli._find_daemon_record(f"{_ACCOUNT_SERVER}?o=222") is not None
+    assert killed == []
+
+
+def test_foreground_records_use_the_bare_server_url() -> None:
+    """Records keyed by workspace still send requests to the bare server URL."""
+    target = f"{_ACCOUNT_SERVER}?o=111"
+    foreground = cli._foreground_daemon_record(
+        target=target, server_url=_ACCOUNT_SERVER, host_id="host_abc"
+    )
+    assert foreground.server_url == _ACCOUNT_SERVER
+    assert cli._daemon_base_url(foreground) == _ACCOUNT_SERVER
+
+    assert cli._record_probed_through(foreground, target).server_url == _ACCOUNT_SERVER
+
+
+def test_resolving_a_workspace_server_pins_the_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``?o=`` pins the CLI once, at resolution."""
+    from omnigent.cli_auth import pinned_databricks_org_id, store_databricks_org_id
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    store_databricks_org_id(_ACCOUNT_SERVER, "222")
+
+    cli._resolve_server_url(f"{_ACCOUNT_SERVER}?o=111")
+
+    assert pinned_databricks_org_id(_ACCOUNT_SERVER) == "111"
+    # A concurrent launch rewriting the shared record no longer moves this command.
+    store_databricks_org_id(_ACCOUNT_SERVER, "333")
+    assert cli._selected_org_id(_ACCOUNT_SERVER) == "111"
+
+
+def test_apps_url_with_a_stored_org_keeps_its_url_only_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the workspace API mount fronts several workspaces; an app keeps its old key."""
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    app = "https://myapp-1.aws.databricksapps.com"
+    store_databricks_auth(app, "https://dbc-1.cloud.databricks.com", org_id="123")
+
+    assert cli._normalize_daemon_target(app) == app
+    assert cli._selected_org_id(app) is None
+
+
+def test_mixed_case_server_gets_the_same_workspace_key_and_pin() -> None:
+    """The CLI's expected key and the spawned daemon's pin must name one workspace."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR, pin_databricks_org_id
+
+    server = "https://ACCT.example.com/api/2.0/omnigent"
+    pin_databricks_org_id(server, "111")
+
+    assert cli._normalize_daemon_target(server).endswith("?o=111")
+    assert cli._build_host_daemon_env(server_url=server)[PINNED_DATABRICKS_ORG_ENV_VAR].endswith(
+        "?o=111"
+    )

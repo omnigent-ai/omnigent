@@ -11,7 +11,7 @@ description: >
 
 inputs:
   dependency_smoke:
-    description: Run the existing cross-component compatibility smoke suite.
+    description: Deprecated; removal in 0.21.0. Run compatibility smoke only.
     required: false
     default: "false"
   shard_id:
@@ -87,7 +87,7 @@ runs:
 
     - name: Install project and test dependencies
       shell: bash
-      run: uv sync --locked --extra all --extra openshell --group test
+      run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
     - name: Install system dependencies
       # bubblewrap backs the linux_bwrap sandbox. Ubuntu 24.04 restricts
@@ -99,7 +99,7 @@ runs:
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
       with:
         harness: claude
 
@@ -118,12 +118,12 @@ runs:
         echo "OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN=$billing_cli_dir/node_modules/.bin/claude" >> "$GITHUB_ENV"
 
     - name: Install Codex CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
       with:
         harness: codex
 
     - name: Install Pi CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
       with:
         harness: pi
 

@@ -5,12 +5,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import tomllib
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
-import tomllib
 import yaml
 
 from omnigent.errors import OmnigentError

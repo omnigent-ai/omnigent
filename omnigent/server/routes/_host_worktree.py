@@ -162,7 +162,7 @@ async def _await_host_worktree_result(
             ) from exc
         try:
             return await asyncio.wait_for(future, timeout=_WORKTREE_TIMEOUT_S)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise WorktreeHostUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to {op} within "
                 f"{_WORKTREE_TIMEOUT_S:.0f}s (it may be running an older version "

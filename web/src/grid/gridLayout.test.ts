@@ -46,6 +46,16 @@ describe("session grid layouts", () => {
         expect(swapGridSessions(swapped, "a", "b")).toEqual(layout);
         expect(swapGridSessions(layout, "a", "a")).toBe(layout);
         expect(swapGridSessions(layout, "a", "missing")).toBe(layout);
+        expect(swapGridSessions(layout, "a", "a", edge)).toBe(layout);
+        expect(swapGridSessions(layout, "a", "missing", edge)).toBe(layout);
+        if (gridSessionIds(layout).length > 2)
+          expect(swapGridSessions(layout, "a", "b", edge)).toBe(layout);
+      }
+      for (const original of [two, splitGrid("a", "a", "b", perpendicular)!]) {
+        expect(swapGridSessions(original, "b", "a", edge)).toEqual({
+          axis: edge === "left" || edge === "right" ? "columns" : "rows",
+          children: edge === "left" || edge === "top" ? ["b", "a"] : ["a", "b"],
+        });
       }
       expect(removeGridSession(four, "d")).toEqual(three);
       expect(removeGridSession(three, "c")).toEqual(two);

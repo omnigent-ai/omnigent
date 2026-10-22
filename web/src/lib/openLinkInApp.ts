@@ -53,19 +53,26 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
   );
 }
 
+/** Resolve `href` against the page, or null unless it is an http(s) URL — so a
+ *  link from untrusted data can't carry a `javascript:` or `data:` scheme. */
+export function parseHttpUrl(href: string): URL | null {
+  let url: URL;
+  try {
+    url = new URL(href, window.location.href);
+  } catch {
+    return null;
+  }
+  return url.protocol === "http:" || url.protocol === "https:" ? url : null;
+}
+
 /**
  * Open an http(s) `href` in the conversation's embedded browser when the user
  * opted in. Returns true when routed (the caller cancels the default click).
  */
 export function maybeOpenLinkInApp(conversationId: string | undefined, href: string): boolean {
   if (!conversationId || !supportsBrowser() || !readOpenLinksInApp()) return false;
-  let url: URL;
-  try {
-    url = new URL(href, window.location.href);
-  } catch {
-    return false;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const url = parseHttpUrl(href);
+  if (!url) return false;
   void openInApp(conversationId, url.toString());
   return true;
 }

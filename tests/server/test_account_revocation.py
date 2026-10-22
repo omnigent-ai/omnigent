@@ -1115,6 +1115,7 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
         ),
         prefix="/v1",
     )
+    tasks.configure_dispatch(True)
     task = tasks.create(
         uuid.uuid4().hex,
         "private task",
@@ -1131,10 +1132,12 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
         status="succeeded",
         scheduled_at=100,
     )
+    assert task.next_run_at is not None
     path = f"/v1/scheduled-tasks/{task.id}"
     assert alice.get(path).status_code == 200
     assert alice.get(path + "/runs").status_code == 200
     assert admin.delete("/auth/users/alice").status_code == 204
+    assert tasks.get(task.id).next_run_at is None
     invite = admin.post("/auth/invite", json={}).json()["token"]
     replacement = TestClient(admin.app)
     assert (
@@ -1148,6 +1151,10 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
     assert listing.status_code == 200 and listing.json()["scheduled_tasks"] == []
     assert replacement.get(path).status_code == 404
     assert replacement.get(path + "/runs").status_code == 404
+    cursor = tasks.purge_deleted_tasks(limit=1)
+    while cursor is not None:
+        cursor = tasks.purge_deleted_tasks(after=cursor, limit=1)
+    assert tasks.get(task.id) is None
 
 
 @pytest.mark.parametrize("launch_kind", ["initial", "inline", "transfer", "admin_relaunch"])

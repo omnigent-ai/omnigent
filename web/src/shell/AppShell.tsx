@@ -88,6 +88,7 @@ import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
   terminalTabKey,
+  terminalDisplayLabel,
   useCreateTerminal,
   useDeleteTerminal,
 } from "@/hooks/useTerminals";
@@ -2762,7 +2763,7 @@ function AppShellImpl() {
               if (terminalPendingClose === null) return null;
               const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose);
               if (!info) return null;
-              return info.session ? `${info.name} · ${info.session}` : info.name;
+              return terminalDisplayLabel(info);
             })()}
             onConfirm={confirmCloseTerminal}
             onCancel={() => setTerminalPendingClose(null)}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import re
 import subprocess
 import sys
@@ -4942,7 +4943,7 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="modal"),
         sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
@@ -4994,7 +4995,7 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="modal"),
         sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
@@ -5027,7 +5028,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="modal"),
         sandbox_config=SimpleNamespace(configs=()),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
@@ -5213,6 +5214,84 @@ async def test_kick_managed_wake_defers_the_classifier_to_the_wake_task(
     assert reads == [], "the kick must not read the agent store; the wake task does"
     assert captured["agent_store"] is store
     assert captured["agent_id"] == builtin.id
+
+
+async def test_relaunch_and_wake_seed_the_launch_status_with_the_host_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relaunch and a wake seed ``provisioning`` with the host's provider, so the
+    launch's stage rows name it even on a replica that never cached the launch.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _noop(**kwargs: object) -> None:
+        return None
+
+    published: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _noop)
+    monkeypatch.setattr(orchestration, "_run_managed_wake", _noop)
+    monkeypatch.setattr(
+        orchestration,
+        "_publish_sandbox_status",
+        lambda session_id, stage, error=None, *, provider=None: published.append(
+            (session_id, stage, provider)
+        ),
+    )
+    shared = {
+        "sandbox_config": SimpleNamespace(configs=()),
+        "conversation_store": SimpleNamespace(),
+        "host_store": SimpleNamespace(),
+        "app_state": SimpleNamespace(agent_store=_StubAgentStore()),
+    }
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_relaunch",
+        conv=SimpleNamespace(labels={}, host_id="host_1", agent_id=None),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="arclet"),
+        tracker=ManagedLaunchTracker(),
+        **shared,
+    )
+    orchestration._kick_managed_wake_impl(
+        session_id="conv_wake",
+        conv=SimpleNamespace(labels={}, host_id="host_2", agent_id=None),
+        tracker=ManagedLaunchTracker(),
+        provider="arclet",
+        **shared,
+    )
+    await asyncio.gather(*(set(orchestration._managed_launch_tasks) - before))
+    assert published == [
+        ("conv_relaunch", "provisioning", "arclet"),
+        ("conv_wake", "provisioning", "arclet"),
+    ]
+
+
+def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    Each launch-stage debug row names the provider, and later stages and a failure
+    keep the one the launch started with.
+    """
+    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+
+    session_id = "conv_provider_rows"
+    try:
+        with caplog.at_level(logging.INFO):
+            helpers._publish_sandbox_status_impl(session_id, "provisioning", provider="arclet")
+            helpers._publish_sandbox_status_impl(session_id, "starting")
+            helpers._publish_sandbox_status_impl(session_id, "failed", "host never connected")
+    finally:
+        _session_sandbox_status_cache.pop(session_id, None)
+    rows = [
+        (record.event_name, record.attributes)
+        for record in caplog.records
+        if getattr(record, "event_name", None) in {"sandbox_launch_stage", "sandbox_launch_failed"}
+    ]
+    assert rows == [
+        ("sandbox_launch_stage", {"stage": "provisioning", "provider": "arclet"}),
+        ("sandbox_launch_stage", {"stage": "starting", "provider": "arclet"}),
+        ("sandbox_launch_failed", {"stage": "starting", "provider": "arclet"}),
+    ]
 
 
 async def test_run_managed_wake_re_stamps_the_woken_runner(

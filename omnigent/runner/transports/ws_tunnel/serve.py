@@ -852,7 +852,7 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
         return False
     try:
         return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
-    except Exception:  # noqa: BLE001 - optional status cannot prevent a tunnel upgrade.
+    except Exception:  # optional status cannot prevent a tunnel upgrade.
         _logger.warning(
             "sign_in_pending read failed; continuing with the available credential",
             exc_info=True,
@@ -1500,7 +1500,10 @@ async def _send_hello(
         pass
 
     from omnigent.host.frames import CAP_MCP_REGISTRY
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+        CAP_FILESYSTEM_ATTACHMENTS,
+    )
 
     await send_text(
         encode_frame(
@@ -1509,6 +1512,7 @@ async def _send_hello(
                 frame_protocol_version=1,
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
+                    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
-import { CommandIcon, LoaderCircleIcon, WandSparklesIcon } from "lucide-react";
+import { CommandIcon, LoaderCircleIcon, PlugIcon, WandSparklesIcon } from "lucide-react";
 import type { SkillsStatus } from "@/lib/types";
+import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
 /**
@@ -19,6 +20,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name>",
+  "/mcp": "Show MCP servers enabled for this session",
   "/new": "Start a blank session in the same project",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
   "/side":
@@ -143,6 +145,12 @@ export function rankedSlashCommandNames(
     .sort((a, b) => rank(a) - rank(b));
 }
 
+/** One row of the read-only `/mcp` inventory. */
+interface McpServerRow {
+  name: string;
+  description?: string | null;
+}
+
 interface SlashCommandMenuProps {
   /** The text typed after the leading ``/``, used to filter suggestions. */
   query: string;
@@ -166,6 +174,82 @@ interface SlashCommandMenuProps {
   /** Context-specific guidance when discovery cannot run yet. */
   skillsUnavailableMessage?: string;
   onRetrySkills?: () => void;
+  /** Replace suggestions with the read-only MCP inventory for an exact `/mcp`. */
+  showMcpServers?: boolean;
+  /** Effective MCP servers: agent-declared plus host-native for the active harness. */
+  mcpServers?: readonly McpServerRow[];
+  mcpServersStatus?: string;
+  mcpSettingsHref?: string;
+}
+
+function McpServerRows({
+  servers,
+  status,
+}: {
+  servers?: readonly McpServerRow[];
+  status?: string;
+}) {
+  if (!servers?.length && !status) {
+    return (
+      <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
+        No MCP servers enabled for this session.
+      </div>
+    );
+  }
+  return (
+    <>
+      {servers?.map((server) => (
+        <div key={server.name} className="flex items-start gap-2 rounded-md px-2 py-1.5">
+          <PlugIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+          <div className="min-w-0">
+            <div className="text-ui text-foreground">{server.name}</div>
+            {server.description && (
+              <div className="truncate text-xs leading-4 text-muted-foreground">
+                {server.description}
+              </div>
+            )}
+          </div>
+        </div>
+      ))}
+      {status && (
+        <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
+          {status}
+        </div>
+      )}
+    </>
+  );
+}
+
+function McpServerMenu({
+  servers,
+  status,
+  settingsHref = "/settings/harnesses",
+}: {
+  servers?: readonly McpServerRow[];
+  status?: string;
+  settingsHref?: string;
+}) {
+  return (
+    <div
+      data-testid="mcp-server-menu"
+      onMouseDown={(event) => event.preventDefault()}
+      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+    >
+      <div className="px-2 py-1">
+        <div className="font-medium text-ui text-foreground">MCP servers</div>
+        <div className="text-xs leading-4 text-muted-foreground">Enabled for this session</div>
+      </div>
+      <div className="max-h-64 overflow-y-auto">
+        <McpServerRows servers={servers} status={status} />
+      </div>
+      <div className="mt-1 border-border border-t px-2 pt-2 text-xs text-muted-foreground">
+        <Link className="underline hover:text-foreground" to={settingsHref}>
+          Go to Settings
+        </Link>{" "}
+        to configure MCP servers.
+      </div>
+    </div>
+  );
 }
 
 /** One filtered menu row, carrying its index in the flat match order. */
@@ -250,6 +334,10 @@ export function SlashCommandMenu({
   skillsStatus,
   skillsUnavailableMessage = "Skills unavailable while disconnected.",
   onRetrySkills,
+  showMcpServers = false,
+  mcpServers,
+  mcpServersStatus,
+  mcpSettingsHref,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
@@ -261,6 +349,14 @@ export function SlashCommandMenu({
     if (activeIndex < 0 || !listRef.current) return;
     listRef.current.querySelector('[data-active="true"]')?.scrollIntoView({ block: "nearest" });
   }, [activeIndex]);
+  if (showMcpServers)
+    return (
+      <McpServerMenu
+        servers={mcpServers}
+        status={mcpServersStatus}
+        settingsHref={mcpSettingsHref}
+      />
+    );
   if (matchedNames.length === 0 && skillsStatus == null) return null;
 
   // The flat match order (from rankedSlashCommandNames) drives the caller's
@@ -288,7 +384,7 @@ export function SlashCommandMenu({
       data-testid="slash-command-menu"
       className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
     >
-      <div ref={listRef} className="max-h-80 overflow-y-auto">
+      <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}
         {builtinRows.map((row) => (
           <MenuRowButton

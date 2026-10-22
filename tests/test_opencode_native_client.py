@@ -149,7 +149,11 @@ async def test_error_raises() -> None:
     await client.aclose()
 
 
-async def test_auth_and_directory_headers_applied() -> None:
+@pytest.mark.parametrize(
+    ("directory", "header"),
+    [("/repo", "%2Frepo"), ("/home/josé/projekt", "%2Fhome%2Fjos%C3%A9%2Fprojekt")],
+)
+async def test_auth_and_directory_headers_applied(directory: str, header: str) -> None:
     captured: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -157,10 +161,10 @@ async def test_auth_and_directory_headers_applied() -> None:
         captured["dir"] = request.headers.get("x-opencode-directory", "")
         return httpx.Response(200, json=[])
 
-    client = _client(handler, headers={"Authorization": "Basic abc"}, directory="/repo")
+    client = _client(handler, headers={"Authorization": "Basic abc"}, directory=directory)
     await client.list_messages("ses_1")
     assert captured["auth"] == "Basic abc"
-    assert captured["dir"] == "/repo"
+    assert captured["dir"] == header
     await client.aclose()
 
 

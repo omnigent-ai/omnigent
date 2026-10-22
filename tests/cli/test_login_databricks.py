@@ -1046,6 +1046,25 @@ def test_workspace_url_leaves_oss_server_alone(
     )
 
 
+@pytest.mark.parametrize("suffix", ["", "/omnigent"])
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection refused"), httpx.InvalidURL("invalid proxy")],
+    ids=["connection-error", "invalid-proxy"],
+)
+def test_workspace_url_keeps_input_when_probe_cannot_connect(
+    suffix: str,
+    failure: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An optional workspace probe leaves connection errors to the requesting command."""
+    server = f"https://omni.example.com{suffix}"
+    probed = _scripted_normalizer_httpx(monkeypatch, {"https://omni.example.com/v1/me": failure})
+
+    assert cli_mod._workspace_api_server_url(server) == server
+    assert probed == ["https://omni.example.com/v1/me"]
+
+
 def test_workspace_url_leaves_apps_edge_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
