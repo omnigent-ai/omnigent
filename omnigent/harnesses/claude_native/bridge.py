@@ -7193,6 +7193,71 @@ _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 # waiting never stalls other relay traffic.
 _FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
 
+# Phases the native hooks post. Only these may be answered from the
+# no-policy allow cache; any other phase always reaches the server.
+_ALLOW_CACHE_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_TOOL_RESULT", "PHASE_REQUEST"})
+
+
+class _NoPolicyAllowCache:
+    """Remembers, per relay, that the server found no policies for its session.
+
+    The server's no-policy fast path answers ALLOW and, when the operator
+    enables it, says how long that answer may be reused. Until then the
+    relay answers the session's hook evaluations itself, saving a server
+    round trip on every native tool call.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._expires_at = 0.0
+
+    def covers(self, request: object) -> bool:
+        """Return whether *request* may be answered ALLOW without the server.
+
+        :param request: An ``EvaluationRequest`` body, e.g.
+            ``{"event": {"type": "PHASE_TOOL_CALL", "data": {"name": "Bash"}}}``.
+        :returns: ``True`` while the cache is live and the event is one the
+            server's no-policy fast path would also have allowed.
+        """
+        from omnigent.runtime.policies.builder import is_always_gated_tool
+
+        with self._lock:
+            if time.monotonic() >= self._expires_at:
+                return False
+        event = request.get("event") if isinstance(request, dict) else None
+        if not isinstance(event, dict):
+            return False
+        phase = event.get("type")
+        if phase not in _ALLOW_CACHE_PHASES:
+            return False
+        data = event.get("data")
+        tool_name = data.get("name") if isinstance(data, dict) else None
+        return not (phase == "PHASE_TOOL_CALL" and is_always_gated_tool(tool_name))
+
+    def record(self, verdict: object) -> None:
+        """Start the cache window when *verdict* carries one.
+
+        :param verdict: A parsed ``EvaluationResponse`` body.
+        :returns: None.
+        """
+        from omnigent.runtime.policies.builder import NO_POLICY_ALLOW_CACHE_FIELD
+
+        if not isinstance(verdict, dict) or verdict.get("result") != "POLICY_ACTION_ALLOW":
+            return
+        seconds = verdict.get(NO_POLICY_ALLOW_CACHE_FIELD)
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+            return
+        with self._lock:
+            self._expires_at = time.monotonic() + float(seconds)
+
+    def clear(self) -> None:
+        """Drop the cache so the next evaluation asks the server again.
+
+        :returns: None.
+        """
+        with self._lock:
+            self._expires_at = 0.0
+
 
 def _tool_relay_handler_factory(
     token: str,
@@ -7220,6 +7285,7 @@ def _tool_relay_handler_factory(
         registry.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
+    allow_cache = _NoPolicyAllowCache()
 
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
@@ -7286,7 +7352,12 @@ def _tool_relay_handler_factory(
                 return
             if not isinstance(arguments, dict):
                 arguments = {}
-            self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
+            result = _run_relay_tool(tool_executor, loop, name, arguments)
+            if name == "sys_add_policy":
+                # The new policy must gate the very next hook, not the first
+                # one after the cache window ends.
+                allow_cache.clear()
+            self._send_json(result)
 
         def _respond_hook_output(self, output: dict[str, object] | None) -> None:
             """Answer a hook-evaluate request with final hook output JSON.
@@ -7334,6 +7405,13 @@ def _tool_relay_handler_factory(
             eval_request = hook_payload_to_evaluation_request(hook_event, payload)
             if eval_request is None:
                 self._respond_hook_output(None)
+                return
+            if allow_cache.covers(eval_request):
+                self._respond_hook_output(
+                    evaluation_response_to_hook_output(
+                        hook_event, {"result": "POLICY_ACTION_ALLOW"}
+                    )
+                )
                 return
             context = eval_request["event"]["context"]
             context["harness"] = "claude-native"
@@ -7399,6 +7477,7 @@ def _tool_relay_handler_factory(
                 )
                 self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
+            allow_cache.record(verdict)
             hook_output = evaluation_response_to_hook_output(hook_event, verdict)
             hook_specific = (hook_output or {}).get("hookSpecificOutput")
             decision = (
@@ -7423,6 +7502,9 @@ def _tool_relay_handler_factory(
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
+            if allow_cache.covers(payload):
+                self._send_json({"result": "POLICY_ACTION_ALLOW"})
+                return
             import urllib.parse as _up
 
             session_component = _up.quote(session_id, safe="")
@@ -7434,6 +7516,9 @@ def _tool_relay_handler_factory(
                 self._send_policy_proxy_error(exc)
                 return
             raw = resp.content
+            if resp.status_code == HTTPStatus.OK:
+                with contextlib.suppress(ValueError, TypeError):
+                    allow_cache.record(json.loads(raw))
             self.send_response(resp.status_code)
             for header in ("Content-Type", "Content-Length"):
                 val = resp.headers.get(header)

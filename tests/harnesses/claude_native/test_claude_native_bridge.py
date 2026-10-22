@@ -13130,7 +13130,8 @@ async def test_hook_evaluate_endpoint_allows(
 
     The endpoint owns the whole transform chain, so an ALLOW must reach
     the curl hook as an empty body — and every event must consult the
-    server, since verdicts are content-dependent and nothing is cached.
+    server, since verdicts are content-dependent and an ALLOW without an
+    allow-cache window is never reused.
     """
     client = _ScriptedPolicyClient({"result": "POLICY_ACTION_ALLOW"})
     relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
@@ -13147,6 +13148,161 @@ async def test_hook_evaluate_endpoint_allows(
         # The relay wrote the shell-sourceable env file the curl hooks use.
         env_text = (bridge_dir / claude_native_bridge._TOOL_RELAY_ENV_FILE).read_text("utf-8")
         assert "OMNIGENT_RELAY_URL=" in env_text and "OMNIGENT_RELAY_TOKEN=" in env_text
+    finally:
+        relay.close()
+
+
+_NO_POLICY_ALLOW: dict[str, object] = {
+    "result": "POLICY_ACTION_ALLOW",
+    "allow_cache_seconds": 30.0,
+}
+
+
+def _evaluation_request(phase: str, tool_name: str = "Bash") -> dict[str, object]:
+    """Build the ``EvaluationRequest`` body the Codex hook posts to the relay."""
+    return {
+        "event": {
+            "type": phase,
+            "target": "",
+            "data": {"name": tool_name, "arguments": {}},
+            "context": {},
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_hook_evaluate_endpoint_reuses_no_policy_allow_within_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _policy_retry_clock: Mock
+) -> None:
+    """A no-policy ALLOW with a window answers later hooks locally until it ends."""
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        for payload in (
+            _PRE_TOOL_USE_PAYLOAD,
+            _PRE_TOOL_USE_PAYLOAD,
+            {**_PRE_TOOL_USE_PAYLOAD, "hook_event_name": "PostToolUse", "tool_output": "x"},
+            _USER_PROMPT_SUBMIT_PAYLOAD,
+        ):
+            body = await asyncio.to_thread(
+                _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", payload
+            )
+            assert body == ""
+        assert client.calls == 1, "hooks inside the window must not reach the server"
+
+        _policy_retry_clock.monotonic.return_value += 30.0
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+        assert client.calls == 2, "an expired window must ask the server again"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_policy_evaluate_proxy_reuses_no_policy_allow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Codex passthrough shares the window and answers a plain ALLOW."""
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        first = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/policies/evaluate",
+            _evaluation_request("PHASE_TOOL_CALL"),
+        )
+        assert json.loads(first) == _NO_POLICY_ALLOW
+        second = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/policies/evaluate",
+            _evaluation_request("PHASE_TOOL_RESULT"),
+        )
+        assert json.loads(second) == {"result": "POLICY_ACTION_ALLOW"}
+        assert client.calls == 1
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_body",
+    [
+        _evaluation_request("PHASE_TOOL_CALL", "sys_add_policy"),
+        _evaluation_request("PHASE_TOOL_CALL", "sys_scheduled_task_create"),
+        _evaluation_request("PHASE_LLM_RESPONSE"),
+    ],
+    ids=["sys_add_policy", "scheduled_task", "llm_response_phase"],
+)
+async def test_allow_window_never_covers_always_evaluated_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request_body: dict[str, object]
+) -> None:
+    """Approval-gated tools and non-hook phases always reach the server."""
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/policies/evaluate",
+            _evaluation_request("PHASE_TOOL_CALL"),
+        )
+        await asyncio.to_thread(_relay_request_raw, bridge_dir, "/policies/evaluate", request_body)
+        assert client.calls == 2
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        {"result": "POLICY_ACTION_ALLOW"},
+        {"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 0},
+        {"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": True},
+        {"result": "POLICY_ACTION_DENY", "reason": "no", "allow_cache_seconds": 30.0},
+    ],
+    ids=["no_window", "zero_window", "bool_window", "deny"],
+)
+async def test_allow_window_requires_positive_no_policy_allow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: dict[str, object]
+) -> None:
+    """Only an ALLOW with a positive window starts local answering."""
+    client = _ScriptedPolicyClient(verdict)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        for _ in range(2):
+            await asyncio.to_thread(
+                _relay_request_raw,
+                bridge_dir,
+                "/policies/evaluate",
+                _evaluation_request("PHASE_TOOL_CALL"),
+            )
+        assert client.calls == 2
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_sys_add_policy_through_relay_ends_allow_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A policy the agent adds gates the very next hook, not the next window."""
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/tool", {"name": "sys_add_policy", "arguments": {}}
+        )
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+        assert client.calls == 2
     finally:
         relay.close()
 

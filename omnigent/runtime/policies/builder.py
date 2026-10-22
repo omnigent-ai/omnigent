@@ -400,6 +400,25 @@ def _load_user_period_cost(
     return conversation_store.list_daily_cost_states(owner, start_date)
 
 
+#: Field on a no-policy ``POLICY_ACTION_ALLOW`` evaluate response: how many
+#: seconds the caller may keep answering the session's hooks ALLOW without
+#: asking again. Absent when the operator has not enabled the allow cache.
+NO_POLICY_ALLOW_CACHE_FIELD = "allow_cache_seconds"
+
+
+def is_always_gated_tool(tool_name: str | None) -> bool:
+    """Return ``True`` for tools whose ``PHASE_TOOL_CALL`` must reach the engine.
+
+    The engine unconditionally injects ``_REQUIRED_APPROVAL_SPECS``, so these
+    calls are gated even when no other policy exists and must never be
+    answered by a no-policy fast path.
+
+    :param tool_name: The called tool's name, e.g. ``"sys_add_policy"``.
+    :returns: Whether the call is always evaluated.
+    """
+    return tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
+
+
 def any_policies_apply(
     *,
     spec: AgentSpec,
@@ -436,12 +455,7 @@ def any_policies_apply(
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
-    # The engine unconditionally injects _REQUIRED_APPROVAL_SPECS, so their
-    # TOOL_CALL events must always reach it: never fast-path sys_add_policy
-    # or the scheduled-task mutation tools.
-    if phase == Phase.TOOL_CALL and (
-        tool_name == "sys_add_policy" or tool_name in SCHEDULED_TASK_APPROVAL_TOOLS
-    ):
+    if phase == Phase.TOOL_CALL and is_always_gated_tool(tool_name):
         return True
     if spec.guardrails and spec.guardrails.policies:
         return True

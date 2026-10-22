@@ -30,8 +30,10 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.caps import RuntimeCaps
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.runtime.policies.builder import (
+    NO_POLICY_ALLOW_CACHE_FIELD,
     any_policies_apply,
     build_policy_engine,
 )
@@ -108,6 +110,31 @@ from omnigent.stores.permission_store import PermissionStore
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+def _no_policy_allow_body(caps: RuntimeCaps) -> dict[str, object]:
+    """Build the ALLOW body for an evaluation where no policies apply.
+
+    Carries the operator's allow-cache window when one is configured, so the
+    runner's tool relay can answer the session's next hooks locally instead
+    of paying this round trip for the same answer.
+
+    :param caps: The server's runtime caps.
+    :returns: The response body, e.g.
+        ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 30.0}``.
+    """
+    body: dict[str, object] = {"result": "POLICY_ACTION_ALLOW"}
+    resolver = caps.native_hook_allow_cache_seconds
+    if resolver is None:
+        return body
+    try:
+        seconds = float(resolver())
+    except Exception:  # A broken resolver must not fail the gate.
+        _logger.warning("native hook allow-cache resolver failed; not caching", exc_info=True)
+        return body
+    if seconds > 0:
+        body[NO_POLICY_ALLOW_CACHE_FIELD] = seconds
+    return body
 
 
 def _create_route_decision_id(
@@ -863,7 +890,7 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                content=json.dumps(_no_policy_allow_body(_caps)),
                 media_type="application/json",
             )
 

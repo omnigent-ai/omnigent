@@ -79,6 +79,13 @@ class RuntimeCaps:
         costs only a badge on the decision chip, whereas claiming a
         custom client is gateway-backed would promise reachability
         nobody verified.
+    :param native_hook_allow_cache_seconds: Optional callable invoked per
+        ``POST /policies/evaluate`` that returns how long, in seconds, a
+        runner may answer a native harness's policy hooks locally after the
+        server finds no policies apply to the session, e.g. ``lambda: 30.0``.
+        ``None`` or a non-positive result keeps every hook a server round
+        trip (the default). A policy added inside the window is enforced
+        once it expires, so keep it near the server's own 30 s policy cache.
     """
 
     execution_timeout: int = 7200
@@ -111,3 +118,5 @@ class RuntimeCaps:
     # Always present so consumers read one value object instead of re-parsing
     # config; the defaults describe an unconfigured deployment.
     routing_settings: RoutingSettings = field(default_factory=_default_routing_settings)
+    # Per-request so a managed deployment can resolve it per workspace.
+    native_hook_allow_cache_seconds: Callable[[], float] | None = None
