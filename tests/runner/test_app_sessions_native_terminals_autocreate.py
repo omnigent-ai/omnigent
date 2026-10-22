@@ -559,9 +559,11 @@ async def test_auto_create_pi_terminal_unmanaged_keeps_pinned_model(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
 async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    adopted: bool,
 ) -> None:
     """A managed slash-bearing pick never reaches the own-login pi argv.
 
@@ -609,6 +611,23 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
                 metadata={"terminal_name": "pi", "session_key": "main", "running": True},
             )
 
+    if adopted:
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from tests.test_preference_models import model_snapshot
+
+        path = model_snapshot(tmp_path / "preferences", "saved")
+        monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+        before = path.read_bytes()
+        with pytest.raises(RuntimeError, match="saved choice is unchanged"):
+            await _auto_create_pi_terminal(
+                "47f049b9d13df4db397c7f46859b825f",
+                _FakeResourceRegistry(),
+                lambda _sid, _evt: None,
+                server_client=NullServerClient(),
+            )
+        assert captured == {}
+        assert path.read_bytes() == before
+        return
     await _auto_create_pi_terminal(
         "47f049b9d13df4db397c7f46859b825f",
         _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -825,10 +844,21 @@ async def _launch_pi_terminal_args(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
 async def test_auto_create_pi_terminal_spec_pinned_own_login_reference_passes_through(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    adopted: bool,
 ) -> None:
+    if adopted:
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from tests.test_preference_models import model_snapshot
+
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.setenv(
+            PREFERENCE_SNAPSHOT_ENV,
+            str(model_snapshot(tmp_path / "preferences", "openai-codex/gpt-5.6-sol")),
+        )
     seed_pi_own_login_catalog(tmp_path / "pi-own-login", "openai-codex", ["gpt-5.6-sol"])
 
     args = await _launch_pi_terminal_args(
@@ -838,7 +868,7 @@ async def test_auto_create_pi_terminal_spec_pinned_own_login_reference_passes_th
         agent_spec=AgentSpec(
             spec_version=1,
             name="pi",
-            executor=ExecutorSpec(model="openai-codex/gpt-5.6-sol"),
+            executor=ExecutorSpec(model=None if adopted else "openai-codex/gpt-5.6-sol"),
         ),
     )
 
@@ -1279,12 +1309,14 @@ def _stub_kimi_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ids=["goose", "hermes", "kiro", "devin", "qwen", "kimi"],
 )
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
 async def test_auto_create_native_terminal_inherits_agent_sandbox(
     terminal_name: str,
     builder_name: str,
     stub_launch: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    adopted: bool,
 ) -> None:
     """
     Goose/hermes/kiro/devin/qwen/kimi auto-create honour the agent's ``os_env.sandbox``.
@@ -1324,6 +1356,19 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
 
     monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
     stub_launch(tmp_path, monkeypatch)
+    if adopted:
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from tests.test_preference_models import model_snapshot
+
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.setenv(
+            PREFERENCE_SNAPSHOT_ENV, str(model_snapshot(tmp_path / "preferences", "portable"))
+        )
+        if terminal_name == "devin":
+            monkeypatch.setattr(
+                "omnigent.harnesses.devin_native.main.resolve_devin_launch_model",
+                lambda model, _effort: model,
+            )
 
     captured: dict[str, Any] = {}
 
@@ -1382,6 +1427,12 @@ async def test_auto_create_native_terminal_inherits_agent_sandbox(
     )
     assert launched_sandbox.type == "none"
     assert captured["parent_os_env"] is agent_os_env
+    if adopted:
+        spec = captured["spec"]
+        if terminal_name == "goose":
+            assert spec.env["GOOSE_MODEL"] == "portable"
+        else:
+            assert spec.args[spec.args.index("--model") + 1] == "portable"
 
 
 @pytest.mark.parametrize("terminal_name", ["goose", "hermes", "kiro", "qwen"])
@@ -2380,9 +2431,11 @@ async def _run_auto_create_cursor_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
 async def test_auto_create_cursor_terminal_injects_spec_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    adopted: bool,
 ) -> None:
     """A spec-pinned cursor model is threaded into the cursor-agent launch args.
 
@@ -2390,11 +2443,22 @@ async def test_auto_create_cursor_terminal_injects_spec_model(
     session's ``executor.model`` (from ``--model`` or config.yaml ``model:``)
     must reach the TUI as ``--model <id>`` — the regression #933 fixes.
     """
+    if adopted:
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from tests.test_preference_models import model_snapshot
+
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+        monkeypatch.setenv(
+            PREFERENCE_SNAPSHOT_ENV,
+            str(model_snapshot(tmp_path / "preferences", "sonnet-4-thinking")),
+        )
     captured = await _run_auto_create_cursor_terminal(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         agent_spec=AgentSpec(
-            spec_version=1, name="cursor", executor=ExecutorSpec(model="sonnet-4-thinking")
+            spec_version=1,
+            name="cursor",
+            executor=ExecutorSpec(model=None if adopted else "sonnet-4-thinking"),
         ),
         terminal_launch_args=None,
     )
@@ -5492,9 +5556,11 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
 async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    adopted: bool,
 ) -> None:
     """
     A pick no row can serve launches on the catalog's default and resets the pick.
@@ -5548,6 +5614,27 @@ async def test_auto_create_claude_terminal_unserved_pick_resets_to_the_catalog_d
 
     async def _resolve() -> None:
         return None
+
+    if adopted:
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from tests.test_preference_models import model_snapshot
+
+        path = model_snapshot(tmp_path / "preferences", "saved")
+        monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+        before = path.read_bytes()
+        with pytest.raises(RuntimeError, match="saved choice is unchanged"):
+            await _auto_create_claude_terminal(
+                "1a2b3c4d5e6f47a8b9c0d1e2f3a4b5c6",
+                _RecordingClaudeRegistry(captured),
+                lambda _sid, _evt: None,
+                server_client=fake_client,
+                resolve_launch_config=_resolve,
+            )
+        assert captured == {}
+        assert [body for body in patches if "model_override" in body] == []
+        assert path.read_bytes() == before
+        await fake_client.aclose()
+        return
 
     await _auto_create_claude_terminal(
         "1a2b3c4d5e6f47a8b9c0d1e2f3a4b5c6",

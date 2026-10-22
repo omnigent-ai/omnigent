@@ -35,6 +35,52 @@ _PROVIDER_DEFAULT = "gpt-5.6-terra"
 _RETIRED_PICK = "gpt-5.4-retired"
 
 
+@pytest.mark.parametrize("selection", ["shared", "spec", "session"])
+@pytest.mark.asyncio
+async def test_adopted_unavailable_choice_never_resets_or_starts_default(
+    codex_launch_harness, tmp_path, monkeypatch, selection
+):
+    from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+    from tests.test_preference_models import model_snapshot
+
+    harness = codex_launch_harness
+    path = model_snapshot(tmp_path / "preferences", _RETIRED_PICK)
+    monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+    if selection != "session":
+        harness.snapshot["model_override"] = None
+    if selection == "spec":
+        from dataclasses import replace
+
+        harness.agent_spec = replace(
+            harness.agent_spec, executor=replace(harness.agent_spec.executor, model=_RETIRED_PICK)
+        )
+    harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    before = path.read_bytes()
+    with pytest.raises(RuntimeError, match="saved choice is unchanged"):
+        await harness.launch()
+    assert harness.resets == []
+    assert harness.builds == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_adopted_shared_model_reaches_codex_builder(
+    codex_launch_harness, tmp_path, monkeypatch
+):
+    from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+    from tests.test_preference_models import model_snapshot
+
+    harness = codex_launch_harness
+    monkeypatch.setenv(
+        PREFERENCE_SNAPSHOT_ENV, str(model_snapshot(tmp_path / "preferences", "available"))
+    )
+    harness.snapshot["model_override"] = None
+    harness.seed_catalog([{"id": "available", "isDefault": True}])
+    await harness.launch()
+    assert harness.builds[0]["model"] == "available"
+    assert harness.resets == []
+
+
 @dataclass
 class _LaunchHarness:
     """A real runner launch with scripted provider configuration and processes."""

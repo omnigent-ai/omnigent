@@ -74,6 +74,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_terminal_name,
 )
 from omnigent.native.native_dispatch import resolve_hook
+from omnigent.preference_models import adopted_model, adopted_model_args, reject_model_substitution
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
@@ -1626,7 +1627,13 @@ async def _auto_create_opencode_terminal(
             await leftover.close()
     clear_bridge_state(bridge_dir)
 
-    model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
+    model_override = adopted_model(
+        "opencode-native",
+        workspace,
+        session_model=launch_config.model_override,
+        spec_model=_opencode_native_model_from_spec(agent_spec),
+        args=launch_config.terminal_launch_args or (),
+    )
     # Route opencode through the Databricks Unity Gateway when the spec names a
     # profile. Unlike codex/claude/pi (which consume HARNESS_*_GATEWAY_* env the
     # CLI translates), opencode reads provider/auth from its own config file, so
@@ -2691,7 +2698,13 @@ async def _auto_create_pi_terminal(
         )
 
         # Provider-qualified picker values select one of the configured models.
-        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
+        spec_model = adopted_model(
+            "pi-native",
+            workspace,
+            session_model=launch_config.model_override,
+            spec_model=_pi_native_model_from_spec(agent_spec),
+            args=launch_config.terminal_launch_args or (),
+        )
         pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
         # Provider discovery does network I/O; keep the runner's stream and
         # tunnel heartbeats responsive while Pi starts.
@@ -2702,6 +2715,8 @@ async def _auto_create_pi_terminal(
         else:
             provider = await asyncio.to_thread(resolve_pi_native_provider, model=spec_model)
         if provider is not None:
+            if spec_model and provider.unroutable_model_warning():
+                reject_model_substitution("pi-native", spec_model)
             launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
                 provider,
@@ -2727,6 +2742,8 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 pi_args.extend(["--model", own_login_model])
+            else:
+                reject_model_substitution("pi-native", spec_model)
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -3133,7 +3150,13 @@ async def _auto_create_cursor_terminal(
     # ``--model=X`` form) wins over both, so only inject when the user did not
     # already pin one — otherwise cursor-agent would see two ``--model`` values.
     if not any(arg in ("--model", "-m") or arg.startswith("--model=") for arg in cursor_args):
-        model = launch_config.model_override or _cursor_native_model_from_spec(agent_spec)
+        model = adopted_model(
+            "cursor-native",
+            workspace,
+            session_model=launch_config.model_override,
+            spec_model=_cursor_native_model_from_spec(agent_spec),
+            args=launch_config.terminal_launch_args or (),
+        )
         if model is not None:
             cursor_args.extend(["--model", model])
     # Inherit the agent's os_env so its declared sandbox is honored by Cursor.
@@ -3333,6 +3356,11 @@ async def _auto_create_goose_terminal(
         "GOOSE_TELEMETRY_OFF": "1",
         "GOOSE_MODE": "smart_approve",
     }
+    from omnigent.harnesses.goose_native.bridge import build_goose_native_spawn_env
+
+    goose_model = adopted_model("goose-native", workspace)
+    if goose_model:
+        goose_env.update(build_goose_native_spawn_env(session_id, model=goose_model))
     # Launch-unique Goose session name. `goose session --name X` (without
     # --resume) creates a NEW sessions row each launch (verified, Goose 1.38),
     # so a per-launch-unique name lets the forwarder bind to EXACTLY this
@@ -3525,7 +3553,12 @@ async def _auto_create_hermes_terminal(
     # ``started_at`` is at/after this instant (minus a small skew). A wiped bridge
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
-    hermes_args = [*(launch_config.terminal_launch_args or [])]
+    hermes_args = adopted_model_args(
+        "hermes-native",
+        workspace,
+        launch_config.terminal_launch_args or (),
+        session_model=launch_config.model_override,
+    )
     # Resolve the per-session HERMES_HOME early: the fork block below needs it
     # to place the cloned state.db, and the env block after needs it for the
     # HERMES_HOME env var.
@@ -3762,7 +3795,13 @@ async def _auto_create_kiro_terminal(
     kiro_launch = build_kiro_launch(
         launch_config.terminal_launch_args or [],
         resume_id=launch_config.external_session_id,
-        model=launch_config.model_override,
+        model=adopted_model(
+            "kiro-native",
+            workspace,
+            session_model=launch_config.model_override,
+            spec_model=_pi_native_model_from_spec(agent_spec),
+            args=launch_config.terminal_launch_args or (),
+        ),
     )
     launch_epoch_ms = int(time.time() * 1000)
     # Inherit the agent's os_env so its declared sandbox (e.g. ``type: none``),
@@ -3977,7 +4016,13 @@ async def _auto_create_devin_terminal(
     # pair does, so both entry points land on the same Devin model.
     launch_model = await asyncio.to_thread(
         resolve_devin_launch_model,
-        launch_config.model_override,
+        adopted_model(
+            "devin-native",
+            workspace,
+            session_model=launch_config.model_override,
+            spec_model=_pi_native_model_from_spec(agent_spec),
+            args=launch_config.terminal_launch_args or (),
+        ),
         launch_config.reasoning_effort,
     )
     write_devin_session_config(
@@ -4350,7 +4395,12 @@ async def _auto_create_qwen_terminal(
     # the default in-terminal prompt (the embedded pane shows it) — Omnigent-side
     # gating via ``confirmation_response`` is a follow-up (see design doc).
     qwen_args = [
-        *(launch_config.terminal_launch_args or []),
+        *adopted_model_args(
+            "qwen-native",
+            workspace,
+            launch_config.terminal_launch_args or (),
+            session_model=launch_config.model_override,
+        ),
         *resume_args,
         *mcp_args,
         "--input-file",
@@ -4556,7 +4606,12 @@ async def _auto_create_kimi_terminal(
     # No subcommand: bare ``kimi`` launches the interactive TUI. Pass-through
     # launch args (``omnigent kimi -- <args>``) are persisted on the session
     # snapshot and threaded here.
-    kimi_args = list(launch_config.terminal_launch_args or [])
+    kimi_args = adopted_model_args(
+        "kimi-native",
+        workspace,
+        launch_config.terminal_launch_args or (),
+        session_model=launch_config.model_override,
+    )
 
     # Wire the Omnigent tool-policy hooks: kimi reads a single
     # ``$KIMI_CODE_HOME/config.toml``, so point it at a session-scoped home that
@@ -5037,7 +5092,17 @@ async def _auto_create_codex_terminal(
     # synthesis can stamp session_meta.model_provider with the provider
     # this launch actually routes through.
     unpinned_model = _codex_native_model_from_spec(agent_spec)
-    default_model = launch_config.model_override or unpinned_model
+    default_model = adopted_model(
+        "codex-native",
+        launch_config.workspace,
+        session_model=launch_config.model_override,
+        spec_model=unpinned_model,
+        args=launch_config.terminal_launch_args or (),
+    )
+    from omnigent.preference_startup import inherited_launch
+
+    adopted = inherited_launch() is not None
+    requested_model = default_model if adopted else launch_config.model_override
     # Thread the spec so its executor.auth / legacy profile win over
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
@@ -5082,8 +5147,7 @@ async def _auto_create_codex_terminal(
     # 400 class). Profile-backed shapes already resolve their default at
     # materialization time and are left alone.
     if codex_binding is None and (
-        launch_config.model_override
-        or (_codex_launch.model is None and _codex_launch.profile is None)
+        requested_model or (_codex_launch.model is None and _codex_launch.profile is None)
     ):
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
@@ -5118,8 +5182,8 @@ async def _auto_create_codex_terminal(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        if launch_config.model_override and _codex_catalog:
-            pick = launch_config.model_override
+        if requested_model and _codex_catalog:
+            pick = requested_model
             reachable = codex_reachable_model_slug(pick, _codex_catalog)
             fresh_rows = _codex_catalog
             if reachable is None and _codex_catalog_was_stale:
@@ -5131,6 +5195,7 @@ async def _auto_create_codex_terminal(
                     _codex_catalog_was_stale = False
                     reachable = codex_reachable_model_slug(pick, fresh_rows)
             if reachable is None:
+                reject_model_substitution("codex-native", pick)
                 # Re-resolve so provider overrides cannot retain the old model.
                 # A failed probe permits fallback, but cannot retire the pick.
                 fallback_model = unpinned_model
@@ -6644,6 +6709,7 @@ async def _auto_create_antigravity_terminal(
     # agy model label from the session's model_override (None lets agy default).
     _model_override = snapshot.get("model_override")
     model = _model_override if isinstance(_model_override, str) and _model_override else None
+    model = adopted_model("antigravity-native", workspace, session_model=model)
 
     # Bridge id mirrors the CLI/harness derivation: the session's bridge-id
     # label when present (so the spawn env built by
@@ -7395,6 +7461,7 @@ def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) 
     if not isinstance(model, str) or not model:
         return None
     if model.startswith(("databricks-", "databricks/")):
+        reject_model_substitution("cursor-native", model)
         _logger.warning(
             "cursor-native: pinned model %r is not a cursor-agent model id; "
             "launching cursor-agent on its configured default instead.",
@@ -8736,6 +8803,16 @@ async def _auto_create_claude_terminal(
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
+    from omnigent.preference_startup import inherited_launch
+
+    if inherited_launch() is not None and not launch_metadata.routing_enabled:
+        session_model_override = adopted_model(
+            "claude-native",
+            workspace,
+            session_model=session_model_override,
+            spec_model=_claude_native_model_from_spec(agent_spec),
+            args=session_launch_args or (),
+        )
     session_external_id = launch_metadata.external_session_id
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history
@@ -9090,6 +9167,7 @@ async def _auto_create_claude_terminal(
                     # ``omnigent setup`` can re-point the default). Launch on what
                     # this provider serves; reset the pick to Default only on fresh
                     # evidence, so the picker shows what the session now runs.
+                    reject_model_substitution("claude-native", pick)
                     offered = ", ".join(
                         str(row.get("id") or row.get("model") or "") for row in launch_catalog
                     )

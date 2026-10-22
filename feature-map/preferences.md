@@ -8,6 +8,7 @@ the CLI. Connected CLI launches and user-owned hosts adopt cached/shared default
 at startup; browser controls and managed startup remain separate. Pending edits
 retry on host reconnect without polling between messages.
 Native Claude/Codex sessions also apply plugin toggles in private settings.
+Native startup applies adopted model defaults and retains known-unavailable choices.
 
 ## Sub-features
 
@@ -38,6 +39,8 @@ Native Claude/Codex sessions also apply plugin toggles in private settings.
   preview/apply an import or restore, retry edits and resolve conflicts.
 - `shared-plugins`: import explicit native user toggles, apply installed plugins
   independently in concurrent sessions, and retain unavailable selections with warnings.
+- `shared-models`: apply the frozen model at native startup; retain an unavailable
+  choice and show a startup error instead of replacing it with a default.
 
 ## How to get to it (user POV)
 
@@ -96,6 +99,13 @@ private settings for installed plugins. Missing plugins remain requested and
 produce a warning; installation stays local. See the
 [plugin guide](../docs/shared-preferences-plugins.md).
 
+**Shared models:** save `model` (or `opencode_model`) through the shared/machine
+scope controls, then launch a new native session. Explicit launch, session and
+agent choices still win. For an unavailable Claude/Codex selection, or an
+unrepresentable Pi own-login selection, fix the provider or choose another
+session model and retry; the saved default remains unchanged. See the
+[model guide](../docs/shared-preferences-models.md).
+
 ## Driving it with the repro environment
 
 Preconditions: use an isolated config home and project; never edit your usual
@@ -132,6 +142,20 @@ checks temporary intent in all twelve adapters' multipart requests using simulat
 HTTP. Those checks do not prove vendor model/plugin application or availability UI.
 Component cases cover login changes, initial choice, startup timeout, frozen
 session choices, bounded snapshots, and idle/bounded reconnect retries.
+
+**Adopted native models (component/process boundary):**
+
+```sh
+uv run --no-sync pytest tests/test_preference_models.py \
+  tests/runner/test_codex_model_pick_fallback.py \
+  tests/runner/test_app_sessions_native_terminals_autocreate.py --reruns 0 -q
+```
+
+Existing runner scenarios now cover adopted versus legacy launches, saved model
+application and no-reset errors for unavailable Claude/Codex and Pi selections.
+Terminal processes and provider responses are simulated in these scenarios.
+The shared-plugin recipe below supplies the real Codex process/config boundary.
+It does not cover live availability for every vendor or managed Arclet startup.
 
 **Project and invocation compatibility (component tests):**
 
@@ -179,6 +203,10 @@ a portable YAML/native-plugin import, set/remove a machine override, and restore
 the import. Native toggles require the explicit `--plugins` options.
 
 **Shared plugins (own environment):**
+
+The real Codex scenario below also reads the native effective model config for
+each frozen workspace. Distinct model values survive concurrent startup. It does
+not send a model request or establish provider availability.
 
 ```sh
 uv run --no-sync pytest tests/test_preference_plugins.py \
@@ -263,7 +291,7 @@ the correctness scenarios above.
 - Request parsing currently has no route-specific body-size or rate limit.
   Add these before broad activation; the value cap applies after JSON parsing.
 - Managed deployment, Universe wiring, Arclet startup, SDK plugin consumers,
-  and per-harness model availability remain unverified follow-ups. Startup adoption
+  and live per-harness model availability remain unverified follow-ups. Startup adoption
   carries portable intent; each adapter must still apply and report its capabilities.
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.

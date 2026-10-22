@@ -7,48 +7,37 @@ import pytest
 
 from omnigent.preference_startup import (
     PREFERENCE_SNAPSHOT_ENV,
-    PreferenceLaunch,
-    write_launch_snapshot,
 )
 from omnigent.preference_sync import (
     PreferenceNamespace,
-    PreferenceSnapshot,
     SharedPreferenceEntry,
     SharedPreferenceKey,
 )
+from tests._helpers.preferences import preference_snapshot
 
 
 def plugin_snapshot(root: Path, ecosystem: str, values: dict[str, bool]) -> Path:
-    path = root / "preferences.json"
-    write_launch_snapshot(
-        path,
-        PreferenceLaunch(
-            shared=PreferenceSnapshot(
-                identity=PreferenceNamespace(
-                    authority_id="plugin-test", user_id="alice", workspace_id=root.name
-                ),
-                revision=1,
-                entries=[
-                    SharedPreferenceEntry(
-                        key=SharedPreferenceKey(
-                            kind="plugin",
-                            name={
-                                "ecosystem": ecosystem,
-                                "name": key.split("@")[0],
-                                "source": key.split("@")[1],
-                            },
-                        ),
-                        version=1,
-                        value=value,
-                    )
-                    for key, value in values.items()
-                ],
-            ),
-            installation_id="test",
-            state="current",
+    return preference_snapshot(
+        root,
+        identity=PreferenceNamespace(
+            authority_id="plugin-test", user_id="alice", workspace_id=root.name
         ),
+        shared=[
+            SharedPreferenceEntry(
+                key=SharedPreferenceKey(
+                    kind="plugin",
+                    name={
+                        "ecosystem": ecosystem,
+                        "name": key.split("@")[0],
+                        "source": key.split("@")[1],
+                    },
+                ),
+                version=1,
+                value=value,
+            )
+            for key, value in values.items()
+        ],
     )
-    return path
 
 
 def test_claude_overlay_keeps_project_policy_and_missing_intent(tmp_path, monkeypatch):

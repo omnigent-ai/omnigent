@@ -116,8 +116,13 @@ def test_shared_plugins_isolated_through_real_app_server_startup(tmp_path):
     import sys
     from concurrent.futures import ThreadPoolExecutor
 
+    from omnigent.preference_sync import (
+        PreferenceNamespace,
+        SharedPreferenceEntry,
+        SharedPreferenceKey,
+    )
     from tests._helpers.live_server import isolated_process_env
-    from tests.test_preference_plugins import plugin_snapshot
+    from tests._helpers.preferences import preference_snapshot
 
     codex = os.environ.get("OMNIGENT_CODEX_PATH") or shutil.which("codex")
     if not codex:
@@ -143,11 +148,13 @@ from pathlib import Path
 from omnigent.harnesses.codex_native.app_server import (
     CodexNativeAppServer, CodexAppServerClient, _allocate_loopback_port,
 )
+from omnigent.preference_models import adopted_model
 async def run():
     root = Path(sys.argv[2])
     app = CodexNativeAppServer(codex_path=sys.argv[1], socket_path=root / "socket",
         codex_home=root / "codex", env=dict(os.environ), config_overrides=[],
         cwd=Path(sys.argv[3]), bridge_dir=root / "bridge", trust_project=True,
+        pinned_model=adopted_model("codex-native", Path(sys.argv[3])),
         listen_url=f"ws://127.0.0.1:{_allocate_loopback_port()}")
     app.bridge_dir.mkdir()
     await app.start()
@@ -158,7 +165,8 @@ async def run():
             response = await client.request(
                 "skills/list", {"cwds": [sys.argv[3]], "forceReload": True},
             )
-            print(json.dumps(response))
+            config = await client.request("config/read", {})
+            print(json.dumps({"skills": response, "config": config}))
         finally:
             await client.close()
     finally:
@@ -168,7 +176,30 @@ asyncio.run(run())
 
     def launch(enabled):
         root = tmp_path / str(enabled)
-        snapshot = plugin_snapshot(root, "codex", {"preferences-check@preferences-lab": enabled})
+        model = f"fixture-model-{enabled}"
+        snapshot = preference_snapshot(
+            root,
+            identity=PreferenceNamespace(
+                authority_id="test", user_id="alice", workspace_id=str(enabled)
+            ),
+            shared=[
+                SharedPreferenceEntry(
+                    key=SharedPreferenceKey(kind="model", name="model"), version=1, value=model
+                ),
+                SharedPreferenceEntry(
+                    key=SharedPreferenceKey(
+                        kind="plugin",
+                        name={
+                            "ecosystem": "codex",
+                            "source": "preferences-lab",
+                            "name": "preferences-check",
+                        },
+                    ),
+                    version=1,
+                    value=enabled,
+                ),
+            ],
+        )
         environment = isolated_process_env(
             root / "home",
             {
@@ -187,7 +218,10 @@ asyncio.run(run())
         )
         assert result.returncode == 0, result.stdout + result.stderr
         response = json.loads(result.stdout.splitlines()[-1])
-        skills = [skill for entry in response["result"]["data"] for skill in entry["skills"]]
+        assert response["config"]["result"]["config"]["model"] == model, response["config"]
+        skills = [
+            skill for entry in response["skills"]["result"]["data"] for skill in entry["skills"]
+        ]
         active = [
             skill
             for skill in skills
