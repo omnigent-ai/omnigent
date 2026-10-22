@@ -284,6 +284,55 @@ def test_stop_signal_reaches_sink_then_dies_by_signal(tmp_path: Path, signum: in
     assert attrs["exit_code"] == str(128 + signum)
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["/usr/local/bin/isaac", "omni", "host", "stop"], "isaac omni stop"),
+        (["omnigent", "host", "enable", "--server", "https://example.invalid"], "omnigent enable"),
+        (["/usr/bin/systemctl", "--user", "restart", "omnigent-host"], "systemctl restart"),
+        (["/sbin/shutdown", "-h", "now"], "shutdown"),
+        (["/usr/local/bin/isaac", "omni", "claude"], None),
+        (["/usr/bin/python3", "/home/alice/stop.py"], None),
+        ([], None),
+    ],
+)
+def test_stop_command_keeps_only_known_words(argv: list[str], expected: str | None) -> None:
+    """A stop command is named by program and stop words only, never its other arguments."""
+    assert cr._stop_command(argv) == expected
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+def test_stop_signal_report_names_a_running_stop_command(tmp_path: Path) -> None:
+    """The signal exit row names the parent chain and a stop command running at the time."""
+    rows_path = tmp_path / "rows.jsonl"
+    # argv[0] "omnigent" with a trailing "stop" word; ``; :`` keeps sh from exec-ing sleep.
+    stopper = subprocess.Popen(["omnigent", "-c", "sleep 30; :", "stop"], executable="/bin/sh")
+    proc = _run_child(
+        """
+        cr.install_host_signal_handlers()
+        print("ready", flush=True)
+        while True:
+            time.sleep(0.05)
+        """,
+        rows_path,
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+    finally:
+        stopper.kill()
+        if proc.poll() is None:
+            proc.kill()
+
+    (row,) = _exit_rows(rows_path)
+    attrs = row["attributes"]
+    assert isinstance(attrs, dict)
+    assert "omnigent stop" in str(attrs["stop_commands"]).split(", ")
+    assert str(attrs["parent_chain"]).startswith(os.path.basename(sys.executable))
+
+
 def test_uncaught_crash_reaches_sink(tmp_path: Path) -> None:
     rows_path = tmp_path / "rows.jsonl"
     proc = _run_child('raise RuntimeError("daemon exploded")\n', rows_path)
