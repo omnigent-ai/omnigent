@@ -284,7 +284,182 @@ class MainActivityTest {
                 awaitMainThread { activity.isFinishing }
                 val setup = shadowOf(activity).nextStartedActivity
                 assertEquals(ConnectActivity::class.java.name, setup.component?.className)
-                assertTrue(setup.getStringExtra(ConnectActivity.EXTRA_ERROR)?.isNotBlank() == true)
+                assertEquals(
+                    OidcSignInException
+                        .SignInRefused(
+                            server.origin.removePrefix("http://"),
+                            null,
+                        ).message,
+                    setup.getStringExtra(ConnectActivity.EXTRA_ERROR),
+                )
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `legacy browser launch failure shows browser unavailable in setup`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+            } else {
+                LocalHttpServer.Response(202)
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                activity.declared<OidcLoginManager>("oidcLoginManager").browserLauncher =
+                    { _, _ -> false }
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread { activity.isFinishing }
+                assertEquals(
+                    OidcSignInException
+                        .BrowserUnavailable(
+                            server.origin.removePrefix("http://"),
+                        ).message,
+                    shadowOf(
+                        activity,
+                    ).nextStartedActivity.getStringExtra(ConnectActivity.EXTRA_ERROR),
+                )
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `legacy ticket poll server error shows generic unreachable with numeric details`() {
+        LocalHttpServer { request ->
+            when (request.path) {
+                "/auth/cli-login" -> {
+                    LocalHttpServer.Response(
+                        200,
+                        """{"ticket":"abc","login_url":"/auth/login"}""",
+                    )
+                }
+
+                "/auth/cli-poll" -> {
+                    LocalHttpServer.Response(503, "secret-response-body")
+                }
+
+                else -> {
+                    LocalHttpServer.Response(404)
+                }
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                activity.declared<OidcLoginManager>("oidcLoginManager").pollIntervalMillis = 20
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread {
+                    activity.declared<ConnectionStatus?>(
+                        "connectionStatus",
+                    ) is ConnectionStatus.ServerUnreachable
+                }
+                val status =
+                    activity.declared<ConnectionStatus.ServerUnreachable>(
+                        "connectionStatus",
+                    )
+                assertEquals(UnreachableKind.GENERIC, status.kind)
+                assertEquals("HTTP 503", status.details?.error)
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+                activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+                val details =
+                    activity
+                        .findViewById<TextView>(
+                            R.id.status_details_text,
+                        ).text
+                        .toString()
+                assertTrue(details.contains("HTTP 503"))
+                assertFalse(details.contains("secret-response-body"))
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `legacy ticket poll network deadline shows unreachable`() {
+        val server =
+            LocalHttpServer { request ->
+                if (request.path == "/auth/cli-login") {
+                    LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+                } else {
+                    LocalHttpServer.Response(202)
+                }
+            }
+        try {
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                activity.declared<OidcLoginManager>("oidcLoginManager").apply {
+                    pollIntervalMillis = 100
+                    pollTimeoutMillis = 400
+                }
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread {
+                    activity.declared<ConnectionStatus?>(
+                        "connectionStatus",
+                    ) is ConnectionStatus.AuthTabHandoff
+                }
+                server.close()
+                awaitMainThread {
+                    activity.declared<ConnectionStatus?>(
+                        "connectionStatus",
+                    ) is ConnectionStatus.ServerUnreachable
+                }
+                val status =
+                    activity.declared<ConnectionStatus.ServerUnreachable>(
+                        "connectionStatus",
+                    )
+                assertTrue(
+                    status.kind == UnreachableKind.OFFLINE ||
+                        status.kind == UnreachableKind.GENERIC,
+                )
+                assertTrue(status.details?.error in setOf("ConnectException", "IOException"))
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun `legacy ticket poll pending deadline returns neutral setup message`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+            } else {
+                LocalHttpServer.Response(202)
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                activity.declared<OidcLoginManager>("oidcLoginManager").apply {
+                    pollIntervalMillis = 20
+                    pollTimeoutMillis = 180
+                }
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread { activity.isFinishing }
+                assertEquals(
+                    "Sign-in timed out. Try again.",
+                    shadowOf(
+                        activity,
+                    ).nextStartedActivity.getStringExtra(ConnectActivity.EXTRA_ERROR),
+                )
             } finally {
                 controller.pause().stop().destroy()
             }
@@ -392,7 +567,8 @@ class MainActivityTest {
                 .getItemAt(0)
                 .text
                 .toString()
-        assertEquals(details, copied)
+        assertTrue(copied.startsWith(details))
+        assertTrue(copied.contains("Android API\n"))
 
         activity.findViewById<Button>(R.id.status_primary).performClick()
         assertEquals(2, manifestReads)
@@ -524,7 +700,8 @@ class MainActivityTest {
                 .getItemAt(0)
                 .text
                 .toString()
-        assertEquals(rendered, copied)
+        assertTrue(copied.startsWith(rendered))
+        assertTrue(copied.contains("Android API\n"))
         assertTrue(rendered.contains("ERROR_HOST_LOOKUP"))
         assertFalse(rendered.contains("ERR_PRIVATESTATE"))
         assertFalse(rendered.contains("private-code"))
@@ -556,7 +733,8 @@ class MainActivityTest {
                 .getItemAt(0)
                 .text
                 .toString()
-        assertEquals(details, copied)
+        assertTrue(copied.startsWith(details))
+        assertTrue(copied.contains("Android API\n"))
     }
 
     @Test
