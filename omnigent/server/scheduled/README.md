@@ -30,8 +30,8 @@ entire agent turn.
 
 The executor checks its lease before external actions, attaches the session before
 sending the prompt, and records `running` after delivery. Lease loss stops local
-startup work. Interrupted runs remain recorded for recovery; the scheduler never
-resends a prompt automatically. After an outage it dispatches one overdue
+startup work. Interrupted `starting` runs remain recorded for recovery; the scheduler
+never resends a prompt automatically. After an outage it dispatches one overdue
 occurrence per task, then advances into the future instead of replaying every
 missed occurrence.
 

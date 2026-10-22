@@ -271,10 +271,10 @@ async def test_cancelled_renewal_finishes_before_the_next_lease_update(store, mo
         await asyncio.gather(renewal, return_exceptions=True)
 
 
-@pytest.mark.parametrize("cancel_caller", [False, True])
+@pytest.mark.parametrize("cancel_when", ["never", "while_writing", "after_write"])
 @pytest.mark.parametrize("failure", [RuntimeError, StartupLeaseLost])
 async def test_lease_write_failure_after_cancellation_is_logged_once(
-    store, monkeypatch, caplog, cancel_caller, failure
+    store, monkeypatch, caplog, cancel_when, failure
 ):
     task = _task(store)
     clock = FakeClock(task.next_run_at)
@@ -300,18 +300,26 @@ async def test_lease_write_failure_after_cancellation_is_logged_once(
     caller = asyncio.create_task(lease.check())
     try:
         await asyncio.wait_for(entered.wait(), 10)
-        if cancel_caller:
+        writes = list(lease._writes)
+        if cancel_when == "while_writing":
             caller.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await caller
-        writes = list(lease._writes)
+        elif cancel_when == "after_write":
+            # Done callbacks run before the shielded caller resumes.
+            assert len(writes) == 1
+            writes[0].add_done_callback(lambda _: caller.cancel())
         release.set()
-        if not cancel_caller:
+        if cancel_when == "never":
             with pytest.raises(failure):
                 await asyncio.wait_for(caller, 10)
+        elif cancel_when == "after_write":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, 10)
+            assert writes[0].done()
         await asyncio.wait_for(asyncio.gather(*writes, return_exceptions=True), 10)
         records = [r for r in caplog.records if r.name.endswith("dispatch_scheduler")]
-        if cancel_caller and failure is RuntimeError:
+        if cancel_when != "never" and failure is RuntimeError:
             assert len(records) == 1
             assert records[0].levelno == logging.ERROR
             assert run.id in records[0].message
@@ -397,7 +405,7 @@ async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
     "interruption",
     ["lease_loss", "renewal_timeout", "stop", "executor_error", "running_executor_error"],
 )
-async def test_interrupted_executor_stops_and_leaves_run_recoverable(
+async def test_interrupted_executor_stops_and_preserves_run_state(
     store, monkeypatch, caplog, interruption
 ):
     task = _task(store)

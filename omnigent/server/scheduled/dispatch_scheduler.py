@@ -349,7 +349,7 @@ class PersistentTaskScheduler:
                     lease.run.status,
                 )
             except Exception:
-                # Outcome may be ambiguous; recovery inspects the run after its lease expires.
+                # Recovery inspects runs still marked starting after lease expiry.
                 _logger.exception(
                     "Startup interrupted for run %s (status=%s); "
                     "stopping local startup work and lease renewals",
