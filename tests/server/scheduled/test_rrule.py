@@ -362,8 +362,8 @@ def test_bounded_iterator_preserves_dateutil_occurrences(rule: str, zone: str) -
         "FREQ=MONTHLY;INTERVAL=2",
         "FREQ=YEARLY;INTERVAL=2",
         "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29",
-        "FREQ=DAILY;COUNT=500",
-        "FREQ=DAILY;COUNT=2",
+        "FREQ=DAILY;BYHOUR=9;COUNT=500",
+        "FREQ=DAILY;BYHOUR=9;COUNT=2",
         "FREQ=DAILY;UNTIL=20250301T000000Z",
     ],
 )
@@ -398,3 +398,10 @@ def test_old_unbounded_rule_seeks_without_scanning_its_history(
     # A tiny budget proves the lookup doesn't walk twelve years of past occurrences.
     monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 20)
     assert get_next_fire_time(rule, _dt(2026, 10, 21), UTC, anchor=_dt(2014, 10, 21)) == expected
+
+
+def test_legacy_search_horizon_remains_midnight_based() -> None:
+    rule = "FREQ=YEARLY;INTERVAL=8;BYHOUR=1"
+    after = _dt(2026, 1, 1, 2)
+    assert get_next_fire_time(rule, after, UTC) is None
+    assert get_next_fire_time(rule, after, UTC, anchor=after) == _dt(2034, 1, 1, 1)

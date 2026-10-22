@@ -89,21 +89,23 @@ class _RRuleLimits(Protocol):
 class _BoundedRRule:
     rule: rrule
     count: int | None
+    count_after: datetime | None = None
 
     def __iter__(self) -> Iterator[datetime]:
         return self._occurrences()
 
     def _occurrences(self, start_at: datetime | None = None) -> Iterator[datetime]:
         try:
-            yield from islice(
-                iter_bounded(
-                    self.rule,
-                    max_steps=_MAX_SEARCH_STEPS,
-                    max_seconds=_MAX_SEARCH_SECONDS,
-                    start_at=start_at if self.count is None else None,
-                ),
-                self.count,
+            occurrences = iter_bounded(
+                self.rule,
+                max_steps=_MAX_SEARCH_STEPS,
+                max_seconds=_MAX_SEARCH_SECONDS,
+                start_at=start_at if self.count is None else None,
             )
+            if self.count is not None and self.count_after is not None:
+                # Past occurrences on the creation day must not consume COUNT.
+                occurrences = (occ for occ in occurrences if occ > self.count_after)
+            yield from islice(occurrences, self.count)
         except RRuleSearchLimitError as exc:
             raise RRuleSearchError(str(exc)) from exc
         except ValueError as exc:
@@ -147,14 +149,20 @@ def get_next_fire_time(
     :param rule_str: An RFC 5545 recurrence rule, e.g. ``"FREQ=DAILY;BYHOUR=9"``.
     :param after: The instant to search after (any tz-aware datetime).
     :param tz: The IANA timezone occurrences are evaluated in.
-    :param anchor: Stable schedule anchor for persisted schedules. Defaults to
-        ``after`` for the legacy timer scheduler.
+    :param anchor: Creation time for persisted schedules. COUNT includes only
+        occurrences strictly after this instant; interval phase uses its local date.
+        Omit to retain the legacy timer's query-day anchor and COUNT behavior.
     :returns: The next fire as a tz-aware datetime, or ``None`` if the rule has
         no further occurrences.
     :raises RRuleValidationError: If ``rule_str`` is malformed.
     """
     dtstart = _anchor_dtstart(anchor if anchor is not None else after, tz)
-    rule = _parse(rule_str, dtstart, horizon_from=after.astimezone(tz))
+    rule = _parse(
+        rule_str,
+        dtstart,
+        horizon_from=after.astimezone(tz) if anchor is not None else None,
+        count_after=anchor.astimezone(tz) if anchor is not None else None,
+    )
     # `rule.after` compares in dtstart's timezone, so localize `after` too. A
     # spring-forward "imaginary" wall time maps to some instant via zoneinfo and
     # a fall-back duplicated time picks the earlier of the two; both are
@@ -180,7 +188,11 @@ class RRuleTrigger:
 
 
 def _parse(
-    rule_str: str, dtstart: datetime, *, horizon_from: datetime | None = None
+    rule_str: str,
+    dtstart: datetime,
+    *,
+    horizon_from: datetime | None = None,
+    count_after: datetime | None = None,
 ) -> _ParsedRRule:
     """Parse an RRULE string anchored at ``dtstart``, normalizing errors.
 
@@ -253,7 +265,7 @@ def _parse(
         # Apply COUNT outside dateutil so the bounded rule does not combine
         # COUNT and UNTIL, which RFC 5545 disallows.
         bounded = parsed.replace(count=None, until=until)
-        return _BoundedRRule(bounded, limits._count)
+        return _BoundedRRule(bounded, limits._count, count_after)
     except (ValueError, TypeError) as exc:
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 

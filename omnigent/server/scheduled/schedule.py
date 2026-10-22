@@ -24,6 +24,9 @@ def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
     try:
         timezone = ZoneInfo(task.timezone or "UTC")
     except (ZoneInfoNotFoundError, ValueError):
+        _logger.warning(
+            "Unknown timezone %r for task %s; defaulting to UTC", task.timezone, task.id
+        )
         timezone = ZoneInfo("UTC")
     try:
         occurrence = get_next_fire_time(
