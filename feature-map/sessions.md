@@ -165,7 +165,12 @@ is saved per grid and stays fixed when switching sessions; the header shrinks
 with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
 fills the grid area, including its header. Drag a cell titlebar onto another cell
-to swap positions, or focus the title and press Space, choose a cell with the arrow keys, and
+to swap positions. With exactly two sessions side by side, drop a titlebar
+near the whole grid's top/bottom edge to stack them. When stacked, use the
+left/right edge to place them side by side, including along the dragged cell's
+side. Only edges that change orientation appear; their preview spans the grid.
+The center swaps positions and Escape cancels the preview.
+Alternatively, focus the title and press Space, choose a cell with the arrow keys, and
 press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
 only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
 Grids wait for account identity; if it is unavailable, use Reload to retry.

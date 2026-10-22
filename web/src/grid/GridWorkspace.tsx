@@ -57,6 +57,7 @@ import {
 } from "@/components/ui/context-menu";
 import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
 import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
+import { GridDropOverlay, type GridDropTarget } from "./GridDropTargets";
 import { gridTitle, useGridSessions } from "./GridSessionsContext";
 
 export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
@@ -252,7 +253,11 @@ export function RearrangeableGrid({
     },
   };
   const grids = useGridSessions()!;
-  const [draggedTitle, setDraggedTitle] = useState<string | null>(null);
+  const [dragged, setDragged] = useState<{ id: string; title: string } | null>(null);
+  const rearrangeTargetId =
+    dragged && sessionIds.length === 2 && sessionIds.includes(dragged.id)
+      ? sessionIds.find((id) => id !== dragged.id)
+      : undefined;
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
@@ -262,20 +267,36 @@ export function RearrangeableGrid({
     <DndContext
       sensors={sensors}
       autoScroll={false}
-      collisionDetection={(args) =>
-        args.pointerCoordinates ? pointerWithin(args) : closestCenter(args)
-      }
+      collisionDetection={(args) => {
+        if (!args.pointerCoordinates) return closestCenter(args);
+        const edges = pointerWithin({
+          ...args,
+          droppableContainers: args.droppableContainers.filter(
+            (target) => target.data.current?.type === "session-grid",
+          ),
+        });
+        return edges.length ? edges : pointerWithin(args);
+      }}
       accessibility={{
         screenReaderInstructions: {
           draggable:
             "Press Space to pick up this conversation, then use the arrow keys to choose another cell. Press Space again to swap positions, or Escape to cancel.",
         },
       }}
-      onDragStart={({ active }) => setDraggedTitle(active.data.current?.title ?? "Session")}
-      onDragCancel={() => setDraggedTitle(null)}
+      onDragStart={({ active, activatorEvent }) => {
+        // Keep Escape on the drag handle instead of a cell's autofocused terminal.
+        if (activatorEvent.target instanceof HTMLElement)
+          activatorEvent.target.closest("button")?.focus();
+        setDragged({ id: String(active.id), title: active.data.current?.title ?? "Session" });
+      }}
+      onDragCancel={() => setDragged(null)}
       onDragEnd={({ active, over }) => {
-        setDraggedTitle(null);
-        if (over) grids.swapPanes(String(active.id), String(over.id));
+        setDragged(null);
+        if (!over) return;
+        const target = over.data.current as GridDropTarget | undefined;
+        if (target?.type === "session-grid")
+          grids.swapPanes(String(active.id), target.targetId, target.edge);
+        else grids.swapPanes(String(active.id), String(over.id));
       }}
     >
       <div
@@ -315,7 +336,7 @@ export function RearrangeableGrid({
             </Button>
           </header>
           <div
-            className="grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
+            className="relative grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
             data-testid="session-grid"
           >
             {gridPanes(layout).map(({ sessionId, area }) => (
@@ -330,14 +351,21 @@ export function RearrangeableGrid({
                 onOpenWorkspace={() => openWorkspace(sessionId)}
               />
             ))}
+            {rearrangeTargetId && typeof layout !== "string" && (
+              <GridDropOverlay
+                targetId={rearrangeTargetId}
+                edges={layout.axis === "columns" ? ["top", "bottom"] : ["left", "right"]}
+                edgeOnly
+              />
+            )}
           </div>
         </div>
         <div ref={setWorkspaceTarget} className="contents" data-testid="grid-workspace-panel" />
       </div>
       <DragOverlay dropAnimation={null}>
-        {draggedTitle && (
+        {dragged && (
           <div className="w-fit max-w-72 truncate rounded-md border bg-background px-2 py-1 text-ui shadow-md">
-            {draggedTitle}
+            {dragged.title}
           </div>
         )}
       </DragOverlay>
