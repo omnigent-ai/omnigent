@@ -264,24 +264,31 @@ def test_bound_codex_does_not_fallback_when_credential_disappears(
         resolve_native_codex_launch(model=None)
 
 
-def test_pi_single_model_policy_preserves_literal_ids_and_stays_curated() -> None:
+@pytest.mark.parametrize("model", ["databricks-literal/model-b", "omnigent/model-a"])
+@pytest.mark.parametrize("selection", ["default", "literal", "picker"])
+def test_pi_single_model_policy_preserves_literal_ids_and_stays_curated(
+    model: str, selection: str
+) -> None:
     profile = _profile()
     profile["inference"] = {
         "harnesses": {
             "pi-native": {
                 "provider": "bifrost",
-                "default_model": "databricks-literal/model-b",
-                "model_allowlist": ["databricks-literal/model-b"],
+                "default_model": model,
+                "model_allowlist": [model],
             }
         }
     }
     with inference_config_scope(profile):
-        provider = resolve_pi_native_provider()
+        selected = None if selection == "default" else model
+        if selection == "picker":
+            selected = f"omnigent/{model}"
+        provider = resolve_pi_native_provider(model=selected)
         assert provider is not None
-        assert provider.model == "databricks-literal/model-b"
+        assert provider.model == model
         assert provider.curated_models
         assert [row["id"] for row in _live_family_model_entries(provider, transport=None)] == [
-            "databricks-literal/model-b"
+            model
         ]
         with pytest.raises(OmnigentError, match="configured model list"):
             resolve_pi_native_provider(model="unlisted")
