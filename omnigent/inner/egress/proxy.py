@@ -166,16 +166,20 @@ async def _open_upstream(
     The CONNECT target is the DNS-pinned IP, and plain HTTP also uses CONNECT
     (to port 80). Proxies that deny CONNECT to non-TLS ports (Squid's default)
     or filter by hostname will refuse; the default proxy port is 3128.
+    Schemeless values are read as ``http://``; non-``http://`` proxy URLs are
+    ignored with a warning and the destination is dialed directly.
     """
     proxies = urllib.request.getproxies_environment()
     proxy = proxies.get("https" if ssl_ctx else "http") or proxies.get("all")
-    if not proxy or urllib.request.proxy_bypass_environment(host):
+    p = urlparse(proxy if proxy and "://" in proxy else f"http://{proxy}") if proxy else None
+    if p and (p.scheme != "http" or not p.hostname):
+        # Unsupported (https://, socks*://): connect directly, as before proxy support.
+        logger.warning("Ignoring unsupported upstream proxy scheme %r", p.scheme)
+        p = None
+    if not p or urllib.request.proxy_bypass_environment(f"{host}:{port}"):
         return await asyncio.open_connection(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )
-    p = urlparse(proxy)
-    if p.scheme != "http" or not p.hostname:  # https:// would need TLS-in-TLS
-        raise OSError("upstream proxy must be an http://host:port URL")
     reader, writer = await asyncio.open_connection(p.hostname, p.port or 3128)
     try:
         auth = b""

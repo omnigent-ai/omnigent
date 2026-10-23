@@ -94,11 +94,56 @@ async def test_https_handshakes_with_original_host_over_tunnel(monkeypatch, tmp_
     assert sni == ["example.test"]
 
 
-async def test_https_proxy_url_is_rejected(monkeypatch):
-    monkeypatch.setenv("http_proxy", "https://user:secret@127.0.0.1:1")
-    with pytest.raises(OSError, match="http://") as exc:
-        await _open_upstream("example.test", "203.0.113.5", 80)
-    assert "secret" not in str(exc.value)
+@pytest.mark.parametrize(
+    "proxy_url",
+    ["https://user:secret@127.0.0.1:1", "socks5://127.0.0.1:1"],
+)
+async def test_unsupported_proxy_scheme_connects_directly(monkeypatch, proxy_url, caplog):
+    async def target(reader, writer):
+        writer.write(b"direct")
+        await writer.drain()
+        writer.close()
+
+    server, port = await _serve(target)
+    monkeypatch.setenv("all_proxy", proxy_url)
+    reader, writer = await _open_upstream("example.test", "127.0.0.1", port)
+    assert await reader.read() == b"direct"
+    writer.close()
+    server.close()
+    assert "secret" not in caplog.text
+
+
+async def test_schemeless_proxy_is_read_as_http(monkeypatch):
+    seen = []
+
+    async def proxy(reader, writer):
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 OK\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+
+    server, port = await _serve(proxy)
+    monkeypatch.setenv("http_proxy", f"127.0.0.1:{port}")
+    reader, writer = await _open_upstream("example.test", "203.0.113.5", 80)
+    assert await reader.read() == b"ok"
+    writer.close()
+    server.close()
+    assert seen[0].startswith(b"CONNECT 203.0.113.5:80")
+
+
+async def test_no_proxy_entry_with_port_bypasses_proxy(monkeypatch):
+    async def target(reader, writer):
+        writer.write(b"direct")
+        await writer.drain()
+        writer.close()
+
+    server, port = await _serve(target)
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")  # would fail if used
+    monkeypatch.setenv("no_proxy", f"localhost:{port}")
+    reader, writer = await _open_upstream("localhost", "127.0.0.1", port)
+    assert await reader.read() == b"direct"
+    writer.close()
+    server.close()
 
 
 async def test_all_proxy_is_fallback(monkeypatch):
