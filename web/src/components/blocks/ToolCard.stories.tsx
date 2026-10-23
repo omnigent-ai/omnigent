@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent } from "storybook/test";
+import { userEvent, within } from "storybook/test";
 import { ToolCard } from "./ToolCard";
 
 const longOutput = Array.from(
@@ -7,10 +7,38 @@ const longOutput = Array.from(
   (_, index) => `Line ${String(index + 1).padStart(2, "0")}: deterministic tool output`,
 ).join("\n");
 
+const longCommand =
+  '/bin/zsh -lc \'PATH="$HOME/.nvm/versions/node/v22.22.3/bin:$PATH" pnpm install ' +
+  "--lockfile-only --ignore-scripts --filter @omnigent/web --filter @omnigent/desktop " +
+  "--reporter=append-only > /tmp/install.log 2>&1'";
+
+const longLineOutput = [
+  "Scope: all 14 workspace projects",
+  `WARN  deprecated subdependencies found: ${Array.from(
+    { length: 12 },
+    (_, index) => `@scope/legacy-package-${index}@1.0.${index}`,
+  ).join(", ")}`,
+  "Lockfile is up to date, resolution step is skipped",
+  "Done in 13.6s using pnpm v10.17.1",
+].join("\n");
+
+const pnpmOutput = Array.from(
+  { length: 85 },
+  (_, index) => `Progress: resolved ${(index + 1) * 20}, reused ${(index + 1) * 20}, downloaded 0`,
+).join("\n");
+
 const meta = {
   title: "Components/Blocks/ToolCard",
   component: ToolCard,
   tags: ["visual-snapshot"],
+  // Cards span the chat column in the app; the centered canvas would shrink them to their content.
+  decorators: [
+    (Story) => (
+      <div className="w-[42rem] max-w-full">
+        <Story />
+      </div>
+    ),
+  ],
 } satisfies Meta<typeof ToolCard>;
 
 export default meta;
@@ -20,6 +48,8 @@ async function expand(canvasElement: HTMLElement): Promise<void> {
   const trigger = canvasElement.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]');
   if (!trigger) throw new Error("Tool card trigger not found");
   await userEvent.click(trigger);
+  // Snapshot the resting state, not the keyboard focus ring the click leaves.
+  trigger.blur();
 }
 
 export const CompletedFileRead: Story = {
@@ -67,5 +97,171 @@ export const FailedExpanded: Story = {
     startedAt: null,
     duration: 0.042,
   },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellCompleted: Story = {
+  args: {
+    name: "shell",
+    arguments: { command: "/bin/zsh -lc 'git status --short'", cwd: "/home/dev/omnigent" },
+    output: " M web/package.json\n M pnpm-workspace.yaml\n?? web/src/lib/newFile.ts",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.08,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellFailedWithExitCode: Story = {
+  args: {
+    name: "shell",
+    arguments: { command: "/bin/bash -lc 'pnpm install --frozen-lockfile'", cwd: "/repo" },
+    output:
+      "ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with frozen-lockfile because pnpm-lock.yaml " +
+      "is not up to date with web/package.json\n[exit code: 1]",
+    state: "output-available",
+    startedAt: null,
+    duration: 3.1,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellLongLinesWrapped: Story = {
+  args: {
+    name: "shell",
+    arguments: {
+      command: longCommand,
+      cwd: "/home/dev/omnigent",
+    },
+    output: longLineOutput,
+    state: "output-available",
+    startedAt: null,
+    duration: 13.6,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellLongLinesScrolling: Story = {
+  args: ShellLongLinesWrapped.args,
+  play: async ({ canvasElement }) => {
+    await expand(canvasElement);
+    const wrapToggle = within(canvasElement).getByRole("button", { name: "Disable word wrap" });
+    await userEvent.click(wrapToggle);
+    wrapToggle.blur();
+  },
+};
+
+export const ShellManyLinesOutput: Story = {
+  args: {
+    name: "Bash",
+    arguments: { command: "pnpm install --reporter=append-only" },
+    output: pnpmOutput,
+    state: "output-available",
+    startedAt: null,
+    duration: 42,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellRunning: Story = {
+  args: {
+    name: "Bash",
+    arguments: { command: 'PATH="$HOME/.nvm/versions/node/v22.22.3/bin:$PATH" pnpm test' },
+    output: null,
+    state: "input-available",
+    startedAt: null,
+    duration: 12,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// sys_os_shell reports its working directory in the result, not the arguments.
+export const ShellSysOsShellResultCwd: Story = {
+  args: {
+    name: "sys_os_shell",
+    arguments: { command: "git log --oneline -3" },
+    output: JSON.stringify({
+      stdout:
+        "3f2a9c1 Add the settings page\n" +
+        "8b1e0d4 Fix the login redirect\n" +
+        "c47a2e9 Update dependencies\n",
+      stderr: "",
+      exit_code: 0,
+      timed_out: false,
+      cwd: "/home/dev/omnigent",
+    }),
+    state: "output-available",
+    startedAt: null,
+    duration: 0.05,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// Claude's Bash carries no cwd, so the actions share the command's line.
+export const ShellLongCommandWithoutCwd: Story = {
+  args: {
+    name: "shell",
+    arguments: { command: longCommand },
+    output: "Lockfile is up to date, resolution step is skipped",
+    state: "output-available",
+    startedAt: null,
+    duration: 13.6,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellAnsiColors: Story = {
+  args: {
+    name: "Bash",
+    arguments: { command: "git diff --stat --color=always origin/main" },
+    output: [
+      " web/package.json    | 2 \u001b[32m+\u001b[m\u001b[31m-\u001b[m",
+      " pnpm-workspace.yaml | 3 \u001b[32m++\u001b[m\u001b[31m-\u001b[m",
+      " 2 files changed, 3 insertions(+), 2 deletions(-)",
+      "\u001b[1;33mwarning:\u001b[0m CRLF will be replaced by LF in web/package.json",
+    ].join("\n"),
+    state: "output-available",
+    startedAt: null,
+    duration: 0.04,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A phone-width card: the actions get their own row instead of crowding the
+// first command line or the folder.
+const narrowCard: Story["decorators"] = [
+  (Story) => (
+    <div className="w-80">
+      <Story />
+    </div>
+  ),
+];
+
+export const ShellNarrowWithoutCwd: Story = {
+  args: {
+    name: "shell",
+    arguments: { command: longCommand },
+    output: "Lockfile is up to date, resolution step is skipped",
+    state: "output-available",
+    startedAt: null,
+    duration: 13.6,
+  },
+  decorators: narrowCard,
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellNarrowWithCwd: Story = {
+  args: {
+    name: "shell",
+    arguments: {
+      command: "/bin/zsh -lc 'git status --short'",
+      cwd: "/home/dev/omnigent/web/src/components",
+    },
+    output: " M blocks/ToolCard.tsx\n?? blocks/NewCard.tsx",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.08,
+  },
+  decorators: narrowCard,
   play: async ({ canvasElement }) => expand(canvasElement),
 };

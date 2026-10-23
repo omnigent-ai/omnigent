@@ -99,6 +99,7 @@ export type TerminalFileLinkListener = (uri: string) => boolean;
 export interface TerminalWorkspaceFileTarget {
   path: string;
   line: number | null;
+  endLine?: number;
 }
 
 /** Resolve an OSC 8 local-file URI to a workspace-relative viewer target. */
@@ -123,7 +124,8 @@ export function resolveTerminalWorkspaceFileLink(
   const citation = splitWorkspaceFileCitation(`${decodedPath}${url.hash}`);
   if (url.hash && !citation.hasPosition) return null;
   const path = resolveChatFilePath(citation.path, root, home)?.path ?? null;
-  return path === null || path.startsWith("/") ? null : { path, line: citation.line };
+  if (path === null || path.startsWith("/")) return null;
+  return { path, line: citation.line, ...(citation.endLine ? { endLine: citation.endLine } : {}) };
 }
 
 export function openTerminalLink(

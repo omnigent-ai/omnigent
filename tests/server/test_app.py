@@ -2636,7 +2636,7 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
     monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
     monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
 
-    with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
+    with caplog.at_level(logging.INFO):
         await captured["callback"](runner_id, connection)  # type: ignore[operator]
 
     deferred_events = [
@@ -2653,6 +2653,24 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
     assert any(f"session={archived.id}" in msg and "reason=archived" in msg for msg in messages)
     # Verify active session does not have a deferred event
     assert not any(f"session={active.id}" in msg for msg in messages)
+    decisions = {
+        record.session_id: record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_session_init_decision"
+    }
+    assert decisions[idle.id]["decision"] == "defer"
+    assert decisions[idle.id]["reason"] == "idle"
+    assert decisions[idle.id]["live_status"] == "idle"
+    assert decisions[idle.id]["pending_elicitation_count"] == 0
+    assert decisions[idle.id]["has_last_task_error"] is False
+    assert decisions[archived.id]["reason"] == "archived"
+    assert decisions[archived.id]["archived"] is True
+    assert decisions[active.id]["decision"] == "initialize_now"
+    for attrs in decisions.values():
+        assert attrs["runner_generation"] == 1
+        assert attrs["runner_id"] == runner_id
+        assert attrs["init_trigger"] == "runner_connect"
+        assert "server_commit_sha" in attrs
 
 
 @pytest.mark.asyncio

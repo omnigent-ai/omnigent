@@ -100,7 +100,7 @@ async def test_legacy_failure_keeps_current_reply_and_ignores_meta_messages(stat
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["output", "failure_detail"])
+@pytest.mark.parametrize("source", ["output", "failure_detail", "both"])
 @pytest.mark.parametrize("structured", [False, True])
 async def test_wire_failure_reason_wins_over_stored_text(source: str, structured: bool) -> None:
     reason = "Actual failure"
@@ -120,10 +120,13 @@ async def test_wire_failure_reason_wins_over_stored_text(source: str, structured
                 ),
             }
         )
-    data = {"status": "failed", "response_id": "resp_new", source: reason}
+    detail_source = "failure_detail" if source == "both" else source
+    data = {"status": "failed", "response_id": "resp_new", detail_source: reason}
+    if source == "both":
+        data["output"] = json.dumps({"error": {"code": "prose-code", "param": "prose-param"}})
     result = await _enrich(data, [_message("assistant", "Old reply", "resp_old")])
     context = result.pop("failure_context")
-    assert context["detail_source"] == f"external_status_{source}"
+    assert context["detail_source"] == f"external_status_{detail_source}"
     if structured:
         assert context["provider_error_type"] == "invalid_request_error"
         assert context["provider_error_code"] == "array_above_max_length"
@@ -134,13 +137,19 @@ async def test_wire_failure_reason_wins_over_stored_text(source: str, structured
 
 
 @pytest.mark.asyncio
-async def test_harness_failure_detail_wins_over_stored_prose() -> None:
+@pytest.mark.parametrize("partial_output", [None, "Now add the block on the new branch:"])
+async def test_harness_failure_detail_wins_over_stored_prose(
+    partial_output: str | None,
+) -> None:
+    data = {
+        "status": "failed",
+        "response_id": "resp_failed",
+        "failure_detail": " API Error: 500 Overloaded ",
+    }
+    if partial_output is not None:
+        data["output"] = partial_output
     result = await _enrich(
-        {
-            "status": "failed",
-            "response_id": "resp_failed",
-            "failure_detail": " API Error: 500 Overloaded ",
-        },
+        data,
         [_message("assistant", "Now add the block on the new branch:", "resp_failed")],
     )
     assert result["output"] == "API Error: 500 Overloaded"

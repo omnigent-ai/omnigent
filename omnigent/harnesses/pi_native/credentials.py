@@ -1697,10 +1697,14 @@ def resolve_pi_native_provider(
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
+    binding = binding_for_harness(config, "pi-native")
     selection = _split_pi_native_model_selection(model)
     if selection is not None:
-        _, model = selection
-    binding = binding_for_harness(config, "pi-native")
+        _, stripped = selection
+        allowlist = binding.model_allowlist if binding is not None else None
+        # Prefer the picker target; retain an allowlisted literal only as a fallback.
+        if allowlist is None or stripped in allowlist or model not in allowlist:
+            model = stripped
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
         selected = resolve_bound_model(config, "pi-native", model)

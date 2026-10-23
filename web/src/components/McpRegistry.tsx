@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { PlugIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import { withBasePath } from "@/lib/basePath";
-import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
+import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
 
 export function McpRegistryConnections() {
@@ -213,23 +213,16 @@ export function McpRegistryPicker({
 }) {
   const ownCatalog = useMcpRegistryCatalog(!catalog);
   const { services, error, loading, refresh } = catalog ?? ownCatalog;
-  const [authorizing, setAuthorizing] = useState<string | null>(null);
-  const [connectionError, setConnectionError] = useState<{ id: string; message: string } | null>(
-    null,
-  );
-  const authorization = useRef<AbortController | null>(null);
+  const { signIn, authorizing, error: connectionError, clearError } = useRegistrySignIn(refresh);
   const [workspaceService, setWorkspaceService] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
-  useEffect(
-    () => () => {
-      authorization.current?.abort();
-      onAuthorizingChange?.(false);
-    },
-    [onAuthorizingChange],
-  );
+  useEffect(() => {
+    onAuthorizingChange?.(authorizing !== null);
+  }, [authorizing, onAuthorizingChange]);
+  useEffect(() => () => onAuthorizingChange?.(false), [onAuthorizingChange]);
 
   async function enable(service: RegistryService, workspaceUrl?: string) {
-    setConnectionError(null);
+    clearError();
     if (service.connected) {
       onToggle(service.id, true);
       return;
@@ -238,31 +231,9 @@ export function McpRegistryPicker({
       setWorkspaceService(service.id);
       return;
     }
-    const controller = new AbortController();
-    authorization.current = controller;
-    setAuthorizing(service.id);
-    onAuthorizingChange?.(true);
-    try {
-      await authorizeRegistryService(service, controller.signal, workspaceUrl);
-      setWorkspaceService(null);
-      const updated = await refresh();
-      if (!updated?.find((s) => s.id === service.id)?.connected) {
-        throw new Error("Account is not connected. Please try again.");
-      }
-      if (!controller.signal.aborted && !attached.includes(service.id)) onToggle(service.id, true);
-    } catch (e) {
-      if (!controller.signal.aborted) {
-        setConnectionError({
-          id: service.id,
-          message: e instanceof Error ? e.message : "Sign-in failed",
-        });
-      }
-    } finally {
-      if (!controller.signal.aborted) {
-        setAuthorizing(null);
-        onAuthorizingChange?.(false);
-      }
-    }
+    if (!(await signIn(service, workspaceUrl))) return;
+    setWorkspaceService(null);
+    if (!attached.includes(service.id)) onToggle(service.id, true);
   }
 
   const unavailable = attached.filter((id) => !services.some((s) => s.id === id));
@@ -309,9 +280,7 @@ export function McpRegistryPicker({
                         : authorizing === service.id
                           ? "Authorizing…"
                           : service.connected
-                            ? service.auth === "none"
-                              ? "Ready"
-                              : "Connected"
+                            ? "Connected"
                             : tokenNeeded
                               ? "Connect your account in settings"
                               : "Needs sign-in"}

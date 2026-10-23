@@ -24,9 +24,16 @@ and the recording protocol for comparing revisions.
 - `changes`: select a changed Markdown file, then exit diff to edit it.
 - `direct-link`: open a session URL with a selected Markdown file.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
-  Source at that line, rather than the rich editor.
+  Source at that line, rather than the rich editor, and a range (`:12-18`,
+  `#L12-L18`) highlights every cited line. Right-clicking or long-pressing the
+  link offers Copy path, which copies its path (absolute when the workspace root
+  is known).
 - `tool-row`: click the path on an agent's Read, Write, or Edit row for a
   Markdown file, including one the agent just created; absolute paths open too.
+- `agent-api`: ask the agent to use `ui_open_file` with a workspace-relative
+  Markdown path, or call the [file-opening endpoint](../docs/agent-ui-api.md).
+  Only current session viewers (the selected pane in grids) open the file;
+  background requests are not replayed.
 - `document-link`: follow a relative file link inside the editor's link popup.
 - `mobile`: use the session Files surface or a file link at a phone width.
 
@@ -132,6 +139,11 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_heading_text_anchor_content_excludes_prefix`.
+- `agent-api`, desktop and phone-sized browser:
+  `tests/e2e_ui/files/test_right_panel.py::test_agent_opens_workspace_file`
+  drives a scripted agent tool call through the runner, server and stream into
+  the real file viewer. Grid targeting and dirty-navigation guards are covered
+  by `web/src/grid/GridSessionPane.test.tsx`; native app/device runs remain manual.
 - `document-link`:
   `tests/e2e_ui/files/test_markdown_editor_link_popup.py::test_editor_link_popup_opens_relative_link_from_keyboard`
   opens a relative file from the keyboard-accessible link popup.
@@ -139,6 +151,10 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/browser_ui/files/test_file_line_navigation.py::test_citation_preserves_offline_markdown_draft_with_diff_preference`
   exercises a citation, offline editing, and the dirty-navigation guard. Its
   health polling uses simulated time; it is not a performance sample.
+- `chat-link` Copy path: the "copying a file link's path" component tests in
+  `web/src/components/blocks/ChatMarkdown.fileLinks.test.tsx` cover openable,
+  missing, and unverified links. Manually long-press a link in the mobile apps
+  and right-click one in the desktop app; neither should open the file.
 - `changes`: manually open Markdown from Changes, exit diff, edit and save,
   then re-enter diff and verify the saved edit. The standard CUJ starts from a
   direct link; it does not establish this entry point's correctness.

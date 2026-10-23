@@ -60,6 +60,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
   approve as approveElicitation,
@@ -1375,6 +1376,8 @@ export interface ChatActions {
    * there is no active conversation.
    */
   compact: () => Promise<void>;
+  /** Run the native harness's /clear in the session terminal. */
+  clearContext: () => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -3397,6 +3400,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postEvent(conversationId, { type: "compact", data: {} });
+  },
+  clearContext: async () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    await postEvent(conversationId, { type: "clear", data: {} });
   },
 
   refreshSessionState: async (conversationId) => {
@@ -7909,6 +7917,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({
         pendingUserMessages: [],
       });
+      return;
+    case "ui_open_file":
+      emitUiOpenFile(event, sourceConversationId);
       return;
     case "browser_action_request":
       // Embedded-browser action: fan out to the relay hook (which claims,

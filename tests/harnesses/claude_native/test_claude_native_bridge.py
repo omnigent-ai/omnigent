@@ -20,6 +20,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -5090,6 +5091,266 @@ def test_inject_user_message_verifies_submit_after_transient_capture_loss(
     inject_user_message(bridge_dir, content="fix the flaky test")
 
     assert len(enters) == (1 if accept_first else 2)
+
+
+@pytest.mark.parametrize(
+    "draft_rows",
+    [
+        pytest.param("  [Pasted text #1 +7 lines]\n", id="collapsed-placeholder"),
+        pytest.param("  Task: ship the paste\n  submit fix and verify\n", id="wrapped-literal"),
+        pytest.param("  Task: ship the pa\n  ste submit fix\n", id="wrapped-mid-word"),
+    ],
+)
+def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft_rows: str,
+) -> None:
+    """
+    A draft rendered under a blank ``❯`` is still verified and resubmitted.
+
+    Claude Code can leave the prompt row blank and render the paste on the
+    rows below it in the framed input box — collapsed to ``[Pasted text #1
+    +N lines]`` or as literal text wrapped at the pane width, which can
+    split the needle across rows. Reading only the ``❯`` row never sees
+    that draft, so delivery sent one blind Enter and reported success; when
+    the TUI swallowed it the first prompt of a sub-agent dispatch sat unsent
+    until someone pressed Enter.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    pasted_pane = _composer_pane().replace("❯ \n", "❯\n" + draft_rows)
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that renders the paste below ``❯`` and swallows the first Enter.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = pasted_pane
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            if tui["enters"] > 1:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+
+    assert tui["pane"] == _composer_pane(), "The draft was left unsent in the input box."
+    assert tui["enters"] == 2
+
+
+_SUBMITTED_ECHO = """\
+❯ Task: ship the paste submit fix and verify
+  Task: ship the paste submit fix and verify
+"""
+
+
+@pytest.mark.parametrize(
+    "after_submit",
+    [
+        pytest.param(
+            lambda: (
+                _SUBMITTED_ECHO
+                + _composer_pane().replace(
+                    "? for shortcuts", "⏵⏵ auto mode on (shift+tab to cycle)"
+                )
+            ),
+            id="empty-box-under-echo",
+        ),
+        # Lazy: the dialog pane is defined further down this module.
+        pytest.param(lambda: _SUBMITTED_ECHO + _PERMISSION_PROMPT_PANE, id="permission-dialog"),
+    ],
+)
+def test_inject_user_message_sends_no_extra_enter_after_an_accepted_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after_submit: Callable[[], str],
+) -> None:
+    """
+    Once the draft leaves the input box, no retry Enter follows.
+
+    Reading the whole framed box must not pick up the submitted message's
+    transcript echo above the frame, the mode footer below it, or a boxed
+    dialog the started turn opens. Any of those read as a still-pending
+    draft would send a retry Enter into the running turn, and on a
+    permission dialog that Enter approves the tool.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that accepts the first Enter.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane().replace(
+                "❯ \n", "❯\n  Task: ship the paste\n  submit fix and verify\n"
+            )
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            tui["pane"] = after_submit()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+
+    assert tui["enters"] == 1, f"Expected one submit Enter, got {tui['enters']}."
+
+
+def test_inject_user_message_retries_enter_for_a_draft_with_invisible_characters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A draft holding U+FEFF is still recognised, so its swallowed Enter is retried.
+
+    Claude Code keeps Unicode format characters in the draft but never
+    renders them, and its first Enter only strips them ("Removed 2
+    invisible characters · review and press Enter to send"). A needle that
+    kept them never matched the pane, so delivery treated the message as
+    sent after that one Enter and it sat unsent.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that hides U+FEFF and spends the first Enter stripping it.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("Task: ship the fix")
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            if tui["enters"] == 1:
+                tui["pane"] = _composer_pane("Task: ship the fix").replace(
+                    "? for shortcuts",
+                    "Removed 2 invisible characters · review and press Enter to send",
+                )
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="\ufeff\ufeffTask: ship the fix")
+
+    assert tui["pane"] == _composer_pane(), "The draft was left unsent in the input box."
+    assert tui["enters"] == 2
+
+
+def test_inject_user_message_ignores_rows_below_an_unclosed_input_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no closing rule under the prompt row, the rows below are not read as the draft.
+
+    Here the started turn's pane shows the empty ``❯`` row directly under
+    the last rule, with the mode footer and a status line carrying the
+    session title (the prompt's first words) below it. Counting those rows
+    as the input box would read the title as a still-pending draft and
+    send retry Enters into the running turn.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    unclosed_after_submit = """\
+❯ Task: ship the paste submit fix
+──────────────────────────────
+❯
+  ⏵⏵ auto mode on (shift+tab to cycle)
+  Task: ship the paste submit fix · Opus
+"""
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that accepts the first Enter and leaves the box unclosed.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("Task: ship the paste submit fix")
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            tui["pane"] = unclosed_after_submit
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix")
+
+    assert tui["enters"] == 1, f"Expected one submit Enter, got {tui['enters']}."
 
 
 @pytest.mark.parametrize("capture_lost", [False, True], ids=["draft-remains", "capture-lost"])
@@ -12996,17 +13257,18 @@ class _ScriptedPolicyClient:
         self.steps = list(steps)
         self.calls = 0
         self.bodies: list[dict[str, object] | None] = []
+        self.urls: list[str] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
         """Replay the next step as a minimal httpx-Response-shaped namespace.
 
-        :param url: Evaluate path (ignored).
+        :param url: Forwarded session path, recorded for routing checks.
         :param json: Forwarded EvaluationRequest; recorded for identity checks.
         :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
-        del url
+        self.urls.append(url)
         self.bodies.append(json)
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
@@ -13364,6 +13626,77 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_pi_extension_ui_relay_path_proxies_to_session_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool relay forwards ``/hook/pi/extension-ui`` to the session hook."""
+
+    client = _ScriptedPolicyClient({"type": "extension_ui_response", "confirmed": True})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/pi/extension-ui",
+            {
+                "elicitation_id": "elicit_pi_" + "ab" * 16,
+                "request": {"method": "confirm", "title": "Clear?", "message": "Lost."},
+            },
+        )
+        assert json.loads(body) == {"type": "extension_ui_response", "confirmed": True}
+        assert client.urls == ["/v1/sessions/conv_hook_eval/hooks/pi-extension-ui"]
+        assert client.bodies[0]["elicitation_id"] == "elicit_pi_" + "ab" * 16
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_bytes", [False, True])
+async def test_pi_dialog_disconnect_cancels_upstream_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_bytes: bool
+) -> None:
+    """Client EOF or pipelined bytes release the upstream wait without spinning."""
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class WaitingClient:
+        async def post(self, url, json):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, WaitingClient())
+    info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+    from urllib.parse import urlsplit
+
+    url = urlsplit(info["url"])
+    _, writer = await asyncio.open_connection(url.hostname, url.port)
+    try:
+        body = json.dumps({"elicitation_id": "cancel-check", "request": {"method": "confirm"}})
+        writer.write(
+            (
+                "POST /hook/pi/extension-ui HTTP/1.1\r\n"
+                f"Host: {url.netloc}\r\nAuthorization: Bearer {info['token']}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+            ).encode()
+        )
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if extra_bytes:
+            writer.write(b"unexpected pipelined bytes")
+            await writer.drain()
+        else:
+            writer.close()
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+    finally:
+        writer.close()
+        with suppress(ConnectionResetError):
+            await writer.wait_closed()
+        relay.close()
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

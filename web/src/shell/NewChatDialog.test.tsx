@@ -10974,6 +10974,24 @@ describe("claude-code default permission mode (payload anchor for Auto)", () => 
     localStorage.clear();
   });
 
+  it("keeps the launch mode unchanged and leaves Shift+Tab to focus traversal", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAgent("a1");
+    const chip = screen.getByTestId("new-chat-landing-permission-chip");
+    expect(chip).toBeEnabled();
+    const selectedMode = chip.textContent;
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "unfinished draft" } });
+
+    expect(fireEvent.keyDown(input, { key: "Tab", shiftKey: true })).toBe(true);
+    expect(chip.textContent).toBe(selectedMode);
+    expect(input).toHaveValue("unfinished draft");
+    expect(input).not.toHaveAttribute("aria-keyshortcuts");
+  });
+
   it("omits terminal_launch_args when the permission mode is left on Default", async () => {
     // The behavior Auto matches: Default = inherit the machine's own config, so
     // the create call carries no permission flag at all.
