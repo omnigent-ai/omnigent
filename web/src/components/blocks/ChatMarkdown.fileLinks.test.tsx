@@ -19,12 +19,22 @@ import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 import { showToast } from "@/components/ui/toast";
 
+const { copyTextMock } = vi.hoisted(() => ({
+  copyTextMock: vi.fn<(text: string) => Promise<void>>(),
+}));
+vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+import { toast } from "sonner";
+
 const toastMock = vi.mocked(showToast);
 const fetchMock = vi.fn();
 
 beforeEach(() => {
   fetchMock.mockReset();
   toastMock.mockReset();
+  copyTextMock.mockReset().mockResolvedValue(undefined);
+  vi.mocked(toast.success).mockReset();
+  vi.mocked(toast.error).mockReset();
   vi.stubGlobal("fetch", fetchMock);
 });
 
@@ -535,5 +545,79 @@ describe("dead file links give feedback instead of a silent no-op", () => {
     const message = String(toastMock.mock.calls[0][0]);
     expect(message).toContain("doesn't resolve");
     expect(message).not.toContain("wasn't found");
+  });
+});
+
+// A file link carries no href, so neither the browser nor the desktop shell
+// offers "Copy Link Address" for it. Its own menu copies the path it names,
+// host-absolute so it still resolves when pasted into another session.
+describe("copying a file link's path", () => {
+  async function copyFromMenu(link: HTMLElement): Promise<void> {
+    fireEvent.contextMenu(link);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    await waitFor(() => expect(copyTextMock).toHaveBeenCalledTimes(1));
+  }
+
+  it.each([
+    ["an absolute href", `${WORKSPACE}/docs/handoff.md`],
+    ["a relative href", "docs/handoff.md"],
+    ["a cited line", "docs/handoff.md:21"],
+    ["a home-relative href", "~/ws/docs/handoff.md"],
+  ])("copies the host-absolute path of a link with %s", async (_label, href) => {
+    renderMarkdown(`[Handoff](${href})`, ["docs/handoff.md"]);
+
+    await copyFromMenu(screen.getByRole("button", { name: "Handoff" }));
+    expect(copyTextMock).toHaveBeenCalledWith(`${WORKSPACE}/docs/handoff.md`);
+    expect(openFile).not.toHaveBeenCalled();
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied path"));
+  });
+
+  it("copies a relative path as written while the workspace root is unknown", async () => {
+    renderMarkdown("[Handoff](docs/handoff.md)", ["docs/handoff.md"], {
+      ...FILE_VIEWER,
+      workspaceRoot: null,
+    });
+
+    await copyFromMenu(screen.getByRole("button", { name: "Handoff" }));
+    expect(copyTextMock).toHaveBeenCalledWith("docs/handoff.md");
+  });
+
+  it("copies an unverified link's path", async () => {
+    renderMarkdown("[ghost.md](docs/ghost.md)");
+
+    await copyFromMenu(screen.getByText("ghost.md"));
+    expect(copyTextMock).toHaveBeenCalledWith(`${WORKSPACE}/docs/ghost.md`);
+  });
+
+  it("copies a confirmed-missing link's path", async () => {
+    fetchMock.mockResolvedValue(dirListing(["/no/such/other.txt"]));
+    renderMarkdown("[missing](/no/such/file.txt)", [], FILE_VIEWER_WITH_SESSION);
+
+    await copyFromMenu(await screen.findByRole("button", { name: "missing" }));
+    expect(copyTextMock).toHaveBeenCalledWith("/no/such/file.txt");
+  });
+
+  it("copies an unresolvable path as written", async () => {
+    renderMarkdown(`[trap](${WORKSPACE}/../../etc/hosts)`);
+
+    await copyFromMenu(screen.getByRole("button", { name: "trap" }));
+    expect(copyTextMock).toHaveBeenCalledWith(`${WORKSPACE}/../../etc/hosts`);
+  });
+
+  it("reports a failed copy", async () => {
+    copyTextMock.mockRejectedValue(new Error("denied"));
+    renderMarkdown("[Handoff](docs/handoff.md)", ["docs/handoff.md"]);
+
+    await copyFromMenu(screen.getByRole("button", { name: "Handoff" }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn't copy the path"));
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("leaves the native menu on an external link", () => {
+    renderMarkdown("[docs](https://example.com/page)");
+
+    // fireEvent returns false when a handler called preventDefault.
+    expect(fireEvent.contextMenu(screen.getByRole("link", { name: "docs" }))).toBe(true);
+    expect(screen.queryByRole("menuitem")).toBeNull();
   });
 });

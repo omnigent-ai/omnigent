@@ -151,11 +151,14 @@ def test_runner_can_read_keyring_from_cli_desktop_session(
 )
 def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     server_url: str | None,
     keeps_provider_secret: bool,
 ) -> None:
     """Proxy selectors reach both daemon modes without widening provider secrets."""
     # Given
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
     for name, value in _PROXY_ENV.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "corp")
@@ -167,7 +170,9 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     # Then
     assert {name: env.get(name) for name in _PROXY_ENV} == _PROXY_ENV
     assert env["DATABRICKS_CONFIG_PROFILE"] == "corp"
-    assert ("OPENAI_API_KEY" in env) is keeps_provider_secret
+    assert env.get("OPENAI_API_KEY") == (
+        "local-provider-secret" if keeps_provider_secret else None
+    )
 
 
 def test_runner_env_excludes_proxy_vars_by_default() -> None:

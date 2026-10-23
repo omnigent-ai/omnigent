@@ -32,6 +32,7 @@ import {
   resizeTerminalSplit,
   terminalLayoutGeometry,
 } from "@/lib/terminalSplitLayout";
+import type { Session } from "@/lib/types";
 import { TerminalSplitDivider } from "./TerminalSplitDivider";
 import { updateTerminalSplit, useTerminalSplitPanes } from "./terminalSplitPanesStore";
 import { useTerminalFirst } from "./TerminalFirstContext";
@@ -75,6 +76,8 @@ interface MainTerminalViewProps {
   readOnly?: boolean;
   /** Known runner-tunnel state for the active session. */
   runnerOnline?: boolean;
+  /** Failed session's last task error; shown on the stopped-terminal state to explain why the harness stopped, mirroring the chat error pill. */
+  lastTaskError?: Session["lastTaskError"];
   /** Relaunch or reconnect the session without replaying user input. */
   onResume?: () => void | Promise<void>;
   /**
@@ -100,6 +103,7 @@ export function MainTerminalView({
   className,
   readOnly = false,
   runnerOnline,
+  lastTaskError,
   onResume,
   sandboxOffline = false,
   onSurfaceElement,
@@ -135,6 +139,11 @@ export function MainTerminalView({
   // has caught up and explicitly reported the runner offline.
   const resumeAvailable =
     onResume !== undefined && !startingUp && (runnerOffline || terminals.length === 0);
+  // Mirror the chat error pill's actionable cause on the stopped-terminal state.
+  const failureCauseMessage =
+    typeof lastTaskError?.message === "string" && lastTaskError.message.trim().length > 0
+      ? lastTaskError.message
+      : null;
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -313,6 +322,14 @@ export function MainTerminalView({
                 <p className="font-medium text-foreground text-ui">
                   {sandboxOffline ? "The sandbox is offline." : "The harness is not running."}
                 </p>
+                {failureCauseMessage ? (
+                  <p
+                    data-testid="terminal-failure-cause"
+                    className="text-destructive text-sm [overflow-wrap:anywhere]"
+                  >
+                    {failureCauseMessage}
+                  </p>
+                ) : null}
                 <p className="text-muted-foreground text-sm">
                   {sandboxOffline
                     ? "Resume it to reconnect the terminal."

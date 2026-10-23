@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from time import monotonic
+from typing import Literal
 
 from omnigent.debug_logging import CAPTURED_STACK_TRACE_FIELD, debug_event
 
@@ -52,6 +54,7 @@ def _capture_stack(thread_id: int) -> str:
 @contextmanager
 def monitor_event_loop(
     *,
+    process_role: Literal["server", "runner"] = "server",
     stall_threshold_s: float = 5.0,
     sample_interval_s: float = 1.0,
     report_interval_s: float = 60.0,
@@ -62,6 +65,8 @@ def monitor_event_loop(
     executor to capture a stack. Reports are rate limited across all stalls in
     this context. A native extension holding the GIL can also delay this thread.
     """
+    if process_role not in {"server", "runner"}:
+        raise ValueError("Watchdog process role must be server or runner")
     for value in (stall_threshold_s, sample_interval_s, report_interval_s):
         if not math.isfinite(value) or value <= 0:
             raise ValueError("Watchdog intervals must be finite and positive")
@@ -98,11 +103,13 @@ def monitor_event_loop(
                     continue
                 last_report = monotonic()
                 _logger.warning(
-                    "Server event loop has not advanced for %.3fs",
+                    "%s event loop has not advanced for %.3fs",
+                    process_role.capitalize(),
                     stalled_s,
                     extra={
                         **debug_event(
-                            "server_event_loop_stalled",
+                            f"{process_role}_event_loop_stalled",
+                            pid=os.getpid(),
                             stalled_s=round(stalled_s, 3),
                             threshold_s=stall_threshold_s,
                             loop_thread_id=loop_thread_id,
@@ -113,7 +120,7 @@ def monitor_event_loop(
                 )
             except Exception:
                 last_report = monotonic()
-                _logger.exception("Could not capture the stalled server event loop")
+                _logger.exception("Could not capture the stalled %s event loop", process_role)
 
     thread = threading.Thread(target=watch, name="omnigent-event-loop-watchdog", daemon=True)
     heartbeat()
@@ -126,7 +133,7 @@ def monitor_event_loop(
                 heartbeat_handle.cancel()
             _logger.exception(
                 "Could not start the event-loop watchdog; serving without stack capture",
-                extra=debug_event("server_event_loop_watchdog_failed"),
+                extra=debug_event(f"{process_role}_event_loop_watchdog_failed", pid=os.getpid()),
             )
         yield
     finally:

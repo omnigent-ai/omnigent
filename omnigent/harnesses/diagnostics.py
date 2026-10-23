@@ -213,6 +213,27 @@ def sign_in_running_elsewhere(screen: str | None) -> bool:
     return bool(screen) and _SIGN_IN_ELSEWHERE.search(screen) is not None
 
 
+# A launcher, or a ``sudo`` it runs, reading a password from the terminal, e.g.
+# "Password:" or "[sudo] password for alice:". Typed input is not echoed, so
+# the prompt stays the last line until it is answered.
+_PASSWORD_PROMPT = re.compile(r"\bpassword(?: for [^:]+)?:\s*$", re.IGNORECASE)
+
+
+def launcher_password_prompt(screen: str | None) -> bool:
+    """Whether a launcher is waiting for a password typed into its terminal.
+
+    Only the last non-blank line counts: a launcher that moved on leaves the
+    prompt above its later output.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when the screen ends on a password prompt.
+    """
+    if not screen:
+        return False
+    lines = [line for line in screen.splitlines() if line.strip()]
+    return bool(lines) and _PASSWORD_PROMPT.search(lines[-1]) is not None
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 

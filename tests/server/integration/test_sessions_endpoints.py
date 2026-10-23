@@ -5589,11 +5589,14 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_harness
     assert snapshot_error["message"] == detail
 
 
-@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("wire_output", "partial_output"), [(False, False), (True, False), (False, True)]
+)
 async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     wire_output: bool,
+    partial_output: bool,
 ) -> None:
     """Native 429 reports retain a retryable code on the stream and snapshot."""
     detail = (
@@ -5631,6 +5634,9 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     data: dict[str, Any] = {"status": "failed", "response_id": response_id}
     if wire_output:
         data["output"] = detail
+    if partial_output:
+        data["output"] = "The earlier request returned HTTP 403; I am checking the result."
+        data["failure_detail"] = detail
     status_resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

@@ -10,6 +10,10 @@ and steers messages while the agent is busy.
 
 ## Sub-features
 
+- `prompt-link`: opening the new-session page with `?prompt=`
+  fills an editable draft without starting a session. The consumed prompt is
+  removed from the URL while other query parameters and the fragment remain.
+  A new link replaces a parked draft; subsequent edits survive navigation.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -149,6 +153,12 @@ and steers messages while the agent is busy.
   queue or send immediately. Existing queued messages retain FIFO ordering.
 
 **New-session composer** (landing page, or New session):
+
+- Open `/?prompt=Explain%20this%20code`. Check that the
+  draft is filled and editable, no session starts until Send, and an embedded
+  deployment stays under its mount path. Browser proof:
+  `tests/browser_ui/chat/test_prompt_url.py`; router and draft edge cases:
+  `web/src/shell/NewChatDialog.test.tsx` (`prompt URL handoff`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow

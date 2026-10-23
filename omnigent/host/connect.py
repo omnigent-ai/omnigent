@@ -160,6 +160,7 @@ from omnigent.process_logging import (
     configure_process_logging,
     display_log_path,
     env_truthy,
+    nonblocking_terminal_stdio,
     open_process_log_file,
     process_log_dir,
     redact_log_text,
@@ -5352,17 +5353,23 @@ def run_host_process(
     """
     # Before any startup work logs, so its earliest debug-log rows are attributed.
     publish_origin_identity(server_url)
-    host_log_path = configure_process_logging(
-        "host",
-        log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
-    )
-    from omnigent.host import crash_reporting
+    # The loop prints and logs to the terminal; one that stops reading must not stall it.
+    restore_terminal_stdio = nonblocking_terminal_stdio()
+    try:
+        host_log_path = configure_process_logging(
+            "host",
+            log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),
+        )
+        from omnigent.host import crash_reporting
 
-    crash_reporting.install_host_crash_hooks()
-    crash_reporting.set_host_exit_context(daemon_target=daemon_target)
-    # Installed before any startup work, so a stop signal during e.g. the git
-    # credential setup is still reported and drained.
-    restore_signal_handlers = crash_reporting.install_host_signal_handlers()
+        crash_reporting.install_host_crash_hooks()
+        crash_reporting.set_host_exit_context(daemon_target=daemon_target)
+        # Installed before any startup work, so a stop signal during e.g. the git
+        # credential setup is still reported and drained.
+        restore_signal_handlers = crash_reporting.install_host_signal_handlers()
+    except BaseException:
+        restore_terminal_stdio()
+        raise
     # Report here rather than relying on sys.excepthook: the foreground CLI
     # catches crashes itself, so the hook never sees them.
     try:
@@ -5386,25 +5393,32 @@ def run_host_process(
             crash_reporting.report_host_exit(
                 "uncaught", exit_code=1, exc_info=(type(exc), exc, exc.__traceback__)
             )
-        _finish_host_exit(restore_signal_handlers)
+        _finish_host_exit(restore_signal_handlers, restore_terminal_stdio)
         raise
     crash_reporting.await_signal_exit()
     crash_reporting.report_host_exit("lifecycle_lost" if lifecycle_lost else "clean", exit_code=0)
-    _finish_host_exit(restore_signal_handlers)
+    _finish_host_exit(restore_signal_handlers, restore_terminal_stdio)
 
 
-def _finish_host_exit(restore_signal_handlers: Callable[[], None]) -> None:
+def _finish_host_exit(
+    restore_signal_handlers: Callable[[], None],
+    restore_terminal_stdio: Callable[[], None],
+) -> None:
     """Drain the reported exit while still protected, then hand signals back.
 
     A stop signal during the drain waits for it and then dies by the signal;
     one after the handlers are restored takes its default action, with the
-    exit row already delivered.
+    exit row already delivered. The terminal streams are restored last, even
+    if an earlier step raises.
     """
     from omnigent.host import crash_reporting
 
-    crash_reporting.drain_debug_sink()
-    restore_signal_handlers()
-    crash_reporting.await_signal_exit()
+    try:
+        crash_reporting.drain_debug_sink()
+        restore_signal_handlers()
+        crash_reporting.await_signal_exit()
+    finally:
+        restore_terminal_stdio()
 
 
 def _serve_host_until_exit(

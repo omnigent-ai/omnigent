@@ -2781,26 +2781,20 @@ async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> None:
-    """The choice bridge reaches executors that accept it, and only those.
-
-    Bridges are installed by attribute, so a rename on either side would leave the
-    feature silently inert — the card would quietly stay Approve/Reject. Executors
-    that don't offer the agent's own options must not grow the attribute.
-    """
+@pytest.mark.parametrize("bridge", ["_elicitation_choice_handler", "_form_elicitation_handler"])
+@pytest.mark.parametrize("supported", [False, True])
+async def test_run_turn_installs_optional_bridges_only_where_supported(
+    bridge: str,
+    supported: bool,
+) -> None:
     import asyncio
 
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.inner.executor import ExecutorConfig, Message, ToolSpec, TurnComplete
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    class _ChoiceCapableExecutor(Executor):
-        """Declares the attribute, as :class:`AcpExecutor` does."""
-
-        def __init__(self) -> None:
-            self._elicitation_choice_handler = None
-
+    class TurnExecutor(Executor):
         async def run_turn(
             self,
             messages: list[Message],
@@ -2810,29 +2804,30 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         ):
             yield TurnComplete(response="ok")
 
-    class _BinaryOnlyExecutor(Executor):
-        """Declares no choice attribute — e.g. the SDK harnesses."""
+    executor = TurnExecutor()
+    if supported:
+        setattr(executor, bridge, None)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext("resp_bridge", asyncio.Queue(), asyncio.Event())
+    await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+    assert (getattr(executor, bridge, None) is not None) is supported
+    assert getattr(executor, "_elicitation_handler", None) is not None
 
-        async def run_turn(
-            self,
-            messages: list[Message],
-            tools: list[ToolSpec],
-            system_prompt: str,
-            config: ExecutorConfig | None = None,
-        ):
-            yield TurnComplete(response="ok")
 
-    for executor, expected in ((_ChoiceCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
-        adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
-        ctx = TurnContext(
-            response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
-        )
-        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+@pytest.mark.asyncio
+async def test_form_elicitation_handler_decline_does_not_cancel_the_turn() -> None:
+    """Form dialogs return the declined verdict without killing the session."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
-        installed = getattr(executor, "_elicitation_choice_handler", None) is not None
-        assert installed is expected, type(executor).__name__
-        # The yes/no bridge is installed on both — the choice bridge is additive.
-        assert getattr(executor, "_elicitation_handler", None) is not None
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    params = ElicitationRequestParams(mode="form", message="Continue?")
+    result = await adapter._stable_form_elicitation_handler("form-id", params)
+    assert result.action == "decline"
+    assert not ctx.cancelled.was_set
+    assert ctx.seen[0][0] == "form-id"
 
 
 def test_translate_event_emits_subagent_started() -> None:
