@@ -5952,8 +5952,9 @@ describe("NewChatLandingScreen", () => {
   });
 
   it.each(["message", "attachment"] as const)(
-    "keeps the missing-directory explanation visible for a %s draft until a directory is selected",
+    "keeps the missing-directory tooltip readable for a %s draft until dismissed or resolved",
     async (draftKind) => {
+      const user = userEvent.setup();
       localStorage.removeItem(RECENT_KEY);
       useHostFilesystemMock.mockReturnValue({
         ...SUCCESS_QUERY_STATE,
@@ -5961,7 +5962,6 @@ describe("NewChatLandingScreen", () => {
       } as unknown as ReturnType<typeof useHostFilesystem>);
       renderLanding();
       const input = screen.getByTestId("new-chat-landing-input");
-      expect(screen.queryByTestId("new-chat-landing-submit-reason")).not.toBeInTheDocument();
       if (draftKind === "message") {
         fireEvent.change(input, { target: { value: "inspect the repo" } });
       } else {
@@ -5969,21 +5969,34 @@ describe("NewChatLandingScreen", () => {
           target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
         });
       }
-      const reason = screen.getByTestId("new-chat-landing-submit-reason");
-      expect(reason).toHaveAttribute("role", "status");
-      expect(reason).toBeVisible();
-      expect(reason).toHaveTextContent("Please choose a host and working directory");
-      expect(input).toHaveAccessibleDescription(reason.textContent!);
-
+      const reason = "Please choose a host and working directory";
+      expect(screen.queryByText(reason)).not.toBeInTheDocument();
       const submit = screen.getByTestId("new-chat-landing-submit");
+      const trigger = submit.parentElement!;
       expect(submit).toBeDisabled();
-      fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
-      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason.textContent!);
-      fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse" });
-      fireEvent.click(submit.parentElement!);
-      fireEvent.keyDown(input, { key: "Enter" });
+      await user.hover(trigger);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+      fireEvent.click(trigger);
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      await user.unhover(trigger);
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      await user.click(input);
       await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
-      expect(reason).toBeVisible();
+
+      expect(trigger).toHaveAttribute("role", "group");
+      expect(trigger).toHaveAttribute("aria-disabled", "true");
+      expect(trigger).toHaveAttribute("tabindex", "0");
+      act(() => trigger.focus());
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+
+      await user.click(input);
+      await user.keyboard("{Enter}");
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse" });
+      expect(screen.getByRole("tooltip")).toBeVisible();
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
 
       fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
@@ -5993,8 +6006,9 @@ describe("NewChatLandingScreen", () => {
       fireEvent.keyDown(pathInput, { key: "Enter" });
       fireEvent.click(screen.getByTestId("workspace-picker-select"));
       await waitFor(() => expect(submit).toBeEnabled());
-      expect(screen.queryByTestId("new-chat-landing-submit-reason")).not.toBeInTheDocument();
-      expect(input).not.toHaveAttribute("aria-describedby");
+      expect(screen.queryByText(reason)).not.toBeInTheDocument();
+      expect(trigger).not.toHaveAttribute("tabindex");
+      expect(trigger).not.toHaveAttribute("aria-disabled");
     },
   );
 
@@ -8412,9 +8426,7 @@ describe("NewChatLandingScreen skills menu", () => {
     );
     renderLanding({}, "/", undefined, true);
     typeMessage("/review");
-    expect(
-      within(screen.getByTestId("slash-command-menu")).getByText("Loading skills…"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
     const input = screen.getByTestId("new-chat-landing-input");
     fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.keyDown(input, { key: "Tab" });

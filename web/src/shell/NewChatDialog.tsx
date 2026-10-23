@@ -9,7 +9,7 @@ import {
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
-import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
@@ -2354,7 +2354,10 @@ export function NewChatLandingScreen() {
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const submitFeedbackId = useId();
+  const submitTooltipTriggerRef = useRef<HTMLSpanElement>(null);
+  const [submitTooltipState, setSubmitTooltipState] = useState<"closed" | "open" | "pinned">(
+    "closed",
+  );
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
@@ -5093,9 +5096,8 @@ export function NewChatLandingScreen() {
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
-  const hasDraft = message.trim().length > 0 || files.length > 0;
   const canSubmit =
-    hasDraft &&
+    (message.trim().length > 0 || files.length > 0) &&
     !mcpAuthorizing &&
     mcpSelectionError === null &&
     !pickerLoading &&
@@ -5108,7 +5110,7 @@ export function NewChatLandingScreen() {
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
 
-  // Show the next missing input below the draft and in the button's tooltip.
+  // Name the next missing input in the submit tooltip.
   const submitDisabledReason = canSubmit
     ? null
     : mcpAuthorizing || mcpSelectionError
@@ -5134,7 +5136,15 @@ export function NewChatLandingScreen() {
                       : message.trim().length === 0 && files.length === 0
                         ? "Enter a message to get started"
                         : null;
-  const submitFeedback = hasDraft ? submitDisabledReason : null;
+  useEffect(() => {
+    if (submitDisabledReason !== null) return;
+    setSubmitTooltipState("closed");
+    if (document.activeElement === submitTooltipTriggerRef.current) {
+      submitTooltipTriggerRef.current
+        ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+        ?.focus();
+    }
+  }, [submitDisabledReason]);
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5468,7 +5478,11 @@ export function NewChatLandingScreen() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit || createAttemptRef.current !== null) return;
+    if (!canSubmit) {
+      if (submitDisabledReason !== null) setSubmitTooltipState("pinned");
+      return;
+    }
+    if (createAttemptRef.current !== null) return;
     const createAttempt = Symbol();
     createAttemptRef.current = createAttempt;
     // BrowserRouter may defer its React update even though history already
@@ -6792,7 +6806,6 @@ export function NewChatLandingScreen() {
                 onPaste,
                 placeholder: pillSkills.length > 0 ? "" : placeholderText,
                 "aria-label": placeholderText,
-                "aria-describedby": submitFeedback ? submitFeedbackId : undefined,
                 rows: 1,
                 autoFocus: !isMobileViewport,
                 "data-testid": "new-chat-landing-input",
@@ -6873,15 +6886,6 @@ export function NewChatLandingScreen() {
                         data-testid="new-chat-landing-attachment-error"
                       >
                         {attachmentError}
-                      </ComposerFeedbackRow>
-                    )}
-                    {submitFeedback && (
-                      <ComposerFeedbackRow
-                        id={submitFeedbackId}
-                        role="status"
-                        data-testid="new-chat-landing-submit-reason"
-                      >
-                        {submitFeedback}
                       </ComposerFeedbackRow>
                     )}
                     {/* No own bg — the pill paints the surface. An explicit bg-card
@@ -7272,11 +7276,38 @@ export function NewChatLandingScreen() {
                       onInterim={dictation.replaceInterim}
                     />
                     <TooltipProvider>
-                      <Tooltip>
+                      <Tooltip
+                        open={submitTooltipState !== "closed"}
+                        onOpenChange={(open) =>
+                          setSubmitTooltipState((current) =>
+                            current === "pinned" ? current : open ? "open" : "closed",
+                          )
+                        }
+                      >
                         <TooltipTrigger asChild>
                           <span
+                            ref={submitTooltipTriggerRef}
+                            role={submitDisabledReason !== null ? "group" : undefined}
+                            tabIndex={submitDisabledReason !== null ? 0 : undefined}
+                            aria-label={submitDisabledReason !== null ? "Start session" : undefined}
+                            aria-disabled={submitDisabledReason !== null ? true : undefined}
+                            onPointerDown={(event) => {
+                              if (submitDisabledReason === null) return;
+                              event.preventDefault();
+                              setSubmitTooltipState("pinned");
+                            }}
+                            onKeyDown={(event) => {
+                              if (
+                                submitDisabledReason !== null &&
+                                (event.key === "Enter" || event.key === " ")
+                              ) {
+                                event.preventDefault();
+                                setSubmitTooltipState("pinned");
+                              }
+                            }}
+                            onBlur={() => setSubmitTooltipState("closed")}
                             className={cn(
-                              "inline-flex shrink-0",
+                              "inline-flex shrink-0 rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring",
                               !canSubmit && "cursor-not-allowed",
                             )}
                           >
@@ -7293,6 +7324,14 @@ export function NewChatLandingScreen() {
                           <TooltipContent
                             className="border border-border bg-popover text-popover-foreground shadow-menu ring-1 ring-foreground/10"
                             data-testid="new-chat-landing-submit-error-tooltip"
+                            onPointerDownOutside={(event) => {
+                              if (submitTooltipTriggerRef.current?.contains(event.target as Node)) {
+                                event.preventDefault();
+                              } else {
+                                setSubmitTooltipState("closed");
+                              }
+                            }}
+                            onEscapeKeyDown={() => setSubmitTooltipState("closed")}
                           >
                             {submitDisabledReason}
                           </TooltipContent>
