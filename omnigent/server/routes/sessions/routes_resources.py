@@ -145,11 +145,9 @@ class _RunnerStreamResponse(StreamingResponse):
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
 # Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
 _PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
-# The largest PR attachment GitHub takes, a video; the runner checks each type's limit.
-_MAX_PR_ATTACHMENT_BYTES = 100 * 1024 * 1024
-# The host tunnel carries the file base64-encoded (a third larger) in one frame,
-# which the host accepts up to 100 MB.
-_MAX_TUNNELED_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# The largest PR attachment, a video; the runner checks each type's limit. Both
+# the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
+_MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -3564,7 +3562,7 @@ def register_resources_routes(
 
         The file goes to the provider without being kept by Omnigent, and the PR
         is unchanged until a description that links it is saved. Falls back to
-        the host tunnel when the runner is offline, for files up to 70 MB.
+        the host tunnel when the runner is offline.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
@@ -3580,11 +3578,6 @@ def register_resources_routes(
         except OmnigentError as exc:
             if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
                 raise
-            if len(content) > _MAX_TUNNELED_PR_ATTACHMENT_BYTES:
-                raise HTTPException(
-                    status_code=413,
-                    detail="Files over 70 MB attach only while the session's runner is online.",
-                ) from exc
             payload = await _write_workspace_via_host(
                 session_id,
                 conv,

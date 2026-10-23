@@ -349,6 +349,7 @@ def test_attachments_take_their_type_and_extension_from_the_content(
         ({"content": b"\x00\x00\x00\x1cftypavif" + b"\x00" * 8}, "Attach a PNG, JPEG"),
         ({"content": b"ABCD\x00\x00\x00\x00WEBPVP8 "}, "Attach a PNG, JPEG"),
         ({"content": PNG + b"\x00" * (10 * 1024 * 1024)}, "An image can be at most 10 MB"),
+        ({"content": MP4 + b"\x00" * (70 * 1024 * 1024)}, "A video can be at most 70 MB"),
         ({"pr_url": GITLAB_MR_URL, "content": PNG}, "Attaching files to a GitLab merge request"),
         ({"pr_url": None, "content": PNG}, "Select a pull request to attach files"),
     ],

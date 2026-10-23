@@ -16778,7 +16778,7 @@
     },
     "/v1/sessions/{session_id}/resources/github/attachments": {
       "post": {
-        "description": "Upload an image or video to embed in the selected PR's description.\n\nThe file goes to the provider without being kept by Omnigent, and the PR\nis unchanged until a description that links it is saved. Falls back to\nthe host tunnel when the runner is offline, for files up to 70 MB.\n\n**Parameters**\n\n- `pr_url` \u2014 The selected PR, which must be tracked by the session.\n- `file` \u2014 The image or video.\n\n**Returns:** A `session.github.pr_attachment` with the `url` to embed.",
+        "description": "Upload an image or video to embed in the selected PR's description.\n\nThe file goes to the provider without being kept by Omnigent, and the PR\nis unchanged until a description that links it is saved. Falls back to\nthe host tunnel when the runner is offline.\n\n**Parameters**\n\n- `pr_url` \u2014 The selected PR, which must be tracked by the session.\n- `file` \u2014 The image or video.\n\n**Returns:** A `session.github.pr_attachment` with the `url` to embed.",
         "operationId": "upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
         "parameters": [
           {

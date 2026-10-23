@@ -3338,6 +3338,22 @@ async def test_github_attachment_forwards_the_bytes_and_relays_the_refusal(
     )
 
 
+def test_pr_attachments_fit_one_tunnel_frame() -> None:
+    """The largest attachment, base64-encoded, fits a runner or host tunnel frame.
+
+    A bigger frame is refused with close code 1009, which drops every request on
+    that tunnel. The host's ``websockets.connect`` uses the same 100 MB limit.
+    """
+    from omnigent.runner import pr_resource
+    from omnigent.server.routes.sessions import routes_resources
+    from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+
+    largest = routes_resources._MAX_PR_ATTACHMENT_BYTES
+    assert largest == pr_resource._MAX_VIDEO_ATTACHMENT_BYTES
+    encoded_length = 4 * -(-largest // 3)  # base64's exact output length
+    assert encoded_length < RUNNER_TUNNEL_MAX_MESSAGE_BYTES * 0.95
+
+
 @pytest.mark.asyncio
 async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
     """A refused merge keeps the runner's status and message, with the PR edit wait."""
@@ -9942,8 +9958,6 @@ async def test_pr_attachment_reaches_offline_host_base64_encoded(
     upload = {"file": ("shot.png", b"\x89PNG-bytes", "image/png")}
 
     uploaded = await offline_env_client.post(path, data={"pr_url": url}, files=upload)
-    monkeypatch.setattr(routes_resources, "_MAX_TUNNELED_PR_ATTACHMENT_BYTES", 4)
-    too_large = await offline_env_client.post(path, data={"pr_url": url}, files=upload)
 
     assert (uploaded.status_code, uploaded.json()) == (200, asset), uploaded.text
     [call] = captured
@@ -9952,10 +9966,6 @@ async def test_pr_attachment_reaches_offline_host_base64_encoded(
     params = call["params"]
     assert (params["pr_url"], params["name"]) == (url, "shot.png")
     assert base64.b64decode(params["content_base64"]) == b"\x89PNG-bytes"
-    assert too_large.status_code == 413
-    assert "runner is online" in too_large.json()["detail"]
-    # Base64 grows the file by a third; the encoded frame must fit the host's 100 MB limit.
-    assert routes_resources._MAX_TUNNELED_PR_ATTACHMENT_BYTES * 4 / 3 < 100 * 1024 * 1024 * 0.95
 
 
 @pytest.mark.asyncio
