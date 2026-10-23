@@ -43,7 +43,8 @@ and steers messages while the agent is busy.
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
   slash/mention menu acting on Tab, chip disabled, session in a mode the chip can't switch back to
-  (Codex read-only, Claude Don't ask; menu only), change in flight, change
+  (Codex read-only, Claude Don't ask; menu only), change in flight (Shift+Tab
+  holds focus without sending another request; Tab still moves focus forward), change
   refused or failed (next press moves past it, or retries it when it is the only
   other mode), no other mode (native focus move, no
   `aria-keyshortcuts`).
@@ -335,6 +336,8 @@ Other connection providers alone do not enable the managed MCP picker.
   priority in `web/src/pages/ChatPage.mention.test.tsx`; mode ordering and
   wraparound are in
   `web/src/lib/permissionModeCycle.test.ts`.
+  `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
+  page leaves the launch mode unchanged and does not prevent focus traversal.
 - **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
   permission-mode picker has component coverage in
   `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort

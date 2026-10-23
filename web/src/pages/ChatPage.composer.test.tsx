@@ -2785,13 +2785,31 @@ describe("Composer shared visible controls", () => {
 });
 
 describe("Composer permission-mode shortcut", () => {
-  const { setClaudePermissionMode, setCodexApprovalMode } = useChatStore.getState();
+  beforeEach(() => {
+    const {
+      conversationId,
+      sessionHarness,
+      claudePermissionMode,
+      codexApprovalMode,
+      setClaudePermissionMode,
+      setCodexApprovalMode,
+    } = useChatStore.getState();
+    // Zustand copies spies into later states, so restore both identity and setters.
+    onTestFinished(() =>
+      useChatStore.setState({
+        conversationId,
+        sessionHarness,
+        claudePermissionMode,
+        codexApprovalMode,
+        setClaudePermissionMode,
+        setCodexApprovalMode,
+      }),
+    );
+  });
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
     clearSessionDrafts();
-    // Zustand copies spies into each new state object, so restore the setters.
-    useChatStore.setState({ setClaudePermissionMode, setCodexApprovalMode });
   });
 
   /**
@@ -3038,10 +3056,11 @@ describe("Composer permission-mode shortcut", () => {
   it("leaves Shift+Tab to an open slash menu", () => {
     const setMode = spyClaudeSetter();
     const input = renderClaudeSession("cycle-slash");
-    fireEvent.change(input, { target: { value: "/" } });
+    fireEvent.change(input, { target: { value: "/n" } });
     expect(activeRow()).not.toBeNull();
 
-    pressShiftTab(input);
+    expect(pressShiftTab(input)).toBe(false);
+    expect(input).toHaveValue("/new ");
     expect(setMode).not.toHaveBeenCalled();
   });
 
