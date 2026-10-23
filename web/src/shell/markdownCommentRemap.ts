@@ -24,5 +24,10 @@ export function remapFormattedMarkdownComment(comment: Comment, content: string)
       console.warn("Markdown comment remapping failed; keeping stored offsets", error);
     }
   }
-  return previous.doc ? remapMarkdownComment(previous.doc, comment, content, manager) : comment;
+  try {
+    return previous.doc ? remapMarkdownComment(previous.doc, comment, content, manager) : comment;
+  } catch (error) {
+    console.warn("Markdown comment remapping failed; keeping stored offsets", error);
+    return comment;
+  }
 }

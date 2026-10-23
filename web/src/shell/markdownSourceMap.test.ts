@@ -3,7 +3,11 @@ import { Editor } from "@tiptap/core";
 import type { Comment } from "@/hooks/useComments";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
-import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
+import {
+  computeSelectionData,
+  findPmRangeForComment,
+  remapMarkdownComment,
+} from "./TipTapEditorHelpers";
 import { markdownSourceMap } from "./markdownSourceMap";
 import callTable from "../../../tests/e2e_ui/comments/fixtures/call-table.md?raw";
 import mixedStructures from "../../../tests/e2e_ui/comments/fixtures/mixed-structures.md?raw";
@@ -148,14 +152,13 @@ describe("validated Markdown source positions", () => {
     },
   );
 
-  it("reports unexpected mapping errors in production and caches the failed map", () => {
+  it("reports unexpected mapping errors and caches the failed map", () => {
     const raw = "word word";
     const doc = parse(raw);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const traversal = vi.spyOn(doc, "forEach").mockImplementation(() => {
       throw new TypeError("mapper bug");
     });
-    vi.stubEnv("DEV", false);
     try {
       expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
       expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
@@ -164,8 +167,20 @@ describe("validated Markdown source positions", () => {
     } finally {
       traversal.mockRestore();
       warn.mockRestore();
-      vi.unstubAllEnvs();
     }
+  });
+  it.each([10, 11])("rejects a proportional offset on another mapped emoji (%i)", (length) => {
+    const raw = `label &#x1F600; 😀 [x](${"x".repeat(length)})`;
+    const doc = parse(raw);
+    expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
+    expect(doc.textBetween(7, 8)).toBe("\ud83d");
+    expect(computeSelectionData(7, 8, doc, raw, editor.markdown)).toBeNull();
+    const whole = computeSelectionData(7, 9, doc, raw, editor.markdown)!;
+    expect(whole).toEqual({ start_index: 6, end_index: 15, anchor_content: "😀" });
+    expect(findPmRangeForComment(doc, whole as Comment, raw, editor.markdown)).toEqual({
+      from: 7,
+      to: 9,
+    });
   });
   it.each(
     [
@@ -255,6 +270,14 @@ describe("validated Markdown source positions", () => {
           editor.markdown,
         ),
       ).toEqual({ from, to });
+      expect(
+        remapMarkdownComment(
+          doc,
+          { start_index, end_index: end_index + 1, anchor_content: word } as Comment,
+          raw,
+          editor.markdown!,
+        ),
+      ).toEqual({ start_index, end_index, anchor_content: word });
     },
   );
 

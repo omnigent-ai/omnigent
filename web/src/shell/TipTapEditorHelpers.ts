@@ -130,11 +130,10 @@ export function findPmRangeForComment(
  *
  * When the text cannot be found verbatim in the raw file (e.g. multi-line
  * selections, table cells, or code blocks whose markdown syntax the parser
- * strips), falls back to proportionally scaled indices so the button is never
- * blocked.  The anchor_content from the PM doc is still used for re-locating
- * the highlight later via findPmRangeForComment.
+ * strips), falls back to proportionally scaled indices. The rendered quote
+ * still relocates the highlight through findPmRangeForComment.
  *
- * Returns null only when the selection contains no text.
+ * Returns null for empty selections or a fallback that identifies another mapped copy.
  */
 export function computeSelectionData(
   from: number,
@@ -180,6 +179,8 @@ export function computeSelectionData(
   // Fall back to proportional indices when the anchor text isn't found
   // verbatim (multi-line, table, code block selections).
   if (idx === -1) {
+    const range = map && mappedRange(doc, map, hint, hint + anchor_content.length, anchor_content);
+    if (range && (range.from !== from || range.to !== to)) return null;
     return {
       start_index: hint,
       end_index: hint + anchor_content.length,
@@ -205,6 +206,37 @@ function lowerBound(values: number[], value: number): number {
   return start;
 }
 
+const renderedIndexes = new WeakMap<ProseMirrorNode, { text: string; positions: number[] }>();
+
+function renderedIndex(doc: ProseMirrorNode) {
+  const cached = renderedIndexes.get(doc);
+  if (cached) return cached;
+  let text = "";
+  let firstBlock = true;
+  const positions: number[] = [];
+  doc.descendants((node, position) => {
+    const value = node.isText
+      ? node.text!
+      : node.isLeaf
+        ? (node.type.spec.leafText?.(node) ?? "")
+        : "";
+    // Match textBetween's separators, which have no selectable source character.
+    if (node.isBlock && ((node.isLeaf && value) || node.isTextblock)) {
+      if (!firstBlock) {
+        text += SEP;
+        positions.push(-1);
+      }
+      firstBlock = false;
+    }
+    text += value;
+    for (let index = 0; index < value.length; index++)
+      positions.push(position + (node.isText ? index : 0));
+  });
+  const result = { text, positions };
+  renderedIndexes.set(doc, result);
+  return result;
+}
+
 export function remapMarkdownComment(
   doc: ProseMirrorNode,
   comment: Comment,
@@ -215,21 +247,25 @@ export function remapMarkdownComment(
   if (!anchor) return comment;
   const map = markdownSourceMap(doc, rawContent, manager);
   if (!map || mappedRange(doc, map, comment.start_index, comment.end_index, anchor)) return comment;
-  const text = doc.textBetween(0, doc.content.size, SEP);
+  const { text, positions } = renderedIndex(doc);
   let best = comment;
   let distance = Infinity;
   for (let index = text.indexOf(anchor); index !== -1; index = text.indexOf(anchor, index + 1)) {
-    const from = textOffsetToPmPos(doc, index);
-    const to = textOffsetToPmPos(doc, index + anchor.length);
-    const captured = computeSelectionData(from, to, doc, rawContent, manager);
-    if (!captured) continue;
-    const range = mappedRange(doc, map, captured.start_index, captured.end_index, anchor);
-    if (!range || range.from < from || range.to > to) continue;
-    const candidateDistance = Math.abs(captured.start_index - comment.start_index);
-    if (candidateDistance < distance) {
-      best = { ...comment, ...captured };
-      distance = candidateDistance;
-    }
+    const first = exactIndex(map.positions, positions[index]);
+    const last = exactIndex(map.positions, positions[index + anchor.length - 1]);
+    if (first === -1 || last < first) continue;
+    const start_index = map.starts[first];
+    const end_index = map.ends[last];
+    const candidateDistance = Math.abs(start_index - comment.start_index);
+    if (start_index > comment.start_index && candidateDistance >= distance) break;
+    if (candidateDistance >= distance) continue;
+    // A decoded entity can map several characters to one indivisible source span.
+    const bounds = exactRange(map.starts, start_index, map.ends, end_index);
+    if (!bounds || bounds[0] !== first || bounds[1] !== last) continue;
+    best = { ...comment, start_index, end_index };
+    distance = candidateDistance;
   }
-  return best;
+  return best !== comment && mappedRange(doc, map, best.start_index, best.end_index, anchor)
+    ? best
+    : comment;
 }

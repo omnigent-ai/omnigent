@@ -191,9 +191,6 @@ instead of treating one comparison clip as complete feature verification.
 
 ## Gotchas
 
-- A rebuilt server does not update JavaScript in an already-open browser tab.
-  Check the tab's loaded asset against the server entry point before validating
-  a fix; preserve unsaved drafts when opening a fresh tab or reloading.
 - Comment offsets remain raw-source ranges; the quote is rendered text. A
   selection such as `wo**rd**` can span markup, and its minimal source range
   ends at the last selected character, before the closing `**`. Formatted
@@ -202,6 +199,9 @@ instead of treating one comparison clip as complete feature verification.
   Unsupported or oversized documents retain stored ranges in Source mode.
   This does not repair previously mis-saved offsets or guarantee tracking
   through arbitrary subsequent edits.
+- Older clients can display a formatted comment on a plain literal copy.
+  Refresh those tabs to load the source-map behavior; this display difference
+  does not overwrite the comment's saved offsets.
 - The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
   It applies above 1 MiB regardless of the saved view preference. The choice
   stays fixed for that file visit so an autosave cannot replace an editor with
