@@ -2880,6 +2880,18 @@ async def _auto_create_pi_terminal(
             code="pi_native_model_rerouted",
             notice=model_notice,
         )
+    # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
+    # transcript forwarder, so its slot owns this task until relaunch/teardown.
+    if auth_token:
+        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_auth_refresh
+
+        _register_auto_forwarder_task(
+            session_id,
+            asyncio.create_task(
+                supervise_pi_auth_refresh(bridge_dir, launch_config.server_url),
+                name=f"pi-auth-refresh-{session_id}",
+            ),
+        )
     return terminal_view
 
 

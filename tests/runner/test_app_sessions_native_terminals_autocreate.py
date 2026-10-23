@@ -194,6 +194,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
+    import omnigent.runner.app as runner_app_mod
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     if env_denylist is None:
@@ -226,6 +227,16 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
         )
 
     monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+    # TUI-typed turns skip the executor's refresh, so the runner owns one per launch.
+    supervised: list[tuple[Path, str]] = []
+
+    async def _supervise(bridge_dir: Path, url: str) -> None:
+        supervised.append((bridge_dir, url))
+
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: lambda: "tok")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.auth_refresh.supervise_pi_auth_refresh", _supervise
+    )
 
     captured: dict[str, Any] = {}
 
@@ -301,6 +312,11 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert {"list_comments", "sys_session_list"} <= tool_names
     # The fresh terminal is surfaced on the live stream for the Terminal toggle.
     assert any(evt.get("type") == "session.resource.created" for evt in published)
+    task = runner_app_mod._AUTO_FORWARDER_TASKS.pop("47f049b9d13df4db397c7f46859b825f")
+    assert task.get_name() == "pi-auth-refresh-47f049b9d13df4db397c7f46859b825f"
+    await task
+    bridge_dir = Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).parent
+    assert supervised == [(bridge_dir, "http://127.0.0.1:8000")]
 
     args = captured["spec"].args
     assert args[-2:] == ["--append-system-prompt", "User addition"]
