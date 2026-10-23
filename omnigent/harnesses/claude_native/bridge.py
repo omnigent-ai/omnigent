@@ -6180,13 +6180,25 @@ class _ComposerBox(NamedTuple):
 def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     """Keep frame edges, excluding further-indented rule text in a draft.
 
-    The last two rules can be a frame edge and a draft line; the less-indented
-    rule identifies the frame in both a complete and a clipped input box.
+    A clipped draft can end in several indented rules. Its earlier glyph row
+    identifies the opening frame without mistaking a draft rule for an edge.
     """
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
         return rules
     frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
+    # A closing rule at the candidate's indentation rules out an older box.
+    following_indent = frame_indent
+    for idx in reversed(rules[:-2]):
+        indent = len(lines[idx]) - len(lines[idx].lstrip())
+        if (
+            indent < following_indent
+            and idx + 1 < len(lines)
+            and lines[idx + 1].strip()[:1] in _COMPOSER_MODE_GLYPHS
+        ):
+            frame_indent = indent
+            break
+        following_indent = min(following_indent, indent)
     return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
 
 

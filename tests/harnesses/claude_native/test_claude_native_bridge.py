@@ -11231,7 +11231,7 @@ _STALE_DRAFT_CURSORS = pytest.mark.parametrize(
 # three-line draft is cut off without its closing rule, so a capture cannot
 # tell how much of it lies below the pane.
 _BOX_GEOMETRIES = pytest.mark.parametrize(
-    "visible_rows", [None, 2], ids=["whole-box-on-screen", "sliver-pane"]
+    "visible_rows", [None, 2, 4], ids=["whole-box-on-screen", "sliver-pane", "four-row-pane"]
 )
 
 
@@ -11239,8 +11239,12 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
     "draft",
-    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
-    ids=["plain-draft", "draft-with-rule"],
+    [
+        _STALE_MULTILINE_DRAFT,
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────"),
+        "STALE ONE\n─────────\n─────────\nLAST LINE",
+    ],
+    ids=["plain-draft", "draft-with-rule", "draft-with-two-rules"],
 )
 def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
@@ -11271,8 +11275,12 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
     "draft",
-    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
-    ids=["plain-draft", "draft-with-rule"],
+    [
+        _STALE_MULTILINE_DRAFT,
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────"),
+        "STALE ONE\n─────────\n─────────\nLAST LINE",
+    ],
+    ids=["plain-draft", "draft-with-rule", "draft-with-two-rules"],
 )
 def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
@@ -11404,6 +11412,29 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
             "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    four\n  ──────\n",
             claude_native_bridge._ComposerBox(["  ❯ one", "    ──────", "    four"], framed=True),
         ),
+        (
+            "──────\n❯ one\n  ──────\n  ──────\n  four",
+            claude_native_bridge._ComposerBox(
+                ["❯ one", "  ──────", "  ──────", "  four"], framed=False
+            ),
+        ),
+        (
+            "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    ──────\n    four",
+            claude_native_bridge._ComposerBox(
+                ["  ❯ one", "    ──────", "    ──────", "    four"], framed=False
+            ),
+        ),
+        (
+            "──────\n❯ one\n  ──────\n  ❯ quoted prompt\n  ──────\n  four",
+            claude_native_bridge._ComposerBox(
+                ["❯ one", "  ──────", "  ❯ quoted prompt", "  ──────", "  four"],
+                framed=False,
+            ),
+        ),
+        (
+            "──────\n❯ old\n──────\n  ──────\n  Change effort?\n  ❯ 1. Yes\n  ──────",
+            None,
+        ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
     ],
@@ -11413,6 +11444,10 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         "rule-inside-draft",
         "rule-inside-clipped-draft",
         "indented-frame-with-earlier-rule",
+        "two-rules-inside-clipped-draft",
+        "two-rules-inside-indented-clipped-draft",
+        "quoted-prompt-inside-clipped-draft",
+        "old-composer-above-indented-dialog",
         "dialog-selector",
         "no-box",
     ],
