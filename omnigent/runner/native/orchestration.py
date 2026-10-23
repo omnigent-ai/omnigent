@@ -5001,6 +5001,7 @@ async def _auto_create_codex_terminal(
     server_client: httpx.AsyncClient | None = None,
     session_init: RunnerSessionInitEnvelope | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -5044,6 +5045,8 @@ async def _auto_create_codex_terminal(
         persisted launch args and the native thread id.
     :param session_init: Snapshot supplied for this initialization. Later
         terminal ensures omit it to read updated configuration from the server.
+    :param event_dispatcher: Runner tunnel dispatcher. The forwarder posts turn
+        status on the tunnel while connected, so it survives an HTTP auth lapse.
     :returns: The created terminal resource view.
     """
     import socket as _socket
@@ -5850,6 +5853,7 @@ async def _auto_create_codex_terminal(
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
+                event_dispatcher=event_dispatcher,
             )
             if launch_config.external_session_id is None
             else _codex_forward_known_thread(
@@ -5861,6 +5865,7 @@ async def _auto_create_codex_terminal(
                 app_server=app_server,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
+                event_dispatcher=event_dispatcher,
             )
         ),
         name=f"codex-forwarder-{session_id}",
@@ -6092,6 +6097,7 @@ async def _codex_discover_thread_and_forward(
     thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """
     Adopt the fresh Codex TUI's thread, then mirror it into the Omnigent session.
@@ -6142,6 +6148,8 @@ async def _codex_discover_thread_and_forward(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param event_dispatcher: Runner tunnel dispatcher. The forwarder posts turn
+        status on the tunnel while connected, so it survives an HTTP auth lapse.
     """
     from omnigent.harnesses.codex_native.bridge import (
         CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
@@ -6452,6 +6460,7 @@ async def _codex_discover_thread_and_forward(
             thread_id=thread_id,
             client=event_client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            event_dispatcher=event_dispatcher,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -6498,6 +6507,7 @@ async def _codex_forward_known_thread(
     app_server: CodexNativeAppServer | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """
     Forward a runner-owned Codex terminal that resumes an existing thread.
@@ -6518,6 +6528,8 @@ async def _codex_forward_known_thread(
         endpoint a re-created terminal has since installed.
     :param turn_router: First-message routing endpoint this launch
         started, torn down alongside the subagent one.
+    :param event_dispatcher: Runner tunnel dispatcher. The forwarder posts turn
+        status on the tunnel while connected, so it survives an HTTP auth lapse.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -6543,6 +6555,7 @@ async def _codex_forward_known_thread(
             thread_id=thread_id,
             client=client,
             auth=_RunnerDatabricksAuth(auth_factory),
+            event_dispatcher=event_dispatcher,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -10146,6 +10159,7 @@ async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         session_init=ctx.session_init,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        event_dispatcher=ctx.event_dispatcher,
     )
 
 

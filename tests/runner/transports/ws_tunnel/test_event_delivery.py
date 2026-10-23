@@ -14,10 +14,12 @@ from websockets.exceptions import ConnectionClosedError
 
 from omnigent.errors import ErrorCode
 from omnigent.runner.transports.ws_tunnel.event_delivery import (
+    DEFAULT_TUNNELED_EVENT_TYPES,
     RunnerEventDispatcher,
     TunnelEventClient,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_ACK_BUSY,
     EventAckFrame,
     EventBatchFrame,
     EventReadyFrame,
@@ -37,13 +39,24 @@ _ITEM = {
 }
 
 
-def _client(dispatcher: RunnerEventDispatcher, http_posts: list[object]) -> TunnelEventClient:
+_STATUS = {"type": "external_session_status", "data": {"status": "failed", "output": "x"}}
+_STATUS_ONLY = frozenset({"external_session_status"})
+
+
+def _client(
+    dispatcher: RunnerEventDispatcher,
+    http_posts: list[object],
+    tunneled_event_types: frozenset[str] = DEFAULT_TUNNELED_EVENT_TYPES,
+    tunneled_session_id: str | None = None,
+) -> TunnelEventClient:
     def handler(request: httpx.Request) -> httpx.Response:
         http_posts.append(json.loads(request.content))
         return httpx.Response(202, json={"queued": False})
 
     return TunnelEventClient(
         event_dispatcher=dispatcher,
+        tunneled_event_types=tunneled_event_types,
+        tunneled_session_id=tunneled_session_id,
         transport=httpx.MockTransport(handler),
         base_url="http://server",
     )
@@ -651,3 +664,93 @@ async def test_disconnect_during_failed_send_leaves_no_unretrieved_future_error(
     await asyncio.sleep(0)
     assert dispatcher._pending == {}
     assert not reported
+
+
+async def test_status_uses_the_tunnel_only_for_the_opted_in_session() -> None:
+    dispatcher = RunnerEventDispatcher()
+    default_posts: list[object] = []
+    opted_in_posts: list[object] = []
+    frames: list[EventBatchFrame] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        frames.append(frame)
+        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, default_posts) as default_client:
+        await default_client.post(_URL, json=_STATUS)
+    async with _client(dispatcher, opted_in_posts, _STATUS_ONLY, "session-a") as status_client:
+        status = await status_client.post(_URL, json=_STATUS)
+        child_status = await status_client.post("/v1/sessions/child-b/events", json=_STATUS)
+        item = await status_client.post(_URL, json=_ITEM)
+    assert status.status_code == child_status.status_code == item.status_code == 202
+    assert [(frame.session_id, frame.events) for frame in frames] == [("session-a", [_STATUS])]
+    assert default_posts == [_STATUS]
+    assert opted_in_posts == [_STATUS, _ITEM]
+
+
+async def test_status_uses_http_while_the_tunnel_is_down() -> None:
+    dispatcher = RunnerEventDispatcher()
+    http_posts: list[object] = []
+
+    async def send(_text: str) -> None:
+        raise AssertionError("disconnected tunnel must not send")
+
+    dispatcher.ready(send)
+    dispatcher.disconnected()
+    async with _client(dispatcher, http_posts, _STATUS_ONLY) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=_STATUS), timeout=1)
+    assert response.status_code == 202
+    assert http_posts == [_STATUS]
+
+
+@pytest.mark.parametrize("failure", ["lost-ack", "failed-ingest-ack"])
+async def test_unconfirmed_status_returns_to_its_producer(failure: str) -> None:
+    dispatcher = RunnerEventDispatcher()
+    http_posts: list[object] = []
+    frames: list[EventBatchFrame] = []
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        frames.append(frame)
+        if failure == "lost-ack":
+            dispatcher.disconnected()
+            asyncio.get_running_loop().call_soon(dispatcher.ready, send)
+        else:
+            dispatcher.acknowledge(EventAckFrame(frame.id, 0, "ingest failed", retryable=True))
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, http_posts, _STATUS_ONLY) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=_STATUS), timeout=2)
+        await asyncio.sleep(0.5)
+    assert response.status_code == 503
+    assert len(frames) == 1
+    assert http_posts == []
+    assert not dispatcher.has_pending
+
+
+async def test_busy_status_stays_queued_until_the_server_applies_it() -> None:
+    dispatcher = RunnerEventDispatcher()
+    http_posts: list[object] = []
+    frames: list[EventBatchFrame] = []
+    busy_acks = 4  # Outlasts the forwarder's three POST attempts.
+
+    async def send(text: str) -> None:
+        frame = decode_frame(text)
+        assert isinstance(frame, EventBatchFrame)
+        frames.append(frame)
+        if len(frames) <= busy_acks:
+            dispatcher.acknowledge(EventAckFrame(frame.id, 0, EVENT_ACK_BUSY, retryable=True))
+        else:
+            dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
+
+    dispatcher.ready(send)
+    async with _client(dispatcher, http_posts, _STATUS_ONLY) as client:
+        response = await asyncio.wait_for(client.post(_URL, json=_STATUS), timeout=5)
+    assert response.status_code == 202
+    assert [frame.events for frame in frames] == [[_STATUS]] * (busy_acks + 1)
+    assert http_posts == []
+    assert not dispatcher.has_pending

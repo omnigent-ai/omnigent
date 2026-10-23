@@ -35,6 +35,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import (
     silence_source,
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
+    EVENT_ACK_BUSY,
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
     EventBatchFrame,
@@ -905,7 +906,9 @@ async def _receive_loop(
                 if slots.locked() or runner_active.get(runner_id, 0) >= 2:
                     await registry.send_text(
                         session,
-                        encode_frame(EventAckFrame(resp_frame.id, 0, "busy", retryable=True)),
+                        encode_frame(
+                            EventAckFrame(resp_frame.id, 0, EVENT_ACK_BUSY, retryable=True)
+                        ),
                     )
                     continue
                 await slots.acquire()

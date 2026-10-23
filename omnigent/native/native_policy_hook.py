@@ -534,6 +534,16 @@ def fail_closed_hook_output(
     return None
 
 
+def is_fail_closed_request_reason(reason: str) -> bool:
+    """
+    Report whether a prompt block reason came from :func:`fail_closed_hook_output`.
+
+    :param reason: Block reason a harness reported for ``UserPromptSubmit``.
+    :returns: ``True`` when the policy verdict could not be obtained.
+    """
+    return reason.startswith(_EVAL_UNAVAILABLE_REQUEST_REASON)
+
+
 _EVAL_UNAVAILABLE_ASK_REASON = (
     "Omnigent policy evaluation unavailable (could not reach or authenticate to the "
     "Omnigent server); please approve or deny this tool call manually."

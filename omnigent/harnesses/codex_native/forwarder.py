@@ -75,6 +75,8 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native.native_policy_hook import is_fail_closed_request_reason
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -134,6 +136,9 @@ _EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
 # handlers are harmless no-ops if a build spells these differently.
 _CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
 _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+_CODEX_HOOK_COMPLETED_METHOD = "hook/completed"
+# Turn status must still reach the server when the runner's HTTP credentials lapse.
+_CODEX_TUNNELED_EVENT_TYPES = frozenset({"external_session_status"})
 # How often the forwarder claims pending ``/side`` questions from the bridge dir.
 # The executor writes one and returns, so this is the delay before the side chat
 # starts; a fork is cheap, so poll fast enough to feel immediate.
@@ -2162,6 +2167,7 @@ async def supervise_forwarder(
     client: CodexAppServerClient | None = None,
     auth: httpx.Auth | None = None,
     ap_transport: httpx.AsyncBaseTransport | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> None:
     """
     Mirror Codex app-server notifications into an Omnigent session.
@@ -2184,6 +2190,8 @@ async def supervise_forwarder(
     :param auth: Optional HTTP auth for long-lived remote sessions.
     :param ap_transport: Optional HTTP transport for the Omnigent client,
         e.g. ``httpx.MockTransport(...)`` for tests.
+    :param event_dispatcher: Optional runner tunnel dispatcher. When set,
+        turn status events use the runner's tunnel while it is connected.
     :returns: None. Runs until cancelled or the app-server connection
         closes.
     """
@@ -2203,6 +2211,11 @@ async def supervise_forwarder(
         auth=auth,
         timeout=httpx.Timeout(30.0),
         transport=ap_transport,
+        event_dispatcher=event_dispatcher,
+        tunneled_event_types=_CODEX_TUNNELED_EVENT_TYPES,
+        # Sub-agent rows can keep a stale runner binding, which tunnel ingestion
+        # rejects; over HTTP their statuses still apply.
+        tunneled_session_id=session_id,
     ) as ap_client:
         # Synthesize the thread's MCP startup round (see the comment on
         # _CODEX_MCP_STARTUP_STATUS_METHOD): the fresh-launch forwarder
@@ -3736,6 +3749,80 @@ async def _maybe_fail_turn_on_certificate_failure(
     return True
 
 
+def _claim_terminal_error_turn(
+    *,
+    session_id: str,
+    bridge_dir: Path | None,
+    params: _JsonObject,
+    turn_id: str | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> bool:
+    """
+    Claim a turn whose terminal error is about to be surfaced.
+
+    A claimed turn's later ``turn/completed`` edge is suppressed, so the error
+    stays the turn's terminal status.
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory; ``None`` for child threads.
+    :param params: Codex notification params carrying the turn id.
+    :param turn_id: Codex turn id from ``params``, e.g. ``"turn_123"``.
+    :param forwarder_state: Optional forwarder state recording surfaced errors.
+    :returns: ``False`` for a duplicate or stale error that must not be posted.
+    """
+    if forwarder_state is None:
+        return True
+    if turn_id in forwarder_state.surfaced_terminal_error_turns:
+        _logger.info("Codex forwarder ignored duplicate terminal error: turn_id=%s", turn_id)
+        return False
+    # Child threads have no on-disk bridge to correlate against.
+    if bridge_dir is not None and (
+        turn_id is None
+        or (
+            not clear_active_turn_id_if_matches(bridge_dir, turn_id)
+            and not _terminal_turn_boundary_matches_idle_bridge(bridge_dir, params, turn_id)
+        )
+    ):
+        _logger.info(
+            "Codex forwarder ignored stale terminal error",
+            extra=debug_event(
+                "codex_terminal_error_ignored",
+                session_id=session_id,
+                turn_id=turn_id,
+                reason="stale_or_ambiguous_turn",
+            ),
+        )
+        return False
+    if turn_id is not None:
+        forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    return True
+
+
+def _policy_unavailable_prompt_block_reason(params: _JsonObject) -> str | None:
+    """
+    Return the reason for a prompt blocked because policy evaluation failed.
+
+    Other ``UserPromptSubmit`` blocks, such as model routing or a policy denial,
+    are reported to the user through their own channels and return ``None``.
+
+    :param params: Codex ``hook/completed`` params, e.g.
+        ``{"turnId": "turn_123", "run": {"eventName": "userPromptSubmit",
+        "status": "blocked", "entries": [{"kind": "feedback", "text": "..."}]}}``.
+    :returns: The hook's block reason, or ``None`` for any other hook run.
+    """
+    run = params.get("run")
+    if not isinstance(run, dict):
+        return None
+    if run.get("eventName") != "userPromptSubmit" or run.get("status") != "blocked":
+        return None
+    entries = run.get("entries")
+    for entry in entries if isinstance(entries, list) else []:
+        text = entry.get("text") if isinstance(entry, dict) else None
+        if isinstance(text, str) and is_fail_closed_request_reason(text.strip()):
+            return text.strip()
+    return None
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -3790,35 +3877,14 @@ async def _maybe_handle_turn_event(
                 _logger.warning("Codex forwarder ignored malformed error notification")
                 return True
             turn_id = _turn_id_from_payload(params)
-            if forwarder_state is not None:
-                if turn_id in forwarder_state.surfaced_terminal_error_turns:
-                    _logger.info(
-                        "Codex forwarder ignored duplicate terminal error: turn_id=%s",
-                        turn_id,
-                    )
-                    return True
-                # Child threads have no on-disk bridge to correlate against.
-                if bridge_dir is not None and (
-                    turn_id is None
-                    or (
-                        not clear_active_turn_id_if_matches(bridge_dir, turn_id)
-                        and not _terminal_turn_boundary_matches_idle_bridge(
-                            bridge_dir, params, turn_id
-                        )
-                    )
-                ):
-                    _logger.info(
-                        "Codex forwarder ignored stale terminal error",
-                        extra=debug_event(
-                            "codex_terminal_error_ignored",
-                            session_id=session_id,
-                            turn_id=turn_id,
-                            reason="stale_or_ambiguous_turn",
-                        ),
-                    )
-                    return True
-                if turn_id is not None:
-                    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+            if not _claim_terminal_error_turn(
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+                turn_id=turn_id,
+                forwarder_state=forwarder_state,
+            ):
+                return True
             compaction_model: str | None = None
             selected_model = forwarder_state.model if forwarder_state is not None else None
             if (
@@ -3846,6 +3912,38 @@ async def _maybe_handle_turn_event(
                 ),
             )
             await usage_coalescer.flush()
+        return True
+    if method == _CODEX_HOOK_COMPLETED_METHOD:
+        reason = _policy_unavailable_prompt_block_reason(params)
+        if reason is None:
+            return True
+        async with _conversation_item_delivery_scope(session_id):
+            if delta_coalescer is not None:
+                await delta_coalescer.flush()
+            turn_id = _turn_id_from_payload(params)
+            if not _claim_terminal_error_turn(
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                params=params,
+                turn_id=turn_id,
+                forwarder_state=forwarder_state,
+            ):
+                return True
+            _logger.warning(
+                "Codex prompt blocked because Omnigent policy evaluation was unavailable: "
+                "turn_id=%s",
+                turn_id,
+            )
+            await _post_turn_status_edge(
+                client,
+                session_id,
+                _CodexTurnStatusEdge(
+                    status="failed",
+                    turn_id=turn_id,
+                    source="hook/completed:policy-unavailable",
+                    error=_CodexTerminalError(message=reason, kind=_CODEX_ERROR_KIND_GENERIC),
+                ),
+            )
         return True
     if method == "turn/started":
         async with _conversation_item_delivery_scope(session_id):

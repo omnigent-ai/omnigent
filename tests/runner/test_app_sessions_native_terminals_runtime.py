@@ -47,6 +47,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     RunnerSessionInitSnapshot,
 )
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.budgets import budget
 from tests.runner.conftest import (
@@ -776,6 +777,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     published_events: list[dict[str, Any]] = []
     forward_calls: list[dict[str, Any]] = []
+    event_dispatcher = RunnerEventDispatcher()
     preload_calls: list[tuple[str, str, list[str] | None, str | None]] = []
     effort_calls: list[tuple[str, str, object]] = []
 
@@ -875,6 +877,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             agent_spec=agent_spec,
             server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
             session_init=session_init,
+            event_dispatcher=event_dispatcher,
         )
         await asyncio.sleep(0)
         remembered_dir = orchestration._AUTO_CODEX_BRIDGE_DIRS.get(session_id)
@@ -966,6 +969,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "client": retained_client if retain_subscription else None,
             # The forwarder tears down only the app-server this launch started.
             "app_server": app_server,
+            "event_dispatcher": event_dispatcher,
         }
     ]
     bridge_state = codex_native_bridge.read_bridge_state(bridge_dir)
@@ -3837,6 +3841,7 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
             closed.append("server")
 
     client = _Client()
+    event_dispatcher = RunnerEventDispatcher()
 
     def server_url(_name: str) -> str:
         if outcome == "setup_error":
@@ -3845,6 +3850,7 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
 
     async def forward(**kwargs: Any) -> None:
         assert kwargs["client"] is client
+        assert kwargs["event_dispatcher"] is event_dispatcher
         assert not closed
         if outcome == "forward_error":
             raise RuntimeError("forward failed")
@@ -3862,6 +3868,7 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
         codex_ws_url="ws://127.0.0.1:9876",
         thread_id="thread_test",
         client=client,  # type: ignore[arg-type]
+        event_dispatcher=event_dispatcher,
     )
     if outcome == "success":
         await operation
@@ -4098,7 +4105,10 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
     async def _fake_wait(*_args: object, **_kwargs: object) -> str:
         return "019e96aa-abcd-7343-8d3b-6f914d60936b"
 
-    async def _fake_supervise(**_kwargs: object) -> None:
+    event_dispatcher = RunnerEventDispatcher()
+
+    async def _fake_supervise(**kwargs: object) -> None:
+        assert kwargs["event_dispatcher"] is event_dispatcher
         if outcome == "raises":
             raise RuntimeError("forward failed")
         if outcome == "cancelled":
@@ -4132,6 +4142,7 @@ async def test_codex_discover_thread_and_forward_marks_its_pane_for_replacement(
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
             app_server=launched,  # type: ignore[arg-type]
+            event_dispatcher=event_dispatcher,
         )
         if outcome in ("raises", "cancelled"):
             error = asyncio.CancelledError if outcome == "cancelled" else RuntimeError

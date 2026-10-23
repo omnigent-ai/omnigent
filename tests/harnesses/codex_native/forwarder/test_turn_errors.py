@@ -21,6 +21,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_certificate_failure,
     write_bridge_state,
 )
+from omnigent.native.native_policy_hook import fail_closed_hook_output
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
@@ -765,6 +766,103 @@ async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: 
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id is None
+
+
+_POLICY_UNAVAILABLE_REASON = fail_closed_hook_output(
+    "UserPromptSubmit", "retry budget exhausted (last error: server returned 502)"
+)["reason"]  # type: ignore[index]
+
+
+async def _block_prompt_then_complete(
+    tmp_path: Path, *, event_name: str, status: str, reason: str
+) -> list[tuple[str, dict]]:
+    """Replay a prompt hook run followed by Codex's empty ``turn/completed``."""
+    _seed_active_turn(tmp_path, "turn_123")
+    client = _RecordingClient()
+    usage_coalescer = fwd._SessionUsageCoalescer(client, "conv_x")  # type: ignore[arg-type]
+    elicitation_tracker = fwd._CodexElicitationTaskTracker()
+    forwarder_state = fwd._CodexForwarderState()
+    hook_completed = {
+        "method": "hook/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "run": {
+                "eventName": event_name,
+                "status": status,
+                "entries": [{"kind": "feedback", "text": reason}],
+            },
+        },
+    }
+    turn_completed = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turn": {"id": "turn_123", "status": "completed", "items": []},
+        },
+    }
+    for event in (hook_completed, turn_completed):
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=usage_coalescer,
+            elicitation_tracker=elicitation_tracker,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+    return client.posts
+
+
+@pytest.mark.asyncio
+async def test_prompt_blocked_by_unavailable_policy_fails_the_turn(tmp_path: Path) -> None:
+    """A fail-closed prompt block, not the later empty completion, ends the turn."""
+    posts = await _block_prompt_then_complete(
+        tmp_path,
+        event_name="userPromptSubmit",
+        status="blocked",
+        reason=_POLICY_UNAVAILABLE_REASON,
+    )
+
+    assert posts == [
+        (
+            "/v1/sessions/conv_x/events",
+            {
+                "type": "external_session_status",
+                "data": {
+                    "status": "failed",
+                    "response_id": "codex_turn_123",
+                    "output": _POLICY_UNAVAILABLE_REASON,
+                },
+            },
+        )
+    ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_name", "status", "reason"),
+    [
+        ("userPromptSubmit", "blocked", "Routing this request to gpt-5.4."),
+        ("userPromptSubmit", "completed", _POLICY_UNAVAILABLE_REASON),
+        ("preToolUse", "blocked", _POLICY_UNAVAILABLE_REASON),
+    ],
+    ids=["other-prompt-block", "prompt-not-blocked", "tool-hook"],
+)
+async def test_other_hook_runs_leave_the_turn_to_turn_completed(
+    tmp_path: Path, event_name: str, status: str, reason: str
+) -> None:
+    """Only a prompt blocked by unavailable policy evaluation is reported as a failure."""
+    posts = await _block_prompt_then_complete(
+        tmp_path, event_name=event_name, status=status, reason=reason
+    )
+
+    assert [body["data"]["status"] for _url, body in posts] == ["idle"]
+    assert "output" not in posts[0][1]["data"]
 
 
 def test_terminal_error_from_turn_none_for_clean_turn() -> None:

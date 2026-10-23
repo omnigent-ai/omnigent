@@ -34,6 +34,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
@@ -2264,6 +2265,41 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
     ]
     assert fake_client.closed
+
+
+def test_supervise_forwarder_tunnels_status_only_for_its_own_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Sub-agent statuses keep HTTP, which applies them despite a stale runner binding."""
+    from omnigent import cli_auth
+
+    open_server_client = cli_auth.open_server_client
+    opened: list[dict[str, Any]] = []
+
+    def open_recording_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        opened.append(kwargs)
+        return open_server_client(*args, **kwargs)
+
+    monkeypatch.setattr(cli_auth, "open_server_client", open_recording_client)
+
+    asyncio.run(
+        codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=_FakeCodexAppServerClient(),  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+            event_dispatcher=RunnerEventDispatcher(),
+        )
+    )
+
+    assert [(kw["tunneled_event_types"], kw["tunneled_session_id"]) for kw in opened] == [
+        (frozenset({"external_session_status"}), "conv_123")
+    ]
 
 
 @pytest.mark.parametrize(

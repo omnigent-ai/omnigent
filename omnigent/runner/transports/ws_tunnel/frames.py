@@ -205,6 +205,8 @@ class WSCloseFrame:
 # Additive extension of the runner tunnel, negotiated after hello. These are
 # not tunneled HTTP responses or terminal WebSocket channel frames.
 EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
+# Retryable event.ack error sent before the server applies any of the batch.
+EVENT_ACK_BUSY = "busy"
 
 # Close reason (with code 1000) a runner sends when its idle watchdog found no
 # active work, so the server settles the runner's sessions instead of failing them.
