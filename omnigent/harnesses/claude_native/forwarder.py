@@ -1070,14 +1070,18 @@ class _PostRetryTracker:
         :param key: Stable retry key, e.g. ``"hook:2:idle"``.
         :returns: None.
         """
-        self._entries.pop(key, None)
+        self.discard(key)
         # A cleared key means the post got through (or was ambiguously
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
 
+    def discard(self, key: str) -> None:
+        """Remove retry state for an event no longer being delivered."""
+        self._entries.pop(key, None)
+
     def clear_snapshot_failure(self, key: str) -> None:
         """Remove local snapshot retry state without changing HTTP health."""
-        self._entries.pop(key, None)
+        self.discard(key)
 
     def snapshot_fallback_due(self, key: str) -> bool:
         """Use the SDK fallback on the final local snapshot attempt."""
@@ -3767,6 +3771,33 @@ def _is_subagent_hook_record(
     return _subagent_hook_reason(record, parent_claude_session_ids) is not None
 
 
+def _superseded_failure_cursors(
+    records: Sequence[ClaudeHookRecord], parent_claude_session_ids: Collection[str]
+) -> set[int]:
+    """Find failures followed by a submitted and completed parent turn in one batch."""
+    completed_sessions: set[str] = set()
+    submitted_sessions: set[str] = set()
+    superseded: set[int] = set()
+    for record in reversed(records):
+        native_session_id = record.claude_session_id
+        if not native_session_id or native_session_id not in parent_claude_session_ids:
+            continue
+        if _is_subagent_hook_record(record, parent_claude_session_ids=parent_claude_session_ids):
+            continue
+        if record.event_name == "SessionStart" and (
+            record.source in {"clear", "startup"} or record.fork_detected or record.fork_rotated_to
+        ):
+            completed_sessions.discard(native_session_id)
+            submitted_sessions.discard(native_session_id)
+        elif record.event_name == "Stop":
+            completed_sessions.add(native_session_id)
+        elif record.event_name == "UserPromptSubmit" and native_session_id in completed_sessions:
+            submitted_sessions.add(native_session_id)
+        elif record.event_name == "StopFailure" and native_session_id in submitted_sessions:
+            superseded.add(record.event_cursor)
+    return superseded
+
+
 def _subagent_hook_reason(
     record: ClaudeHookRecord, parent_claude_session_ids: Collection[str] | None
 ) -> str | None:
@@ -4166,6 +4197,7 @@ async def _forward_available_status_events(
         )
         await _write_hook_state_async(bridge_dir, durable)
         return durable
+    superseded_failures = _superseded_failure_cursors(result.records, parent_claude_session_ids)
     durable = state
     for record in result.records:
         status = _HOOK_EVENT_TO_STATUS.get(record.event_name or "")
@@ -4217,6 +4249,34 @@ async def _forward_available_status_events(
                 record.transcript_path,
                 extra={"session_id": session_id},
             )
+            durable = next_durable
+            await _write_hook_state_async(bridge_dir, durable)
+            continue
+        retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
+        if record.event_cursor in superseded_failures:
+            # Preserve the historical failure without failing the newer completed turn.
+            try:
+                context = _stop_failure_context(
+                    record,
+                    session_id=session_id,
+                    parent_claude_session_ids=parent_claude_session_ids,
+                    diagnostic_health=diagnostic_health,
+                )
+                context.update(
+                    failure_decision="superseded", suppression_reason="later_completed_parent_turn"
+                )
+                _logger.info(
+                    "Claude failure superseded by a later completed parent turn; session=%s",
+                    session_id,
+                    extra=debug_event(
+                        "native_failure_observed",
+                        session_id=session_id,
+                        **failure_log_attributes(context),
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - telemetry cannot block status forwarding
+                _logger.debug("Claude historical failure telemetry failed: %s", type(exc).__name__)
+            retry_tracker.discard(retry_key)
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
             continue
@@ -4490,7 +4550,6 @@ async def _forward_available_status_events(
             durable = next_durable
             await _write_hook_state_async(bridge_dir, durable)
             continue
-        retry_key = f"hook:{record.event_cursor}:{record.byte_offset}:{status}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
             return durable
         failure_context: FailureContext | None = None

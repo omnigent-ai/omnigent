@@ -259,15 +259,14 @@ def store_databricks_auth(
 
 
 def store_databricks_org_id(server_url: str, org_id: str) -> None:
-    """Persist a workspace selector without replacing existing credentials.
+    """Persist a verified workspace selector without replacing existing credentials.
 
-    URL normalization calls this when a managed server URL carries ``?o=``.
-    Keeping the selector beside the server's existing auth record lets later
-    CLI helpers and child processes rebuild routing headers after the query has
-    been removed from the HTTP base URL.
+    Call after successful authentication and workspace validation. Before that,
+    use :func:`pin_databricks_org_id` to route this process and its children
+    without changing a saved login.
 
     :param server_url: Canonical server API base.
-    :param org_id: Workspace selector parsed from the user-supplied URL.
+    :param org_id: Workspace selector accepted by the server.
     """
     existing = _load_entry(server_url) or {}
     if existing.get("org_id") == org_id:

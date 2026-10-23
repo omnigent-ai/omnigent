@@ -3937,6 +3937,45 @@ def _host_daemon_alive() -> bool:
 _LOCAL_SERVER_DISCOVER_TIMEOUT_S = 120.0
 
 
+def _verified_databricks_org_id(
+    response: httpx.Response, requested_org_id: str | None
+) -> str | None:
+    """Check a successful auth probe's workspace before saving login details.
+
+    Older deployments omit the identity header; retain their successfully
+    authenticated selector. A reported identity must agree with the request.
+    """
+    reported_org_id = response.headers.get("x-databricks-org-id", "").strip() or None
+    if requested_org_id and reported_org_id and requested_org_id != reported_org_id:
+        from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+        exc = click.ClickException(
+            f"Requested workspace {requested_org_id}, but the server reports "
+            f"workspace {reported_org_id}. The server URL may be truncated or "
+            "point to a different workspace. Copy the full Omnigent URL from "
+            "the intended workspace and retry. Saved Omnigent login details were not changed."
+        )
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
+    return reported_org_id or requested_org_id
+
+
+def _persist_databricks_org_id(server: str, org_id: str) -> None:
+    """Save a verified selector with an actionable error on write failure."""
+    from omnigent.cli_auth import store_databricks_org_id
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    try:
+        store_databricks_org_id(server, org_id)
+    except OSError as error:
+        exc = click.ClickException(
+            "Could not persist the workspace routing selector. "
+            "Check that the Omnigent data directory is writable, then retry."
+        )
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc from error
+
+
 def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False) -> None:
     """Sign in (or fail with the login hint) for Databricks-fronted servers.
 
@@ -3969,11 +4008,14 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
 
     from omnigent.chat import _remote_headers
     from omnigent.cli_auth import (
+        is_workspace_hosted_url,
         load_databricks_org_id,
         load_databricks_workspace_host,
+        pinned_databricks_org_id,
         store_databricks_auth,
     )
 
+    org_id = load_databricks_org_id(server)
     headers = _remote_headers(server_url=server, host_id=None)
     try:
         probe = _httpx.get(f"{server}/v1/me", headers=headers, timeout=10.0)
@@ -3982,6 +4024,9 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         # already-actionable error rather than failing the pre-flight.
         return
     if probe.status_code == 200:
+        org_id = _verified_databricks_org_id(probe, org_id)
+        if org_id and is_workspace_hosted_url(server):
+            _persist_databricks_org_id(server, org_id)
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
     credential_rejected = False
@@ -3998,7 +4043,6 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
         credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
         return
-    org_id = load_databricks_org_id(server)
     auth_info = _databricks_workspace_auth_info(workspace_host)
     if auth_info is not None:
         if org_id is None:
@@ -4007,6 +4051,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             )
         refreshed_probe = _verify_databricks_server_token(server, auth_info.token, org_id)
         if refreshed_probe.status_code == 200:
+            org_id = _verified_databricks_org_id(refreshed_probe, org_id)
             store_databricks_auth(server, workspace_host, org_id=org_id)
             return
     # User-facing: show the display form (the workspace /omnigent URL, with
@@ -4025,10 +4070,13 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
             f"HTTP {probe.status_code}). Run `{login_cmd}` and retry."
         )
     click.echo(f"{state} — running `{login_cmd}` first.")
-    # Login selector comes from the URL, not the stored org_id used above: on a
-    # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
-    # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
-    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
+    # Preserve an explicit selector after normalization stripped the query.
+    # Without one, let the browser login resolve and bind its own workspace.
+    _databricks_login(
+        server,
+        workspace_host,
+        org_id=pinned_databricks_org_id(server) or _org_id_from_url(server),
+    )
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -13049,17 +13097,10 @@ def _resolve_server_url(server: str) -> ServerUrl:
         if org_id is not None:
             resolved = ServerUrl(api_base=api_base, org_id=org_id)
             if resolved.is_workspace_hosted:
-                from omnigent.cli_auth import pin_databricks_org_id, store_databricks_org_id
+                from omnigent.cli_auth import pin_databricks_org_id
 
-                # Pin first: the stored record is shared across workspaces on this host.
+                # Route this command and its children without saving an unverified selector.
                 pin_databricks_org_id(resolved.api_base, org_id)
-                try:
-                    store_databricks_org_id(resolved.api_base, org_id)
-                except OSError as exc:
-                    raise click.ClickException(
-                        "Could not persist the workspace routing selector. "
-                        "Check that the Omnigent data directory is writable, then retry."
-                    ) from exc
         else:
             resolved = ServerUrl.from_api_base(api_base)
         # Every remote CLI command resolves its server here, so this attributes
@@ -13338,6 +13379,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
             f"{workspace_host} accepted the login, but {display} rejected the token "
             f"(HTTP {verify.status_code}). Check that your user has access to this app."
         )
+    org_id = _verified_databricks_org_id(verify, org_id)
     user_id: str | None = None
     with contextlib.suppress(ValueError):
         raw_user = verify.json().get("user_id")
@@ -13349,10 +13391,7 @@ def _databricks_login(server: str, workspace_host: str, org_id: str | None = Non
         server,
         workspace_host,
         user_id=user_id,
-        # Recorded so later commands replay it as ``?o=`` to route requests
-        # and browser links append it. The login URL's selector wins; fall
-        # back to the org id the workspace stamps on responses.
-        org_id=org_id or verify.headers.get("x-databricks-org-id"),
+        org_id=org_id,
     )
     who = f" as {user_id}" if user_id else ""
     click.echo(
@@ -13589,7 +13628,12 @@ def login(server_url: str) -> None:
     # hosted omnigent) means Databricks fronts the server. This
     # lets one CLI command handle every posture without a flag.
     try:
-        probe = _httpx.get(f"{server}/v1/me", timeout=10.0, trust_env=_trust_env_for(server))
+        probe = _httpx.get(
+            f"{server}/v1/me",
+            params={"o": org_id} if org_id else None,
+            timeout=10.0,
+            trust_env=_trust_env_for(server),
+        )
     except _httpx.HTTPError as exc:
         raise click.ClickException(
             f"Could not reach {server}/v1/me: {exc}\nIs the server running?"
@@ -13611,6 +13655,9 @@ def login(server_url: str) -> None:
         with _contextlib.suppress(ValueError):
             detected_login_url = probe.json().get("login_url")
     elif probe.status_code == 200:
+        org_id = _verified_databricks_org_id(probe, org_id)
+        if org_id and resolved.is_workspace_hosted:
+            _persist_databricks_org_id(server, org_id)
         # Header mode (or already authenticated). Tell the user
         # they don't need to log in and exit cleanly.
         click.echo(
