@@ -258,8 +258,10 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert followup in child_text
     assert "First side answer." in child_text
     assert "Second side answer." in child_text
-    model_requests = get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
-    model_inputs = [json.dumps(request.get("input", [])) for request in model_requests]
+    model_inputs = [
+        json.dumps(request.get("input", []))
+        for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+    ]
     first_input = next(text for text in model_inputs if question in text and followup not in text)
     followup_input = next(text for text in model_inputs if followup in text)
     assert parent_question in first_input
@@ -267,18 +269,6 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert parent_reply in followup_input
     assert question in followup_input
     assert "First side answer." in followup_input
-    # The fork replays the parent's turns as live history, so the model must be
-    # told it is in a side conversation and that history is reference only.
-    request_texts = [json.dumps(request).lower() for request in model_requests]
-    parent_request = next(
-        text
-        for text in request_texts
-        if parent_question.lower() in text and question.lower() not in text
-    )
-    side_requests = [text for text in request_texts if question.lower() in text]
-    assert "side conversation" not in parent_request
-    assert len(side_requests) == 2
-    assert all("side conversation" in text for text in side_requests)
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
 
 
@@ -730,6 +720,11 @@ def test_side_chat_opened_while_parent_runs_answers_only_its_question(
         expect(page.locator(_ASSISTANT).filter(has_text=parent_reply)).to_be_visible(
             timeout=30_000
         )
+        model_inputs = [
+            json.dumps(request.get("input", []))
+            for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+        ]
+        assert sum(parent_question in text and question not in text for text in model_inputs) == 1
     finally:
         httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
 

@@ -358,17 +358,35 @@ async def test_patch_bind_side_chat_init_suppresses_recovery_turn(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Binding a side chat to a runner asks the runner to skip its recovery turn."""
+    """A copied sub-agent completion must not start a side-chat recovery turn."""
     captured = _stub_late_runner_bind(monkeypatch)
 
     agent = await create_test_agent(client)
     source = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert source.status_code == 201, source.text
+    notice = "[System: sub-agent worker finished. Summarize its result.]"
+    seeded = await client.post(
+        f"/v1/sessions/{source.json()['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": notice}],
+                },
+            },
+        },
+    )
+    assert seeded.status_code in (200, 202), seeded.text
     fork = await client.post(
         f"/v1/sessions/{source.json()['id']}/fork",
         json={"title": "Side chat", "side_chat": True},
     )
     assert fork.status_code == 201, fork.text
+    items = await client.get(f"/v1/sessions/{fork.json()['id']}/items")
+    assert items.status_code == 200, items.text
+    assert notice in items.text
     captured.pop("posts", None)
 
     patch = await client.patch(

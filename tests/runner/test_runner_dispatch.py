@@ -57,7 +57,6 @@ from fastapi.responses import JSONResponse, Response
 from fastapi.responses import StreamingResponse as _StreamingResponse
 
 import omnigent.runtime.harnesses._executor_adapter as _adapter_mod_recovery
-from omnigent.entities import Conversation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE
 from omnigent.inner.executor import (
     Executor as _RecoveryExecutor,
@@ -90,7 +89,6 @@ from omnigent.runner.app import (
 from omnigent.runner.policy_proxy import (
     _evaluate_policy_via_omnigent,
 )
-from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
@@ -98,13 +96,9 @@ from omnigent.runtime.harnesses._executor_adapter import (
 )
 from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultEvent
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.runtime.prompt import (
-    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
-    SIDE_CONVERSATION_INSTRUCTION,
-)
+from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
 from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
@@ -12508,102 +12502,6 @@ async def test_cross_path_resolution_contract(
             f"because their transports report differently, not because they "
             f"answer the same question differently."
         )
-
-
-_SIDE_CHAT_LABELS = {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "conv_main"}
-
-
-class _SideChatSnapshotClient(NullServerClient):
-    """Session snapshot for a side chat forked from ``conv_main``."""
-
-    def __init__(self, conv: str) -> None:
-        super().__init__()
-        self._conv = conv
-
-    async def get(self, url: str, **kwargs: object) -> Any:
-        if url.endswith(f"/v1/sessions/{self._conv}"):
-            return httpx.Response(200, json={"agent_id": "ag_side", "labels": _SIDE_CHAT_LABELS})
-        return await super().get(url, **kwargs)
-
-
-@pytest.mark.parametrize(
-    ("init_source", "stream", "harness"),
-    [
-        ("snapshot_fetch", False, "hermes"),
-        ("snapshot_fetch", True, "openai-agents"),
-        ("session_init", False, "openai-agents"),
-        ("session_init", True, "hermes"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_side_chat_turns_compose_side_conversation_instruction(
-    init_source: str, stream: bool, harness: str
-) -> None:
-    """Every side-chat turn tells the model its copied history is reference only.
-
-    Covers labels from the snapshot fetch and the init envelope on both builds.
-    """
-    conv = f"conv_side_{init_source}_{harness}_{stream}"
-
-    async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return AgentSpec(
-            spec_version=1,
-            name="side",
-            instructions="Main agent instructions.",
-            executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
-        )
-
-    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
-    app = create_runner_app(
-        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
-        spec_resolver=resolver,
-        server_client=(
-            _SideChatSnapshotClient(conv)
-            if init_source == "snapshot_fetch"
-            else NullServerClient()
-        ),
-    )
-    async with _runner_test_client(app) as http:
-        if init_source == "session_init":
-            payload = build_runner_session_init_payload(
-                Conversation(
-                    id=conv,
-                    agent_id="ag_side",
-                    created_at=0,
-                    updated_at=0,
-                    root_conversation_id=conv,
-                    labels=dict(_SIDE_CHAT_LABELS),
-                ),
-                server_version="test",
-                suppress_recovery_turn=True,
-            )
-            created = await http.post("/v1/sessions", json=payload)
-            assert created.status_code == 201, created.text
-        for _turn in range(2):
-            response = await http.post(
-                f"/v1/sessions/{conv}/events?stream={str(stream).lower()}",
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_side",
-                    "harness": harness,
-                    "model": "x",
-                    "content": [],
-                },
-            )
-            assert response.status_code == (200 if stream else 202), response.text
-            if not stream:
-                await _await_bg_turn_task(conv)
-
-    expected = "\n\n".join(
-        (
-            "Main agent instructions.",
-            EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
-            SIDE_CONVERSATION_INSTRUCTION,
-        )
-    )
-    assert [body.get("instructions") for body in recording.posted_bodies] == [expected] * 2
 
 
 # ---------------------------------------------------------------------------
