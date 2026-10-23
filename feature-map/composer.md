@@ -92,6 +92,9 @@ and steers messages while the agent is busy.
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+- `blocked-start`: hovering or focusing disabled Start explains the missing
+  setup. Clicking, tapping, or trying to submit pins that explanation until
+  dismissed or the missing setup is completed.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.
@@ -181,6 +184,10 @@ and steers messages while the agent is busy.
 
 **New-session composer** (landing page, or New session):
 
+- Write a prompt or attach a file before choosing a working directory. Hover
+  or focus disabled Start to see what is missing; click, tap, or press Enter to
+  keep the tooltip open. Click elsewhere or press Escape to dismiss it. Choose
+  a directory to clear the tooltip and enable Start.
 - Open `/?prompt=Explain%20this%20code`. Check that the
   draft is filled and editable, no session starts until Send, and an embedded
   deployment stays under its mount path. Browser proof:
@@ -284,6 +291,14 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **`blocked-start`:** on a fresh new-session page with no working directory,
+  enter a prompt or attach a file. Hover disabled Start, click it, then move
+  away: its tooltip should stay visible. Check dismissal by outside click,
+  Escape, or tabbing away from focused Start, plus Tab focus and Enter submission;
+  no session should be created.
+  Choose a working directory and check that the tooltip disappears and Start
+  enables. Repeat with a phone viewport and touch input. Component coverage:
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`offline-hosts`:**
   `tests/e2e_ui/start_session/test_start_session.py::test_start_session_keeps_offline_host_selected`
   covers the connected-host and managed-sandbox variants with stubbed host responses.

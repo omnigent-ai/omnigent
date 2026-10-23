@@ -225,6 +225,8 @@ class ShellPrOp:
         Replaces generic JSON/bare-URL extraction for this operation.
     :ivar parse_result: Optional parser that also needs structured tool results.
         Takes precedence over ``parse_output`` and generic extraction.
+    :ivar resolve_result: Optional lookup for identities absent from command output.
+        Runs in the background after success, separately from immediate PR operations.
     """
 
     tracks: bool
@@ -233,6 +235,7 @@ class ShellPrOp:
     content_only: bool
     parse_output: Callable[[str], Sequence[PullRequestRef]] | None = None
     parse_result: Callable[[object], Sequence[PullRequestRef]] | None = None
+    resolve_result: Callable[[object], Sequence[PullRequestRef]] | None = None
 
 
 @runtime_checkable

@@ -4562,6 +4562,10 @@ class HostProcess:
             )
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
+            if isinstance(exc, InvalidURI) or exc.response.status_code in (401, 403):
+                # Rediscover repaired credentials instead of reusing a rejected SDK cache.
+                self._auth_token_factory = None
+                self._auth_token_factory_resolved = False
             # The upgrade itself was rejected. Fail loud on permanent
             # failures (auth / authorization / outdated server); let the
             # reconnect loop retry transient ones.
