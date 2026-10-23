@@ -258,6 +258,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-postgres-${{ github.run_id }}
+          overwrite: true
           path: artifacts/
           retention-days: 14
 
@@ -309,6 +310,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-crdb-${{ matrix.crdb_version }}-${{ github.run_id }}
+          overwrite: true
           path: artifacts/
           retention-days: 14
 
@@ -357,6 +359,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-mysql-${{ github.run_id }}
+          overwrite: true
           path: artifacts/
           retention-days: 14
 
@@ -474,6 +477,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-codex-parity-${{ github.run_id }}
+          overwrite: true
           path: artifacts/
           retention-days: 14
 

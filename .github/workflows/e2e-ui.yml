@@ -149,6 +149,8 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: codex-parity-sidecar
+          # Failed-job reruns also download this when the build job is reused.
+          overwrite: true
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
           if-no-files-found: error
           retention-days: 1
@@ -232,7 +234,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: browser-contract-playwright-${{ github.run_id }}
+          name: browser-contract-playwright-${{ github.run_id }}-${{ github.run_attempt }}
           path: test-results/
           retention-days: 3
           if-no-files-found: ignore
@@ -417,9 +419,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          # Shard suffix avoids the matrix's parallel uploads colliding (v4
-          # 409s on dupe names).
-          name: e2e-ui-playwright-${{ github.run_id }}-shard${{ matrix.shard_id }}
+          # Keep each attempt's diagnostics without colliding across shards.
+          name: e2e-ui-playwright-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard_id }}
           # `playwright-report/` is the JS-runner's HTML dir, never produced
           # by pytest-playwright -- kept for forward-compat (ignore-if-absent).
           path: |
@@ -454,7 +455,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
+          name: e2e-ui-server-logs-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard_id }}
           # server.log + runner.log from the live_server and mocked-Codex
           # fixtures' tmp dirs, plus the native bridge dirs and the Claude /
           # Codex transcripts staged above -- all needed to triage a native
