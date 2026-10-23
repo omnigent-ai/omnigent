@@ -85,12 +85,17 @@ export const PULL_REQUEST_MARKDOWN_COMPONENTS: Components = { img: PullRequestIm
 // Summary tab unmounting when the reader switches tabs.
 
 interface DescriptionDraft {
+  /** Unique per opened editor, so an upload lands only in the draft it started in. */
+  id: number;
   body: string;
   uploading: number;
   error: string | null;
 }
 
 const descriptionDrafts = new Map<string, DescriptionDraft>();
+let lastDraftId = 0;
+// Page-wide, so a placeholder never repeats when the editor remounts.
+let lastUploadId = 0;
 const draftListeners = new Set<() => void>();
 
 function subscribeToDrafts(listener: () => void): () => void {
@@ -101,9 +106,10 @@ function subscribeToDrafts(listener: () => void): () => void {
 function updateDescriptionDraft(
   key: string,
   update: (draft: DescriptionDraft) => DescriptionDraft | null,
+  draftId?: number,
 ): void {
   const draft = descriptionDrafts.get(key);
-  if (!draft) return;
+  if (!draft || (draftId !== undefined && draft.id !== draftId)) return;
   const next = update(draft);
   if (next) descriptionDrafts.set(key, next);
   else descriptionDrafts.delete(key);
@@ -111,7 +117,8 @@ function updateDescriptionDraft(
 }
 
 function startDescriptionDraft(key: string, body: string): void {
-  descriptionDrafts.set(key, { body, uploading: 0, error: null });
+  lastDraftId += 1;
+  descriptionDrafts.set(key, { id: lastDraftId, body, uploading: 0, error: null });
   draftListeners.forEach((listener) => listener());
 }
 
@@ -129,6 +136,7 @@ export function insertOnOwnLine(body: string, text: string, start: number, end: 
 /** Forget every draft and uploaded image copy; for tests. */
 export function resetPullRequestDescriptionDrafts(): void {
   descriptionDrafts.clear();
+  lastUploadId = 0;
   uploadedImageCopies.forEach((copy) => URL.revokeObjectURL(copy));
   uploadedImageCopies.clear();
   draftListeners.forEach((listener) => listener());
@@ -336,7 +344,6 @@ function PullRequestDescriptionEditor({
   // Where an attachment goes: the last caret or selection, or the end before any.
   const selection = useRef<{ start: number; end: number } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const uploadCount = useRef(0);
   const editorRef = useRef<HTMLDivElement>(null);
   // Bring Save and Cancel into view when the editor opens low in the Summary tab.
   // Braced: newer browsers return a Promise, which React would call as a cleanup.
@@ -353,9 +360,11 @@ function PullRequestDescriptionEditor({
           error: "Only images and videos can be attached.",
         }));
       }
+      const draftId = descriptionDrafts.get(draftKey)?.id;
+      if (draftId === undefined) return;
       for (const file of media) {
-        uploadCount.current += 1;
-        const placeholder = `![Uploading ${file.name || "file"}…](#upload-${uploadCount.current})`;
+        lastUploadId += 1;
+        const placeholder = `![Uploading ${file.name || "file"}…](#upload-${lastUploadId})`;
         updateDescriptionDraft(draftKey, (current) => {
           const start = Math.min(
             selection.current?.start ?? current.body.length,
@@ -370,21 +379,29 @@ function PullRequestDescriptionEditor({
         uploadPullRequestAttachment(conversationId, prUrl, file).then(
           (attachment) => {
             rememberUploadedImage(attachment.url, file);
-            updateDescriptionDraft(draftKey, (current) => ({
-              ...current,
-              body: current.body.replace(placeholder, attachmentMarkdown(attachment, file.name)),
-              uploading: current.uploading - 1,
-            }));
+            updateDescriptionDraft(
+              draftKey,
+              (current) => ({
+                ...current,
+                body: current.body.replace(placeholder, attachmentMarkdown(attachment, file.name)),
+                uploading: current.uploading - 1,
+              }),
+              draftId,
+            );
           },
           (error: unknown) =>
-            updateDescriptionDraft(draftKey, (current) => ({
-              ...current,
-              body: current.body.replace(placeholder, ""),
-              uploading: current.uploading - 1,
-              error: `Couldn’t attach ${file.name || "the file"}: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            })),
+            updateDescriptionDraft(
+              draftKey,
+              (current) => ({
+                ...current,
+                body: current.body.replace(placeholder, ""),
+                uploading: current.uploading - 1,
+                error: `Couldn’t attach ${file.name || "the file"}: ${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              }),
+              draftId,
+            ),
         );
       }
     },

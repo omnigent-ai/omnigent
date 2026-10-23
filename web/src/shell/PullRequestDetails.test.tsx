@@ -305,6 +305,68 @@ it("uploads a pasted image at the caret and embeds GitHub's URL", async () => {
   expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
 });
 
+it("an upload from a discarded draft leaves the reopened draft alone", async () => {
+  const { uploads } = stubFetch();
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  renderDetails();
+  const screenshot = () => new File(["png"], "image.png", { type: "image/png" });
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+  fireEvent.change(editor(), { target: { value: "" } });
+  fireEvent.paste(editor(), { clipboardData: { files: [screenshot()] } });
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+  fireEvent.change(editor(), { target: { value: "" } });
+  fireEvent.paste(editor(), { clipboardData: { files: [screenshot()] } });
+  await waitFor(() => expect(uploads).toHaveLength(2));
+  const pending = "![Uploading image.png…](#upload-2)";
+  expect(editor()).toHaveValue(pending);
+
+  await act(async () => uploads[0].respond(json({ detail: "The discarded upload failed" }, 400)));
+  expect(editor()).toHaveValue(pending);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+  await act(async () => uploads[1].respond(attachment("image/png")));
+  await waitFor(() => expect(editor()).toHaveValue(`![image](${ASSET_URL})`));
+  expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+});
+
+it("an upload lands in its draft after the editor remounts", async () => {
+  const { uploads } = stubFetch();
+  const { view } = renderDetails();
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+  fireEvent.change(editor(), { target: { value: "" } });
+  fireEvent.paste(editor(), {
+    clipboardData: { files: [new File(["png"], "image.png", { type: "image/png" })] },
+  });
+  await waitFor(() => expect(uploads).toHaveLength(1));
+  view.unmount();
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <PullRequestDescription
+        conversationId="conv_1"
+        prUrl={PR_URL}
+        body="Old body"
+        editable
+        attachments
+      />
+    </QueryClientProvider>,
+  );
+  fireEvent.paste(editor(), {
+    clipboardData: { files: [new File(["png"], "image.png", { type: "image/png" })] },
+  });
+  expect(editor()).toHaveValue(
+    "![Uploading image.png…](#upload-1)\n![Uploading image.png…](#upload-2)",
+  );
+
+  await act(async () => uploads[0].respond(attachment("image/png")));
+  await waitFor(() =>
+    expect(editor()).toHaveValue(`![image](${ASSET_URL})\n![Uploading image.png…](#upload-2)`),
+  );
+});
+
 it("shows this tab's uploads from local copies, before and after saving", async () => {
   const { uploads } = stubFetch();
   const copies = stubObjectUrls();
