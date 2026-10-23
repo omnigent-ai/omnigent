@@ -432,7 +432,7 @@ function ShellTerminalPanel({
   // the card is too narrow to share a line. Only classes change, so focus stays.
   const actionsBesideCommand = cwd === null;
   const actions = (
-    <CodeBlockActions className="my-0 mr-0 ml-auto shrink-0 gap-1">
+    <CodeBlockActions className="my-0 mr-0 ml-auto shrink-0 gap-1 @max-[480px]/shell:-ml-1">
       <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
       <CopyTextButton label="Copy command" caption="command" text={command} />
       {hasOutput && (
@@ -459,7 +459,8 @@ function ShellTerminalPanel({
         className="@container/shell"
       >
         {cwd !== null && (
-          // On a narrow card the folder takes its own line and the actions wrap below it.
+          // On a narrow card the folder takes its own line and the actions wrap below
+          // it, left-aligned with the text.
           <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-3 pt-1.5">
             <span
               className="min-w-0 truncate font-mono text-muted-foreground text-xs @max-[480px]/shell:basis-full"
@@ -489,7 +490,7 @@ function ShellTerminalPanel({
                   className={
                     wrap
                       ? "float-right mt-1.5 mr-3 -mb-1 ml-2 @max-[480px]/shell:float-none @max-[480px]/shell:m-0 @max-[480px]/shell:flex @max-[480px]/shell:px-3 @max-[480px]/shell:pt-1.5"
-                      : "sticky left-0 flex justify-end px-3 pt-1.5"
+                      : "sticky left-0 flex justify-end px-3 pt-1.5 @max-[480px]/shell:justify-start"
                   }
                 >
                   {actions}
