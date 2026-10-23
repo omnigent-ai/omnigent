@@ -396,6 +396,8 @@ async def test_post_clear_supersession_notifies_old_session() -> None:
     notice_text = item_data["content"][0]["text"]
     assert "/clear" in notice_text
     assert "/c/conv_new" in notice_text
+    # Claude keeps the old conversation live, so it offers to resume here.
+    assert "resume this conversation" in notice_text
 
     _, _, event_body = calls[2]
     assert event_body == {
@@ -440,19 +442,26 @@ async def test_post_clear_supersession_swallows_post_failure() -> None:
     time this runs, so a notification error must not break the poll loop.
     """
 
+    posts: list[str] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        """Fail every POST so both best-effort calls hit their except path."""
+        """Fail every POST so each best-effort notice call hits its except path."""
+        posts.append(request.url.path)
         return httpx.Response(500, json={"error": {"message": "boom"}})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        # Must not raise despite both POSTs returning 500.
+        # Must not raise despite every POST returning 500.
         await forwarder._post_clear_supersession(
             client,
             old_session_id="conv_old",
             new_session_id="conv_new",
             agent_name="claude-native-ui",
         )
+
+    # Each post is independent: an early 500 must not short-circuit the rest, so
+    # all three events (idle status, notice message, redirect) are still attempted.
+    assert posts == ["/v1/sessions/conv_old/events"] * 3
 
 
 @pytest.mark.asyncio
