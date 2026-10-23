@@ -9,6 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
+import { stripAnsi } from "@/lib/shellToolOutput";
 import { cn } from "@/lib/utils";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import type { ComponentProps, CSSProperties, HTMLAttributes, ReactNode } from "react";
@@ -386,7 +387,11 @@ export const CodeBlockContent = ({
   leading?: ReactNode;
 }) => {
   // Memoized raw tokens for immediate display
-  const rawTokens = useMemo(() => createRawTokens(code), [code]);
+  // Raw ANSI escapes would flash on screen until the highlighter loads.
+  const rawTokens = useMemo(
+    () => createRawTokens(language === "ansi" ? stripAnsi(code) : code),
+    [code, language],
+  );
 
   // Synchronous cache lookup — avoids setState in effect for cached results
   const syncTokens = useMemo(

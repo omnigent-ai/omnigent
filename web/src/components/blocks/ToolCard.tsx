@@ -31,7 +31,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
-import { parseShellToolOutput, stripAnsi } from "@/lib/shellToolOutput";
+import { dropTrailingPartialEscape, parseShellToolOutput, stripAnsi } from "@/lib/shellToolOutput";
 import { iconForTool } from "@/lib/toolIcon";
 import {
   type ToolRunCall,
@@ -230,7 +230,8 @@ export function ToolCard({
             )}
           </>
         )}
-        {output === null &&
+        {shellCommand === null &&
+          output === null &&
           (state === "output-error" || state === "cancelled" || state === "no-output") && (
             <EmptyOutputState state={state} />
           )}
@@ -335,39 +336,42 @@ function ToolTriggerRow({
       <span className="min-w-0 flex-1 truncate">
         {title.verb !== null && <span className="font-semibold text-foreground">{title.verb}</span>}
         {title.verb !== null && title.body.length > 0 && " "}
-        {title.isShellCommand === true ? (
-          <ShellCommandLine command={title.body} />
-        ) : onBodyClick ? (
-          // Use <span role="link"> instead of <button> to avoid nesting
-          // interactive elements — CollapsibleTrigger already renders as
-          // a <button>, and nested buttons are invalid HTML.
-          <span
-            role="link"
-            tabIndex={0}
-            className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
-            onClick={(e) => {
-              e.stopPropagation();
-              onBodyClick();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault(); // prevent Space from triggering parent button's click via keyup
-                e.stopPropagation();
-                onBodyClick();
-              }
-            }}
-          >
-            {title.body}
-          </span>
-        ) : (
-          title.body
-        )}
+        <ToolTitleBody title={title} onBodyClick={onBodyClick} />
       </span>
       {duration !== undefined && (
         <span className="shrink-0 tabular-nums opacity-70">{formatToolDuration(duration)}</span>
       )}
       <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
     </CollapsibleTrigger>
+  );
+}
+
+/** The dynamic part of a trigger row: a shell command, a linked file path, or plain text. */
+function ToolTitleBody({ title, onBodyClick }: { title: ToolTitle; onBodyClick?: () => void }) {
+  if (title.isShellCommand === true) return <ShellCommandLine command={title.body} />;
+  if (!onBodyClick) return title.body;
+  return (
+    // Use <span role="link"> instead of <button> to avoid nesting
+    // interactive elements — CollapsibleTrigger already renders as
+    // a <button>, and nested buttons are invalid HTML.
+    <span
+      role="link"
+      tabIndex={0}
+      className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
+      onClick={(e) => {
+        e.stopPropagation();
+        onBodyClick();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault(); // prevent Space from triggering parent button's click via keyup
+          e.stopPropagation();
+          onBodyClick();
+        }
+      }}
+    >
+      {title.body}
+    </span>
   );
 }
 
@@ -467,7 +471,7 @@ function ShellTerminalPanel({
             output={parsed.text}
             renderPanel={(text) => (
               <CodeBlockContent
-                code={text}
+                code={dropTrailingPartialEscape(text)}
                 language="ansi"
                 wrap={wrap}
                 className={cn(TERMINAL_PRE_CLASS, "pt-0 pb-2")}
@@ -478,7 +482,12 @@ function ShellTerminalPanel({
         {parsed !== null && !hasOutput && (
           <div className="px-3 pb-2 font-mono text-muted-foreground text-xs">(no output)</div>
         )}
-        <ShellStatus state={state} exitCode={parsed?.exitCode ?? null} />
+        <ShellStatus
+          state={state}
+          exitCode={parsed?.exitCode ?? null}
+          timedOut={parsed?.timedOut ?? false}
+          hasOutput={output !== null}
+        />
       </CodeBlockContainer>
       {showRaw && (
         <CodePanel
@@ -500,7 +509,17 @@ const SHELL_PROMPT_STYLE = { "--shell-prompt": '"$\u00a0"' } as CSSProperties;
 const TERMINAL_PRE_CLASS = "px-3 !bg-transparent dark:!bg-transparent";
 
 /** Status line under the output; omitted when there is nothing to report. */
-function ShellStatus({ state, exitCode }: { state: ToolState; exitCode: number | null }) {
+function ShellStatus({
+  state,
+  exitCode,
+  timedOut,
+  hasOutput,
+}: {
+  state: ToolState;
+  exitCode: number | null;
+  timedOut: boolean;
+  hasOutput: boolean;
+}) {
   let status: ReactNode;
   if (state === "input-available") {
     status = (
@@ -509,6 +528,8 @@ function ShellStatus({ state, exitCode }: { state: ToolState; exitCode: number |
         running
       </span>
     );
+  } else if (timedOut) {
+    status = <span className="text-destructive">timed out</span>;
   } else if (exitCode !== null) {
     status = (
       <span className={exitCode === 0 ? "text-success" : "text-destructive"}>exit {exitCode}</span>
@@ -517,6 +538,8 @@ function ShellStatus({ state, exitCode }: { state: ToolState; exitCode: number |
     status = <span className="text-destructive">failed</span>;
   } else if (state === "cancelled") {
     status = <span className="text-muted-foreground">cancelled</span>;
+  } else if (state === "no-output" && !hasOutput) {
+    status = <span className="text-muted-foreground">no output recorded</span>;
   } else {
     return null;
   }

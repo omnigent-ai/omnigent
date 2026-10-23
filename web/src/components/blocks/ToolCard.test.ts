@@ -309,6 +309,34 @@ describe("ToolCard shell terminal panel", () => {
     expect(screen.getByText("running")).toBeInTheDocument();
   });
 
+  it.each([
+    ["output-error", "failed", "Tool did not return output before the response failed."],
+    ["cancelled", "cancelled", "Tool was cancelled before output arrived."],
+    ["no-output", "no output recorded", "No output was recorded for this tool call."],
+  ] as const)("reports %s once, inside the terminal", (state, status, genericMessage) => {
+    // WHY: the terminal's status line already says it; the generic box repeated it.
+    const { container } = renderCard({
+      name: "Bash",
+      arguments: { command: "make" },
+      output: null,
+      state,
+    });
+    expand(container);
+    expect(screen.getByText(status)).toBeInTheDocument();
+    expect(screen.queryByText(genericMessage)).toBeNull();
+  });
+
+  it("shows when sys_os_shell killed a command for timing out", () => {
+    const { container } = renderCard({
+      name: "sys_os_shell",
+      arguments: { command: "sleep 99" },
+      output: JSON.stringify({ stdout: "", stderr: "", exit_code: null, timed_out: true }),
+      state: "output-available",
+    });
+    expand(container);
+    expect(screen.getByText("timed out")).toBeInTheDocument();
+  });
+
   it("dims a leading env assignment in the collapsed row", () => {
     // WHY: long PATH=... prefixes otherwise bury the program being run.
     const { container } = renderCard({

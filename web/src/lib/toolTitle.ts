@@ -295,16 +295,33 @@ function stripOmnigentPrefix(name: string): string {
 // `/bin/bash -lc 'cat notes.txt'` or `/bin/zsh -lc ls`.
 const SHELL_WRAPPER_RE = /^(?:\S+\/)?(?:bash|zsh|sh|dash|fish)\s+-l?c\s+([\s\S]+)$/;
 
-/** Peel a login-shell wrapper (and its quotes) off a command string. */
-export function unwrapShellCommand(command: string): string {
-  const match = SHELL_WRAPPER_RE.exec(command.trim());
-  if (match === null) return command.trim();
-  const inner = match[1]!.trim();
-  const quote = inner[0];
-  if ((quote === "'" || quote === '"') && inner.length >= 2 && inner.endsWith(quote)) {
-    return inner.slice(1, -1).trim();
+/**
+ * Peel a login-shell wrapper (and its quoting) off a command string. Anything
+ * after the wrapper that is not exactly one shell word, e.g.
+ * `sh -c 'a' && echo 'b'`, is returned unchanged.
+ */
+function unwrapShellCommand(command: string): string {
+  const trimmed = command.trim();
+  const match = SHELL_WRAPPER_RE.exec(trimmed);
+  if (match === null) return trimmed;
+  return decodeShellWord(match[1]!.trim())?.trim() ?? trimmed;
+}
+
+/** Decode one shell word (`'it'\''s'`, `"a \"b\""`, `ls`), or `null` if it is not exactly one. */
+function decodeShellWord(text: string): string | null {
+  const piece = /'([^']*)'|"((?:[^"\\]|\\[\s\S])*)"|\\([\s\S])|([^\s'"\\]+)/y;
+  let decoded = "";
+  while (piece.lastIndex < text.length) {
+    const match = piece.exec(text);
+    if (match === null) return null;
+    const [, singleQuoted, doubleQuoted, escaped, bare] = match;
+    if (doubleQuoted !== undefined) {
+      decoded += doubleQuoted.replace(/\\([\\"$`])/g, "$1");
+    } else {
+      decoded += singleQuoted ?? escaped ?? bare;
+    }
   }
-  return inner;
+  return decoded;
 }
 
 /** Whether `name` is a shell-command tool in any harness (Bash, shell, sys_os_shell...). */
@@ -313,19 +330,22 @@ export function isShellTool(name: string): boolean {
 }
 
 /**
- * The command line a shell tool call ran, with any login-shell wrapper
- * peeled off, or `null` when the call is not a shell tool or carries no
- * string `command` argument.
+ * The command line a shell tool call ran, or `null` when the call is not a
+ * shell tool or carries no string `command`. Only Codex's `shell` adds a
+ * login-shell wrapper, so other harnesses' commands are shown as run.
  */
 export function shellCommandFor(name: string, args: Record<string, unknown>): string | null {
   if (!isShellTool(name)) return null;
   const command = asString(args.command);
-  return command === null ? null : unwrapShellCommand(command);
+  if (command === null) return null;
+  return stripOmnigentPrefix(name) === "shell" ? unwrapShellCommand(command) : command;
 }
 
 // Leading `NAME=value` assignments, with quoted values, e.g.
 // `PATH="$HOME/bin:$PATH" FOO=1 make` -> `PATH="$HOME/bin:$PATH" FOO=1 `.
-const ENV_PREFIX_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|\S*)\s+)+/;
+// Unquoted values stop at quotes and parens so `FOO="a b"c` never splits.
+const ENV_PREFIX_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'()`]*)\s+)+/;
+const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
  * Split leading environment assignments off a command so the row can dim
@@ -334,8 +354,11 @@ const ENV_PREFIX_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|\
  */
 export function splitEnvPrefix(command: string): { env: string; rest: string } {
   const match = ENV_PREFIX_RE.exec(command);
-  if (match === null || match[0].length === command.length) return { env: "", rest: command };
-  return { env: match[0], rest: command.slice(match[0].length) };
+  if (match === null) return { env: "", rest: command };
+  const rest = command.slice(match[0].length);
+  // Assignments with no program after them (`FOO=1 BAR=2`) are not a prefix.
+  if (rest.length === 0 || ASSIGNMENT_RE.test(rest)) return { env: "", rest: command };
+  return { env: match[0], rest };
 }
 
 function categorizeCall(call: ToolRunCall): RunCategory | "other" {

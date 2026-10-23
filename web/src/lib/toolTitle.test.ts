@@ -328,6 +328,21 @@ describe("shellCommandFor", () => {
     expect(shellCommandFor("Read", { command: "ls" })).toBeNull();
     expect(shellCommandFor("Bash", { command: 42 })).toBeNull();
   });
+
+  it("only unwraps Codex's shell, and keeps commands that are not one quoted word", () => {
+    // Claude ran this wrapper itself, so it is shown and copied as run.
+    expect(shellCommandFor("Bash", { command: "bash -c 'make test'" })).toBe("bash -c 'make test'");
+    // Only `a` runs inside sh; stripping the outer quotes would mangle the rest.
+    expect(shellCommandFor("shell", { command: "sh -c 'a' && echo 'b'" })).toBe(
+      "sh -c 'a' && echo 'b'",
+    );
+    expect(shellCommandFor("shell", { command: String.raw`/bin/bash -lc 'echo '\''hi'\'''` })).toBe(
+      "echo 'hi'",
+    );
+    expect(shellCommandFor("shell", { command: String.raw`/bin/zsh -lc "echo \"a b\""` })).toBe(
+      'echo "a b"',
+    );
+  });
 });
 
 describe("splitEnvPrefix", () => {
@@ -338,8 +353,12 @@ describe("splitEnvPrefix", () => {
     ],
     ["FOO=1 BAR='a b' make test", { env: "FOO=1 BAR='a b' ", rest: "make test" }],
     ["git status", { env: "", rest: "git status" }],
-    // A bare assignment is the whole command, not a prefix.
+    // Assignments with no program after them are not a prefix.
     ["FOO=1", { env: "", rest: "FOO=1" }],
+    ["FOO=1 BAR=2", { env: "", rest: "FOO=1 BAR=2" }],
+    // Never split inside a value.
+    ['FOO="a b"c make', { env: "", rest: 'FOO="a b"c make' }],
+    ["FOO=$(a b) cmd", { env: "", rest: "FOO=$(a b) cmd" }],
   ])("splits %s", (command, expected) => {
     expect(splitEnvPrefix(command)).toEqual(expected);
   });
