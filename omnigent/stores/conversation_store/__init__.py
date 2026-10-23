@@ -174,6 +174,9 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Server-owned origin, retained when a schedule's run history is deleted.
+SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place

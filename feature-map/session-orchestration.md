@@ -10,11 +10,15 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
 - `message`: private sender, same owner and workspace; shared destinations are
   allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
+  Existing owner-authorized reads remain allowed when a session is shared.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
 - `sharing`: sharing the sender blocks subsequent sends and independent creates.
   Existing work continues. Making it private restores eligibility.
+- `scheduled`: newly scheduled runs and their children cannot use the new sends
+  or independent creates. Ordinary scheduling, child work and reads stay available.
+  An owner can still message a long-lived private manager directly.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. A delivery timeout is uncertain and must not auto-retry.
@@ -43,6 +47,8 @@ can supply their own provider through the existing launcher interface.
   requests over HTTP and checks send, history reads, same-host creation, and
   sharing refusal. It also checks that unconfigured managed creation gives a clear
   refusal without creating a session. Codex and tmux are required for the native row.
+  It also fires an owner-created schedule through the real server/host and checks
+  that the resulting worker cannot message a peer or create an independent worker.
 - Component integration: `uv run --no-sync pytest
   tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   authenticated routes, ownership stores, refusal matrix and managed request /
@@ -66,6 +72,9 @@ can supply their own provider through the existing launcher interface.
   owner credentials or sanitize shared content the manager reads.
 - Already admitted work can finish after sharing changes. Unsharing does not
   erase prior conversation content.
+- Scheduled origin is recorded before launch, cannot be edited by clients, and
+  survives deletion of the schedule. Sessions predating this marker may have no
+  recoverable scheduling origin; their upgrade policy still needs a decision.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
 - The server enforces the flag even though tool schemas are discoverable while

@@ -281,3 +281,68 @@ def test_private_manager_launch_send_read_and_sharing(
                 wait_text(manager, "MANAGER_BLOCKED")
                 assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 assert "Shared sessions cannot" in json.dumps(get_mock_requests(mock))
+
+                configure(
+                    "SCHEDULED_MANAGER_TASK",
+                    [
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_message",
+                                    {
+                                        "session_id": worker,
+                                        "message": "SCHEDULED_MUST_NOT_DELIVER",
+                                    },
+                                    "scheduled-message",
+                                )
+                            ]
+                        },
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_create",
+                                    {"agent_id": agent, "placement": "same_host"},
+                                    "scheduled-create",
+                                )
+                            ]
+                        },
+                        {"text": "SCHEDULED_MANAGER_BLOCKED"},
+                    ],
+                )
+                response = client.post(
+                    "/v1/scheduled-tasks",
+                    json={
+                        "name": "Scheduled worker",
+                        "prompt": "SCHEDULED_MANAGER_TASK",
+                        "rrule": "FREQ=DAILY",
+                        "timezone": "UTC",
+                        "agent_id": agent,
+                        "host_id": host_id,
+                        "workspace": str(stack.workspace),
+                    },
+                )
+                assert response.status_code == 200, response.text
+                task_id = response.json()["id"]
+                response = client.post(f"/v1/scheduled-tasks/{task_id}/run")
+                assert response.status_code == 202, response.text
+                poll_until(
+                    lambda: (
+                        client.get(f"/v1/scheduled-tasks/{task_id}")
+                        .json()
+                        .get("last_run_conversation_id")
+                    ),
+                    timeout_s=60,
+                )
+                scheduled = client.get(f"/v1/scheduled-tasks/{task_id}").json()[
+                    "last_run_conversation_id"
+                ]
+                wait_text(scheduled, "SCHEDULED_MANAGER_BLOCKED")
+                assert "SCHEDULED_MUST_NOT_DELIVER" not in json.dumps(items(worker))
+                assert "Scheduled sessions cannot" in json.dumps(get_mock_requests(mock))
+                after_scheduled = {
+                    row["id"]
+                    for row in client.get("/v1/sessions", params={"visibility": "mine"}).json()[
+                        "data"
+                    ]
+                }
+                assert after_scheduled == before_managed | {scheduled}

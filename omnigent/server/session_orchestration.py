@@ -12,7 +12,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
 
@@ -34,6 +34,11 @@ def require_owned_session(
             break
         if is_session_closed(current.labels, current.title):
             break
+        if private and SCHEDULED_TASK_ORIGIN_LABEL_KEY in (current.labels or {}):
+            raise OmnigentError(
+                "Scheduled sessions cannot send messages or launch independent sessions",
+                code=ErrorCode.FORBIDDEN,
+            )
         seen.add(current.id)
         if current.parent_conversation_id is not None:
             current = conversations.get_conversation(current.parent_conversation_id)

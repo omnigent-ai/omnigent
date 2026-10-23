@@ -1,6 +1,7 @@
 """Runner dispatch through authenticated routes and real ownership/sharing stores."""
 
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -8,6 +9,7 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
@@ -156,6 +158,106 @@ async def test_child_inherits_source_sharing(auth_client, peers, db_uri):
     captured.clear()
     assert "error" in await _send(auth_client, child, target)
     assert not captured.get("posts")
+
+
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_reads(
+    auth_client, auth_app, peers, db_uri, execution_target
+):
+    from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests._helpers.polling import poll_until_async
+
+    source, target, captured = peers
+    conversations = SqlAlchemyConversationStore(db_uri)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    task = schedules.create(
+        scheduled_task_id=uuid4().hex,
+        name="Scheduled worker",
+        prompt="Ordinary scheduled work",
+        rrule="FREQ=HOURLY",
+        user_id="alice",
+        agent_id=source["agent_id"],
+        timezone="UTC",
+        execution_target=execution_target,
+        host_id=uuid4().hex,
+        workspace="/tmp",
+    )
+    labels_at_launch = []
+
+    async def launch(session, task):
+        labels_at_launch.append(session.labels)
+
+    on_fire = build_on_fire(
+        FireDeps(
+            scheduled_task_store=schedules,
+            agent_store=auth_app.state.agent_store,
+            conversation_store=conversations,
+            permission_store=SqlAlchemyPermissionStore(db_uri),
+            host_store=auth_app.state.host_store,
+            host_registry=auth_app.state.host_registry,
+            sandbox_config=auth_app.state.sandbox_config,
+        ),
+        launch_dispatch=launch,
+    )
+    assert await on_fire(0, task.id)
+    await poll_until_async(lambda: schedules.get(task.id).last_run_conversation_id, timeout_s=5)
+    scheduled_id = schedules.get(task.id).last_run_conversation_id
+    assert labels_at_launch[0][SCHEDULED_TASK_ORIGIN_LABEL_KEY] == task.id
+    schedules.delete(task.id)
+    assert schedules.list_runs(task.id)[0] == []
+
+    scheduled = {"id": scheduled_id}
+    auth_client.headers.update(_bind_runner(db_uri, scheduled_id))
+    for depth in range(3):
+        captured.clear()
+        result = await _send(auth_client, scheduled, target)
+        assert "Scheduled sessions cannot" in result["detail"], result
+        for placement in ("same_host", "managed"):
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps({"agent_id": source["agent_id"], "placement": placement}),
+                    server_client=auth_client,
+                    conversation_id=scheduled["id"],
+                )
+            )
+            assert result.get("error") == "access_denied", result
+        assert not captured.get("posts")
+        history = json.loads(
+            await execute_tool(
+                tool_name="sys_session_get_history",
+                arguments=json.dumps({"conversation_id": target["id"]}),
+                server_client=auth_client,
+                conversation_id=scheduled["id"],
+            )
+        )
+        assert "error" not in history, history
+        # Ordinary child creation retains its existing authorization and parentage.
+        if depth < 2:
+            response = await auth_client.post(
+                "/v1/sessions",
+                json={"agent_id": source["agent_id"], "parent_session_id": scheduled["id"]},
+            )
+            assert response.status_code == 201, response.text
+            scheduled = response.json()
+
+    for labels in (
+        {SCHEDULED_TASK_ORIGIN_LABEL_KEY: ""},
+        {SCHEDULED_TASK_ORIGIN_LABEL_KEY: "other"},
+    ):
+        response = await auth_client.patch(f"/v1/sessions/{scheduled_id}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], "labels": labels}
+        )
+        assert response.status_code == 400, response.text
+    response = await auth_client.patch(f"/v1/sessions/{scheduled_id}", json={"labels": {}})
+    assert response.status_code == 200, response.text
+    assert (
+        conversations.get_conversation(scheduled_id).labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY]
+        == task.id
+    )
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
