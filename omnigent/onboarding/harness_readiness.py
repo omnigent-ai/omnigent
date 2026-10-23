@@ -262,6 +262,13 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(HERMES_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
+    if canonical == "genie":
+        # Must agree with the picker map's genie branch: the host's quick probe
+        # uses this function, and a True here against a "binary-missing" map
+        # entry makes every readiness tick look like a new install.
+        from omnigent.onboarding.harness_install import GENIE_KEY
+
+        return _installer_only_availability(GENIE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -945,6 +952,15 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
         return False
+    if canonical == "genie":
+        # Genie is Databricks' fork of Codex: it uses the genie binary and
+        # authenticates via Databricks profile / AI Gateway, not Codex's
+        # subscription path. Gate readiness on the genie binary only, with the
+        # structured "binary-missing" reason Codex reports so the UI can show
+        # install guidance.
+        from omnigent.onboarding.harness_install import GENIE_KEY
+
+        return _binary_availability_reason(GENIE_KEY)
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
@@ -1014,9 +1030,15 @@ def harness_is_configured(harness: str) -> bool:
 
 
 def _is_codex_family_harness(canonical: str) -> bool:
-    """Return whether a canonical harness uses Codex readiness semantics."""
+    """Return whether a canonical harness uses Codex readiness semantics.
+
+    Genie is in ``CODEX_CANONICAL_HARNESSES`` for model routing but gates on its
+    own binary, so it must not share Codex's readiness probe or cache entry.
+    """
     return (
-        canonical in CODEX_CANONICAL_HARNESSES and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+        canonical in CODEX_CANONICAL_HARNESSES
+        and canonical != "genie"
+        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
     )
 
 

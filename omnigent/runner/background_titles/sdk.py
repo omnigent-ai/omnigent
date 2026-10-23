@@ -22,18 +22,21 @@ _logger = logging.getLogger("omnigent.runner.background_titles.sdk")
 async def generate_background_title(context: BackgroundTitleContext) -> str | None:
     """Generate a title with a synthetic tool-free SDK harness session."""
     spawn_env = dict(context.spawn_env)
-    if context.harness == "codex":
+    if context.harness in ("codex", "genie"):
+        # Genie (codex fork) reads the same knobs under HARNESS_GENIE_*; the
+        # minimal-config flag is read by the shared executor under its codex name.
+        prefix = "HARNESS_GENIE_" if context.harness == "genie" else "HARNESS_CODEX_"
         spawn_env.update(
             {
-                "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "1",
-                "HARNESS_CODEX_ENABLE_WEB_SEARCH": "0",
+                f"{prefix}DISABLE_NATIVE_TOOLS": "1",
+                f"{prefix}ENABLE_WEB_SEARCH": "0",
                 "HARNESS_CODEX_MINIMAL_CONFIG": "1",
-                "HARNESS_CODEX_SKILLS_FILTER": json.dumps("none"),
-                "HARNESS_CODEX_SKILLS_DIR": "",
+                f"{prefix}SKILLS_FILTER": json.dumps("none"),
+                f"{prefix}SKILLS_DIR": "",
             }
         )
-        spawn_env.pop("HARNESS_CODEX_AGENT_NAME", None)
-        spawn_env.pop("HARNESS_CODEX_BUNDLE_DIR", None)
+        spawn_env.pop(f"{prefix}AGENT_NAME", None)
+        spawn_env.pop(f"{prefix}BUNDLE_DIR", None)
     else:
         spawn_env["HARNESS_CLAUDE_SDK_SKILLS_FILTER"] = json.dumps("none")
         spawn_env.pop("HARNESS_CLAUDE_SDK_AGENT_NAME", None)

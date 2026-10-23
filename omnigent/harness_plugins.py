@@ -604,6 +604,20 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
+    # Genie is Databricks' fork of the codex CLI, driven over the identical
+    # app-server protocol; same capabilities as codex.
+    "genie": _C(
+        _IM.CLI_SUBPROCESS,
+        _EL.JSONRPC,
+        _RS.WARM_REATTACH,
+        _EF.OPENAI,
+        _MF.GPT,
+        _AU.OMNIGENT_CREDENTIAL,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        instruction_delivery=_ID.COMPOSED_PER_TURN,
+    ),
     "pi": _C(
         _IM.CLI_SUBPROCESS,
         _EL.NONE,
@@ -769,6 +783,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "cursor",
             "cursor-native",
             "devin-native",
+            "genie",
             "goose",
             "goose-native",
             "hermes",
@@ -802,6 +817,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "omnigent.inner.copilot_harness",
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
+        "genie": "omnigent.inner.genie_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
@@ -908,6 +924,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "HARNESS_CODEX_MODEL",
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
+        "genie": "HARNESS_GENIE_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
@@ -929,6 +946,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex-native": BackgroundTitleGeneratorSpec(
             "omnigent.runner.background_titles.codex_native:generate_background_title"
         ),
+        "genie": BackgroundTitleGeneratorSpec(
+            "omnigent.runner.background_titles.sdk:generate_background_title"
+        ),
     },
     harness_labels={
         "antigravity": "Antigravity",
@@ -937,6 +957,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "Copilot",
         "cursor": "Cursor",
         "devin-native": "Devin",
+        "genie": "Genie",
         "hermes": "Hermes",
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free

@@ -105,6 +105,48 @@ async def _runner_client(app):
 
 
 @pytest.mark.asyncio
+async def test_background_title_isolates_genie_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Genie (codex fork) gets the codex title-worker isolation under its own vars."""
+    harness_client = _FakeHarnessClient()
+    process_manager = _FakeProcessManager(harness_client)
+
+    async def resolve_harness_config(**kwargs: Any) -> tuple[str, dict[str, str]]:
+        return "genie", {
+            "HARNESS_GENIE_MODEL": "gpt-5.4-mini",
+            "HARNESS_GENIE_SKILLS_DIR": "/parent-session-skills",
+            "HARNESS_GENIE_AGENT_NAME": "genie",
+            "HARNESS_GENIE_BUNDLE_DIR": "/bundle",
+        }
+
+    monkeypatch.setattr("omnigent.runner.app._resolve_harness_config", resolve_harness_config)
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/background-title",
+            json={
+                "prompt": "please investigate the authentication timeout",
+                "agent_id": "agent_test",
+            },
+        )
+
+    assert response.status_code == 200
+    [(_process_key, harness, env)] = process_manager.get_client_calls
+    assert harness == "genie"
+    assert env == {
+        "HARNESS_GENIE_DISABLE_NATIVE_TOOLS": "1",
+        "HARNESS_GENIE_ENABLE_WEB_SEARCH": "0",
+        "HARNESS_CODEX_MINIMAL_CONFIG": "1",
+        "HARNESS_GENIE_MODEL": "gpt-5.4-mini",
+        "HARNESS_GENIE_SKILLS_FILTER": '"none"',
+        "HARNESS_GENIE_SKILLS_DIR": "",
+    }
+
+
+@pytest.mark.asyncio
 async def test_background_title_uses_isolated_codex_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
