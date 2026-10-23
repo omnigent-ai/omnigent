@@ -5,7 +5,7 @@ import json
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -186,9 +186,7 @@ def _second_compaction() -> list[dict[str, Any]]:
 
 
 def _claude_timestamp(moment: datetime) -> str:
-    return (
-        moment.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    )
+    return moment.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _write_transcript(
@@ -371,7 +369,7 @@ def test_hook_snapshot_rejects_attachment_chain_to_an_older_boundary(
     _, transcript = _write_transcript(tmp_path, monkeypatch, entries)
 
     with pytest.raises(ValueError, match="Claude compaction summary is not available yet"):
-        forwarder._restore_preserved_compaction_messages(transcript, [])
+        forwarder._latest_compact_summary_uuid(transcript)
 
 
 @pytest.mark.parametrize("missing", ["request", "summary"])
@@ -444,7 +442,7 @@ def test_hook_completion_waits_for_the_summary_of_a_boundary_without_retained_me
 def test_hook_completion_ignores_a_boundary_written_before_its_precompact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_timestamp: str | None
 ) -> None:
-    precompact_seen_at = datetime(2026, 5, 27, 22, 53, 20, tzinfo=timezone.utc)
+    precompact_seen_at = datetime(2026, 5, 27, 22, 53, 20, tzinfo=UTC)
     entries = _transcript()
     if stale_timestamp is not None:
         next(entry for entry in entries if entry["uuid"] == "boundary")["timestamp"] = (
@@ -557,9 +555,7 @@ async def test_completion_hook_binds_to_the_boundary_of_its_own_compaction(
         # until Claude writes this compaction's boundary and summary.
         assert hook_state.event_cursor == 0
         assert boundaries == []
-        boundary["timestamp"] = _claude_timestamp(
-            datetime.now(timezone.utc) + timedelta(seconds=5)
-        )
+        boundary["timestamp"] = _claude_timestamp(datetime.now(UTC) + timedelta(seconds=5))
         entries.extend([boundary, summary])
         transcript.write_text(
             "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
@@ -594,7 +590,7 @@ async def test_completion_hook_dates_the_boundary_from_when_precompact_fired(
 ) -> None:
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
-    fired_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    fired_at = datetime.now(UTC) - timedelta(minutes=5)
     entries = _transcript()
     next(entry for entry in entries if entry["uuid"] == "boundary")["timestamp"] = (
         _claude_timestamp(fired_at + timedelta(seconds=30))
