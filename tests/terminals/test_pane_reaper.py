@@ -15,6 +15,16 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.subagent_work import (
+    get_subagent_work,
+    mark_subagent_work_started,
+    mark_subagent_work_terminal,
+    mark_subagent_work_waiting,
+    register_child_session,
+    register_subagent_work,
+    unregister_child_session,
+    unregister_subagent_work_for_session,
+)
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
@@ -295,3 +305,79 @@ async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(
     assert await reaper._is_busy(pane)
     instance._last_client_interaction_at = time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 1.0
     assert not await reaper._is_busy(pane)
+
+
+async def test_runner_busy_check_spares_a_pane_with_a_running_subagent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pane is busy while a background sub-agent it spawned is still running.
+
+    A Codex background sub-agent runs in the parent's app-server with no parent
+    turn, pane status, approval or tmux input of its own, so every parent-local
+    signal reads idle. The reaper must still hold the pane while the child's
+    work is in flight, or it reaps the pane and kills the child mid-task.
+    """
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    parent = "conv_subagent_parent"
+    child = "conv_subagent_child"
+    pane = PaneRef(parent, terminal_resource_id("codex", "main"), "codex", tmp_path / "tmux.sock")
+
+    try:
+        # No sub-agent yet: every signal idle, so the pane is reapable.
+        assert not await reaper._is_busy(pane)
+
+        register_child_session(
+            child,
+            parent_session_id=parent,
+            title="Codex:essay",
+            tool="Codex",
+            session_name="essay",
+        )
+        entry = register_subagent_work(
+            parent_session_id=parent,
+            child_session_id=child,
+            agent="Codex",
+            title="essay",
+            wrapper_label="codex-native-ui-subagent",
+        )
+        mark_subagent_work_started(child)
+        assert entry.status == "running"
+        assert await reaper._is_busy(pane)
+
+        # The running child spares only its own parent's pane.
+        other = PaneRef(
+            "conv_other", terminal_resource_id("codex", "main"), "codex", tmp_path / "tmux.sock"
+        )
+        assert not await reaper._is_busy(other)
+
+        # A restart-orphaned "waiting" entry has unknown liveness and must not
+        # pin the pane. A genuinely resumed child re-enters "running" and holds.
+        assert mark_subagent_work_waiting(child).status == "waiting"
+        assert not await reaper._is_busy(pane)
+        assert mark_subagent_work_started(child).status == "running"
+        assert await reaper._is_busy(pane)
+
+        # A terminal child no longer holds the pane: it may be reaped again.
+        mark_subagent_work_terminal(child, status="completed", output=None)
+        assert get_subagent_work(child).status == "completed"
+        assert not await reaper._is_busy(pane)
+
+        # The waiting helper must not un-terminalize a delivered child and so
+        # re-pin a finished pane.
+        assert mark_subagent_work_waiting(child).status == "completed"
+        assert not await reaper._is_busy(pane)
+    finally:
+        unregister_subagent_work_for_session(parent)
+        unregister_child_session(child)

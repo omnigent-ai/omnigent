@@ -170,6 +170,7 @@ from omnigent.runner.subagent_routing import (
 )
 from omnigent.runner.subagent_work import (
     _CODEX_NATIVE_HARNESS,
+    _SUBAGENT_ACTIVE_STATUSES,
     _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
     _SUBAGENT_TERMINAL_STATUSES,
     _WAKE_POST_MAX_ATTEMPTS,
@@ -7795,6 +7796,13 @@ def create_runner_app(
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
+                return True
+            # A background sub-agent runs in the parent's app-server with no
+            # parent turn, status, approval or pane output; hold the pane while a
+            # child dispatch is actively in flight, else reaping strands it.
+            if any(
+                entry.status in _SUBAGENT_ACTIVE_STATUSES for entry in list_subagent_work(conv_id)
+            ):
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a
