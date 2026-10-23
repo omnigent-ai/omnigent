@@ -15,8 +15,11 @@ labels are untouched. A snapshot requires a version. A non-null version with a
 null snapshot means a compatible writer has explicitly cleared the current
 error. A null version means ownership is unknown and recovery must be refused.
 The existing primary key `(workspace_id, id)` serves every lookup; no secondary
-index or duplicate status column is added. No runtime model or codec consumes
-these columns in this prerequisite.
+index or duplicate status column is added. The table metadata reserves the same
+columns and checks for CockroachDB's fresh `create_all` plus stamp bootstrap.
+Both columns are excluded from the ORM mapper, so ordinary reads and writes
+remain compatible with the preceding schema. No runtime consumer or codec is
+introduced in this prerequisite.
 
 ## Required application contract
 

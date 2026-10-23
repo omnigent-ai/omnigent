@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from sqlalchemy.orm import Session
 
+from omnigent.db.db_models import ConversationBase, OmnigentBase, SqlConversationMetadata
 from omnigent.db.utils import _build_alembic_config
 
 _PREVIOUS = "c8e4f2a6b901"
@@ -250,3 +252,65 @@ def test_offline_ddl_has_binary_bounds_without_defaults(dialect: str, uuid_type:
     assert "length(live_error_state) <= 16383" in sql
     assert "live_error_state IS NULL OR live_status_version IS NOT NULL" in sql
     assert "DEFAULT" not in sql
+
+
+def test_reserved_columns_do_not_change_orm_reads_or_writes(prior_engine: sa.Engine) -> None:
+    reserved = {"live_status_version", "live_error_state"}
+    assert reserved.issubset(SqlConversationMetadata.__table__.c.keys())
+    assert reserved.isdisjoint(sa.inspect(SqlConversationMetadata).attrs.keys())
+    assert reserved.isdisjoint(column["name"] for column in _columns(prior_engine, _TABLE))
+    statements: list[str] = []
+
+    def record_sql(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    sa.event.listen(prior_engine, "before_cursor_execute", record_sql)
+    with Session(prior_engine) as session:
+        existing = session.scalars(sa.select(SqlConversationMetadata)).one()
+        existing.live_status = 1
+        session.add(SqlConversationMetadata(id="fedcba9876543210fedcba9876543210", kind=1))
+        session.commit()
+    assert any(statement.startswith("INSERT") for statement in statements)
+    assert any(statement.startswith("UPDATE") for statement in statements)
+    assert any(statement.startswith("SELECT") for statement in statements)
+    assert all(name not in statement for name in reserved for statement in statements)
+
+
+def test_create_all_and_stamp_bootstrap_matches_migrated_ownership_schema(
+    prior_engine: sa.Engine, tmp_path: Path
+) -> None:
+    _migrate(prior_engine, _REVISION)
+    reserved = {"live_status_version", "live_error_state"}
+    migrated_columns = [
+        column for column in _columns(prior_engine, _TABLE) if column["name"] in reserved
+    ]
+    migrated_checks = {
+        check["name"]: check["sqltext"]
+        for check in sa.inspect(prior_engine).get_check_constraints(_TABLE)
+        if check["name"].startswith("ck_conv_meta_live_")
+    }
+    bootstrap = sa.create_engine(f"sqlite:///{tmp_path / 'bootstrap.db'}")
+    try:
+        # Fresh CockroachDB uses model create_all + stamp, bypassing migration upgrade.
+        OmnigentBase.metadata.create_all(bootstrap)
+        ConversationBase.metadata.create_all(bootstrap)
+        config = _build_alembic_config(str(bootstrap.url))
+        with bootstrap.begin() as connection:
+            config.attributes["connection"] = connection
+            command.stamp(config, _REVISION)
+        assert [
+            column for column in _columns(bootstrap, _TABLE) if column["name"] in reserved
+        ] == migrated_columns
+        assert {
+            check["name"]: check["sqltext"]
+            for check in sa.inspect(bootstrap).get_check_constraints(_TABLE)
+            if check["name"].startswith("ck_conv_meta_live_")
+        } == migrated_checks
+        _migrate(bootstrap, _PREVIOUS, downgrade=True)
+        assert reserved.isdisjoint(column["name"] for column in _columns(bootstrap, _TABLE))
+        _migrate(bootstrap, _REVISION)
+        assert [
+            column for column in _columns(bootstrap, _TABLE) if column["name"] in reserved
+        ] == migrated_columns
+    finally:
+        bootstrap.dispose()
