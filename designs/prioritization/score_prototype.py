@@ -27,7 +27,7 @@ import os
 import re
 import sys
 
-NOW = datetime.datetime.now(datetime.timezone.utc)
+NOW = datetime.datetime.now(datetime.UTC)
 
 # ── Tunable weights ──────────────────────────────────────────────────────
 # Severity tiers are checked most-severe first; first match wins. Kept narrow

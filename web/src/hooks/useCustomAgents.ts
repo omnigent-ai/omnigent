@@ -123,7 +123,7 @@ export function useCustomAgentConfig(id: string) {
 export function usePatchCustomAgent(id: string) {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ etag, patch }: { etag: string; patch: AgentConfigPatch }) =>
+    mutationFn: ({ etag, patch }: { etag: string | null; patch: AgentConfigPatch }) =>
       patchAgentConfig(id, etag, patch),
     retry: false,
     gcTime: 0,

@@ -7,16 +7,16 @@ exclude: ^omnigent/server/static/web-ui/
 repos:
   - repo: local
     hooks:
-      - id: ruff-format
-        name: ruff format
-        language: system
-        entry: .venv/bin/python -m ruff format --force-exclude
-        types: [python]
-
       - id: ruff-check
         name: ruff check
         language: system
         entry: .venv/bin/python -m ruff check --fix --force-exclude
+        types: [python]
+
+      - id: ruff-format
+        name: ruff format
+        language: system
+        entry: .venv/bin/python -m ruff format --force-exclude
         types: [python]
 
       - id: pyrefly

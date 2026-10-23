@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from fastapi import FastAPI
@@ -777,7 +777,7 @@ def test_daily_cost_recorded_for_owned_session_without_a_policy(app: FastAPI, st
     regression that re-added the gate would leave ``get_daily_cost`` at 0.0.
     """
     conversation_store = stores[0]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     sid = _seed_session(stores, owner=ALICE, title="no-policy session")
     resp = TestClient(app).post(
         f"/v1/sessions/{sid}/events",
@@ -801,7 +801,7 @@ def test_daily_cost_tracks_display_cost_not_policy_cost(app: FastAPI, stores) ->
     the rollup would over-report the daily total by the gate's mid-turn lead.
     """
     conversation_store = stores[0]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     sid = _seed_session(stores, owner=ALICE, title="cost split session")
     resp = TestClient(app).post(
         f"/v1/sessions/{sid}/events",
@@ -836,7 +836,7 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
     cumulative spend on the child, and asserts the owner's daily total rises.
     """
     conversation_store, _agent_store, _permission_store = stores
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
 
     # Parent session — owned by Alice.
     parent_id = _seed_session(stores, owner=ALICE, title="parent session")

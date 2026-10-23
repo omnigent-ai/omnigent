@@ -3,9 +3,8 @@ name: Maintainer Approval
 # Gates merge on a maintainer's approval, except for explicitly trusted automation
 # authors. The job *is* the required check: it exits non-zero until approval (or
 # a trusted author) is present, and GitHub reports that pass/fail as the
-# `Maintainer Approval` status. No commit status is posted (a fork's token
-# is read-only, so a `gh api .../statuses` POST would 403), so the check is the
-# job result instead.
+# `Maintainer Approval` status. Before granting a dependency exemption it
+# invalidates Merge Ready; workflow completion triggers fresh evidence checks.
 #
 # Trigger is `pull_request_target`, so it runs from main with the base token
 # even for fork PRs: it isn't held behind the fork-PR-workflow approval gate
@@ -23,7 +22,7 @@ name: Maintainer Approval
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -40,11 +39,12 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
+      statuses: write  # invalidate readiness before granting a dependency exemption
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check out approval evaluator
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           sparse-checkout: |
@@ -56,6 +56,7 @@ jobs:
           persist-credentials: false
 
       - name: Install trusted policy parser
+        continue-on-error: true
         if: >-
           github.event.pull_request.user.login == 'dependabot[bot]' &&
           vars.DEPENDABOT_AUTOMERGE_MODE == 'merge'

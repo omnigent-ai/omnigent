@@ -27,16 +27,30 @@ reattach when the session moves to another host.
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
   says so and routes the user to the terminal.
+- `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
+  into shell panes, resize them (each side stays within 25–75%), and close them.
 
 ## How to get to it (user POV)
 
 **Agent terminal** (sessions whose harness has a terminal):
+
+Native subagents that share a parent's terminal show their work in chat and have
+no Chat/Terminal switcher. Open the parent session to use its terminal. Children
+with their own terminal retain the switcher.
 
 - Use the Chat/Terminal switcher in the session header.
 - Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
 - Choose Resume when the terminal shows as stopped.
+- On desktop with `grid_sessions_display_ui` enabled, use each grid cell's header switch.
+  The shortcut targets the active cell; shells remain in the shared Workspace.
+- On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
+  right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
+  divider (or focus it and use the arrow keys along its axis) to resize. "Close
+  pane" asks for confirmation, then kills the focused shell; the agent pane
+  cannot be closed. Panes are saved per session in this browser and show only
+  for desktop owners outside grid cells.
 
 **User shells:**
 
@@ -68,12 +82,21 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
+  Grid cells: `tests/browser_ui/chat/test_session_grid.py` covers two real xterm
+  surfaces against mocked terminal WebSockets, independent input, per-cell
+  switches and keeping connections across view changes. Run without a server
+  using `--browser-ui-skip-build --reruns 0 --video=on`.
   `tests/e2e_ui/shells/test_new_shell.py::test_starting_terminal_view_shows_loading_without_resume`,
   `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`.
   The stopped state with a selectable empty terminal (own environment):
   `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
   kills the session's runner, so it fails under `verify-env run`; run it with
   plain `uv run pytest`.
+  Native child ownership and live output (opt-in, own environment):
+  `tests/e2e/test_codex_native_child_visibility_e2e.py`.
+  This uses real Codex credentials and holds a child command open while checking
+  the parent terminal and child chat; see the prerequisites in
+  `tests/harnesses/codex_native/forwarder/README.md`.
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
@@ -121,6 +144,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  working/blocked status with an attached or closed viewer and the flag-off
+  fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 
 ## Gotchas
 

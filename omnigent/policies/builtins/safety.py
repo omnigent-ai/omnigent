@@ -355,15 +355,108 @@ def ask_on_add_policy(event: PolicyEvent) -> PolicyResponse:
     }
 
 
+# Agent tools that create or reshape unattended work. The builder injects
+# ``ask_on_scheduled_task_change`` into every engine and exempts these names
+# from its no-policy fast path; both read this set so they cannot drift.
+SCHEDULED_TASK_APPROVAL_TOOLS: frozenset[str] = frozenset(
+    {"sys_scheduled_task_create", "sys_scheduled_task_update"}
+)
+
+
+# Settings a user weighs before approving, shown first in this order so
+# unexpected extra arguments cannot push them out of the prompt.
+_SCHEDULED_TASK_SETTINGS = (
+    "name",
+    "agent_id",
+    "rrule",
+    "timezone",
+    "state",
+    "host_id",
+    "workspace",
+    "execution_target",
+    "permission_mode",
+    "max_cost_usd",
+    "model_override",
+    "reasoning_effort",
+    "prompt",
+)
+_PREVIEW_VALUE_CHARS = 60
+_PREVIEW_EXTRA_CHARS = 200
+
+
+def _clip(value: str) -> str:
+    """Bound a preview value, marking the cut so it cannot pass for the whole value."""
+    if len(value) > _PREVIEW_VALUE_CHARS:
+        return value[: _PREVIEW_VALUE_CHARS - 3] + "..."
+    return value
+
+
+def _scheduled_task_settings(args: dict[str, object], *, skip: str) -> str:
+    """``key=value`` pairs for every argument but ``skip``, each value bounded.
+
+    Known settings come first and are never dropped; other arguments follow and
+    are capped as a group. The free-text prompt can be long enough to push the
+    settings out of the card's truncated argument preview, so it is reported by
+    length only.
+    """
+
+    def pair(key: str) -> str:
+        value = str(args[key])
+        if key == "prompt":
+            return f"prompt={len(value)} chars"
+        return f"{key}={_clip(value)}"
+
+    known = [pair(key) for key in _SCHEDULED_TASK_SETTINGS if key in args and key != skip]
+    keys = sorted(key for key in args if key not in _SCHEDULED_TASK_SETTINGS and key != skip)
+    extra: list[str] = []
+    remaining = _PREVIEW_EXTRA_CHARS
+    for index, key in enumerate(keys):
+        item = pair(key)
+        size = len(item) + (2 if extra else 0)
+        suffix = 5 if index < len(keys) - 1 else 0
+        if size + suffix > remaining:
+            extra.append("...")
+            break
+        extra.append(item)
+        remaining -= size
+    return ", ".join([*known, *extra])
+
+
 def ask_on_scheduled_task_change(event: PolicyEvent) -> PolicyResponse:
-    """Require approval before an agent persists or changes unattended work."""
+    """ASK for user approval before an agent creates or updates a scheduled task.
+
+    Matches ``event["target"]`` (the dispatched tool identity) rather than
+    ``data["name"]``, which an earlier policy may have transformed. Reads
+    and ``sys_scheduled_task_delete`` are not gated here: deleting a task
+    only removes future runs instead of scheduling new unattended work.
+
+    :param event: Policy event dict.
+    :returns: ASK if a scheduled task is being created or updated, ALLOW
+        otherwise.
+    """
     if event.get("type") != "tool_call":
         return _ALLOW
-    if event.get("target") not in {"sys_scheduled_task_create", "sys_scheduled_task_update"}:
+    tool = event.get("target")
+    if tool not in SCHEDULED_TASK_APPROVAL_TOOLS:
         return _ALLOW
+    data = event.get("data")
+    args = data.get("arguments") if isinstance(data, dict) else None
+    if not isinstance(args, dict):
+        args = {}
+    action = "create" if tool == "sys_scheduled_task_create" else "update"
+    if not args:
+        preview = f"{action} a scheduled task (details unavailable)"
+    elif action == "create":
+        name = _clip(str(args.get("name") or "(unnamed)"))
+        settings = _scheduled_task_settings(args, skip="name")
+        preview = f"create scheduled task {name!r} ({settings or 'no settings'})"
+    else:
+        task_id = _clip(str(args.get("scheduled_task_id") or "(no id)"))
+        settings = _scheduled_task_settings(args, skip="scheduled_task_id")
+        preview = f"update scheduled task {task_id} ({settings or 'no fields'})"
     return {
         "result": "ASK",
-        "reason": "Approve these scheduled task settings for future unattended runs?",
+        "reason": f"Agent wants to {preview}. Approve?",
     }
 
 

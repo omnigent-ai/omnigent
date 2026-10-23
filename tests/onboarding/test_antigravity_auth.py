@@ -171,6 +171,7 @@ def test_antigravity_install_command_falls_back_to_pip(monkeypatch: pytest.Monke
     cmd = antigravity_install_command()
     assert cmd == [
         extra_install.sys.executable,
+        "-P",
         "-m",
         "pip",
         "install",
@@ -220,7 +221,7 @@ def test_install_antigravity_sdk_runs_command_then_rechecks(
 
     assert install_antigravity_sdk() is True
     assert calls == [
-        [extra_install.sys.executable, "-m", "pip", "install", "omnigent[antigravity]"]
+        [extra_install.sys.executable, "-P", "-m", "pip", "install", "omnigent[antigravity]"]
     ]
 
 

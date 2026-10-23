@@ -333,7 +333,7 @@ async def test_interrupt_during_setup_phase_recovers_stuck_turn() -> None:
         try:
             await _aio.wait_for(resolver_entered.wait(), timeout=5.0)
             fresh_turn_started = True
-        except _aio.TimeoutError:
+        except TimeoutError:
             fresh_turn_started = False
 
         resolver_gate.set()  # release the blocked turn for clean teardown

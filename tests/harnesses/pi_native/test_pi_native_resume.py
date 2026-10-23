@@ -275,6 +275,8 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
         "toolResult",
         "assistant",
     ]
+    # Gemini rejects a replayed tool result whose name is empty.
+    assert entries[2]["message"]["toolName"] == "bash"
     # Parent chain is strictly linear.
     assert entries[0]["parentId"] is None
     for prev, cur in itertools.pairwise(entries):
@@ -374,9 +376,9 @@ def _assert_results_follow_calls(messages: list[dict[str, Any]]) -> None:
     assert not pending
 
 
-def _call(call_id: str, response_id: str = "") -> dict[str, Any]:
+def _call(call_id: str, response_id: str = "", *, name: str = "bash") -> dict[str, Any]:
     return _function_call_item(
-        name="bash", call_id=call_id, arguments="{}", item_id=call_id, response_id=response_id
+        name=name, call_id=call_id, arguments="{}", item_id=call_id, response_id=response_id
     )
 
 
@@ -437,7 +439,7 @@ def test_pairing_keeps_valid_history_and_result_order() -> None:
             _user_item("read both", response_id="r1"),
             _call("c1", "r1"),
             _assistant_item("Reading.", response_id="r1"),
-            _call("c2", "r1"),
+            _call("c2", "r1", name="read"),
             _output("c2", "second"),
             _output("c1", "first"),
             _assistant_item("Done.", item_id="a2", response_id="r2"),
@@ -452,6 +454,8 @@ def test_pairing_keeps_valid_history_and_result_order() -> None:
         "assistant",
     ]
     assert [m["content"][0]["text"] for m in messages[2:4]] == ["second", "first"]
+    # A moved result keeps the name of its own call, not of the one it now follows.
+    assert [m["toolName"] for m in messages[2:4]] == ["read", "bash"]
 
 
 def test_pairing_keeps_first_of_duplicate_results() -> None:
@@ -486,6 +490,8 @@ def test_orphan_and_missing_results_are_left_alone() -> None:
     )
     assert [m["role"] for m in messages] == ["toolResult", "assistant", "assistant"]
     assert messages[0]["toolCallId"] == "orphan"
+    # No call to name it after; the orphan is replayed as-is.
+    assert messages[0]["toolName"] == ""
 
 
 def test_empty_text_items_are_dropped() -> None:

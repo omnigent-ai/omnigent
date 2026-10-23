@@ -1415,6 +1415,26 @@ describe("closed bridge overlay", () => {
     // visible so the user can retry after fixing the host.
     expect(terminalSessionMock.instances).toHaveLength(1);
   });
+
+  it("names an offline sandbox in the resume action and its failures", async () => {
+    const onResume = vi.fn().mockRejectedValue(new Error("launch failed"));
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        onResume={onResume}
+        resumeTarget="sandbox"
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "stopped", code: 4405 });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^resume sandbox$/i }));
+
+    await screen.findByText("Couldn't resume sandbox: launch failed");
+  });
 });
 
 describe("status overlay stacking", () => {

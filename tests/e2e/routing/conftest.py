@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -38,6 +37,7 @@ import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.live_server import find_free_port
 from tests.e2e.routing._helpers import POLL_INTERVAL_S, wait_for
 from tests.e2e.routing._mock_router import MockRouter, serve_mock_router
 
@@ -80,16 +80,6 @@ def _require_opt_in() -> None:
             f"set {_RUN_GATE_ENV}=1 to run the Smart Routing e2e CUJs "
             "(they launch real claude/codex TUIs and a real host daemon)"
         )
-
-
-def _free_port() -> int:
-    """Return a free TCP port on loopback.
-
-    :returns: A port number nothing is currently listening on.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 @pytest.fixture(scope="session")
@@ -159,7 +149,7 @@ def routing_server(
     :param tmp_path_factory: Pytest temp path factory.
     :yields: The server base URL, e.g. ``"http://127.0.0.1:54321"``.
     """
-    port = _free_port()
+    port = find_free_port()
     root = tmp_path_factory.mktemp("routing_e2e_server")
     db_path = root / "routing_e2e.db"
     config_path = root / "server.yaml"

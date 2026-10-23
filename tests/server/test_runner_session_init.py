@@ -31,6 +31,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from tests.budgets import budget
 
 
 class _Registry:
@@ -693,12 +694,12 @@ async def test_delayed_initialization_cannot_follow_a_replacement_tunnel() -> No
             )
         )
         try:
-            await asyncio.wait_for(entered.wait(), timeout=1)
+            await asyncio.wait_for(entered.wait(), timeout=budget(1))
             new = reg.register("runner_init", AsyncMock(), hello)
             assert new.generation > old.generation
             release.set()
             with pytest.raises(ConnectionError, match="before request was sent"):
-                await asyncio.wait_for(init, timeout=1)
+                await asyncio.wait_for(init, timeout=budget(1))
         finally:
             release.set()
             init.cancel()

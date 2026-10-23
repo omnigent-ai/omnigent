@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import os
 import stat
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import tomllib
 
 from omnigent.host import databricks_credential as dc
 from omnigent.host import jcode_databricks as jd

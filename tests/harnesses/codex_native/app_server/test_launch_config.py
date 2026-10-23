@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,150 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
 
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oss\\"' in overrides
+
+
+_UCODE_HOST = "https://example.cloud.databricks.com"
+# Differs from the profile-derived gateway so the tests tell the two routes apart.
+_UCODE_BASE_URL = "https://ucode-gateway.example.com/codex/v1"
+_UCODE_AUTH = f"ug auth-token --host {_UCODE_HOST} --profile ug-oauth-example"
+
+
+def _ucode_codex_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, codex: dict[str, Any] | None
+) -> str:
+    """
+    Build a native Codex server for the ``oss`` profile with *codex* as ucode's entry.
+
+    :param tmp_path: Per-test directory for the profile file and ucode state.
+    :param monkeypatch: Fixture used to isolate the profile, ucode state, and discovery.
+    :param codex: ucode's ``codex`` agent entry for the profile host, or ``None``
+        for no ucode state at all.
+    :returns: The server's config overrides joined by newlines.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        f"[oss]\nhost = {_UCODE_HOST}\nauth_type = databricks-cli\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    state_path = tmp_path / "ucode-state.json"
+    if codex is not None:
+        state = {"workspaces": {_UCODE_HOST: {"agents": {"codex": codex}}}}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
+
+    def _discovery_offline(_profile: str | None) -> object:
+        raise RuntimeError("model discovery is offline in this test")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        _discovery_offline,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model="test-model",
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+    return "\n".join(app_server.config_overrides)
+
+
+def test_build_codex_native_server_takes_gateway_and_auth_from_ucode_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ucode's ``codex`` entry supplies the gateway, auth command, and refresh cadence.
+
+    ucode is the source of truth for Databricks routing, as it already is for
+    native Claude, so a profile whose workspace ucode configured uses ucode's
+    gateway and login instead of ``databricks auth token --profile``.
+    """
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {
+            "base_url": _UCODE_BASE_URL,
+            "auth_command": _UCODE_AUTH,
+            # ucode writes Codex's cadence inside its ``auth`` table.
+            "auth": {"refresh_interval_ms": 60000},
+        },
+    )
+
+    assert json.dumps(_UCODE_BASE_URL) in overrides
+    assert json.dumps(_UCODE_AUTH) in overrides
+    assert "refresh_interval_ms=60000" in overrides
+    assert "databricks auth token" not in overrides
+
+
+def test_build_codex_native_server_defaults_cadence_without_one_in_ucode_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ucode entry without a refresh cadence keeps the default cadence."""
+    overrides = _ucode_codex_overrides(
+        tmp_path, monkeypatch, {"base_url": _UCODE_BASE_URL, "auth_command": _UCODE_AUTH}
+    )
+
+    assert json.dumps(_UCODE_AUTH) in overrides
+    assert "refresh_interval_ms=900000" in overrides
+
+
+def test_build_codex_native_server_keeps_profile_path_when_ucode_state_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unreadable ucode state file falls back to the profile path without a traceback."""
+
+    def _unreadable(_workspace_url: str) -> object:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", _unreadable)
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.codex_native.app_server"):
+        overrides = _ucode_codex_overrides(tmp_path, monkeypatch, None)
+
+    assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oss\\"' in overrides
+    # The gateway lookup's warning names the host; discovery's own fallback names the profile.
+    warnings = [
+        r
+        for r in caplog.records
+        if f"could not read ucode state for {_UCODE_HOST!r}" in r.getMessage()
+    ]
+    assert warnings
+    assert not any(r.exc_info for r in warnings)
+
+
+@pytest.mark.parametrize(
+    "codex",
+    [None, {}, {"base_url": _UCODE_BASE_URL}, {"auth_command": _UCODE_AUTH}],
+    ids=["no-state", "empty-entry", "base-url-only", "auth-only"],
+)
+def test_build_codex_native_server_keeps_profile_path_without_usable_ucode_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex: dict[str, Any] | None,
+) -> None:
+    """
+    Without a ucode entry naming both a base URL and auth, the profile path is kept.
+
+    A half-written entry would pair one workspace's gateway with another login,
+    so it never overrides the profile-derived gateway and auth.
+    """
+    overrides = _ucode_codex_overrides(tmp_path, monkeypatch, codex)
+
+    assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
+    assert _UCODE_BASE_URL not in overrides
+    assert "ug auth-token" not in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 

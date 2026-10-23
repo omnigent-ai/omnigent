@@ -52,7 +52,7 @@ jobs:
       # Checkout main only for load-maintainers.sh; the PR branch is checked
       # out later (regen job), after authorization passes.
       - name: Checkout (for the maintainer script)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Load maintainers from .github/MAINTAINER
         id: maint
@@ -154,7 +154,7 @@ jobs:
       # build backends, which must not find a push token on disk. The App token
       # is minted only after `uv lock` and enters only at the push step.
       - name: Checkout the PR branch
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ needs.authorize.outputs.head }}
           persist-credentials: false
@@ -207,7 +207,7 @@ jobs:
       - name: Mint App token
         id: app-token
         if: vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}

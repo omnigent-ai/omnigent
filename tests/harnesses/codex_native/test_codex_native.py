@@ -7,6 +7,7 @@ import base64
 import contextlib
 import json
 import os
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -17,7 +18,6 @@ from typing import Any
 import click
 import httpx
 import pytest
-import tomllib
 import yaml
 from PIL import Image
 
@@ -908,6 +908,45 @@ def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     :param expected: Whether it classifies as an unreadable thread.
     """
     assert codex_native_app_server.is_unreadable_thread_error(exc) is expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": (
+                        "no rollout found for thread id 019e96aa-0be2-7343-8d3b-6f914d60936d"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603, "message": "no rollout found for thread id 019e96aa"}
+            ),
+            False,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "thread 019e already has an active writer"}
+            ),
+            False,
+        ),
+        (RuntimeError("no rollout found for thread id 019e96aa"), False),
+    ],
+)
+def test_is_missing_rollout_error(exc: BaseException, expected: bool) -> None:
+    """
+    Only codex's ``-32600 no rollout found`` resume refusal counts as a missing rollout.
+
+    :param exc: Exception raised by the resume request.
+    :param expected: Whether it classifies as a missing rollout.
+    """
+    assert codex_native_app_server.is_missing_rollout_error(exc) is expected
 
 
 def test_codex_resume_permission_params_parse_legacy_flags() -> None:

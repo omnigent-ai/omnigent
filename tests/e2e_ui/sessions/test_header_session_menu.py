@@ -6,8 +6,62 @@ The child path proves the owner menu is replaced by a Fork-only menu.
 
 from __future__ import annotations
 
+import sys
+
 import httpx
 from playwright.sync_api import Page, expect
+
+
+def test_rename_hotkey_from_composer_persists_and_cancels(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """The shortcut edits the current title without losing the chat draft."""
+    base_url, session_id = seeded_session
+    original_title = "Session before rename"
+    response = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"title": original_title},
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    page.goto(f"{base_url}/c/{session_id}")
+
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("Keep this draft while renaming")
+    modifier = "Meta" if sys.platform == "darwin" else "Control"
+    page.keyboard.press(f"{modifier}+Alt+r")
+
+    rename_input = page.get_by_role("textbox", name="Session name")
+    expect(rename_input).to_be_focused()
+    expect(rename_input).to_have_value(original_title)
+    assert rename_input.evaluate("el => [el.selectionStart, el.selectionEnd]") == [
+        0,
+        len(original_title),
+    ]
+    renamed_title = "Session renamed with the keyboard"
+    page.keyboard.type(renamed_title)
+    expect(rename_input).to_have_value(renamed_title)
+    rename_input.press("Enter")
+
+    expect(page.get_by_test_id("header-title")).to_have_text(renamed_title)
+    expect(composer).to_have_value("Keep this draft while renaming")
+    page.reload()
+    expect(page.get_by_test_id("header-title")).to_have_text(renamed_title)
+
+    composer.click()
+    page.keyboard.press(f"{modifier}+Alt+r")
+    expect(rename_input).to_be_focused()
+    rename_input.fill("Cancel this rename")
+    rename_input.press("Escape")
+    expect(rename_input).to_have_count(0)
+    expect(page.get_by_test_id("header-title")).to_have_text(renamed_title)
+    expect(composer).to_have_value("Keep this draft while renaming")
+
+    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    snapshot.raise_for_status()
+    assert snapshot.json()["title"] == renamed_title
 
 
 def test_header_session_menu_always_shows_horizontal_ellipsis(
@@ -106,6 +160,9 @@ def test_header_session_menu_renames_owner_and_hides_for_subagent(
             timeout=30_000
         )
         expect(page.get_by_test_id("header-conversation-actions")).to_have_count(0)
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        page.keyboard.press(f"{modifier}+Alt+r")
+        expect(page.get_by_role("textbox", name="Session name")).to_have_count(0)
         child_trigger = page.get_by_test_id("desktop-fork-actions-menu")
         expect(child_trigger).to_be_visible()
         child_trigger.click()

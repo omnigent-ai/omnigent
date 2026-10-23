@@ -10,12 +10,11 @@ import logging
 import os
 import threading
 import time
+import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
-
-import tomllib
 
 from omnigent.spec.skill_sources import (
     SkillSourceContext,

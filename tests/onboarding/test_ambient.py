@@ -976,6 +976,23 @@ def test_claude_managed_gateway_display_name(
     assert ambient.claude_managed_gateway_display_name() == expected
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_ISAAC_CLAUDE_SETTINGS, "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, "apiKeyHelper": "t"}, None),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}}, None),
+        ({"apiKeyHelper": "print-token"}, None),
+    ],
+)
+def test_claude_managed_gateway_routes(
+    clean_env, monkeypatch, payload: object, expected: str | None
+) -> None:
+    """Only a credentialed, non-Anthropic managed gateway owns Claude routing."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+    assert ambient.claude_managed_gateway_routes() == expected
+
+
 def test_claude_managed_gateway_missing_file_is_graceful(clean_env, monkeypatch) -> None:
     """An absent settings file yields (None, False) rather than raising."""
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (clean_env / "nope.json",))

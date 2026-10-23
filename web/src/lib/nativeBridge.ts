@@ -202,6 +202,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
+  /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
+  refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
+  /** Check local credentials before an Arclet launch without starting sign-in. */
+  checkDbcert?: () => Promise<DbcertStatusResult>;
 
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
@@ -241,6 +245,74 @@ interface ElectronDesktopApi extends NativeShellApi {
   ) => Promise<{ ok: boolean; error?: string }>;
   /** Clear native key interception when the recent-session gesture was declined. */
   browserCancelRecentSessionSwitch?: () => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Inspect the local Google Chrome profiles for cookies in the site tree the
+   * conversation's view is on. Metadata only (profile + per-scope counts): no
+   * Keychain access and no cookie values. Absent on shells predating the feature.
+   */
+  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
+  /**
+   * Copy that site's cookies out of one Chrome profile into the conversation's
+   * own in-memory browser session. Decrypts via the Keychain (system prompt on
+   * the first import); `expectedHost` must still match the view's current site.
+   */
+  browserChromeCookieImport?: (
+    conversationId: string,
+    args: { profileId: string; expectedHost: string; scope?: string },
+  ) => Promise<ChromeCookieImportResult>;
+}
+
+/** One importable site tree and how many cookies a profile holds for it. */
+export interface ChromeCookieScopeCount {
+  /** The page's host or one of its parent domains. */
+  host: string;
+  /** Cookies on that domain and its subdomains, plus inherited domain cookies. */
+  cookieCount: number;
+}
+
+/** One local Chrome profile that holds cookies for the current site. */
+export interface ChromeCookieProfile {
+  /** Chrome's profile directory name (e.g. `Default`, `Profile 2`). */
+  id: string;
+  /** Chrome's profile display name, falling back to the directory name. */
+  name: string;
+  /** How many cookies the profile holds for the page's own host tree. */
+  cookieCount: number;
+  /** Counts per scope, narrowest first (see {@link ChromeCookiePreviewResult.scopes}).
+   *  Only scopes this profile actually holds cookies for are listed. */
+  scopes?: ChromeCookieScopeCount[];
+}
+
+export interface ChromeCookiePreviewResult {
+  ok: boolean;
+  /** Host whose page asked for the import (main-derived from the real URL). */
+  host?: string;
+  /** Scopes the user may pick: `host`, then each parent domain Chrome holds
+   *  a domain cookie for. */
+  scopes?: string[];
+  /** Profiles with at least one cookie for any scope; empty when none match. */
+  profiles?: ChromeCookieProfile[];
+  error?: string;
+}
+
+export interface ChromeCookieImportResult {
+  ok: boolean;
+  /** The user declined the shell's own confirmation; nothing was read. */
+  cancelled?: boolean;
+  host?: string;
+  /** The site tree actually copied (the page's host unless the user widened it). */
+  scope?: string;
+  profileId?: string;
+  profileName?: string;
+  /** Cookies matching the site tree (before decryption). */
+  found?: number;
+  /** Cookies written into the conversation's session. */
+  imported?: number;
+  /** Matched cookies we could not decrypt and left out. */
+  skipped?: number;
+  /** Cookies Chrome believes are valid but the session rejected. */
+  failed?: number;
+  error?: string;
 }
 
 /** A lifecycle action for the host daemon. */
@@ -249,6 +321,11 @@ export type HostControlAction = "start" | "stop" | "restart";
 export type ArcaExtendMode = "overnight" | "workweek";
 export type ArcaExtendResult =
   { ok: true; shutdownAt: number | null } | { ok: false; error: string };
+export type DbcertRefreshResult = { ok: true } | { ok: false; error: string };
+export interface DbcertRefreshOptions {
+  skipArcaSync?: boolean;
+}
+export type DbcertStatusResult = { ok: true; valid: boolean } | { ok: false; error: string };
 
 /** Result of connecting the Arca instance as a host, from the desktop shell. */
 export interface ArcaConnectResult extends HostActionResult {
@@ -284,8 +361,12 @@ export interface DesktopFeatures {
   databricksInternalFeatures?: boolean;
   /** This window may offer one-click Arca extension. */
   canExtendArca?: boolean;
+  /** This window may renew the laptop's dbcert. */
+  canRefreshDbcert?: boolean;
   /** Shell can restore Arca preview identity after a desktop restart. */
   arcaPreviewRecovery?: boolean;
+  /** This shell can import the current site's cookies from local Google Chrome. */
+  chromeCookieImport?: boolean;
 }
 
 /** Status of the local `omni` CLI, from the desktop shell. */
@@ -1042,6 +1123,39 @@ export async function extendArca(mode: ArcaExtendMode): Promise<ArcaExtendResult
       ok: false,
       error: "Could not extend Arca from this app.",
     };
+  }
+}
+
+/** Present only in desktop shells that can renew this machine's dbcert. */
+export function hasDbcertRefreshBridge(): boolean {
+  return typeof electronApi()?.refreshDbcert === "function";
+}
+
+export function hasDbcertPreflightBridge(): boolean {
+  return typeof electronApi()?.checkDbcert === "function" && hasDbcertRefreshBridge();
+}
+
+/** Check the laptop's credentials without opening a browser or renewing them. */
+export async function checkDbcert(): Promise<DbcertStatusResult> {
+  const bridge = electronApi()?.checkDbcert;
+  if (!bridge) return { ok: false, error: "Laptop credential checks are unavailable in this app." };
+  try {
+    return await bridge();
+  } catch (error) {
+    console.warn("[nativeBridge] electron checkDbcert failed:", error);
+    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
+  }
+}
+
+/** Renew the laptop's dbcert through the desktop shell, which runs `dbcert --force`. */
+export async function refreshDbcert(options?: DbcertRefreshOptions): Promise<DbcertRefreshResult> {
+  const bridge = electronApi()?.refreshDbcert;
+  if (!bridge) return { ok: false, error: "dbcert refresh is unavailable in this app." };
+  try {
+    return await (options ? bridge(options) : bridge());
+  } catch (error) {
+    console.warn("[nativeBridge] electron refreshDbcert failed:", error);
+    return { ok: false, error: "Could not run dbcert from this app." };
   }
 }
 

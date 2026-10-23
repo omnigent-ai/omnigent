@@ -1605,8 +1605,11 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 # immediately.
                 core.create_namespaced_secret(
                     namespace,
-                    build_token_secret_manifest(
-                        secret_name=secret_name, namespace=namespace, token=token
+                    cast(
+                        "k8s_client.V1Secret",
+                        build_token_secret_manifest(
+                            secret_name=secret_name, namespace=namespace, token=token
+                        ),
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
@@ -1645,7 +1648,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param manifest: The manifest from :func:`build_job_manifest`.
         """
         self._load_batch().create_namespaced_job(
-            namespace, manifest, _request_timeout=_POD_READY_REQUEST_TIMEOUT_S
+            namespace,
+            cast("k8s_client.V1Job", manifest),
+            _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
         )
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:

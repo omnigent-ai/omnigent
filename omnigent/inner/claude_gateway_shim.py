@@ -253,7 +253,7 @@ class ClaudeGatewayShim:
         if self._serve_task is not None:
             try:
                 await asyncio.wait_for(self._serve_task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except (TimeoutError, asyncio.CancelledError):
                 self._serve_task.cancel()
             self._serve_task = None
         if self._client is not None:
