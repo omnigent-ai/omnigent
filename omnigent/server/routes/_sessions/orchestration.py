@@ -374,6 +374,7 @@ from omnigent.server.schemas import (
     ErrorDetail,
     NativeModelOption,
     NativeUsageBaseline,
+    SandboxWorkspaceRequest,
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
@@ -4328,6 +4329,7 @@ async def _run_managed_launch(
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     host_id: str | None = None,
+    sandbox_workspace: SandboxWorkspaceRequest | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4436,6 +4438,26 @@ async def _run_managed_launch(
         )
         if managed is None:
             return
+        if sandbox_workspace is not None:
+            from omnigent.server.sandbox_workspaces import prepare_sandbox_session_workspace
+
+            try:
+                host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+                if host is None:
+                    raise HTTPException(404, "sandbox host disappeared during preparation")
+                _publish_sandbox_status(session_id, "cloning", provider=host.sandbox_provider)
+                managed.workspace = await prepare_sandbox_session_workspace(
+                    host=host,
+                    config=sandbox_config,
+                    session_id=session_id,
+                    selection=sandbox_workspace,
+                )
+            except Exception:  # noqa: BLE001 — background task must settle the launch tracker
+                _logger.exception("Sandbox workspace preparation failed for %s", session_id)
+                reason = "sandbox workspace preparation failed; select the saved sandbox to retry"
+                tracker.fail(session_id, reason)
+                _publish_sandbox_status(session_id, "failed", reason)
+                return
         await _bind_and_launch_managed_runner(
             session_id=session_id,
             managed=managed,
@@ -11578,11 +11600,45 @@ async def _create_session_from_existing_agent(
 
     # Validate the host workspace before creating a session or worktree.
     canonical_workspace: str | None = body.workspace
+    workspace_session_id: str | None = None
+    if body.sandbox_workspace is not None:
+        from omnigent.db.utils import generate_conversation_id
+        from omnigent.server.auth import RESERVED_USER_LOCAL
+        from omnigent.server.routes._host_launch import resolve_host_owner
+        from omnigent.server.sandbox_workspaces import (
+            prepare_sandbox_session_workspace,
+            session_workspace_launcher,
+        )
+
+        config = getattr(request.app.state, "sandbox_config", None)
+        if body.host_id is not None:
+            if getattr(request.app.state, "host_store", None) is None:
+                raise HTTPException(400, "sandbox hosts are not configured")
+            host = await asyncio.to_thread(
+                resolve_host_owner,
+                user_id=user_id,
+                host_id=body.host_id,
+                host_store=request.app.state.host_store,
+            )
+            workspace_session_id = generate_conversation_id()
+            canonical_workspace = await prepare_sandbox_session_workspace(
+                host=host,
+                config=config,
+                session_id=workspace_session_id,
+                selection=body.sandbox_workspace,
+            )
+        else:
+            session_workspace_launcher(
+                config,
+                body.sandbox_provider,
+                user_id or RESERVED_USER_LOCAL,
+                body.sandbox_workspace,
+            )
     if body.host_id is not None:
         canonical_workspace = await _validate_session_workspace(
             user_id=user_id,
             host_id=body.host_id,
-            workspace=body.workspace,
+            workspace=canonical_workspace,
             agent=agent,
             agent_cache=agent_cache,
             request=request,
@@ -11749,6 +11805,10 @@ async def _create_session_from_existing_agent(
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
     initial_labels.update(registry_labels)
+    if body.sandbox_workspace is not None:
+        from omnigent.server.sandbox_workspaces import sandbox_workspace_labels
+
+        initial_labels.update(sandbox_workspace_labels(body.sandbox_workspace))
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,
@@ -11834,6 +11894,7 @@ async def _create_session_from_existing_agent(
                 cost_control_mode_override=cost_control_mode_override,
                 subagent_routing_override=subagent_routing_override,
                 harness_override=harness_override,
+                conversation_id=workspace_session_id,
                 **snapshot_kwargs,
             )
     except NameAlreadyExistsError as exc:

@@ -6278,3 +6278,82 @@ async def test_new_sandbox_records_provider_ownership_policy(db_uri, reusable, s
             == hosts[0].host_id
         )
         assert len(store.list_hosts(_OWNER)) == 1
+
+
+@pytest.mark.parametrize("result", ["/work/session", "relative/path", PermissionError("denied")])
+async def test_static_workspace_preparation_before_managed_runner(monkeypatch, result):
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SandboxWorkspaceRequest
+
+    calls = []
+
+    class Controller(FakeSandboxLauncher):
+        @property
+        def capabilities(self):
+            return replace(super().capabilities, session_workspaces=True)
+
+        def bind_principal(self, principal):
+            self.principal = principal
+
+        def prepare_session_workspace(self, sandbox_id, **kwargs):
+            calls.append((self.principal, sandbox_id, kwargs))
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    controller = Controller(reusable_hosts=True)
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            provider="modal",
+            launcher_factory=lambda: controller,
+            server_url="https://example.com",
+            token_ttl_s=3600,
+        )
+    )
+    host = SimpleNamespace(
+        sandbox_attached=True, sandbox_id="box", sandbox_provider="modal", user_id=_OWNER
+    )
+    launches = []
+
+    async def provision(**kwargs):
+        assert kwargs["repos"] == []
+        return ManagedHostLaunch(host_id="host", workspace="/work")
+
+    async def bind(**kwargs):
+        launches.append(kwargs["managed"].workspace)
+
+    monkeypatch.setattr(orchestration, "_provision_managed_sandbox", provision)
+    monkeypatch.setattr(orchestration, "_bind_and_launch_managed_runner", bind)
+    tracker = ManagedLaunchTracker()
+    tracker.begin("conv_workspace")
+    await orchestration._run_managed_launch(
+        session_id="conv_workspace",
+        owner=_OWNER,
+        sandbox_config=config,
+        repos=[],
+        tracker=tracker,
+        conversation_store=SimpleNamespace(get_conversation=lambda _: None),
+        host_store=SimpleNamespace(get_host=lambda _: host),
+        host_registry=None,
+        tunnel_registry=None,
+        sandbox_workspace=SandboxWorkspaceRequest(
+            repositories=["https://github.com/org/repo#new-branch"]
+        ),
+    )
+    assert calls[0][:2] == (_OWNER, "box")
+    assert calls[0][2]["session_id"] == "conv_workspace"
+    assert calls[0][2]["repos"][0].branch == "new-branch"
+    assert launches == (["/work/session"] if result == "/work/session" else [])
+    assert controller.terminated == []
+
+
+async def test_static_workspace_capability_is_opt_in():
+    from omnigent.server.sandbox_workspaces import session_workspace_launcher
+    from omnigent.server.schemas import SandboxWorkspaceRequest
+
+    controller = FakeSandboxLauncher(reusable_hosts=True)
+    with pytest.raises(HTTPException, match="does not support session workspaces"):
+        session_workspace_launcher(
+            _injected_config(controller), None, _OWNER, SandboxWorkspaceRequest()
+        )
+    assert not controller.prepared and not controller.provisioned_names

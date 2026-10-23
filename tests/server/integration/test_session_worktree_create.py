@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import httpx
@@ -93,6 +93,7 @@ async def register_worktree_host(
         ``_HostCapture`` whose ``.create`` / ``.remove`` lists accumulate
         the create- and remove-worktree frames the host received.
     """
+    app.state.host_store = HostStore(db_uri)
     conns: list[HostConnection] = []
 
     def _register(
@@ -101,7 +102,19 @@ async def register_worktree_host(
         create_error: str | None = None,
         workspace: str | None = None,
         capabilities: list[str] | None = None,
+        static_sandbox: bool = False,
     ) -> _HostCapture:
+        if static_sandbox:
+            HostStore(db_uri).register_managed_host(
+                host_id=_HOST_ID,
+                name="wt-host",
+                user_id=RESERVED_USER_LOCAL,
+                token="test-token",
+                provider="modal",
+                sandbox_id="static-box",
+                token_expires_at=2_000_000_000,
+                sandbox_attached=True,
+            )
         HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
         conn = app.state.host_registry.register(
             host_id=_HOST_ID,
@@ -637,3 +650,159 @@ async def test_registry_create_persists_overrides_and_worktree_atomically(
     assert initial["labels"] == stored.labels
     assert stored.labels["omnigent.mcp_service.tracker"] == "1"
     assert stored.labels[WORKTREE_ROOT_LABEL_KEY] == worktree_root_fingerprint(workspace)
+
+
+@pytest.mark.parametrize("create_worktrees", [False, True])
+@pytest.mark.parametrize("fork", [False, True])
+async def test_controller_workspaces_reuse_host_and_persist_session_directory(
+    app, client, register_worktree_host, create_worktrees, db_uri, fork, tmp_path
+):
+    """Per-repo choices reach the owner-bound controller, never generic git cleanup."""
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from tests.server.helpers import FakeSandboxLauncher
+
+    store = SqlAlchemyConversationStore(db_uri)
+    cap = register_worktree_host(static_sandbox=True)
+    if fork:
+        from fastapi import APIRouter
+
+        from omnigent.runtime.agent_cache import AgentCache
+        from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.stores.artifact_store.local import LocalArtifactStore
+
+        router = APIRouter()
+        router.include_router(
+            create_hosts_router(
+                app.state.host_registry,
+                app.state.host_store,
+                store,
+                agent_store=app.state.agent_store,
+                agent_cache=AgentCache(
+                    artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+                    cache_dir=tmp_path / "cache",
+                ),
+            ),
+            prefix="/v1",
+        )
+        app.router.routes[:0] = router.routes
+    calls = []
+    preparation_failure = False
+
+    class Controller(FakeSandboxLauncher):
+        @property
+        def capabilities(self):
+            return replace(super().capabilities, session_workspaces=True, multi_repo=True)
+
+        def bind_principal(self, principal):
+            self.principal = principal
+
+        def prepare_session_workspace(self, sandbox_id, *, session_id, repos, create_worktrees):
+            calls.append((self.principal, sandbox_id, session_id, repos, create_worktrees))
+            if preparation_failure:
+                if create_worktrees:
+                    raise PermissionError("not authorized")
+                return "relative/path"
+            return f"/work/sessions/{session_id}"
+
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            provider="modal",
+            server_url="https://example.com",
+            token_ttl_s=3600,
+            launcher_factory=lambda: Controller(reusable_hosts=True),
+        )
+    )
+    agent = await create_test_agent(client, name="static-workspaces")
+    source = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()
+    for _ in range(2):
+        fork_id = None
+        if fork:
+            cloned = await client.post(f"/v1/sessions/{source['id']}/fork", json={})
+            assert cloned.status_code == 201, cloned.text
+            fork_id = cloned.json()["id"]
+            store.set_labels(
+                fork_id, {"omnigent.fork.source_external_session_id": "old-host-transcript"}
+            )
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners" if fork else "/v1/sessions",
+            json={
+                **(
+                    {"session_id": fork_id}
+                    if fork
+                    else {"agent_id": agent["id"], "host_id": _HOST_ID}
+                ),
+                "sandbox_workspace": {
+                    "repositories": [
+                        "https://github.com/org/api#feature/new",
+                        "https://github.com/org/ui",
+                    ],
+                    "create_worktrees": create_worktrees,
+                },
+            },
+        )
+        assert response.status_code == (200 if fork else 201), response.text
+        body = (await client.get(f"/v1/sessions/{fork_id}")).json() if fork else response.json()
+        assert body["workspace"] == f"/work/sessions/{body['id']}"
+        assert body["host_id"] == _HOST_ID
+        stored = store.get_conversation(body["id"])
+        assert stored.git_branch is None
+        assert "omnigent.fork.source_external_session_id" not in stored.labels
+        assert stored.labels["omnigent.sandbox.create_worktrees"] == str(create_worktrees).lower()
+        assert stored.labels["omnigent.sandbox.repo.0"] == "https://github.com/org/api#feature/new"
+        assert calls[-1][:3] == (RESERVED_USER_LOCAL, "static-box", body["id"])
+        assert [repo.branch for repo in calls[-1][3]] == ["feature/new", None]
+        assert calls[-1][4] == create_worktrees
+        assert cap.launches[-1].workspace == body["workspace"]
+        await client.get(f"/v1/sessions/{body['id']}")
+    assert calls[0][2] != calls[1][2]
+    assert len(calls) == 2
+    assert cap.create == [] and cap.remove == []
+    if fork:
+        # Reusing this directory preserves repo choices for a later clone.
+        cloned = await client.post(f"/v1/sessions/{body['id']}/fork", json={})
+        assert cloned.status_code == 201, cloned.text
+        clone_id = cloned.json()["id"]
+        response = await client.post(
+            f"/v1/hosts/{_HOST_ID}/runners",
+            json={"session_id": clone_id, "workspace": body["workspace"]},
+        )
+        assert response.status_code == 200, response.text
+        assert len(calls) == 2
+        assert store.get_conversation(clone_id).labels["omnigent.sandbox.repo.0"] == (
+            "https://github.com/org/api#feature/new"
+        )
+
+        preparation_failure = True
+        cloned = await client.post(f"/v1/sessions/{body['id']}/fork", json={})
+        clone_id = cloned.json()["id"]
+        payload = {
+            "session_id": clone_id,
+            "sandbox_workspace": {"create_worktrees": create_worktrees},
+        }
+        response = await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=payload)
+        assert response.status_code == (403 if create_worktrees else 502), response.text
+        assert store.get_conversation(clone_id).runner_id is None
+        assert len(cap.launches) == 3
+        preparation_failure = False
+        response = await client.post(f"/v1/hosts/{_HOST_ID}/runners", json=payload)
+        assert response.status_code == 200, response.text
+        assert calls[-1][2] == calls[-2][2] == clone_id
+        assert not cap.create and not cap.remove
+
+
+async def test_controller_workspace_rejects_ordinary_host_before_provider_call(
+    client, register_worktree_host
+):
+    register_worktree_host()
+    agent = await create_test_agent(client, name="ordinary-host")
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_id": _HOST_ID,
+            "sandbox_workspace": {},
+        },
+    )
+    assert response.status_code == 400
+    assert "saved static sandbox" in response.text

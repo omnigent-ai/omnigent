@@ -1501,6 +1501,23 @@ _MAX_MANAGED_WORKSPACES = 10
 _MANAGED_HOST_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
+class SandboxWorkspaceRequest(BaseModel):
+    """Controller-owned repository layout for a new static sandbox session."""
+
+    model_config = {"extra": "forbid"}
+    repositories: list[str] = Field(default_factory=list, max_length=_MAX_MANAGED_WORKSPACES)
+    create_worktrees: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def _check_repositories(self) -> Self:
+        from omnigent.server.managed_hosts import parse_repo_workspace
+
+        repos = [parse_repo_workspace(value) for value in self.repositories]
+        if len({repo.url for repo in repos}) != len(repos):
+            raise ValueError("select each repository only once")
+        return self
+
+
 class _SessionCreateRequestBase(BaseModel):
     """
     JSON request body for ``POST /v1/sessions``.
@@ -1675,6 +1692,7 @@ class _SessionCreateRequestBase(BaseModel):
     sandbox_provider: str | None = None
     workspace: str | None = None
     workspaces: list[str] | None = None
+    sandbox_workspace: SandboxWorkspaceRequest | None = None
     git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     model_override: str | None = None
@@ -1683,6 +1701,21 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+
+    @model_validator(mode="after")
+    def _check_sandbox_workspace(self) -> Self:
+        if self.sandbox_workspace is not None:
+            if self.workspace is not None or self.workspaces is not None or self.git is not None:
+                raise ValueError(
+                    "sandbox_workspace cannot be combined with workspace, workspaces, or git"
+                )
+            if self.parent_session_id is not None:
+                raise ValueError("sandbox_workspace is only supported for top-level sessions")
+            if self.host_type != "managed" and self.host_id is None:
+                raise ValueError(
+                    "sandbox_workspace requires an existing host_id or host_type=managed"
+                )
+        return self
 
     @model_validator(mode="after")
     def _check_startup_input(self) -> Self:
@@ -2810,6 +2843,9 @@ class SessionForkRequest(BaseModel):
         explicit value overrides it and an explicit ``null`` gives the
         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
         an external fork's directory is chosen when it binds a host.
+    :param sandbox_workspace: Optional controller-owned repository and worktree
+        choices for a new managed sandbox. Replaces ``workspace``; requires the
+        provider's ``session_workspaces`` capability.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2823,6 +2859,7 @@ class SessionForkRequest(BaseModel):
     sandbox_provider: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    sandbox_workspace: SandboxWorkspaceRequest | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
@@ -2855,6 +2892,11 @@ class SessionForkRequest(BaseModel):
         # at module scope would risk import cycles.
         from omnigent.server.managed_hosts import parse_repo_workspace
 
+        if self.sandbox_workspace is not None:
+            if self.host_type != "managed" or self.workspace is not None or self.side_chat:
+                raise ValueError(
+                    "sandbox_workspace requires a managed fork without workspace or side_chat"
+                )
         if self.host_type == "managed":
             if self.host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(self.host_id):
                 raise ValueError(

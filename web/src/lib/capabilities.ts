@@ -140,6 +140,7 @@ export interface ServerInfo {
       inference_models?: boolean;
       default_models?: boolean;
       reusable_hosts?: boolean;
+      session_workspaces?: boolean;
     }
   >;
   /**
