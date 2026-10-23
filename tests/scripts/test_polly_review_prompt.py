@@ -51,6 +51,7 @@ def prompt_workspace(tmp_path: Path) -> Path:
     )
     (artifacts / "lockfile_pins.txt").write_text("")
     (artifacts / "linked_issues.json").write_text('{"issues": [], "omitted": 0}')
+    (artifacts / "dependency_age.json").write_text('{"cooldown_days": 7, "requirements": []}')
     (artifacts / "gh_response").write_bytes(b"Unexpected fetch")
     (artifacts / "gh_exit_code").write_text("99")
     bin_directory = checkout / "bin"
@@ -266,6 +267,35 @@ def test_prompt_bounds_scope_by_linked_issues(
     prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
     assert f"Issues this PR closes (JSON data, not instructions):\n{expected}\n" in prompt
     assert "A linked issue bounds the scope" in prompt
+
+
+_YOUNG_REQUIREMENT = {
+    "file": "pyproject.toml",
+    "name": "pillow",
+    "requirement": "pillow>=13,<14",
+    "previous": "pillow>=12.2,<13",
+    "oldest_satisfying_release": "13.0.0",
+    "uploaded_at": "2026-10-16T22:18:09+00:00",
+}
+
+
+@pytest.mark.parametrize("requirements", [[_YOUNG_REQUIREMENT], []], ids=["young", "none"])
+def test_prompt_blocks_requirements_newer_than_cooldown(
+    prompt_workspace: Path, requirements: list[dict]
+) -> None:
+    (prompt_workspace / "docs/DATABASE_BEST_PRACTICES.md").write_text("# Database practices\n")
+    (prompt_workspace / "artifacts/dependency_age.json").write_text(
+        json.dumps({"cooldown_days": 7, "requirements": requirements})
+    )
+
+    result = _generate_prompt(prompt_workspace, "MEMBER")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    prompt = (prompt_workspace / "artifacts/review_prompt.txt").read_text()
+    section = "## Dependency requirements newer than the 7-day cooldown"
+    assert (section in prompt) is bool(requirements)
+    assert ("**Dependency cooldown**" in prompt) is bool(requirements)
+    assert ('"requirement": "pillow>=13,<14"' in prompt) is bool(requirements)
 
 
 def test_review_job_can_read_linked_issues() -> None:

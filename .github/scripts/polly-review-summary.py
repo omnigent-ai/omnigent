@@ -6,6 +6,11 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 TESTS = "Tests and test support"
@@ -18,6 +23,10 @@ LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
     }
   } }
 }"""
+# Matches uv.toml's exclude-newer and the release hold on internal PyPI mirrors.
+DEPENDENCY_COOLDOWN_DAYS = 7
+DEPENDENCY_LOOKUP_LIMIT = 40
+REQUIREMENT_LINE = re.compile(r'^([+-])\s*"([^"]+)",?\s*(?:#.*)?$')
 
 
 def category(filename: str) -> str:
@@ -242,9 +251,131 @@ def linked_issues(pull_request: str) -> dict | None:
     return {"issues": issues, "omitted": omitted}
 
 
+def changed_requirements(diff_text: str) -> list[dict]:
+    """Return requirements a diff adds to pyproject.toml files, with the line each replaces."""
+    # Imported lazily: the other modes run on the runner's bare python3.
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
+
+    current_file = None
+    removed: dict[tuple[str, str], str] = {}
+    added: list[tuple[tuple[str, str], str]] = []
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            match = re.match(r"diff --git a/\S+ b/(\S+)$", line)
+            is_manifest = match and PurePosixPath(match.group(1)).name == "pyproject.toml"
+            current_file = match.group(1) if is_manifest else None
+            continue
+        match = REQUIREMENT_LINE.match(line)
+        if current_file is None or line.startswith(("+++", "---")) or not match:
+            continue
+        try:
+            requirement = Requirement(match.group(2))
+        except InvalidRequirement:
+            continue
+        key = (current_file, canonicalize_name(requirement.name))
+        if match.group(1) == "-":
+            removed[key] = match.group(2)
+        elif requirement.specifier:
+            added.append((key, match.group(2)))
+    return [
+        {"file": file, "name": name, "requirement": text, "previous": removed.get((file, name))}
+        for (file, name), text in added
+        if removed.get((file, name)) != text
+    ]
+
+
+def pypi_release_uploads(name: str) -> dict[str, datetime]:
+    """Return each PyPI release's first non-yanked upload time."""
+    url = f"https://pypi.org/pypi/{urllib.parse.quote(name)}/json"
+    with urllib.request.urlopen(url, timeout=10) as response:
+        releases = json.load(response)["releases"]
+    uploads = {}
+    for version, files in releases.items():
+        times = [
+            datetime.fromisoformat(file["upload_time_iso_8601"].replace("Z", "+00:00"))
+            for file in files
+            if not file.get("yanked")
+        ]
+        if times:
+            uploads[version] = min(times)
+    return uploads
+
+
+def repository_package_names(root: Path) -> set[str]:
+    """Return the distribution names published from this repository."""
+    from packaging.utils import canonicalize_name
+
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--", "*pyproject.toml"],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    ).stdout
+    names = set()
+    for path in filter(None, listed.decode().split("\0")):
+        name = (
+            tomllib.loads((root / path).read_text(encoding="utf-8")).get("project", {}).get("name")
+        )
+        if name:
+            names.add(canonicalize_name(name))
+    return names
+
+
+def young_dependency_requirements(
+    diff_text: str,
+    repository_packages: set[str],
+    fetch_uploads: Callable[[str], dict[str, datetime]] = pypi_release_uploads,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Return changed requirements that no release older than the cooldown satisfies."""
+    from packaging.requirements import Requirement
+    from packaging.version import InvalidVersion, Version
+
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=DEPENDENCY_COOLDOWN_DAYS)
+    changes = [
+        change
+        for change in changed_requirements(diff_text)
+        if change["name"] not in repository_packages
+    ]
+    findings = []
+    for change in changes[:DEPENDENCY_LOOKUP_LIMIT]:
+        try:
+            uploads = fetch_uploads(change["name"])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            findings.append({**change, "lookup_error": type(error).__name__})
+            continue
+        releases = {}
+        for version, uploaded in uploads.items():
+            try:
+                releases[Version(version)] = uploaded
+            except InvalidVersion:
+                continue
+        specifier = Requirement(change["requirement"]).specifier
+        if any(specifier.filter(v for v, uploaded in releases.items() if uploaded <= cutoff)):
+            continue
+        satisfying = list(specifier.filter(releases))
+        oldest = min(satisfying, key=releases.__getitem__) if satisfying else None
+        findings.append(
+            {
+                **change,
+                "oldest_satisfying_release": str(oldest) if oldest else None,
+                "uploaded_at": releases[oldest].isoformat() if oldest else None,
+            }
+        )
+    return findings
+
+
 def main() -> None:
     mode, source, destination = sys.argv[1:]
-    if mode == "stats":
+    if mode == "dependency-age":
+        findings = young_dependency_requirements(
+            Path(source).read_text(encoding="utf-8", errors="replace"),
+            repository_package_names(Path.cwd()),
+        )
+        result = {"cooldown_days": DEPENDENCY_COOLDOWN_DAYS, "requirements": findings}
+        Path(destination).write_text(json.dumps(result), encoding="utf-8")
+    elif mode == "stats":
         Path(destination).write_text(json.dumps(diff_stats(Path(source))), encoding="utf-8")
     elif mode == "linked-issues":
         Path(destination).write_text(json.dumps(linked_issues(source)), encoding="utf-8")

@@ -5,6 +5,7 @@ import os
 import runpy
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -510,3 +511,98 @@ def test_linked_issues_lookup_failure_records_unavailable(
     assert detail in result.stdout
     assert result.stdout.count("\n") == 1
     assert json.loads((tmp_path / "linked_issues.json").read_text()) is None
+
+
+_NOW = datetime(2026, 10, 23, tzinfo=UTC)
+_UPLOADS = {
+    "pillow": {
+        "12.3.0": datetime(2026, 7, 1, tzinfo=UTC),
+        "13.0.0": datetime(2026, 10, 16, 22, 18, tzinfo=UTC),
+    },
+    "httpx": {"0.28.1": datetime(2025, 1, 1, tzinfo=UTC)},
+}
+
+
+def _manifest_diff(path: str, removed: str, added: str) -> str:
+    lines = [f"-    {removed}"] if removed else []
+    return "\n".join(
+        [
+            f"diff --git a/{path} b/{path}",
+            f"--- a/{path}",
+            f"+++ b/{path}",
+            "@@ -1 +1 @@",
+            *lines,
+            f"+    {added}  # comment",
+            "",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("diff", "expected"),
+    [
+        (
+            _manifest_diff("pyproject.toml", '"pillow>=12.2,<13",', '"pillow>=13,<14",'),
+            [
+                {
+                    "name": "pillow",
+                    "previous": "pillow>=12.2,<13",
+                    "oldest_satisfying_release": "13.0.0",
+                }
+            ],
+        ),
+        (
+            _manifest_diff("sdks/ui/pyproject.toml", "", '"pillow==14.0",'),
+            [{"name": "pillow", "previous": None, "oldest_satisfying_release": None}],
+        ),
+        (_manifest_diff("pyproject.toml", '"pillow>=12,<13",', '"pillow>=12.2,<14",'), []),
+        (
+            _manifest_diff(
+                "pyproject.toml", '"omnigent-ui-sdk==0.19.0",', '"omnigent-ui-sdk==0.20.0",'
+            ),
+            [],
+        ),
+        (_manifest_diff("pyproject.toml", '"pillow>=12.2,<13",', '"pillow>=12.2,<13",'), []),
+        (_manifest_diff("requirements.txt", '"pillow>=12.2,<13",', '"pillow>=13,<14",'), []),
+        (_manifest_diff("pyproject.toml", "", '"pillow",'), []),
+    ],
+    ids=[
+        "raised-floor",
+        "added-unsatisfiable",
+        "aged-release-allowed",
+        "repository-package",
+        "comment-only",
+        "not-a-manifest",
+        "no-specifier",
+    ],
+)
+def test_young_dependency_requirements_flag_only_unaged_requirements(
+    diff: str, expected: list[dict]
+) -> None:
+    findings = _HELPERS["young_dependency_requirements"](
+        diff, {"omnigent-ui-sdk"}, _UPLOADS.__getitem__, now=_NOW
+    )
+
+    assert [
+        {key: finding[key] for key in ("name", "previous", "oldest_satisfying_release")}
+        for finding in findings
+    ] == expected
+
+
+def test_young_dependency_requirements_record_failed_lookups() -> None:
+    def unavailable(name: str) -> dict:
+        raise OSError(name)
+
+    diff = _manifest_diff("pyproject.toml", '"httpx>=0.27",', '"httpx>=0.28",')
+
+    findings = _HELPERS["young_dependency_requirements"](diff, set(), unavailable, now=_NOW)
+
+    assert findings == [
+        {
+            "file": "pyproject.toml",
+            "name": "httpx",
+            "requirement": "httpx>=0.28",
+            "previous": "httpx>=0.27",
+            "lookup_error": "OSError",
+        }
+    ]
