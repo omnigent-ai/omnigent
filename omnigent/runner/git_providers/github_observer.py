@@ -572,7 +572,7 @@ def _graphql_output_eligible(segments: Sequence[ShellSegment]) -> bool:
 
 
 def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
-    """Return one op per ``gh pr`` or ``gh api`` segment, in order.
+    """Return ordered ``gh`` operations followed by a deferred push lookup.
 
     Other ``gh`` commands produce no op. GraphQL output additionally requires
     known stdout producers and a stream without redirects or pipes.

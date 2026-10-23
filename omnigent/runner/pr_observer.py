@@ -400,7 +400,7 @@ def observe_tool_completion(
                     with _pending_lookups_lock:
                         _pending_lookups.discard(key)
                     raise
-    except Exception:  # noqa: BLE001 — the observer must never change a tool call's result
+    except Exception:
         _logger.warning(
             "Failed to record session PRs", extra={"session_id": session_id}, exc_info=True
         )
