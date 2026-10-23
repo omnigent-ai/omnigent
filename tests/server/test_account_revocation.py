@@ -1489,7 +1489,8 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
     assert stores["permission_store"].get("alice", session_id) is None
 
 
-def test_account_deletion_while_legacy_scheduler_unavailable(setup_app, monkeypatch):
+@pytest.mark.parametrize("startup_phase", ["unavailable", "loading"])
+def test_account_deletion_before_legacy_startup_finishes(setup_app, monkeypatch, startup_phase):
     from unittest.mock import Mock
 
     admin, alice, stores, _ = setup_app
@@ -1512,11 +1513,35 @@ def test_account_deletion_while_legacy_scheduler_unavailable(setup_app, monkeypa
     tasks = stores["scheduled_task_store"]
     list_tasks = Mock(wraps=tasks.list)
     monkeypatch.setattr(tasks, "list", list_tasks)
-    deleted = admin.delete("/auth/users/alice")
-    assert deleted.status_code == 204, deleted.text
-    list_tasks.assert_not_called()
-    assert tasks.get(created.json()["id"]).state == "deleted"
-    admin.portal.call(scheduler.start)
+    snapshot_taken, release = Event(), Event()
+    load = tasks.list_active_all_workspaces
+
+    def blocked_load():
+        snapshot = load()
+        snapshot_taken.set()
+        assert release.wait(10), "Startup snapshot was never released"
+        return snapshot
+
+    loading = None
+    try:
+        if startup_phase == "loading":
+            monkeypatch.setattr(tasks, "list_active_all_workspaces", blocked_load)
+            monkeypatch.setattr(admin.app.state, "scheduled_task_scheduler", scheduler)
+            loading = admin.portal.start_task_soon(scheduler.start)
+            assert snapshot_taken.wait(10)
+        deleted = admin.delete("/auth/users/alice")
+        assert deleted.status_code == 204, deleted.text
+        if startup_phase == "loading":
+            list_tasks.assert_called_once_with(owner_user_id="alice")
+        else:
+            list_tasks.assert_not_called()
+        assert tasks.get(created.json()["id"]).state == "deleted"
+    finally:
+        release.set()
+        if loading is not None:
+            loading.result(timeout=10)
+    if loading is None:
+        admin.portal.call(scheduler.start)
     assert scheduler.is_started
     assert scheduler.job_count == 0
     assert tasks.list_runs(created.json()["id"])[0] == []

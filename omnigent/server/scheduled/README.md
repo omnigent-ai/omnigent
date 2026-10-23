@@ -93,6 +93,10 @@ remain in the database for a later recovery sweep.
 
 ## Execution and recovery callbacks
 
+Give each application its own scheduled-task store instance. `create_app()` sets
+that object's scheduling mode; sharing it lets one app overwrite another's mode.
+Separate instances can share a database, with all replicas using the same mode.
+
 The application supplies these through `ScheduledTaskDispatchHooks`, passed to
 `create_app(scheduled_task_dispatch=...)`:
 
@@ -189,7 +193,10 @@ Persistent startup normally just launches the polling loop; database failures
 inside that loop retry at `poll_seconds`, not `startup_retry_seconds`.
 Database reads and cursor resets run off the event loop. Shutdown stops scheduling
 before the sandbox reaper and waits for an ongoing cursor reset to finish, so a
-slow database write can delay shutdown.
+slow database write can delay shutdown. Shutdown does not wait for a pending
+legacy task read: its worker thread may keep a connection until the query finishes,
+but its result cannot arm timers after shutdown. Process exit may still wait for
+the thread pool to finish. Configure database/driver timeouts to bound that wait.
 
 All replicas sharing a database must use the same mode, because legacy timers do
 not claim occurrences. Changing the environment of a running server does not

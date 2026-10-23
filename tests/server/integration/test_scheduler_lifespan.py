@@ -653,3 +653,74 @@ async def test_shutdown_stops_scheduling_before_sandbox_reaper(
         else:
             assert scheduler.is_started
     shutdown.assert_awaited_once()
+
+
+async def test_shutdown_during_legacy_read_does_not_wait_or_arm_late_timers(
+    runtime_init, db_uri, tmp_path, monkeypatch
+):
+    from threading import Event
+
+    loop = asyncio.get_running_loop()
+    entered, finished = asyncio.Event(), asyncio.Event()
+    release = Event()
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    task = store.create(
+        _uid("shutdown-read"),
+        "shutdown read",
+        "prompt",
+        "FREQ=DAILY",
+        None,
+        _uid("agent"),
+        "UTC",
+    )
+    load = store.list_active_all_workspaces
+    attempts = 0
+
+    def fail_then_block():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        snapshot = load()
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(10), "Startup read was never released"
+            return snapshot
+        finally:
+            loop.call_soon_threadsafe(finished.set)
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
+    monkeypatch.setattr(store, "list_active_all_workspaces", fail_then_block)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        scheduler_config=ScheduledTaskSchedulerConfig(startup_retry_seconds=0.01),
+    )
+    lifespan = app.router.lifespan_context(app)
+    await lifespan.__aenter__()
+    shutdown = None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        scheduler = app.state.scheduled_task_scheduler
+        retry = next(
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "scheduled-task-startup-retry"
+        )
+        shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
+        await asyncio.wait_for(asyncio.shield(shutdown), 5)
+        assert retry.cancelled()
+        assert not finished.is_set()
+        assert not scheduler.is_started
+        assert scheduler.job_count == 0
+    finally:
+        release.set()
+        if shutdown is not None:
+            await shutdown
+        else:
+            await lifespan.__aexit__(None, None, None)
+    await asyncio.wait_for(finished.wait(), 10)
+    assert not scheduler.is_started
+    assert scheduler.job_count == 0
+    assert scheduler.next_run_at(task.id) is None

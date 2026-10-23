@@ -1948,7 +1948,7 @@ async def test_database_scheduler_crud_uses_persisted_next_run(
     # its schedule and renders that same value without another scheduler lookup.
     assert isinstance(auth_app.state.scheduled_task_scheduler, PersistentTaskScheduler)
     assert auth_app.state.scheduled_task_scheduler.is_started
-    store = auth_app.state.scheduled_task_scheduler._store
+    store = SqlAlchemyScheduledTaskStore(db_uri)
     if not scheduler_available:
         await auth_app.state.scheduled_task_scheduler.stop()
         monkeypatch.setattr(auth_app.state, "scheduled_task_scheduler", None)
