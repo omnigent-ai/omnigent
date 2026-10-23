@@ -7630,8 +7630,15 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                     break
                 after = page.get("last_id")
 
-        with out_path.open("w", encoding="utf-8") as fh:
-            fh.writelines(iter_transcript_lines(session_data, _items()))
+        # Write beside the target and rename, so a failure while paging never
+        # leaves a partial file that reads as a complete transcript.
+        tmp_path = out_path.with_name(f".{out_path.name}.partial")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as fh:
+                fh.writelines(iter_transcript_lines(session_data, _items()))
+            tmp_path.replace(out_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
 
@@ -7694,7 +7701,14 @@ def _read_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, ob
         first_record: object = json.loads(first) if first.strip() else None
     except ValueError as exc:
         raise click.ClickException(f"{src_path}:1: not valid JSON ({exc}).") from exc
-    if isinstance(first_record, dict) and "record_type" in first_record:
+    # A schema header is authoritative: a file naming one is read as a transcript
+    # (and refused if the version is unknown) even if it also carries a legacy
+    # ``record_type`` key.
+    if (
+        isinstance(first_record, dict)
+        and "schema" not in first_record
+        and "record_type" in first_record
+    ):
         return _read_legacy_session_export(src_path)
 
     try:
@@ -7823,6 +7837,8 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     if not src_path.is_file():
         raise click.ClickException(f"Import file not found: {input_path}")
 
+    from omnigent.export import SETTING_KEYS
+
     meta, initial_items = _read_session_export(src_path)
     if not initial_items:
         raise click.ClickException(f"{input_path}: no items to import.")
@@ -7873,14 +7889,9 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
             body["title"] = resolved_title
         if labels:
             body["labels"] = labels
-        for key in (
-            "workspace",
-            "harness_override",
-            "model_override",
-            "reasoning_effort",
-            "cost_control_mode_override",
-            "terminal_launch_args",
-        ):
+        # Every setting the export writes is re-applied; the key list is the
+        # export's so the two cannot drift apart.
+        for key in ("workspace", *SETTING_KEYS):
             value = meta.get(key)
             if value is not None:
                 body[key] = value

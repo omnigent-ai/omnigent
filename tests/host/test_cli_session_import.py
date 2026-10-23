@@ -320,7 +320,12 @@ def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
             "agent_id": "ag_abc",
             "harness": "claude-native",
             "workspace": "/work/churn",
-            "settings": {"reasoning_effort": "high"},
+            "settings": {
+                "reasoning_effort": "high",
+                "harness_override": "claude-native",
+                "subagent_routing_override": "same-harness",
+                "cost_control_mode_override": "strict",
+            },
         },
         entries=[
             {"turn": 1, "seq": 1, "role": "user", "kind": "message", "text": "hello"},
@@ -368,7 +373,11 @@ def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
     assert body["agent_id"] == "ag_abc"
     assert body["title"] == "orig"
     assert body["workspace"] == "/work/churn"
+    # Every exported setting reaches the create request, not an allowlist of them.
     assert body["reasoning_effort"] == "high"
+    assert body["harness_override"] == "claude-native"
+    assert body["subagent_routing_override"] == "same-harness"
+    assert body["cost_control_mode_override"] == "strict"
     assert [item["type"] for item in body["initial_items"]] == [
         "message",
         "function_call",

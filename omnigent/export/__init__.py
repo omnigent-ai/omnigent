@@ -2,6 +2,7 @@
 
 from omnigent.export.transcript import (
     ITEM_ENVELOPE_KEYS,
+    SETTING_KEYS,
     SUPPORTED_SCHEMAS,
     TRANSCRIPT_SCHEMA,
     EntryNumbering,
@@ -21,6 +22,7 @@ from omnigent.export.transcript import (
 
 __all__ = [
     "ITEM_ENVELOPE_KEYS",
+    "SETTING_KEYS",
     "SUPPORTED_SCHEMAS",
     "TRANSCRIPT_SCHEMA",
     "EntryNumbering",

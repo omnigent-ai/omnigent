@@ -10264,6 +10264,18 @@
             "description": "The bound agent's canonical harness, e.g. `\"claude-sdk\"` or `\"openai-agents\"`. Lets the client render the active credential for the correct provider family instead of inferring it from the model string (which is wrong when the agent declares no model). `None` when the agent cannot be looked up.",
             "title": "Harness"
           },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session harness override, e.g. `\"codex\"`; `None` when the session runs the agent's own harness.",
+            "title": "Harness Override"
+          },
           "host_id": {
             "anyOf": [
               {

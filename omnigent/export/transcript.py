@@ -1,31 +1,8 @@
 """The ``omnigent.transcript/1`` portable session transcript.
 
-A transcript is newline-delimited JSON: the first line is a
-:class:`TranscriptHeader` naming the schema, every later line is one
-:class:`TranscriptEntry`. The entry vocabulary is deliberately small and
-harness-neutral (``message``, ``reasoning``, ``tool_call``, ``tool_result``,
-``error``, ``compaction``, ``note``) so a reviewer can read the file without
-an Omnigent server, and so a reader never has to grow a case per harness.
-
-Three properties the format guarantees:
-
-* **Sealed content is explicit.** When a provider returned something the
-  client could not read (encrypted reasoning, a provider-hosted tool
-  result), the readable fields say so instead of silently looking complete.
-* **Compaction is a boundary, not a gap.** The entries before a compaction
-  stay in the file; the ``compaction`` entry carries the summary the model
-  continued from and names the last entry it covers.
-* **Nothing is lost on import.** Every entry also carries ``raw``, the item
-  payload exactly as the exporting server stored it, so a re-import rebuilds
-  the item field for field even where the readable fields summarize.
-
-The CLI (``omnigent session export``) builds the file through
-:func:`iter_transcript_lines`; the server route (``GET /v1/sessions/{id}/export``)
-streams the same header and numbering through :func:`header_from_session` and
-:class:`EntryNumbering`, one page of items at a time. Both start from the flat
-API item shape (:meth:`ConversationItem.to_api_dict`). ``omnigent session
-import`` reads the file back through :func:`read_transcript` /
-:func:`item_from_entry`.
+Writer, reader and item rebuilder for the format documented in
+``docs/session-export.md``: a header line, then one harness-neutral entry per
+item, each carrying the stored payload in ``raw`` so an import is lossless.
 """
 
 from __future__ import annotations
@@ -70,7 +47,7 @@ _NON_SETTING_OVERRIDES: frozenset[str] = frozenset({"reported_model", "share_wor
 #: Session fields carried under ``header.settings`` so a re-import can restore
 #: the same per-session configuration: every stored override that is a
 #: setting, plus the launch args, which live in their own column.
-_SETTING_KEYS: tuple[str, ...] = (
+SETTING_KEYS: tuple[str, ...] = (
     *(k for k in SESSION_OVERRIDE_KEYS if k not in _NON_SETTING_OVERRIDES),
     "terminal_launch_args",
 )
@@ -216,7 +193,7 @@ class TranscriptEntry(BaseModel):
         stray = sorted(
             name
             for name, value in self.__dict__.items()
-            if name not in allowed and value not in (None, False)
+            if name not in allowed and value is not None and value is not False
         )
         if stray:
             raise ValueError(f"{self.kind} entry cannot carry {', '.join(stray)}")
@@ -294,7 +271,7 @@ def header_from_session(
         workspace=session.get("workspace"),
         parent_session_id=session.get("parent_session_id"),
         root_conversation_id=session.get("root_conversation_id"),
-        settings={k: session[k] for k in _SETTING_KEYS if session.get(k) is not None},
+        settings={k: session[k] for k in SETTING_KEYS if session.get(k) is not None},
         exported_at=exported_at,
     )
 
@@ -331,9 +308,7 @@ def header_from_conversation(
         workspace=conv.workspace,
         parent_session_id=conv.parent_conversation_id,
         root_conversation_id=conv.root_conversation_id,
-        settings={
-            k: getattr(conv, k) for k in _SETTING_KEYS if getattr(conv, k, None) is not None
-        },
+        settings={k: getattr(conv, k) for k in SETTING_KEYS if getattr(conv, k, None) is not None},
         exported_at=exported_at,
     )
 
@@ -545,15 +520,20 @@ class EntryNumbering:
     """
 
     def __init__(self) -> None:
-        self._turn = 0
+        self._user_messages = 0
         self._seq = 0
 
     def entry(self, item: Mapping[str, Any]) -> TranscriptEntry:
-        """Number the next item and map it to an entry."""
-        if self._turn == 0 or _starts_turn(item):
-            self._turn += 1
+        """Number the next item and map it to an entry.
+
+        Items before the first user message (startup context, lifecycle
+        events) belong to turn 1 with that message, so the first request is
+        always turn 1 whatever precedes it.
+        """
+        if _starts_turn(item):
+            self._user_messages += 1
         self._seq += 1
-        return entry_from_item(item, turn=self._turn, seq=self._seq)
+        return entry_from_item(item, turn=max(1, self._user_messages), seq=self._seq)
 
 
 def iter_transcript_entries(items: Iterable[Mapping[str, Any]]) -> Iterator[TranscriptEntry]:

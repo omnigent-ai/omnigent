@@ -169,10 +169,14 @@ def register_items_routes(
                 )
                 for item in page.data:
                     yield numbering.entry(item.to_api_dict()).to_line() + "\n"
-                # A page that says "more" without a cursor cannot be followed;
-                # restarting from the first page would loop forever.
-                if not page.has_more or page.last_id is None:
+                if not page.has_more:
                     break
+                if page.last_id is None:
+                    # Cannot be followed; aborting the stream beats a file that
+                    # silently ends early and reads as complete.
+                    raise RuntimeError(
+                        f"session {session_id} item page reported more results without a cursor"
+                    )
                 after = page.last_id
 
         return _NdjsonResponse(

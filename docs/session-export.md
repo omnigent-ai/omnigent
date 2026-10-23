@@ -105,6 +105,10 @@ replaced item id) and carries the summary it continued from.
 
 ### What the file does not promise
 
+- Harness and model are header fields, not per-entry ones. The store keeps
+  neither per item; an entry carries the `agent` that produced it, and a
+  `compaction` names the model that wrote its summary. A session whose model
+  changed mid-way shows the last reported model in the header only.
 - The stream has no trailer. A download that stopped early (a lost connection,
   a store error mid-page) is still a valid file; check that the last `seq`
   matches the item count you expect before trusting it as complete.

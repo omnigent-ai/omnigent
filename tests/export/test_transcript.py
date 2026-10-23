@@ -86,13 +86,16 @@ def test_header_names_schema_and_session() -> None:
 def test_header_settings_track_the_stored_overrides_the_create_route_accepts() -> None:
     """Every stored override that is a setting is exported, and every exported
     setting is something ``POST /v1/sessions`` can re-apply on import."""
-    from omnigent.export.transcript import _NON_SETTING_OVERRIDES, _SETTING_KEYS
-    from omnigent.server.schemas import SessionCreateRequest
+    from omnigent.export.transcript import _NON_SETTING_OVERRIDES, SETTING_KEYS
+    from omnigent.server.schemas import SessionCreateRequest, SessionResponse
     from omnigent.stores.conversation_store.overrides import SESSION_OVERRIDE_KEYS
 
-    exported = set(_SETTING_KEYS)
+    exported = set(SETTING_KEYS)
     assert exported >= set(SESSION_OVERRIDE_KEYS) - _NON_SETTING_OVERRIDES
     assert exported <= set(SessionCreateRequest.model_fields)
+    # The CLI builds its header from the session snapshot, so every setting the
+    # route exports must be on the snapshot too, or the two files differ.
+    assert exported <= set(SessionResponse.model_fields)
 
 
 # ── Entry mapping ───────────────────────────────────────────
@@ -335,9 +338,24 @@ def test_turns_start_at_each_user_message() -> None:
 
 
 def test_a_file_that_opens_without_a_user_message_still_starts_at_turn_one() -> None:
+    """Startup context and lifecycle items before the first request share turn 1
+    with it; the first request is never pushed into turn 2."""
     entries = list(iter_transcript_entries([_assistant("hello")]))
-
     assert [e.turn for e in entries] == [1]
+
+    items = [
+        _item(
+            "message",
+            role="user",
+            content=[{"type": "input_text", "text": "context"}],
+            is_meta=True,
+        ),
+        _item("resource_event", event_type="terminal.created", resource_id="t"),
+        _user("one"),
+        _assistant("1"),
+        _user("two"),
+    ]
+    assert [e.turn for e in iter_transcript_entries(items)] == [1, 1, 1, 1, 2]
 
 
 # ── Writer ↔ reader ─────────────────────────────────────────

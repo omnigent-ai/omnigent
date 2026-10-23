@@ -40,15 +40,12 @@ function mockJsonResponse(
   body: unknown,
   init?: { ok?: boolean; status?: number; statusText?: string },
 ): Response {
-  const response = {
+  return {
     ok: init?.ok ?? true,
     status: init?.status ?? 200,
     statusText: init?.statusText ?? "OK",
     json: async () => body,
-    // A body probe (`res.clone().json()`) must not consume the response.
-    clone: () => response,
-  };
-  return response as unknown as Response;
+  } as unknown as Response;
 }
 
 // An NDJSON streaming response: each line is emitted as its own chunk so the
@@ -1608,27 +1605,33 @@ describe("exportSessionTranscript", () => {
   });
 
   it("surfaces the server's error for a session the caller cannot read", async () => {
+    // The export 404 and the session probe 404 carry the same envelope: the
+    // session really is unknown, so no fallback.
+    const notFound = { error: { code: "not_found", message: "Not found" } };
     fetchMock.mockResolvedValueOnce(
-      mockJsonResponse(
-        { error: { code: "not_found", message: "Session not found" } },
-        { ok: false, status: 404, statusText: "Not Found" },
-      ),
+      mockJsonResponse(notFound, { ok: false, status: 404, statusText: "Not Found" }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(notFound, { ok: false, status: 404, statusText: "Not Found" }),
     );
 
     await expect(exportSessionTranscript("sess_missing")).rejects.toMatchObject({
       status: 404,
       code: "not_found",
     });
-    // A session 404 carries the AP error envelope and must not be mistaken
-    // for an older server without the route.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls).toEqual([
+      "/v1/sessions/sess_missing/export",
+      "/v1/sessions/sess_missing?include_items=false&include_liveness=false",
+    ]);
   });
 
   it("builds the legacy export client-side when the server has no /export route", async () => {
-    // FastAPI's unknown-route 404 has no `error` envelope.
+    // An older server that serves the web UI answers an unknown /v1 path with
+    // the same envelope as a missing session; only the session probe tells them apart.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse(
-        { detail: "Not Found" },
+        { error: { code: "not_found", message: "Not found" } },
         { ok: false, status: 404, statusText: "Not Found" },
       ),
     );

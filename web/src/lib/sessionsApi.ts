@@ -1449,58 +1449,49 @@ export async function fetchSessionItemsPage(
 }
 
 /**
- * Fetch a session's portable transcript (`omnigent.transcript/1` NDJSON).
+ * Fetch a session's portable transcript (`omnigent.transcript/1` NDJSON, see
+ * `docs/session-export.md`); the server pages the items and the SPA passes
+ * the body through.
  *
- * `GET /v1/sessions/{id}/export` writes the same file as `omnigent session
- * export`: a header line naming the schema, then one entry per committed
- * item in chronological order, so the download round-trips through
- * `omnigent session import`. The server pages the items; the SPA just
- * passes the body through.
- *
- * An older server has no `/export` route. FastAPI answers an unknown route
- * with `{"detail": "Not Found"}`, while a missing or unreadable session
- * answers with the AP `{"error": {...}}` envelope; only the former falls back
- * to {@link exportSessionTranscriptLegacy}, so a real "not found" still
- * surfaces as the error it is.
+ * An older server has no `/export` route, and its 404 looks exactly like a
+ * missing session's (the SPA fallback answers unknown `/v1` paths with the
+ * same error envelope). So on a 404 the session itself is fetched: if that
+ * succeeds the route is missing and the legacy export is built client-side;
+ * if not, the original "not found" is the real answer.
  */
 export async function exportSessionTranscript(sessionId: string): Promise<string> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/export`);
-  if (res.status === 404 && !(await isApiErrorEnvelope(res))) {
-    return exportSessionTranscriptLegacy(sessionId);
+  if (res.status === 404) {
+    const metaRes = await authenticatedFetch(sessionMetaUrl(sessionId));
+    if (metaRes.ok) {
+      return exportSessionTranscriptLegacy(
+        sessionId,
+        (await metaRes.json()) as Record<string, unknown>,
+      );
+    }
+    throw await apiErrorFromResponse(res);
   }
   if (!res.ok) throw await apiErrorFromResponse(res);
   return await res.text();
 }
 
-/** Whether a non-OK response body is the AP `{"error": {...}}` envelope. */
-async function isApiErrorEnvelope(res: Response): Promise<boolean> {
-  try {
-    const body = (await res.clone().json()) as { error?: unknown };
-    return typeof body === "object" && body !== null && typeof body.error === "object";
-  } catch {
-    return false;
-  }
+function sessionMetaUrl(sessionId: string): string {
+  const params = new URLSearchParams({ include_items: "false", include_liveness: "false" });
+  return `/v1/sessions/${encodeURIComponent(sessionId)}?${params}`;
 }
 
 /**
- * Build the pre-schema export client-side for a server without `/export`.
- *
- * The first line is the session metadata (`record_type: "session_meta"`),
- * every following line one committed item (`record_type: "item"`) in
- * chronological order. `omnigent session import` still reads this shape.
+ * Build the pre-schema export client-side for a server without `/export`:
+ * a `record_type: "session_meta"` line, then one `record_type: "item"` line
+ * per committed item. `omnigent session import` still reads this shape.
  *
  * @deprecated Compatibility shim for servers older than the `/export` route
  * (added in 0.20.0). Remove in 0.22.0, when those servers are out of support.
  */
-async function exportSessionTranscriptLegacy(sessionId: string): Promise<string> {
-  const metaParams = new URLSearchParams({
-    include_items: "false",
-    include_liveness: "false",
-  });
-  const metaRes = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
-  );
-  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+async function exportSessionTranscriptLegacy(
+  sessionId: string,
+  meta: Record<string, unknown>,
+): Promise<string> {
   const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
 
   // Pages are a cursor chain (each request needs the previous last_id),
