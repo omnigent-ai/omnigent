@@ -1,6 +1,9 @@
 /** Query param for deep-linking to a transcript message. */
 export const MESSAGE_QUERY_PARAM = "message";
 
+/** Query param that opens the chat's find bar filled in, at the oldest match. */
+export const FIND_QUERY_PARAM = "find";
+
 /**
  * Build a shareable URL for a message in the current session.
  *

@@ -20,6 +20,8 @@ from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
 MAX_PENDING_INPUTS = 100
+# Items one find-in-chat request scans, newest first; a longer chat pages by cursor.
+FIND_WINDOW_ITEMS = 2000
 
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
@@ -983,6 +985,33 @@ class ConversationStore(ABC):
         :param limit: Maximum number of results to return.
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
+        """
+        ...
+
+    @abstractmethod
+    def find_item_matches(
+        self,
+        conversation_id: str,
+        query: str,
+        *,
+        before: int | None = None,
+        window: int = FIND_WINDOW_ITEMS,
+    ) -> tuple[list[tuple[str, str]], int | None]:
+        """
+        Locate the matches for *query* among one window of a conversation's items.
+
+        The same case-insensitive substring rule as session search, so the
+        chat's find bar agrees with the sidebar's snippet. Each call scans at
+        most *window* items, newest first, ending just before *before*.
+
+        :param conversation_id: The conversation to look in, e.g. ``"conv_abc123"``.
+        :param query: The text to find, e.g. ``"deploy"``.
+        :param before: Position cursor: scan items before it, or from the
+            newest item when ``None``, e.g. ``4000``.
+        :param window: Maximum number of items to scan.
+        :returns: ``(matches, next_before)``: ``(item_id, response_id)`` pairs
+            in chat order, and the cursor for the next older window, or ``None``
+            once the window reached the conversation's first item.
         """
         ...
 

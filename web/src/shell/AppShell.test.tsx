@@ -136,13 +136,15 @@ vi.mock("./Sidebar", () => ({
   // Rendered as aside.conversations-sidebar like the real one, so the
   // peek-dismiss logic (which treats that selector as "inside the card") sees
   // the same shape here as in the app.
-  Sidebar: ({ open, peek }: { open: boolean; peek?: boolean }) => (
+  Sidebar: ({ open, peek, onClose }: { open: boolean; peek?: boolean; onClose: () => void }) => (
     <aside
       className="conversations-sidebar"
       data-testid="sidebar"
       data-open={open ? "true" : "false"}
       data-peek={peek ? "true" : "false"}
-    />
+    >
+      <button type="button" data-testid="sidebar-close" onClick={onClose} />
+    </aside>
   ),
 }));
 vi.mock("./FilesPanel", () => ({
@@ -2100,6 +2102,69 @@ describe("Workspace rail maximize", () => {
 
     fireEvent.click(screen.getByTestId("nav-settings"));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it.each([
+    ["mobile", "false"],
+    ["desktop", "true"],
+  ] as const)(
+    "on %s, a palette pick that leaves /settings leaves the sidebar %s",
+    (viewport, openAfter) => {
+      // Entering settings from the open drawer saves "open"; a mobile pick closes
+      // the drawer, so leaving settings must not restore it over the chat.
+      const baseMatchMedia = window.matchMedia;
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+        ...baseMatchMedia(query),
+        matches:
+          viewport === "desktop" ? query === "(min-width: 768px)" : query.includes("max-width"),
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
+      mockConversations([
+        { id: "conv_abc", permission_level: null },
+        { id: "conv_other", permission_level: null },
+      ]);
+      renderShell("/c/conv_abc");
+
+      // Desktop starts docked open; the phone drawer starts closed.
+      if (viewport === "mobile") {
+        fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+      }
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+      fireEvent.click(screen.getByTestId("nav-settings"));
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+      // An explicit close on desktop still restores the docked sidebar on the way out.
+      if (viewport === "desktop") fireEvent.click(screen.getByTestId("sidebar-close"));
+      fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+      fireEvent.click(screen.getAllByRole("option")[1]);
+
+      expect(screen.queryByTestId("nav-settings")).not.toBeNull();
+      expect(screen.queryByText("settings")).toBeNull();
+      expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", openAfter);
+    },
+  );
+
+  it("on mobile, closing the drawer within settings keeps Back landing on the list", () => {
+    // A section row or a palette pick of Settings closes the drawer inside settings;
+    // the Back row later leaves settings and must still reopen the drawer.
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: query.includes("max-width"),
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    fireEvent.click(screen.getByTestId("sidebar-close"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    fireEvent.click(screen.getByText("Go to Settings"));
+
     fireEvent.click(screen.getByTestId("nav-home"));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });

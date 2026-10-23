@@ -8,6 +8,22 @@
 // the composer untouched. On Windows/Linux the dialog shows Ctrl and only Ctrl
 // fires.
 
+/** Set on the file viewer's root while it owns ⌘F (the user last clicked or focused it). */
+export const FILE_FIND_OWNER_ATTRIBUTE = "data-find-owner";
+
+/** Window event asking the open chat to show its find bar (the header's find button). */
+export const CHAT_FIND_REQUEST_EVENT = "omnigent:chat-find";
+
+/** Ask the open chat to show its find bar, as ⌘F does. */
+export function requestChatFind(): void {
+  window.dispatchEvent(new Event(CHAT_FIND_REQUEST_EVENT));
+}
+
+/** True while an open file viewer owns ⌘F rather than the chat. */
+export function fileViewerOwnsFind(): boolean {
+  return document.querySelector(`[${FILE_FIND_OWNER_ATTRIBUTE}]`) !== null;
+}
+
 /** True on Apple platforms (⌘ is the command modifier); false elsewhere (Ctrl). */
 export function isMacPlatform(): boolean {
   if (typeof navigator === "undefined") return false;

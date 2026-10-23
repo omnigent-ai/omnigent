@@ -9,15 +9,25 @@
 import { ChevronRightIcon, SquareTerminalIcon } from "lucide-react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { type FindReveal, useRevealedCollapsible } from "@/components/chat/chatFindReveal";
 
 interface TerminalCommandCardProps {
   kind: "input" | "output";
   input: string | null;
   stdout: string | null;
   stderr: string | null;
+  /** Set while find in chat shows a match inside this card. */
+  findReveal?: FindReveal;
 }
 
-export function TerminalCommandCard({ kind, input, stdout, stderr }: TerminalCommandCardProps) {
+export function TerminalCommandCard({
+  kind,
+  input,
+  stdout,
+  stderr,
+  findReveal,
+}: TerminalCommandCardProps) {
+  const collapsible = useRevealedCollapsible(findReveal !== undefined, findReveal === "current");
   if (kind === "input") {
     return (
       <div
@@ -60,7 +70,7 @@ export function TerminalCommandCard({ kind, input, stdout, stderr }: TerminalCom
   }
 
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible {...collapsible} className="group not-prose w-full">
       <CollapsibleTrigger className="w-full cursor-pointer">{trigger}</CollapsibleTrigger>
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {hasStdout && (

@@ -9,6 +9,7 @@ import type { Agent } from "@/hooks/useAgents";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { CHAT_FIND_REQUEST_EVENT } from "@/lib/hotkeys";
 import { ChatHeader } from "./ChatHeader";
 import {
   TerminalFirstContextProvider,
@@ -1042,5 +1043,34 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.queryByRole("button", { name: "Conversation actions" })).toBeNull();
     expect(screen.getByRole("link", { name: "Back to parent session" })).toBeInTheDocument();
     expect(screen.getByText("reviewer")).toBeInTheDocument();
+  });
+});
+
+describe("ChatHeader — find in chat", () => {
+  it.each([false, true])("asks the chat to open its find bar (mobile: %s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const requests = vi.fn();
+    window.addEventListener(CHAT_FIND_REQUEST_EVENT, requests);
+    renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Find in chat" }));
+
+    expect(requests).toHaveBeenCalledTimes(1);
+    window.removeEventListener(CHAT_FIND_REQUEST_EVENT, requests);
+  });
+
+  it("has no find button without a session", () => {
+    renderHeader({ sidebarOpen: true });
+    expect(screen.queryByRole("button", { name: "Find in chat" })).toBeNull();
+  });
+
+  it("has no find button in the terminal view", () => {
+    renderHeaderWithSession(makeTerminalFirstCtx({ view: "terminal" }));
+    expect(screen.queryByRole("button", { name: "Find in chat" })).toBeNull();
+  });
+
+  it("keeps the find button in the chat view of a terminal-first session", () => {
+    renderHeaderWithSession(makeTerminalFirstCtx({ view: "chat" }));
+    expect(screen.getByRole("button", { name: "Find in chat" })).toBeInTheDocument();
   });
 });

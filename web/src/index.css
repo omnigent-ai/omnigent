@@ -1901,6 +1901,11 @@ html[data-electron-mac] .breadcrumb-folder {
   background-color: color-mix(in oklch, var(--warning) 70%, transparent);
 }
 
+/* Find-in-chat matches on screen (painted by useChatFindHighlight). */
+::highlight(chat-find) {
+  background-color: color-mix(in oklch, var(--warning) 45%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;

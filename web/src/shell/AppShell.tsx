@@ -1707,6 +1707,17 @@ function AppShellImpl() {
     setSidebarOpen(false);
     setSidebarPeek(false);
   }, [setSidebarOpen]);
+  // The palette closes the phone drawer before it navigates. A pick that leaves
+  // settings keeps it closed, instead of restoring the state saved on entry.
+  const handlePaletteCloseSidebar = useCallback(
+    (path: string) => {
+      if (sidebarOpenBeforeSettingsRef.current !== null && !path.startsWith("/settings")) {
+        sidebarOpenBeforeSettingsRef.current = false;
+      }
+      handleSidebarClose();
+    },
+    [handleSidebarClose],
+  );
   const handleSidebarOpen = useCallback(
     (peek = false) => {
       setSidebarOpen(!peek);
@@ -2811,6 +2822,7 @@ function AppShellImpl() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+            onCloseSidebar={handlePaletteCloseSidebar}
           />
           <RecentSessionsSwitcher
             conversations={allConversations}

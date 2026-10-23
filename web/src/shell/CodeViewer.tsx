@@ -698,7 +698,7 @@ export function CodeViewer({
   useEffect(() => {
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
-      if (hasCommandModifier(e) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f" && !e.defaultPrevented) {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -717,7 +717,7 @@ export function CodeViewer({
     // above with its own find bar).
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
-      if (hasCommandModifier(e) && e.key === "f") {
+      if (hasCommandModifier(e) && e.key === "f" && !e.defaultPrevented) {
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);

@@ -14,6 +14,7 @@ import { ChevronRightIcon, CommandIcon, WandSparklesIcon, type LucideIcon } from
 import { useMemo } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { type FindReveal, useRevealedCollapsible } from "@/components/chat/chatFindReveal";
 
 type SlashCommandKind = "skill" | "command";
 
@@ -49,9 +50,18 @@ interface SlashCommandCardProps {
   arguments: string;
   /** `<local-command-stdout>` text, or null when absent (typical for Skills). */
   output: string | null;
+  /** Set while find in chat shows a match inside this card. */
+  findReveal?: FindReveal;
 }
 
-export function SlashCommandCard({ kind, name, arguments: args, output }: SlashCommandCardProps) {
+export function SlashCommandCard({
+  kind,
+  name,
+  arguments: args,
+  output,
+  findReveal,
+}: SlashCommandCardProps) {
+  const collapsible = useRevealedCollapsible(findReveal !== undefined, findReveal === "current");
   const hasArgs = args.length > 0;
   const hasOutput = output !== null && output.length > 0;
   const canExpand = hasArgs || hasOutput;
@@ -92,7 +102,7 @@ export function SlashCommandCard({ kind, name, arguments: args, output }: SlashC
   }
 
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible {...collapsible} className="group not-prose w-full">
       <CollapsibleTrigger className="w-full cursor-pointer">{trigger}</CollapsibleTrigger>
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         {hasArgs && <ArgsPanel args={args} />}

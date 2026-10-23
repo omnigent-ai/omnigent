@@ -4,7 +4,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { cn } from "@/lib/utils";
 import { ChevronRightIcon, SparklesIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
-import { createContext, memo, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, memo, useContext, useEffect, useMemo, useState } from "react";
+import { useRevealedOpen } from "@/components/chat/chatFindReveal";
 import { Streamdown } from "streamdown";
 import { MERMAID_STREAMDOWN_PROPS } from "@/components/ai-elements/MermaidBlock";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -53,6 +54,8 @@ export type ReasoningProps = ComponentProps<typeof Collapsible> & {
    * non-interactive header (see `ReasoningTrigger` / `ReasoningContent`).
    */
   expandable?: boolean;
+  /** Open while find in chat shows a match inside, unless the reader toggles it. */
+  revealed?: boolean;
 };
 
 export const Reasoning = memo(
@@ -61,6 +64,7 @@ export const Reasoning = memo(
     isStreaming = false,
     duration,
     expandable = true,
+    revealed = false,
     children,
     ...props
   }: ReasoningProps) => {
@@ -69,16 +73,17 @@ export const Reasoning = memo(
     // Resetting on the next stream means a new reasoning section
     // doesn't inherit the user's choice from the previous one.
     const [userOverride, setUserOverride] = useState<boolean | null>(null);
+    const [shownOpen, handleOpenChange] = useRevealedOpen(
+      revealed,
+      userOverride ?? isStreaming,
+      setUserOverride,
+    );
     // A non-expandable section is always closed — there's nothing inside.
-    const isOpen = expandable ? (userOverride ?? isStreaming) : false;
+    const isOpen = expandable ? shownOpen : false;
 
     useEffect(() => {
       if (isStreaming) setUserOverride(null);
     }, [isStreaming]);
-
-    const handleOpenChange = useCallback((newOpen: boolean) => {
-      setUserOverride(newOpen);
-    }, []);
 
     const contextValue = useMemo(
       () => ({ duration, isOpen, isStreaming, setIsOpen: handleOpenChange, expandable }),

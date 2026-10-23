@@ -208,19 +208,30 @@ def test_native_find_shortcut_mounts_the_full_loaded_transcript(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Ctrl+F makes every loaded bubble available to browser find-in-page."""
+    """The first find press opens the chat's find bar; a second from the bar
+    falls through to browser find-in-page with every loaded bubble mounted."""
     _open_seeded_pair(page, seeded_session_pair)
     bubbles = page.locator('[data-testid="message-bubble"]')
     mounted_before = bubbles.count()
     assert mounted_before < 100, mounted_before
 
+    # Last window listener in bubble phase, so it sees each press's final defaultPrevented.
     page.evaluate(
-        """() => window.dispatchEvent(new KeyboardEvent('keydown', {
-          key: 'f',
-          ctrlKey: true,
-          bubbles: true,
-        }))"""
+        """() => {
+          window.__findPrevented = [];
+          window.addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'f') window.__findPrevented.push(e.defaultPrevented);
+          });
+        }"""
     )
+    # Virtualized transcript rows; the workspace rail virtualizes its own.
+    rows = page.get_by_role("log").locator("[data-index]")
+    page.keyboard.press("ControlOrMeta+f")
+    expect(page.get_by_role("textbox", name="Find in chat")).to_be_focused()
+    expect(rows.first).to_be_attached()
 
-    expect(page.locator("[data-index]")).to_have_count(0, timeout=30_000)
+    page.keyboard.press("ControlOrMeta+f")
+    expect(rows).to_have_count(0, timeout=30_000)
     assert bubbles.count() > mounted_before
+    # The chat claims the first press; the second stays the browser's.
+    assert page.evaluate("() => window.__findPrevented") == [True, False]

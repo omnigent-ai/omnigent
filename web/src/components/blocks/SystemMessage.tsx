@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
+import { useRevealedOpen } from "@/components/chat/chatFindReveal";
 import type { ParsedSystemMessage, SystemMessageKind } from "@/lib/systemMessage";
 
 const KIND_ICON: Record<Exclude<SystemMessageKind, "subagent_wake">, LucideIcon> = {
@@ -24,6 +25,8 @@ const KIND_ICON: Record<Exclude<SystemMessageKind, "subagent_wake">, LucideIcon>
 
 interface SystemMessageViewProps {
   message: ParsedSystemMessage;
+  /** Find in chat stepped to a match in this message. */
+  revealed?: boolean;
 }
 
 /**
@@ -36,8 +39,9 @@ interface SystemMessageViewProps {
  * in history so the parent agent drains its inbox, but the web UI hides them
  * because the Agents rail already owns that status.
  */
-export function SystemMessageView({ message }: SystemMessageViewProps) {
-  const [open, setOpen] = useState(false);
+export function SystemMessageView({ message, revealed = false }: SystemMessageViewProps) {
+  const [openByReader, setOpenByReader] = useState(false);
+  const [open, setOpen] = useRevealedOpen(revealed, openByReader, setOpenByReader);
   if (message.kind === "subagent_wake") return null;
   const Icon = KIND_ICON[message.kind];
   const hasBody = message.body.trim().length > 0;
@@ -51,7 +55,7 @@ export function SystemMessageView({ message }: SystemMessageViewProps) {
       {hasBody ? (
         <button
           type="button"
-          onClick={() => setOpen((v) => !v)}
+          onClick={() => setOpen(!open)}
           className="flex items-center gap-1.5 rounded px-1.5 py-0.5 hover:text-foreground"
           aria-expanded={open}
         >

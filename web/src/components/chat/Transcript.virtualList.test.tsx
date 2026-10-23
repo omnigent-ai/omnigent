@@ -1,8 +1,16 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
-import { isNativeFindShortcut, type TranscriptGeometry, VirtualBubbleList } from "./Transcript";
+import {
+  isNativeFindShortcut,
+  findShortcutRoute,
+  useChatFind,
+  useChatFindShortcut,
+  type TranscriptGeometry,
+  VirtualBubbleList,
+} from "./Transcript";
+import { FILE_FIND_OWNER_ATTRIBUTE, isMacPlatform, requestChatFind } from "@/lib/hotkeys";
 
 afterEach(cleanup);
 
@@ -109,6 +117,7 @@ it("recognizes unhandled native find keyboard shortcuts", () => {
       metaKey: true,
       ctrlKey: false,
       altKey: false,
+      shiftKey: false,
       defaultPrevented: false,
     }),
   ).toBe(true);
@@ -118,6 +127,7 @@ it("recognizes unhandled native find keyboard shortcuts", () => {
       metaKey: false,
       ctrlKey: true,
       altKey: false,
+      shiftKey: false,
       defaultPrevented: false,
     }),
   ).toBe(true);
@@ -127,9 +137,132 @@ it("recognizes unhandled native find keyboard shortcuts", () => {
       metaKey: true,
       ctrlKey: false,
       altKey: false,
+      shiftKey: false,
       defaultPrevented: true,
     }),
   ).toBe(false);
+});
+
+it("routes ⌘F to the chat's find, the browser's find or an open file", () => {
+  document.body.innerHTML = `<input id="find" />`;
+  const findInput = document.getElementById("find");
+  const press = {
+    key: "f",
+    metaKey: isMacPlatform(),
+    ctrlKey: !isMacPlatform(),
+    altKey: false,
+    shiftKey: false,
+    defaultPrevented: false,
+  };
+  const options = { showTerminal: false, findInput, fileOwnsFind: false };
+
+  expect(findShortcutRoute(press, options)).toBe("chat");
+  expect(findShortcutRoute(press, { ...options, showTerminal: true })).toBe("native");
+  // An open file that owns ⌘F gets it untouched: no find bar, no native-find render.
+  expect(findShortcutRoute(press, { ...options, fileOwnsFind: true })).toBeNull();
+  expect(findShortcutRoute({ ...press, key: "g" }, options)).toBeNull();
+  // ⌘⇧F belongs to the workspace's content search.
+  expect(findShortcutRoute({ ...press, shiftKey: true }, options)).toBeNull();
+  findInput?.focus();
+  expect(findShortcutRoute(press, options)).toBe("native");
+  document.body.innerHTML = "";
+});
+
+it("claims ⌘F ahead of the side panel's listeners unless an open file owns it", () => {
+  document.body.innerHTML = `<input id="find" /><aside data-testid="file-viewer"></aside>`;
+  const findInputRef = { current: document.getElementById("find") as HTMLInputElement };
+  const onChatFind = vi.fn();
+  const onNativeFind = vi.fn();
+  // Registered before the chat's, as a file viewer opened earlier would be.
+  const panelSaw: boolean[] = [];
+  const panel = (event: KeyboardEvent) => panelSaw.push(event.defaultPrevented);
+  window.addEventListener("keydown", panel);
+  const { unmount } = renderHook(() =>
+    useChatFindShortcut({
+      enabled: true,
+      showTerminal: false,
+      findInputRef,
+      onChatFind,
+      onNativeFind,
+    }),
+  );
+  const press = () =>
+    document.body.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "f",
+        metaKey: isMacPlatform(),
+        ctrlKey: !isMacPlatform(),
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+  press();
+  expect(onChatFind).toHaveBeenCalledOnce();
+  expect(panelSaw).toEqual([true]);
+
+  document.querySelector("aside")?.setAttribute(FILE_FIND_OWNER_ATTRIBUTE, "");
+  press();
+  expect(onChatFind).toHaveBeenCalledOnce();
+  expect(onNativeFind).not.toHaveBeenCalled();
+  expect(panelSaw).toEqual([true, false]);
+
+  unmount();
+  window.removeEventListener("keydown", panel);
+  document.body.innerHTML = "";
+});
+
+it("opens the chat's find bar when the header asks, outside the terminal view", () => {
+  const onChatFind = vi.fn();
+  const findInputRef = { current: null };
+  const { rerender, unmount } = renderHook(
+    ({ showTerminal }) =>
+      useChatFindShortcut({
+        enabled: true,
+        showTerminal,
+        findInputRef,
+        onChatFind,
+        onNativeFind: vi.fn(),
+      }),
+    { initialProps: { showTerminal: false } },
+  );
+
+  requestChatFind();
+  expect(onChatFind).toHaveBeenCalledTimes(1);
+
+  rerender({ showTerminal: true });
+  requestChatFind();
+  expect(onChatFind).toHaveBeenCalledTimes(1);
+
+  unmount();
+  requestChatFind();
+  expect(onChatFind).toHaveBeenCalledTimes(1);
+});
+
+it("focuses the find input within the tap that opens it", () => {
+  let focusedDuringTap: Element | null = null;
+  function Harness() {
+    const { find, findInputRef, openChatFind } = useChatFind("conv-1", null);
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            openChatFind();
+            focusedDuringTap = document.activeElement;
+          }}
+        >
+          open
+        </button>
+        {find ? <input aria-label="find" ref={findInputRef} /> : null}
+      </>
+    );
+  }
+  render(<Harness />);
+
+  screen.getByRole("button", { name: "open" }).click();
+
+  expect(focusedDuringTap).toBe(screen.getByRole("textbox", { name: "find" }));
 });
 
 it("renders every bubble in normal flow after native find is detected", () => {

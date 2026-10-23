@@ -39,6 +39,7 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onOpenChange: vi.fn(),
     onToggleLeftSidebar: vi.fn(),
     onToggleRightSidebar: vi.fn(),
+    onCloseSidebar: vi.fn(),
     ...overrides,
   };
   render(<CommandPalette {...props} />);
@@ -102,6 +103,7 @@ describe("CommandPalette — sessions", () => {
       onOpenChange: vi.fn(),
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
+      onCloseSidebar: vi.fn(),
     };
     const { rerender } = render(<CommandPalette {...props} />);
     expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
@@ -331,6 +333,20 @@ describe("CommandPalette — match preview", () => {
     for (const m of marks) expect(m.textContent?.toLowerCase()).toBe("what");
   });
 
+  it("opens a content match with the chat's find bar on the query", () => {
+    setSessions([
+      conv("c1", "Hello", "cursor", "…the deploy step failed…"),
+      conv("c2", "deploy runbook", "agent", null),
+    ]);
+    renderPalette();
+    search("deploy step");
+
+    fireEvent.click(screen.getByText("Hello"));
+    expect(navigate).toHaveBeenLastCalledWith("/c/c1?find=deploy%20step");
+    fireEvent.click(screen.getByText(/runbook/));
+    expect(navigate).toHaveBeenLastCalledWith("/c/c2");
+  });
+
   it("omits the snippet line for a title-only match (no search_snippet)", () => {
     setSessions([conv("c1", "deploy runbook", "agent", null)]);
     renderPalette();
@@ -402,6 +418,38 @@ describe("CommandPalette — mobile full-screen sheet", () => {
     fireEvent.click(screen.getByLabelText("Close search"));
 
     expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it.each([
+    { viewport: "mobile", isMobile: true, closes: 1 },
+    { viewport: "desktop", isMobile: false, closes: 0 },
+  ])("closes the sidebar on $viewport only when a pick navigates", ({ isMobile, closes }) => {
+    setMobile(isMobile);
+    setSessions([conv("c1", "Hello", "cursor", "…the deploy step failed…")]);
+    const onCloseSidebar = vi.fn();
+    const onToggleLeftSidebar = vi.fn();
+    vi.useFakeTimers();
+    renderPalette({ onCloseSidebar, onToggleLeftSidebar });
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "deploy" } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    vi.useRealTimers();
+
+    fireEvent.click(screen.getByText("Hello"));
+    expect(navigate).toHaveBeenLastCalledWith("/c/c1?find=deploy");
+    expect(onCloseSidebar).toHaveBeenCalledTimes(closes);
+
+    // Every page-opening action closes it the same way; a panel toggle does not.
+    fireEvent.change(input, { target: { value: "" } });
+    for (const label of ["New chat", "Go to Inbox", "Go to Automations", "Go to Settings"]) {
+      fireEvent.click(screen.getByText(label));
+    }
+    expect(onCloseSidebar).toHaveBeenCalledTimes(closes * 5);
+    fireEvent.click(screen.getByText("Toggle conversations sidebar"));
+    expect(onToggleLeftSidebar).toHaveBeenCalledTimes(1);
+    expect(onCloseSidebar).toHaveBeenCalledTimes(closes * 5);
   });
 
   it("still searches from the mobile input", () => {

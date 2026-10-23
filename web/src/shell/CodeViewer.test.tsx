@@ -190,7 +190,7 @@ describe("CodeViewer find-in-file shortcut", () => {
     viewMode: "editor" | "source",
     setSearchOpen: (open: boolean) => void,
   ) {
-    render(
+    return render(
       <>
         <textarea aria-label="Prompt" />
         <CodeViewer
@@ -246,6 +246,30 @@ describe("CodeViewer find-in-file shortcut", () => {
 
     expect(event.defaultPrevented).toBe(true);
     expect(setSearchOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("leaves a Cmd+F the chat already claimed alone, in both find modes", () => {
+    vi.spyOn(navigator, "platform", "get").mockReturnValue("MacIntel");
+    const claim = (event: Event) => event.preventDefault();
+    window.addEventListener("keydown", claim, true);
+    try {
+      for (const mode of ["editor", "source"] as const) {
+        const setSearchOpen = vi.fn();
+        const { unmount } = renderMarkdownViewer(mode, setSearchOpen);
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "f",
+            metaKey: true,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+        expect(setSearchOpen).not.toHaveBeenCalled();
+        unmount();
+      }
+    } finally {
+      window.removeEventListener("keydown", claim, true);
+    }
   });
 
   it("leaves Ctrl+F to a focused composer beside Markdown source on macOS", () => {

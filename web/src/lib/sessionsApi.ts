@@ -290,6 +290,12 @@ interface SessionItemsResponseWire {
 export const SESSION_HISTORY_PAGE_SIZE = 20;
 
 /**
+ * Page size when history is paged toward a target (a find match, a deep link,
+ * the first message) rather than by a scroll-up. The server caps `limit` at 1000.
+ */
+export const SESSION_HISTORY_SEEK_PAGE_SIZE = 1000;
+
+/**
  * Convert the snake-case `usage_by_model` wire map into the camelCase
  * `Record<string, ModelUsage>` the store/UI use, or `null` when absent.
  * A `null`/absent value (or `null` token bucket) maps to `null` on the
@@ -1291,6 +1297,37 @@ export async function fetchSessionItemsPage(
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
   return { items: [...page.data].reverse(), hasMore: page.has_more };
+}
+
+/** One item that matched a find-in-chat query. */
+export interface SessionSearchMatch {
+  id: string;
+  response_id: string;
+}
+
+/**
+ * The items whose text contains `query` in one window of a session, oldest first.
+ *
+ * Ids only (the find bar pages history in up to a match before scrolling to
+ * it). The server scans a fixed window of items per call, newest first; pass
+ * `nextBefore` back as `before` for the next older window until it is null.
+ */
+export async function searchSessionItems(
+  sessionId: string,
+  query: string,
+  { before, signal }: { before?: number; signal?: AbortSignal } = {},
+): Promise<{ matches: SessionSearchMatch[]; nextBefore: number | null }> {
+  const params = new URLSearchParams({ q: query });
+  if (before !== undefined) params.set("before", String(before));
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/search?${params}`,
+    { signal },
+  );
+  const page = await readJsonOrThrow<{
+    data: SessionSearchMatch[];
+    next_before: number | null;
+  }>(res);
+  return { matches: page.data, nextBefore: page.next_before };
 }
 
 /**

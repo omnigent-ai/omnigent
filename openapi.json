@@ -17453,6 +17453,77 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/search": {
+      "get": {
+        "description": "Locate the items in one window of a session whose text contains `q`.\n\nBacks the chat's find bar: ids only, so the client loads history up to\na match and scrolls to it. Same match rule as session search. Each\nrequest scans a fixed window of items, newest first; the client walks\nolder windows with `next_before` until `has_more` is false.\n\n**Returns:** `{\"data\": [{\"id\", \"response_id\"}, ...], \"has_more\": bool, \"next_before\": int | None}`, matches in chat order.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if no session exists or the caller can't read it.",
+        "operationId": "search_session_items_v1_sessions__session_id__search_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The text to find (case-insensitive substring), e.g. `\"deploy\"`.",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Position cursor from a previous page's `next_before`; omit to start at the newest item.",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Session Items",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/sign-in-link": {
       "get": {
         "description": "Return the sign-in link the session's terminal is waiting on right now.\n\nAsked by the error card at click time, so the user opens the live\nprompt rather than a link saved earlier that its launcher process has\nsince abandoned.\n\n**Returns:** The runner's `{\"pending\", \"url\", \"code\", \"terminal_id\"}` payload.",

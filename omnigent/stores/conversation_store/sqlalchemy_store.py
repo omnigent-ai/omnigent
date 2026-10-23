@@ -95,6 +95,7 @@ from omnigent.stores.conversation_store import (
     _INSTANCE_SCOPED_LABEL_KEYS,
     _SANDBOX_REPO_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
+    FIND_WINDOW_ITEMS,
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
@@ -630,6 +631,20 @@ def _fetch_labels_bulk(
     return out
 
 
+def _chat_text_match(pattern: str) -> ColumnElement[bool]:
+    """
+    Items whose ``search_text`` matches ``pattern``, among those the chat shows as text.
+
+    A compaction renders only as a marker, so a match in its summary would
+    count in session search and find in chat with nothing to land on.
+    ILIKE on the raw column: only it carries the pg_trgm index.
+    """
+    return and_(
+        SqlConversationItem.search_text.ilike(pattern),
+        SqlConversationItem.type != encode_item_type("compaction"),
+    )
+
+
 def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
@@ -672,7 +687,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        _chat_text_match(pattern),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -2231,6 +2246,55 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._conv_session_immediate, "transition_pending_input", write
         )
 
+    def find_item_matches(
+        self,
+        conversation_id: str,
+        query: str,
+        *,
+        before: int | None = None,
+        window: int = FIND_WINDOW_ITEMS,
+    ) -> tuple[list[tuple[str, str]], int | None]:
+        """
+        Locate the matches for *query* among one window of a conversation's items.
+
+        Same ILIKE predicate as :func:`_fetch_search_snippets`. Both reads walk
+        the ``(workspace_id, conversation_id, position)`` index over at most
+        *window* items; ``data`` is never read.
+
+        :param conversation_id: The conversation to look in, e.g. ``"conv_abc123"``.
+        :param query: The text to find, e.g. ``"deploy"``.
+        :param before: Position cursor: scan items before it, or from the
+            newest item when ``None``, e.g. ``4000``.
+        :param window: Maximum number of items to scan.
+        :returns: ``(matches, next_before)``: ``(item_id, response_id)`` pairs
+            in chat order, and the cursor for the next older window, or ``None``
+            once the window reached the conversation's first item.
+        """
+        in_scope = [
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id == conversation_id,
+        ]
+        if before is not None:
+            in_scope.append(SqlConversationItem.position < before)
+        with self._conv_session("find_item_matches") as session:
+            # The window's oldest position, then the next older one if it exists.
+            edges = session.scalars(
+                select(SqlConversationItem.position)
+                .where(*in_scope)
+                .order_by(SqlConversationItem.position.desc())
+                .offset(window - 1)
+                .limit(2)
+            ).all()
+            if edges:
+                in_scope.append(SqlConversationItem.position >= edges[0])
+            rows = session.execute(
+                select(SqlConversationItem.id, SqlConversationItem.response_id)
+                .where(*in_scope, _chat_text_match(f"%{query.lower()}%"))
+                .order_by(SqlConversationItem.position)
+            ).all()
+        matches = [(item_id, response_id) for item_id, response_id in rows]
+        return matches, edges[0] if len(edges) == 2 else None
+
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """
         Fetch one persisted item by id, or ``None`` when absent.
@@ -3200,7 +3264,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        _chat_text_match(pattern),
                     )
                     .exists()
                 )

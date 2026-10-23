@@ -114,6 +114,48 @@ def register_items_routes(
             has_more=page.has_more,
         )
 
+    @router.get("/sessions/{session_id}/search", response_model=None)
+    async def search_session_items(
+        request: Request,
+        session_id: str,
+        q: str = Query(min_length=1),
+        before: int | None = Query(default=None, ge=0),
+    ) -> dict[str, object]:
+        """
+        Locate the items in one window of a session whose text contains ``q``.
+
+        Backs the chat's find bar: ids only, so the client loads history up to
+        a match and scrolls to it. Same match rule as session search. Each
+        request scans a fixed window of items, newest first; the client walks
+        older windows with ``next_before`` until ``has_more`` is false.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :param q: The text to find (case-insensitive substring), e.g. ``"deploy"``.
+        :param before: Position cursor from a previous page's ``next_before``;
+            omit to start at the newest item.
+        :returns: ``{"data": [{"id", "response_id"}, ...], "has_more": bool,
+            "next_before": int | None}``, matches in chat order.
+        :raises OmnigentError: 404 if no session exists or the caller can't read it.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        if access.conversation is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        matches, next_before = await asyncio.to_thread(
+            conversation_store.find_item_matches, session_id, q, before=before
+        )
+        return {
+            "data": [
+                {"id": item_id, "response_id": response_id} for item_id, response_id in matches
+            ],
+            "has_more": next_before is not None,
+            "next_before": next_before,
+        }
+
     # ── GET /sessions/{session_id}/child_sessions ────────────────
 
     @router.get(

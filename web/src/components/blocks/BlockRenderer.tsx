@@ -22,6 +22,12 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import {
+  FIND_CURRENT_ATTRIBUTE,
+  type FindReveal,
+  findRevealsFor,
+  useRevealedOpen,
+} from "@/components/chat/chatFindReveal";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -106,6 +112,8 @@ interface BlockRendererProps {
   showsWorking?: boolean;
   /** Start a fold containing a mid-turn user interjection open. */
   defaultExpanded?: boolean;
+  /** Item ids find in chat stepped to in this bubble; the last is the current match. */
+  findItemIds?: readonly string[];
 }
 
 /** The subset of {@link BlockRendererProps} the fold decision reads. */
@@ -207,6 +215,7 @@ export function BlockRenderer({
   showsWorking = false,
   defaultExpanded = false,
   onRetryError,
+  findItemIds,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
     sessionStatus,
@@ -282,7 +291,10 @@ export function BlockRenderer({
     else if (showFold) foldLatchedRef.current = true;
   });
 
+  const findReveals = findRevealsFor(items, findItemIds ?? []);
   if (showFold) {
+    // A match no rendered item claims opens every fold of its bubble.
+    const revealsAllFolds = findItemIds !== undefined && findReveals.size === 0;
     const rendered: ReactNode[] = [];
     for (const segment of partition.segments) {
       if (segment.kind === "text") {
@@ -291,13 +303,23 @@ export function BlockRenderer({
             liveEdge: false,
             indexBase: segment.startIndex,
             onRetryError,
+            findReveals,
           }),
         );
         continue;
       }
       if (segment.kind === "exempt") {
         rendered.push(
-          renderItem(segment.item, segment.index, false, false, false, false, onRetryError),
+          renderItem(
+            segment.item,
+            segment.index,
+            false,
+            false,
+            false,
+            false,
+            onRetryError,
+            findReveals.get(segment.item),
+          ),
         );
         continue;
       }
@@ -308,11 +330,13 @@ export function BlockRenderer({
           workedForS={workRunCount === 1 ? workedForS : undefined}
           animateCollapse={animateCollapse}
           defaultOpen={defaultExpanded}
+          revealed={revealsAllFolds || segment.items.some((item) => findReveals.has(item))}
         >
           {renderSequence(segment.items, {
             liveEdge: false,
             indexBase: segment.startIndex,
             onRetryError,
+            findReveals,
           })}
         </TurnWorkedFold>,
       );
@@ -324,6 +348,7 @@ export function BlockRenderer({
     liveEdge: isTurnLive,
     suppressReasoningDuration: showsWorking,
     onRetryError,
+    findReveals,
   });
 }
 
@@ -336,7 +361,13 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
+  {
+    liveEdge,
+    suppressReasoningDuration = false,
+    indexBase = 0,
+    onRetryError,
+    findReveals,
+  }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -375,15 +406,17 @@ function renderSequence(
         // are nested (inside `ToolGroupSummary`).
         rendered.push(
           <div key={`tool-group-with-tail:${indexBase + runStart}`} className="space-y-1">
-            <ToolGroupSummary tools={group.tools} />
+            <ToolGroupSummary tools={group.tools} findReveals={findReveals} />
             {tail.map((fragment, idx) =>
-              renderToolRunFragment(fragment, indexBase + runStart, idx),
+              renderToolRunFragment(fragment, indexBase + runStart, idx, findReveals),
             )}
           </div>,
         );
       } else {
         for (let idx = 0; idx < fragments.length; idx += 1) {
-          rendered.push(renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx));
+          rendered.push(
+            renderToolRunFragment(fragments[idx]!, indexBase + runStart, idx, findReveals),
+          );
         }
       }
       previousRenderedItemWasText = false;
@@ -401,6 +434,7 @@ function renderSequence(
         suppressReasoningDuration,
         followsText,
         onRetryError,
+        findReveals?.get(item),
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -414,6 +448,7 @@ interface TurnSequenceOptions {
   suppressReasoningDuration?: boolean;
   indexBase?: number;
   onRetryError?: BlockRendererProps["onRetryError"];
+  findReveals?: ReadonlyMap<RenderItem, FindReveal>;
 }
 
 interface TurnPartition {
@@ -515,11 +550,14 @@ function TurnWorkedFold({
   workedForS,
   animateCollapse,
   defaultOpen,
+  revealed,
   children,
 }: {
   workedForS?: number;
   animateCollapse: boolean;
   defaultOpen: boolean;
+  /** Find in chat shows a match inside this fold. */
+  revealed: boolean;
   children: ReactNode;
 }) {
   const label = workedForS !== undefined ? `Worked for ${formatWorkedFor(workedForS)}` : "Worked";
@@ -557,6 +595,7 @@ function TurnWorkedFold({
     setUserOpened(next);
     setOpen(next);
   };
+  const [shownOpen, handleShownOpenChange] = useRevealedOpen(revealed, open, handleOpenChange);
   useLayoutEffect(() => {
     if (!open || !scrollOnOpenRef.current) return;
     scrollOnOpenRef.current = false;
@@ -591,8 +630,8 @@ function TurnWorkedFold({
     // bare `group` class here would incorrectly trigger).
     <Collapsible
       key="turn-worked-fold"
-      open={open}
-      onOpenChange={handleOpenChange}
+      open={shownOpen}
+      onOpenChange={handleShownOpenChange}
       className="group/turn-fold not-prose w-full"
       data-testid="turn-worked-fold"
     >
@@ -609,7 +648,7 @@ function TurnWorkedFold({
           content so the spacing and guide shrink with its existing
           height animation. */}
       <CollapsibleContent
-        className={cn("turn-fold-content", userOpened && "turn-fold-content-instant")}
+        className={cn("turn-fold-content", (userOpened || revealed) && "turn-fold-content-instant")}
       >
         <div className="relative flex flex-col gap-1 pt-2 pl-4">
           <span
@@ -682,13 +721,27 @@ function renderToolRunFragment(
   fragment: ToolRunFragment,
   runStart: number,
   fragmentIndex: number,
+  findReveals?: ReadonlyMap<RenderItem, FindReveal>,
 ): ReactNode {
   if (fragment.kind === "group") {
     return (
-      <ToolGroupSummary key={`tool-group:${runStart}:${fragmentIndex}`} tools={fragment.tools} />
+      <ToolGroupSummary
+        key={`tool-group:${runStart}:${fragmentIndex}`}
+        tools={fragment.tools}
+        findReveals={findReveals}
+      />
     );
   }
-  return renderItem(fragment.tool, runStart + fragment.index, false, false);
+  return renderItem(
+    fragment.tool,
+    runStart + fragment.index,
+    false,
+    false,
+    false,
+    false,
+    undefined,
+    findReveals?.get(fragment.tool),
+  );
 }
 
 const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
@@ -737,6 +790,7 @@ function renderItem(
   suppressReasoningDuration = false,
   followsText = false,
   onRetryError?: BlockRendererProps["onRetryError"],
+  findReveal?: FindReveal,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -746,6 +800,7 @@ function renderItem(
           key={key}
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
+          {...{ [FIND_CURRENT_ATTRIBUTE]: findReveal === "current" ? "" : undefined }}
         >
           <FilePathAwareMessageResponse
             className="chat-markdown"
@@ -772,6 +827,7 @@ function renderItem(
           text={item.text}
           isStreaming={isReasoningStreaming}
           duration={suppressReasoningDuration ? undefined : item.duration}
+          findReveal={findReveal}
         />
       );
     case "tool":
@@ -784,6 +840,7 @@ function renderItem(
             arguments={item.execution.arguments}
             output={item.output}
             state={item.state}
+            findReveal={findReveal}
           />
         );
       }
@@ -797,6 +854,7 @@ function renderItem(
           state={item.state}
           startedAt={item.startedAt}
           duration={item.duration}
+          findReveal={findReveal}
         />
       );
     case "native_tool":
@@ -811,6 +869,7 @@ function renderItem(
           arguments={item.data}
           output={null}
           state="output-available"
+          findReveal={findReveal}
         />
       );
     case "slash_command":
@@ -821,6 +880,7 @@ function renderItem(
           name={item.name}
           arguments={item.arguments}
           output={item.output}
+          findReveal={findReveal}
         />
       );
     case "terminal_command":
@@ -831,6 +891,7 @@ function renderItem(
           input={item.input}
           stdout={item.stdout}
           stderr={item.stderr}
+          findReveal={findReveal}
         />
       );
     case "error":
@@ -846,6 +907,7 @@ function renderItem(
           remediation={item.remediation}
           level={item.level}
           relatedErrors={item.relatedErrors}
+          findReveal={findReveal}
           onRetry={
             onRetryError
               ? (actionableError) =>

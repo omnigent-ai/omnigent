@@ -11,6 +11,7 @@ import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elem
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { shortModelName } from "@/components/CostRoutingControl";
+import { type FindReveal, useRevealedCollapsible } from "@/components/chat/chatFindReveal";
 import type { ToolState } from "@/lib/renderItems";
 import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
@@ -118,6 +119,8 @@ interface SmartRoutingCardProps {
   /** Tool output (success JSON or an `Error: …` string); null while judging. */
   output: string | null;
   state: ToolState;
+  /** Set while find in chat shows a match inside this card. */
+  findReveal?: FindReveal;
 }
 
 /** Shimmer verbs cycled per task row while the router judges (wraps past 4). */
@@ -134,7 +137,13 @@ const ROUTING_VERBS = ["weighing", "matching", "tuning", "sizing up"] as const;
  * dispatches with its own model choices in that case, so the card must
  * not pretend a plan exists.
  */
-export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutingCardProps) {
+export function SmartRoutingCard({
+  arguments: args,
+  output,
+  state,
+  findReveal,
+}: SmartRoutingCardProps) {
+  const collapsible = useRevealedCollapsible(findReveal !== undefined, findReveal === "current");
   const plannedTasks = useMemo(() => parsePlannedTasks(args), [args]);
   const recommendations = useMemo(
     () => (output === null ? null : parseRecommendations(output)),
@@ -163,7 +172,7 @@ export function SmartRoutingCard({ arguments: args, output, state }: SmartRoutin
   const taskNoun = tasks.length === 1 ? "task" : "tasks";
   return (
     <Collapsible
-      defaultOpen={false}
+      {...collapsible}
       className={cn(
         "group not-prose my-1 flex flex-col gap-1.5 rounded-md border border-border bg-muted/30 px-3 py-2",
         TOOL_SURFACE_WIDTH_CLASS,

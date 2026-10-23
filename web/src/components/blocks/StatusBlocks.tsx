@@ -24,7 +24,7 @@ import {
   XIcon,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { CodeBlock, CodeBlockHeader, CodeBlockTitle } from "@/components/ai-elements/code-block";
 import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
@@ -35,6 +35,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import {
+  ChatFindRevealContext,
+  FIND_CURRENT_ATTRIBUTE,
+  type FindReveal,
+  useRevealedOpen,
+  useRevealedValue,
+} from "@/components/chat/chatFindReveal";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
@@ -66,6 +73,8 @@ interface ErrorBannerProps {
   onRetry?: (error: RelatedRenderError) => Promise<void>;
   /** Later failures emitted by the same response, turn, and agent. */
   relatedErrors?: RelatedRenderError[];
+  /** Set while find in chat shows a match inside this error. */
+  findReveal?: FindReveal;
 }
 
 /**
@@ -303,6 +312,7 @@ export function ErrorBanner({
   level,
   onRetry,
   relatedErrors = EMPTY_RELATED_ERRORS,
+  findReveal,
 }: ErrorBannerProps) {
   const workspaceMissing =
     code === "workspace_missing" ||
@@ -350,9 +360,30 @@ export function ErrorBanner({
   // The hint already shows this card's error and cause, so its Message section would repeat them.
   const inlineMessage = code === COMPACTION_MODEL_FAILED_CODE && Boolean(cause);
   const expandable = !inlineMessage || relatedDetails.length > 0 || diagnostics.length > 0;
-  const [expanded, setExpanded] = useState(false);
-  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
-  const [activeDiagnostics, setActiveDiagnostics] = useState(diagnostics[0]?.id ?? "terminal");
+  // The headline hides the indexed message, so find opens the body and the diagnostic holding it.
+  const findQuery = useContext(ChatFindRevealContext)?.query.toLowerCase() ?? "";
+  const matchingDiagnostic =
+    findReveal && findQuery
+      ? diagnostics.find((item) => item.content.toLowerCase().includes(findQuery))?.id
+      : undefined;
+  const [expandedByReader, setExpandedByReader] = useState(false);
+  const [expanded, setExpanded] = useRevealedOpen(
+    findReveal !== undefined,
+    expandedByReader,
+    setExpandedByReader,
+  );
+  const [diagnosticsOpenByReader, setDiagnosticsOpenByReader] = useState(false);
+  const [diagnosticsOpen, setDiagnosticsOpen] = useRevealedOpen(
+    matchingDiagnostic !== undefined,
+    diagnosticsOpenByReader,
+    setDiagnosticsOpenByReader,
+  );
+  const [readerDiagnostics, setReaderDiagnostics] = useState(diagnostics[0]?.id ?? "terminal");
+  const [activeDiagnostics, setActiveDiagnostics] = useRevealedValue(
+    matchingDiagnostic,
+    readerDiagnostics,
+    setReaderDiagnostics,
+  );
   const [copiedTarget, setCopiedTarget] = useState<string | null>(null);
   // The card's saved link is bound to the launcher process that printed it, so
   // the button asks the host for the live prompt at click time.
@@ -379,10 +410,10 @@ export function ErrorBanner({
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
-    if (!diagnostics.some((item) => item.id === activeDiagnostics)) {
-      setActiveDiagnostics(diagnostics[0]?.id ?? "terminal");
+    if (!diagnostics.some((item) => item.id === readerDiagnostics)) {
+      setReaderDiagnostics(diagnostics[0]?.id ?? "terminal");
     }
-  }, [activeDiagnostics, diagnostics]);
+  }, [readerDiagnostics, diagnostics]);
   useEffect(() => {
     if (retryError && !retrying) dismissButtonRef.current?.focus();
   }, [retryError, retrying]);
@@ -489,8 +520,9 @@ export function ErrorBanner({
       />
       <div
         data-testid="error-pill"
+        {...{ [FIND_CURRENT_ATTRIBUTE]: findReveal === "current" ? "" : undefined }}
         data-level={notice ? "info" : "error"}
-        onClick={() => expandable && setExpanded((value) => !value)}
+        onClick={() => expandable && setExpanded(!expanded)}
         className={cn(
           "group/error relative z-10 w-[560px] max-w-full rounded-[12px] p-[8px] text-foreground",
           expandable && "cursor-pointer",
@@ -507,7 +539,7 @@ export function ErrorBanner({
             aria-controls={expandable && expanded ? messageId : undefined}
             onClick={(event) => {
               event.stopPropagation();
-              if (expandable) setExpanded((value) => !value);
+              if (expandable) setExpanded(!expanded);
             }}
             className={cn(
               "flex min-w-0 flex-1 items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",

@@ -3,6 +3,7 @@ import { Profiler, useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UserMessageBlock } from "@/lib/blocks";
 import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT } from "@/pages/TranscriptScrollbar";
+import { SESSION_HISTORY_SEEK_PAGE_SIZE } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import {
   HistoryAutoLoader,
@@ -1838,5 +1839,6 @@ describe("JumpToTopButton", () => {
     expect(scroller.stopScroll).toHaveBeenCalled();
     expect(scroller.state.isAtBottom).toBe(false);
     expect(loadMoreHistory).toHaveBeenCalledTimes(2);
+    expect(loadMoreHistory).toHaveBeenLastCalledWith(undefined, SESSION_HISTORY_SEEK_PAGE_SIZE);
   });
 });

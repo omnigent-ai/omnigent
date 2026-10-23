@@ -18,7 +18,7 @@
 
 import type React from "react";
 import { defaultFilter } from "cmdk";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -53,6 +53,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** Close the left sidebar; called with the target path before a navigation on mobile. */
+  onCloseSidebar: (path: string) => void;
 }
 
 interface ActionCommand {
@@ -108,6 +110,7 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  onCloseSidebar,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -131,6 +134,16 @@ export function CommandPalette({
 
   const close = (): void => onOpenChange(false);
 
+  // On mobile the sidebar is a drawer over the chat, so leave it closed behind
+  // the page the palette opens; the docked desktop sidebar keeps its state.
+  const go = useCallback(
+    (path: string): void => {
+      if (isMobile) onCloseSidebar(path);
+      navigate(path);
+    },
+    [isMobile, navigate, onCloseSidebar],
+  );
+
   const actions = useMemo<ActionCommand[]>(
     () => [
       {
@@ -138,28 +151,28 @@ export function CommandPalette({
         label: "New chat",
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
+        run: () => go("/"),
       },
       {
         id: "go-inbox",
         label: "Go to Inbox",
         icon: InboxIcon,
         keywords: ["notifications", "comments", "needs response"],
-        run: () => navigate("/inbox"),
+        run: () => go("/inbox"),
       },
       {
         id: "go-tasks",
         label: "Go to Automations",
         icon: CalendarClockIcon,
         keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
-        run: () => navigate("/tasks"),
+        run: () => go("/tasks"),
       },
       {
         id: "go-settings",
         label: "Go to Settings",
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
-        run: () => navigate("/settings"),
+        run: () => go("/settings"),
       },
       {
         id: "toggle-left-sidebar",
@@ -176,7 +189,7 @@ export function CommandPalette({
         run: onToggleRightSidebar,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [go, onToggleLeftSidebar, onToggleRightSidebar],
   );
 
   const filteredActions = useMemo(() => {
@@ -260,9 +273,10 @@ export function CommandPalette({
     action.run();
   };
 
-  const goToSession = (id: string): void => {
+  // A content match opens the chat's find bar on that query, at its oldest match.
+  const goToSession = (id: string, findQuery?: string): void => {
     close();
-    navigate(`/c/${id}`);
+    go(findQuery ? `/c/${id}?find=${encodeURIComponent(findQuery)}` : `/c/${id}`);
   };
 
   return (
@@ -366,7 +380,7 @@ export function CommandPalette({
                   <CommandItem
                     key={s.id}
                     value={s.id}
-                    onSelect={() => goToSession(s.id)}
+                    onSelect={() => goToSession(s.id, s.snippet ? debouncedQuery : undefined)}
                     className="items-start pl-6"
                   >
                     <div className="flex min-w-0 flex-1 flex-col gap-0.5">

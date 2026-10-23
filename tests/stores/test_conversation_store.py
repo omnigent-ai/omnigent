@@ -2133,6 +2133,106 @@ def test_list_conversations_search_snippet_uses_earliest_match(
     assert "second mention" not in snippet
 
 
+def _find_message(text: str, response_id: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id=response_id,
+        data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+    )
+
+
+def test_find_item_matches_lists_one_sessions_matches_in_chat_order(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Matches come back oldest first, case-insensitive, from that session only."""
+    from omnigent.db.db_models import workspace_scope
+
+    conv = conversation_store.create_conversation()
+    other = conversation_store.create_conversation()
+    appended = conversation_store.append(
+        conv.id,
+        [
+            _find_message("the Zorblat appears", "resp_a"),
+            _find_message("nothing here", "resp_b"),
+            _find_message("zorblat again", "resp_c"),
+            _find_message("ZORBLAT last", "resp_d"),
+        ],
+    )
+    conversation_store.append(other.id, [_find_message("zorblat elsewhere", "resp_x")])
+
+    expected = [(item.id, item.response_id) for item in appended if item.response_id != "resp_b"]
+    assert conversation_store.find_item_matches(conv.id, "zorblat") == (expected, None)
+    assert conversation_store.find_item_matches(conv.id, "absent") == ([], None)
+    with workspace_scope(424242):
+        assert conversation_store.find_item_matches(conv.id, "zorblat") == ([], None)
+
+
+def test_chat_search_skips_compaction_summaries(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A compaction shows only as a marker, so its summary matches neither search."""
+    conv = conversation_store.create_conversation()
+    conversation_store.update_conversation(conv.id, title="General chat")
+    # The compaction comes first, so the earliest-match snippet would pick it.
+    [_, message] = conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_1",
+                data=CompactionData(
+                    summary="earlier the zorblat and the quuxite were discussed",
+                    last_item_id="7ae6efab548a4e13ae0ac9efc56d841e",
+                    model="openai/gpt-4o",
+                    token_count=50,
+                ),
+            ),
+            _find_message("the zorblat plan", "resp_a"),
+        ],
+    )
+
+    assert conversation_store.find_item_matches(conv.id, "zorblat") == (
+        [(message.id, "resp_a")],
+        None,
+    )
+    assert conversation_store.find_item_matches(conv.id, "quuxite") == ([], None)
+    quuxite = conversation_store.list_conversations(search_query="quuxite").data
+    assert conv.id not in {c.id for c in quuxite}
+    [found] = [
+        c
+        for c in conversation_store.list_conversations(search_query="zorblat").data
+        if c.id == conv.id
+    ]
+    assert found.search_snippet is not None
+    assert "plan" in found.search_snippet and "discussed" not in found.search_snippet
+
+
+def test_find_item_matches_scans_one_window_and_walks_older_windows_by_cursor(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each call sees only its window of items; the cursor reaches every older match."""
+    conv = conversation_store.create_conversation()
+    texts = ["zorblat 0", "zorblat 1", "zorblat 2", "-", "zorblat 4", "-", "zorblat 6"]
+    appended = conversation_store.append(
+        conv.id, [_find_message(text, f"resp_{i}") for i, text in enumerate(texts)]
+    )
+    ids = [(item.id, item.response_id) for item in appended]
+
+    pages = []
+    before: int | None = None
+    while True:
+        matches, before = conversation_store.find_item_matches(
+            conv.id, "zorblat", before=before, window=3
+        )
+        pages.append((matches, before))
+        if before is None:
+            break
+
+    # Windows of three items, newest first: positions 4-6, then 1-3, then 0.
+    # Each window's oldest item (4, then 1) matches and belongs to its own page.
+    assert pages == [([ids[4], ids[6]], 4), ([ids[1], ids[2]], 1), ([ids[0]], None)]
+
+
 def test_list_conversations_excludes_archived_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

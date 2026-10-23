@@ -58,6 +58,7 @@ function SessionSearch() {
         onOpenChange={setOpen}
         onToggleLeftSidebar={() => undefined}
         onToggleRightSidebar={() => undefined}
+        onCloseSidebar={() => undefined}
       />
     </main>
   );

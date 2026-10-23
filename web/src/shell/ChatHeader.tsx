@@ -14,6 +14,7 @@ import {
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
+  SearchIcon,
   ShareIcon,
   TerminalIcon,
   UserPlusIcon,
@@ -21,6 +22,7 @@ import {
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { requestChatFind } from "@/lib/hotkeys";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -47,6 +49,7 @@ import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
+import { useTerminalFirst } from "./TerminalFirstContext";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 
@@ -353,6 +356,8 @@ export function ChatHeader({
   mobileMenu,
 }: ChatHeaderProps) {
   const isMobile = useIsMobileViewport();
+  const terminalFirst = useTerminalFirst();
+  const showTerminal = terminalFirst?.isTerminalFirst && terminalFirst.view === "terminal";
   const canvas = useCanvasWorkspace();
   const { trackClick } = useOmnigentAnalytics();
   // Workspace-rail entries (Files · Changes · Agents · Shells · Logs), each
@@ -634,6 +639,22 @@ export function ChatHeader({
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
         {!pending && conversationId && <ViewModeToggle />}
+        {/* Find in chat: the touch entry to the bar ⌘F opens. */}
+        {!pending && conversationId && !showTerminal && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Find in chat"
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+F`}
+            title={`Find in chat (${MOD_KEY}F)`}
+            onClick={requestChatFind}
+            componentId="chat.header.find"
+            className="border-none text-muted-foreground hover:text-foreground max-md:size-11"
+          >
+            <SearchIcon className="size-4 max-md:size-5" />
+          </Button>
+        )}
         {!pending && !actionConversation && canFork && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
