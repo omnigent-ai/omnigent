@@ -98,7 +98,7 @@ def build_sign_in_watch(
                         continue
                     try:
                         result = await entry.instance.read(join_wrapped=True)
-                    except Exception:  # noqa: BLE001 — an unreadable pane shows nothing this poll
+                    except Exception:
                         _logger.debug(
                             "Failed to read the sign-in pane for %s", conv_id, exc_info=True
                         )
