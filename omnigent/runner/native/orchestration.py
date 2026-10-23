@@ -9393,7 +9393,8 @@ async def _auto_create_claude_terminal(
         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
         # etc.) when derived. Empty provider config still forces
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
-        env=build_native_claude_terminal_env(claude_config),
+        # No CLI client watches this pane, so ucode must not wait on a person.
+        env=build_native_claude_terminal_env(claude_config, unattended=True),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
         # inherit this env and several build ``WorkspaceClient`` without pinning
