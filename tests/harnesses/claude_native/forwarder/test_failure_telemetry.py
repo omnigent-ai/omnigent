@@ -228,7 +228,9 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         assert context["detail_source"] == "hook_error_details"
     else:
         assert failure["failure_detail"] == (
-            "Claude Code ended the turn with an API error (authentication_failed)."
+            "Claude Code could not authenticate with the model provider (authentication_failed). "
+            "Check the sign-in for Claude Code in this session's terminal or the credential it "
+            "uses, then send your message again."
         )
         assert context["detail_source"] == "hook_error_category"
         assert "native_api_error_message" not in context
@@ -471,7 +473,9 @@ async def test_api_error_is_not_reused_once_its_turn_ended(tmp_path: Path) -> No
     first, second = failures
     assert first["failure_detail"] == "Synthetic spend limit reached"
     assert second["failure_detail"] == (
-        "Claude Code ended the turn with an API error (authentication_failed)."
+        "Claude Code could not authenticate with the model provider (authentication_failed). "
+        "Check the sign-in for Claude Code in this session's terminal or the credential it "
+        "uses, then send your message again."
     )
     assert second["failure_context"]["detail_source"] == "hook_error_category"
 
