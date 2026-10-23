@@ -11,6 +11,7 @@ import {
   type MouseEvent,
   type PointerEvent,
 } from "react";
+import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { cn } from "@/lib/utils";
 import {
   EXTRA_KEY_ROWS,
@@ -70,6 +71,8 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
   const targetRef = useRef(target);
   targetRef.current = target;
   const transformRef = useRef<ExtraKeysInputTransform | null>(null);
+  // iOS only (0 elsewhere): a docked keyboard covers the home indicator.
+  const keyboardOpen = useIOSNativeKeyboardInset() > 0;
 
   // Single write point for modifier state: the ref feeds the transform, the
   // React state repaints the highlighted keys, and the session only carries
@@ -200,8 +203,12 @@ export const TerminalExtraKeys = memo(function TerminalExtraKeys({
       role="toolbar"
       aria-label="Terminal extra keys"
       data-testid="terminal-extra-keys"
+      data-keyboard-open={keyboardOpen || undefined}
       className={cn("terminal-extra-keys", className)}
       onContextMenu={(e) => e.preventDefault()}
+      // Taps send on pointerup; WebKit still moves focus on the tap's synthetic
+      // click, so cancel it to keep xterm's textarea (and the keyboard) focused.
+      onTouchEnd={(e) => e.preventDefault()}
     >
       {EXTRA_KEY_ROWS.map((row, rowIndex) =>
         row.map((key) => {
