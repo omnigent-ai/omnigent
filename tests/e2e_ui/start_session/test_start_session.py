@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 from typing import Any
 
@@ -463,40 +462,38 @@ def test_start_session_select_permission_mode(seeded_session: tuple[str, str]) -
     _run_in_fresh_loop(_drive_permission_mode(base_url, session_id))
 
 
-async def _prepare_claude_landing(
-    page, session_id: str, create_bodies: list[dict[str, Any]]
-) -> None:
-    """Stub a lone Claude Code agent on one host with a recent workspace."""
-    await _register_common_routes(page, created_session_id=session_id, create_bodies=create_bodies)
-
-    # Hide agents left by other tests so Claude remains the selected harness.
-    async def handle_agent_scan(route: Route) -> None:
-        await route.fulfill(
-            status=200,
-            content_type="application/json",
-            body=json.dumps({"data": []}),
-        )
-
-    await page.route(
-        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
-    )
-
-    # Seed a recent workspace before the SPA mounts so Send enables without the file browser.
-    await page.add_init_script(
-        f"""window.localStorage.setItem(
-            "omnigent:recent-workspaces",
-            JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
-        );"""
-    )
-
-
 async def _drive_permission_mode(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
             create_bodies: list[dict[str, Any]] = []
-            await _prepare_claude_landing(page, session_id, create_bodies)
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Hide agents left by other tests so Claude remains the selected harness.
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps({"data": []}),
+                )
+
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
+
+            # Seed a recent working directory for the stubbed host so the
+            # working-directory chip auto-fills and Send can enable without
+            # touching the (host-less) file browser. Set before the SPA boots
+            # so the landing composer reads it on mount.
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );"""
+            )
 
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -537,81 +534,6 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             )
             await expect(perm).to_contain_text("Accept edits")
         finally:
-            await browser.close()
-
-
-def test_start_session_shift_tab_cycles_permission_mode(seeded_session: tuple[str, str]) -> None:
-    """Shift+Tab in the landing composer steps the launch mode, skipping Bypass.
-
-    The chip walks Claude Code's menu order without leaving the prompt, and the
-    session launches with the mode it stopped on.
-    """
-    base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_permission_mode_hotkey(base_url, session_id))
-
-
-async def _hold_for_recording(page, milliseconds: int) -> None:
-    """Pause only in recorded runs, so a demo shows each state."""
-    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
-        await page.wait_for_timeout(milliseconds)
-
-
-async def _drive_permission_mode_hotkey(base_url: str, session_id: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            create_bodies: list[dict[str, Any]] = []
-            await _prepare_claude_landing(page, session_id, create_bodies)
-
-            await page.goto(f"{base_url}/")
-            prompt = page.get_by_test_id("new-chat-landing-input")
-            await prompt.wait_for(state="visible", timeout=30_000)
-            perm = page.get_by_test_id("new-chat-landing-permission-chip")
-            await expect(perm).to_contain_text("Manual")
-            # The menu offers Bypass; the shortcut must still never land on it.
-            await perm.click()
-            await expect(
-                page.get_by_role("menuitemradio", name="Bypass permissions", exact=True)
-            ).to_be_visible()
-            await _hold_for_recording(page, 1_200)
-            await page.keyboard.press("Escape")
-            await expect(page.get_by_test_id("new-chat-landing-permission-menu")).to_be_hidden()
-            await prompt.click()
-            await prompt.press_sequentially("plan the refactor first")
-            await _hold_for_recording(page, 1_000)
-
-            labels = (
-                "Auto",
-                "Accept edits",
-                "Plan",
-                "Don't ask",
-                "Manual",
-                "Auto",
-                "Accept edits",
-            )
-            for label in (*labels, "Plan"):
-                await prompt.press("Shift+Tab")
-                await expect(perm).to_contain_text(label)
-                await expect(perm).not_to_contain_text("Bypass")
-                await expect(prompt).to_be_focused()
-                await _hold_for_recording(page, 1_000)
-            await expect(prompt).to_have_value("plan the refactor first")
-
-            await page.get_by_test_id("new-chat-landing-submit").click()
-            await poll_until_async(lambda: len(create_bodies) == 1)
-            body = create_bodies[0]
-            assert body["agent_id"] == "ag_claude_e2e", body
-            assert body.get("terminal_launch_args") == ["--permission-mode", "plan"], body
-            await expect(
-                page.get_by_test_id("message-bubble").get_by_text(
-                    "plan the refactor first", exact=True
-                )
-            ).to_be_visible()
-            await _hold_for_recording(page, 2_000)
-        finally:
-            # Closing the context first finalizes a recorded video.
-            await page.context.close()
             await browser.close()
 
 

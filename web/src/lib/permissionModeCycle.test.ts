@@ -1,17 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  CLAUDE_NATIVE_PERMISSION_MODES,
-  CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
-} from "./claudePermissionMode";
+import { CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES } from "./claudePermissionMode";
 import { CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS } from "./codexApprovalMode";
-import { codexCreateApprovalOptions } from "./codexApprovalOptions";
-import {
-  AGY_NATIVE_SKIP_MODES,
-  CURSOR_NATIVE_EXEC_MODES,
-  DEVIN_NATIVE_PERMISSION_MODES,
-  knownPermissionModeConcept,
-} from "./nativeHarnessModes";
+import { DEVIN_NATIVE_PERMISSION_MODES, knownPermissionModeConcept } from "./nativeHarnessModes";
 import {
   isCyclablePermissionMode,
   isPermissionModeCycleKey,
@@ -64,37 +55,29 @@ describe("nextCycledPermissionMode", () => {
   });
 
   it("never lands on a full-access mode", () => {
-    expect(lap("claude-native", CLAUDE_NATIVE_PERMISSION_MODES, "default")).not.toContain(
-      "bypassPermissions",
-    );
-    expect(lap("codex-native", codexCreateApprovalOptions(), "default")).toEqual([
-      "default",
-      "read-only",
-      "default",
-      "read-only",
-      "default",
-    ]);
+    expect(
+      lap("claude-native", CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES, "default"),
+    ).not.toContain("bypassPermissions");
     expect(lap("codex-native", CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS, "ask-for-approval")).toEqual([
       "ask-for-approval",
       "approve-for-me",
       "ask-for-approval",
       "approve-for-me",
     ]);
-    expect(lap("cursor-native", CURSOR_NATIVE_EXEC_MODES, "default")).not.toContain("yolo");
     expect(lap("devin-native", DEVIN_NATIVE_PERMISSION_MODES, "normal")).not.toContain("dangerous");
   });
 
   it("leaves a full-access mode for the next safe mode in the menu", () => {
     expect(
       nextCycledPermissionMode(
-        "claude-native",
-        CLAUDE_NATIVE_PERMISSION_MODES,
-        "bypassPermissions",
+        "codex-native",
+        CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+        "full-access",
       ),
-    ).toBe("default");
-    expect(nextCycledPermissionMode("antigravity-native", AGY_NATIVE_SKIP_MODES, "skip")).toBe(
-      "default",
-    );
+    ).toBe("ask-for-approval");
+    expect(
+      nextCycledPermissionMode("devin-native", DEVIN_NATIVE_PERMISSION_MODES, "dangerous"),
+    ).toBe("normal");
   });
 
   it("starts from the top of the menu when the current mode is unknown", () => {
@@ -126,19 +109,21 @@ describe("nextCycledPermissionMode", () => {
   });
 
   it("returns null when no other safe mode exists", () => {
-    expect(nextCycledPermissionMode("antigravity-native", AGY_NATIVE_SKIP_MODES, "default")).toBe(
-      null,
-    );
+    expect(
+      nextCycledPermissionMode(
+        "codex-native",
+        CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+        "ask-for-approval",
+        new Set(["approve-for-me"]),
+      ),
+    ).toBe(null);
     expect(nextCycledPermissionMode("claude-native", [], "default")).toBe(null);
   });
 
-  it("classifies every mode the composers offer", () => {
+  it("classifies every mode the in-session composer offers", () => {
     const vocabularies: [string, readonly { value: string }[]][] = [
-      ["claude-native", CLAUDE_NATIVE_PERMISSION_MODES],
-      ["codex-native", codexCreateApprovalOptions()],
+      ["claude-native", CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES],
       ["codex-native", CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS],
-      ["cursor-native", CURSOR_NATIVE_EXEC_MODES],
-      ["antigravity-native", AGY_NATIVE_SKIP_MODES],
       ["devin-native", DEVIN_NATIVE_PERMISSION_MODES],
     ];
     const unmapped = vocabularies.flatMap(([harness, options]) =>

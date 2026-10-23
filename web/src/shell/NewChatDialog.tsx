@@ -37,9 +37,7 @@ import {
 import {
   codexCreateApprovalOptions,
   applyCodexApprovalSelection,
-  codexApprovalSelectionValue,
 } from "@/lib/codexApprovalOptions";
-import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permissionModeCycle";
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
@@ -4189,32 +4187,6 @@ export function NewChatLandingScreen() {
     else if (supportsDevinPermission) setDevinPermissionMode(mode);
     rememberPickerOptions(selectedNativeHarness, { mode });
   };
-  const selectedDirectModeByHarness: Record<string, string> = {
-    "claude-native": permissionMode,
-    "codex-native": codexApprovalSelectionValue(approvalMode, bypassSandbox),
-    "cursor-native": cursorExecMode,
-    "antigravity-native": agySkipMode,
-    "devin-native": devinPermissionMode,
-  };
-  const selectedDirectMode = selectedNativeHarness
-    ? selectedDirectModeByHarness[selectedNativeHarness]
-    : undefined;
-  // Mirrors when the permission chip below renders clickable.
-  const directModePickerClickable =
-    !noExecutionTargetSelected &&
-    visiblePermissionRow != null &&
-    !(pickerLoading && !interactiveWhileLoading);
-  // Don't change the mode mid-create; the in-flight request already captured it.
-  const nextDirectMode =
-    directModePickerClickable && !creating && !checkingDbcert
-      ? nextCycledPermissionMode(selectedNativeHarness, directModeOptions, selectedDirectMode)
-      : null;
-  /** Shift+Tab: step the launch permission mode. Returns whether it took the key. */
-  const cycleDirectMode = (): boolean => {
-    if (nextDirectMode === null) return false;
-    selectDirectMode(nextDirectMode);
-    return true;
-  };
   // Clear shared state on agent changes; the harness seed restores its own
   // saved options. Initial agent resolution must preserve the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
@@ -6809,11 +6781,6 @@ export function NewChatLandingScreen() {
                   // submission (same UX as the in-session composer).
                   if (slashCompletion.handleKey(e, { shouldPreferSendOverCompletion })) return;
 
-                  if (isPermissionModeCycleKey(e) && cycleDirectMode()) {
-                    e.preventDefault();
-                    return;
-                  }
-
                   if (shouldSubmitFromKeyboard) {
                     e.preventDefault();
                     // The mention menu is briefly closed while its listing loads;
@@ -6825,7 +6792,6 @@ export function NewChatLandingScreen() {
                 onPaste,
                 placeholder: pillSkills.length > 0 ? "" : placeholderText,
                 "aria-label": placeholderText,
-                "aria-keyshortcuts": nextDirectMode === null ? undefined : "Shift+Tab",
                 rows: 1,
                 autoFocus: !isMobileViewport,
                 "data-testid": "new-chat-landing-input",
@@ -7197,7 +7163,21 @@ export function NewChatLandingScreen() {
                         label={visiblePermissionRow.label}
                         value={visiblePermissionRow.value}
                         harness={selectedNativeHarness}
-                        selectedValue={selectedDirectMode}
+                        selectedValue={
+                          selectedNativeHarness === "claude-native"
+                            ? permissionMode
+                            : selectedNativeHarness === "codex-native"
+                              ? bypassSandbox
+                                ? CODEX_NATIVE_BYPASS_APPROVAL_VALUE
+                                : approvalMode
+                              : selectedNativeHarness === "cursor-native"
+                                ? cursorExecMode
+                                : selectedNativeHarness === "antigravity-native"
+                                  ? agySkipMode
+                                  : selectedNativeHarness === "devin-native"
+                                    ? devinPermissionMode
+                                    : undefined
+                        }
                         loading={pickerLoading}
                         interactiveWhileLoading={interactiveWhileLoading}
                         options={directModeOptions}
