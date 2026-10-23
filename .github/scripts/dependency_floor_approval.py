@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
-"""Require a second maintainer's label on a young-dependency-floor waiver.
+"""Require a second maintainer for a new young-dependency-floor waiver.
 
-The young-dependency-floor lint can be waived in pyproject.toml for an urgent
-bump the internal mirrors already serve. The waiver comment is self-attested,
-so a PR that adds or changes one (the directive or the requirement it covers)
-also needs the approval label, added by a maintainer other than the author after
-running ``just check-internal-mirror``. Waivers are parsed with the lint's own
-``disabled_rules_by_line`` so both sides agree on what a waiver is.
+A waiver comment in pyproject.toml is self-attested, so a PR that newly waives a
+requirement (compared with its merge base) also needs a maintainer other than
+the author to add the approval label and approve a commit carrying that waiver.
+Binding the label to an approved commit keeps a later edit from riding on it.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from maintainer_approval import gh_json, maintainers, paginated
+from maintainer_approval import gh_json, latest_decisive_reviews, maintainers, paginated
 
 from dev.lint._framework import disabled_rules_by_line
 
 RULE_NAME = "young-dependency-floor"
 LABEL = "dependency-floor-approved"
 PYPROJECT = "pyproject.toml"
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 @dataclass(frozen=True)
@@ -34,50 +30,34 @@ class FloorDecision:
     reason: str
 
 
-def waiver_lines(pyproject_text: str) -> set[int]:
-    """Line numbers holding a waiver directive or the requirement it covers."""
-    covered = {
-        line
-        for line, rules in disabled_rules_by_line(pyproject_text).items()
-        if RULE_NAME in rules
+def waived_requirements(pyproject_text: str) -> set[str]:
+    """Stripped text of every line a young-dependency-floor waiver covers."""
+    lines = pyproject_text.splitlines()
+    return {
+        lines[number - 1].strip()
+        for number, rules in disabled_rules_by_line(pyproject_text).items()
+        if RULE_NAME in rules and number <= len(lines)
     }
-    directives = {
-        number
-        for number, text in enumerate(pyproject_text.splitlines(), start=1)
-        if any(RULE_NAME in rules for rules in disabled_rules_by_line(text).values())
-    }
-    return covered | directives
-
-
-def added_lines(patch: str) -> set[int]:
-    """New-file line numbers a unified diff adds or rewrites."""
-    added: set[int] = set()
-    line = 0
-    for text in patch.splitlines():
-        if hunk := _HUNK_RE.match(text):
-            line = int(hunk.group(1))
-        elif text.startswith("+"):
-            added.add(line)
-            line += 1
-        elif text.startswith(" "):
-            line += 1
-    return added
 
 
 def floor_decision(
     *,
     author: str,
     labels: set[str],
-    changed_waivers: list[int],
+    new_waivers: set[str],
     maintainer_logins: set[str],
     timeline: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    waivers_at: Callable[[str], set[str]],
 ) -> FloorDecision:
-    """Accept a waiver change only with the label from a non-author maintainer."""
-    lines = ", ".join(str(line) for line in changed_waivers)
+    """Accept new waivers only with the label and approval of a non-author maintainer."""
+    if not new_waivers:
+        return FloorDecision(True, "No young-dependency-floor waiver added or changed.")
+    listed = ", ".join(f"`{waiver}`" for waiver in sorted(new_waivers))
     ask = (
-        f"{PYPROJECT} line(s) {lines} add or change a {RULE_NAME} waiver. A maintainer "
-        f"other than @{author} should confirm the release is on the internal mirror "
-        f"(`just check-internal-mirror`) and add the `{LABEL}` label."
+        f"{PYPROJECT} adds or changes a {RULE_NAME} waiver on {listed}. A maintainer other "
+        f"than @{author} should confirm the release is on the internal mirror "
+        f"(`just check-internal-mirror`), add the `{LABEL}` label, and approve the PR."
     )
     if LABEL not in labels:
         return FloorDecision(False, ask)
@@ -91,7 +71,19 @@ def floor_decision(
         return FloorDecision(False, f"`{LABEL}` was added by the author. {ask}")
     if labeler.casefold() not in {login.casefold() for login in maintainer_logins}:
         return FloorDecision(False, f"`{LABEL}` was added by non-maintainer @{labeler}. {ask}")
-    return FloorDecision(True, f"Waiver on line(s) {lines} approved by maintainer @{labeler}.")
+    review = {
+        login.casefold(): review for login, review in latest_decisive_reviews(reviews).items()
+    }.get(labeler.casefold())
+    if review is None or str(review.get("state") or "").upper() != "APPROVED":
+        return FloorDecision(False, f"@{labeler} added `{LABEL}` but has not approved. {ask}")
+    approved_sha = str(review.get("commit_id") or "")
+    if not new_waivers <= waivers_at(approved_sha):
+        return FloorDecision(
+            False, f"@{labeler} approved {approved_sha[:9]}, before these waivers. {ask}"
+        )
+    return FloorDecision(
+        True, f"Waivers on {listed} approved by maintainer @{labeler} at {approved_sha[:9]}."
+    )
 
 
 def evaluate(
@@ -101,24 +93,27 @@ def evaluate(
     maintainer_lookup: Callable[[str], set[str]] = maintainers,
 ) -> FloorDecision:
     pull = request(["api", f"repos/{repository}/pulls/{pr_number}"])
-    files = paginated(f"repos/{repository}/pulls/{pr_number}/files", request)
-    entry = next((item for item in files if item.get("filename") == PYPROJECT), None)
-    if entry is None or entry.get("status") == "removed":
-        return FloorDecision(True, f"{PYPROJECT} is unchanged.")
     head_sha = pull["head"]["sha"]
-    content = request(["api", f"repos/{repository}/contents/{PYPROJECT}?ref={head_sha}"])
-    waivers = waiver_lines(base64.b64decode(content["content"]).decode())
-    # GitHub omits the patch for very large diffs; treat every waiver as changed.
-    patch = entry.get("patch")
-    changed = sorted(waivers if patch is None else waivers & added_lines(patch))
-    if not changed:
+    compare = request(
+        ["api", f"repos/{repository}/compare/{pull['base']['sha']}...{head_sha}?per_page=1"]
+    )
+
+    def waivers_at(sha: str) -> set[str]:
+        content = request(["api", f"repos/{repository}/contents/{PYPROJECT}?ref={sha}"])
+        return waived_requirements(base64.b64decode(content["content"]).decode())
+
+    head_waivers = waivers_at(head_sha)
+    new_waivers = head_waivers - waivers_at(compare["merge_base_commit"]["sha"])
+    if not new_waivers:
         return FloorDecision(True, "No young-dependency-floor waiver added or changed.")
     return floor_decision(
         author=str((pull.get("user") or {}).get("login") or ""),
         labels={str(label.get("name") or "") for label in pull.get("labels") or []},
-        changed_waivers=changed,
+        new_waivers=new_waivers,
         maintainer_logins=maintainer_lookup(repository),
         timeline=paginated(f"repos/{repository}/issues/{pr_number}/timeline", request),
+        reviews=paginated(f"repos/{repository}/pulls/{pr_number}/reviews", request),
+        waivers_at=lambda sha: head_waivers if sha == head_sha else waivers_at(sha),
     )
 
 

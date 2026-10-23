@@ -38,17 +38,34 @@ def _pyproject(dependencies: Sequence[str], extras: Sequence[str] = ()) -> str:
 
 
 @pytest.mark.parametrize(
-    ("pyproject", "line"),
+    ("pyproject", "location", "raw"),
     [
-        (_pyproject(['    "pillow>=13,<14",']), 4),
-        (_pyproject([], ['images = ["pillow>=13,<14"]']), 7),
+        (_pyproject(['    "pillow>=13,<14",']), "pyproject.toml:4", "pillow>=13,<14"),
+        (_pyproject([], ['images = ["pillow>=13,<14"]']), "pyproject.toml:7", "pillow>=13,<14"),
+        (_pyproject(['    "pillow~=13.0",']), "pyproject.toml:4", "pillow~=13.0"),
+        (_pyproject(['    "pillow==13.*",']), "pyproject.toml:4", "pillow==13.*"),
+        (
+            _pyproject(['    "pillow>=13; python_version >= \\"3.12\\"",']),
+            "pyproject.toml:4",
+            'pillow>=13; python_version >= "3.12"',
+        ),
+        (_pyproject(['    """pillow>=13,\\', '    <14""",']), "pyproject.toml", "pillow>=13,<14"),
     ],
-    ids=["dependency", "extra"],
+    ids=[
+        "dependency",
+        "extra",
+        "compatible-release",
+        "wildcard-equality",
+        "escaped-quotes",
+        "line-not-found",
+    ],
 )
-def test_flags_floor_only_a_cooldown_release_satisfies(pyproject: str, line: int) -> None:
+def test_flags_floor_only_a_cooldown_release_satisfies(
+    pyproject: str, location: str, raw: str
+) -> None:
     assert lint.find_violations(pyproject, _lock(), NOW) == [
-        f"pyproject.toml:{line}: `pillow>=13,<14` needs pillow 13.0.0+, uploaded 2026-10-16 "
-        "and inside the 7-day cooldown until 2026-10-23"
+        f"{location}: `{raw}` needs pillow 13.0.0+, uploaded 2026-10-16 22:15 UTC "
+        "and inside the 7-day cooldown until 2026-10-23 22:15 UTC"
     ]
 
 

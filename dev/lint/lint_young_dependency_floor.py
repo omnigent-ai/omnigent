@@ -1,21 +1,14 @@
 """Flag dependency floors that only a release inside the uv cooldown satisfies.
 
-uv.toml's cooldown plus a per-package ``exclude-newer-package`` exemption can
-lock a release younger than the cooldown. That is fine for uv.lock, but package
-mirrors that embargo young releases (such as the Databricks PyPI proxy) resolve
-the requirements declared in pyproject.toml, not the lock. A floor that forces
-the young release (``pillow>=13`` while 13.0.0 is days old) makes omnigent
-uninstallable from those mirrors until the release ages in.
+Mirrors that embargo young releases (such as the Databricks PyPI proxy) install
+from the floors in pyproject.toml, not from uv.lock, so a floor at or above a
+locked release uploaded inside uv.lock's ``exclude-newer-span`` makes omnigent
+uninstallable there. Only ``[project]`` dependencies and extras are checked;
+dependency groups never reach published metadata.
 
-This rule fails when a requirement in ``[project].dependencies`` or
-``[project.optional-dependencies]`` has a lower bound at or above a locked
-version uploaded inside uv.lock's ``exclude-newer-span``. Dependency groups are
-repo-only and never reach published metadata, so they are not checked. An
-urgent bump the mirror already serves is suppressed on the requirement line
-with a reason; see :mod:`dev.lint._framework`.
-
-Release age only approximates mirror availability: a mirror can also withhold
-an older release, which only ``just check-internal-mirror`` detects.
+Release age approximates what a mirror serves, and only locked versions are
+known: a young release uv.lock does not pin, or an older one a mirror withholds,
+is only caught by ``just check-internal-mirror``.
 """
 
 from __future__ import annotations
@@ -44,14 +37,13 @@ HINT = (
     "`just check-internal-mirror`, then add above the requirement:\n"
     "  # custom-lint: disable-next=young-dependency-floor -- <why urgent; mirror checked>\n"
     "A maintainer other than the PR author must then add the `dependency-floor-approved`\n"
-    "label, or the required Maintainer Approval check stays red."
+    "label and approve the PR, or the required Maintainer Approval check stays red."
 )
 
 # Specifier operators whose version bounds the admitted releases from below.
 _LOWER_BOUND_OPERATORS = frozenset({">=", ">", "==", "~="})
 _SPAN_RE = re.compile(r"P(\d+)D")
 _TABLE_RE = re.compile(r"^\[+([^\]]+)\]+")
-_QUOTED_RE = re.compile(r"\"([^\"]+)\"|'([^']+)'")
 _REQUIREMENT_TABLES = frozenset({"project", "project.optional-dependencies"})
 
 
@@ -64,9 +56,33 @@ def _published_requirements(pyproject: dict) -> set[str]:
     return requirements
 
 
-def _requirement_lines(pyproject_text: str, published: set[str]) -> Iterator[tuple[int, str]]:
-    """Yield ``(line, requirement)`` where a published requirement is written."""
+def _line_strings(line: str) -> list[str]:
+    """Strings in one line of a TOML array: a ``key = [...]`` line or an element line."""
+    for document in (line, f"value = [{line}\n]"):
+        try:
+            parsed = tomllib.loads(document)
+        except tomllib.TOMLDecodeError:
+            continue
+        return [
+            item
+            for value in parsed.values()
+            if isinstance(value, list)
+            for item in value
+            if isinstance(item, str)
+        ]
+    return []
+
+
+def _requirement_lines(
+    pyproject_text: str, published: set[str]
+) -> Iterator[tuple[int | None, str]]:
+    """Yield ``(line, requirement)`` for each published requirement.
+
+    A requirement whose line cannot be found is yielded with ``None`` so it is
+    still checked; it just cannot be waived.
+    """
     table = ""
+    located: set[str] = set()
     for line_number, line in enumerate(pyproject_text.splitlines(), start=1):
         stripped = line.strip()
         if header := _TABLE_RE.match(stripped):
@@ -74,10 +90,12 @@ def _requirement_lines(pyproject_text: str, published: set[str]) -> Iterator[tup
             continue
         if table not in _REQUIREMENT_TABLES or stripped.startswith("#"):
             continue
-        for match in _QUOTED_RE.finditer(line):
-            text = match.group(1) or match.group(2)
+        for text in _line_strings(line):
             if text in published:
+                located.add(text)
                 yield line_number, text
+    for text in sorted(published - located):
+        yield None, text
 
 
 def _floor(requirement: Requirement) -> Version | None:
@@ -124,10 +142,13 @@ def find_violations(pyproject_text: str, lock_text: str, now: datetime) -> list[
             continue
         for version, uploaded in uploads.get(canonicalize_name(requirement.name), []):
             if uploaded + cooldown > now and floor >= version:
+                location = (
+                    "pyproject.toml" if line_number is None else f"pyproject.toml:{line_number}"
+                )
                 violations.append(
-                    f"pyproject.toml:{line_number}: `{raw}` needs {requirement.name} "
-                    f"{version}+, uploaded {uploaded:%Y-%m-%d} and inside the "
-                    f"{cooldown.days}-day cooldown until {uploaded + cooldown:%Y-%m-%d}"
+                    f"{location}: `{raw}` needs {requirement.name} {version}+, uploaded "
+                    f"{uploaded:%Y-%m-%d %H:%M} UTC and inside the {cooldown.days}-day "
+                    f"cooldown until {uploaded + cooldown:%Y-%m-%d %H:%M} UTC"
                 )
     return violations
 
