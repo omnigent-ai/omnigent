@@ -160,10 +160,16 @@ async def _open_upstream(
     """Dial the destination, tunnelling via the ambient HTTP(S)_PROXY when set.
 
     ``NO_PROXY`` hosts connect directly. TLS (when ``ssl_ctx`` is given) is
-    negotiated end-to-end with ``host`` over the CONNECT tunnel.
+    negotiated end-to-end with ``host`` over the CONNECT tunnel. Only env
+    vars are read (``ALL_PROXY`` is the fallback); OS proxy settings are ignored.
+
+    The CONNECT target is the DNS-pinned IP, and plain HTTP also uses CONNECT
+    (to port 80). Proxies that deny CONNECT to non-TLS ports (Squid's default)
+    or filter by hostname will refuse; the default proxy port is 3128.
     """
-    proxy = urllib.request.getproxies().get("https" if ssl_ctx else "http")
-    if not proxy or urllib.request.proxy_bypass(host):
+    proxies = urllib.request.getproxies_environment()
+    proxy = proxies.get("https" if ssl_ctx else "http") or proxies.get("all")
+    if not proxy or urllib.request.proxy_bypass_environment(host):
         return await asyncio.open_connection(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )

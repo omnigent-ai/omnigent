@@ -3034,8 +3034,6 @@ async def test_http_request_chains_through_upstream_proxy(
         writer.close()
 
     server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
-    for k in ("no_proxy", "NO_PROXY"):
-        monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
     monkeypatch.setattr(
         asyncio.get_event_loop(),
@@ -3061,3 +3059,49 @@ async def test_http_request_chains_through_upstream_proxy(
     assert response.endswith(b"via-up")
     assert seen[0].startswith(b"CONNECT 93.184.216.34:80 HTTP/1.1")
     assert seen[1].startswith(b"GET /x HTTP/1.1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_host", "resolved_ip"),
+    [("blocked.example.com", "93.184.216.34"), ("allowed.example.com", "10.0.0.5")],
+    ids=["rule-denied", "private-destination"],
+)
+async def test_denied_request_never_contacts_upstream_proxy(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    request_host: str,
+    resolved_ip: str,
+) -> None:
+    """Rule and private-IP denials return 403 before any upstream proxy dial."""
+    cert_path, key_path, _ = ca_paths
+    contacted: list[bool] = []
+
+    async def upstream_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        contacted.append(True)
+        writer.close()
+
+    server = await asyncio.start_server(upstream_proxy, "127.0.0.1", 0)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+    monkeypatch.setattr(
+        asyncio.get_event_loop(),
+        "getaddrinfo",
+        _stub_getaddrinfo_resolving({request_host: resolved_ip}),
+    )
+    proxy = EgressProxy(parse_rules(["GET allowed.example.com/**"]), cert_path, key_path)
+    port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            f"GET http://{request_host}/x HTTP/1.1\r\nHost: {request_host}\r\n\r\n".encode()
+        )
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(4096), timeout=5)
+        writer.close()
+        await asyncio.sleep(0.05)
+    finally:
+        await proxy.stop()
+        server.close()
+
+    assert b"403 Forbidden" in response
+    assert not contacted

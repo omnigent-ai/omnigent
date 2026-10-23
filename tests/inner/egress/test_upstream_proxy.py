@@ -15,14 +15,7 @@ async def _serve(handler):
     return server, server.sockets[0].getsockname()[1]
 
 
-@pytest.fixture
-def clean_proxy_env(monkeypatch):
-    for k in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
-        monkeypatch.delenv(k, raising=False)
-        monkeypatch.delenv(k.upper(), raising=False)
-
-
-async def test_http_goes_through_connect_tunnel(monkeypatch, clean_proxy_env):
+async def test_http_goes_through_connect_tunnel(monkeypatch):
     seen = []
 
     async def proxy(reader, writer):
@@ -43,7 +36,7 @@ async def test_http_goes_through_connect_tunnel(monkeypatch, clean_proxy_env):
     assert "Proxy-Authorization: Basic dXNlcjpwQHNz" in seen[0]
 
 
-async def test_refused_connect_raises(monkeypatch, clean_proxy_env):
+async def test_refused_connect_raises(monkeypatch):
     async def proxy(reader, writer):
         await reader.readuntil(b"\r\n\r\n")
         writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
@@ -57,7 +50,7 @@ async def test_refused_connect_raises(monkeypatch, clean_proxy_env):
     server.close()
 
 
-async def test_no_proxy_connects_directly(monkeypatch, clean_proxy_env):
+async def test_no_proxy_connects_directly(monkeypatch):
     async def target(reader, writer):
         writer.write(b"direct")
         await writer.drain()
@@ -65,16 +58,14 @@ async def test_no_proxy_connects_directly(monkeypatch, clean_proxy_env):
 
     server, port = await _serve(target)
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")  # would fail if used
-    monkeypatch.setenv("no_proxy", "127.0.0.1")
-    reader, writer = await _open_upstream("127.0.0.1", "127.0.0.1", port)
+    monkeypatch.setenv("no_proxy", "localhost")
+    reader, writer = await _open_upstream("localhost", "127.0.0.1", port)
     assert await reader.read() == b"direct"
     writer.close()
     server.close()
 
 
-async def test_https_handshakes_with_original_host_over_tunnel(
-    monkeypatch, clean_proxy_env, tmp_path
-):
+async def test_https_handshakes_with_original_host_over_tunnel(monkeypatch, tmp_path):
     cert_path, key_path = ensure_ca(cache_dir=tmp_path)
     server_ctx = HostCertCache(cert_path, key_path).get_ssl_context("example.test")
     client_ctx = ssl.create_default_context(cafile=str(cert_path))
@@ -84,7 +75,7 @@ async def test_https_handshakes_with_original_host_over_tunnel(
 
     def serve() -> None:
         conn, _ = listener.accept()
-        while b"\r\n\r\n" not in conn.recv(4096, socket.MSG_PEEK):
+        while (peeked := conn.recv(4096, socket.MSG_PEEK)) and b"\r\n\r\n" not in peeked:
             pass
         conn.recv(4096)
         conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
@@ -103,8 +94,26 @@ async def test_https_handshakes_with_original_host_over_tunnel(
     assert sni == ["example.test"]
 
 
-async def test_https_proxy_url_is_rejected(monkeypatch, clean_proxy_env):
+async def test_https_proxy_url_is_rejected(monkeypatch):
     monkeypatch.setenv("http_proxy", "https://user:secret@127.0.0.1:1")
     with pytest.raises(OSError, match="http://") as exc:
         await _open_upstream("example.test", "203.0.113.5", 80)
     assert "secret" not in str(exc.value)
+
+
+async def test_all_proxy_is_fallback(monkeypatch):
+    seen = []
+
+    async def proxy(reader, writer):
+        seen.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.write(b"HTTP/1.1 200 OK\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+
+    server, port = await _serve(proxy)
+    monkeypatch.setenv("all_proxy", f"http://127.0.0.1:{port}")
+    reader, writer = await _open_upstream("example.test", "203.0.113.5", 80)
+    assert await reader.read() == b"ok"
+    writer.close()
+    server.close()
+    assert seen[0].startswith(b"CONNECT 203.0.113.5:80")
