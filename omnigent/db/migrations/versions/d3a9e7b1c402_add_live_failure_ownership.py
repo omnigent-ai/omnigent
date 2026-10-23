@@ -65,12 +65,16 @@ def downgrade() -> None:
     while True:
         query = sa.select(table).order_by(table.c.workspace_id, table.c.id).limit(100)
         if cursor is not None:
-            query = query.where(
-                sa.or_(
-                    table.c.workspace_id > cursor[0],
-                    sa.and_(table.c.workspace_id == cursor[0], table.c.id > cursor[1]),
+            if op.get_bind().dialect.name == "mysql":
+                # MySQL needs expanded inequalities; SQLite/Postgres seek tuples.
+                query = query.where(
+                    sa.or_(
+                        table.c.workspace_id > cursor[0],
+                        sa.and_(table.c.workspace_id == cursor[0], table.c.id > cursor[1]),
+                    )
                 )
-            )
+            else:
+                query = query.where(sa.tuple_(table.c.workspace_id, table.c.id) > cursor)
         rows = op.get_bind().execute(query).all()
         if not rows:
             break

@@ -168,24 +168,49 @@ def test_snapshot_and_status_share_a_versioned_atomic_update(prior_engine: sa.En
 
 
 @pytest.mark.parametrize("populated", [False, True])
+@pytest.mark.parametrize("same_workspace", [False, True])
 def test_downgrade_checks_later_batches_and_preserves_used_state(
-    prior_engine: sa.Engine, populated: bool
+    prior_engine: sa.Engine, populated: bool, same_workspace: bool
 ) -> None:
     _migrate(prior_engine, _REVISION)
+    rows = [
+        {
+            "workspace_id": 1 if same_workspace else value,
+            "id": value.to_bytes(16, "big"),
+        }
+        for value in range(1, 202)
+    ]
     with prior_engine.begin() as connection:
         connection.execute(
             sa.text(
                 f"INSERT INTO {_TABLE} (workspace_id, id, kind) VALUES (:workspace_id, :id, 1)"
             ),
-            [{"workspace_id": workspace, "id": _ID} for workspace in range(1, 202)],
+            rows,
         )
         if populated:
             connection.execute(
                 sa.text(
-                    f"UPDATE {_TABLE} SET live_status_version = :version WHERE workspace_id = 201"
+                    f"UPDATE {_TABLE} SET live_status_version = :version "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
                 ),
-                {"version": b"v" * 16},
+                {**rows[-1], "version": b"v" * 16},
             )
+    page_plans: list[str] = []
+
+    def inspect_page(connection, _cursor, statement, parameters, _context, _executemany):
+        if (
+            statement.startswith("SELECT")
+            and ".live_status_version" in statement
+            and "WHERE" in statement
+        ):
+            page_plans.extend(
+                row[3]
+                for row in connection.exec_driver_sql(
+                    "EXPLAIN QUERY PLAN " + statement, parameters
+                )
+            )
+
+    sa.event.listen(prior_engine, "before_cursor_execute", inspect_page)
     if populated:
         with pytest.raises(RuntimeError, match="retain its columns"):
             _migrate(prior_engine, _PREVIOUS, downgrade=True)
@@ -195,7 +220,11 @@ def test_downgrade_checks_later_batches_and_preserves_used_state(
             )
             assert (
                 connection.scalar(
-                    sa.text(f"SELECT live_status_version FROM {_TABLE} WHERE workspace_id = 201")
+                    sa.text(
+                        f"SELECT live_status_version FROM {_TABLE} "
+                        "WHERE workspace_id = :workspace_id AND id = :id"
+                    ),
+                    rows[-1],
                 )
                 == b"v" * 16
             )
@@ -206,6 +235,8 @@ def test_downgrade_checks_later_batches_and_preserves_used_state(
         }
     with prior_engine.connect() as connection:
         assert connection.scalar(sa.text(f"SELECT COUNT(*) FROM {_TABLE}")) == 202
+    assert page_plans
+    assert all("SEARCH" in plan and "SCAN" not in plan for plan in page_plans)
 
 
 @pytest.mark.parametrize("dialect,uuid_type", [("mysql", "BINARY(16)"), ("postgresql", "BYTEA")])
