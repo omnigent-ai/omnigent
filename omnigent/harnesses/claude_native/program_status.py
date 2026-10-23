@@ -58,14 +58,11 @@ class ClaudeProgramStatusPoller:
             self._using_osc = True
             if report != self._last:
                 self._last = report
-                status = (
-                    "running"
-                    if report.state in {"working", "blocked"}
-                    else "failed"
-                    if report.state == "error"
-                    else "idle"
-                )
-                self._on_status(status, blocked_reason(report))
+                # The StopFailure hook owns the failed edge and carries the API
+                # error text; an error report here would fail the turn first, bare.
+                if report.state != "error":
+                    status = "running" if report.state in {"working", "blocked"} else "idle"
+                    self._on_status(status, blocked_reason(report))
         else:
             if self._using_osc:
                 self._fallback.resync()
