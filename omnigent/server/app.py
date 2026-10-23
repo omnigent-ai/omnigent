@@ -3892,6 +3892,7 @@ def create_app(
             HOST_OFFLINE_RECHECK_S,
             RUNNER_DISCONNECT_GRACE_S,
             _intentional_stop_sessions,
+            _session_active_response_cache,
             _session_status_cache,
         )
 
@@ -3901,6 +3902,8 @@ def create_app(
             if conv.id not in _intentional_stop_sessions
             and _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES
         ]
+        # Host lookups can yield to a replacement turn; keep the entry-time identity.
+        held_turn_ids = {conv.id: _session_active_response_cache.get(conv.id) for conv in held}
         host_id = await _routing_host_id(held)
         if not held or await _host_offline(host_id) is not True:
             return None
@@ -3909,6 +3912,7 @@ def create_app(
         deadline = started + HOST_OFFLINE_HOLD_S
         host_back = False
         outcome = "cancelled"
+        hold_id = uuid.uuid4().hex
         for conv in held:
             _logger.info(
                 "Runner %s: host offline, holding session=%s",
@@ -3917,8 +3921,10 @@ def create_app(
                 extra=debug_event(
                     "runner_disconnect_held_host_offline",
                     session_id=conv.id,
+                    turn_id=held_turn_ids[conv.id],
                     runner_id=runner_id,
                     host_id=host_id,
+                    hold_id=hold_id,
                     hold_s=HOST_OFFLINE_HOLD_S,
                 ),
             )
@@ -3954,7 +3960,10 @@ def create_app(
                     extra=debug_event(
                         "runner_disconnect_hold_ended",
                         session_id=conv.id,
+                        turn_id=held_turn_ids[conv.id],
                         runner_id=runner_id,
+                        host_id=host_id,
+                        hold_id=hold_id,
                         outcome=outcome,
                         held_s=round(loop.time() - started, 3),
                     ),

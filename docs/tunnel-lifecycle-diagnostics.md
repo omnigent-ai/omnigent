@@ -257,6 +257,22 @@ when the context exits.
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
+- `runner_disconnect_held_host_offline` and `runner_disconnect_hold_ended`:
+  one row per held session, with a random `hold_id` shared by all sessions in
+  that runner's hold episode. Join start/end rows on `hold_id` and `session_id`;
+  a later hold on the same runner gets a new ID. Both rows retain `runner_id`,
+  `host_id`, and the session's known active `turn_id` captured before host
+  lookups await. An unknown turn stays absent even if a later turn starts.
+  The start includes `hold_s`; the end includes `held_s` and `outcome`
+  (`runner_reconnected`, `server_shutdown`, `host_back_without_runner`,
+  `expired`, or `cancelled`). This is a hold identity, not a relay `outage_id`;
+  the sweep does not own or invent the relay's outage identity.
+  A reconnect outcome or stream heartbeat proves transport availability,
+  not turn success. Measure the interrupted turn's outcome using terminal
+  evidence for the same known session/turn; missing terminal evidence and
+  unknown turns remain unresolved. Shutdown/cancellation can leave recovery
+  to another replica. These fields enable measurement and do not change
+  failure policy, grace periods, or failure counts directly.
 - `runner_disconnect_decision`: a warning explaining the status check in the
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
