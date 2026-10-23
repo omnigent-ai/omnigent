@@ -39,6 +39,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _build_tools,
     _claude_prompt_rendered,
+    _composer_row,
     _escape_slash_command_text,
     _escape_unsupported_slash_command,
     _hook_record_from_jsonl_record,
@@ -4847,9 +4848,11 @@ def test_inject_user_message_raises_on_tmux_failure(
         inject_user_message(bridge_dir, content="hi")
 
 
+@pytest.mark.parametrize("truncated_title", [False, True])
 def test_inject_user_message_waits_for_claude_prompt_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    truncated_title: bool,
 ) -> None:
     """
     Injection polls for Claude's prompt before sending any keystrokes.
@@ -4869,14 +4872,21 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     )
 
     send_keys: list[list[str]] = []
+
     # Prompt is absent for the first two polls (TUI still booting),
     # then renders. A wrong gate would send keys during the empty
     # polls; a correct gate waits for the third capture. After boot the
     # fake behaves like the live input box: the paste deposits the
     # draft, Enter clears it (so the submit-verification gate passes).
-    boot_panes = ["", "", _composer_pane()]
+    def ready_pane(draft: str = "") -> str:
+        pane = _composer_pane(draft)
+        if truncated_title:
+            pane = " A session title longer than the terminal width… ─\n" + pane.split("\n", 1)[1]
+        return pane
+
+    boot_panes = ["", "", ready_pane()]
     capture_calls = {"n": 0}
-    tui = {"pane": _composer_pane()}
+    tui = {"pane": ready_pane()}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -4898,9 +4908,9 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
                 return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
-            tui["pane"] = _composer_pane("hello")
+            tui["pane"] = ready_pane("hello")
         if cmd[-1] == "Enter":
-            tui["pane"] = _composer_pane()
+            tui["pane"] = ready_pane()
         send_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -9287,6 +9297,397 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+def test_claude_prompt_rendered_sees_prompt_under_truncated_label() -> None:
+    """A clipped title can consume every leading glyph of the opening rule."""
+    rule = "─" * 103
+    pane = "\n".join(
+        [
+            '● Agent "fix the webhook retry path" finished · 3m 48s',
+            " Retry failed billing webhook deliveries with exponential backoff and"
+            " jitter, capped at one hour(… ─",  # opening rule: no leading run
+            "❯",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+            "  ⏵⏵ auto mode on · 1 shell",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+def test_claude_prompt_rendered_sees_prompt_over_a_draft_line_trailing_off_in_a_glyph() -> None:
+    """A draft line ending in a rule glyph does not hide the input box."""
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            rule,  # opening rule
+            "❯ first line of the draft",
+            "  second line of the draft trails off… ─",
+            "  third line",
+            rule,  # closing rule
+            "  Opus 4.8 (1M) │ xhigh │ 237.7k/1M $4.64",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize(
+    ("label_rows", "closing_rows"),
+    [
+        pytest.param(
+            [
+                " fix-the-billing-webhook-retry-backoff-path-and-document-",
+                "every-edge-case-we-hit-in-staging-this-week-before-the-re",
+                "lease-freeze ─",
+            ],
+            ["─" * 57, "─" * 57, "─" * 14],
+            id="ascii",
+        ),
+        pytest.param(
+            [
+                " 請求のWebhook再試行バックオフ経路を修正し、ステージング",
+                "で発生した全てのエッジケースを文書化する作業セッション ─",
+            ],
+            ["─" * 57, "─" * 55],
+            id="wide-chars",
+        ),
+    ],
+)
+def test_claude_prompt_rendered_sees_prompt_under_title_wider_than_pane(
+    label_rows: list[str], closing_rows: list[str]
+) -> None:
+    """
+    A title wider than the pane leaves no rule glyph left of the label.
+
+    Claude Code lets a ``/rename`` title overflow the opening rule instead
+    of shortening it, so the label wraps and the row directly above ``❯``
+    is the title's tail plus the trailing glyph; the closing rule wraps to
+    the same width. Captured from Claude Code 2.1.268 in a 57-column
+    browser terminal.
+    """
+    pane = "\n".join(
+        [
+            "  ⎿  Session renamed to: fix-the-billing-webhook-retry-ba",
+            "     ckoff-path-and-document-every-edge-case-we-hit-in-st",
+            "     aging-this-week-before-the-release-freeze",
+            *label_rows,
+            "❯",
+            *closing_rows,
+            "  ⏸ manual mode on",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+
+
+_PANE_WIDE_TITLE = (
+    "fix-the-billing-webhook-retry-backoff-path-and-document-every-edge-case-"
+    "we-hit-in-staging-this-week-before-the-release-freeze"
+)
+_WRAPPED_BOX_FOOTER = "  ⏸ manual mode on · ? for shortcuts · ← for agents"
+
+
+@pytest.mark.parametrize(
+    ("opening_rows", "closing_rows"),
+    [
+        pytest.param([f" {_PANE_WIDE_TITLE[:54]} ─"], ["─" * 57], id="fills-the-row"),
+        pytest.param([f" {_PANE_WIDE_TITLE[:55]}", "─"], ["─" * 57, "─"], id="one-column-over"),
+        pytest.param([f" {_PANE_WIDE_TITLE[:56]}", "─"], ["─" * 57, "──"], id="two-columns-over"),
+        pytest.param([_PANE_WIDE_TITLE[:57], "─"], ["─" * 57, "───"], id="three-columns-over"),
+        pytest.param(
+            [f" {_PANE_WIDE_TITLE[:56]}", f"{_PANE_WIDE_TITLE[56:64]} ─"],
+            ["─" * 57, "─" * 10],
+            id="ten-columns-over",
+        ),
+    ],
+)
+def test_claude_prompt_rendered_sees_prompt_under_title_overflowing_pane_by_a_few_columns(
+    opening_rows: list[str], closing_rows: list[str]
+) -> None:
+    """
+    The opening rule's glyph alone on a row still frames the input box.
+
+    Captured from Claude Code 2.1.268 in a 57-column pane. A title that
+    exactly fills the row leaves no leading glyph and no ``…``; one that
+    overflows by a column or three pushes the rule's single trailing glyph
+    onto its own row, and the closing rule wraps onto a stub too short to
+    read as a rule by itself.
+    """
+    pane = "\n".join(
+        [
+            "  ⎿  Session renamed to: fix-the-billing-webhook-retry-ba",
+            "     ckoff-path-and-document",
+            *opening_rows,
+            "❯ ",
+            *closing_rows,
+            _WRAPPED_BOX_FOOTER,
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+    assert _occupying_surface(pane) is None
+
+
+def test_claude_prompt_rendered_sees_multiline_draft_in_a_box_wider_than_the_pane() -> None:
+    """A draft's indented continuation rows sit between ``❯`` and the wrapped closing rule."""
+    pane = "\n".join(
+        [
+            f" {_PANE_WIDE_TITLE[:56]}",
+            f"{_PANE_WIDE_TITLE[56:64]} ─",
+            "❯ first line of the draft",
+            "  second line of the draft",
+            "  third line",
+            "─" * 57,
+            "─" * 10,
+            _WRAPPED_BOX_FOOTER,
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is True
+    assert _occupying_surface(pane) is None
+
+
+# An earlier rule and an echoed prompt above the box, from the transcript.
+_STALE_PROMPT_ROWS = ["─" * 57, "❯ earlier prompt"]
+
+
+def _wide_shell_box(prefix: list[str]) -> str:
+    """A shell-mode box whose title wraps the frame, under *prefix* rows."""
+    return "\n".join(
+        [
+            *prefix,
+            f" {_PANE_WIDE_TITLE[:55]}",
+            "─",
+            "!",
+            "─" * 57,
+            "─",
+            "  ! for shell mode",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix", [[], _STALE_PROMPT_ROWS], ids=["box-only", "stale-prompt-above"]
+)
+def test_shell_mode_in_a_box_wider_than_the_pane_still_reads_as_shell_mode(
+    prefix: list[str],
+) -> None:
+    """
+    The wrapped frame yields the composer row, so its mode glyph is still read.
+
+    The box is read before an earlier rule, so a prompt echoed under that rule
+    can't stand in for the live composer.
+    """
+    pane = _wide_shell_box(prefix)
+    assert _claude_prompt_rendered(pane) is False
+    assert _occupying_surface(pane) == "shell mode"
+
+
+def test_inject_user_message_does_not_paste_into_shell_mode_under_a_stale_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message never lands in a wrapped shell-mode box, whatever the transcript above holds."""
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    writes: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(
+                returncode=0, stdout=_wide_shell_box(_STALE_PROMPT_ROWS), stderr=""
+            )
+        if "list-panes" not in cmd:
+            writes.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="shell mode"):
+        inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
+    assert not [cmd for cmd in writes if "load-buffer" in cmd or "paste-buffer" in cmd]
+
+
+def test_box_wider_than_the_pane_outranks_the_shortcuts_panel_row() -> None:
+    """
+    The composer is read upward from the closing rule before the row under it.
+
+    With no row of the opening rule reading as a rule, the row under the
+    lowest rule is the ``?`` panel's "! for shell mode" row while that panel
+    is open, so a free chat composer would read as shell mode. Shell mode in
+    the same box must still be reported.
+    """
+    panel = "  ! for shell mode        double tap esc to clear input"
+    title_rows = [f" {_PANE_WIDE_TITLE[:56]}", f"{_PANE_WIDE_TITLE[56:64]} ─"]
+    chat = "\n".join([*title_rows, "❯", "─" * 57, "─" * 10, panel])
+    shell = "\n".join([*title_rows, "!", "─" * 57, "─" * 10, panel])
+    assert _composer_row(chat) == "❯"
+    assert _claude_prompt_rendered(chat) is True
+    assert _occupying_surface(chat) is None
+    assert _composer_row(shell) == "!"
+    assert _occupying_surface(shell) == "shell mode"
+
+
+def test_history_search_in_a_box_wider_than_the_pane_still_reads_as_occupied() -> None:
+    """
+    The closing rule's wrapped stub does not hide the ctrl+r footer.
+
+    The footer region starts under the whole closing rule, stub included;
+    were the stub to lead the region, the footer's prefix would be missed
+    and the history search would read as a free composer.
+    """
+    pane = "\n".join(
+        [
+            "❯ hello history entry",
+            f" {_PANE_WIDE_TITLE[:55]}",
+            "─",
+            "❯ ",
+            "─" * 57,
+            "─",
+            "  search prompts:   ⏸ manual mode on · ← for agents",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+    assert _occupying_surface(pane) == "the prompt-history search"
+
+
+def test_permission_mode_reads_the_footer_below_a_wrapped_closing_rule() -> None:
+    """The footer region starts below the whole wrapped closing rule, stub included."""
+    pane = "\n".join(
+        [
+            f" {_PANE_WIDE_TITLE[:55]}",
+            "─",
+            "❯ ",
+            "─" * 57,
+            "─",
+            "  ⏸ plan mode on (shift+tab to cycle)",
+        ]
+    )
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "plan"
+
+
+def test_claude_prompt_rendered_ignores_a_menu_row_above_a_rule() -> None:
+    """
+    A selected menu row directly above a rule is not a composer.
+
+    Reading a wrapped box upward from its closing rule needs the opening
+    rule's glyph on the row above the composer; a menu's rows carry none.
+    """
+    pane = "\n".join(
+        [
+            "Detected a custom API key in your environment",
+            "Do you want to use this API key?",
+            "  1. Yes",
+            "❯ 2. No (recommended)",
+            "─" * 57,
+            "  Enter to confirm · Esc to cancel",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+
+
+_CLIPPED_TITLE_ROW = " Retry failed billing webhook deliveries with exponential backoff … ─"
+
+
+def _menu_under(row: str) -> str:
+    """A menu's selected row under *row*, with a rule and the menu's footer below."""
+    return "\n".join(
+        [
+            row,
+            "❯ 2. No (recommended)",
+            "─" * 57,
+            "  Enter to confirm · Esc to cancel",
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "  ⎿  the build output trails off here ─",
+        "Build cancelled ─",
+        _CLIPPED_TITLE_ROW,
+    ],
+    ids=["indented-transcript-row", "unindented-content-row", "clipped-title-row"],
+)
+def test_claude_prompt_rendered_ignores_a_menu_row_under_a_glyph_terminated_line(row: str) -> None:
+    """
+    Content ending in ``─`` above a menu's selected row does not make it the composer.
+
+    A wrapped opening rule wraps the closing rule too, and the one shape that
+    keeps a single-row closing rule is a title one space in; an indented
+    transcript row or ordinary output at the pane edge is neither. A row that
+    does read as a rule, such as a clipped title, still leaves a numbered
+    option above a dialog footer a menu.
+    """
+    assert _claude_prompt_rendered(_menu_under(row)) is False
+
+
+def test_inject_user_message_does_not_paste_into_a_menu_under_a_clipped_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A menu's selected row under a clipped title is not an input box to paste into."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.5)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    writes: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_menu_under(_CLIPPED_TITLE_ROW), stderr="")
+        if "list-panes" not in cmd:
+            writes.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
+    assert not [cmd for cmd in writes if "load-buffer" in cmd or "paste-buffer" in cmd]
+
+
+@pytest.mark.parametrize(
+    "rule_rows",
+    [["─" * 40], ["───", "─" * 40], ["─", "─" * 40], ["─" * 40, "─"]],
+    ids=["single-rule", "divider-then-rule", "stub-then-rule", "rule-then-stub"],
+)
+def test_claude_prompt_rendered_ignores_an_echoed_prompt_under_a_glyph_terminated_line(
+    rule_rows: list[str],
+) -> None:
+    """
+    An echoed prompt above a dialog's rule is not a composer.
+
+    A transcript line at the pane edge can end in a rule glyph, but a box
+    wider than the pane wraps its closing rule into rows no wider than the
+    first, and the one single-row shape is the title that exactly fills the
+    opening rule, one space in. A full-width line ending in ``─`` over a
+    scrollback ``❯`` above a dialog's rule is neither, with or without a
+    short divider or stray glyph row touching that rule. A dialog's selector
+    and footer below a rule that does wrap still make the pane a dialog.
+    """
+    pane = "\n".join(
+        [
+            "● build output trails off… ─",
+            "❯ old prompt echo",
+            *rule_rows,
+            "  Rewind",
+            "  Restore the code and/or conversation to the point before…",
+            "  ❯ (current)",
+            "  Enter to continue · Esc to cancel",
+        ]
+    )
+    assert _claude_prompt_rendered(pane) is False
+    assert _occupying_surface(pane) == "an overlay"
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -9301,6 +9702,9 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        # A title wider than the pane is cut with "…" and loses the leading run.
+        " Retry failed billing webhook deliveries with exponential backoff … ─",
+        " 修复计费回调的重试路径并加入指数退避与抖动以及每小时上限… ─",  # wide-character title
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -9325,6 +9729,13 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        # No leading run: only a label cut with a spaced-off "…" may stand in for it.
+        "a sentence that ends in a box glyph ─",
+        "a truncated sentence that ends…─",
+        "… " + "─" * 30,  # the mark with no label before it
+        # Indented past the rule's edge: a draft or transcript line, not a title.
+        "  the build was cancelled because the graph is huge… ─",
+        "- item one that trails off somewhere… ─",
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
@@ -11832,8 +12243,44 @@ _TRUST_DIALOG_PANE = """\
  Enter to confirm · Esc to cancel
 """
 
+# A keypress notice with no ❯ row (constructed around the "Press Enter to
+# continue" footer the gate accepts): the footer alone tells it from output.
+_PRESS_ENTER_NOTICE_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  Welcome to Claude Code 2.1
+  What's new: faster boot, new /model picker.
+  Press Enter to continue · Esc to cancel
+"""
+
 # The same dialog text scrolled into the transcript above a live input box.
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
+
+# A bare transcript tail with no box rule where Claude's own output happens to
+# quote a footer phrase that wraps across rows ("press enter to" / "continue").
+_WRAPPED_FOOTER_IN_TRANSCRIPT_PANE = """\
+⏺ Here is how the installer finishes: it waits
+for you to press enter to
+continue past the summary screen.
+"""
+
+# A selector-less notice below a rule whose footer is "Esc to cancel", with an
+# unrelated "press enter" later in the same region. The dialog qualifies only
+# when its own footer phrase is a keypress hint, not when one trails elsewhere.
+_SELECTORLESS_CANCEL_THEN_PRESS_ENTER_PANE = """\
+────────────────────────────────────────────────────────────
+Something finished. Press Esc to cancel the
+remaining steps, or press enter when ready.
+"""
+
+
+def _wrap_phrase(pane: str, phrase: str, wrapped: str) -> str:
+    """Return *pane* with *phrase* split as *wrapped*, failing if it is absent.
+
+    A silent ``str.replace`` no-op would turn a wrapped-footer case into a
+    duplicate of the unwrapped one if the pane's wording ever changed.
+    """
+    assert phrase in pane, f"{phrase!r} not found; wrapped-footer case is stale"
+    return pane.replace(phrase, wrapped)
 
 
 @pytest.mark.parametrize(
@@ -11841,19 +12288,48 @@ _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
     [
         (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
         (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
+        # A narrow pane wraps the footer across rows.
+        (
+            _wrap_phrase(_MCP_APPROVAL_CHECKLIST_PANE, "Esc to reject all", "Esc to\n reject all"),
+            "2 new MCP servers found in this project",
+        ),
         (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
         (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+        (_PRESS_ENTER_NOTICE_PANE, "Welcome to Claude Code 2.1"),
+        (
+            _wrap_phrase(_PRESS_ENTER_NOTICE_PANE, "Esc to cancel", "Esc to\n  cancel"),
+            "Welcome to Claude Code 2.1",
+        ),
+        # Any keypress hint in the footer qualifies, not only the first one.
+        (
+            _wrap_phrase(
+                _PRESS_ENTER_NOTICE_PANE,
+                "Press Enter to continue · Esc to cancel",
+                "Esc to exit · Press Enter to continue",
+            ),
+            "Welcome to Claude Code 2.1",
+        ),
     ],
-    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+    ids=[
+        "mcp-single",
+        "mcp-checklist",
+        "mcp-checklist-wrapped-footer",
+        "api-key",
+        "folder-trust",
+        "press-enter",
+        "press-enter-wrapped-footer",
+        "press-enter-after-esc-hint",
+    ],
 )
 def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
     """
-    Each real startup dialog is recognised by shape and named by its headline.
+    Each startup dialog is recognised by shape and named by its headline.
 
-    All four captures come from Claude Code 2.1.269. None of them is a mounted
-    input box, and each replaces the box with an option list under a
-    "Enter to … · Esc to …" footer, so the headline is what the web error
-    can show the person who has to answer it.
+    The four dialog captures come from Claude Code 2.1.269; the wrapped-footer
+    and keypress-notice variants are built from the same shapes. None of them is
+    a mounted input box, and each replaces the box with a "Enter to … · Esc to
+    …" footer, so the headline is what the web error can show the person who
+    has to answer it.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) == headline
     assert _claude_prompt_rendered(pane) is False
@@ -11870,6 +12346,8 @@ def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str
         _SETTINGS_PANEL_PANE,
         _PERMISSION_PROMPT_PANE,
         _DIALOG_ECHO_ABOVE_COMPOSER_PANE,
+        _WRAPPED_FOOTER_IN_TRANSCRIPT_PANE,
+        _SELECTORLESS_CANCEL_THEN_PRESS_ENTER_PANE,
     ],
     ids=[
         "ready",
@@ -11880,6 +12358,8 @@ def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str
         "settings-panel",
         "permission-prompt",
         "dialog-echo-above-composer",
+        "wrapped-footer-in-transcript",
+        "selectorless-cancel-then-press-enter",
     ],
 )
 def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
@@ -11889,7 +12369,10 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
     A live composer wins even with dialog text scrolled above it; a booting
     pane has no footer; the settings panel's "Esc to clear" is not a confirm
     footer; and a boxed tool permission prompt has no footer at all, so it
-    stays on its own PermissionRequest path.
+    stays on its own PermissionRequest path. Without a framing rule, a footer
+    phrase that only wraps across transcript rows is not a dialog either. A
+    selector-less "Esc to cancel" notice does not qualify just because an
+    unrelated "press enter" trails later in the region.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) is None
 
