@@ -338,6 +338,7 @@ class FaultProxy:
         self._intercept = intercept
         self._server: asyncio.base_events.Server | None = None
         self._port_reservation: socket.socket | None = None
+        self._started = False
         self._connections: dict[int, _Connection] = {}
         self._rules: dict[int, _Rule] = {}
         self._ids = itertools.count(1)
@@ -511,6 +512,9 @@ class FaultProxy:
         self._changed = asyncio.Event()
 
     async def _start(self) -> None:
+        if self._started:
+            raise RuntimeError(f"proxy {self.name} already started")
+        self._started = True
         self._changed = asyncio.Event()
         try:
             if sys.platform == "linux":
@@ -525,6 +529,7 @@ class FaultProxy:
             if self._port_reservation is not None:
                 self._port_reservation.close()
                 self._port_reservation = None
+            self._started = False
             raise
         self._emit(
             "listen", port=self._listen_port, upstream=f"{self.upstream[0]}:{self.upstream[1]}"
@@ -546,11 +551,13 @@ class FaultProxy:
     async def _stop(self) -> None:
         for rule_id in list(self._rules):
             self._rules.pop(rule_id, None)
+        self._listener_refusals = 0
         await self._unlisten()
         if self._port_reservation is not None:
             self._port_reservation.close()
             self._port_reservation = None
         await self._end_matching(None, rst=False, reason="proxy_stop")
+        self._started = False
         self._signal_change()
 
     async def _add_rules(
