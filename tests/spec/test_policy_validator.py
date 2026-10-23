@@ -181,6 +181,7 @@ guardrails:
         # runner's tool dispatch, so a user tool shadowing it would never
         # be invoked (its calls would silently route to the builtin).
         "sys_list_models",
+        "ui_open_file",
     ],
 )
 def test_validate_rejects_local_tool_colliding_with_builtin(
