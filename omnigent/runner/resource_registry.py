@@ -635,7 +635,9 @@ class SessionResourceRegistry:
             self._published_session_status[session_id] = (status, blocked_on)
             return True
 
-    def _sync_status_edge(self, session_id: str, status: str) -> None:
+    def _sync_status_edge(
+        self, session_id: str, status: str, *, turn_ended_at_ms: int | None = None
+    ) -> None:
         """Adopt an external status and re-arm its file poller after idle."""
         with self._lock:
             self._published_session_status[session_id] = (status, None)
@@ -643,7 +645,10 @@ class SessionResourceRegistry:
         # A queued turn can hide the idle file edge. Re-arm only for idle so a
         # stale busy file cannot clear a forwarded failure.
         if status == "idle" and poller is not None:
-            poller.resync()
+            if turn_ended_at_ms is not None:
+                poller.note_turn_ended(turn_ended_at_ms)
+            else:
+                poller.resync()
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -682,6 +687,16 @@ class SessionResourceRegistry:
                 extra={"session_id": runner_primary_session_id()},
             )
 
+    def claude_status_file_reports_busy(self, session_id: str) -> bool:
+        """Whether Claude's status file says busy, including a background agent.
+
+        :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+        :returns: ``True`` when the session's status-file poller last read ``busy``.
+        """
+        with self._lock:
+            poller = self._status_pollers.get(session_id)
+        return poller is not None and poller.reports_busy
+
     def session_activity_epoch(self, session_id: str) -> int:
         """Count explicit turn activity, retaining it after idle or terminal exit."""
         with self._lock:
@@ -700,12 +715,21 @@ class SessionResourceRegistry:
         turn's stale ``idle`` and be misclassified as a clean shutdown. The
         watcher flips the memo back to ``idle`` once the turn completes.
 
+        Also tells the claude-native poller, so a ``busy`` file left over from a
+        background agent reads as this turn's ``running``.
+
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         """
         self._set_session_status_memo(session_id, "running")
         self._note_terminal_status(session_id, "running", "runner_turn_start")
+        with self._lock:
+            poller = self._status_pollers.get(session_id)
+        if poller is not None:
+            poller.note_turn_started(int(time.time() * 1000))
 
-    def note_external_session_status(self, session_id: str, status: str) -> None:
+    def note_external_session_status(
+        self, session_id: str, status: str, *, turn_ended_at_ms: int | None = None
+    ) -> None:
         """Record a terminal-observed external status for exit classification.
 
         Structured native forwarders can know turn completion more reliably than
@@ -721,12 +745,14 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
+        :param turn_ended_at_ms: When Claude's ``Stop`` hook fired with a
+            background agent still running, in epoch milliseconds, or ``None``.
         """
         if status in {"idle", "failed"}:
             self._set_session_status_memo(session_id, status)
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
-        self._sync_status_edge(session_id, status)
+        self._sync_status_edge(session_id, status, turn_ended_at_ms=turn_ended_at_ms)
         self._note_terminal_status(session_id, status, "forwarded_status")
 
     def _note_terminal_status(self, session_id: str, status: str, source: str) -> None:
@@ -1700,10 +1726,15 @@ class SessionResourceRegistry:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
+            read_prompt_submitted_at,
         )
         from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
+
+        def _prompt_submitted_at_ms() -> int | None:
+            submitted_at = read_prompt_submitted_at(bridge_dir)
+            return None if submitted_at is None else int(submitted_at * 1000)
 
         def _session_id_getter() -> str | None:
             # Best-effort: the bridge records Claude's uuid only after the
@@ -1723,6 +1754,7 @@ class SessionResourceRegistry:
             ),
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,
+            prompt_submitted_at_getter=_prompt_submitted_at_ms,
         )
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller

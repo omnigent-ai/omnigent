@@ -1482,7 +1482,12 @@ def create_runner_app(
         status edges decide when the turn settles. SDK turns are already covered
         by ``_active_turns`` and need not publish a closing edge.
         """
-        if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
+        in_flight = _native_pane_status.get(session_id) in _IN_FLIGHT_SESSION_STATUSES
+        # A background agent keeps Claude's file busy after the turn reads idle.
+        if not in_flight and not (
+            resource_registry is not None
+            and resource_registry.claude_status_file_reports_busy(session_id)
+        ):
             return False
         return is_native_harness(_session_harness_name(session_id))
 
@@ -6698,7 +6703,18 @@ def create_runner_app(
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
                 _native_pane_status[conversation_id] = status
-                resource_registry.note_external_session_status(conversation_id, status)
+                turn_ended_at_ms = (
+                    data.get("turn_ended_at_ms")
+                    if status == "idle" and isinstance(data, dict)
+                    else None
+                )
+                resource_registry.note_external_session_status(
+                    conversation_id,
+                    status,
+                    turn_ended_at_ms=turn_ended_at_ms
+                    if isinstance(turn_ended_at_ms, int) and not isinstance(turn_ended_at_ms, bool)
+                    else None,
+                )
                 child_status = (
                     "idle" if terminal_status == "completed" else terminal_status or status
                 )
@@ -7784,6 +7800,9 @@ def create_runner_app(
             ):
                 return True
             if _native_pane_status.get(conv_id) == "running":
+                return True
+            # A background agent outlives the turn, so the session reads idle.
+            if resource_registry.claude_status_file_reports_busy(conv_id):
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
             # active turn, so every signal above reads idle. Reaping it kills the

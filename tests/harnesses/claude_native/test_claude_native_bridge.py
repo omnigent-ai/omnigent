@@ -62,6 +62,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_message_deltas_from_offset,
     read_permission_hook_config,
+    read_prompt_submitted_at,
     read_seen_claude_session_ids,
     read_transcript_items_from_offset,
     read_transcript_items_since,
@@ -799,6 +800,25 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
 
     assert read_transcript_path(bridge_dir) == transcript_path
     assert read_claude_session_id(bridge_dir) == "claude-session"
+
+
+def test_record_hook_event_keeps_the_pinned_session_prompt_time(tmp_path: Path) -> None:
+    """Only the pinned session's own prompt moves the recorded prompt time."""
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "session_id": "parent"})
+    assert read_prompt_submitted_at(bridge_dir) is None
+
+    record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit", "session_id": "parent"})
+    hooks = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0).records
+    assert read_prompt_submitted_at(bridge_dir) == hooks[-1].recorded_at
+
+    for payload in (
+        {"hook_event_name": "UserPromptSubmit", "session_id": "parent", "agent_id": "agent-1"},
+        {"hook_event_name": "UserPromptSubmit", "session_id": "foreign-session"},
+        {"hook_event_name": "Stop", "session_id": "parent"},
+    ):
+        record_hook_event(bridge_dir, payload)
+    assert read_prompt_submitted_at(bridge_dir) == hooks[-1].recorded_at
 
 
 @pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])
@@ -10456,6 +10476,7 @@ def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
     )
 
     assert record.background_task_count == 1
+    assert record.background_agent_running is True
     assert record.background_tasks == [
         {
             "id": "bash-task",

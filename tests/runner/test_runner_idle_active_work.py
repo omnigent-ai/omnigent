@@ -9,11 +9,15 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI
 
+from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.runner import create_runner_app, pending_approvals
 from omnigent.runner._entry import _run_inactivity_monitor
 from omnigent.runner.app import (
@@ -354,17 +358,18 @@ async def _native_app_with_session(conv_id: str, harness: str = "pi-native") -> 
     )
 
 
-async def _post_status(client: Any, conv_id: str, status: str) -> None:
+async def _post_status(client: Any, conv_id: str, status: str, **extra: object) -> None:
     """POST one forwarder-style ``external_session_status`` edge.
 
     :param client: Runner test client.
     :param conv_id: Session id, e.g. ``"conv_native"``.
     :param status: Native status, e.g. ``"running"`` or ``"idle"``.
+    :param extra: Additional event data, e.g. ``turn_ended_at_ms=2000``.
     :returns: None.
     """
     resp = await client.post(
         f"/v1/sessions/{conv_id}/events",
-        json={"type": "external_session_status", "data": {"status": status}},
+        json={"type": "external_session_status", "data": {"status": status, **extra}},
     )
     assert resp.status_code == 204, resp.text
 
@@ -436,6 +441,60 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
         app.state.begin_turn_slot(conv_id)
         app.state.active_turns.pop(conv_id, None)
         publish_pane_status(conv_id, "idle", None)
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("turn_ended_at_ms", "published_after_stop"),
+    [
+        (2000, ["running", "idle"]),
+        (True, ["running", "running"]),
+        ("2000", ["running", "running"]),
+    ],
+    ids=["stop-time", "bool-time-ignored", "string-time-ignored"],
+)
+async def test_claude_background_agent_pins_idle_shutdown_after_stop(
+    tmp_path: Path, turn_ended_at_ms: object, published_after_stop: list[str]
+) -> None:
+    """A background agent still running after Claude's ``Stop`` keeps the runner up.
+
+    With a valid ``Stop`` time the session reads idle so follow-ups are not
+    queued; a malformed time re-syncs the busy file as running. Either way
+    Claude's status file stays ``busy`` until the agent finishes.
+    """
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_claude_background_agent"
+    app = await _native_app_with_session(conv_id, harness="claude-native")
+    status_file = tmp_path / "sessions" / "1.json"
+    status_file.parent.mkdir()
+    # A 1 ms stamp would read idle if ``True`` were taken as a 1 ms Stop time.
+    record = {"pid": 1, "sessionId": "s", "kind": "interactive", "statusUpdatedAt": 1}
+    status_file.write_text(json.dumps({**record, "status": "busy"}), encoding="utf-8")
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=lambda: 1,
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    app.state.session_resource_registry._status_pollers[conv_id] = poller
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "running")
+        poller.tick()
+        await _post_status(client, conv_id, "idle", turn_ended_at_ms=turn_ended_at_ms)
+        poller.tick()
+        assert published == published_after_stop
+        assert app.state.has_active_work() is True
+
+        status_file.write_text(
+            json.dumps({**record, "status": "idle", "statusUpdatedAt": 3000}), encoding="utf-8"
+        )
+        os.utime(status_file, (status_file.stat().st_mtime + 1,) * 2)
+        poller.tick()
         assert app.state.has_active_work() is False
 
 

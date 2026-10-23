@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -431,18 +432,14 @@ def test_stop_failure_detail_uses_transcript_api_error_without_warning(
     assert not [record for record in caplog.records if record.levelno == logging.WARNING]
 
 
-@pytest.mark.asyncio
-async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
-    tmp_path: Path,
-) -> None:
-    """
-    ``Stop`` with ``background_tasks`` posts ``idle`` plus the shell count.
+async def _forward_one_stop(
+    tmp_path: Path, background_tasks: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Record a ``Stop`` with *background_tasks* and return the forwarder's request.
 
-    The turn really has ended, so the status is ``idle`` — the spinner stays
-    lit off the count instead (``showsWorking`` is ``isWorking || tally > 0``).
-    The count is the one thing Claude's status file cannot report: its
-    ``shell`` literal is a boolean and the indicator renders a number, which
-    is why this hook still posts at all.
+    :param tmp_path: Test directory for the bridge and transcript.
+    :param background_tasks: The hook payload's tasks, e.g. one running shell.
+    :returns: The recorded request, with ``path`` and ``body``.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -460,15 +457,7 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
         {
             "hook_event_name": "Stop",
             "session_id": "claude-session",
-            "background_tasks": [
-                {
-                    "id": "abc123",
-                    "type": "shell",
-                    "status": "running",
-                    "description": "Wait for CI",
-                    "command": "sleep 120",
-                },
-            ],
+            "background_tasks": background_tasks,
         },
     )
     server, thread, base_url = _start_recording_server()
@@ -484,7 +473,7 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
         )
     )
     try:
-        request = await _get_recorded_request(server)
+        return await _get_recorded_request(server)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -492,6 +481,33 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
         server.shutdown()
         server.server_close()
         thread.join(timeout=5.0)
+
+
+@pytest.mark.asyncio
+async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
+    tmp_path: Path,
+) -> None:
+    """
+    ``Stop`` with ``background_tasks`` posts ``idle`` plus the shell count.
+
+    The turn really has ended, so the status is ``idle`` — the spinner stays
+    lit off the count instead (``showsWorking`` is ``isWorking || tally > 0``).
+    The count is the one thing Claude's status file cannot report: its
+    ``shell`` literal is a boolean and the indicator renders a number, which
+    is why this hook still posts at all.
+    """
+    request = await _forward_one_stop(
+        tmp_path,
+        [
+            {
+                "id": "abc123",
+                "type": "shell",
+                "status": "running",
+                "description": "Wait for CI",
+                "command": "sleep 120",
+            },
+        ],
+    )
 
     assert request["path"] == "/v1/sessions/conv_abc/events"
     assert request["body"] == {
@@ -513,6 +529,34 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
             ],
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_status", "reports_stop_time"), [("running", True), ("completed", False)]
+)
+async def test_forwarder_reports_stop_time_only_while_a_background_agent_runs(
+    tmp_path: Path, agent_status: str, reports_stop_time: bool
+) -> None:
+    """A Stop that leaves a background agent running carries its hook time.
+
+    That agent keeps Claude's status file busy, and the runner needs the time to
+    tell the held busy from a newer turn. Any other Stop omits it.
+    """
+    recorded_after_ms = int(time.time() * 1000)
+    request = await _forward_one_stop(
+        tmp_path, [{"id": "agent-task", "type": "subagent", "status": agent_status}]
+    )
+    recorded_before_ms = int(time.time() * 1000)
+
+    data = request["body"]["data"]
+    turn_ended_at_ms = data.pop("turn_ended_at_ms", None)
+    assert data == {"status": "idle", "turn_completed": True, "background_task_count": 0}
+    if reports_stop_time:
+        assert turn_ended_at_ms is not None
+        assert recorded_after_ms <= turn_ended_at_ms <= recorded_before_ms
+    else:
+        assert turn_ended_at_ms is None
 
 
 @pytest.mark.asyncio

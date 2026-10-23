@@ -313,12 +313,11 @@ def test_unknown_status_clears_dedup_so_next_read_publishes(tmp_path: Path) -> N
 
 
 def test_stale_busy_is_reported_as_written(tmp_path: Path) -> None:
-    """A long-standing ``busy`` still reads as running — no freshness window.
+    """A long-standing ``busy`` with no ``Stop`` since reads as running.
 
-    Claude reports ``busy`` while a delegate or background shell works, which
-    can outlast the turn that started it, and that is correct: it *is* still
-    doing work. The file says what Claude is doing, so we report it as written
-    rather than timing it out and second-guessing with a pane diff.
+    A turn can work for a long time without Claude rewriting the file, so there
+    is no freshness window: we report it as written rather than timing it out
+    and second-guessing with a pane diff.
     """
     sessions = tmp_path / "sessions"
     now = 1785480100.0
@@ -339,6 +338,120 @@ def test_stale_busy_is_reported_as_written(tmp_path: Path) -> None:
     poller.tick()
     assert published == [RUNNING]
     assert poller.active is True
+
+
+def _rewrite_session_file(directory: Path, *, mtime: float, **fields) -> None:
+    """Rewrite pid 1's file and give it a distinct mtime so the poller rereads it."""
+    path = _write_session_file(directory, pid=1, session_id="s", **fields)
+    os.utime(path, (mtime, mtime))
+
+
+def test_busy_left_by_a_background_agent_reads_idle_after_stop(tmp_path: Path) -> None:
+    """A ``busy`` stamped before the last ``Stop`` is a delegate holdover, not a turn.
+
+    Claude keeps the file ``busy`` while a background agent runs and does not
+    restamp it when the turn ends. Publishing that as running would queue every
+    follow-up until the agent finished.
+    """
+    sessions = tmp_path / "sessions"
+    _rewrite_session_file(sessions, mtime=1000, status="busy", status_updated_at=1000)
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [RUNNING]
+
+    poller.note_turn_ended(2000)
+    poller.tick()
+    assert published == [RUNNING, IDLE]
+    assert poller.reports_busy is True
+
+    _rewrite_session_file(sessions, mtime=1001, status="busy", status_updated_at=1000)
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert published == [RUNNING, IDLE, IDLE]
+
+    _rewrite_session_file(sessions, mtime=1002, status="idle", status_updated_at=5000)
+    poller.tick()
+    assert published == [RUNNING, IDLE, IDLE]
+    assert poller.reports_busy is False
+
+
+def test_turn_after_stop_reads_the_held_busy_as_running(tmp_path: Path) -> None:
+    """A runner-delivered or Claude-started turn ends the holdover."""
+    sessions = tmp_path / "sessions"
+    _rewrite_session_file(sessions, mtime=1000, status="busy", status_updated_at=1000)
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    poller.note_turn_ended(2000)
+    poller.tick()
+    assert published == [RUNNING, IDLE]
+
+    poller.note_turn_started(3000)
+    poller.tick()
+    assert published == [RUNNING, IDLE, RUNNING]
+
+    poller.note_turn_ended(4000)
+    poller.tick()
+    assert published == [RUNNING, IDLE, RUNNING, IDLE]
+
+    _rewrite_session_file(sessions, mtime=1001, status="idle", status_updated_at=5000)
+    poller.tick()
+    _rewrite_session_file(sessions, mtime=1002, status="busy", status_updated_at=6000)
+    poller.tick()
+    assert published == [RUNNING, IDLE, RUNNING, IDLE, RUNNING]
+
+
+def test_prompt_during_the_holdover_reads_the_unchanged_busy_as_running(tmp_path: Path) -> None:
+    """A turn Claude starts while still ``busy`` is running without any file write.
+
+    Another agent finishing, or a prompt typed in the pane, keeps the file
+    ``busy`` with its old stamp; only the prompt time shows the new turn.
+    """
+    sessions = tmp_path / "sessions"
+    _rewrite_session_file(sessions, mtime=1000, status="busy", status_updated_at=1000)
+    prompt_submitted_at: list[int | Exception] = [500]
+
+    def _prompt_submitted_at() -> int:
+        value = prompt_submitted_at[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        prompt_submitted_at_getter=_prompt_submitted_at,
+    )
+    poller.tick()
+    poller.note_turn_ended(2000)
+    poller.tick()
+    prompt_submitted_at[0] = OSError("state file unreadable")
+    poller.tick()
+    assert published == [RUNNING, IDLE]
+
+    prompt_submitted_at[0] = 3000
+    poller.tick()
+    assert published == [RUNNING, IDLE, RUNNING]
+
+    poller.note_turn_ended(4000)
+    poller.tick()
+    poller.tick()
+    assert published == [RUNNING, IDLE, RUNNING, IDLE]
 
 
 def test_retire_stops_the_file_owning_status(tmp_path: Path) -> None:

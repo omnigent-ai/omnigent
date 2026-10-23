@@ -1025,6 +1025,9 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param background_agent_running: Whether a ``Stop`` hook's
+        ``background_tasks`` lists a background agent that has not finished.
+        ``False`` for all other events.
     :param failure_category: ``StopFailure`` error category, e.g.
         ``"rate_limit"``. ``None`` for other events or when absent.
     :param failure_message: ``StopFailure`` raw API error detail from the
@@ -1052,6 +1055,7 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    background_agent_running: bool = False
     failure_category: str | None = None
     failure_message: str | None = None
     failure_context: FailureContext | None = None
@@ -2980,6 +2984,8 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
                 seen = read_seen_claude_session_ids(bridge_dir)
                 seen.add(claude_session_id)
                 state["seen_claude_session_ids"] = sorted(seen)
+            if event_name == "UserPromptSubmit" and not payload.get("agent_id"):
+                state["prompt_submitted_at"] = envelope["recorded_at"]
         else:
             _logger.debug(
                 "Ignoring identity fields from side-channel hook event; "
@@ -3030,6 +3036,25 @@ def read_claude_session_id(bridge_dir: Path) -> str | None:
     if not isinstance(raw, str) or not raw:
         return None
     return raw
+
+
+def read_prompt_submitted_at(bridge_dir: Path) -> float | None:
+    """
+    Return when the pinned Claude session last submitted a prompt.
+
+    Set by :func:`record_hook_event` from the session's own
+    ``UserPromptSubmit`` hook, whether the prompt was typed in the pane,
+    delivered by Omnigent, or a background agent's completion notice.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The hook's recorded time in epoch seconds, e.g.
+        ``1792430876.27``, or ``None`` before the first prompt.
+    """
+    state = _read_json_file(bridge_dir / _STATE_FILE)
+    raw = state.get("prompt_submitted_at") if isinstance(state, dict) else None
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    return float(raw)
 
 
 def read_seen_claude_session_ids(bridge_dir: Path) -> set[str]:
@@ -3951,9 +3976,16 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status = "completed"
     background_task_count = 0
     background_tasks: list[_JsonObject] | None = None
+    background_agent_running = False
     if event_name == "Stop" and isinstance(payload, dict):
         raw_bg = payload.get("background_tasks")
         if isinstance(raw_bg, list):
+            background_agent_running = any(
+                isinstance(task, dict)
+                and task.get("type") in _BACKGROUND_AGENT_TASK_TYPES
+                and task.get("status") not in _TERMINAL_BACKGROUND_TASK_STATUSES
+                for task in raw_bg
+            )
             # Keep only shells still running: Claude Code leaves finished
             # shells in the array (see _TERMINAL_BACKGROUND_TASK_STATUSES), so a
             # raw len() over-counts and pins the indicator after they exit. An
@@ -4037,6 +4069,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         task_status=task_status,
         background_task_count=background_task_count,
         background_tasks=background_tasks,
+        background_agent_running=background_agent_running,
         failure_category=failure_category,
         failure_message=failure_message,
         failure_context=failure_context,

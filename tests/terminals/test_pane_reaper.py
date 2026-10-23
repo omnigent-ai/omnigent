@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +13,7 @@ import pytest
 
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
@@ -243,6 +246,54 @@ async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
     # Another session's parked prompt does not spare this pane.
     other = PaneRef("conv_other", pane.terminal_id, "claude", pane.socket_path)
     assert not await reaper._is_busy(other)
+
+
+async def test_runner_busy_check_spares_a_pane_running_a_background_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The runner's busy check spares a pane whose finished turn left an agent running.
+
+    The session reads idle after Claude's ``Stop`` so follow-ups can be sent, but
+    Claude's status file stays ``busy`` until the background agent finishes.
+    """
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    status_file = tmp_path / "sessions" / "1.json"
+    status_file.parent.mkdir()
+    record = {"pid": 1, "sessionId": "s", "kind": "interactive", "statusUpdatedAt": 1000}
+    status_file.write_text(json.dumps({**record, "status": "busy"}), encoding="utf-8")
+    poller = SessionStatusPoller(
+        on_status=lambda _status, _reason: None,
+        pane_pid_getter=lambda: 1,
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    resource_registry._status_pollers["conv_agent"] = poller
+    resource_registry.note_external_session_status("conv_agent", "idle", turn_ended_at_ms=2000)
+    poller.tick()
+    pane = PaneRef(
+        "conv_agent", terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+    )
+    assert await reaper._is_busy(pane)
+
+    status_file.write_text(
+        json.dumps({**record, "status": "idle", "statusUpdatedAt": 3000}), encoding="utf-8"
+    )
+    os.utime(status_file, (status_file.stat().st_mtime + 1,) * 2)
+    poller.tick()
+    assert not await reaper._is_busy(pane)
 
 
 async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(
