@@ -631,6 +631,10 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
                 parse_result=parse_result,
             )
         )
+    from omnigent.runner.git_providers.github_push import push_operation
+
+    if push := push_operation(segments):
+        ops.append(push)
     return ops
 
 
