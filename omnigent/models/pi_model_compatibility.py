@@ -8,7 +8,10 @@ from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.models.model_fallbacks import PI_ANTHROPIC_THINKING_REQUIRED
+from omnigent.models.model_fallbacks import (
+    PI_ANTHROPIC_ADAPTIVE_THINKING,
+    PI_ANTHROPIC_THINKING_REQUIRED,
+)
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata
 
 if TYPE_CHECKING:
@@ -77,9 +80,8 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 # through the Responses API instead and do not need it.
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
-# Claude models support extended thinking; reasoning:true in the model entry
-# enables Pi's thinking level controls. Paired with forceAdaptiveThinking in the
-# provider compat block so Pi sends thinking.type.adaptive (required by claude-4+).
+# Claude models support extended thinking; reasoning:true enables Pi's controls.
+# Adaptive versus budget-based thinking is configured per model.
 PI_CLAUDE_THINKING_MODEL_FRAGMENTS: tuple[str, ...] = ("claude",)
 
 
@@ -90,6 +92,7 @@ class PiModelEntry(TypedDict):
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
     thinkingLevelMap: NotRequired[dict[str, str | None]]
+    compat: NotRequired[dict[str, bool]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]
@@ -97,11 +100,15 @@ class PiModelEntry(TypedDict):
 
 
 def pi_model_with_thinking_defaults(entry: PiModelEntry) -> PiModelEntry:
-    """Disable Pi's off level only for known models that require thinking.
+    """Fill Anthropic defaults, respecting explicit level maps and compatibility flags.
 
-    Explicit maps win; unknown models retain Pi's default level mapping.
+    Match exact names behind vendor/gateway prefixes; leave suffixes and unknowns alone.
     """
-    model = entry["id"].lower().removeprefix("system.ai.").removeprefix("databricks-")
+    model = entry["id"].lower().rsplit("/", 1)[-1]
+    model = model.removeprefix("system.ai.").removeprefix("databricks-")
+    compat = entry.get("compat", {})
+    if model in PI_ANTHROPIC_ADAPTIVE_THINKING.model_ids and "forceAdaptiveThinking" not in compat:
+        entry = {**entry, "reasoning": True, "compat": {**compat, "forceAdaptiveThinking": True}}
     if model in PI_ANTHROPIC_THINKING_REQUIRED.model_ids and "thinkingLevelMap" not in entry:
         return {**entry, "reasoning": True, "thinkingLevelMap": {"off": None}}
     return entry

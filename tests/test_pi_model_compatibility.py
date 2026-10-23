@@ -248,18 +248,23 @@ def test_generic_model_ambiguous_catalog_does_not_guess_capability(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    ("model", "requires_thinking"),
+    ("model", "requires_thinking", "adaptive"),
     [
-        ("system.ai.claude-opus-5-5", True),
-        ("databricks-claude-sonnet-5-5", True),
-        ("claude-fable-5-1", True),
-        ("system.ai.claude-opus-5", False),
-        ("system.ai.claude-haiku-5-5", False),
-        ("system.ai.claude-opus-5-50", False),
+        ("system.ai.claude-opus-5-5", True, True),
+        ("databricks-claude-sonnet-5-5", True, True),
+        ("claude-fable-5-1", True, True),
+        ("anthropic/claude-opus-5-5", True, True),
+        ("claude-sonnet-4-6", False, True),
+        ("system.ai.claude-opus-5", False, True),
+        ("claude-haiku-4-5", False, False),
+        ("system.ai.claude-haiku-5-5", False, False),
+        ("system.ai.claude-opus-5-50", False, False),
     ],
 )
 @pytest.mark.parametrize("catalog_available", [False, True])
-def test_native_and_sdk_agree_on_anthropic_thinking(model, requires_thinking, catalog_available):
+def test_native_and_sdk_agree_on_anthropic_thinking(
+    model, requires_thinking, adaptive, catalog_available
+):
     from omnigent.harnesses.pi_native.credentials import PiProviderConfig
     from omnigent.inner.pi_executor import _build_models_json
 
@@ -281,8 +286,9 @@ def test_native_and_sdk_agree_on_anthropic_thinking(model, requires_thinking, ca
         catalog_models=[catalog] if catalog_available else [],
     )["providers"]["databricks-anthropic"]
     for provider in (native, sdk):
-        assert provider["compat"]["forceAdaptiveThinking"] is True
+        assert "forceAdaptiveThinking" not in provider.get("compat", {})
         entry = next(row for row in provider["models"] if row["id"] == model)
+        assert entry.get("compat", {}).get("forceAdaptiveThinking", False) is adaptive
         assert entry.get("thinkingLevelMap") == ({"off": None} if requires_thinking else None)
         if requires_thinking:
             assert entry["reasoning"] is True
@@ -290,7 +296,11 @@ def test_native_and_sdk_agree_on_anthropic_thinking(model, requires_thinking, ca
             assert entry["contextWindow"] == 1000000
 
 
-def test_openai_compatible_claude_keeps_off_available():
+@pytest.mark.parametrize(
+    ("wire_api", "provider_name"),
+    [("chat", "databricks-completions"), ("responses", "databricks-openai")],
+)
+def test_openai_compatible_claude_keeps_off_available(wire_api, provider_name):
     from omnigent.harnesses.pi_native.credentials import PiProviderConfig
     from omnigent.inner.pi_executor import _build_models_json
     from omnigent.models.pi_model_compatibility import pi_generic_model_json_entry
@@ -310,14 +320,40 @@ def test_openai_compatible_claude_keeps_off_available():
         "synthetic",
         {"openai": "https://gateway.example/v1"},
         model=model,
-    )["providers"]["databricks-completions"]
+        openai_wire_api=wire_api,
+    )["providers"][provider_name]
     for provider in (native, sdk):
         assert "thinkingLevelMap" not in provider["models"][0]
+        assert "compat" not in provider["models"][0]
+    assert sdk["models"] == native["models"] == [pi_generic_model_json_entry(model)]
 
 
-@pytest.mark.parametrize("model", ["claude-opus-5-5", "anthropic-compatible-model"])
-def test_explicit_thinking_map_wins_over_fallback(model: str) -> None:
+@pytest.mark.parametrize("compat", [{}, {"forceAdaptiveThinking": False}])
+def test_explicit_thinking_settings_win_over_fallback(compat) -> None:
     from omnigent.models.pi_model_compatibility import pi_model_with_thinking_defaults
 
-    entry = {"id": model, "thinkingLevelMap": {"off": "low"}}
+    entry = {
+        "id": "claude-opus-5-5",
+        "thinkingLevelMap": {"off": "low"},
+        "compat": {"supportsEagerToolInputStreaming": False, **compat},
+    }
+    result = pi_model_with_thinking_defaults(entry)
+    assert result["thinkingLevelMap"] is entry["thinkingLevelMap"]
+    assert result["compat"] == {"forceAdaptiveThinking": True, **entry["compat"]}
+    assert entry["compat"] == {"supportsEagerToolInputStreaming": False, **compat}
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "anthropic-compatible-model",
+        "claude-opus-5-5[1m]",
+        "claude-opus-5-5-20261001",
+        "us.anthropic.claude-opus-5-5",
+    ],
+)
+def test_unknown_thinking_defaults_leave_entry_unchanged(model: str) -> None:
+    from omnigent.models.pi_model_compatibility import pi_model_with_thinking_defaults
+
+    entry = {"id": model}
     assert pi_model_with_thinking_defaults(entry) is entry

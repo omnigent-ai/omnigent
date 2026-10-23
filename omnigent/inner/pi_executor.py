@@ -68,9 +68,11 @@ from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
+    PiModelEntry,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
+    pi_model_is_reasoning,
     pi_model_json_entry,
     pi_model_with_thinking_defaults,
     unsupported_in_pi,
@@ -869,7 +871,7 @@ def _build_models_json(
             registered_model = replace(catalog_model, id=model)
         # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
         # not assignable to it (dict value types are invariant), so copy.
-        model_entry = pi_model_json_entry(registered_model)
+        model_entry: PiModelEntry = pi_model_json_entry(registered_model)
         if provider_name == "databricks-anthropic":
             model_entry = pi_model_with_thinking_defaults(model_entry)
         entry: _JsonObject = dict(model_entry)
@@ -907,7 +909,6 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
-                "compat": {"forceAdaptiveThinking": True},
                 "models": provider_models["databricks-anthropic"],
             },
             # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
@@ -970,9 +971,9 @@ def _build_models_json(
             ):
                 model_entry = pi_generic_model_json_entry(model)
             else:
-                model_entry = pi_model_json_entry(
-                    model_catalog.ModelEntry(id=model, family="other")
-                )
+                model_entry = {"id": model, "input": ["text", "image"]}
+                if pi_model_is_reasoning(model) or provider["api"] == "anthropic-messages":
+                    model_entry["reasoning"] = True
             if provider["api"] == "anthropic-messages":
                 model_entry = pi_model_with_thinking_defaults(model_entry)
             entry = dict(model_entry)

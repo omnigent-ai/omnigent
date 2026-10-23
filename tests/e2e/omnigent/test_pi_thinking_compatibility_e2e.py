@@ -27,6 +27,7 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests
         ("claude-opus-5-5", "none", "adaptive"),
         ("claude-sonnet-4-6", "high", "adaptive"),
         ("claude-haiku-4-5", "none", "disabled"),
+        ("claude-haiku-4-5", "high", "enabled"),
     ],
 )
 def test_pi_launch_sends_supported_thinking(
@@ -61,8 +62,10 @@ def test_pi_launch_sends_supported_thinking(
         {"OMNIGENT_CONFIG_HOME": str(config_home), "PI_OFFLINE": "1"},
         {key: value for key, value in os.environ.items() if key in {"PATH", "LANG", "LC_ALL"}},
     )
-    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "user-pi"))
     if transport == "native":
+        monkeypatch.setattr(
+            "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "user-pi"
+        )
         with inference_config_scope(config):
             provider = resolve_pi_native_provider(model=model, config_loader=lambda: config)
         assert provider is not None
@@ -110,3 +113,6 @@ def test_pi_launch_sends_supported_thinking(
     assert requests[0]["thinking"]["type"] == thinking
     if thinking == "adaptive":
         assert requests[0]["output_config"]["effort"] == ("high" if effort == "high" else "low")
+    elif thinking == "enabled":
+        assert requests[0]["thinking"]["budget_tokens"] > 0
+        assert "output_config" not in requests[0]

@@ -375,7 +375,10 @@ Cross-harness journeys:
   `uv run --no-sync pytest tests/e2e/omnigent/test_pi_thinking_compatibility_e2e.py --reruns 0 -q`.
   Real SDK CLI and native provider-launch/print paths send requests to the shared
   mock provider: Opus 5.5 clamps off to adaptive/low, Sonnet honors high, and
-  Haiku retains off. Catalog and alias cases use `tests/test_pi_model_compatibility.py`.
+  Haiku retains off and uses budget-based thinking at high. Adaptive compatibility
+  is per model. Catalog, vendor prefixes and unchanged OpenAI-compatible entries
+  use `tests/test_pi_model_compatibility.py`; dated, region and `[1m]` variants
+  do not receive an unverified thinking fallback.
   This proves request serialization, not browser/TUI controls or live serving compatibility.
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,

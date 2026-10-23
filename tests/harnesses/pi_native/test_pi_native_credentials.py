@@ -963,7 +963,13 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
-    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
+    assert entry["models"] == [
+        {
+            "id": "databricks-claude-sonnet-4-6",
+            "reasoning": True,
+            "compat": {"forceAdaptiveThinking": True},
+        }
+    ]
 
 
 def test_to_models_config_attributes_unity_gateway_providers() -> None:

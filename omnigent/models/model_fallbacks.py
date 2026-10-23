@@ -33,6 +33,26 @@ PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
 )
 
 
+# Custom providers do not inherit Pi's built-in per-model compatibility flags.
+PI_ANTHROPIC_ADAPTIVE_THINKING = StaticModelFallback(
+    model_ids=(
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+    ),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog forceAdaptiveThinking entries",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
+
+
 #: Curated preference ORDER for codex's current arms — a ranking hint only
 #: (preferred first), consumed by the Databricks live-discovery ranker to
 #: sort servable ids. It never invents picker rows: ids absent from the live
