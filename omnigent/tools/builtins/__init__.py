@@ -30,6 +30,7 @@ from omnigent.tools.builtins.agents import (
     SysAgentGetTool,
     SysAgentListTool,
 )
+from omnigent.tools.builtins.ask_user import SysAskUserTool
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -85,6 +86,7 @@ __all__ = [
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
+    "SysAskUserTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysListModelsTool",
@@ -270,6 +272,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_fetch": None,
     "list_comments": None,
     "update_comment": None,
+    "sys_ask_user": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved

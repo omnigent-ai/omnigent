@@ -1,3 +1,4 @@
+import type { AsyncUserInput } from "./asyncQuestions";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Block walker — converts a flat `AnyBlock[]` into a list of bubble
 // groups for the JSX layer to map over.
@@ -71,6 +72,7 @@ export interface RelatedRenderError extends RenderErrorDetails {
 export type RenderItem =
   | {
       kind: "text";
+      asyncUserInput?: AsyncUserInput;
       itemId: string | null;
       text: string;
       final: boolean;
@@ -613,7 +615,10 @@ function isStandaloneSentinelBlock(b: AnyBlock): boolean {
  * were the agent's own step, hiding what the user said.
  */
 function isUserInputElicitationBlock(b: AnyBlock): boolean {
-  return b.type === "elicitation" && isUserInputElicitation(b);
+  return (
+    (b.type === "text_done" && b.asyncUserInput !== undefined) ||
+    (b.type === "elicitation" && isUserInputElicitation(b))
+  );
 }
 
 /** Whether a later assistant bubble continues the turn started at `from`. */
@@ -1737,6 +1742,7 @@ function textItem(run: AnyBlock[]): RenderItem {
         kind: "text",
         itemId: b.ctx.itemId,
         text: b.fullText,
+        ...(b.asyncUserInput ? { asyncUserInput: b.asyncUserInput } : {}),
         final: true,
         ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
       };

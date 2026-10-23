@@ -134,6 +134,7 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   the model/effort pill, the configuration gear, and slash commands.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
+- [Structured questions](./async-questions.md) covers Codex and compatible ACP choices, Claude hook replies, custom answers, scoped replies, reload, retry, and composer preservation.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
   approvals, resume, and terminal behavior, with native disconnect test boundaries.

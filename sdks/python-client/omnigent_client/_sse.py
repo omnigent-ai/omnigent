@@ -363,6 +363,7 @@ def _parse_output_item(data: dict[str, Any]) -> StreamEvent | None:
         content = item.get("content", [])
         return MessageDone(
             content=content if isinstance(content, list) else [],
+            async_user_input=item.get("async_user_input"),
         )
 
     if item_type == "reasoning":

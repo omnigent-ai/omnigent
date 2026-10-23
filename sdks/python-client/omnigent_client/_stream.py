@@ -542,6 +542,7 @@ class BlockStream:
                         full_text=full_text,
                         has_code_blocks="```" in full_text,
                         ctx=_ctx(),
+                        async_user_input=event.async_user_input,
                     )
                     in_text = False
                     full_text = ""
@@ -556,6 +557,7 @@ class BlockStream:
                             full_text=text,
                             has_code_blocks="```" in text,
                             ctx=_ctx(),
+                            async_user_input=event.async_user_input,
                         )
 
             # ── Reasoning done ───────────────────────

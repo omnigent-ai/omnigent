@@ -1,3 +1,4 @@
+import { readAsyncUserInput } from "./asyncQuestions";
 import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_sse.py.
 //
@@ -1245,6 +1246,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     const content = rec.content;
     return {
       type: "message_done",
+      asyncUserInput: readAsyncUserInput(rec.async_user_input),
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,

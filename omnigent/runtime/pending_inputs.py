@@ -114,6 +114,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities.conversation import AsyncQuestionReply
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native.input_diagnostics import input_attributes, log_input_event
 
@@ -234,6 +235,7 @@ class DrainedInput:
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    async_question_reply: AsyncQuestionReply | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
     # Reconstructed entries without original delivery metadata must remain unknown.
@@ -307,6 +309,7 @@ class _Entry:
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    async_question_reply: AsyncQuestionReply | None = None
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
@@ -370,6 +373,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    async_question_reply: AsyncQuestionReply | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -415,6 +419,7 @@ def record(
             content=content,
             created_by=created_by,
             stable_id=stable_id,
+            async_question_reply=async_question_reply,
             background_titles_enabled=background_titles_enabled,
         )
         entries = _pending.setdefault(conversation_id, {})
@@ -756,6 +761,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        async_question_reply=drained.async_question_reply,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
@@ -969,6 +975,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
         stable_id=entry.stable_id,
+        async_question_reply=entry.async_question_reply,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,

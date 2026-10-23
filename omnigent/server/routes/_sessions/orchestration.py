@@ -44,6 +44,7 @@ from omnigent.entities import (
     TerminalCommandData,
 )
 from omnigent.entities.conversation import (
+    AsyncQuestionReply,
     FunctionCallData,
     FunctionCallOutputData,
     parse_item_data,
@@ -3108,8 +3109,15 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
-            # A text match preserves the sender recorded at POST time. FIFO
-            # settlement alone does not establish authorship of the mirror.
+            if drained.async_question_reply is not None:
+                item = item.model_copy(
+                    update={
+                        "data": item.data.model_copy(
+                            update={"async_question_reply": drained.async_question_reply}
+                        )
+                    }
+                )
+            # FIFO settlement does not establish authorship of the mirror.
             if (
                 drained.created_by is not None
                 and item.created_by is None
@@ -3301,6 +3309,19 @@ def _new_external_conversation_item(
                     uuid.NAMESPACE_URL,
                     f"omnigent-external-item:{session_id}:{source_id.strip()}",
                 ).hex
+            }
+        )
+    if isinstance(item.data, MessageData) and item.data.async_user_input is not None:
+        # Supply the reply id so HTTP clients need no browser crypto APIs.
+        stable_id = item.stable_id or uuid.uuid4().hex
+        reply_id = hashlib.sha256(
+            f"omnigent-async-question:{session_id}:{stable_id}".encode()
+        ).hexdigest()[:32]
+        prompt = item.data.async_user_input.model_copy(update={"reply_id": reply_id})
+        item = item.model_copy(
+            update={
+                "stable_id": stable_id,
+                "data": item.data.model_copy(update={"async_user_input": prompt}),
             }
         )
     return item
@@ -7714,17 +7735,34 @@ async def _forward_codex_side_chat_turn(
     child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
     if not parent_id or not child_thread_id:
         return None
-    resp = await runner_client.post(
-        f"/v1/sessions/{url_component(parent_id)}/events",
-        json={
-            "type": "message",
-            "content": body.data.get("content"),
-            "codex_side_thread_id": child_thread_id,
-        },
-    )
+    pending_id = None
+    if body.data.get("async_question_reply") is not None:
+        pending_id = pending_inputs.record(
+            conv.id,
+            body.data["content"],
+            stable_id=body.data.get("stable_id"),
+            async_question_reply=AsyncQuestionReply.model_validate(
+                body.data["async_question_reply"]
+            ),
+        )
+    try:
+        resp = await runner_client.post(
+            f"/v1/sessions/{url_component(parent_id)}/events",
+            json={
+                "type": "message",
+                "content": body.data.get("content"),
+                "codex_side_thread_id": child_thread_id,
+            },
+        )
+    except BaseException:
+        if pending_id is not None:
+            pending_inputs.resolve(conv.id, pending_id)
+        raise
     if resp.status_code >= 400:
+        if pending_id is not None:
+            pending_inputs.resolve(conv.id, pending_id)
         raise _codex_side_chat_runner_error(resp)
-    return _SessionEventDispatchResult(item_id=None, pending_id=None)
+    return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
 
 
 def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
@@ -7757,6 +7795,64 @@ def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
 
 
 async def _dispatch_session_event_to_runner_impl(
+    session_id: str,
+    conv: Conversation,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    runner_client: httpx.AsyncClient,
+    *,
+    agent_name: str | None,
+    file_store: FileStore | None,
+    artifact_store: ArtifactStore | None,
+    has_mcp_servers: bool = False,
+    created_by: str | None = None,
+    runner_router: RunnerRouter | None = None,
+    native_terminal_ready: bool = False,
+    host_store: HostStore | None = None,
+    host_registry: HostRegistry | None = None,
+    background_titles_enabled: bool = True,
+    agent_revision: str | None = None,
+    startup_input: StartupInputContext | None = None,
+) -> _SessionEventDispatchResult:
+    """Keep async answers idempotent without changing other message dispatch."""
+    from omnigent.server.routes._async_questions import prepare_question_reply, question_reply_lock
+
+    async def dispatch(event: SessionEventInput) -> _SessionEventDispatchResult:
+        return await _dispatch_session_event_to_runner_unlocked(
+            session_id,
+            conv,
+            event,
+            conversation_store,
+            runner_client,
+            agent_name=agent_name,
+            file_store=file_store,
+            artifact_store=artifact_store,
+            has_mcp_servers=has_mcp_servers,
+            created_by=created_by,
+            runner_router=runner_router,
+            native_terminal_ready=native_terminal_ready,
+            host_store=host_store,
+            host_registry=host_registry,
+            background_titles_enabled=background_titles_enabled,
+            agent_revision=agent_revision,
+            startup_input=startup_input,
+        )
+
+    if body.type != "message" or body.data.get("async_question_reply") is None:
+        return await dispatch(body)
+    async with question_reply_lock(session_id):
+        body, existing_id = await asyncio.to_thread(
+            prepare_question_reply, session_id, body, conversation_store
+        )
+        if existing_id is not None:
+            return _SessionEventDispatchResult(item_id=existing_id, pending_id=None)
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, body.data["stable_id"])
+        if pending_id is not None:
+            return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+        return await dispatch(body)
+
+
+async def _dispatch_session_event_to_runner_unlocked(
     session_id: str,
     conv: Conversation,
     body: SessionEventInput,
@@ -7982,6 +8078,11 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                async_question_reply=(
+                    AsyncQuestionReply.model_validate(body.data["async_question_reply"])
+                    if body.data.get("async_question_reply") is not None
+                    else None
+                ),
             )
             if queues_message
             else None

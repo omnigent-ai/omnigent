@@ -90,3 +90,39 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "delivery,questions,preserved",
+    [
+        (
+            "async",
+            [{"title": "Pick", "options": ["One", "Two"]}, {"title": "Detail", "options": None}],
+            True,
+        ),
+        ("async", [{"title": " ", "options": ["One"]}], False),
+        ("async", [{"title": "Pick", "options": []}], False),
+        (None, [{"title": "Pick", "options": ["One"]}], False),
+    ],
+)
+async def test_async_questions_preserve_structured_metadata_and_original_text(
+    delivery: str | None, questions: list[dict[str, object]], preserved: bool
+) -> None:
+    client = _RecordingClient()
+    item = {
+        "type": "agentMessage",
+        "id": "call_question",
+        "text": "Original question text",
+        "delivery": delivery,
+        "questions": questions,
+    }
+    await fwd._post_agent_message(
+        client, "conv_x", {"threadId": "thread_x", "turnId": "turn_x"}, item
+    )
+    data = client.posts[0][1]["data"]["item_data"]
+    assert data["content"] == [{"type": "output_text", "text": "Original question text"}]
+    if preserved:
+        assert data["async_user_input"] == {"call_id": "call_question", "questions": questions}
+    else:
+        assert "async_user_input" not in data

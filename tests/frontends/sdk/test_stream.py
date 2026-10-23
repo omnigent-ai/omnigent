@@ -759,3 +759,29 @@ async def test_tool_call_distinct_call_ids_yield_separate_groups(
         f"by call_id — the second logical tool call would be "
         f"silently lost from the user's view."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_deltas", [False, True])
+async def test_async_question_metadata_survives_the_stream(
+    block_stream: BlockStream, with_deltas: bool
+) -> None:
+    from omnigent_client._async_questions import AsyncUserInput
+
+    prompt: AsyncUserInput = {
+        "call_id": "native_call",
+        "questions": [{"title": "Pick", "options": ["One", "Two"]}],
+    }
+    events = [TextDelta(delta="Original")] if with_deltas else []
+    session = FakeSession(
+        [
+            *events,
+            MessageDone(
+                content=[{"type": "output_text", "text": "Original"}], async_user_input=prompt
+            ),
+        ]
+    )
+    blocks = [block async for block in block_stream.stream(session, "test")]
+    done = next(block for block in blocks if isinstance(block, TextDone))
+    assert done.full_text == "Original"
+    assert done.async_user_input == prompt

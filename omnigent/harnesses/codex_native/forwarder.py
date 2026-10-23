@@ -16,9 +16,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
+from omnigent.entities.conversation import AsyncUserInput
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
@@ -6424,15 +6426,25 @@ async def _post_agent_message(
     text = item.get("text")
     if not isinstance(text, str) or not text:
         return False
+    item_data: _JsonObject = {
+        "role": "assistant",
+        "agent": _AGENT_NAME,
+        "content": [{"type": "output_text", "text": text}],
+    }
+    if item.get("delivery") == "async" and item.get("questions") is not None:
+        try:
+            questions = AsyncUserInput.model_validate(
+                {"call_id": item.get("id"), "questions": item["questions"]}
+            )
+        except ValidationError:
+            _logger.warning("Ignoring malformed Codex async questions; preserving message text")
+        else:
+            item_data["async_user_input"] = questions.model_dump()
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
+        item_data=item_data,
         response_id=_response_id(params),
         message_id=_completed_streaming_message_id(params, item, "agentMessage"),
         source_id=source_id or _source_id(params, item),

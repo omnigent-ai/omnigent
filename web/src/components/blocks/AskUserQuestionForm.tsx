@@ -2,7 +2,7 @@
 // isOther controls custom input; submit requires an answer to every question.
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useState } from "react";
+import { type ChangeEvent, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 
@@ -12,8 +12,17 @@ import type { ClaudeQuestion } from "@/lib/askUserQuestion";
  */
 export type AskUserQuestionAnswers = Record<string, string | string[]>;
 
+export interface AskUserQuestionDraft {
+  currentIndex: number;
+  selections: Record<string, string | string[]>;
+  customSelected: Record<string, boolean>;
+  customInputs: Record<string, string>;
+}
+
 interface AskUserQuestionFormProps {
   questions: ClaudeQuestion[];
+  initialDraft?: AskUserQuestionDraft;
+  onDraftChange?: (draft: AskUserQuestionDraft) => void;
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
 }
@@ -54,16 +63,25 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+export function AskUserQuestionForm({
+  questions,
+  onSubmit,
+  onReject,
+  initialDraft,
+  onDraftChange,
+}: AskUserQuestionFormProps) {
   // Currently-visible question (carousel index).
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(
+    Math.max(0, Math.min(initialDraft?.currentIndex ?? 0, questions.length - 1)),
+  );
 
   // Per-question option selection. Single-select stores a string;
   // multi-select stores a deduped array.
   const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
     const initial: Record<string, string | string[]> = {};
     for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect ? [] : "";
+      initial[questionKey(q)] =
+        initialDraft?.selections[questionKey(q)] ?? (q.multiSelect ? [] : "");
     }
     return initial;
   });
@@ -74,14 +92,20 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
   // the answer).
   const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
     const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = false;
+    for (const q of questions)
+      initial[questionKey(q)] = initialDraft?.customSelected[questionKey(q)] ?? false;
     return initial;
   });
   const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = "";
+    for (const q of questions)
+      initial[questionKey(q)] = initialDraft?.customInputs[questionKey(q)] ?? "";
     return initial;
   });
+
+  useEffect(() => {
+    onDraftChange?.({ currentIndex, selections, customSelected, customInputs });
+  }, [currentIndex, selections, customSelected, customInputs, onDraftChange]);
 
   const handleSingleSelect = (key: string, label: string) => {
     // Single-select mutex: clicking a real option clears the

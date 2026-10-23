@@ -1,3 +1,4 @@
+import type { AsyncUserInput, AsyncQuestionReply } from "./asyncQuestions";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -232,6 +233,7 @@ export interface ResponseStartBlock {
  * user input directly, not as a block).
  */
 export interface UserMessageBlock {
+  asyncQuestionReply?: AsyncQuestionReply;
   type: "user_message";
   ctx: BlockContext;
   /** Same shape as `MessageItem.content` from the items API. */
@@ -381,6 +383,7 @@ export interface TextChunk {
 
 /** Complete text from a text-streaming section. */
 export interface TextDone {
+  asyncUserInput?: AsyncUserInput;
   type: "text_done";
   ctx: BlockContext;
   fullText: string;

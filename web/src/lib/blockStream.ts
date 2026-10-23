@@ -706,13 +706,23 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // either empty or carries the previous turn's id, so isResponseSwitch
       // spuriously fires for an in-fact same-response message_done.
       const accumulatedFromDeltas = state.fullText;
+      const text = outputTextFromMessageContent(event.content);
+      const finishesAsyncText = !!event.asyncUserInput && text === accumulatedFromDeltas;
 
       // Close prior blocks under the OLD responseId before stamping the new one.
       yield* closeReasoning(state);
       if (hadOpenText) {
         // On a response switch, event.itemId belongs to the new message — don't
         // attach it to the old text block being closed.
-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
+        for (const block of closeText(state, isResponseSwitch ? null : event.itemId || null)) {
+          yield finishesAsyncText && block.type === "text_done"
+            ? {
+                ...block,
+                asyncUserInput: event.asyncUserInput,
+                ctx: { ...block.ctx, itemId: event.itemId },
+              }
+            : block;
+        }
       }
 
       // A message_done with a new id is a genuine turn transition (the
@@ -730,9 +740,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
 
       // Same-response: deltas already produced the text; skip event.content to
       // avoid duplication. Response-switch: emit event.content as the new body.
-      if (hadOpenText && !isResponseSwitch) return;
-
-      const text = outputTextFromMessageContent(event.content);
+      if (hadOpenText && !isResponseSwitch && (!event.asyncUserInput || finishesAsyncText)) return;
 
       // Race-safe dedup: even on a perceived response switch, if the deltas
       // that just closed accumulated EXACTLY the text in ``event.content``,
@@ -745,6 +753,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       if (text) {
         yield {
           type: "text_done",
+          ...(event.asyncUserInput ? { asyncUserInput: event.asyncUserInput } : {}),
           ctx: ctx(state, event.itemId || null),
           fullText: text,
           hasCodeBlocks: text.includes("```"),

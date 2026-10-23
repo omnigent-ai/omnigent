@@ -31,6 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from omnigent.entities.conversation import AsyncQuestionReply
 from omnigent.runtime import pending_inputs
 
 
@@ -61,7 +62,10 @@ def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(
     monkeypatch.setattr(
         pending_inputs, "time", SimpleNamespace(time=lambda: now, monotonic=lambda: now)
     )
-    first = pending_inputs.record("conv", [_text_block("private first")], stable_id="a" * 32)
+    reply = AsyncQuestionReply(source_item_id="question", answers={"call:0": "Choice"})
+    first = pending_inputs.record(
+        "conv", [_text_block("private first")], stable_id="a" * 32, async_question_reply=reply
+    )
     original = pending_inputs.delivery_attributes_for("conv", first)
     now = 101.0
     assert (
@@ -88,6 +92,7 @@ def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(
     assert "private first" not in repr(restored)
     redrained = pending_inputs.resolve("conv", first)
     assert redrained is not None and redrained.interrupted is interrupted
+    assert redrained.async_question_reply == reply
 
 
 def test_completed_lifecycle_classifies_a_later_skip_by_stable_id(

@@ -1,3 +1,4 @@
+import { readAsyncQuestionReply, type AsyncQuestionReply } from "@/lib/asyncQuestions";
 // Module-scope Zustand store for the active chat session.
 //
 // The streaming state lives outside the React tree so it survives
@@ -166,6 +167,7 @@ import type { ReplyQuote, StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
 export interface SendOptions {
+  asyncQuestionReply?: AsyncQuestionReply;
   /** Compact is a control event, not a user-message turn. */
   command?: "compact";
   /** Client-only quote provenance, retained if the composer needs to retry. */
@@ -2466,8 +2468,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     const pinnedState = pinnedId === null ? get() : setterForState(pinnedId);
-    const retryId = pinnedState?.pendingRetryStableId ?? null;
-    const restoredDraft = pinnedState?.restoredSendDraft ?? null;
+    const retryId = opts?.asyncQuestionReply ? null : (pinnedState?.pendingRetryStableId ?? null);
+    const restoredDraft = opts?.asyncQuestionReply
+      ? null
+      : (pinnedState?.restoredSendDraft ?? null);
     // Submitting consumes what the composer held, a restored failed send
     // included: drop its tracker too, or delivery evidence for that send could
     // later retract a NEW draft that merely repeats the same text.
@@ -2744,6 +2748,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             role: "user",
             content: serverContent,
             stable_id: stableId,
+            ...(opts?.asyncQuestionReply ? { async_question_reply: opts.asyncQuestionReply } : {}),
           },
         },
         { holdWhenHostOffline: true },
@@ -2754,6 +2759,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // bubble. Settle local state from the POST response instead of
       // depending on the live stream being connected.
       if (postResult.denied) {
+        opts?.onError?.("The reply was rejected by the input policy.");
         // Target the session this send posted to: the user may have navigated
         // away while the POST was open, and settling the VISIBLE conversation
         // would clobber an unrelated chat's composer state.
@@ -7376,9 +7382,11 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  asyncQuestionReply?: AsyncQuestionReply,
 ): UserMessageBlock {
   return {
     type: "user_message",
+    ...(asyncQuestionReply ? { asyncQuestionReply } : {}),
     ctx: {
       agent: null,
       depth: 0,
@@ -8299,6 +8307,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  readAsyncQuestionReply(event.data.async_question_reply),
                 ),
               ],
             };
@@ -8335,6 +8344,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
+                readAsyncQuestionReply(event.data.async_question_reply),
               ),
             ],
           };
@@ -8346,7 +8356,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              readAsyncQuestionReply(event.data.async_question_reply),
+            ),
           ],
         };
       });

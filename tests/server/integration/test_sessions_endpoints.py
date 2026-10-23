@@ -723,7 +723,19 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
-async def test_native_message_repeat_with_same_stable_id_forwards_once(
+@pytest.mark.parametrize(
+    "question_mode,native",
+    [
+        ("plain", True),
+        ("answered", True),
+        ("cancelled", True),
+        ("answered", False),
+        ("cancelled", False),
+    ],
+)
+async def test_message_repeat_with_same_stable_id_forwards_once(
+    question_mode: str,
+    native: bool,
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -767,19 +779,99 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             "omnigent.server.routes._sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
-        agent = await create_test_agent(client, name="claude-native-ui")
+        agent_name = (
+            ("claude-native-ui" if question_mode == "plain" else "codex-native-ui")
+            if native
+            else "Cline"
+        )
+        agent = await create_test_agent(
+            client,
+            name=agent_name,
+            executor=None if native else {"type": "omnigent", "config": {"harness": "acp:cline"}},
+        )
         created = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": agent["id"],
                 "labels": {
                     "omnigent.ui": "terminal",
-                    "omnigent.wrapper": "claude-code-native-ui",
-                },
+                    "omnigent.wrapper": "claude-code-native-ui"
+                    if question_mode == "plain"
+                    else agent_name,
+                }
+                if native
+                else {},
             },
         )
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
+        if question_mode != "plain":
+            source = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "response_id": "question_turn",
+                        "item_data": {
+                            "role": "assistant",
+                            "agent": agent_name,
+                            "content": [{"type": "output_text", "text": "Original question"}],
+                            "async_user_input": {
+                                "call_id": "call_question",
+                                "questions": [
+                                    {"title": "Which path?", "options": ["One", "Two"]},
+                                    {"title": "Which path?", "options": None},
+                                ],
+                            },
+                        },
+                    },
+                },
+            )
+            assert source.status_code == 202, source.text
+            source_id = source.json()["item_id"]
+            stored_questions = (await client.get(f"/v1/sessions/{session_id}/items")).json()[
+                "data"
+            ]
+            reply_id = next(item for item in stored_questions if item["id"] == source_id)[
+                "async_user_input"
+            ]["reply_id"]
+            reply = {
+                "source_item_id": source_id,
+                "answers": {}
+                if question_mode == "cancelled"
+                else {"call_question:0": "Two", "call_question:1": "Custom"},
+                "cancelled": question_mode == "cancelled",
+            }
+            message["data"]["async_question_reply"] = reply
+            for invalid_reply in [
+                {**reply, "source_item_id": "source-from-another-chat"},
+                {**reply, "cancelled": False, "answers": {"call_question:0": "One"}},
+                {
+                    **reply,
+                    "cancelled": False,
+                    "answers": {"call_question:0": " ", "call_question:1": "Custom"},
+                },
+                {**reply, "cancelled": True, "answers": {"call_question:0": "One"}},
+                {**reply, "cancelled": "yes"},
+            ]:
+                invalid = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={
+                        **message,
+                        "data": {**message["data"], "async_question_reply": invalid_reply},
+                    },
+                )
+                expected = 404 if invalid_reply["source_item_id"] != source_id else 400
+                assert invalid.status_code == expected, invalid.text
+            assert not pending_inputs.snapshot_for(session_id)
+            other = await _create_session(client, agent["id"])
+            foreign = await client.post(f"/v1/sessions/{other['id']}/events", json=message)
+            assert foreign.status_code == 400, foreign.text
+            assert (
+                foreign.json()["error"]["message"] == "The question does not belong to this chat"
+            )
+            assert not pending_inputs.snapshot_for(other["id"])
         try:
 
             def message_forwards() -> int:
@@ -792,15 +884,60 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             forwarded_body = json.loads(
                 next(r for r in forwarded if r.url.path.endswith("/events")).content
             )
-            assert forwarded_body["stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+            if question_mode == "plain":
+                assert forwarded_body["stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+            else:
+                assert forwarded_body["stable_id"] == reply_id
+                assert forwarded_body["content"][0]["text"] != "set up the worktree"
 
             second = await client.post(f"/v1/sessions/{session_id}/events", json=message)
             assert second.status_code == 202, second.text
             # Same queued entry, no second message forward (the idempotent
             # terminal ensure may still probe), still exactly one queued message.
-            assert second.json()["pending_id"] == first.json()["pending_id"]
+            identity_key = "pending_id" if native else "item_id"
+            assert second.json()[identity_key] == first.json()[identity_key]
             assert message_forwards() == 1
-            assert len(pending_inputs.snapshot_for(session_id)) == 1
+            assert len(pending_inputs.snapshot_for(session_id)) == (1 if native else 0)
+            if question_mode != "plain":
+                if native:
+                    mirror = await client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "external_conversation_item",
+                            "data": {
+                                "source_id": "native-answer-source",
+                                "response_id": "answer_turn",
+                                "item_type": "message",
+                                "item_data": {
+                                    "role": "user",
+                                    "content": forwarded_body["content"],
+                                },
+                            },
+                        },
+                    )
+                    assert mirror.status_code == 202, mirror.text
+                    answer_id = mirror.json()["item_id"]
+                else:
+                    answer_id = first.json()["item_id"]
+                items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+                assert (
+                    next(item for item in items if item["id"] == answer_id)["async_question_reply"]
+                    == reply
+                )
+                assert pending_inputs.snapshot_for(session_id) == []
+                third = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                assert third.status_code == 202, third.text
+                assert third.json()["item_id"] == answer_id
+                assert message_forwards() == 1
+                # A second choice never creates another user message.
+                message["data"]["async_question_reply"] = {
+                    **reply,
+                    "cancelled": False,
+                    "answers": {"call_question:0": "One", "call_question:1": "Different"},
+                }
+                conflict = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                assert conflict.status_code == 409, conflict.text
+                assert message_forwards() == 1
         finally:
             for pending in pending_inputs.snapshot_for(session_id):
                 pending_inputs.resolve(session_id, pending["pending_id"])

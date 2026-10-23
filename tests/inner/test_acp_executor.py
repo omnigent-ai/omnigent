@@ -15,6 +15,7 @@ Two layers:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import sys
@@ -1931,13 +1932,21 @@ async def test_mcp_relay_starts_and_builds_serve_mcp_entry() -> None:
     """A real relay boots (writes bridge.json + tool_relay.json + HTTP server)
     and yields one ACP stdio server pointing at the shared serve-mcp."""
     m = OmnigentAcpMcp("t")
+    from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas
+    from omnigent.spec.types import AgentSpec
+
+    ask_user = next(
+        s
+        for s in build_native_relay_tool_schemas(AgentSpec(spec_version=1))
+        if s["name"] == "sys_ask_user"
+    )
 
     async def fake_exec(name: str, args: dict) -> dict:
         return {"ok": True}
 
     loop = asyncio.get_event_loop()
     servers = m.session_new_servers(
-        tools=[{"name": "sys_agent_list", "parameters": {"type": "object", "properties": {}}}],
+        tools=[ask_user],
         tool_executor=fake_exec,
         loop=loop,
     )
@@ -1948,6 +1957,10 @@ async def test_mcp_relay_starts_and_builds_serve_mcp_entry() -> None:
         assert "serve-mcp" in entry["args"]
         assert "omnigent.harnesses.claude_native.bridge" in entry["args"]
         assert all("name" in e and "value" in e for e in entry["env"])
+        assert m._bridge_dir is not None
+        relay = json.loads((m._bridge_dir / "tool_relay.json").read_text())
+        assert relay["tools"][0]["name"] == "sys_ask_user"
+        assert relay["tools"][0]["parameters"] == ask_user["parameters"]
         # Idempotent: a second call returns the cached relay, not a new one.
         assert m.session_new_servers(tools=[], tool_executor=fake_exec, loop=loop) is servers
     finally:

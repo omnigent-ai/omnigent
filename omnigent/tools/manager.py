@@ -26,6 +26,7 @@ from omnigent.tools.builtins import (
     SysAgentDownloadTool,
     SysAgentGetTool,
     SysAgentListTool,
+    SysAskUserTool,
     SysCallAsyncTool,
     SysCancelAsyncTool,
     SysListModelsTool,
@@ -501,6 +502,7 @@ class ToolManager:
     def _register_session_tools(self) -> None:
         """Register framework-owned tools for the current session."""
         self._tools[SysSessionRenameTool.name()] = SysSessionRenameTool()
+        self._tools[SysAskUserTool.name()] = SysAskUserTool()
 
     def _register_agent_mgmt_tools(self) -> None:
         """

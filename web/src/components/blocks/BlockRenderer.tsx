@@ -1,3 +1,4 @@
+import { AsyncQuestionCard } from "./AsyncQuestionCard";
 // Dispatch from a `RenderItem` to the right component. Pure switch on
 // `item.kind`. Compaction renders as a standalone `Bubble` in
 // `ChatPage`, not as an inline render item — no case for it here.
@@ -748,11 +749,18 @@ function renderItem(
           className={cn("min-w-0", followsText && "mt-2")}
         >
           <FilePathAwareMessageResponse
-            className="chat-markdown"
+            className={cn("chat-markdown", item.asyncUserInput && "h-auto")}
             mode={isTextStreaming ? "streaming" : "static"}
           >
             {item.text}
           </FilePathAwareMessageResponse>
+          {item.asyncUserInput && item.itemId && (
+            <AsyncQuestionCard
+              key={item.itemId}
+              itemId={item.itemId}
+              prompt={item.asyncUserInput}
+            />
+          )}
           {item.previewInterrupted && item.itemId?.startsWith("live:") && (
             <div
               role="status"

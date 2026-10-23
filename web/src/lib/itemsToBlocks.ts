@@ -1,3 +1,4 @@
+import { readAsyncUserInput, readAsyncQuestionReply } from "./asyncQuestions";
 // Translate persisted `ConversationItem`s into a flat `AnyBlock[]` —
 // the same shape the live `BlockStream` reducer produces during
 // streaming. The store holds a single block list regardless of source
@@ -332,6 +333,7 @@ function isCompactionSummaryMessage(item: MessageItem): boolean {
 function userMessageToBlock(item: MessageItem): UserMessageBlock {
   return {
     type: "user_message",
+    asyncQuestionReply: readAsyncQuestionReply(item.async_question_reply),
     ctx: ctxFor(item),
     // Forward the full content array verbatim so the renderer can
     // pluck text, images, and files without the translator imposing
@@ -356,6 +358,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     .join("");
   return {
     type: "text_done",
+    asyncUserInput: readAsyncUserInput(item.async_user_input),
     ctx: ctxFor(item),
     fullText: text,
     hasCodeBlocks: text.includes("```"),

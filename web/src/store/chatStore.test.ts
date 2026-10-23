@@ -3318,6 +3318,61 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.status).toBe("idle");
   });
 
+  it.each([true, false])(
+    "keeps ordinary composer and restored drafts on async reply success=%s",
+    async (ok) => {
+      const sessionId = "conv_existing";
+      const draft = { conversationId: sessionId, text: "Unsent ordinary draft", files: [] };
+      const restored = { ...draft, stableId: "ordinary_retry", delivered: false };
+      useChatStore.setState({
+        conversationId: sessionId,
+        abortController: new AbortController(),
+        sessionHarness: "codex-native",
+        status: "idle",
+        sessionStatus: "running",
+        blocks: [],
+        pendingUserMessages: [],
+        failedSendDraft: draft,
+        restoredSendDraft: restored,
+        pendingRetryStableId: restored.stableId,
+      });
+      setSessionDraft(sessionId, draft);
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith(`/v1/sessions/${sessionId}/events`)) {
+          return ok
+            ? mockResponse({ queued: true, pending_id: "question_pending" })
+            : mockResponse(
+                { error: { code: "internal_error", message: "Reply failed" } },
+                { ok: false, status: 500 },
+              );
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const onError = vi.fn();
+      await useChatStore.getState().send("Card answer", "agent_xyz", [], {
+        pinnedConversationId: sessionId,
+        stableId: "a".repeat(32),
+        asyncQuestionReply: {
+          source_item_id: "source",
+          answers: { "call:0": "Answer" },
+          cancelled: false,
+        },
+        onError,
+      });
+      expect(onError).toHaveBeenCalledTimes(ok ? 0 : 1);
+      expect(useChatStore.getState()).toMatchObject({
+        failedSendDraft: draft,
+        restoredSendDraft: restored,
+        pendingRetryStableId: restored.stableId,
+      });
+      expect(getSessionDraft(sessionId)).toEqual(draft);
+      const post = fetchMock.mock.calls.find(([input]) =>
+        String(input).endsWith(`/v1/sessions/${sessionId}/events`),
+      );
+      expect(JSON.parse(post![1]!.body as string).data.stable_id).toBe("a".repeat(32));
+    },
+  );
+
   it("settles optimistic pending state when an input policy denies the send", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",

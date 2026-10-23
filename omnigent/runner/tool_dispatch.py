@@ -48,8 +48,10 @@ if TYPE_CHECKING:
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
+from pydantic import ValidationError
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.entities.conversation import AsyncUserInput
 from omnigent.harness_aliases import (
     canonicalize_harness,
     is_native_harness,
@@ -68,6 +70,7 @@ from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_ima
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.tools.builtins.ask_user import SysAskUserTool
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -318,7 +321,7 @@ _SESSION_QUERY_TOOLS = frozenset(
     }
 )
 
-_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name(), SysAskUserTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
@@ -597,6 +600,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysAskUserTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -6520,6 +6524,75 @@ async def _fetch_peek_meta(
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
 
 
+async def _ask_user_via_rest(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    agent_name: str | None,
+    call_id: str | None,
+    response_id: str | None,
+) -> str:
+    """Persist questions before acknowledging; answers arrive on a later turn.
+
+    Direct dispatch can supply stable call/response IDs. MCP execution supplies
+    neither here; it uses a generated question ID and retained-operation retries.
+    """
+    if server_client is None or not conversation_id:
+        return json.dumps({"error": "sys_ask_user requires server access and a session id"})
+    if set(args) != {"questions"}:
+        return json.dumps({"error": "sys_ask_user accepts only 'questions'"})
+    question_call_id = call_id or uuid.uuid4().hex
+    try:
+        prompt = AsyncUserInput.model_validate({"call_id": question_call_id, **args})
+    except ValidationError as exc:
+        return json.dumps({"error": f"Invalid sys_ask_user questions: {exc}"})
+    identity = json.dumps([response_id, question_call_id])
+    source_id = f"sys_ask_user:{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
+    try:
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": agent_name or "agent",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "\n\n".join(q.title for q in prompt.questions),
+                            }
+                        ],
+                        "async_user_input": prompt.model_dump(exclude_none=True),
+                    },
+                    "response_id": response_id or source_id,
+                    "source_id": source_id,
+                },
+            },
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"sys_ask_user failed: {exc}"})
+    item_id = result.get("item_id") if isinstance(result, dict) else None
+    if not isinstance(item_id, str) or not item_id:
+        return json.dumps({"error": "sys_ask_user server did not acknowledge a question item"})
+    return json.dumps(
+        {
+            "status": "awaiting_user_input",
+            "item_id": item_id,
+            "call_id": question_call_id,
+            "message": (
+                "Questions posted. Answers will arrive in a later user message. "
+                "Continue independent work; wait for answers before dependent work."
+            ),
+        }
+    )
+
+
 async def execute_tool(
     *,
     tool_name: str,
@@ -6541,6 +6614,8 @@ async def execute_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    call_id: str | None = None,
+    response_id: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -6568,6 +6643,8 @@ async def execute_tool(
         caller knows it (the server's per-session override outranks the
         spec's declaration). Decides whether the native relay's
         unconditional ``sys_os_*`` counts toward the granted surface.
+    :param call_id: Trusted tool-call identity when known by the dispatcher.
+    :param response_id: Trusted originating response identity, when available.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -6690,6 +6767,15 @@ async def execute_tool(
                 publish_event=publish_event,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+            )
+        elif tool_name == SysAskUserTool.name():
+            output = await _ask_user_via_rest(
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                agent_name=agent_name or agent_id,
+                call_id=call_id,
+                response_id=response_id,
             )
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
@@ -6970,6 +7056,8 @@ async def dispatch_tool_locally(
         )
     output = await execute_tool(
         tool_name=tool_name,
+        call_id=call_id,
+        response_id=response_id,
         arguments=arguments,
         server_client=server_client,
         terminal_registry=terminal_registry,

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
@@ -281,6 +281,43 @@ class Conversation:
 # ── Conversation item data types ───────────────────────
 
 
+class AsyncUserInputQuestion(BaseModel):
+    """One asynchronous question, without a native question id."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    title: str = Field(min_length=1)
+    options: list[str] | None = Field(default=None, min_length=1)
+
+    @field_validator("title", "options")
+    @classmethod
+    def nonblank(cls, value: str | list[str] | None) -> str | list[str] | None:
+        """Reject blank questions and choices at the native boundary."""
+        values = value if isinstance(value, list) else [value]
+        if any(isinstance(entry, str) and not entry.strip() for entry in values):
+            raise ValueError("questions and options must not be blank")
+        return value
+
+
+class AsyncUserInput(BaseModel):
+    """Persisted native question data; the tool already acknowledged completion."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    call_id: str = Field(min_length=1)
+    reply_id: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{32}$", exclude_if=lambda v: v is None
+    )
+    questions: list[AsyncUserInputQuestion] = Field(min_length=1)
+
+
+class AsyncQuestionReply(BaseModel):
+    """A user message correlated with a persisted async question message."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_item_id: str = Field(min_length=1)
+    answers: dict[str, str] = Field(default_factory=dict)
+    cancelled: bool = False
+
+
 class StartupInputOptions(BaseModel):
     """Request options retained only while a startup input awaits delivery."""
 
@@ -324,6 +361,10 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    async_user_input: AsyncUserInput | None = Field(default=None, exclude_if=lambda v: v is None)
+    async_question_reply: AsyncQuestionReply | None = Field(
+        default=None, exclude_if=lambda v: v is None
+    )
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -346,6 +387,10 @@ class MessageData(BaseModel):
         """
         if self.role == "assistant" and self.agent is None:
             raise ValueError("assistant messages require 'agent'")
+        if self.async_user_input is not None and self.role != "assistant":
+            raise ValueError("only assistant messages can ask async questions")
+        if self.async_question_reply is not None and self.role != "user":
+            raise ValueError("only user messages can answer async questions")
         return self
 
 
