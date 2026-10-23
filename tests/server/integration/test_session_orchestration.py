@@ -19,6 +19,9 @@ from tests.server.integration.test_managed_startup_inputs import (
 from tests.server.integration.test_sessions_attribution import _bind_runner
 from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
 from tests.server.integration.test_sessions_permissions import _create_session_as
+from tests.server.integration.test_sessions_subagent_context import (
+    two_replica_stack as two_replica_stack,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -319,9 +322,10 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
 
 
+@pytest.mark.parametrize("child_manager", [False, True])
 @pytest.mark.parametrize("move_before_recheck", [False, True])
 async def test_same_host_creation_uses_current_source_and_stays_private(
-    auth_client, auth_app, peers, db_uri, monkeypatch, move_before_recheck
+    auth_client, auth_app, peers, db_uri, monkeypatch, move_before_recheck, child_manager
 ):
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from omnigent.server.routes.sessions import routes_core
@@ -335,6 +339,15 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
         auth_app.state.host_store.upsert_on_connect(host_id, host_id, owner)
     store = SqlAlchemyConversationStore(db_uri)
     store.set_host_id(source["id"], hosts[0], workspace="/original")
+    manager = source
+    if child_manager:
+        response = await auth_client.post(
+            "/v1/sessions",
+            json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+        )
+        assert response.status_code == 201, response.text
+        manager = response.json()
+        assert store.get_conversation(manager["id"]).host_id is None
     auth_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
     original_check = routes_core.require_orchestration_source
     checks = 0
@@ -364,7 +377,7 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
     response = await auth_client.post(
         "/v1/sessions/orchestrated",
-        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        headers={ORCHESTRATION_SOURCE_HEADER: manager["id"]},
         json={"agent_id": source["agent_id"], "host_id": hosts[2], "workspace": "/requested"},
     )
     assert response.status_code == 201, response.text
@@ -381,7 +394,7 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     assert [grant.user_id for grant in grants] == ["alice"]
 
 
-@pytest.mark.parametrize("shape", ["parent", "multipart"])
+@pytest.mark.parametrize("shape", ["parent", "multipart", "initial_items", "skill"])
 async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, peers, shape):
     from tests._helpers.session import post_session_bundle
 
@@ -394,6 +407,30 @@ async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, p
             json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
         )
         expected = "Orchestration creates independent sessions"
+    elif shape in ("initial_items", "skill"):
+        first = {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Unattributed task"}],
+            },
+        }
+        payload = (
+            {"initial_items": [first]}
+            if shape == "initial_items"
+            else {
+                "initial_input": {
+                    "type": "slash_command",
+                    "data": {"kind": "skill", "name": "work"},
+                }
+            }
+        )
+        response = await auth_client.post(
+            "/v1/sessions/orchestrated",
+            headers=headers,
+            json={"agent_id": source["agent_id"], "host_type": "managed", **payload},
+        )
+        expected = "Use initial_input" if shape == "initial_items" else "first task must be text"
     else:
         response = await post_session_bundle(
             auth_client.post, "/v1/sessions", b"unused", metadata={}, headers=headers
@@ -549,3 +586,206 @@ async def test_unsupported_route_never_uses_ordinary_creation(
         )
     )
     assert "unavailable on this server" in result["error"]
+
+
+@pytest.mark.parametrize("share_before_admission", [False, True])
+async def test_startup_queue_admission_and_replay(
+    auth_client, auth_app, peers, db_uri, monkeypatch, share_before_admission
+):
+    from omnigent.server.startup_inputs import STARTUP_LABEL
+
+    source, target, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(target["id"], {STARTUP_LABEL: "pending"})
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    startup = auth_app.state.startup_inputs
+    accepts = startup.accepts
+
+    async def check_startup(*args):
+        result = await accepts(*args)
+        assert result is True
+        if share_before_admission:
+            permissions.grant("bob", source["id"], LEVEL_READ)
+        return result
+
+    monkeypatch.setattr(startup, "accepts", check_startup)
+    result = await _send(auth_client, source, target)
+    pending = store.list_pending_inputs(target["id"])
+    assert not captured.get("posts")
+    if share_before_admission:
+        assert "Shared sessions cannot" in result["detail"]
+        assert pending == []
+    else:
+        assert result["queued"] is True
+        assert len(pending) == 1
+        permissions.grant("bob", source["id"], LEVEL_READ)
+        await startup._deliver(auth_app, target["id"], pending[0])
+        await startup._deliver(auth_app, target["id"], pending[0])
+        delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
+        assert len(delivered) == 1
+        assert f"[Message from session {source['id']}]" in json.dumps(delivered)
+        assert store.list_pending_inputs(target["id"]) == []
+        assert "Shared sessions cannot" in (await _send(auth_client, source, target))["detail"]
+
+
+@pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)
+@pytest.mark.parametrize("target_kind", ["root", "child", "side_chat"])
+@pytest.mark.parametrize("legacy_host", [False, True])
+async def test_peer_message_readdresses_across_replicas(
+    two_replica_stack, db_uri, monkeypatch, target_kind, legacy_host
+):
+    import httpx
+
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions.helpers import _get_runner_client_impl
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    stack = two_replica_stack
+    flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
+    for app in (stack.keyless_replica, stack.tunnel_replica):
+        app.state.feature_flags = flags
+    source = await _create_session_as(stack.keyless_client, "", "alice")
+    target = await _create_session_as(stack.tunnel_client, "", "alice")
+    source_headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
+    _bind_runner(db_uri, target["id"])
+    host_id = uuid4().hex
+    _register_online_host(stack.tunnel_replica, host_id, "alice")
+    stack.conv_store.set_host_id(target["id"], host_id, workspace="/worker")
+    captured = _stub_late_runner_bind(monkeypatch)
+    capture_client = sessions._get_runner_client
+
+    async def resolve_runner(session_id, router, **kwargs):
+        if router is stack.tunnel_replica.state.runner_router:
+            return await capture_client(session_id, router, **kwargs)
+        return await _get_runner_client_impl(session_id, router, **kwargs)
+
+    monkeypatch.setattr(sessions, "_get_runner_client", resolve_runner)
+    if target_kind == "child":
+        response = await stack.tunnel_client.post(
+            "/v1/sessions",
+            headers={"X-Forwarded-Email": "alice"},
+            json={"agent_id": target["agent_id"], "parent_session_id": target["id"]},
+        )
+        assert response.status_code == 201, response.text
+        target = response.json()
+    elif target_kind == "side_chat":
+        side = await _create_session_as(stack.tunnel_client, "", "alice")
+        _bind_runner(db_uri, side["id"])
+        stack.conv_store.set_labels(
+            side["id"], {"omnigent.side_chat": "1", "omnigent.side_chat.source_id": target["id"]}
+        )
+        target = side
+    captured.clear()
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "sender-host")
+    received = []
+    transports = [
+        httpx.ASGITransport(app=app) for app in (stack.keyless_replica, stack.tunnel_replica)
+    ]
+
+    async def ingress(request):
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        on_target = key is None if legacy_host else key == host_id
+        response = await transports[int(on_target)].handle_async_request(request)
+        await response.aread()
+        received.append((request.method, request.url.path, key, response.status_code))
+        return response
+
+    async with open_server_client(
+        "http://sharded",
+        headers=source_headers,
+        auth=_RunnerDatabricksAuth(lambda: "test-bearer", "http://sharded"),
+        transport=httpx.MockTransport(ingress),
+    ) as client:
+        result = await _send(client, source, target)
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "sender-host"
+    assert result.get("queued") is True, result
+    posts = [(key, status) for method, path, key, status in received if method == "POST"]
+    assert posts == (
+        [("sender-host", 400), (host_id, 400), (None, 202)]
+        if legacy_host
+        else [("sender-host", 400), (host_id, 202)]
+    )
+    delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
+    assert len(delivered) == 1
+    assert f"[Message from session {source['id']}]" in json.dumps(delivered)
+
+
+@pytest.mark.parametrize("two_replica_stack", ["managed"], indirect=True)
+async def test_managed_create_is_addressed_before_provisioning(
+    two_replica_stack, db_uri, monkeypatch
+):
+    import asyncio
+
+    import httpx
+
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.server.routes.sessions import routes_core
+
+    stack = two_replica_stack
+    flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
+    for app in (stack.keyless_replica, stack.tunnel_replica):
+        app.state.feature_flags = flags
+    source = await _create_session_as(stack.keyless_client, "", "alice")
+    headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "sender-host")
+    launched = asyncio.Event()
+    captured = {}
+
+    async def launch(**kwargs):
+        captured.update(kwargs)
+        launched.set()
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
+    transports = [
+        httpx.ASGITransport(app=app) for app in (stack.keyless_replica, stack.tunnel_replica)
+    ]
+    reserved = []
+
+    async def ingress(request):
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        if request.method == "POST":
+            body = json.loads(request.content)
+            assert key == body["host_id"] and key != "sender-host"
+            reserved.append(key)
+        response = await transports[int(key != "sender-host")].handle_async_request(request)
+        await response.aread()
+        return response
+
+    async with open_server_client(
+        "http://sharded",
+        headers=headers,
+        auth=_RunnerDatabricksAuth(lambda: "test-bearer", "http://sharded"),
+        transport=httpx.MockTransport(ingress),
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": source["agent_id"],
+                        "placement": "managed",
+                        "message": "First task",
+                    }
+                ),
+                server_client=client,
+                conversation_id=source["id"],
+            )
+        )
+    assert "error" not in result, result
+    await asyncio.wait_for(launched.wait(), timeout=2)
+    assert reserved == [captured["host_id"]]
+    assert captured["host_registry"] is stack.tunnel_replica.state.host_registry
+    worker = stack.conv_store.get_conversation(result["conversation_id"])
+    assert worker.labels["omnigent.sandbox.requested_host_id"] == reserved[0]
+    pending = stack.conv_store.list_pending_inputs(worker.id)
+    assert len(pending) == 1
+    assert (
+        pending[0].data.content[0]["text"] == f"[Message from session {source['id']}]\nFirst task"
+    )
+    await stack.tunnel_replica.state.startup_inputs.shutdown()

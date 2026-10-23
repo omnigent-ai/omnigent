@@ -46,7 +46,7 @@ from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
-from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.routing import RunnerRouter, routing_host_id, routing_host_session
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
     pending_elicitations,
@@ -999,8 +999,32 @@ def register_core_routes(
                 conversation_store,
                 permission_store,
             )
+            if body.initial_items:
+                raise OmnigentError(
+                    "Use initial_input for the first task", code=ErrorCode.INVALID_INPUT
+                )
+            if body.initial_input is not None:
+                from omnigent.server.session_orchestration import orchestration_message
+
+                first = body.initial_input
+                content = first.data.get("content")
+                if (
+                    first.type != "message"
+                    or first.data.get("role") != "user"
+                    or not isinstance(content, list)
+                    or len(content) != 1
+                    or not isinstance(content[0], dict)
+                    or content[0].get("type") != "input_text"
+                ):
+                    raise OmnigentError(
+                        "The first task must be text", code=ErrorCode.INVALID_INPUT
+                    )
+                body.initial_input = orchestration_message(source.id, content[0].get("text"))
             if body.host_type == "external":
-                if not source.host_id or not source.workspace:
+                placement = await asyncio.to_thread(
+                    routing_host_session, source, conversation_store
+                )
+                if placement is None or not placement.host_id or not placement.workspace:
                     raise OmnigentError(
                         "Sender needs a connected host and workspace", code=ErrorCode.INVALID_INPUT
                     )
@@ -1008,8 +1032,8 @@ def register_core_routes(
                     body = type(body).model_validate(
                         {
                             **body.model_dump(exclude_unset=True),
-                            "host_id": source.host_id,
-                            "workspace": source.workspace,
+                            "host_id": placement.host_id,
+                            "workspace": placement.workspace,
                         }
                     )
                 except ValidationError as exc:

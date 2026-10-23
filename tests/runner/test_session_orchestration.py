@@ -29,6 +29,8 @@ async def test_create_placement(placement, monkeypatch):
     requests = []
 
     def handler(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"request_managed_sandbox_host_id": True})
         requests.append(request)
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
@@ -69,9 +71,8 @@ async def test_create_placement(placement, monkeypatch):
     if placement == "managed":
         assert "sandbox_provider" not in body
         assert body["host_type"] == "managed"
-        assert body["initial_input"]["data"]["content"][0]["text"] == (
-            "[Message from session manager]\nStart"
-        )
+        assert len(body["host_id"]) == 32
+        assert body["initial_input"]["data"]["content"][0]["text"] == "Start"
         assert "initial_items" not in body
     elif placement == "child":
         assert body["initial_items"][0]["data"]["content"][0]["text"] == "Start"
@@ -88,6 +89,8 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
     requests = []
 
     def unsupported(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={})
         requests.append(request)
         return httpx.Response(status, json={"detail": "Unsupported route"})
 
@@ -108,11 +111,16 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeout", "non_json"])
-async def test_message_timeout_is_not_retried(failure):
+@pytest.mark.parametrize("after_routing", [False, True])
+async def test_message_timeout_is_not_retried(failure, after_routing):
     requests = []
 
     def timeout(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"host_id": "worker"})
         requests.append(request)
+        if after_routing and len(requests) == 1:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
         if failure == "non_json":
             return httpx.Response(202, text="Accepted")
         raise httpx.ReadTimeout("uncertain")
@@ -127,7 +135,7 @@ async def test_message_timeout_is_not_retried(failure):
             conversation_id="manager",
         )
     assert "do not automatically resend" in result
-    assert len(requests) == 1
+    assert len(requests) == (2 if after_routing else 1)
 
 
 @pytest.mark.asyncio
@@ -190,3 +198,43 @@ async def test_independent_initial_message_is_validated_before_creation(placemen
             )
         )
     assert "initial message of 1–8000 characters" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("supported", [False, True])
+async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeypatch, supported):
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "sender-host")
+    requests = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"request_managed_sandbox_host_id": supported})
+        requests.append((dict(request.headers), json.loads(request.content)))
+        if len(requests) == 1:
+            return httpx.Response(401)
+        return httpx.Response(201, json={"id": uuid4().hex})
+
+    async with open_server_client(
+        "http://sharded",
+        auth=_RunnerDatabricksAuth(lambda: "test-token", "http://sharded"),
+        transport=httpx.MockTransport(respond),
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "managed"}),
+                server_client=client,
+                conversation_id=uuid4().hex,
+            )
+        )
+        assert client.headers[OMNIGENT_SLICE_KEY_HEADER] == "sender-host"
+    assert "error" not in result, result
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    headers, body = requests[-1]
+    assert headers.get(OMNIGENT_SLICE_KEY_HEADER.lower()) == body.get("host_id")
+    assert ("host_id" in body) is supported

@@ -15,7 +15,8 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
 - `sharing`: sharing the sender blocks subsequent sends and independent creates.
-  Existing work continues. Making it private restores eligibility.
+  Accepted work, including tasks saved while a worker starts, continues. Making
+  the sender private restores eligibility.
 - `scheduled`: newly scheduled runs and their children cannot use the new sends
   or independent creates. Ordinary scheduling, child work and reads stay available.
   An owner can still message a long-lived private manager directly.
@@ -54,6 +55,9 @@ can supply their own provider through the existing launcher interface.
   authenticated routes, ownership stores, refusal matrix and managed request /
   durable startup contract with simulated provisioning. It covers default provider
   selection for OSS and embedding configurations, and an absent orchestration route.
+  Two ASGI replicas sharing a database verify host routing for root, child and
+  side-chat destinations with the production runner client/auth and a simulated
+  ingress. Queue tests check refusal before saving and replay after sharing.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager and repeat: the tool must report refusal and the
@@ -63,8 +67,9 @@ can supply their own provider through the existing launcher interface.
 
 ## Gotchas
 
-- Same host also means the same workspace; separate sessions do not isolate
-  filesystem edits. Managed creation provisions a new environment.
+- Same host also means the same workspace, inherited together from the host-bound
+  ancestor for child managers. Separate sessions do not isolate filesystem edits.
+  Managed creation reserves its routing host ID when supported by the server.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
 - A shared receiver can continue working but cannot message back while shared.
@@ -75,8 +80,12 @@ can supply their own provider through the existing launcher interface.
   this gate requires token-derived runner IDs and refuses other bindings.
 - Peer messages carry only task text and owner attribution. They do not forward
   per-event model/tool overrides or a caller-supplied delivery ID.
-- Already admitted work can finish after sharing changes. Unsharing does not
-  erase prior conversation content.
+- Admission is the final source check before delivery or saving a startup task.
+  Successfully queued tasks can finish after the sender is shared; replay retains
+  normal destination permissions and policy checks. The check and subsequent
+  dispatch/save are not one atomic transaction. Unsharing does not erase history.
+- Only an explicit wrong-replica refusal permits a bounded re-address. Timeouts,
+  other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
   survives deletion of the schedule. Sessions predating this marker may have no
   recoverable scheduling origin; their upgrade policy still needs a decision.

@@ -1102,23 +1102,9 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
-            message = body.data.get("message")
-            if not isinstance(message, str) or not message.strip() or len(message) > 8000:
-                raise OmnigentError(
-                    "Provide a message of 1–8000 characters", code=ErrorCode.INVALID_INPUT
-                )
-            body = SessionEventInput(
-                type="message",
-                data={
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": f"[Message from session {source.id}]\n{message}",
-                        }
-                    ],
-                },
-            )
+            from omnigent.server.session_orchestration import orchestration_message
+
+            body = orchestration_message(source.id, body.data.get("message"))
         if body.type == "message" and _is_native_terminal_session(conv):
             _logger.info(
                 "Native input received before runner initialization",
@@ -1350,7 +1336,16 @@ def register_events_routes(
             )
             and await startup.accepts(conv, request.app)
         ):
-            # Deferred authorization needs the identity even when attribution is hidden.
+            if peer_message:
+                await asyncio.to_thread(
+                    require_orchestration_source,
+                    request,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                    target_id=session_id,
+                )
+            # A saved task is accepted work; sharing later does not revoke it.
             saved = await startup.enqueue(
                 session_id, body, user_id=user_id, headers=request.headers, first=False
             )

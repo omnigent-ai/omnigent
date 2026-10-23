@@ -12,6 +12,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
+from omnigent.server.schemas import SessionStartupInput
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
@@ -89,3 +90,18 @@ def require_orchestration_source(
         if source.id == target.id:
             raise OmnigentError("Choose another session", code=ErrorCode.INVALID_INPUT)
     return source
+
+
+def orchestration_message(source_id: str, message: object) -> SessionStartupInput:
+    """Build a text-only task attributed to the verified source."""
+    if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+        raise OmnigentError("Provide a message of 1–8000 characters", code=ErrorCode.INVALID_INPUT)
+    return SessionStartupInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": f"[Message from session {source_id}]\n{message}"}
+            ],
+        },
+    )

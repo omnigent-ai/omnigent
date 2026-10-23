@@ -3535,9 +3535,7 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        f"[Message from session {conversation_id}]\n{message}"
-        if placement == "managed" and message is not None
-        else message,
+        message,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
@@ -3557,7 +3555,21 @@ async def _execute_session_create(
             body.pop("initial_items", None)
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
-        resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
+            info = await server_client.get("/v1/info")
+            info.raise_for_status()
+            host_id = (
+                uuid.uuid4().hex if info.json().get("request_managed_sandbox_host_id") else None
+            )
+            if host_id is not None:
+                body["host_id"] = host_id
+            resp = await post_on_host(
+                server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
+            )
+        else:
+            resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if placement != "child" and resp.status_code in (404, 405):
