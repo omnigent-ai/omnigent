@@ -51,10 +51,24 @@ switch for all terminal text retention or existing logging. See
 [Native harness diagnostics](harness-diagnostics.md) for the capture bounds,
 startup-failure fields, and app-server logging controls.
 
+A Claude startup wrapper can print a failure while its launched command exits
+zero. Before any identity-bound Claude hook has been observed for that launch,
+a final launcher Error panel can add `launcher_failure_kind`,
+`launcher_exit_evidence_source=terminal_final_error_panel`, and
+`launcher_reported_exit_status` to the exit records. The reported nonzero code
+comes from the panel; `terminal_exit_status` still records tmux's launched-command
+status. Exception panels add a failure kind without inventing an exit code.
+
+These fields contain allowlisted categories and numeric codes, without panel
+text, paths, or credentials. Earlier panels, output followed by a later TUI,
+unreadable hook evidence, and launches with any observed Claude hook do not
+provide launcher attribution.
+
 ## Verification
 
 ```sh
-uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_resource_registry.py
+uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_resource_registry.py \
+  tests/test_harness_diagnostics.py tests/runner/test_claude_lifecycle_telemetry.py --reruns 0
 ```
 
 Run `omnidev` and explicitly close a disposable terminal. Verify that
