@@ -504,10 +504,12 @@ plain `uv run pytest`, which starts a private server for the test.
   No browser test drives the card into the fork dialog.
 - **`fork`, whole session and resources:**
   `tests/e2e_ui/start_session/test_start_session.py::test_static_sandbox_repository_and_worktree_choices`
-  (own environment, `clone` variant) drives the header Clone dialog through
+  (own environment, `clone` and `fork` variants) drives the header Clone dialog
+  and the per-response Fork action through
   source-folder reuse, waking another static sandbox, per-repo branch choices,
   and a new static sandbox on mobile. The SPA and conversation-copy API are real;
-  controller, GitHub and runner-launch transport are mocked.
+  controller, GitHub and runner-launch transport are mocked. Seeded history is
+  copied in full for Clone and truncated at the selected response for Fork.
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
   The dialog's permission-mode picker for native targets has component

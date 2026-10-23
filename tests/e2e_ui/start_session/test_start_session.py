@@ -3747,13 +3747,26 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
         _run_in_fresh_loop(drive(base_url, seeded["session_id"]))
 
 
-@pytest.mark.parametrize("journey", ["create", "clone"])
+@pytest.mark.parametrize("journey", ["create", "clone", "fork"])
 def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, journey):
     """Real SPA journeys; controller/create transport is stubbed and asserted."""
     import httpx
 
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from tests._helpers.live_server import isolated_local_server
     from tests._helpers.native_session import create_native_session
+
+    turns = [
+        (
+            "Inspect the API authentication flow.",
+            "The api and web checkouts are ready for investigation.",
+        ),
+        (
+            "Next, implement the fix on a separate branch.",
+            "Use a worktree to keep those edits separate.",
+        ),
+    ]
 
     async def drive(base_url, session_id):
         async with async_playwright() as pw:
@@ -3881,7 +3894,13 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, jou
                 async def clone_session(route):
                     forks.append(route.request.post_data_json)
                     # Copy real history; compute is supplied by the mocked controller transport.
-                    response = await route.fetch(post_data="{}")
+                    forwarded = {
+                        key: value
+                        for key, value in forks[-1].items()
+                        if key
+                        not in {"host_type", "sandbox_provider", "host_id", "sandbox_workspace"}
+                    }
+                    response = await route.fetch(post_data=json.dumps(forwarded))
                     assert response.status == 201
                     await route.fulfill(response=response)
 
@@ -3904,9 +3923,19 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, jou
                 )
                 for target in ("same", "paused", "new"):
                     await page.goto(f"{base_url}/c/{session_id}")
-                    await page.get_by_test_id("header-conversation-actions").click()
-                    await page.get_by_test_id("header-fork-conversation").click()
+                    if journey == "fork":
+                        first_reply = page.locator(
+                            '[data-testid="message-bubble"][data-role="assistant"]'
+                        ).first
+                        await first_reply.hover()
+                        await first_reply.get_by_test_id("fork-from-response").click()
+                    else:
+                        await page.get_by_test_id("header-conversation-actions").click()
+                        await page.get_by_test_id("header-fork-conversation").click()
                     dialog = page.get_by_test_id("fork-session-dialog")
+                    await expect(dialog.get_by_role("heading")).to_have_text(
+                        "Fork from this response" if journey == "fork" else "Clone session"
+                    )
                     await expect(
                         dialog.get_by_role("checkbox", name="Use source working folder")
                     ).to_be_checked()
@@ -3942,6 +3971,17 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, jou
                     await dialog.get_by_test_id("fork-session-submit").click()
                     await expect(dialog).not_to_be_visible()
                     await expect(page).not_to_have_url(re.compile(rf"/c/{session_id}$"))
+                    user_messages = page.locator(
+                        '[data-testid="message-bubble"][data-role="user"]'
+                    )
+                    await expect(user_messages.filter(has_text=turns[0][0])).to_be_visible()
+                    await expect(user_messages.filter(has_text=turns[1][0])).to_have_count(
+                        0 if journey == "fork" else 1
+                    )
+                    assert forks[-1].get("up_to_response_id") == (
+                        "resp_static_0" if journey == "fork" else None
+                    )
+                    await page.screenshot(path=str(tmp_path / f"history-{target}.png"))
                 assert (
                     launches[0]["workspace"] == "/work/api"
                     and "sandbox_workspace" not in launches[0]
@@ -3962,7 +4002,7 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, jou
                 assert forks[-1]["host_type"] == "managed"
 
             try:
-                if journey == "clone":
+                if journey in {"clone", "fork"}:
                     await drive_clones()
                     return
                 await page.goto(f"{base_url}/")
@@ -4042,4 +4082,27 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, jou
     with isolated_local_server(tmp_path / "server") as base_url:
         with httpx.Client() as client:
             seeded = create_native_session(client, base_url, harness="codex")
+        if journey != "create":
+            store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'server' / 'chat.db'}")
+            store.append(
+                seeded["session_id"],
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id=f"resp_static_{index}",
+                        data=MessageData(
+                            role=role,
+                            content=[
+                                {
+                                    "type": "input_text" if role == "user" else "output_text",
+                                    "text": text,
+                                }
+                            ],
+                            agent="codex" if role == "assistant" else None,
+                        ),
+                    )
+                    for index, turn in enumerate(turns)
+                    for role, text in zip(("user", "assistant"), turn, strict=True)
+                ],
+            )
         _run_in_fresh_loop(drive(base_url, seeded["session_id"]))
