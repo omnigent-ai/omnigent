@@ -507,12 +507,21 @@ def build_native_controls(
                 timeout=ready_deadline - asyncio.get_running_loop().time(),
             )
         except TimeoutError:
+            # A cold relaunch can outlast the budget. The next web turn applies the
+            # persisted selection, so report it unconfirmed instead of refusing it.
             _logger.warning(
-                "Codex-native runtime was not ready for settings update for session=%s",
+                "Codex-native runtime was not ready for settings update for session=%s; "
+                "the next turn applies it",
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            state = None
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": "codex_native_settings_update_timeout",
+                    "detail": "Codex was still starting; the next turn applies the settings.",
+                },
+            ), settings
         if state is None:
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
