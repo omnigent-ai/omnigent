@@ -310,6 +310,8 @@ _DIALOG_FOOTER_RE = re.compile(
     r"enter to (confirm|continue)|press enter to continue|esc to (cancel|exit|reject)",
     re.IGNORECASE,
 )
+# The selected row of a numbered option list, e.g. "❯ 1. Yes".
+_NUMBERED_SELECTOR_ROW_RE = re.compile(r"❯\s*\d+\.")
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
@@ -5003,10 +5005,7 @@ def _permission_mode_from_pane(pane: str) -> str | None:
         pane is mid-repaint, or the mode is one with no footer).
     """
     lines = [line for line in pane.splitlines() if line.strip()]
-    # Below the last box rule is the footer region. With no rule the input box
-    # isn't mounted; fall back to the tail so a footer still reads during boot.
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    region = _rows_below_last_rule(lines, _PROMPT_SCAN_TAIL_LINES)
     for line in reversed(region):
         for mode, footer in _PERMISSION_MODE_FOOTERS.items():
             if footer in line:
@@ -6126,23 +6125,96 @@ def _composer_row(pane: str) -> str | None:
     terminal), the lowest rule is the opening one and the row under it is
     the composer.
 
+    Wrapped rules are read as bands (:func:`_rule_bands`). The box is first
+    searched upward from the closing band
+    (:func:`_composer_row_above_closing_rule`): when its title wraps the
+    frame, the band above may be an earlier rule in the transcript. A
+    dialog's footer below the frame overrides all of this
+    (:func:`_is_dialog_option_row`).
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
-    if not rules:
+    bands = _rule_bands(non_empty)
+    if not bands:
         return None
-    candidates = [rules[-2] + 1] if len(rules) >= 2 else []
-    candidates.append(rules[-1] + 1)
-    for idx in candidates:
-        if idx >= len(non_empty):
-            continue
-        row = non_empty[idx]
-        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return row
-    return None
+    row = _composer_row_above_closing_rule(non_empty, bands[-1])
+    if row is None and len(bands) >= 2:
+        row = _composer_glyph_row(non_empty, bands[-2][1] + 1)
+    row = row or _composer_glyph_row(non_empty, bands[-1][1] + 1)
+    if row is None or _is_dialog_option_row(row, non_empty):
+        return None
+    return row
+
+
+def _composer_glyph_row(lines: list[str], idx: int) -> str | None:
+    """Return ``lines[idx]`` when it is led by a composer glyph, else ``None``."""
+    if idx >= len(lines):
+        return None
+    row = lines[idx]
+    return row if row.strip()[:1] in _COMPOSER_MODE_GLYPHS else None
+
+
+def _is_dialog_option_row(row: str, lines: list[str]) -> bool:
+    """
+    Return whether *row* is a dialog's selected option rather than the composer.
+
+    A numbered option over a dialog footer is a menu whatever rule sits above
+    it, e.g. ``"❯ 2. No (recommended)"`` over "Enter to confirm · Esc to cancel".
+
+    :param row: The candidate composer row.
+    :param lines: Non-empty pane rows, in order.
+    :returns: ``True`` when the footer below the frame belongs to a dialog.
+    """
+    if not _NUMBERED_SELECTOR_ROW_RE.match(row.strip()):
+        return False
+    footer = _rows_below_last_rule(lines, _DIALOG_SCAN_TAIL_LINES)
+    return any(_DIALOG_FOOTER_RE.search(line) for line in footer)
+
+
+def _composer_row_above_closing_rule(
+    lines: list[str], closing_rule: tuple[int, int]
+) -> str | None:
+    """
+    Return the composer row when no row of the box's opening rule reads as one.
+
+    When the title overflows the pane the opening rule wraps: its trailing
+    glyph lands alone on a row, or after a bare slice of the title, so
+    :func:`_is_box_rule` finds nothing above ``❯``. The box is still
+    framed: its composer is the mode-glyph row above the closing rule, past
+    the draft's indented continuation rows, and the row above it ends in
+    the opening rule's glyph (:func:`_is_rule_tail`). A box wider than the
+    pane wraps its closing rule as well (:func:`_is_wrapped_rule`); the one
+    shape that keeps a single-row closing rule is a title that exactly fills
+    the opening rule, one space in (:func:`_is_edge_aligned_title_row`). An
+    echoed prompt under a transcript line that happens to end in a rule
+    glyph meets neither condition, and a dialog's selector and footer below
+    the rule (a rewind dialog under a wrapped divider) rule the box out.
+
+    :param lines: Non-empty pane rows, in order.
+    :param closing_rule: ``(first, last)`` row span of the closing rule.
+    :returns: The composer row, or ``None`` when the rows above the closing
+        rule are not framed that way.
+    """
+    first = closing_rule[0]
+    idx = first - 1
+    while idx > 0 and lines[idx].startswith("  "):
+        idx -= 1
+    if idx < 1 or lines[idx].strip()[:1] not in _COMPOSER_MODE_GLYPHS:
+        return None
+    above = lines[idx - 1]
+    if not _is_rule_tail(above):
+        return None
+    if not _is_wrapped_rule(lines, closing_rule) and not _is_edge_aligned_title_row(above):
+        return None
+    below = lines[closing_rule[1] + 1 :]
+    if any(_DIALOG_FOOTER_RE.search(line) for line in below) and any(
+        line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in below
+    ):
+        return None
+    return lines[idx]
 
 
 class _ComposerBox(NamedTuple):
@@ -6278,8 +6350,7 @@ def _history_search_footer_shown(pane: str) -> bool:
     :returns: ``True`` when a footer row names the history search.
     """
     lines = [line for line in pane.splitlines() if line.strip()]
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    region = _rows_below_last_rule(lines, _PROMPT_SCAN_TAIL_LINES)
     # A narrow pane wraps the footer's left cell across rows ("search" /
     # "prompts:"), interleaving the right cell's text, so no single row
     # carries the whole marker. Each row's left-cell fragment is the text
@@ -6317,7 +6388,9 @@ def _is_box_rule(line: str) -> bool:
     are otherwise the same shape. The length of the leading run cannot draw
     it: Claude Code right-aligns the label, so that run shrinks to a single
     glyph once the title nears the pane width, and the pane is only as wide
-    as the person's browser terminal.
+    as the person's browser terminal. A clipped title without a leading
+    run (``" a very long title… ─"``) is accepted only when it starts one
+    space in and its label ends in ``… ``.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
@@ -6330,12 +6403,118 @@ def _is_box_rule(line: str) -> bool:
         return True
     lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
-    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+    if trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
         return False
     label = stripped[lead : len(stripped) - trail]
     if any(ch in _BOX_RULE_CHARS for ch in label):
         return False
+    if lead < 1:
+        starts_at_edge = line.startswith(" ") and not line.startswith("  ")
+        return starts_at_edge and label.endswith("… ") and bool(label[:-2].strip())
     return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
+
+
+def _is_rule_tail(line: str) -> bool:
+    """
+    Return whether a row ends the way a wrapped labelled rule's last row does.
+
+    That row is the rule's trailing run of edge glyphs, alone or spaced off
+    from the tail of the title, with no other rule glyph on the row. Like the
+    rule it belongs to it starts at the pane edge or one space in; draft and
+    transcript rows are indented further.
+
+    :param line: A single pane line, e.g. ``"─"`` or ``"lease-freeze ─"``.
+    :returns: ``True`` when the row can close a wrapped labelled rule.
+    """
+    stripped = line.strip()
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    if trail < 1 or line.startswith("  "):
+        return False
+    label = stripped[:-trail]
+    if any(ch in _BOX_RULE_CHARS for ch in label):
+        return False
+    return not label or label.endswith(" ")
+
+
+def _is_edge_aligned_title_row(line: str) -> bool:
+    """
+    Return whether a row is a title filling the opening rule: one space in, then a glyph.
+
+    :param line: A single pane line, e.g. ``" a title as wide as the pane ─"``.
+    :returns: ``True`` for a labelled row whose only lead is the rule's edge.
+    """
+    if not line.startswith(" ") or line.startswith("  "):
+        return False
+    stripped = line.strip()
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    return trail >= 1 and bool(stripped[:-trail].strip())
+
+
+def _is_edge_glyph_run(line: str) -> bool:
+    """Return whether *line* is nothing but horizontal rule glyphs, however few."""
+    stripped = line.strip()
+    return bool(stripped) and all(ch in _TITLED_RULE_EDGE_GLYPHS for ch in stripped)
+
+
+def _rule_bands(lines: list[str]) -> list[tuple[int, int]]:
+    """
+    Return each box rule's row span as ``(first, last)`` indices into *lines*.
+
+    A rule wider than the pane wraps onto the rows below it, so consecutive
+    rule rows are one rule. The wrapped remainder can be shorter than
+    :func:`_is_box_rule` admits (a lone ``─`` under a full-width row), so a
+    bare run of edge glyphs continues the rule above it; on its own, or above
+    a rule, it is content.
+
+    :param lines: Non-empty pane rows, in order.
+    :returns: Rule spans, top to bottom.
+    """
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx, line in enumerate([*lines, ""]):
+        if _is_box_rule(line) or (start is not None and _is_edge_glyph_run(line)):
+            start = idx if start is None else start
+            continue
+        if start is not None:
+            bands.append((start, idx - 1))
+        start = None
+    return bands
+
+
+def _is_wrapped_rule(lines: list[str], band: tuple[int, int]) -> bool:
+    """
+    Return whether a rule band is one rule wrapped at the pane width.
+
+    A wrapped rule starts with a full-width row and continues with rows no
+    wider than it. Two separate rules on neighbouring rows, such as a short
+    divider over a dialog's frame, do not have that shape.
+
+    :param lines: Non-empty pane rows, in order.
+    :param band: ``(first, last)`` row span from :func:`_rule_bands`.
+    :returns: ``True`` when the band spans several rows of a single rule.
+    """
+    first, last = band
+    width = len(lines[first].strip())
+    return last > first and all(
+        len(lines[idx].strip()) <= width for idx in range(first + 1, last + 1)
+    )
+
+
+def _rows_below_last_rule(lines: list[str], tail_lines: int) -> list[str]:
+    """
+    Return the rows under the last box rule, where Claude Code's footer sits.
+
+    With no rule on screen the input box is not mounted, so the last
+    *tail_lines* rows stand in for the footer region. A wrapped closing
+    rule ends with the last row of its band (:func:`_rule_bands`), so a stub
+    shorter than a rule never leads the region.
+
+    :param lines: Non-empty pane rows, in order.
+    :param tail_lines: Rows to take from the bottom when no rule is drawn.
+    :returns: The footer region, top to bottom.
+    """
+    bands = _rule_bands(lines)
+    return lines[bands[-1][1] + 1 :] if bands else lines[-tail_lines:]
 
 
 def _submit_needle(content: str) -> str:
@@ -6459,8 +6638,7 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     if not pane.strip() or _composer_row(pane) is not None:
         return None
     lines = [line for line in pane.splitlines() if line.strip()]
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
+    region = _rows_below_last_rule(lines, _DIALOG_SCAN_TAIL_LINES)
     footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None
