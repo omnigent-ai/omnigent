@@ -1,7 +1,6 @@
-// Shift+Tab steps the permission chip in menu order; full-access modes stay menu-only.
+// Shift+Tab steps through every option in the permission chip's menu order.
 
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { knownPermissionModeConcept } from "@/lib/nativeHarnessModes";
 
 /** The key fields the cycle check reads from a React keyboard event. */
 export interface PermissionModeCycleKeyEvent {
@@ -25,21 +24,11 @@ export function isPermissionModeCycleKey(event: PermissionModeCycleKeyEvent): bo
   );
 }
 
-/** Whether Shift+Tab may select *mode*: unmapped and full-access modes are menu-only. */
-export function isCyclablePermissionMode(
-  harness: string | null | undefined,
-  mode: string,
-): boolean {
-  const concept = knownPermissionModeConcept(harness, mode);
-  return concept !== undefined && concept !== "full-access";
-}
-
 /**
- * Next cyclable option after *current* in menu order, wrapping; an unknown
+ * Next option after *current* in menu order, wrapping; an unknown
  * *current* starts from the top. Skips *unavailable*. Null when none is reachable.
  */
 export function nextCycledPermissionMode(
-  harness: string | null | undefined,
   options: readonly { value: string }[],
   current: string | null | undefined,
   unavailable: ReadonlySet<string> = new Set(),
@@ -48,7 +37,7 @@ export function nextCycledPermissionMode(
   for (let step = 1; step <= options.length; step += 1) {
     const candidate = options[(start + step) % options.length]!.value;
     if (candidate === current) continue;
-    if (unavailable.has(candidate) || !isCyclablePermissionMode(harness, candidate)) continue;
+    if (unavailable.has(candidate)) continue;
     return candidate;
   }
   return null;

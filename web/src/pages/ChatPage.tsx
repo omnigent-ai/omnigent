@@ -2223,17 +2223,6 @@ export function subAgentComposerLabel(
   return title ?? session.subAgentName ?? session.agentName ?? "sub-agent";
 }
 
-/** The in-session chip's options and the canonical harness id that classifies them. */
-function composerPermissionVocabulary(
-  claudeControl: boolean,
-  devinControl: boolean,
-): { harness: string; options: readonly { value: string; label: string }[] } {
-  if (!claudeControl)
-    return { harness: "codex-native", options: CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS };
-  if (devinControl) return { harness: "devin-native", options: DEVIN_NATIVE_PERMISSION_MODES };
-  return { harness: "claude-native", options: CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES };
-}
-
 /**
  * Sub-agent shelf tucked behind the workspace bar's rounded top.
  * Bottom padding keeps the label above the overlap; opaque surfaces prevent
@@ -2573,11 +2562,11 @@ function ComposerImpl(
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   const devinPermissionControl = modelPickerKind === "devin";
-  const permissionVocabulary = composerPermissionVocabulary(
-    showClaudePermissionMode,
-    devinPermissionControl,
-  );
-  const permissionOptions = permissionVocabulary.options;
+  const permissionOptions = showClaudePermissionMode
+    ? devinPermissionControl
+      ? DEVIN_NATIVE_PERMISSION_MODES
+      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
   const permissionLabel = showClaudePermissionMode
     ? devinPermissionControl
       ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
@@ -2630,11 +2619,7 @@ function ComposerImpl(
     permissionOptions.some((option) => option.value === mode);
   const nextFromSelected =
     permissionControlInteractive && !configBusy && isSwitchableMode(selectedPermissionMode)
-      ? nextCycledPermissionMode(
-          permissionVocabulary.harness,
-          permissionOptions,
-          selectedPermissionMode,
-        )
+      ? nextCycledPermissionMode(permissionOptions, selectedPermissionMode)
       : null;
   /** Shift+Tab: step to the next permission mode. Returns whether it took the key. */
   const cyclePermissionMode = (): boolean => {
@@ -2650,16 +2635,9 @@ function ComposerImpl(
     const resumed =
       resume === null
         ? null
-        : nextCycledPermissionMode(
-            permissionVocabulary.harness,
-            permissionOptions,
-            resume,
-            new Set([selected]),
-          );
+        : nextCycledPermissionMode(permissionOptions, resume, new Set([selected]));
     // With nothing else to move to, retry the failed mode.
-    const next =
-      resumed ??
-      nextCycledPermissionMode(permissionVocabulary.harness, permissionOptions, selected);
+    const next = resumed ?? nextCycledPermissionMode(permissionOptions, selected);
     if (next === null) return false;
     void changePermission(next).then((landed) => {
       if (!landed && useChatStore.getState().conversationId === sessionId)

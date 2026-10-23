@@ -3,15 +3,13 @@ import { describe, expect, it } from "vitest";
 import { canonicalNativeHarness, permissionModeConcept } from "./nativeHarnessModes";
 
 describe("permissionModeConcept", () => {
-  it("maps Claude, Codex, and Devin vocabularies onto shared concepts", () => {
+  it("maps Claude and Codex vocabularies onto shared concepts", () => {
     expect(permissionModeConcept("claude-native", "default")).toBe("manual");
     expect(permissionModeConcept("claude-native", "plan")).toBe("read-only");
     expect(permissionModeConcept("codex-native", "default")).toBe("automatic");
     expect(permissionModeConcept("codex-native", "read-only")).toBe("read-only");
     expect(permissionModeConcept("codex-native", "full-access")).toBe("full-access");
     expect(permissionModeConcept("codex-native", "bypass")).toBe("full-access");
-    expect(permissionModeConcept("devin-native", "accept-edits")).toBe("edit-automatic");
-    expect(permissionModeConcept("devin-native", "dangerous")).toBe("full-access");
   });
 
   it("supports native harness aliases", () => {

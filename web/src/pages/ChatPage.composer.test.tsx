@@ -2826,6 +2826,11 @@ describe("Composer permission-mode shortcut", () => {
   const pressShiftTab = (input: HTMLElement) =>
     fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
   const settled = () => waitFor(() => expect(chip()).toBeEnabled());
+  const cycleTo = async (label: string) => {
+    pressShiftTab(textarea());
+    await waitFor(() => expect(chip()).toHaveTextContent(label));
+    await settled();
+  };
 
   it("cycles a Claude session's mode with Shift+Tab and keeps the draft focused", async () => {
     const setMode = spyClaudeSetter();
@@ -2935,7 +2940,7 @@ describe("Composer permission-mode shortcut", () => {
     expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "plan", "default", "auto"]);
   });
 
-  it("does not cycle a Codex session into Full Access", async () => {
+  it("cycles through every Codex mode, including Full Access, and wraps", async () => {
     useChatStore.setState({
       conversationId: "cycle-codex",
       sessionHarness: "codex-native",
@@ -2948,12 +2953,17 @@ describe("Composer permission-mode shortcut", () => {
       });
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
 
-    pressShiftTab(textarea());
-    await waitFor(() => expect(chip()).toHaveTextContent("Ask for approval"));
-    expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual(["ask-for-approval"]);
+    await cycleTo("Full Access");
+    await cycleTo("Ask for approval");
+    await cycleTo("Approve for me");
+    expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual([
+      "full-access",
+      "ask-for-approval",
+      "approve-for-me",
+    ]);
   });
 
-  it("retries a failed mode when it is the only other safe one", async () => {
+  it("moves past a failed Codex mode to Full Access on the next press", async () => {
     useChatStore.setState({
       conversationId: "cycle-codex-retry",
       sessionHarness: "codex-native",
@@ -2972,11 +2982,8 @@ describe("Composer permission-mode shortcut", () => {
     await screen.findByText("Runner refused");
     await settled();
     expect(pressShiftTab(textarea())).toBe(false);
-    await waitFor(() => expect(chip()).toHaveTextContent("Approve for me"));
-    expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual([
-      "approve-for-me",
-      "approve-for-me",
-    ]);
+    await waitFor(() => expect(chip()).toHaveTextContent("Full Access"));
+    expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual(["approve-for-me", "full-access"]);
   });
 
   it.each([
@@ -3005,7 +3012,7 @@ describe("Composer permission-mode shortcut", () => {
     expect(setApproval).not.toHaveBeenCalled();
   });
 
-  it("does not cycle a Devin session into Dangerous", async () => {
+  it("cycles through every Devin mode, including Dangerous, and wraps", async () => {
     useChatStore.setState({
       conversationId: "cycle-devin",
       sessionHarness: "devin-native",
@@ -3016,8 +3023,16 @@ describe("Composer permission-mode shortcut", () => {
       <Composer {...composerProps({ showClaudePermissionMode: true, modelPickerKind: "devin" })} />,
     );
 
-    pressShiftTab(textarea());
-    await waitFor(() => expect(setMode).toHaveBeenCalledWith("normal"));
+    await cycleTo("Dangerous");
+    await cycleTo("Normal");
+    await cycleTo("Accept edits");
+    await cycleTo("Smart");
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual([
+      "dangerous",
+      "normal",
+      "accept-edits",
+      "smart",
+    ]);
   });
 
   it("leaves Shift+Tab to an open slash menu", () => {

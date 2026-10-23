@@ -40,12 +40,12 @@ and steers messages while the agent is busy.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
-  Codex, and Devin native sessions steps the chip in menu order, wrapping, never
-  onto full-access or unclassified modes, while the chip is clickable. States:
+  Codex, and Devin native sessions steps through every mode in the chip's menu,
+  including Full Access and Dangerous, wrapping while the chip is clickable. States:
   slash/mention menu acting on Tab, chip disabled, session in a mode the chip can't switch back to
   (Codex read-only, Claude Don't ask; menu only), change in flight, change
   refused or failed (next press moves past it, or retries it when it is the only
-  other safe mode), no other safe mode (native focus move, no
+  other mode), no other mode (native focus move, no
   `aria-keyshortcuts`).
 - `managed-mcp-picker`: choose administrator-configured services before launch
   on a host or sandbox. States: loading, empty, error/retry, selected, unavailable,
@@ -327,12 +327,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
 - **`permission-mode-hotkey`:** in session with a real Claude CLI,
   `tests/e2e_ui/chat/test_claude_native_permission_switch_from_dont_ask.py::test_shift_tab_cycles_permission_mode_from_composer`.
-  The E2E is nightly; Codex and Devin have component coverage only.
+  The E2E is nightly; Codex and Devin have component tests but no dedicated
+  shortcut E2E in the suite.
   Component tests cover the in-flight, refused, downgraded, next-lap, menu-reset,
-  two-mode retry, slash-menu, viewer, read-only
+  Codex/Devin full cycles, slash-menu, viewer, read-only
   and unreachable states in `web/src/pages/ChatPage.composer.test.tsx`, mention-menu
   priority in `web/src/pages/ChatPage.mention.test.tsx`; mode ordering and
-  classification are in
+  wraparound are in
   `web/src/lib/permissionModeCycle.test.ts`.
 - **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
   permission-mode picker has component coverage in

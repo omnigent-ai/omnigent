@@ -33,8 +33,6 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     "full-access": "full-access",
     "read-only": "read-only",
     bypass: "full-access",
-    "ask-for-approval": "automatic",
-    "approve-for-me": "automatic",
   },
   "cursor-native": {
     default: "manual",
@@ -47,12 +45,6 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     default: "manual",
     skip: "full-access",
   },
-  "devin-native": {
-    normal: "manual",
-    "accept-edits": "edit-automatic",
-    smart: "automatic",
-    dangerous: "full-access",
-  },
 };
 
 const NATIVE_HARNESS_ALIASES: Record<string, string> = {
@@ -63,21 +55,10 @@ const NATIVE_HARNESS_ALIASES: Record<string, string> = {
   "native-antigravity": "antigravity-native",
   "agy-native": "antigravity-native",
   "native-agy": "antigravity-native",
-  "native-devin": "devin-native",
 };
 
 export function canonicalNativeHarness(harness: string): string {
   return NATIVE_HARNESS_ALIASES[harness] ?? harness;
-}
-
-/** The mode's mapped concept, or `undefined` when the harness or mode is unmapped. */
-export function knownPermissionModeConcept(
-  harness: string | null | undefined,
-  value: string | null | undefined,
-): PermissionModeConcept | undefined {
-  if (!harness || !value) return undefined;
-  const concepts = PERMISSION_MODE_CONCEPTS[canonicalNativeHarness(harness)];
-  return concepts && Object.hasOwn(concepts, value) ? concepts[value] : undefined;
 }
 
 /** Shared permission concept for presentation across native harness vocabularies. */
@@ -85,7 +66,9 @@ export function permissionModeConcept(
   harness: string | null | undefined,
   value: string | null | undefined,
 ): PermissionModeConcept {
-  return knownPermissionModeConcept(harness, value) ?? "default";
+  if (!harness || !value) return "default";
+  const canonicalHarness = canonicalNativeHarness(harness);
+  return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
 }
 
 // Antigravity (agy) permission control. agy exposes exactly ONE pre-emptive
