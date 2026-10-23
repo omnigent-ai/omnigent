@@ -4,7 +4,7 @@
 
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { hasCommandModifier, isFocusInDialogOrMenu, isMacPlatform } from "@/lib/hotkeys";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 
 /** The split a keydown asks for, or null when it isn't a split chord. */
@@ -36,10 +36,11 @@ export function useTerminalSplitHotkey(
     if (!enabled) return;
 
     const handler = (event: globalThis.KeyboardEvent): void => {
-      // Ignore auto-repeat: holding the chord would open a shell per tick.
-      if (event.repeat || terminalSplitHotkeyAxis(event, isMac) !== axis) return;
+      if (terminalSplitHotkeyAxis(event, isMac) !== axis || isFocusInDialogOrMenu()) return;
       event.preventDefault();
       event.stopPropagation();
+      // Claim but skip auto-repeat: holding the chord would open a shell per tick.
+      if (event.repeat) return;
       latest.current();
     };
 

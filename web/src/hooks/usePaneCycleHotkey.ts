@@ -1,11 +1,9 @@
-// ⌘⌥⇧[ / ⌘⌥⇧] (Ctrl+Alt+Shift on Win/Linux) focus the previous / next pane: a
-// grid's cells, or the terminal view's split panes. Grid cells never split, so
-// one chord serves both. Brackets echo the ⌘[ / ⌘] session step; Shift keeps it
-// clear of the ⌘⌥[ / ⌘⌥] sidebar toggles.
+// ⌘⌥⇧[ / ⌘⌥⇧] (Ctrl+Alt+Shift on Win/Linux) focus the previous / next pane: grid
+// cells or split terminal panes (grid cells never split, so one chord serves both).
 
 import { useEffect, useRef } from "react";
 
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { hasCommandModifier, isFocusInDialogOrMenu, isMacPlatform } from "@/lib/hotkeys";
 
 /** -1 for Cmd/Ctrl+Alt+Shift+[, 1 for Cmd/Ctrl+Alt+Shift+], 0 for anything else. */
 export function paneCycleHotkeyStep(
@@ -42,9 +40,11 @@ export function usePaneCycleHotkey(options: PaneCycleHotkeyOptions, isMac = isMa
 
     const handler = (event: globalThis.KeyboardEvent): void => {
       const step = paneCycleHotkeyStep(event, isMac);
-      if (event.repeat || step === 0) return;
+      if (step === 0 || isFocusInDialogOrMenu()) return;
       event.preventDefault();
       event.stopPropagation();
+      // Claim auto-repeat too, so a held chord never reaches the terminal.
+      if (event.repeat) return;
       const { paneKeys, focusedKey, onFocusPane } = latest.current;
       const index = paneKeys.indexOf(focusedKey ?? "");
       onFocusPane(paneKeys[(index + step + paneKeys.length) % paneKeys.length]);

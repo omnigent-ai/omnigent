@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { usePaneCycleHotkey } from "./usePaneCycleHotkey";
 
@@ -43,7 +43,7 @@ describe("usePaneCycleHotkey", () => {
     expect(onFocusPane).toHaveBeenCalledExactlyOnceWith("b");
   });
 
-  it("ignores disabled, unshifted, incomplete, repeated, and AltGraph chords", () => {
+  it("ignores disabled, unshifted, incomplete, repeated, in-dialog, and AltGraph chords", () => {
     const disabled = setup("a", false);
     press();
     expect(disabled.onFocusPane).not.toHaveBeenCalled();
@@ -52,8 +52,17 @@ describe("usePaneCycleHotkey", () => {
     // Without Shift this is the workspace-sidebar toggle.
     press({ ctrlKey: true, altKey: true });
     press({ ctrlKey: true, shiftKey: true });
-    press({ ctrlKey: true, altKey: true, shiftKey: true, repeat: true });
+    // A held chord is still claimed, so it never reaches a focused terminal.
+    expect(
+      press({ ctrlKey: true, altKey: true, shiftKey: true, repeat: true }).defaultPrevented,
+    ).toBe(true);
     press({ ctrlKey: true, altKey: true, shiftKey: true }, "KeyP");
+    const dialog = document.body.appendChild(document.createElement("div"));
+    dialog.setAttribute("role", "dialog");
+    onTestFinished(() => dialog.remove());
+    dialog.appendChild(document.createElement("button")).focus();
+    expect(press().defaultPrevented).toBe(false);
+    dialog.remove();
     vi.spyOn(KeyboardEvent.prototype, "getModifierState").mockImplementation(
       (key) => key === "AltGraph",
     );

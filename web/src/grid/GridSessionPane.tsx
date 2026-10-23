@@ -158,12 +158,17 @@ export function GridSessionPane({
   const showTerminal = terminalFirst && view === "terminal";
   // A connected terminal focuses itself as the cell activates; otherwise focus
   // the chat composer, or the cell itself when there is nothing to type into.
+  const handledFocusRequest = useRef<object | null>(null);
   useEffect(() => {
     const pane = paneRef.current;
-    if (!focusRequest || !pane || pane.contains(document.activeElement)) return;
+    if (!focusRequest || focusRequest === handledFocusRequest.current || !pane) return;
+    handledFocusRequest.current = focusRequest;
+    if (pane.contains(document.activeElement)) return;
     const composer = showTerminal
       ? undefined
-      : Array.from(chatRef.current?.querySelectorAll("textarea") ?? []).at(-1);
+      : Array.from(
+          chatRef.current?.querySelectorAll<HTMLTextAreaElement>("textarea:not(:disabled)") ?? [],
+        ).at(-1);
     (composer ?? pane).focus({ preventScroll: true });
   }, [focusRequest, showTerminal]);
   const hadTerminal = useRef(false);

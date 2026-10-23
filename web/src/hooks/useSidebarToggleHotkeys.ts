@@ -1,8 +1,7 @@
 // ⌘⌥[ / ⌘⌥] (Ctrl+Alt+[ / Ctrl+Alt+] on Win/Linux) toggle the left
 // (Conversations) and right (Workspace) sidebars. Siblings to the session-switch
 // (⌘[ / ⌘]) and approve (⌘↵) hotkeys; like them they fire even inside a focused
-// text field or terminal, so a panel can be collapsed mid-compose. A focused code
-// editor keeps them (Monaco folds with ⌘⌥[ / ⌘⌥]). Platform-aware: only the
+// text field, so a panel can be collapsed mid-compose. Platform-aware: only the
 // ⌘ chord fires on macOS and only the Ctrl chord on Win/Linux.
 //
 // Why this chord: the bare ⌘[ / ⌘] are the browser's Back/Forward gestures, and
@@ -10,8 +9,7 @@
 // (Raycast/Rectangle/…) before the page ever sees them. Adding ⌥ dodges both —
 // it's not a browser gesture and is essentially never grabbed system-wide — and
 // it shares the ⌘⌥ chord with ChatPage's message-nav hotkey. Bind ONCE at the
-// app shell, where the sidebar open-state lives; a displayed grid binds only the
-// right side, for its own workspace, and the app shell then leaves it unset.
+// app shell, where the sidebar open-state lives (a grid binds its own ⌘⌥]).
 
 import { useEffect, useRef } from "react";
 
@@ -43,10 +41,8 @@ export function useSidebarToggleHotkeys(
       // the call: not every environment implements getModifierState, and an
       // unguarded call there would throw and break the whole keydown handler.
       if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
-      // Ignore auto-repeat: holding the chord would flap the panel open/closed.
-      if (e.repeat) return;
-      const el = document.activeElement;
-      if (el instanceof Element && el.closest(".monaco-editor")) return;
+      // Monaco folds with ⌘⌥[ / ⌘⌥] on macOS (Ctrl+Shift elsewhere).
+      if (isMac && document.activeElement?.closest(".monaco-editor")) return;
       // Match the physical key, not the character: ⌥ turns "[" / "]" into "“" /
       // "‘" on macOS, but e.code is stable across layouts and modifiers.
       // Claim the chord: preventDefault drops any default action and
@@ -60,6 +56,8 @@ export function useSidebarToggleHotkeys(
       if (!toggle) return;
       e.preventDefault();
       e.stopPropagation();
+      // Claim auto-repeat too, but act once: holding the chord would flap the panel.
+      if (e.repeat) return;
       toggle();
     };
 

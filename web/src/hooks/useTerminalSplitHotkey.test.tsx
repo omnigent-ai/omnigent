@@ -1,5 +1,5 @@
 import { renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 import { useTerminalSplitHotkey } from "./useTerminalSplitHotkey";
@@ -40,7 +40,7 @@ describe("useTerminalSplitHotkey", () => {
     expect(onSplit).toHaveBeenCalledOnce();
   });
 
-  it("ignores disabled, view-toggle, incomplete, repeated, and AltGraph chords", () => {
+  it("ignores disabled, view-toggle, incomplete, repeated, in-dialog, and AltGraph chords", () => {
     const disabled = setup("columns", false);
     press(SPLIT_RIGHT);
     expect(disabled.onSplit).not.toHaveBeenCalled();
@@ -52,7 +52,14 @@ describe("useTerminalSplitHotkey", () => {
     press({ ...SPLIT_DOWN, shiftKey: true });
     press({ ...SPLIT_RIGHT, altKey: false });
     press({ ...SPLIT_DOWN, ctrlKey: false });
-    press({ ...SPLIT_RIGHT, repeat: true });
+    // A held chord is still claimed, so it never reaches a focused terminal.
+    expect(press({ ...SPLIT_RIGHT, repeat: true }).defaultPrevented).toBe(true);
+    const dialog = document.body.appendChild(document.createElement("div"));
+    dialog.setAttribute("role", "dialog");
+    onTestFinished(() => dialog.remove());
+    dialog.appendChild(document.createElement("button")).focus();
+    expect(press(SPLIT_RIGHT).defaultPrevented).toBe(false);
+    dialog.remove();
     vi.spyOn(KeyboardEvent.prototype, "getModifierState").mockImplementation(
       (key) => key === "AltGraph",
     );
