@@ -213,8 +213,13 @@ def test_claude_merged_streams_track_pushes_but_not_pr_body_output(
     )
     monkeypatch.setattr(github_resource, "_gh", gh)
     segments = _shell_segments("cd repo2 && git push && gh pr view")
-    response = {"stdout": PUSH_OUTPUT, "stderr": "", "interrupted": False}
+    response = {
+        "stdout": PUSH_OUTPUT + "title: PR body\n   deadbee..cafebabe x -> other\n",
+        "stderr": "",
+        "interrupted": False,
+    }
     assert [reference.url for reference in pushed_prs(segments, response)] == [PR_URL]
+    gh.assert_called_once()
     gh.reset_mock()
     response["stdout"] = "Everything up-to-date\n" + PUSH_OUTPUT
     assert pushed_prs(segments, response) == []

@@ -143,7 +143,9 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
             remote = resolve_remote(url)
         elif remote is not None and remote.provider == "github":
             match = _PORCELAIN_UPDATE.fullmatch(line) or _NORMAL_UPDATE.fullmatch(line)
-            if match and (not match[1].startswith("refs/") or match[1].startswith("refs/heads/")):
+            if not match:
+                remote = None
+            elif not match[1].startswith("refs/") or match[1].startswith("refs/heads/"):
                 branch = match[1].removeprefix("refs/heads/")
                 targets[(remote.host, remote.repository, branch)] = None
     references: dict[str, PullRequestRef] = {}
