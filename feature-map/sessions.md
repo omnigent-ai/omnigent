@@ -175,8 +175,9 @@ Double-click a grid title or use
 its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
-identify the session shown in Workspace. The grid header toggles the shared
-panel; it spans the full app height beside the grid header and cells. Its width
+identify the session shown in Workspace. ⌘/Ctrl+Alt+Shift+] / [ activate the
+next / previous cell and focus its terminal or composer. The grid header button
+or ⌘/Ctrl+Alt+] toggles the shared panel; it spans the full app height beside the grid header and cells. Its width
 is saved per grid and stays fixed when switching sessions; the header shrinks
 with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
@@ -429,6 +430,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
   per-cell terminal input, switching without reattaching, active-cell shortcuts,
+  keyboard cell cycling and workspace toggling,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar

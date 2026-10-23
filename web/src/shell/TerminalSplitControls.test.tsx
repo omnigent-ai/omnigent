@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writePreferredShell } from "./preferredShell";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import {
   TerminalFirstContextProvider,
@@ -97,9 +98,12 @@ it.each([
       return renderControls("conv_gate");
     },
   ],
-])("renders nothing when %s", (_case, renderCase) => {
+])("renders nothing and leaves the split chords unbound when %s", (_case, renderCase) => {
   renderCase();
   expect(screen.queryByRole("button", { name: "Split right" })).toBeNull();
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true, shiftKey: true });
+  fireEvent.keyDown(window, { code: "Minus", ctrlKey: true, altKey: true });
+  expect(fixture.createTerminal).not.toHaveBeenCalled();
 });
 
 it("splits the agent pane with the picked shell and focuses the new pane", async () => {
@@ -119,6 +123,23 @@ it("splits the agent pane with the picked shell and focuses the new pane", async
   await waitFor(() =>
     expect(readSessionWorkspaceState("conv_controls_split").terminalSplit).toEqual({
       layout: { axis: "rows", ratio: 0.5, children: [AGENT_KEY, BASH_KEY] },
+      focusedKey: BASH_KEY,
+    }),
+  );
+});
+
+it("splits right with the preferred shell from the keyboard, skipping the picker", async () => {
+  fixture.createTerminal.mockImplementation((_shell: string, { onSuccess }) => onSuccess(BASH));
+  writePreferredShell("bash");
+  renderControls("conv_controls_hotkey");
+
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true, shiftKey: true });
+
+  expect(fixture.createTerminal).toHaveBeenCalledExactlyOnceWith("bash", expect.anything());
+  expect(screen.queryByRole("menu")).toBeNull();
+  await waitFor(() =>
+    expect(readSessionWorkspaceState("conv_controls_hotkey").terminalSplit).toEqual({
+      layout: { axis: "columns", ratio: 0.5, children: [AGENT_KEY, BASH_KEY] },
       focusedKey: BASH_KEY,
     }),
   );

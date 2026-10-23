@@ -131,6 +131,51 @@ describe("useSidebarToggleHotkeys", () => {
     expect(stopSpy).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    ["claims the chord before a focused terminal", "xterm", 1, 0],
+    ["leaves the chord to a focused code editor", "monaco-editor", 0, 1],
+  ])("%s", (_name, surfaceClass, toggles, surfaceKeydowns) => {
+    const { onToggleRight } = setup(false);
+    const surface = document.createElement("div");
+    surface.className = surfaceClass;
+    const input = document.createElement("textarea");
+    surface.append(input);
+    document.body.append(surface);
+    input.focus();
+    const onSurfaceKeyDown = vi.fn();
+    input.addEventListener("keydown", onSurfaceKeyDown);
+
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        code: "BracketRight",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+
+    expect(onToggleRight).toHaveBeenCalledTimes(toggles);
+    expect(onSurfaceKeyDown).toHaveBeenCalledTimes(surfaceKeydowns);
+    surface.remove();
+  });
+
+  it("leaves an unset side unclaimed for another binding", () => {
+    const onToggleRight = vi.fn();
+    renderHook(() => useSidebarToggleHotkeys({ onToggleRight }, false));
+    const ev = new KeyboardEvent("keydown", {
+      code: "BracketLeft",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.body.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(false);
+    press({ ctrlKey: true, altKey: true }, "BracketRight");
+    expect(onToggleRight).toHaveBeenCalledTimes(1);
+  });
+
   it("unbinds on unmount", () => {
     const { onToggleLeft, unmount } = setup(false);
     unmount();
