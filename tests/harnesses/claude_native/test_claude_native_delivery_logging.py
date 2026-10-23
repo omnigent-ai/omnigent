@@ -21,11 +21,11 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("normal", "draft_absent", "returned"),
         ("session_fallback", "draft_absent", "returned"),
         ("unknown_command", "draft_absent", "returned"),
-        ("blank_line", "unverified", "returned"),
+        ("blank_line", "unverified", "error"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
         ("empty_capture", "inconclusive_capture", "error"),
-        ("missing_glyph", "inconclusive_capture", "returned"),
+        ("missing_glyph", "inconclusive_capture", "error"),
         ("transport_error", "not_started", "error"),
         ("observation_error", "not_started", "returned"),
         ("startup_error", "not_started", "error"),
@@ -47,7 +47,7 @@ def test_delivery_diagnostics(
         secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
-    pane = "❯ "
+    pane = "──────\n❯ \n──────\n"
     enters = 0
     pending_checks = 0
 
@@ -76,19 +76,19 @@ def test_delivery_diagnostics(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
-        if args[-1] == "Space":
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
-            pane = "❯ " + content
+            pane = "──────\n❯ " + content + "\n──────\n"
         if args[-1] == "Enter":
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(
+                scenario, "──────\n❯ \n──────\n"
+            )
 
     monkeypatch.setattr(
         bridge,
@@ -141,7 +141,11 @@ def test_delivery_diagnostics(
             expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
             if scenario.startswith("pending_"):
                 expected = bridge.ClaudeUserPromptPending
-            match = "capture is unavailable" if scenario == "empty_capture" else None
+            match = (
+                "chat input cannot be observed"
+                if scenario in {"empty_capture", "missing_glyph"}
+                else None
+            )
             with pytest.raises(expected, match=match):
                 bridge.inject_user_message(tmp_path, content=content)
 
@@ -176,7 +180,7 @@ def test_delivery_diagnostics(
 
     if scenario == "observation_error":
         assert enters == 1
-        assert pane == "❯ "
+        assert pane == "──────\n❯ \n──────\n"
         assert attrs["submit_sent"] is True
     if scenario == "unknown_command":
         assert enters == 2
@@ -190,18 +194,18 @@ def test_delivery_diagnostics(
         assert attrs["draft_polls"] == 1
         assert attrs["draft_empty_captures"] == 0
         assert attrs["draft_wait_ms"] == 0
-        assert attrs["draft_pane_rows"] == 1
+        assert attrs["draft_pane_rows"] == 3
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
         assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
         assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
-        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
-        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
+        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 3)
+        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 6)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
         assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
         if scenario == "empty_capture":
             assert attrs["submit_sent"] is True
-            assert attrs["error_type"] == "RuntimeError"
+            assert attrs["error_type"] == "ClaudeSubmitUnconfirmed"
             assert enters == 1
 
     if scenario == "blank_line":
@@ -210,7 +214,7 @@ def test_delivery_diagnostics(
         assert attrs["leading_blank_line"] is True
         assert attrs["submit_sent"] is True
         assert enters == 1
-        assert pane == "❯ \n" + secret
+        assert pane == "──────\n❯ \n" + secret + "\n──────\n"
     elif scenario in {"normal", "retry", "timeout", "empty_capture", "missing_glyph"}:
         assert attrs["retries"] == enters - 1
         if scenario == "retry":

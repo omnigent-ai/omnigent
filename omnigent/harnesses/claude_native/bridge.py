@@ -4550,9 +4550,9 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
-        # An empty capture can be a repaint or failed tmux read. It proves
-        # neither that the draft cleared nor that another Enter is safe.
-        if not pane.strip():
+        # Repaints and overlays can hide a draft without accepting it.
+        # Only the live chat composer can confirm absence or permit a retry.
+        if not pane.strip() or (submitted_text is not None and not _claude_prompt_rendered(pane)):
             continue
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
@@ -4597,10 +4597,10 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
-    if not pane.strip():
+    if not pane.strip() or (submitted_text is not None and not _claude_prompt_rendered(pane)):
         raise ClaudeSubmitUnconfirmed(
             f"Claude Code {what} delivery could not be confirmed within "
-            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because terminal capture is unavailable. "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because the chat input cannot be observed. "
             "Inspect the terminal before retrying; the message may already have been delivered."
         )
     return False

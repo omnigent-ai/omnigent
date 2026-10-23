@@ -1780,7 +1780,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    pane = "──────\n❯ \n──────\n"
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
@@ -1788,12 +1788,14 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     def run_tmux(socket_path: str, *args: str) -> None:
         nonlocal pane, enters, prompt_pending
         del socket_path
-        if args[-1] == "Space":
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
         elif args[0] == "paste-buffer":
-            pane = "❯ " if refusal == "draft_unobserved" else "❯ review this function"
+            pane = (
+                "──────\n❯ \n──────\n"
+                if refusal == "draft_unobserved"
+                else "──────\n❯ review this function\n──────\n"
+            )
             prompt_pending = not submitted
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
@@ -1843,7 +1845,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
     if refusal == "draft_persisted":
         assert enters >= 1
-        assert pane == "❯ review this function"
+        assert pane == "──────\n❯ review this function\n──────\n"
     else:
         assert enters == int(submitted)
     assert killed == []

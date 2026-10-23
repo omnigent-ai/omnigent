@@ -5066,7 +5066,9 @@ def test_unobserved_user_draft_has_uncertain_delivery(
     assert all("kill-session" not in cmd for cmd in commands)
 
 
-@pytest.mark.parametrize("submit_capture", ["ready", "empty", "whitespace", "failed"])
+@pytest.mark.parametrize(
+    "submit_capture", ["ready", "empty", "whitespace", "failed", "glyphless", "scrollback-glyph"]
+)
 @pytest.mark.parametrize("accept_first", [False, True], ids=["swallowed", "accepted"])
 def test_inject_user_message_verifies_submit_after_transient_capture_loss(
     tmp_path: Path,
@@ -5117,7 +5119,15 @@ def test_inject_user_message_verifies_submit_after_transient_capture_loss(
                     assert len(enters) == 1, "an unreadable pane must not draw another Enter"
                     return SimpleNamespace(
                         returncode=1 if submit_capture == "failed" else 0,
-                        stdout="  \n" if submit_capture == "whitespace" else "",
+                        stdout=(
+                            "  \n"
+                            if submit_capture == "whitespace"
+                            else "Working...\n"
+                            if submit_capture == "glyphless"
+                            else "Earlier ❯ submitted message\nWorking...\n"
+                            if submit_capture == "scrollback-glyph"
+                            else ""
+                        ),
                         stderr="capture unavailable" if submit_capture == "failed" else "",
                     )
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
