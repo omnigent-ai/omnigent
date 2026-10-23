@@ -1906,10 +1906,13 @@ def create_app(
                             except Exception:
                                 _logger.exception("Scheduling cursor reset failed during shutdown")
                             raise
+                    if isinstance(scheduled_task_scheduler, ScheduledTaskScheduler):
+                        app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
                     await scheduled_task_scheduler.start()
                 except Exception:
                     if isinstance(scheduled_task_scheduler, ScheduledTaskScheduler):
                         scheduled_task_scheduler.stop()
+                        app_inst.state.scheduled_task_scheduler = None
                     raise
                 app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
 
@@ -1956,8 +1959,6 @@ def create_app(
             with monitor_event_loop():
                 yield
         finally:
-            if managed_sandbox_reaper is not None:
-                await managed_sandbox_reaper.shutdown()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -1967,6 +1968,8 @@ def create_app(
                 await scheduled_task_scheduler.stop()
             elif scheduled_task_scheduler is not None:
                 scheduled_task_scheduler.stop()
+            if managed_sandbox_reaper is not None:
+                await managed_sandbox_reaper.shutdown()
             metrics_publish_task.cancel()
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task

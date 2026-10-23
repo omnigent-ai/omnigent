@@ -1487,3 +1487,36 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
         == 200
     )
     assert stores["permission_store"].get("alice", session_id) is None
+
+
+def test_account_deletion_while_legacy_scheduler_unavailable(setup_app, monkeypatch):
+    from unittest.mock import Mock
+
+    admin, alice, stores, _ = setup_app
+    scheduler = admin.app.state.scheduled_task_scheduler
+    assert admin.portal is not None
+    admin.portal.call(scheduler.stop)
+    monkeypatch.setattr(admin.app.state, "scheduled_task_scheduler", None)
+    agent_id = create_session(alice).json()["agent_id"]
+    created = alice.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "created during outage",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    tasks = stores["scheduled_task_store"]
+    list_tasks = Mock(wraps=tasks.list)
+    monkeypatch.setattr(tasks, "list", list_tasks)
+    deleted = admin.delete("/auth/users/alice")
+    assert deleted.status_code == 204, deleted.text
+    list_tasks.assert_not_called()
+    assert tasks.get(created.json()["id"]).state == "deleted"
+    admin.portal.call(scheduler.start)
+    assert scheduler.is_started
+    assert scheduler.job_count == 0
+    assert tasks.list_runs(created.json()["id"])[0] == []

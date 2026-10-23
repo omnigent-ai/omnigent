@@ -435,7 +435,7 @@ def create_scheduled_tasks_router(
         ):
             scheduler.add(task)
         # A freshly created task has no runs (last_run_status is None); its
-        # next_run_at is available now that the scheduler armed it above.
+        # next_run_at comes from the legacy timer or the persisted schedule.
         return _to_response(
             task,
             next_run_at=_next_run_at(task, request),

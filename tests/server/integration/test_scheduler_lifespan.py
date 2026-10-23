@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from omnigent.db.db_models import workspace_scope
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.scheduled.config import ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
@@ -31,6 +32,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
@@ -51,6 +53,7 @@ def _build_app(
     dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduler_config: ScheduledTaskSchedulerConfig | None = None,
     server_config: dict | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
@@ -66,6 +69,8 @@ def _build_app(
         scheduled_task_dispatch=dispatch,
         scheduled_task_scheduler_config=scheduler_config,
         server_config=server_config,
+        sandbox_config=sandbox_config,
+        host_store=HostStore(db_uri) if sandbox_config is not None else None,
     )
 
 
@@ -436,7 +441,11 @@ async def test_legacy_startup_retries_without_skipping_cursor_reset(
     async with app.router.lifespan_context(app):
         assert app.state.scheduled_task_scheduler is None
         await poll_until_async(
-            lambda: app.state.scheduled_task_scheduler is not None, timeout_s=10
+            lambda: (
+                app.state.scheduled_task_scheduler is not None
+                and app.state.scheduled_task_scheduler.is_started
+            ),
+            timeout_s=10,
         )
         scheduler = app.state.scheduled_task_scheduler
         assert scheduler.is_started
@@ -473,7 +482,11 @@ async def test_persistent_startup_uses_configured_retry(
     async with app.router.lifespan_context(app):
         assert app.state.scheduled_task_scheduler is None
         await poll_until_async(
-            lambda: app.state.scheduled_task_scheduler is not None, timeout_s=10
+            lambda: (
+                app.state.scheduled_task_scheduler is not None
+                and app.state.scheduled_task_scheduler.is_started
+            ),
+            timeout_s=10,
         )
         assert app.state.scheduled_task_scheduler.is_started
         assert attempts == 2
@@ -583,3 +596,60 @@ async def test_shutdown_waits_for_cursor_reset_without_starting_timers(
     assert retry.done()
     load_tasks.assert_not_called()
     assert app.state.scheduled_task_scheduler is None
+
+
+@pytest.mark.parametrize("mode", ["legacy", "persistent", "retrying"])
+async def test_shutdown_stops_scheduling_before_sandbox_reaper(
+    runtime_init, db_uri, tmp_path, monkeypatch, mode
+):
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxReaperConfig
+    from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
+
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES", "automations_v2" if mode == "persistent" else "-automations_v2"
+    )
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    if mode == "retrying":
+        monkeypatch.setattr(
+            store, "list_active_all_workspaces", Mock(side_effect=RuntimeError("DB unavailable"))
+        )
+    sandbox = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.com",
+            launcher_factory=Mock(side_effect=AssertionError("No sandbox should launch")),
+            managed_launch_supported=False,
+            token_ttl_s=3600,
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True),
+    )
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        sandbox_config=sandbox,
+        dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()),
+    )
+    scheduler = None
+    retry = None
+
+    async def check_shutdown():
+        if retry is not None:
+            assert retry.done()
+        else:
+            assert scheduler is not None
+            assert not scheduler.is_started
+
+    shutdown = AsyncMock(side_effect=check_shutdown)
+    monkeypatch.setattr(ManagedSandboxReaper, "start", AsyncMock())
+    monkeypatch.setattr(ManagedSandboxReaper, "shutdown", shutdown)
+    async with app.router.lifespan_context(app):
+        scheduler = app.state.scheduled_task_scheduler
+        if mode == "retrying":
+            retry = next(
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == "scheduled-task-startup-retry"
+            )
+        else:
+            assert scheduler.is_started
+    shutdown.assert_awaited_once()

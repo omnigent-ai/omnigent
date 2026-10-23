@@ -179,10 +179,17 @@ clears saved `next_run_at` values before creating future timers. Task definition
 run history, and running agent sessions are retained. Clearing the saved times
 prevents a later re-enable from replaying occurrences handled by the old timers.
 If clearing or startup fails, it retries after `startup_retry_seconds` (default 30).
-Until startup succeeds, the scheduler is unavailable; persistent-mode task routes
-still return saved `next_run_at` values. Database reads and cursor resets run off
-the event loop. Shutdown waits for an ongoing cursor reset to finish, so a slow
-database write can delay shutdown.
+Legacy timers become available to routes after cursor reset, before task loading;
+changes made during loading take precedence over the database snapshot. A failed
+load clears partial timers before retrying. Persistent-mode task routes return
+saved `next_run_at` values even when the scheduler is unavailable.
+
+The startup retry interval applies to failures in either scheduler's `start()`.
+Persistent startup normally just launches the polling loop; database failures
+inside that loop retry at `poll_seconds`, not `startup_retry_seconds`.
+Database reads and cursor resets run off the event loop. Shutdown stops scheduling
+before the sandbox reaper and waits for an ongoing cursor reset to finish, so a
+slow database write can delay shutdown.
 
 All replicas sharing a database must use the same mode, because legacy timers do
 not claim occurrences. Changing the environment of a running server does not

@@ -84,6 +84,7 @@ def auth_app(
         feature_flags=resolve_feature_flags(
             {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
         ),
+        server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
         scheduled_task_dispatch=(
             ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(return_value=None))
             if persistent
@@ -1986,3 +1987,76 @@ async def test_database_scheduler_crud_uses_persisted_next_run(
     deleted = await auth_client.delete(url, headers=_headers())
     assert deleted.status_code == 200, deleted.text
     assert store.get(task["id"]) is None
+
+
+@pytest.mark.parametrize("load_fails", [False, True])
+async def test_legacy_retry_keeps_tasks_created_and_edited_during_load(
+    auth_app, db_uri, monkeypatch, load_fails
+):
+    import asyncio
+    from threading import Event
+
+    from tests._helpers.polling import poll_until_async
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    existing = store.create(
+        "0123456789abcdef0123456789abcdef",
+        "existing",
+        "prompt",
+        "FREQ=DAILY;BYHOUR=9",
+        "alice@example.com",
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        "UTC",
+    )
+    entered, release = asyncio.Event(), Event()
+    loop = asyncio.get_running_loop()
+    load = SqlAlchemyScheduledTaskStore.list_active_all_workspaces
+    attempts = 0
+
+    def fail_then_snapshot(self):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        snapshot = load(self)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Startup snapshot was never released"
+        if load_fails and attempts == 2:
+            raise RuntimeError("database read failed after route mutations")
+        return snapshot
+
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore, "list_active_all_workspaces", fail_then_snapshot
+    )
+    async with auth_app.router.lifespan_context(auth_app):
+        assert auth_app.state.scheduled_task_scheduler is None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=auth_app), base_url="http://test"
+            ) as client:
+                created = await client.post(
+                    "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+                )
+                assert created.status_code == 200, created.text
+                edited = await client.patch(
+                    f"/v1/scheduled-tasks/{existing.id}",
+                    json={"rrule": "FREQ=DAILY;BYHOUR=17", "timezone": "Asia/Tokyo"},
+                    headers=_headers(),
+                )
+                assert edited.status_code == 200, edited.text
+                assert created.json()["next_run_at"] is not None
+                assert edited.json()["next_run_at"] is not None
+        finally:
+            release.set()
+        await poll_until_async(
+            lambda: (
+                auth_app.state.scheduled_task_scheduler is not None
+                and auth_app.state.scheduled_task_scheduler.is_started
+            ),
+            timeout_s=10,
+        )
+        scheduler = auth_app.state.scheduled_task_scheduler
+        assert scheduler.job_count == 2
+        assert scheduler.next_run_at(created.json()["id"]) == created.json()["next_run_at"]
+        assert scheduler.next_run_at(existing.id) == edited.json()["next_run_at"]
