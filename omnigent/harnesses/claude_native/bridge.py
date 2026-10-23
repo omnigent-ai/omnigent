@@ -6130,7 +6130,7 @@ def _composer_row(pane: str) -> str | None:
         mode, or ``None`` when no input box is on screen.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(non_empty)
     if not rules:
         return None
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
@@ -6155,6 +6155,19 @@ class _ComposerBox(NamedTuple):
     framed: bool
 
 
+def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
+    """Keep frame edges, excluding further-indented rule text in a draft.
+
+    The last two rules can be a frame edge and a draft line; the less-indented
+    rule identifies the frame in both a complete and a clipped input box.
+    """
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2:
+        return rules
+    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
+    return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+
+
 def _composer_box(pane: str) -> _ComposerBox | None:
     """
     Return every visible row of Claude Code's live input box, or ``None``.
@@ -6169,7 +6182,7 @@ def _composer_box(pane: str) -> _ComposerBox | None:
         screen, or ``None`` when no input box is on screen.
     """
     lines = pane.splitlines()
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(lines)
     if not rules:
         return None
     if len(rules) >= 2:

@@ -10976,11 +10976,17 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
 
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize(
+    "draft",
+    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
+    ids=["plain-draft", "draft-with-rule"],
+)
 def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     visible_rows: int | None,
+    draft: str,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with the message.
@@ -10992,7 +10998,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     clearing burst would likewise leave the hidden lines to be submitted.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
+    composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     inject_user_message(bridge_dir, content="hello from the web")
@@ -11002,11 +11008,17 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
 
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize(
+    "draft",
+    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
+    ids=["plain-draft", "draft-with-rule"],
+)
 def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     visible_rows: int | None,
+    draft: str,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with a slash command.
@@ -11017,7 +11029,7 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     as for a message.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
+    composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -11119,16 +11131,38 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
             "scrollback\n──────\n❯ one\n  two\n  three",
             claude_native_bridge._ComposerBox(["❯ one", "  two", "  three"], framed=False),
         ),
+        (
+            "──────\n❯ one\n  ──────\n  four\n──────\n  ? for shortcuts\n",
+            claude_native_bridge._ComposerBox(["❯ one", "  ──────", "  four"], framed=True),
+        ),
+        (
+            "──────\n❯ one\n  ──────",
+            claude_native_bridge._ComposerBox(["❯ one", "  ──────"], framed=False),
+        ),
+        (
+            "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    four\n  ──────\n",
+            claude_native_bridge._ComposerBox(["  ❯ one", "    ──────", "    four"], framed=True),
+        ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
     ],
-    ids=["framed-with-blank-row", "closing-rule-off-screen", "dialog-selector", "no-box"],
+    ids=[
+        "framed-with-blank-row",
+        "closing-rule-off-screen",
+        "rule-inside-draft",
+        "rule-inside-clipped-draft",
+        "indented-frame-with-earlier-rule",
+        "dialog-selector",
+        "no-box",
+    ],
 )
 def test_composer_box_reads_every_row_of_the_input_box(
     pane: str, box: claude_native_bridge._ComposerBox | None
 ) -> None:
     """Every row of the live box counts, and a box cut off by the pane says so."""
     assert claude_native_bridge._composer_box(pane) == box
+    if box is not None:
+        assert claude_native_bridge._composer_row(pane) == box.rows[0]
 
 
 def test_a_model_switch_types_the_argument_form_and_confirms(
