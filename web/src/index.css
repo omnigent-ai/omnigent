@@ -1682,10 +1682,11 @@ html[data-electron-mac] .breadcrumb-folder {
   -webkit-touch-callout: none;
 }
 
-/* The mobile drawer and the iOS terminal-first surface already reserve the
-   bottom inset (drawer padding / native bar spacer); don't add it twice. */
+/* The mobile drawer already reserves the bottom inset, and a docked iOS
+   keyboard covers the home indicator; don't add the inset in either case.
+   Android zeroes --omnigent-safe-bottom itself while the keyboard is up. */
 :is([data-ios-native], [data-android-native]) .mobile-panel-drawer .terminal-extra-keys,
-[data-ios-native] .main-terminal-view .terminal-extra-keys {
+[data-ios-native] .terminal-extra-keys[data-keyboard-open] {
   padding-bottom: 0.25rem;
 }
 

@@ -8,6 +8,11 @@ import {
 } from "./TerminalExtraKeys";
 import { LONG_PRESS_MS } from "./terminalExtraKeysModel";
 
+const keyboardInset = vi.hoisted(() => ({ value: 0 }));
+vi.mock("@/hooks/useIOSNativeKeyboardInset", () => ({
+  useIOSNativeKeyboardInset: () => keyboardInset.value,
+}));
+
 function makeTarget(applicationCursor = false) {
   return {
     send: vi.fn<(data: string) => void>(),
@@ -71,6 +76,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  keyboardInset.value = 0;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -115,6 +121,18 @@ describe("TerminalExtraKeys layout", () => {
   });
 });
 
+describe("TerminalExtraKeys bottom inset", () => {
+  it("marks the row while a docked iOS keyboard covers the home indicator", () => {
+    const { rerender } = render(<TerminalExtraKeys target={makeTarget()} />);
+    const row = screen.getByTestId("terminal-extra-keys");
+    expect(row).not.toHaveAttribute("data-keyboard-open");
+
+    keyboardInset.value = 320;
+    rerender(<TerminalExtraKeys target={makeTarget()} />);
+    expect(row).toHaveAttribute("data-keyboard-open", "true");
+  });
+});
+
 describe("TerminalExtraKeys pointer semantics", () => {
   it("sends on pointerup exactly once per tap, and prevents the pointerdown default", () => {
     // WHY: pointerdown preventDefault keeps focus on xterm's textarea (soft
@@ -133,6 +151,17 @@ describe("TerminalExtraKeys pointer semantics", () => {
     expect(target.send).toHaveBeenCalledWith("\x1b");
 
     fireEvent.click(esc, { detail: 1 });
+    expect(target.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels touchend so WebKit's synthetic click can't move focus off the terminal", () => {
+    const target = makeTarget();
+    render(<TerminalExtraKeys target={target} />);
+    const esc = key("Escape");
+
+    pointerDown(esc);
+    pointerUp(esc);
+    expect(fireEvent.touchEnd(esc)).toBe(false);
     expect(target.send).toHaveBeenCalledTimes(1);
   });
 
