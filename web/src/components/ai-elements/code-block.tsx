@@ -9,9 +9,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
+import { stripAnsi } from "@/lib/ansi";
 import { cn } from "@/lib/utils";
 import { CheckIcon, CopyIcon } from "lucide-react";
-import type { ComponentProps, CSSProperties, HTMLAttributes } from "react";
+import type { ComponentProps, CSSProperties, HTMLAttributes, ReactNode } from "react";
 import {
   createContext,
   memo,
@@ -22,7 +23,13 @@ import {
   useRef,
   useState,
 } from "react";
-import type { BundledLanguage, BundledTheme, HighlighterGeneric, ThemedToken } from "shiki";
+import type {
+  BundledLanguage,
+  BundledTheme,
+  HighlighterGeneric,
+  SpecialLanguage,
+  ThemedToken,
+} from "shiki";
 
 // Shiki uses bitflags for font styles: 1=italic, 2=bold, 4=underline
 // oxlint-disable-next-line eslint(no-bitwise)
@@ -101,9 +108,12 @@ const LineSpan = ({
 );
 
 // Types
+/** A bundled grammar, or one of Shiki's built-ins (`text`, `ansi` for terminal colors). */
+export type CodeLanguage = BundledLanguage | SpecialLanguage;
+
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
-  language: BundledLanguage;
+  language: CodeLanguage;
   showLineNumbers?: boolean;
   /** Soft-wrap long lines instead of horizontal scrolling. */
   wrap?: boolean;
@@ -136,14 +146,14 @@ const tokensCache = new Map<string, TokenizedCode>();
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
 
-const getTokensCacheKey = (code: string, language: BundledLanguage) => {
+const getTokensCacheKey = (code: string, language: CodeLanguage) => {
   const start = code.slice(0, 100);
   const end = code.length > 100 ? code.slice(-100) : "";
   return `${language}:${code.length}:${start}:${end}`;
 };
 
 const getHighlighter = (
-  language: BundledLanguage,
+  language: CodeLanguage,
 ): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
   const cached = highlighterCache.get(language);
   if (cached) {
@@ -182,7 +192,7 @@ const createRawTokens = (code: string): TokenizedCode => ({
 // Synchronous highlight with callback for async results
 export const highlightCode = (
   code: string,
-  language: BundledLanguage,
+  language: CodeLanguage,
   // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-callbacks)
   callback?: (result: TokenizedCode) => void,
 ): TokenizedCode | null => {
@@ -207,7 +217,9 @@ export const highlightCode = (
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((highlighter) => {
       const availableLangs = highlighter.getLoadedLanguages();
-      const langToUse = availableLangs.includes(language) ? language : "text";
+      // Shiki's built-in `ansi` renders terminal colors but is never listed as loaded.
+      const langToUse =
+        language === "ansi" || availableLangs.includes(language) ? language : "text";
 
       const result = highlighter.codeToTokens(code, {
         lang: langToUse,
@@ -361,15 +373,25 @@ export const CodeBlockContent = ({
   language,
   showLineNumbers = false,
   wrap = false,
+  className,
+  leading,
 }: {
   code: string;
-  language: BundledLanguage;
+  language: CodeLanguage;
   showLineNumbers?: boolean;
   /** Soft-wrap long lines instead of horizontal scrolling. */
   wrap?: boolean;
+  /** Extra classes for the `<pre>`, e.g. to override its padding or background. */
+  className?: string;
+  /** Rendered before the code in the same box, e.g. a floated toolbar the first line wraps around. */
+  leading?: ReactNode;
 }) => {
   // Memoized raw tokens for immediate display
-  const rawTokens = useMemo(() => createRawTokens(code), [code]);
+  // Raw ANSI escapes would flash on screen until the highlighter loads.
+  const rawTokens = useMemo(
+    () => createRawTokens(language === "ansi" ? stripAnsi(code) : code),
+    [code, language],
+  );
 
   // Synchronous cache lookup — avoids setState in effect for cached results
   const syncTokens = useMemo(
@@ -408,8 +430,9 @@ export const CodeBlockContent = ({
       className="relative overflow-auto"
       data-code-highlighted={tokenized === rawTokens ? "false" : "true"}
     >
+      {leading}
       <CodeBlockBody
-        className={wrap ? "whitespace-pre-wrap wrap-anywhere" : undefined}
+        className={cn(wrap && "whitespace-pre-wrap wrap-anywhere", className)}
         showLineNumbers={showLineNumbers}
         tokenized={tokenized}
       />

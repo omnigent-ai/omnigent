@@ -16,6 +16,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import httpx
@@ -917,7 +918,27 @@ def test_list_agy_pids_parses_pgrep_output(monkeypatch: pytest.MonkeyPatch) -> N
         return _completed("1234\n5678\nnot-a-pid\n")
 
     monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr(
+        rpc.psutil, "Process", lambda pid: SimpleNamespace(cmdline=lambda: ["/usr/local/bin/agy"])
+    )
     assert rpc._list_agy_pids() == [1234, 5678]
+
+
+def test_list_agy_pids_skips_supervisors_and_finds_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = {
+        100: ["python", "-m", "gateway", "--", "/usr/local/bin/agy"],
+        200: ["/usr/local/bin/agy"],
+        300: ["/usr/local/bin/agy-helper"],
+    }
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _completed("100\n200\n300\n"))
+    monkeypatch.setattr(
+        rpc.psutil, "Process", lambda pid: SimpleNamespace(cmdline=lambda: commands[pid])
+    )
+    monkeypatch.setattr(rpc, "_child_pids", lambda pid: [200] if pid == 100 else [])
+    assert rpc._list_agy_pids() == [200]
+    assert rpc._agy_pid_in_pane_subtree(100) == 200
 
 
 def test_list_agy_pids_falls_back_to_proc_when_pgrep_missing(
@@ -971,6 +992,8 @@ def test_list_agy_pids_from_proc_matches_bin_agy(
     _write("111", ["/usr/local/bin/agy", "--dangerously-skip-permissions"])
     _write("222", ["node", "/opt/other/server.js"])  # unrelated → skipped
     _write("333", ["/data/.local/bin/agy"])  # installer-default path → matches
+    _write("555", ["python", "-m", "gateway", "--", "/usr/local/bin/agy"])
+    _write("666", ["/usr/local/bin/agy-helper"])
     (tmp_path / "not-a-pid").mkdir()  # non-numeric entry → skipped
 
     monkeypatch.setattr(rpc, "_PROC_FS", str(tmp_path))

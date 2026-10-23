@@ -138,6 +138,7 @@ export function SharingPage() {
   }
 
   const current = state?.sharing_mode;
+  const currentTier = TIERS.find((tier) => tier.id === current);
   const editable = state?.editable ?? false;
   const publicEnabled = state?.public_sharing_enabled ?? true;
   const publicEditable = state?.public_sharing_editable ?? false;
@@ -201,39 +202,57 @@ export function SharingPage() {
             )}
             <div className="flex flex-col gap-6">
               <SettingsGroup title="Sharing mode" testId="settings-group-sharing-mode">
-                <fieldset
-                  className="divide-y divide-border"
-                  disabled={!editable || setMode.isPending}
-                  aria-label="Session sharing mode"
-                >
-                  {TIERS.map((tier) => {
-                    const selected = tier.id === current;
-                    return (
-                      <label
-                        key={tier.id}
-                        className={cn(
-                          "flex cursor-pointer items-start gap-3 py-4 first:pt-0 last:pb-0",
-                          (!editable || setMode.isPending) && "cursor-not-allowed opacity-70",
-                        )}
-                      >
-                        <input
-                          type="radio"
-                          name="sharing-mode"
+                <div className="flex flex-col gap-3 md:flex-row-reverse md:items-start md:gap-6">
+                  <Select
+                    value={current}
+                    onValueChange={(value) => choose(value as SharingMode)}
+                    disabled={!editable || setMode.isPending}
+                    componentId="settings.sharing.mode"
+                    valueHasNoPii
+                  >
+                    <SelectTrigger
+                      className="w-full shrink-0 md:w-52"
+                      aria-label="Session sharing mode"
+                      aria-describedby="sharing-mode-description"
+                    >
+                      <SelectValue>{currentTier?.label}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent
+                      position="popper"
+                      align="end"
+                      className="w-[28rem] max-w-[calc(100vw-2rem)]"
+                    >
+                      {TIERS.map((tier) => (
+                        <SelectItem
+                          key={tier.id}
                           value={tier.id}
-                          checked={selected}
-                          onChange={() => choose(tier.id)}
-                          disabled={!editable || setMode.isPending}
-                          className="mt-1 size-4 accent-primary"
-                        />
-                        <SettingsLabel
-                          label={tier.label}
-                          description={tier.description}
-                          className="flex-1"
-                        />
-                      </label>
-                    );
-                  })}
-                </fieldset>
+                          textValue={tier.label}
+                          aria-labelledby={`sharing-mode-${tier.id}-label`}
+                          aria-describedby={`sharing-mode-${tier.id}-description`}
+                          className="py-2"
+                        >
+                          <span className="flex flex-col gap-1">
+                            <span id={`sharing-mode-${tier.id}-label`} className="font-medium">
+                              {tier.label}
+                            </span>
+                            <span
+                              id={`sharing-mode-${tier.id}-description`}
+                              className="text-sm leading-normal whitespace-normal text-muted-foreground"
+                            >
+                              {tier.description}
+                            </span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p
+                    id="sharing-mode-description"
+                    className="min-w-0 flex-1 text-sm leading-normal text-muted-foreground md:pt-1"
+                  >
+                    {currentTier?.description}
+                  </p>
+                </div>
               </SettingsGroup>
 
               <SettingsGroup title="Public sharing" testId="settings-group-public-sharing">

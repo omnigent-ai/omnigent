@@ -1131,8 +1131,25 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
 
 
-def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
-    """Outputs of parallel calls that finished out of order replay in call order."""
+@pytest.mark.parametrize(
+    "separator_type",
+    [
+        None,
+        "resource_event",
+        "error",
+        "routing_decision",
+        "slash_command",
+        "terminal_command",
+        "interrupted_user",
+        "interrupted_assistant",
+        "interrupted_call",
+        "interrupted_output",
+    ],
+)
+def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
+    separator_type: str | None,
+) -> None:
+    """Omitted metadata and interrupted turns cannot split a replayed output run."""
 
     def call(call_id: str) -> dict[str, Any]:
         return {
@@ -1153,21 +1170,59 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
             "output": f"{call_id} done",
         }
 
-    records = codex_native._codex_rollout_records_from_session_items(
-        [
-            call("call_a"),
-            call("call_b"),
-            output("call_b"),
-            output("call_orphan"),
-            output("call_a"),
-            {
-                "id": "msg_1",
-                "response_id": "codex_turn_1",
+    separators: list[dict[str, Any]] = []
+    interrupted = separator_type is not None and separator_type.startswith("interrupted_")
+    if interrupted:
+        if separator_type == "interrupted_call":
+            separator = call("call_cancelled")
+        elif separator_type == "interrupted_output":
+            separator = output("call_cancelled")
+        else:
+            role = "user" if separator_type == "interrupted_user" else "assistant"
+            separator = {
                 "type": "message",
+                "role": role,
+                "content": [
+                    {
+                        "type": f"{'input' if role == 'user' else 'output'}_text",
+                        "text": "cancelled",
+                    }
+                ],
+            }
+        separators.append({**separator, "response_id": "codex_cancelled"})
+    elif separator_type is not None:
+        separators.append({"type": separator_type})
+    items = [
+        call("call_a"),
+        call("call_b"),
+        output("call_b"),
+        *separators,
+        output("call_orphan"),
+        output("call_a"),
+        {
+            "id": "msg_1",
+            "response_id": "codex_turn_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "both finished"}],
+        },
+    ]
+    if interrupted:
+        items.append(
+            {
+                "type": "message",
+                "response_id": "codex_cancelled",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "both finished"}],
-            },
-        ],
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            }
+        )
+    ordered = codex_native._codex_items_with_outputs_in_call_order(items)
+    if separator_type is not None and not interrupted:
+        assert ordered[3] is items[3]
+    assert items[2]["call_id"] == "call_b"
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
         session_id="conv_codex",
         external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
         cwd=Path("/workspace"),
@@ -1188,3 +1243,28 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
         ("function_call_output", "call_orphan"),
         ("message", None),
     ]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        {"type": "message", "role": "user", "content": [{"type": "input_image"}]},
+        {"type": "message", "role": "developer", "content": "instructions"},
+        {"type": "reasoning", "summary": []},
+        {"type": "native_tool", "name": "view_image"},
+        {"type": "compaction", "summary": "compacted"},
+        {"type": "unknown_future_item"},
+    ],
+    ids=["image", "developer", "reasoning", "native_tool", "compaction", "unknown"],
+)
+def test_replay_output_order_preserves_content_boundaries(boundary: dict[str, Any]) -> None:
+    """Output ordering never moves results across content or a compaction snapshot."""
+    items = [
+        {"type": "function_call", "call_id": "call_a"},
+        {"type": "function_call", "call_id": "call_b"},
+        {"type": "function_call_output", "call_id": "call_b"},
+        boundary,
+        {"type": "function_call_output", "call_id": "call_a"},
+    ]
+
+    assert codex_native._codex_items_with_outputs_in_call_order(items) == items

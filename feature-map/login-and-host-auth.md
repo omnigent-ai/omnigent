@@ -15,6 +15,11 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `workspace-selector-validation`: a URL's `?o=` routes the current command
+  without replacing saved login details. Login and launch auth probes compare
+  it with the server's workspace header, even on HTTP 200; a mismatch names both
+  workspaces and asks for the full URL. Only successful verification saves the
+  selector. Servers without the header retain their existing login behavior.
 - `cli-browser-ticket-consent`: an OIDC sign-in opens a ticket-specific browser
   login and then an **Authorize sign-in** page. Compare its code with the CLI,
   choose **Approve** to complete sign-in, or **Deny** to stop it. Signing in
@@ -32,6 +37,16 @@ be able to write resources without a separate Omnigent account.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.
 - `host-lifecycle`: register in the foreground or background, run as a per-user
   system service, and check status, stop, stop a session, or reset the host ID.
+  A machine runs one host per host ID and Databricks workspace, even through
+  two URLs for it, once the workspace ID is known from the server or a login
+  record; otherwise (a non-Databricks server, or an unreachable server with no
+  login record) daemons stay per URL. A second background daemon yields and
+  `host --background` or `start` reports the running one, a foreground `host`
+  refuses after retrying for about 6 s, and a service host waits until the
+  other daemon stops. If the server reports the running daemon's host offline,
+  a launch doesn't reuse it; it refuses and names the login and `host stop`
+  commands that fix it. Without file locks (Windows), daemons check only each
+  other's records, so two that start at the same moment can both connect.
 - `host-inline-login`: `omnigent host` against a Databricks-fronted server that
   the user is not signed in to runs the login flow first; `--non-interactive`
   fails with the login command instead. States: missing Databricks SDK extra,
@@ -123,6 +138,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   (starts its own accounts server; run with plain `uv run pytest`).
 - **`profile-selection`:**
   `tests/e2e/test_host_auth_prefers_user_over_m2m_sp_e2e.py::test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile`
+- **`workspace-selector-validation`:**
+  `tests/e2e/test_host_inline_login.py::test_login_rejects_truncated_workspace_selector`
+  runs the real CLI and local server behind the existing mock HTTPS workspace,
+  using a test-owned PAT and CA. The proxy accepts the bearer but reports a
+  different workspace. Login must fail without changing auth/config files; a
+  corrected URL must succeed. This tests CLI, HTTP and file boundaries, not a
+  live Databricks deployment. The login and backend unit suites cover cached,
+  refreshed and header-auth responses, omitted headers, and process-local routing.
 - **`expired-credential`:**
   `tests/e2e/test_expired_databricks_credential_launch.py::test_expired_databricks_credential_offers_reauth_not_edge_403`
 - **Pending host sign-in:**
@@ -138,7 +161,27 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   profile of each kind. No e2e covers the host daemon against a real workspace.
 - **`host-lifecycle`:** run `omnigent host --help` and the management commands
   inside cli-setup-verify's sandbox; the system service commands change the
-  user's login items, so only run them on a disposable machine.
+  user's login items, so only run them on a disposable machine. One host per
+  workspace: `tests/host/test_daemon_lifecycle.py` (the `test_daemon_yields_*`
+  cases, `test_daemon_without_flock_yields_to_current_workspace_record`, and
+  `test_background_daemon_loser_exits_before_connecting`),
+  `tests/host/test_cli_host.py`
+  (`test_background_commands_report_reuse_when_the_spawned_daemon_yields` and
+  the `test_foreground_host_*_workspace*` cases; offline daemons:
+  `test_same_workspace_daemon_offline_reason*` and
+  `test_host_background_reuses_same_workspace_daemon_only_when_online`), and
+  `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
+  A real check needs two URLs that reach one workspace, so run it only in a
+  private-network sandbox against a disposable server.
+- **Background harness credentials (own environment, installed Codex/Claude SDK):**
+  `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
+  and background hosts. Saved provider env references and named passthrough keep
+  the configured harness ready; unreferenced keys remain filtered. Uses isolated
+  homes and synthetic credentials without model requests. The Claude SDK case
+  needs bubblewrap when machine-managed settings exist. This covers fresh hosts;
+  existing-daemon refresh and installed OS services need separate verification.
+  `tests/host/test_service.py::test_service_persists_explicit_host_credentials_privately`
+  checks launchd/systemd file contents and permissions with service commands mocked.
 - **`host-inline-login` (own environment, Linux):** run
   `uv run --no-sync pytest tests/e2e/test_host_inline_login.py --reruns 0 -q`.
   It starts an isolated real server and a local HTTPS mock workspace, then
@@ -221,6 +264,10 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 
 ## Gotchas
 
+- Background hosts capture their environment when started; restart the host after
+  changing forwarded credentials. `host enable` saves explicitly forwarded values
+  in plaintext in the per-user service definition, readable only by its owner
+  (0600), so the service can retain them across logins.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

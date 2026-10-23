@@ -125,6 +125,7 @@ SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "succeeded": 3,
     "failed": 4,
     "skipped": 5,
+    "starting": 6,
 }
 
 

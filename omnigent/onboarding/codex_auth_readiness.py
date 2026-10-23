@@ -16,11 +16,10 @@ would authenticate the selected provider.
 from __future__ import annotations
 
 import os
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
-
-import tomllib
 
 CODEX_BUILTIN_PROVIDERS = frozenset(
     {"openai", "amazon-bedrock", "amazon-bedrock-runtime", "ollama", "lmstudio"}

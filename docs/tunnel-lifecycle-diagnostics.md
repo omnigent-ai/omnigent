@@ -89,7 +89,115 @@ session impact or changes KPI eligibility.
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
   `history_len`, `last_item_type`, and the resulting `status`.
 
+### Stack capture during runner event-loop stalls
+
+The runner starts the same dedicated-thread watchdog used by the server while
+its app lifespan is serving. It emits `runner_event_loop_stalled` after five
+seconds without event-loop progress, at most once per minute across all stalls
+and tunnel reconnects. Startup and shutdown are outside the monitored interval.
+Thread startup failure emits `runner_event_loop_watchdog_failed`; serving
+continues without stack capture.
+
+The warning carries `pid`, `stalled_s`, `threshold_s`, `loop_thread_id`, and
+`report_interval_s`. The existing debug sink adds `runner_id`, the primary
+session ID when present, `hostname`, and the client version. Join by runner ID,
+PID, and time with `runner_connected` and `runner_tunnel_health`; the watchdog
+belongs to the process, so it has no connection ID. Its `stack_trace` column
+contains the sampled blocking Python frame locations, bounded to 64 frames and
+8,192 UTF-8 bytes, with no source lines, arguments, or locals. It can capture a
+synchronous credential, filesystem, or subprocess wait before that call returns,
+independently of the event loop and its default executor.
+
+A native extension holding the GIL or a whole-process/VM pause can also prevent
+the watchdog thread from running. A sample collected just after such a pause
+may show resuming execution; it does not establish what caused the pause. An
+absent sample does not prove a healthy runner, particularly when client telemetry
+is disabled or unavailable. Correlate simultaneous process stalls with separate
+host resource and lifecycle evidence. The watchdog never closes a tunnel or
+restarts work.
+
+Use `process_role="runner"` in the isolated example below to verify the runner
+event name and captured stack without interrupting a running session.
+
 ## Server events (`source = 'server'`)
+
+### Stack capture during event-loop stalls
+
+The server starts a dedicated watchdog thread while its ASGI lifespan is serving.
+It checks a one-second event-loop heartbeat and emits `server_event_loop_stalled`
+at WARNING when that heartbeat has not advanced for five seconds. Reports are
+limited to one per minute per app lifespan, including across separate stalls.
+Capture failures also consume this cooldown to limit repeated errors; samples
+discarded because the heartbeat recovered do not.
+The thread does not depend on the event loop or its default executor, so it can
+sample a blocking call before the loop recovers. Startup and shutdown are not
+monitored. If the watchdog thread cannot start, the server continues serving
+and emits `server_event_loop_watchdog_failed` at ERROR.
+
+The warning includes `pid`, `stalled_s`, `threshold_s`, `loop_thread_id`, and
+`report_interval_s` attributes. The message stays on one line; the sampled stack
+is stored once in the debug-log table's `stack_trace` column, carried by the log
+record's `captured_stack_trace` field. It contains at most 64 frames and 8,192
+UTF-8 bytes including the header and omission marker. Frames are innermost first,
+and truncation preserves whole lines and ends with `... older frames omitted ...`.
+Source lines and local variables are not collected. This is a process-level
+event, so correlate by `hostname` and `client_time`, not by session ID.
+
+Set `debug_logs_table` to the configured, fully qualified debug-log table name:
+
+```sql
+SELECT client_time, hostname, attributes['stalled_s'] AS stalled_s, stack_trace
+FROM IDENTIFIER(:debug_logs_table)
+WHERE client_time BETWEEN :start_time AND :end_time
+  AND source = 'server'
+  AND event_name = 'server_event_loop_stalled'
+ORDER BY client_time
+LIMIT 100;
+```
+
+The watchdog is diagnostic only: it neither closes tunnels nor restarts tasks.
+Context exit waits at most 0.1 seconds for its thread. A logging handler stuck
+holding its lock can still delay other shutdown logging or `logging.shutdown()`.
+A native extension holding the GIL, or a process that cannot be scheduled, can
+also prevent the watchdog thread from running. No sample does not establish
+that the loop was healthy. After a process-wide pause (such as SIGSTOP, CPU
+throttling, or a VM pause), the watchdog may run before the overdue heartbeat
+and report a stall with a stack from resuming execution. A sample shows where
+execution was observed, not by itself why it was slow. Managed deployments need
+to incorporate this server change before the new events will appear.
+
+To verify capture locally without interrupting a running server:
+
+```sh
+uv run --no-sync python - <<'PY'
+import asyncio
+import logging
+import time
+from omnigent.util.event_loop_watchdog import monitor_event_loop
+
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter(
+    "%(message)s\n%(captured_stack_trace)s",
+    defaults={"captured_stack_trace": ""},
+))
+logging.basicConfig(level=logging.WARNING, handlers=[handler])
+
+async def main():
+    with monitor_event_loop():
+        time.sleep(7)  # Deliberately block only this throwaway process.
+        await asyncio.sleep(0.1)
+
+asyncio.run(main())
+PY
+```
+
+This example's formatter explicitly displays the captured stack; default console
+logging shows only the one-line warning. Expect one warning around five seconds,
+with `main` and the `time.sleep` line's location in the stack. No locals or source
+text should appear. Normal async waiting emits no warning. The watchdog stops
+when the context exits.
+
+### Tunnel lifecycle
 
 - `runner_tunnel` with `phase` `connected`, `disconnected` or
   `error`: `connection_id` from the runner's hello, `connection_age_s`,
@@ -130,7 +238,8 @@ session impact or changes KPI eligibility.
   the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `handed_off`, `live_elsewhere`,
-  `rebound`, `idle_no_failure` or `failed_mid_turn`), the matching `outage_id`,
+  `rebound`, `held_host_offline`, `idle_no_failure` or `failed_mid_turn`), the
+  matching `outage_id`,
   loss-time `runner_id`/`turn_id`, `grace_s`, `outage_s`, `retries`, and the
   schema marker. `server_shutting_down` and `runner_handoff_reason` say whether
   this replica's own shutdown mark or a per-runner handoff mark was fresh at the
@@ -140,7 +249,10 @@ session impact or changes KPI eligibility.
   means the stored binding named another runner both when the transport was
   lost and at the decision: the session had moved on a replica that could not
   cancel this relay, so the lost runner no longer owns its turn. A move during
-  the outage still fails the turn. The
+  the outage still fails the turn. `held_host_offline` means the session's
+  user-run host went offline too; the disconnect sweep holds the turn
+  (`runner_disconnect_held_host_offline` / `runner_disconnect_hold_ended`) and
+  the reconnect restarts the relay. The
   `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
@@ -186,10 +298,45 @@ session impact or changes KPI eligibility.
   `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
   The latter measures content activity, not the time of a status transition.
   A relay cache hit does not load conversation metadata solely for logging.
-- `runner_session_init_started`: `resume_interrupted_turn`,
-  `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
-  reconnect hook; resume set is a sub-agent restore; suppress set is a
-  message forward.
+- `runner_session_init_decision`: reconnect decisions are `initialize_now` or
+  `defer`, with `reason` (`idle`, `archived`, `no_agent`, or `recovery_required`),
+  `live_status`, pending elicitation count, last-task-error presence, and eager
+  recovery state. Initializer callers record `start`, `join_in_flight`, or
+  `reuse_completed`; a removed agent records `skip` with `reason=agent_removed`.
+  Every decision includes the session, runner, `runner_generation`, `init_trigger`,
+  `has_agent`, `archived`, `server_version`, and `server_commit_sha`. The commit is
+  `unknown` when the installed package lacks build metadata.
+- `runner_session_init_started`, `runner_session_initialized`, and
+  `runner_session_init_failed` share `init_attempt_id`, `runner_generation`,
+  `init_trigger`, and server build identity. Completion and failure include
+  `duration_ms` for the handshake. Joined/cached callers reference the same attempt
+  ID in their decisions, even when their HTTP requests or triggers differ.
+  `reuse_completed` describes task completion, not success: a failed task awaiting
+  eviction can still be observed. Check the attempt's completion/failure event.
+  `init_trigger` distinguishes `runner_connect`, `web_message`, `retry_session`,
+  `native_control`, and `child_recovery`; other ensure callers that pass the shared
+  initializer use `session_ensure`. The direct-POST fallback without an initializer
+  does not emit these initialization diagnostics (including scheduled dispatch and
+  Codex goal launch).
+  Direct callers that do not identify their trigger record `unspecified`.
+  Recovery flags and `recovery_id` remain on the start event; the flags alone do
+  not uniquely identify the caller.
+
+An interactive native terminal does not establish that the separate runtime
+handshake has run. To investigate delayed initialization, first find the
+connection's decision using the session, runner, and generation. A `defer` decision
+followed later by a web-message trigger is different from a handshake that started
+immediately and took a long time to complete.
+
+For native message events, start at `native_input_received`, before initialization can block
+delivery. Join using the session and HTTP `request_id`, or `input_stable_id` when
+available, then follow the initialization decision/attempt and
+`native_input_enqueued` / `native_input_forward_started`. The receipt timestamp is
+when the authorized request reached the route, not the time the user clicked Send.
+These events can also come from CLI/REPL or server startup-input dispatch through
+the same route. `web_message` names that initialization callsite, not the client UI.
+The receipt contains no message text, and a receipt without a completion does not
+establish a failed delivery by itself. These logs do not change KPI classification.
 
 ## Native event ingestion
 

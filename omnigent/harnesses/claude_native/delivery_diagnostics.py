@@ -19,6 +19,11 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 _Parameters = ParamSpec("_Parameters")
 _TMUX_OPERATIONS = frozenset({"send-keys", "load-buffer", "paste-buffer", "kill-session"})
+# Claude Code's composer placeholder while a submitted message waits for a busy turn.
+_QUEUED_PLACEHOLDER = "Press up to edit queued messages"
+# Written by the statusLine wrapper (see ``status.py``); read here without the bridge.
+_CONTEXT_FILE = "context.json"
+_LEADING_CHAR_CLASSES = {"/": "slash", "!": "bang", "@": "at", "#": "hash", "?": "question"}
 
 
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
@@ -149,6 +154,8 @@ def trace_delivery(
                             "newline_count": normalized.count("\n"),
                             "leading_blank_line": bool(normalized)
                             and not normalized.split("\n", 1)[0].strip(),
+                            **_content_shape(content),
+                            **_claude_code_version(bridge_dir),
                             "outcome": outcome,
                             "verification": verification,
                             "delivery_outcome": (
@@ -187,10 +194,44 @@ def trace_delivery(
     return decorate
 
 
+def _content_shape(content: str) -> dict[str, object]:
+    """Classify a message's shape (leading character, words, non-ASCII) without its text."""
+    stripped = content.strip()
+    leading = stripped[:1]
+    if not leading:
+        leading_class = "none"
+    elif not leading.isascii():
+        leading_class = "non_ascii"
+    elif leading.isalpha():
+        leading_class = "letter"
+    elif leading.isdigit():
+        leading_class = "digit"
+    else:
+        leading_class = _LEADING_CHAR_CLASSES.get(leading, "other")
+    return {
+        "content_leading_char": leading_class,
+        "content_word_count": len(stripped.split()),
+        "content_non_ascii": not content.isascii(),
+    }
+
+
+def _claude_code_version(bridge_dir: Path) -> dict[str, object]:
+    """Return the Claude Code version the statusLine last reported, when one is on disk."""
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        version = json.loads((bridge_dir / _CONTEXT_FILE).read_text(encoding="utf-8")).get(
+            "claude_code_version"
+        )
+        if isinstance(version, str) and version:
+            return {"claude_code_version": version}
+    return {}
+
+
 class DraftObservation(TypedDict):
     capture_empty: bool
     prompt_glyph_visible: bool
+    prompt_row_framed: bool
     needle_visible_below_prompt: bool
+    queued_placeholder_visible: bool
     pane_rows: int
     pane_max_columns: int
 
@@ -200,12 +241,16 @@ def _draft_observation(pane: str, needle: str, *, prompt_glyph: str) -> DraftObs
     lines = pane.splitlines()
     prompt_rows = [index for index, line in enumerate(lines) if prompt_glyph in line]
     last_prompt = prompt_rows[-1] if prompt_rows else None
+    rule_above = lines[last_prompt - 1].strip() if last_prompt else ""
     return {
         "capture_empty": not pane.strip(),
         "prompt_glyph_visible": last_prompt is not None,
+        # A rule right above the row marks Claude's input box, not a dialog option or echo.
+        "prompt_row_framed": bool(rule_above) and set(rule_above) == {"─"},
         "needle_visible_below_prompt": bool(needle)
         and last_prompt is not None
         and needle in "\n".join(lines[last_prompt + 1 :]),
+        "queued_placeholder_visible": _QUEUED_PLACEHOLDER in pane,
         "pane_rows": len(lines),
         "pane_max_columns": max((len(line) for line in lines), default=0),
     }

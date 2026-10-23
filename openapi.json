@@ -675,6 +675,25 @@
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
         "type": "object"
       },
+      "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pr_url",
+          "file"
+        ],
+        "title": "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
+        "type": "object"
+      },
       "BrandingInfo": {
         "properties": {
           "app_name": {
@@ -2875,6 +2894,28 @@
         "title": "FailedResponseObject",
         "type": "object"
       },
+      "FilesystemAttachmentsInfo": {
+        "description": "Which uploads native sessions receive as files, for client-side checks.",
+        "properties": {
+          "all_types": {
+            "title": "All Types",
+            "type": "boolean"
+          },
+          "extensions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Extensions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "extensions",
+          "all_types"
+        ],
+        "title": "FilesystemAttachmentsInfo",
+        "type": "object"
+      },
       "FunctionCallData": {
         "description": "Data for a function_call item.\n\n**Parameters**\n\n- `agent` \u2014 Agent name. Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -3845,10 +3886,32 @@
       "McpServerSummary": {
         "description": "An MCP server a harness loads on the host, without secrets.",
         "properties": {
+          "auth_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "connected",
+                  "sign_in_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Account state reported by the host's sign-in manager: `connected` or `sign_in_required`; `None` when nothing reports one.",
+            "title": "Auth Status"
+          },
           "harness": {
             "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
             "title": "Harness",
             "type": "string"
+          },
+          "managed": {
+            "default": false,
+            "description": "Whether an organization pins this server for every user on the host (Claude Code's enterprise MCP config), so it is not the user's to edit.",
+            "title": "Managed",
+            "type": "boolean"
           },
           "name": {
             "description": "Server name as configured, e.g. `\"github\"`.",
@@ -3872,6 +3935,18 @@
             "description": "Config scope; always `user` today.",
             "title": "Scope",
             "type": "string"
+          },
+          "sign_in_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the user finishes signing in; only with `sign_in_required`, and only an http(s) URL carrying no credentials.",
+            "title": "Sign In Url"
           },
           "source_id": {
             "anyOf": [
@@ -4324,6 +4399,67 @@
           "item"
         ],
         "title": "NativeToolData",
+        "type": "object"
+      },
+      "NativeUsageBaseline": {
+        "description": "Own-session cumulative tokens for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
+        "properties": {
+          "cumulative_cache_read_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Cache Read Input Tokens",
+            "type": "integer"
+          },
+          "cumulative_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Input Tokens",
+            "type": "integer"
+          },
+          "cumulative_output_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Output Tokens",
+            "type": "integer"
+          }
+        },
+        "title": "NativeUsageBaseline",
+        "type": "object"
+      },
+      "OpenFileRequest": {
+        "additionalProperties": false,
+        "description": "A workspace-relative file to show, without reading or modifying it.",
+        "properties": {
+          "path": {
+            "description": "Workspace-relative file path.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "OpenFileRequest",
+        "type": "object"
+      },
+      "OpenFileResponse": {
+        "description": "Delivery to live streams is not an acknowledgement from a file viewer.",
+        "properties": {
+          "subscribers": {
+            "format": "int64",
+            "title": "Subscribers",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "subscribers"
+        ],
+        "title": "OpenFileResponse",
         "type": "object"
       },
       "OutputFileDoneEvent": {
@@ -5604,6 +5740,18 @@
       "SandboxStatus": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nCarried on the session snapshot only while the session's\nbackground sandbox launch is in flight or has failed; `None`\nfor sessions without a managed launch and once the launch\nsucceeds (the session then looks like any host-bound session).",
         "properties": {
+          "details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the user needs to do when `stage == \"action_required\"`, e.g. `\"Sign in on your laptop.\"`. `None` otherwise.",
+            "title": "Details"
+          },
           "error": {
             "anyOf": [
               {
@@ -5629,9 +5777,10 @@
             "title": "Provider"
           },
           "stage": {
-            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
+            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox; `action_required` while it also needs the user to act) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
             "enum": [
               "provisioning",
+              "action_required",
               "cloning",
               "starting",
               "connecting",
@@ -5733,6 +5882,16 @@
             },
             "title": "Features",
             "type": "object"
+          },
+          "filesystem_attachments": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FilesystemAttachmentsInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
@@ -5918,7 +6077,8 @@
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
             "turn.completed": "#/components/schemas/TurnCompletedEvent",
             "turn.failed": "#/components/schemas/TurnFailedEvent",
-            "turn.started": "#/components/schemas/TurnStartedEvent"
+            "turn.started": "#/components/schemas/TurnStartedEvent",
+            "ui.open_file": "#/components/schemas/UiOpenFileEvent"
           },
           "propertyName": "type"
         },
@@ -6033,6 +6193,9 @@
           },
           {
             "$ref": "#/components/schemas/BrowserActionRequestEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UiOpenFileEvent"
           },
           {
             "$ref": "#/components/schemas/PolicyDeniedEvent"
@@ -7922,6 +8085,17 @@
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the web UI and the TUI stay in sync.",
             "title": "Model Override"
           },
+          "native_usage_baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeUsageBaseline"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pi's own cumulative token baseline, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+          },
           "parent_session_id": {
             "anyOf": [
               {
@@ -8195,6 +8369,19 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What the user needs to do when `stage == \"action_required\"`, e.g. `\"Sign in on your laptop.\"`. `None` otherwise.",
+            "title": "Details"
+          },
           "error": {
             "anyOf": [
               {
@@ -8238,6 +8425,7 @@
             "description": "The launch stage just entered, e.g. `\"provisioning\"` \u2014 see `SandboxStatus` for the full pipeline order.",
             "enum": [
               "provisioning",
+              "action_required",
               "cloning",
               "starting",
               "connecting",
@@ -9404,6 +9592,39 @@
         "title": "TurnStartedEvent",
         "type": "object"
       },
+      "UiOpenFileEvent": {
+        "description": "Ask current session viewers to open a workspace-relative file; never replayed.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "ui.open_file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "path"
+        ],
+        "title": "UiOpenFileEvent",
+        "type": "object"
+      },
       "UpdateCodexGoalStatusRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{id}/codex_goal/status`.\n\nCodex app-server represents pause/resume as `thread/goal/set` status\nupdates. Omnigent exposes the two user-driven transitions explicitly:\n`\"paused\"` pauses an active goal, and `\"active\"` resumes a paused,\nblocked, or usage-limited goal.",
@@ -10432,7 +10653,7 @@
         ]
       },
       "patch": {
-        "description": "Patch only supplied fields; require the ETag from GET /agents/{id}/config.",
+        "description": "Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config.",
         "operationId": "patch_agent_config_v1_agents__agent_id__patch",
         "parameters": [
           {
@@ -10548,16 +10769,6 @@
               }
             },
             "description": "Invalid partial configuration"
-          },
-          "428": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "If-Match is required"
           }
         },
         "summary": "Patch Agent Config",
@@ -16669,6 +16880,58 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/attachments": {
+      "post": {
+        "description": "Upload an image or video to embed in the selected PR's description.\n\nThe file goes to the provider without being kept by Omnigent, and the PR\nis unchanged until a description that links it is saved. Falls back to\nthe host tunnel when the runner is offline.\n\n**Parameters**\n\n- `pr_url` \u2014 The selected PR, which must be tracked by the session.\n- `file` \u2014 The image or video.\n\n**Returns:** A `session.github.pr_attachment` with the `url` to embed.",
+        "operationId": "upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Session Github Attachment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/changes": {
       "get": {
         "description": "List the PR's changed files (empty when the branch has no PR).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
@@ -16722,6 +16985,276 @@
           }
         },
         "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/details": {
+      "post": {
+        "description": "Replace the selected PR's title and/or description.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_details` with the PR's resulting title and body.",
+        "operationId": "update_session_github_details_v1_sessions__session_id__resources_github_details_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Details",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/disable-auto-merge": {
+      "post": {
+        "description": "Turn off the selected PR's auto-merge with the host's provider account.\n\nServed by the runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "disable_session_github_auto_merge_v1_sessions__session_id__resources_github_disable_auto_merge_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Session Github Auto Merge",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/labels": {
+      "get": {
+        "description": "List the labels the selected PR's repository offers, for the label picker.\n\nRequires edit access, like the label edit it feeds. Falls back to the\nhost tunnel when the runner is offline.\n\n**Returns:** A list of `{name, color, description}` with `has_more`.",
+        "operationId": "list_session_github_labels_v1_sessions__session_id__resources_github_labels_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Add and remove labels on the selected PR with the host's provider account.\n\nServed by the runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_labels` with the PR's resulting labels.",
+        "operationId": "update_session_github_labels_v1_sessions__session_id__resources_github_labels_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge": {
+      "post": {
+        "description": "Merge the selected PR with the host's provider account.\n\nThe merge applies only while the PR's head is `expected_head`. Served by\nthe runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_v1_sessions__session_id__resources_github_merge_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge-options": {
+      "get": {
+        "description": "List the merge methods the selected PR's repository allows, for the merge dialog.\n\nRequires edit access, like the merge it feeds. Falls back to the host\ntunnel when the runner is offline.\n\n**Returns:** A `session.github.merge_options` with `methods` and `default`.",
+        "operationId": "get_session_github_merge_options_v1_sessions__session_id__resources_github_merge_options_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Github Merge Options",
         "tags": [
           "session_resources"
         ]
@@ -16804,6 +17337,98 @@
           }
         },
         "summary": "Update Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/reviewers": {
+      "get": {
+        "description": "List the users and teams a review of the selected PR can be requested from.\n\nRequires edit access, like the reviewer edit it feeds. Falls back to the\nhost tunnel when the runner is offline.\n\n**Returns:** A list of `{login, kind, name}` with `has_more`.",
+        "operationId": "list_session_github_reviewers_v1_sessions__session_id__resources_github_reviewers_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Reviewers",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Request reviews on the selected PR and withdraw pending requests.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_reviewers` with the PR's resulting reviewers.",
+        "operationId": "update_session_github_reviewers_v1_sessions__session_id__resources_github_reviewers_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Reviewers",
         "tags": [
           "session_resources"
         ]
@@ -17140,6 +17765,59 @@
           }
         },
         "summary": "Stream Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/ui/open-file": {
+      "post": {
+        "description": "Ask current viewers to open a workspace-relative file.\n\nRequires session edit access. Requests are transient and never replayed.\nThe subscriber count measures stream delivery, not successful display:\nbackground subscribers may ignore the request, and the viewer retains\nits normal filesystem permissions, error handling and unsaved-edit guard.",
+        "operationId": "open_file_v1_sessions__session_id__ui_open_file_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenFileResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open File",
         "tags": [
           "sessions"
         ]

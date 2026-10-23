@@ -9,6 +9,9 @@ import {
 } from "react";
 import { toast } from "sonner";
 import { useIdentityReady, useViewerId } from "@/hooks/useViewerId";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -28,15 +31,19 @@ import {
 
 interface GridSessionsContextValue {
   enabled: boolean;
+  desktop: boolean;
   identityReady: boolean;
   grids: SessionGrid[];
   activeGrid?: SessionGrid;
   conversationId?: string;
+  /** Focused pane of the displayed grid; defaults to its first session. */
+  selectedSessionId?: string;
+  selectSession: (sessionId: string) => void;
   split: (targetId: string, sessionId: string, edge: SplitEdge) => void;
   closePane: (sessionId: string) => void;
   deleteGrid: (id: string) => void;
   renameGrid: (id: string, name: string) => void;
-  swapPanes: (firstId: string, secondId: string) => void;
+  swapPanes: (firstId: string, secondId: string, edge?: SplitEdge) => void;
 }
 
 const GridSessionsContext = createContext<GridSessionsContextValue | null>(null);
@@ -49,6 +56,9 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
 }
 
 function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
+  const mobileViewport = useIsMobileViewport();
+  const coarsePointer = useIsCoarsePointer();
+  const desktop = !mobileViewport && !coarsePointer && !isIOSShell() && !isAndroidShell();
   const viewerId = useViewerId();
   const identityReady = useIdentityReady();
   const { conversationId: routeConversationId, gridId } = useParams<{
@@ -58,7 +68,7 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   const conversationId = isTempConvId(routeConversationId) ? undefined : routeConversationId;
   const navigate = useNavigate();
   const storageKey =
-    viewerId === null
+    viewerId === null || !desktop
       ? null
       : `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:${viewerId}`;
   const read = useCallback(() => {
@@ -83,6 +93,14 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   }, [storageKey, read]);
   const grids = saved.key === storageKey ? saved.grids : EMPTY_GRIDS;
   const activeGrid = grids.find((grid) => grid.id === gridId);
+  const [selection, setSelection] = useState<{ gridId: string; sessionId: string } | null>(null);
+  const activeSessionIds = activeGrid ? gridSessionIds(activeGrid.layout) : [];
+  const selectedSessionId =
+    selection !== null &&
+    selection.gridId === gridId &&
+    activeSessionIds.includes(selection.sessionId)
+      ? selection.sessionId
+      : activeSessionIds[0];
   const value = useMemo<GridSessionsContextValue>(() => {
     const save = (next: SessionGrid[]) => {
       if (storageKey === null) return;
@@ -100,10 +118,15 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
     };
     return {
       enabled: storageKey !== null,
+      desktop,
       identityReady,
       grids,
       activeGrid,
       conversationId,
+      selectedSessionId,
+      selectSession: (sessionId) => {
+        if (gridId) setSelection({ gridId, sessionId });
+      },
       split: (targetId, sessionId, edge) => {
         if (storageKey === null || isTempConvId(sessionId)) return;
         const layout = activeGrid?.layout ?? conversationId;
@@ -129,9 +152,9 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         }
       },
       deleteGrid,
-      swapPanes: (firstId, secondId) => {
+      swapPanes: (firstId, secondId, edge) => {
         if (!activeGrid) return;
-        const layout = swapGridSessions(activeGrid.layout, firstId, secondId);
+        const layout = swapGridSessions(activeGrid.layout, firstId, secondId, edge);
         if (layout !== activeGrid.layout)
           save(grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)));
       },
@@ -141,10 +164,20 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
           save(grids.map((grid) => (grid.id === id ? { ...grid, name: trimmed } : grid)));
       },
     };
-  }, [grids, activeGrid, conversationId, gridId, navigate, storageKey, identityReady]);
+  }, [
+    grids,
+    activeGrid,
+    conversationId,
+    selectedSessionId,
+    gridId,
+    navigate,
+    storageKey,
+    identityReady,
+    desktop,
+  ]);
   return <GridSessionsContext.Provider value={value}>{children}</GridSessionsContext.Provider>;
 }
 
 export function gridTitle(grid: SessionGrid): string {
-  return grid.name || `Grid · ${gridSessionIds(grid.layout).length} sessions`;
+  return `${grid.name || "Grid"} · ${gridSessionIds(grid.layout).length} sessions`;
 }

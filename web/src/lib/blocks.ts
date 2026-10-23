@@ -700,6 +700,8 @@ export interface ElicitationBlock {
    * ``setMode(auto)``). Absent/false for all other elicitations.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button

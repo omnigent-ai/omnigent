@@ -7,6 +7,7 @@ import base64
 import contextlib
 import json
 import os
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -17,7 +18,6 @@ from typing import Any
 import click
 import httpx
 import pytest
-import tomllib
 import yaml
 from PIL import Image
 
@@ -2843,6 +2843,101 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
+
+
+def test_forwarder_rotation_redirects_viewers_of_the_cleared_session(
+    tmp_path: Path,
+) -> None:
+    """
+    A native Codex ``/clear`` tells the old session where its terminal went.
+
+    Without the notice and ``external_session_superseded`` event, a browser
+    on the old session keeps showing the cleared conversation while the
+    replacement only appears as a new sidebar entry.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_old",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_old",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    old_session_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve Omnigent calls made during Codex session rotation.
+
+        :param request: HTTP request from the forwarder.
+        :returns: Fake Omnigent response.
+        """
+        path = request.url.path
+        if request.method == "GET" and path == "/v1/sessions/conv_old":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_codex",
+                    "runner_id": "runner_123",
+                    "labels": {"omnigent.wrapper": "codex-native-ui"},
+                },
+            )
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_new"})
+        if request.method == "PATCH" and path in {
+            "/v1/sessions/conv_new",
+            "/v1/sessions/conv_old",
+        }:
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1]})
+        if request.method == "POST" and path.endswith("/transfer"):
+            return httpx.Response(200, json={"id": "terminal_codex_main"})
+        if request.method == "POST" and path == "/v1/sessions/conv_old/events":
+            old_session_events.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(500, json={"error": f"unexpected {request.method} {path}"})
+
+    async def run() -> bool:
+        """
+        Rotate onto a new native thread.
+
+        :returns: Whether the forwarder rotated.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(handler),
+        ) as ap_client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id="conv_old",
+                thread_id="thread_old",
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    ap_client, "conv_old"
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                    ap_client, "conv_old"
+                ),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            return await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=ap_client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url="ws://127.0.0.1:9876",
+                event=_thread_started_event("thread_new"),
+            )
+
+    assert asyncio.run(run())
+    assert [event["type"] for event in old_session_events] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
+    assert old_session_events[0]["data"] == {"status": "idle"}
+    notice = old_session_events[1]["data"]["item_data"]
+    assert notice["agent"] == "codex-native-ui"
+    assert "(/c/conv_new)" in notice["content"][0]["text"]
+    assert old_session_events[2]["data"] == {"target_conversation_id": "conv_new"}
 
 
 def test_forwarder_rotation_failure_preserves_old_target(
@@ -5943,7 +6038,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    assert [event for event in session_events if event.session_id == "conv_old"] == []
+    # The cleared session gets only the /clear notice and redirect, never a
+    # stale child-thread event.
+    assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
+        "external_session_status",
+        "external_conversation_item",
+        "external_session_superseded",
+    ]
     assert hook_posts == []
     assert fake_client.responses == []
 

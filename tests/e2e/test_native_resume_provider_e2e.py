@@ -32,10 +32,9 @@ from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
 from tests._helpers.live_server import terminate_process
 from tests._helpers.server_runner import server_runner
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
-from tests.e2e.test_host_codex_native_e2e import _send_user_text
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODEL = "claude-sonnet-4-5"
@@ -55,14 +54,15 @@ def _wait(check: Callable[[], _T], description: str, timeout: float = 60) -> _T:
 @pytest.mark.posix_only
 @pytest.mark.timeout(240)
 @pytest.mark.parametrize(
-    ("harness", "selection"),
+    ("harness", "selection", "restart_scope"),
     [
-        ("claude", "changed-default"),
-        ("claude", "unchanged-default"),
-        ("claude", "agent-pinned"),
-        ("pi", "changed-default"),
-        ("pi", "unchanged-default"),
-        ("pi", "harness-pinned"),
+        ("claude", "changed-default", "runner"),
+        ("claude", "unchanged-default", "runner"),
+        ("claude", "agent-pinned", "runner"),
+        ("pi", "changed-default", "runner"),
+        ("pi", "unchanged-default", "runner"),
+        ("pi", "harness-pinned", "runner"),
+        ("pi", "unchanged-default", "process"),
     ],
 )
 def test_connected_native_resume_routes_to_configured_provider(
@@ -71,6 +71,7 @@ def test_connected_native_resume_routes_to_configured_provider(
     mock_llm_server_url: str,
     harness: str,
     selection: str,
+    restart_scope: str,
 ) -> None:
     """A restart refreshes routing while keeping history, identity and explicit pins."""
     if (reason := cli_unavailable_reason(harness)) is not None:
@@ -200,12 +201,31 @@ def test_connected_native_resume_routes_to_configured_provider(
             return response.json()
 
         history: list[str] = []
+        expected_input_tokens = 0
+        expected_cache_tokens = 0
 
         def round_trip(expected: str, terminal: dict[str, Any] | None = None) -> None:
+            nonlocal expected_input_tokens, expected_cache_tokens
             prompt = f"provider-probe-{uuid.uuid4().hex}"
             replies = {name: f"{name}-reply-{uuid.uuid4().hex}" for name in providers}
+            input_tokens = 1000 if not history else 100
+            cache_tokens = 50 if not history else 5
             for name, url in providers.items():
-                configure_mock_llm(url, [], match=prompt)
+                configure_mock_llm(
+                    url,
+                    [
+                        {
+                            "text": replies[name],
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "cache_read_input_tokens": cache_tokens,
+                            },
+                        }
+                    ]
+                    if harness == "pi"
+                    else [],
+                    match=prompt,
+                )
                 set_fallback_mock_llm(url, prompt, replies[name])
 
             def captured_requests() -> dict[str, list[dict[str, Any]]] | None:
@@ -220,7 +240,7 @@ def test_connected_native_resume_routes_to_configured_provider(
                 return captured if any(captured.values()) else None
 
             if terminal is None:
-                _send_user_text(client, session_id=session_id, text=prompt)
+                send_user_text(client, session_id=session_id, text=prompt)
             else:
                 tmux = [
                     "tmux",
@@ -258,12 +278,31 @@ def test_connected_native_resume_routes_to_configured_provider(
                     f"/v1/sessions/{session_id}/items", params={"limit": 100, "order": "asc"}
                 )
                 response.raise_for_status()
-                return any(
-                    item.get("role") == "assistant" and replies[expected] in json.dumps(item)
-                    for item in response.json()["data"]
+                items = response.json()["data"]
+                return all(
+                    sum(item.get("role") == role and text in json.dumps(item) for item in items)
+                    == 1
+                    for role, text in (("user", prompt), ("assistant", replies[expected]))
                 )
 
             _wait(mirrored_reply, f"{harness} assistant reply mirrored into Omnigent")
+            if harness == "pi":
+                expected_input_tokens += input_tokens
+                expected_cache_tokens += cache_tokens
+
+                def usage_advanced() -> bool:
+                    usage = snapshot().get("usage_by_model") or {}
+                    return usage.get(_MODEL, {}).get("input_tokens") == expected_input_tokens
+
+                _wait(
+                    usage_advanced,
+                    f"Pi cumulative input usage reaching {expected_input_tokens}",
+                    timeout=15,
+                )
+                observed = snapshot()
+                usage = observed["usage_by_model"][_MODEL]
+                assert usage["cache_read_input_tokens"] == expected_cache_tokens
+                assert usage["output_tokens"] == 5 * (len(history) // 2 + 1)
             history.extend((prompt, replies[expected]))
             print(f"{harness} {selection}: expected={expected}, requests={counts}", flush=True)
 
@@ -273,21 +312,43 @@ def test_connected_native_resume_routes_to_configured_provider(
             before = snapshot()
             assert before["external_session_id"]
 
-            previous_runner = stack.runner
-            assert previous_runner is not None
-            terminate_process(previous_runner)
-            assert previous_runner.poll() is not None
-            _wait(
-                lambda: not client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"],
-                "stopped runner",
-            )
-            source_config = select_provider(
-                "legacy" if selection == "unchanged-default" else "current"
-            )
-            stack.runner = None
-            stack.start_runner(env=native_env, cwd=_REPO_ROOT)
-            assert stack.runner is not None and stack.runner.pid != previous_runner.pid
-            terminal = ensure_terminal()
+            if restart_scope == "process":
+                metadata = terminal["metadata"]
+                tmux = ["tmux", "-S", metadata["tmux_socket"]]
+                target = metadata["tmux_target"]
+                previous_pid = subprocess.check_output(
+                    [*tmux, "display-message", "-p", "-t", target, "#{pane_pid}"], text=True
+                ).strip()
+                subprocess.run([*tmux, "kill-pane", "-t", target], check=True)
+                terminal = ensure_terminal()
+                metadata = terminal["metadata"]
+                tmux = ["tmux", "-S", metadata["tmux_socket"]]
+                target = metadata["tmux_target"]
+                current_pid = subprocess.check_output(
+                    [*tmux, "display-message", "-p", "-t", target, "#{pane_pid}"], text=True
+                ).strip()
+                assert current_pid != previous_pid
+                assert stack.runner is not None and stack.runner.poll() is None
+                assert client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"]
+                source_config = (config_root / "config.yaml").read_text()
+            else:
+                previous_runner = stack.runner
+                assert previous_runner is not None
+                terminate_process(previous_runner)
+                assert previous_runner.poll() is not None
+                _wait(
+                    lambda: (
+                        not client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"]
+                    ),
+                    "stopped runner",
+                )
+                source_config = select_provider(
+                    "legacy" if selection == "unchanged-default" else "current"
+                )
+                stack.runner = None
+                stack.start_runner(env=native_env, cwd=_REPO_ROOT)
+                assert stack.runner is not None and stack.runner.pid != previous_runner.pid
+                terminal = ensure_terminal()
             expected = "current" if selection == "changed-default" else "legacy"
             round_trip(expected)
             after = snapshot()
@@ -298,6 +359,7 @@ def test_connected_native_resume_routes_to_configured_provider(
                 "reasoning_effort",
             ):
                 assert after.get(field) == before.get(field), f"resume changed {field}"
+            terminal = ensure_terminal()
             round_trip(expected, terminal)
             assert snapshot()["external_session_id"] == before["external_session_id"]
             assert (config_root / "config.yaml").read_text() == source_config

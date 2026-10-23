@@ -1109,8 +1109,8 @@ class CreateResponseRequest(BaseModel):
         "description": "...", "parameters": {...}}}]``.
     :param tool_choice: Ignored — agent controls this. Silently
         dropped.
-    :param max_output_tokens: Ignored — agent controls this.
-        Silently dropped.
+    :param max_output_tokens: Output token cap, e.g. ``32``.
+        Executors that support a cap apply it; others ignore it.
     :param frequency_penalty: Ignored — agent controls this.
         Silently dropped.
     :param presence_penalty: Ignored — agent controls this.
@@ -2012,9 +2012,11 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# ``failed`` are terminal. ``action_required`` is a provisioning-time
+# warning: the user needs to do what the status's ``details`` say.
 SandboxLaunchStage = Literal[
     "provisioning",
+    "action_required",
     "cloning",
     "starting",
     "connecting",
@@ -2034,13 +2036,17 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox) → ``cloning``
+        ``provisioning`` (creating the sandbox; ``action_required``
+        while it also needs the user to act) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -2049,6 +2055,19 @@ class SandboxStatus(BaseModel):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
+
+
+class NativeUsageBaseline(BaseModel):
+    """Own-session cumulative tokens for resuming a native usage reporter.
+
+    Excludes spawned sessions. Input includes cache reads, matching the native
+    usage event contract rather than the display's separate token buckets.
+    """
+
+    cumulative_input_tokens: int = Field(default=0, ge=0)
+    cumulative_output_tokens: int = Field(default=0, ge=0)
+    cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
 
 
 class ModelUsage(BaseModel):
@@ -2275,6 +2294,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
+    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
+        descendants. Available even when display usage aggregation is skipped;
+        ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2402,6 +2424,7 @@ class SessionResponse(BaseModel):
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
+    native_usage_baseline: NativeUsageBaseline | None = None
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -3624,6 +3647,9 @@ class SessionSandboxStatusEvent(_SSEEventBase):
         pipeline order.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -3639,6 +3665,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
 
 
 class McpServerStartup(BaseModel):
@@ -4345,6 +4372,13 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class UiOpenFileEvent(_SSEEventBase):
+    """Ask current session viewers to open a workspace-relative file; never replayed."""
+
+    type: Literal["ui.open_file"]
+    path: str
+
+
 class BrowserActionRequestEvent(_SSEEventBase):
     """
     Request that the desktop renderer perform one browser action.
@@ -4970,6 +5004,7 @@ ServerStreamEvent = Annotated[
     | ElicitationResolvedEvent
     # ── Transient (SSE-only) — embedded-browser action request ─
     | BrowserActionRequestEvent
+    | UiOpenFileEvent
     # ── Transient (SSE-only) — native policy DENY signal ───────
     | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────

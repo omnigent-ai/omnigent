@@ -21,6 +21,7 @@ import pytest
 from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
 from omnigent.inner._proc import process_alive
+from omnigent.onboarding.providers import ModelInfo
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 
 
@@ -963,6 +964,47 @@ def test_to_models_config_shape() -> None:
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
     assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
+
+
+def test_to_models_config_attributes_unity_gateway_providers() -> None:
+    """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    ug_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
+        "apiKey": "!get-token",
+        "api": "openai-responses",
+        "models": [{"id": "system.ai.gpt-5-5"}],
+        "headers": {"User-Agent": "ucode/0.1.0 pi/0.80.0"},
+    }
+    other_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-test",
+        "api": "openai-completions",
+        "models": [{"id": "qwen/qwen3"}],
+    }
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://dbc-1.cloud.databricks.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="system.ai.claude-sonnet-5",
+        api_key="!get-token",
+        auth_header=True,
+        additional_providers={"ug-openai": ug_provider, "other": other_provider},
+    )
+
+    providers = provider.to_models_config()["providers"]
+
+    assert providers["omnigent"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert providers["ug-openai"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 pi/0.80.0",
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert "headers" not in providers["other"]
+    # The configured payload is shared across renders, so it stays unstamped.
+    assert ug_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
@@ -4294,9 +4336,6 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
                 id="databricks-claude-fable-5-1", family="claude", metadata=capable
             ),
             model_catalog.ModelEntry(
-                id="databricks-gpt-6-luna", family="openai", metadata=capable
-            ),
-            model_catalog.ModelEntry(
                 id="databricks-gemini-3-8-flash", family="other", metadata=capable
             ),
             model_catalog.ModelEntry(
@@ -4310,6 +4349,14 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
         )
 
     monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider: (
+            [ModelInfo(name="gpt-6-luna", provider="openai", supports_reasoning=True)]
+            if provider == "openai"
+            else []
+        ),
+    )
 
     class _MockTransport(httpx.BaseTransport):
         def handle_request(self, request: httpx.Request) -> httpx.Response:

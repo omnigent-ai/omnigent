@@ -36,7 +36,9 @@ from omnigent._platform import default_shell_argv
 from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
+    PI_AGENT,
     is_databricks_ai_gateway_url,
+    with_gateway_attribution,
 )
 from omnigent.harnesses.pi_native.auth_command import (
     AUTH_DIR_ENV,
@@ -173,6 +175,7 @@ class _PiProviderPayload(TypedDict):
     models: list[_PiModelEntry]
     authHeader: NotRequired[bool]
     compat: NotRequired[_PiProviderCompat]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -391,6 +394,13 @@ class PiProviderConfig:
             provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
+        for provider_id, payload in providers.items():
+            if is_databricks_ai_gateway_url(payload["baseUrl"]):
+                # Copy rather than mutate: additional payloads are shared across renders.
+                headers = with_gateway_attribution(
+                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                )
+                providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
 
     def _register_on_surface(
@@ -432,7 +442,7 @@ class PiProviderConfig:
         )
 
 
-def _global_pi_agent_dir() -> Path:
+def global_pi_agent_dir() -> Path:
     """Return Pi's own agent config root (``~/.pi/agent`` by default).
 
     Honours Pi's ``PI_CODING_AGENT_DIR`` override so the pre-launch catalog
@@ -515,7 +525,7 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
         qualified as ``provider/model`` — the reference form Pi's ``--model``
         resolves natively against its own providers.
     """
-    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    root = agent_dir if agent_dir is not None else global_pi_agent_dir()
     entries = _pi_own_login_models(root)
     patterns = _pi_enabled_model_patterns(root)
     if patterns:
@@ -574,7 +584,7 @@ def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None 
     """Check a saved Pi reference independently of the picker shortlist."""
     if not reference:
         return False
-    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    root = agent_dir if agent_dir is not None else global_pi_agent_dir()
     return any(model.reference == reference for model in _pi_own_login_models(root))
 
 
@@ -969,7 +979,7 @@ def _fetch_pi_model_lists(
     """
     try:
         models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
-    except Exception:  # noqa: BLE001 — HTTP/network failure → empty
+    except Exception:  # HTTP/network failure → empty
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "
             "Pi will show only the selected model",
@@ -991,7 +1001,7 @@ def _fetch_pi_model_lists(
         models = enrich_databricks_model_catalog(
             models, model_catalog.catalog_model_entries("databricks")
         )
-    except Exception:  # noqa: BLE001 — live availability remains authoritative
+    except Exception:  # live availability remains authoritative
         _LOGGER.info(
             "pi-native: could not enrich the live Databricks model list with MLflow metadata",
             exc_info=True,
@@ -1208,7 +1218,7 @@ def _databricks_gateway_pi_provider(
                 claude_models, gpt_models, completions_models, gemini_models = (
                     _fetch_pi_model_lists(workspace_url, list_token)
                 )
-            except Exception:  # noqa: BLE001 — network failure must not break launch
+            except Exception:  # network failure must not break launch
                 _LOGGER.info(
                     "pi-native: could not fetch workspace model list; showing default model only",
                     exc_info=True,
@@ -1489,7 +1499,7 @@ def _live_family_model_entries(
             listing = model_catalog._fetch_openai_compatible_listing(
                 listing_provider, transport=transport
             )
-    except Exception:  # noqa: BLE001 — an unreachable listing must not break the picker
+    except Exception:  # an unreachable listing must not break the picker
         _LOGGER.info(
             "pi-native: could not list models for provider %s; offering only the "
             "configured default",
@@ -1683,14 +1693,18 @@ def resolve_pi_native_provider(
             base_config = _load_config()
         else:
             base_config = config_loader()
-    except Exception:  # noqa: BLE001 — legacy config failures fall back to Pi's own login
+    except Exception:  # legacy config failures fall back to Pi's own login
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
+    binding = binding_for_harness(config, "pi-native")
     selection = _split_pi_native_model_selection(model)
     if selection is not None:
-        _, model = selection
-    binding = binding_for_harness(config, "pi-native")
+        _, stripped = selection
+        allowlist = binding.model_allowlist if binding is not None else None
+        # Prefer the picker target; retain an allowlisted literal only as a fallback.
+        if allowlist is None or stripped in allowlist or model not in allowlist:
+            model = stripped
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
         selected = resolve_bound_model(config, "pi-native", model)
@@ -1845,7 +1859,7 @@ def resolve_pi_native_provider(
         if resolved is not None and unmanaged_prefix_notice is not None:
             resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
-    except Exception:  # noqa: BLE001 — any resolution failure must not break launch
+    except Exception:  # any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
         # unresolved ``api_key: $VAR``) falls back to Pi's own login rather than
         # failing the terminal launch.
@@ -2013,4 +2027,7 @@ def pi_native_provider_launch(
             thinking = to_pi_thinking_level(effort)
     if thinking is not None:
         args.extend(["--thinking", thinking])
+    from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+    args.extend(pi_gateway_extension_args(agent_dir, rendered))
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

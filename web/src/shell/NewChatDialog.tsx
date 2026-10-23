@@ -9,8 +9,16 @@ import {
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
@@ -70,6 +78,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
@@ -256,15 +265,22 @@ import {
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
-import { sandboxModelOptionsKey, useSandboxModelOptions } from "@/hooks/useSandboxModelOptions";
+import {
+  previewIsUnsupported,
+  sandboxModelOptionsKey,
+  useSandboxModelOptions,
+  useSandboxUnsupportedAgents,
+} from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
+  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
+  hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
   type HostIdentity,
@@ -940,12 +956,17 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  * server is the authority — this only gates the submit button so an
  * obviously unusable value gets inline feedback instead of a 422.
  *
+ * The host may not carry an ``@``: that is embedded ``user:token@host``
+ * userinfo, which the server refuses so a token never reaches a session
+ * label or a sandbox Pod spec. Refusing it here keeps it out of the
+ * request as well.
+ *
  * @param url Value the user typed in the repository input.
  * @returns true when ``url.trim()`` matches one of the two forms.
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  return /^https:\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
+  return /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
 }
 
 /**
@@ -1367,6 +1388,10 @@ function NewChatPickerLoading({
   );
 }
 
+function noReachableModelsMessage(name: string | undefined): string {
+  return `No models are available for ${name ?? "this harness"}. Ask an admin to enable model access.`;
+}
+
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
@@ -1412,6 +1437,8 @@ export function AgentHarnessPicker({
   autoHarnessActive = false,
   onSelectAutoHarness,
   openNonce = 0,
+  blockedReasons,
+  onPrefetchEntries,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1486,6 +1513,10 @@ export function AgentHarnessPicker({
   onSelectAutoHarness?: () => void;
   /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
   openNonce?: number;
+  /** Agent id → why the target can't run it; those rows render disabled. */
+  blockedReasons?: ReadonlyMap<string, string>;
+  /** Called with the ids of rows the menu is about to show. */
+  onPrefetchEntries?: (agentIds: string[]) => void;
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1641,14 +1672,16 @@ export function AgentHarnessPicker({
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
-    const unavailable = !readiness.selectable && readiness.fallbackRelevant;
-    const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
-    const warningMessage = harnessWarningMessage(
-      agent.display_name,
-      host?.name,
-      readiness.reason,
-      agent.harness,
-    );
+    const blockedReason = blockedReasons?.get(agent.id);
+    const unavailable =
+      blockedReason !== undefined || (!readiness.selectable && readiness.fallbackRelevant);
+    const warning =
+      blockedReason !== undefined
+        ? "No models available"
+        : harnessWarningBadgeText(readiness.reason, collapsedBadge);
+    const warningMessage =
+      blockedReason ??
+      harnessWarningMessage(agent.display_name, host?.name, readiness.reason, agent.harness);
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -1727,6 +1760,13 @@ export function AgentHarnessPicker({
     more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
   }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
+  // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
+  const prefetchedOpenNonce = useRef(0);
+  useEffect(() => {
+    if (!openNonce || openNonce === prefetchedOpenNonce.current) return;
+    prefetchedOpenNonce.current = openNonce;
+    onPrefetchEntries?.(readyHarnessEntries.map((agent) => agent.id));
+  }, [openNonce, onPrefetchEntries, readyHarnessEntries]);
   const selectedOtherHarness = moreHarnessEntries.find((agent) => agent.id === effectiveAgentId);
   const otherHarnessLabel =
     selectedOtherHarness && !autoHarnessActive
@@ -1838,6 +1878,7 @@ export function AgentHarnessPicker({
           for (const agent of [...harnessEntries, ...agentEntries]) {
             void prefetchAvailableAgentDetails(agent, queryClient);
           }
+          onPrefetchEntries?.(readyHarnessEntries.map((agent) => agent.id));
         }
       }}
       trigger={{
@@ -1982,6 +2023,7 @@ export function AgentHarnessPicker({
                     data-testid="new-chat-landing-harness-more"
                     onSelect={(e) => {
                       e.preventDefault();
+                      onPrefetchEntries?.(moreHarnessEntries.map((agent) => agent.id));
                       setMenuPage("more");
                     }}
                     className="items-center"
@@ -1991,7 +2033,11 @@ export function AgentHarnessPicker({
                   </DropdownMenuItem>
                 ) : (
                   // Desktop: hover flyout submenu.
-                  <DropdownMenuSub>
+                  <DropdownMenuSub
+                    onOpenChange={(next) => {
+                      if (next) onPrefetchEntries?.(moreHarnessEntries.map((agent) => agent.id));
+                    }}
+                  >
                     <DropdownMenuSubTrigger
                       data-testid="new-chat-landing-harness-more"
                       className="cursor-pointer items-center"
@@ -2122,7 +2168,9 @@ export function resetLandingDraft(): void {
 
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
+  const linkedPrompt = searchParams.get("prompt");
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2295,11 +2343,29 @@ export function NewChatLandingScreen() {
           autoSeededBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [message, setMessage] = useState<string>(() =>
+    linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
+  );
+  useEffect(() => {
+    if (!searchParams.has("prompt")) return;
+    if (linkedPrompt?.trim()) setMessage(linkedPrompt);
+    // Consume the link once so returning to the composer preserves edits.
+    const remaining = new URLSearchParams(searchParams);
+    remaining.delete("prompt");
+    navigate(
+      { search: remaining.toString(), hash: location.hash },
+      { replace: true, state: location.state },
+    );
+  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
+  const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const submitTooltipTriggerRef = useRef<HTMLSpanElement>(null);
+  const [submitTooltipState, setSubmitTooltipState] = useState<"closed" | "open" | "pinned">(
+    "closed",
+  );
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
@@ -2314,13 +2380,23 @@ export function NewChatLandingScreen() {
   // — without it the upload only fails after the session is created and
   // navigated into, where the first turn's 415 strands the typed message in
   // a session the user never wanted.
-  const { files, attachmentError, addFiles, removeFile, restoreFiles, onPaste, clearError } =
-    useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
+  const {
+    files,
+    attachmentError,
+    accept: fileAccept,
+    addFiles,
+    removeFile,
+    restoreFiles,
+    onPaste,
+    clearError,
+  } = useComposerAttachments({ initialFiles: restoredDraft?.files ?? [] });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, addFiles);
+  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
+    if (!checkingDbcert) addFiles(droppedFiles);
+  });
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -2624,6 +2700,9 @@ export function NewChatLandingScreen() {
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [dbcertRequired, setDbcertRequired] = useState(false);
+  const createAttemptRef = useRef<symbol | null>(null);
+  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -3196,18 +3275,45 @@ export function NewChatLandingScreen() {
     sandboxSelected &&
     sandboxModelCapabilities?.default_models === true &&
     sandboxModelCapabilities.inference_models !== true;
-  const sandboxPreviewEnabled =
+  const sandboxPreviewsOffered =
     sandboxSelected &&
     previewSandboxProvider !== null &&
-    previewHarness !== null &&
     info !== "loading" &&
     (sandboxModelCapabilities?.inference_models === true || sandboxDefaultModelsOffered);
+  const sandboxPreviewEnabled = sandboxPreviewsOffered && previewHarness !== null;
   const sandboxModels = useSandboxModelOptions(
     previewSandboxProvider,
     previewHarness,
     effectiveAgentId,
     cacheUser,
     sandboxPreviewEnabled,
+  );
+  // Only harness rows gray out; agents can switch brains, so the submit check blocks them.
+  const sandboxPreviewEntries = useMemo(
+    () =>
+      harnessEntries.flatMap((agent) => {
+        const harness = nativeCodingAgentForAvailableAgent(agent)?.harness ?? agent.harness;
+        return harness ? [{ agentId: agent.id, harness }] : [];
+      }),
+    [harnessEntries],
+  );
+  const { unsupported: sandboxUnsupportedAgents, prefetch: prefetchSandboxPreviews } =
+    useSandboxUnsupportedAgents(
+      previewSandboxProvider,
+      sandboxPreviewEntries,
+      cacheUser,
+      sandboxPreviewsOffered,
+    );
+  const sandboxBlockedReasons = useMemo(
+    () =>
+      new Map(
+        harnessEntries.flatMap((agent) => {
+          if (!sandboxUnsupportedAgents.has(agent.id)) return [];
+          const reason = sandboxUnsupportedAgents.get(agent.id);
+          return [[agent.id, reason ?? noReachableModelsMessage(agent.display_name)] as const];
+        }),
+      ),
+    [sandboxUnsupportedAgents, harnessEntries],
   );
   // A harness the default catalog cannot serve keeps its ordinary picker.
   const sandboxDefaultModelsEnabled =
@@ -3217,8 +3323,15 @@ export function NewChatLandingScreen() {
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
   const sandboxCatalogPending =
     sandboxPreviewEnabled && sandboxModels.data === undefined && sandboxModels.isLoading;
-  const sandboxCatalogError =
-    sandboxPreviewEnabled && !sandboxDefaultModelsEnabled
+  // Advisory catalogs never block launch; only a provider's certain "unsupported" does.
+  const sandboxSelectedUnsupported = sandboxPreviewEnabled && previewIsUnsupported(sandboxModels);
+  const sandboxBlockedName =
+    selectedNativeHarness === null && pickedHarness !== null
+      ? (brainHarnessLabelsAll[pickedHarness] ?? pickedHarness)
+      : selectedAgent?.display_name;
+  const sandboxCatalogError = sandboxSelectedUnsupported
+    ? (sandboxModels.data?.error ?? noReachableModelsMessage(sandboxBlockedName))
+    : sandboxPreviewEnabled && !sandboxDefaultModelsEnabled
       ? (sandboxModels.error?.message ??
         (sandboxModels.data?.configured && sandboxModels.data.status !== "ready"
           ? (sandboxModels.data.error ?? "No usable models are available for this harness.")
@@ -3570,8 +3683,7 @@ export function NewChatLandingScreen() {
           ? "unknown"
           : "unavailable"
       : undefined;
-  const pickerDataLoading =
-    sandboxCatalogPending ||
+  const pickerDataLoadingBesidesCatalog =
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
     (projectParam !== "" &&
@@ -3585,6 +3697,7 @@ export function NewChatLandingScreen() {
       !routingOn &&
       harnessTriggerDetails.some((row) => row.label === "Model") &&
       (hostsLoading || info === "loading" || pickerModelsLoading));
+  const pickerDataLoading = sandboxCatalogPending || pickerDataLoadingBesidesCatalog;
   const pickerTarget = JSON.stringify([
     projectParam,
     selectedHostId,
@@ -3610,6 +3723,10 @@ export function NewChatLandingScreen() {
     (!harnessTriggerDetails.some((row) => row.label === "Model") ||
       pickerModelOptions.length > 0 ||
       routingOn);
+  // Keep the menu open while only the sandbox catalog loads; submit stays gated.
+  const pickerInteractiveWhileLoading =
+    interactiveWhileLoading ||
+    (sandboxPreviewEnabled && selectedAgent !== undefined && !pickerDataLoadingBesidesCatalog);
   const pickerOptions = useMemo<NewChatPickerOptions | null>(
     () =>
       selectedAgent && selectedAgent.id !== PENDING_AGENT_ID
@@ -3870,14 +3987,16 @@ export function NewChatLandingScreen() {
                   header: "Models",
                   leading: (
                     <>
-                      {sandboxHasModelCatalog && sandboxModels.data?.provider_label && (
-                        <div
-                          className="px-2 py-1 text-xs text-muted-foreground"
-                          data-testid="sandbox-model-provider"
-                        >
-                          {sandboxModels.data.provider_label}
-                        </div>
-                      )}
+                      {sandboxHasModelCatalog &&
+                        !sandboxSelectedUnsupported &&
+                        sandboxModels.data?.provider_label && (
+                          <div
+                            className="px-2 py-1 text-xs text-muted-foreground"
+                            data-testid="sandbox-model-provider"
+                          >
+                            {sandboxModels.data.provider_label}
+                          </div>
+                        )}
                       {selectedNativeHarness === "pi-native" && (
                         <Input
                           aria-label="Search models"
@@ -3894,14 +4013,15 @@ export function NewChatLandingScreen() {
                         </div>
                       )}
                       {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="px-2 py-1 text-xs text-muted-foreground">
+                        <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
                           {pickerModelsError?.message ?? "Models unavailable"}
                         </div>
                       )}
                     </>
                   ),
                   choices: [
-                    ...(sandboxDefaultModelsEnabled ||
+                    // Default can't launch once the provider rules the harness out.
+                    ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
                     (!sandboxInferenceConfigured &&
                       pickerModelOptions.length > 0 &&
                       !pickerModelOptions.some((option) => option.isDefault))
@@ -4998,10 +5118,7 @@ export function NewChatLandingScreen() {
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
 
-  // Why submit is disabled, surfaced as the button's tooltip. Checked in the
-  // order a user fills the form — location first, then message — so the
-  // tooltip always names the next missing input. Null when nothing is
-  // actionable (submitting, or mid-create).
+  // Name the next missing input in the submit tooltip.
   const submitDisabledReason = canSubmit
     ? null
     : mcpAuthorizing || mcpSelectionError
@@ -5027,6 +5144,15 @@ export function NewChatLandingScreen() {
                       : message.trim().length === 0 && files.length === 0
                         ? "Enter a message to get started"
                         : null;
+  useLayoutEffect(() => {
+    if (submitDisabledReason !== null) return;
+    setSubmitTooltipState("closed");
+    if (document.activeElement === submitTooltipTriggerRef.current) {
+      submitTooltipTriggerRef.current
+        ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+        ?.focus();
+    }
+  }, [submitDisabledReason]);
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5360,11 +5486,13 @@ export function NewChatLandingScreen() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
-    if (!canSubmit) return;
-    // A create is actually happening: report it for pointer clicks (via the
-    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
-    // don't emit, matching the disabled Start button.
-    trackClick("new_chat.start_session", "button");
+    if (!canSubmit) {
+      if (submitDisabledReason !== null) setSubmitTooltipState("pinned");
+      return;
+    }
+    if (createAttemptRef.current !== null) return;
+    const createAttempt = Symbol();
+    createAttemptRef.current = createAttempt;
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
@@ -5382,12 +5510,6 @@ export function NewChatLandingScreen() {
         typeof destination === "string" ? destination : destination.pathname,
       );
     };
-    // Remember the repos/branches for next time (seeds the picker on the next
-    // visit). Only when a repo is actually set — a no-repo session leaves the
-    // remembered repos untouched rather than clearing them.
-    if (sandboxRepoSelections.length > 0) {
-      writeLastSandboxRepos(sandboxRepoSelections);
-    }
     setCreating(true);
     setCreateError(null);
     let localConv: {
@@ -5409,14 +5531,49 @@ export function NewChatLandingScreen() {
         navigate(returnToCanvas ? { pathname: "/", search: `?${searchParams.toString()}` } : "/");
       }
     };
-    // The draft is spent from the moment it is submitted: it belongs to the
-    // session now being created, so a detour back to this screen must not
-    // hand it back pre-filled. Flipped here rather than on the response
-    // because the create outlives an unmount; a create that fails hands the
-    // draft back via returnDraftToUser.
-    submittedDraftRevisionRef.current = landingDraftRevision;
-    submittedRef.current = true;
     try {
+      if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
+        const skipCheck = new Promise<null>((resolve) => {
+          skipDbcertCheckRef.current = () => resolve(null);
+        });
+        setCheckingDbcert(true);
+        setDbcertRequired(false);
+        const credentials = await Promise.race([
+          getDesktopFeatures().then((features) =>
+            createAttemptRef.current === createAttempt &&
+            skipDbcertCheckRef.current !== null &&
+            onScreenRef.current &&
+            window.location.href === createLocation &&
+            features?.databricksInternalFeatures === true &&
+            features.canRefreshDbcert === true
+              ? checkDbcert()
+              : null,
+          ),
+          skipCheck,
+        ]);
+        skipDbcertCheckRef.current = null;
+        if (
+          createAttemptRef.current !== createAttempt ||
+          !onScreenRef.current ||
+          window.location.href !== createLocation
+        )
+          return;
+        setCheckingDbcert(false);
+        if (credentials !== null && !credentials.ok) {
+          setCreateError(credentials.error);
+          return;
+        }
+        const needsDbcert = credentials !== null && !credentials.valid;
+        setDbcertRequired(needsDbcert);
+        if (needsDbcert) return;
+      }
+      // Spend the draft only once provisioning starts, after the laptop credential check.
+      submittedDraftRevisionRef.current = landingDraftRevision;
+      submittedRef.current = true;
+      trackClick("new_chat.start_session", "button");
+      if (sandboxRepoSelections.length > 0) {
+        writeLastSandboxRepos(sandboxRepoSelections);
+      }
       const trimmedBranch = branchName.trim();
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -5946,7 +6103,12 @@ export function NewChatLandingScreen() {
       if (localConv !== null) showToast(msg);
       else setCreateError(msg);
     } finally {
-      setCreating(false);
+      if (createAttemptRef.current === createAttempt) {
+        createAttemptRef.current = null;
+        skipDbcertCheckRef.current = null;
+        setCheckingDbcert(false);
+        setCreating(false);
+      }
     }
   }
 
@@ -6112,9 +6274,10 @@ export function NewChatLandingScreen() {
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
-        <div
+        <fieldset
+          disabled={checkingDbcert}
           className={cn(
-            "relative flex flex-col gap-0 max-md:w-[calc(100%-1rem)]",
+            "relative flex min-w-0 flex-col gap-0 max-md:w-[calc(100%-1rem)]",
             COMPOSER_COLUMN_WIDTH,
           )}
           data-testid="new-chat-landing-composer-surface"
@@ -6707,7 +6870,7 @@ export function NewChatLandingScreen() {
                       ref={fileInputRef}
                       type="file"
                       multiple
-                      accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+                      accept={fileAccept}
                       className="hidden"
                       data-testid="new-chat-landing-file-input"
                       onChange={(e) => {
@@ -7059,11 +7222,13 @@ export function NewChatLandingScreen() {
                         openNonce={modelPickerOpenNonce}
                         agentEntries={agentEntries}
                         harnessEntries={harnessEntries}
+                        blockedReasons={sandboxSelected ? sandboxBlockedReasons : undefined}
+                        onPrefetchEntries={prefetchSandboxPreviews}
                         effectiveAgentId={effectiveAgentId}
                         agentLabel={agentLabel}
                         hasAgents={agentList.length > 0}
                         loading={pickerLoading}
-                        interactiveWhileLoading={interactiveWhileLoading}
+                        interactiveWhileLoading={pickerInteractiveWhileLoading}
                         disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}
                         cacheKey={pickerCacheKey}
                         host={harnessWarningHost}
@@ -7119,9 +7284,41 @@ export function NewChatLandingScreen() {
                       onInterim={dictation.replaceInterim}
                     />
                     <TooltipProvider>
-                      <Tooltip>
+                      <Tooltip
+                        open={submitTooltipState !== "closed"}
+                        onOpenChange={(open) =>
+                          setSubmitTooltipState((current) =>
+                            current === "pinned" ? current : open ? "open" : "closed",
+                          )
+                        }
+                      >
                         <TooltipTrigger asChild>
-                          <span className="inline-flex shrink-0">
+                          <span
+                            ref={submitTooltipTriggerRef}
+                            role={submitDisabledReason !== null ? "group" : undefined}
+                            tabIndex={submitDisabledReason !== null ? 0 : -1}
+                            aria-label={submitDisabledReason !== null ? "Start session" : undefined}
+                            aria-disabled={submitDisabledReason !== null ? true : undefined}
+                            onPointerDown={(event) => {
+                              if (submitDisabledReason === null) return;
+                              event.preventDefault();
+                              setSubmitTooltipState("pinned");
+                            }}
+                            onKeyDown={(event) => {
+                              if (
+                                submitDisabledReason !== null &&
+                                (event.key === "Enter" || event.key === " ")
+                              ) {
+                                event.preventDefault();
+                                setSubmitTooltipState("pinned");
+                              }
+                            }}
+                            onBlur={() => setSubmitTooltipState("closed")}
+                            className={cn(
+                              "inline-flex shrink-0 rounded-lg outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                              !canSubmit && "cursor-not-allowed",
+                            )}
+                          >
                             <ComposerSendButton
                               disabled={!canSubmit}
                               label={creating ? "Starting session" : "Start session"}
@@ -7134,6 +7331,14 @@ export function NewChatLandingScreen() {
                           <TooltipContent
                             className="border border-border bg-popover text-popover-foreground shadow-menu ring-1 ring-foreground/10"
                             data-testid="new-chat-landing-submit-error-tooltip"
+                            onPointerDownOutside={(event) => {
+                              if (submitTooltipTriggerRef.current?.contains(event.target as Node)) {
+                                event.preventDefault();
+                              } else {
+                                setSubmitTooltipState("closed");
+                              }
+                            }}
+                            onEscapeKeyDown={() => setSubmitTooltipState("closed")}
                           >
                             {submitDisabledReason}
                           </TooltipContent>
@@ -7171,7 +7376,7 @@ export function NewChatLandingScreen() {
                 : undefined
             }
           />
-        </div>
+        </fieldset>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&
             !autoRoutingSelected &&
@@ -7272,6 +7477,31 @@ export function NewChatLandingScreen() {
             <p className="text-sm text-destructive" data-testid="new-chat-landing-error">
               {createError}
             </p>
+          )}
+
+          {checkingDbcert && (
+            <div
+              className="flex items-center gap-2 text-sm text-muted-foreground"
+              data-testid="new-chat-landing-dbcert-status"
+            >
+              <Spinner className="size-4 shrink-0" />
+              <p role="status">Checking laptop credentials…</p>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => skipDbcertCheckRef.current?.()}
+              >
+                Skip
+              </Button>
+            </div>
+          )}
+
+          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
+            <LaptopDbcertBanner
+              onReady={() => setDbcertRequired(false)}
+              onDismiss={() => setDbcertRequired(false)}
+            />
           )}
 
           {connectError && (

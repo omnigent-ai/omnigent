@@ -58,11 +58,14 @@ Env vars read at startup:
   bundle skill.
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
-  bundled skills from ``<bundle>/skills/<dir>/`` for the
-  ``"all"`` and named-list cases. Unset for agents without a
-  bundled-skill directory.
+  bundled skills from ``<bundle>/skills/<dir>/`` and
+  ``<bundle>/.pi/skills/<dir>/`` for the ``"all"`` and named-list
+  cases, loads ``<bundle>/.pi/extensions`` via ``--extension``, and
+  appends a bundle-root context file (``AGENTS.md`` et al.) to the
+  system prompt. Unset for agents without a bundle directory.
 - ``HARNESS_PI_CONTEXT_FILES``: Whether Pi automatically loads context files
-  such as ``AGENTS.md`` and ``CLAUDE.md``. Defaults to true.
+  such as ``AGENTS.md`` and ``CLAUDE.md``, including the bundle-root one.
+  Defaults to true.
 - ``HARNESS_PI_SYSTEM_PROMPT_MODE``: ``append`` (default) or ``replace`` Pi's
   base prompt with Omnigent's composed instructions.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for

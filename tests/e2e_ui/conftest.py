@@ -326,7 +326,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--ui-dependency-smoke",
         action="store_true",
         default=False,
-        help="Run compatibility smoke journeys and all Codex sidecar consumers.",
+        help="Deprecated; removal in 0.21.0. Run compatibility smoke and Codex sidecar consumers.",
     )
     parser.addoption(
         "--ui-codex-sidecar-only",

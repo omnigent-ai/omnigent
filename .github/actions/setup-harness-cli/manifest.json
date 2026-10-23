@@ -10,7 +10,7 @@
   "codex": {
     "kind": "npm",
     "package": "@openai/codex",
-    "version": "0.139.0",
+    "version": "0.142.0",
     "binary": "codex",
     "lockfile": "locks/codex/package-lock.json"
   },

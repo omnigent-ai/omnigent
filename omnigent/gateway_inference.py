@@ -107,7 +107,7 @@ def gateway_inference_map() -> dict[str, bool]:
     ):
         try:
             backed = check()
-        except Exception:  # noqa: BLE001 — an unevaluable family is omitted, not False
+        except Exception:  # an unevaluable family is omitted, not False
             _logger.warning(
                 "gateway-inference check for the %s family failed; omitting it",
                 family,

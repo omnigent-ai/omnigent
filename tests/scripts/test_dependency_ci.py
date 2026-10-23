@@ -20,6 +20,24 @@ SIDECAR = "tests/codex_parity/sidecar/Cargo.lock"
 HOOKS = ".pre-commit-config.yaml"
 
 
+def test_merge_gate_skip_membership_with_a_large_check_list():
+    """A matching check stays skippable when the list exceeds the pipe buffer."""
+    subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            'source "$1"; printf -v padding "%100000s" ""; ALLOW_SKIP+=("$padding"); '
+            'is_allow_skip "Pytest (inner-rest)"; ! is_allow_skip "unknown check"',
+            "bash",
+            str(ROOT / ".github/scripts/merge-ready/required.sh"),
+        ],
+        check=True,
+    )
+
+
 @pytest.fixture
 def scope_module():
     spec = importlib.util.spec_from_file_location("dependency_scope", CI / "dependency_scope.py")
@@ -120,15 +138,20 @@ def test_each_ecosystem_selects_focused_coverage_from_a_real_merge(
     selection = run_selection(tmp_path, repo, head, git("rev-parse", "HEAD"))
     assert selection["dependency"] == "true", selection
     assert selection["reason"] == f"Dependency scopes: {expected}"
-    assert selection["database"] == "false"
+    assert selection["database"] == str(ecosystem in {"uv", "github-actions"}).lower()
     assert selection["backend"] == str(ecosystem in {"uv", "github-actions"}).lower()
     assert selection["windows"] == selection["backend"]
     assert selection["ios"] == str(ecosystem == "bundler").lower()
     assert selection["web"] == str(ecosystem in {"npm", "github-actions"}).lower()
-    assert selection["docker"] == str(ecosystem in {"npm", "github-actions", "docker"}).lower()
+    assert (
+        selection["docker"] == str(ecosystem in {"uv", "npm", "github-actions", "docker"}).lower()
+    )
     groups = {row["group"] for row in json.loads(selection["python_matrix"])["include"]}
     assert ("runtime-core" in groups) == (ecosystem in {"uv", "github-actions"})
-    assert "misc" not in groups
+    expected_groups = json.loads((CI / "python-matrix.json").read_text())
+    assert json.loads(selection["python_matrix"])["include"] == (
+        expected_groups if ecosystem in {"uv", "github-actions"} else []
+    )
 
 
 @pytest.mark.parametrize(
@@ -173,7 +196,9 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     assert selection["dependency"] == "false"
     assert selection["ui"] == "full"
     assert selection["database"] == "true"
-    assert len(json.loads(selection["python_matrix"])["include"]) == 16
+    assert json.loads(selection["python_matrix"])["include"] == json.loads(
+        (CI / "python-matrix.json").read_text()
+    )
 
 
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
@@ -192,7 +217,7 @@ def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
 
 
 @pytest.mark.parametrize("changed", ["sqlalchemy", "greenlet", "typing-extensions", "unrelated"])
-def test_database_jobs_follow_transitive_lockfile_consumers(scope_module, changed):
+def test_python_lock_updates_keep_all_database_and_image_checks(scope_module, changed):
     before = """
 [[package]]
 name = "sqlalchemy"
@@ -213,8 +238,8 @@ version = "1.0.0"
     selection = scope_module.select_scope(
         [{"filename": "uv.lock", "status": "modified"}], read=lambda _: (before, after)
     )
-    assert selection["database"] == str(changed != "unrelated").lower()
-    assert selection["docker"] == "false"
+    assert selection["database"] == "true"
+    assert selection["docker"] == "true"
     assert selection["e2e"] == "true"
 
 
@@ -285,7 +310,7 @@ def test_cross_ecosystem_bundle_retains_each_consumer(scope_module):
             "sidecar",
         )
     )
-    assert selection["ui"] == "dependency"
+    assert selection["ui"] == "full"
 
 
 @pytest.fixture
@@ -349,11 +374,11 @@ def run_selection(tmp_path, repo, head, merge, *, event_name="pull_request"):
         ([SIDECAR], False, False, False, True, "sidecar"),
         ([OMNIDEV, SIDECAR], False, False, True, True, "sidecar"),
         ([HOOKS], False, False, False, False, "none"),
-        (["pnpm-lock.yaml"], False, False, False, False, "dependency"),
-        (["pnpm-lock.yaml", "web/package.json"], False, False, False, False, "dependency"),
-        ([OMNIDEV, "pnpm-lock.yaml"], False, False, True, False, "dependency"),
+        (["pnpm-lock.yaml"], False, True, False, False, "full"),
+        (["pnpm-lock.yaml", "web/package.json"], False, True, False, False, "full"),
+        ([OMNIDEV, "pnpm-lock.yaml"], False, True, True, False, "full"),
         ([SIDECAR, HOOKS], False, False, False, True, "sidecar"),
-        ([SIDECAR, "uv.lock"], True, True, False, True, "dependency"),
+        ([SIDECAR, "uv.lock"], True, True, False, True, "full"),
         (["omnigent/runner/app.py"], True, True, True, True, "full"),
         (
             [".github/actions/setup-harness-cli/locks/codex/package-lock.json"],
@@ -419,6 +444,69 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
         assert bool(matrix["include"]) == selected
 
 
+@pytest.mark.parametrize("script", ["integration-matrix.sh", "e2e-shard-matrix.sh"])
+@pytest.mark.parametrize(
+    ("event", "draft", "run_tests", "selected"),
+    [
+        ("pull_request", "false", "false", False),
+        ("pull_request", "true", "true", False),
+        ("pull_request", "false", "true", True),
+        ("schedule", "", "true", True),
+        ("workflow_dispatch", "", "true", True),
+    ],
+)
+def test_matrix_skip_output_matches_job_guard(tmp_path, script, event, draft, run_tests, selected):
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", str(CI / script)],
+        env=dict(
+            os.environ,
+            GITHUB_OUTPUT=str(output),
+            EVENT_NAME=event,
+            IS_DRAFT=draft,
+            RUN_TESTS=run_tests,
+            NUM_SHARDS="4",
+        ),
+        check=True,
+    )
+    matrix = output.read_text().strip().removeprefix("matrix=")
+    assert (matrix != '{"include":[]}') == selected
+    assert bool(json.loads(matrix)["include"]) == selected
+
+
+@pytest.mark.parametrize(
+    ("dependency", "ui_scope", "rendered"),
+    [
+        ("true", "full", True),
+        ("true", "none", False),
+        ("true", "sidecar", False),
+        ("false", "full", True),
+    ],
+)
+def test_ui_snapshot_detect_renders_web_dependency_bumps(tmp_path, dependency, ui_scope, rendered):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/ui-snapshot.yml").read_text())
+    step = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "changes")
+    fake_gh = tmp_path / "bin" / "gh"
+    fake_gh.parent.mkdir()
+    fake_gh.write_text("#!/bin/sh\nprintf 'pnpm-lock.yaml\\nweb/package.json\\n'\n")
+    fake_gh.chmod(0o755)
+    output = tmp_path / "output"
+    subprocess.run(
+        ["bash", "-c", step["run"]],
+        env=dict(
+            os.environ,
+            PATH=f"{fake_gh.parent}{os.pathsep}{os.environ['PATH']}",
+            GITHUB_OUTPUT=str(output),
+            DEPENDENCY=dependency,
+            UI_SCOPE=ui_scope,
+            PR="1",
+            REPO="omnigent-ai/omnigent",
+        ),
+        check=True,
+    )
+    assert output.read_text().strip() == f"ui={str(rendered).lower()}"
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -472,7 +560,71 @@ def test_workflows_connect_selection_to_jobs():
         assert any(
             step.get("uses") == "./.github/actions/dependency-ci-scope" for step in setup["steps"]
         )
+    for name in ("integration", "e2e", "e2e-ui"):
+        job = workflows[name]["jobs"][name]
+        # Job conditions run before GitHub expands (and rejects) an empty matrix.
+        assert job.get("if") == "needs.setup.outputs.matrix != '{\"include\":[]}'"
+        assert job["strategy"]["matrix"] == "${{ fromJSON(needs.setup.outputs.matrix) }}"
+    assert workflows["ci"]["jobs"]["scope"]["name"] == "CI coverage scope"
+    assert workflows["e2e"]["jobs"]["setup"]["name"] == "E2E coverage scope"
+    assert workflows["e2e-ui"]["jobs"]["setup"]["name"] == "UI coverage scope"
+    assert workflows["web-tests"]["jobs"]["scope"]["name"] == "Web coverage scope"
+    web_steps = workflows["web-tests"]["jobs"]["web-test"]["steps"]
+    checkouts = [step for step in web_steps if "checkout@" in step.get("uses", "")]
+    assert len(checkouts) == 1
+    assert checkouts[0]["with"]["fetch-depth"] == 2
+    peer_check = next(
+        step for step in web_steps if step.get("name") == "Validate changed dependency peers"
+    )
+    assert peer_check["if"] == "github.event_name == 'pull_request'"
+    assert "check_npm_peers.py --base HEAD^1" in peer_check["run"]
+    peer_setup = next(
+        step
+        for step in web_steps
+        if step.get("name") == "Set up uv for dependency peer validation"
+    )
+    assert peer_setup["if"] == peer_check["if"]
+    # Full CI must retain the consumers checked for dependency-only changes.
+    for name in ("Install other workspace dependencies", "Test and build workspace consumers"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert "if" not in step
+    e2e_steps = workflows["e2e"]["jobs"]["e2e"]["steps"]
+    e2e_run = next(step for step in e2e_steps if step.get("uses") == "./.github/actions/e2e-run")
+    action = yaml.safe_load((ROOT / ".github/actions/e2e-run/action.yml").read_text())
+    assert (
+        e2e_run["with"].get("dependency_smoke", action["inputs"]["dependency_smoke"]["default"])
+        == "false"
+    )
+    matrix = next(
+        step for step in workflows["e2e"]["jobs"]["setup"]["steps"] if step.get("id") == "matrix"
+    )
+    assert matrix["env"]["NUM_SHARDS"] == "8"
     jobs = workflows["ci"]["jobs"]
+    sidecar_cache = next(
+        step for step in jobs["codex-parity"]["steps"] if step.get("id") == "sidecar-cache"
+    )
+    assert sidecar_cache["with"]["path"] == ".tmp-codex-parity-target"
+    for job, manifest in (
+        ("omnidev", "dev/omnidev/Cargo.toml"),
+        ("codex-parity", "tests/codex_parity/sidecar/Cargo.toml"),
+    ):
+        rust_test = next(
+            step for step in jobs[job]["steps"] if "cargo test --locked" in step.get("run", "")
+        )
+        assert manifest in rust_test["run"]
+        assert "if" not in rust_test
+    python_install = next(
+        step for step in jobs["pytest"]["steps"] if step.get("name") == "Install dependencies"
+    )
+    assert "--extra openshell --extra kubernetes" in python_install["run"]
+    sdk_check = next(
+        step
+        for step in jobs["pytest"]["steps"]
+        if step.get("name") == "Check installed sandbox SDK consumers"
+    )
+    assert sdk_check["if"] == "matrix.group == 'server-rest'"
+    assert "kubernetes._ensure_sdk()" in sdk_check["run"]
+    assert "openshell._ensure_sdk()" in sdk_check["run"]
     for name in ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"):
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"
@@ -582,6 +734,8 @@ def _check_reads(tmp_path: Path) -> int:
         "skipped_result",
         "missing_result",
         "old_workflows",
+        "legacy_missing_result",
+        "legacy_missing_ui_result",
         "queued_retry",
         "missing_web_result",
         "failed_web_result",
@@ -594,11 +748,11 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     checks = {
         "DCO": ("completed", "success"),
         "Pre-commit checks": ("completed", "success"),
-        "CI scope": ("completed", "success"),
+        "CI coverage scope": ("completed", "success"),
         "CI result": ("completed", "success"),
-        "UI scope": ("completed", "success"),
+        "UI coverage scope": ("completed", "success"),
         "E2E UI result": ("completed", "success"),
-        "Web scope": ("completed", "success"),
+        "Web coverage scope": ("completed", "success"),
         "Web result": ("completed", "success"),
         "Docker scope": ("completed", "success"),
         "Docker result": ("completed", "success"),
@@ -613,7 +767,7 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
             "omnidev": "Rust tests (omnidev)",
             "parity": "Pytest (codex-parity)",
             "ui": "E2E UI Tests (shard 1/2)",
-            "scope": "CI scope",
+            "scope": "CI coverage scope",
             "android": "Build unsigned AAB",
         }[fault]
         checks[name] = ("completed", "failure")
@@ -635,8 +789,18 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
         del checks["Docker result"]
     elif fault == "skipped_docker_result":
         checks["Docker result"] = ("completed", "skipped")
+    elif fault.startswith("legacy_missing_"):
+        checks["CI scope"] = checks.pop("CI coverage scope")
+        checks["UI scope"] = checks.pop("UI coverage scope")
+        del checks["E2E UI result" if fault == "legacy_missing_ui_result" else "CI result"]
     elif fault == "old_workflows":
-        for name in ("CI scope", "CI result", "UI scope", "E2E UI result", "Rust tests (omnidev)"):
+        for name in (
+            "CI coverage scope",
+            "CI result",
+            "UI coverage scope",
+            "E2E UI result",
+            "Rust tests (omnidev)",
+        ):
             del checks[name]
     api = {
         "checks": {
@@ -680,8 +844,8 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     )
 
 
-_E2E_SHARDS = [f"E2E Tests (shard {index}/4)" for index in range(4)] + [
-    f"E2E Tests (shard {index}/2)" for index in range(2)
+_E2E_SHARDS = [
+    f"E2E Tests (shard {index}/{count})" for count in (2, 4, 8) for index in range(count)
 ]
 
 
@@ -690,14 +854,14 @@ def _gate_snapshot(
     e2e_runs: tuple[tuple[str, str], ...] = (("completed", "2026-10-19T10:00:00Z"),),
     failed: str | None = None,
 ) -> dict[str, Any]:
-    """One API snapshot in which only ``E2E Tests (shard 1/4)`` may be unfinished.
+    """One API snapshot in which only ``E2E Tests (shard 7/8)`` may be unfinished.
 
     :param shard_status: Status of that shard's check run.
     :param e2e_runs: ``(status, created_at)`` for each E2E Tests workflow run.
     :param failed: A required check to report as completed with a failure.
     """
     checks = dict.fromkeys(["DCO", "Pre-commit checks", *_E2E_SHARDS], "completed")
-    checks["E2E Tests (shard 1/4)"] = shard_status
+    checks["E2E Tests (shard 7/8)"] = shard_status
     runs = [
         {
             "name": name,
@@ -735,6 +899,35 @@ def _gate_snapshot(
     }
 
 
+@pytest.mark.parametrize(
+    ("status", "conclusion", "green"),
+    [
+        ("completed", "success", True),
+        ("completed", "failure", False),
+        ("completed", "cancelled", False),
+        ("in_progress", None, False),
+    ],
+)
+def test_merge_gate_requires_successful_workflow_for_empty_integration(
+    tmp_path, status, conclusion, green
+):
+    snapshot = _gate_snapshot("completed")
+    snapshot["checks"]["check_runs"].append(
+        {
+            "id": 100,
+            "name": "Integration (${{ matrix.name }})",
+            "status": "completed",
+            "conclusion": "skipped",
+        }
+    )
+    run = next(
+        run for run in snapshot["runs"]["workflow_runs"] if run["name"] == "Integration Tests"
+    )
+    run.update(status=status, conclusion=conclusion)
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert (process.returncode == 0) == green, process.stdout + process.stderr
+
+
 def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     """A completed workflow's check that still reads as running is re-read, not failed."""
     lagging = _gate_snapshot("in_progress")
@@ -745,11 +938,19 @@ def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     assert "All required checks green" in process.stdout
 
 
+@pytest.mark.parametrize("shard_id", range(8))
+def test_merge_gate_blocks_each_failed_eight_shard_check(tmp_path, shard_id):
+    name = f"E2E Tests (shard {shard_id}/8)"
+    process = _run_merge_gate(tmp_path, [_gate_snapshot("completed", failed=name)])
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert name in (tmp_path / "gate-output").read_text()
+
+
 def test_merge_gate_reports_red_after_the_lag_rereads_run_out(tmp_path):
     process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress")])
     assert process.returncode == 1, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 6
-    assert "E2E Tests (shard 1/4)" in (tmp_path / "gate-output").read_text()
+    assert "E2E Tests (shard 7/8)" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(
@@ -780,3 +981,61 @@ def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
     )
     assert process.returncode == 0, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 2
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "valid",
+        "incompatible",
+        "missing",
+        "optional",
+        "baseline",
+        "context",
+        "prerelease",
+        "prerelease-outside-range",
+    ],
+)
+def test_changed_npm_peer_gate_uses_candidate_lock_and_npm_semver(merged_repo, fault):
+    repo, git = merged_repo
+    lock = {
+        "lockfileVersion": "9.0",
+        "packages": {"storybook@1.0.0": {"peerDependencies": {"vite": "^8.0.0"}}},
+        "snapshots": {"storybook@1.0.0": {"dependencies": {"vite": "8.1.0"}}},
+    }
+    if fault == "baseline":
+        lock["snapshots"]["storybook@1.0.0"]["dependencies"]["vite"] = "7.0.0"
+    path = repo / "pnpm-lock.yaml"
+    path.write_text(yaml.safe_dump(lock))
+    git("add", ".")
+    git("commit", "-qm", "baseline peers")
+    if fault != "baseline":
+        old = "storybook@1.0.0"
+        new = old if fault == "context" else "storybook@1.0.1"
+        metadata = lock["packages"].pop(old)
+        snapshot = lock["snapshots"].pop(old)
+        lock["packages"][new] = metadata
+        lock["snapshots"][new] = snapshot
+        if fault in {"incompatible", "context"}:
+            snapshot["dependencies"]["vite"] = "7.0.0"
+        elif fault in {"missing", "optional"}:
+            snapshot["dependencies"].clear()
+            if fault == "optional":
+                metadata["peerDependenciesMeta"] = {"vite": {"optional": True}}
+        elif fault.startswith("prerelease"):
+            snapshot["dependencies"]["vite"] = (
+                "8.1.0-rc.1" if fault == "prerelease" else "9.0.0-rc.1"
+            )
+    path.write_text(yaml.safe_dump(lock))
+    git("add", ".")
+    git("commit", "--allow-empty", "-qm", "update peers")
+    process = subprocess.run(
+        [sys.executable, str(CI / "check_npm_peers.py"), "--base", "HEAD^1"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert (process.returncode == 0) == (
+        fault in {"valid", "optional", "baseline", "prerelease"}
+    ), process.stdout + process.stderr

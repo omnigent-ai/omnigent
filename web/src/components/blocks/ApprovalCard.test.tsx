@@ -221,44 +221,56 @@ describe("ApprovalCard — approve & switch to auto mode", () => {
     expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
   });
 
-  it("preserves the server capability through parsing, reduction, and rendering", () => {
-    const events = [
-      ...parseEventLines([
-        JSON.stringify({
-          event: "response.elicitation_request",
-          data: {
-            type: "response.elicitation_request",
-            elicitation_id: props.elicitationId,
-            params: {
-              mode: "form",
-              message: props.message,
-              phase: props.phase,
-              policy_name: props.policyName,
-              requestedSchema: {},
-              allow_auto_mode: true,
+  it.each([
+    {
+      hint: { allow_auto_mode: true },
+      button: /approve & switch to auto mode/i,
+      content: { allow_auto_mode: true },
+    },
+    {
+      hint: { permission_directories: ["/worktrees/branch", "/mount/real-branch"] },
+      button: /approve & allow directories for this session/i,
+      content: { allow_directories: true },
+    },
+  ])(
+    "preserves $content through parsing, reduction, and rendering",
+    ({ hint, button, content }) => {
+      const events = [
+        ...parseEventLines([
+          JSON.stringify({
+            event: "response.elicitation_request",
+            data: {
+              type: "response.elicitation_request",
+              elicitation_id: props.elicitationId,
+              params: {
+                mode: "form",
+                message: props.message,
+                phase: props.phase,
+                policy_name: props.policyName,
+                requestedSchema: {},
+                ...hint,
+              },
             },
-          },
-        }),
-      ]),
-    ];
-    const blocks = new BlockStream().reduceSync(events);
-    const bubbles = buildBubbles(blocks, null);
-    const bubble = bubbles[0];
-    expect(bubble.kind).toBe("assistant");
-    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
-    const item = bubble.items[0];
-    expect(item.kind).toBe("elicitation");
-    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
-    const submitSpy = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ submitApproval: submitSpy });
+          }),
+        ]),
+      ];
+      const blocks = new BlockStream().reduceSync(events);
+      const bubbles = buildBubbles(blocks, null);
+      const bubble = bubbles[0];
+      expect(bubble.kind).toBe("assistant");
+      if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+      const item = bubble.items[0];
+      expect(item.kind).toBe("elicitation");
+      if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+      const submitSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ submitApproval: submitSpy });
 
-    render(<ElicitationCard item={item} />);
-    fireEvent.click(screen.getByRole("button", { name: /approve & switch to auto mode/i }));
+      render(<ElicitationCard item={item} />);
+      fireEvent.click(screen.getByRole("button", { name: button }));
 
-    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", {
-      allow_auto_mode: true,
-    });
-  });
+      expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", content);
+    },
+  );
 
   it("keeps ordinary approval and rejection separate from the mode switch", () => {
     const onSubmit = vi.fn();
@@ -307,6 +319,73 @@ describe("ApprovalCard — approve & switch to auto mode", () => {
     );
     expect(screen.getByText(label)).toBeDefined();
     expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
+  });
+});
+
+describe("ApprovalCard — session directory access", () => {
+  const props = {
+    elicitationId: "elic_directories",
+    message: "Claude wants to call **Edit**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "Edit({})",
+    requestedSchema: {},
+    permissionDirectories: ["/worktrees/branch", "/mount/real branch"],
+    status: "pending",
+    response: null,
+  } as const;
+
+  it("shows the exact directories and requires a separate click to grant session access", () => {
+    const onSubmit = vi.fn();
+    render(
+      <ApprovalCard
+        {...props}
+        permissionDirectories={[...props.permissionDirectories]}
+        allowAutoMode
+        allowAllEdits
+        rememberScope={{ tool: "Edit" }}
+        onSubmit={onSubmit}
+      />,
+    );
+    for (const directory of props.permissionDirectories) {
+      expect(screen.getByText(directory, { selector: "code" })).toBeDefined();
+    }
+    expect(screen.queryByRole("button", { name: /switch to auto mode/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /allow all edits/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /don't ask again/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept");
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "decline");
+    fireEvent.click(
+      screen.getByRole("button", { name: "Approve & allow directories for this session" }),
+    );
+    expect(onSubmit).toHaveBeenLastCalledWith(props.elicitationId, "accept", {
+      allow_directories: true,
+    });
+  });
+
+  it.each([
+    ["accept", true, true, "Approved · directory access for this session"],
+    ["accept", false, true, "Approved"],
+    ["decline", true, true, "Rejected"],
+    ["accept", true, false, "Approved"],
+  ] as const)("shows %s with consent %s and scope %s", (action, consent, hasScope, label) => {
+    render(
+      <ApprovalCard
+        {...props}
+        permissionDirectories={hasScope ? [...props.permissionDirectories] : undefined}
+        status="responded"
+        response={{ action, content: { allow_directories: consent } }}
+      />,
+    );
+    expect(screen.getByText(label)).toBeDefined();
+    expect(screen.queryByRole("button")).toBeNull();
+    if (action === "accept" && consent && hasScope) {
+      for (const directory of props.permissionDirectories) {
+        expect(screen.getByText(directory, { selector: "code" })).toBeDefined();
+      }
+    }
   });
 });
 
@@ -1010,6 +1089,74 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByText("Cursor has questions")).toBeDefined();
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
+
+  it.each([
+    {
+      name: "select",
+      harness: "Pi",
+      options: [{ label: "Allow" }, { label: "Block" }],
+      isOther: false,
+      value: "Allow",
+    },
+    { name: "input", harness: "Pi", options: [], isOther: true, value: "hello world" },
+    {
+      name: "plan choice",
+      harness: "Codex",
+      options: [{ label: "Implement the plan" }, { label: "Keep planning" }],
+      isOther: false,
+      value: "Implement the plan",
+    },
+  ])(
+    "submits a $harness $name using its supported inputs",
+    ({ options, isOther, value, harness }) => {
+      const submitSpy = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ submitApproval: submitSpy } as Partial<
+        ReturnType<typeof useChatStore.getState>
+      >);
+      render(
+        <ApprovalCard
+          elicitationId="elic_pi"
+          message="Pi question"
+          phase={harness === "Pi" ? "pi_extension_ui" : "codex_request_user_input"}
+          policyName={
+            harness === "Pi" ? "pi_native_extension_ui" : "codex_native_request_user_input"
+          }
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{
+            questions: [
+              {
+                id: "0",
+                question: "Pi question",
+                options,
+                multiSelect: false,
+                isOther,
+              },
+            ],
+          }}
+        />,
+      );
+      expect(
+        screen.getByText(harness === "Pi" ? "Pi needs your input" : "Codex needs input"),
+      ).toBeDefined();
+      expect(screen.queryByText("Claude has questions")).toBeNull();
+      const submit = screen.getByTestId("ask-user-question-submit");
+      expect(submit.hasAttribute("disabled")).toBe(true);
+      if (isOther) {
+        fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+          target: { value },
+        });
+      } else {
+        expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
+        fireEvent.click(screen.getByLabelText(value));
+      }
+      expect(submit.hasAttribute("disabled")).toBe(false);
+      fireEvent.click(submit);
+      expect(submitSpy).toHaveBeenCalledWith("elic_pi", "accept", { "0": value });
+    },
+  );
 
   it("submits multi-select answers as an array", () => {
     const submitSpy = vi.fn().mockResolvedValue(undefined);

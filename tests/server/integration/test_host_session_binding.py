@@ -158,7 +158,8 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     async def _respond_launched() -> None:
         """Respond to the launch frame from the host."""
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            # Binding writes finish before the launch frame; allow for CI database latency.
+            output = await comm.receive_output(timeout=10.0)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -884,6 +885,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     message_resp = await env.client.post(
@@ -1021,6 +1023,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     # Tail live progress at the layer the SSE endpoint reads it from.
@@ -1076,6 +1079,89 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     assert snapshot_after.status_code == 200, snapshot_after.text
     assert snapshot_after.json()["sandbox_status"] is None
     del tunnels
+
+
+async def test_managed_launch_action_required_reaches_snapshot_and_stream(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch that needs the user to act reports ``action_required`` with
+    what to do: the live stream and the snapshot carry those details until
+    the launch moves on.
+    """
+    from fastapi import HTTPException
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.managed_hosts import SandboxStageObserver
+
+    env = managed_session_env
+    details = "Refresh your dbcert on your laptop."
+    subscribed = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def _launch_needing_action(*, on_stage: SandboxStageObserver, **_: object) -> None:
+        """Stand in for a deployment's launch that finds the user has to act."""
+        await subscribed.wait()
+        # Details only belong to action_required; the publisher drops them elsewhere.
+        on_stage("provisioning", "Not shown for this stage.")
+        on_stage("action_required", details)
+        await finish.wait()
+        raise HTTPException(status_code=502, detail="managed sandbox launch failed: test over")
+
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.launch_managed_host", _launch_needing_action
+    )
+    agent = await create_test_agent(env.client, name="managed-action-required-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    reports: list[dict[str, Any]] = []
+
+    async def _tail_reports() -> None:
+        """Collect sandbox_status events after subscribing, through the first action_required."""
+        async for event in session_stream.subscribe(
+            session_id, ready_event={"type": "_test_subscribed"}
+        ):
+            if event.get("type") == "_test_subscribed":
+                subscribed.set()
+            elif event.get("type") == "session.sandbox_status":
+                reports.append(event)
+                if event["stage"] == "action_required":
+                    return
+
+    try:
+        await asyncio.wait_for(_tail_reports(), timeout=10.0)
+        snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["sandbox_status"] == {
+            "stage": "action_required",
+            "error": None,
+            "provider": "modal",
+            "details": details,
+        }
+    finally:
+        finish.set()
+    assert [(r["stage"], r["details"]) for r in reports] == [
+        ("provisioning", None),
+        ("action_required", details),
+    ]
+
+    # Let the stand-in launch settle as failed so no launch task outlives the test.
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while asyncio.get_running_loop().time() < deadline:
+        settled = await env.client.get(f"/v1/sessions/{session_id}")
+        if (settled.json()["sandbox_status"] or {}).get("stage") == "failed":
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the stand-in launch never settled as failed")
+    # Each report replaces the last, so the failure no longer carries the details.
+    assert settled.json()["sandbox_status"]["details"] is None
 
 
 async def test_subagent_session_reuses_managed_sandbox_runner(
@@ -1336,8 +1422,8 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     calls: list[str] = []
 
     def _finish_wake(**kwargs: object) -> None:
-        del kwargs
-        calls.append("wake")
+        # The wake gets the host's provider, which its seeded launch status names.
+        calls.append(f"wake {kwargs['provider']}")
         tracker.begin(conv.id)
         tracker.finish(conv.id)
 
@@ -1358,7 +1444,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
             conversation_store=conv_store,
         )
     assert exc.value.code == ErrorCode.WRONG_REPLICA
-    assert calls == ["wake"]
+    assert calls == ["wake islo"]
 
 
 async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_paused(
@@ -1494,7 +1580,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
 
     await sessions_module._run_managed_wake(
@@ -1564,7 +1650,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
@@ -1639,7 +1725,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
