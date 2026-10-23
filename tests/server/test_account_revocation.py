@@ -664,7 +664,9 @@ async def test_late_schedule_registration_stops_after_account_deletion(setup_app
 
 
 @pytest.mark.parametrize("setup_app", [True], indirect=True)
-def test_account_deletion_prevents_future_persistent_dispatch(setup_app):
+def test_account_deletion_prevents_future_persistent_dispatch(setup_app, monkeypatch):
+    from unittest.mock import Mock
+
     from omnigent.server.scheduled.dispatch_scheduler import PersistentTaskScheduler
     from tests.server.scheduled.test_scheduler import FakeClock
 
@@ -694,8 +696,11 @@ def test_account_deletion_prevents_future_persistent_dispatch(setup_app):
     scheduler = PersistentTaskScheduler(
         tasks, dispatch.on_fire, dispatch.on_expired, owns_host=dispatch.owns_host, now=clock.now
     )
+    list_tasks = Mock(wraps=tasks.list)
+    monkeypatch.setattr(tasks, "list", list_tasks)
     deleted = admin.delete("/auth/users/alice")
     assert deleted.status_code == 204, deleted.text
+    list_tasks.assert_not_called()
     assert tasks.list_due_tasks(int(clock.now())) == []
     admin.portal.call(scheduler.poll_once)
     admin.portal.call(scheduler.stop)

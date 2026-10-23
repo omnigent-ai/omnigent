@@ -261,7 +261,7 @@ async def test_lifespan_database_switch_dispatches_claim_and_drains(
     async with app.router.lifespan_context(app):
         scheduler = app.state.scheduled_task_scheduler
         assert isinstance(scheduler, PersistentTaskScheduler)
-        for name, value in settings.model_dump().items():
+        for name, value in settings.model_dump(exclude={"startup_retry_seconds"}).items():
             assert getattr(scheduler, f"_{name}") == value
         new_task = store.create(
             _uid("new-dispatch"), "new", "prompt", "FREQ=DAILY", None, _uid("agent"), "UTC"
@@ -393,15 +393,14 @@ async def test_automations_v2_rejects_invalid_scheduler_config_at_app_creation(
         )
 
 
+@pytest.mark.parametrize("config_source", ["yaml", "injected"])
 @pytest.mark.parametrize("failure", ["reset_dispatch_cursors", "list_active_all_workspaces"])
 async def test_legacy_startup_retries_without_skipping_cursor_reset(
-    runtime_init, db_uri, tmp_path, monkeypatch, failure
+    runtime_init, db_uri, tmp_path, monkeypatch, failure, config_source
 ):
-    import omnigent.server.app as app_module
     from tests._helpers.polling import poll_until_async
 
     monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
-    monkeypatch.setattr(app_module, "_SCHEDULED_TASK_START_RETRY_SECONDS", 0.01)
     store = SqlAlchemyScheduledTaskStore(db_uri)
     store.configure_dispatch(True)
     task = store.create(
@@ -418,7 +417,22 @@ async def test_legacy_startup_retries_without_skipping_cursor_reset(
         return original()
 
     monkeypatch.setattr(store, failure, unavailable_once)
-    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        server_config={
+            "scheduled_task_scheduler": {
+                "startup_retry_seconds": 0.01 if config_source == "yaml" else 60,
+                "lease_seconds": -1,
+            }
+        },
+        scheduler_config=(
+            ScheduledTaskSchedulerConfig(startup_retry_seconds=0.01)
+            if config_source == "injected"
+            else None
+        ),
+    )
     async with app.router.lifespan_context(app):
         assert app.state.scheduled_task_scheduler is None
         await poll_until_async(
@@ -430,3 +444,142 @@ async def test_legacy_startup_retries_without_skipping_cursor_reset(
         assert store.get(task.id).next_run_at is None
         assert attempts == 2
     assert not scheduler.is_started
+
+
+async def test_persistent_startup_uses_configured_retry(
+    runtime_init, db_uri, tmp_path, monkeypatch
+):
+    from tests._helpers.polling import poll_until_async
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
+    start = PersistentTaskScheduler.start
+    attempts = 0
+
+    async def unavailable_once(self):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        await start(self)
+
+    monkeypatch.setattr(PersistentTaskScheduler, "start", unavailable_once)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+        dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()),
+        server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
+    )
+    async with app.router.lifespan_context(app):
+        assert app.state.scheduled_task_scheduler is None
+        await poll_until_async(
+            lambda: app.state.scheduled_task_scheduler is not None, timeout_s=10
+        )
+        assert app.state.scheduled_task_scheduler.is_started
+        assert attempts == 2
+
+
+async def test_legacy_rejects_invalid_retry_interval(runtime_init, db_uri, tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
+    with pytest.raises(ValueError, match="startup_retry_seconds"):
+        _build_app(
+            db_uri,
+            tmp_path,
+            scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri),
+            server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0}},
+        )
+
+
+@pytest.mark.parametrize("operation", ["reset_dispatch_cursors", "list_active_all_workspaces"])
+async def test_legacy_startup_database_work_leaves_event_loop_responsive(
+    runtime_init, db_uri, tmp_path, monkeypatch, operation
+):
+    import threading
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    original = getattr(store, operation)
+
+    def blocked():
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Database read blocked the event loop"
+        return original()
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
+    monkeypatch.setattr(store, operation, blocked)
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+    lifespan = app.router.lifespan_context(app)
+    startup = asyncio.create_task(lifespan.__aenter__())
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        assert not startup.done()
+    finally:
+        release.set()
+        await startup
+        await lifespan.__aexit__(None, None, None)
+
+
+@pytest.mark.parametrize("reset_fails", [False, True])
+async def test_shutdown_waits_for_cursor_reset_without_starting_timers(
+    runtime_init, db_uri, tmp_path, monkeypatch, reset_fails
+):
+    import threading
+
+    from tests._helpers.polling import poll_until_async
+
+    loop = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    attempts = 0
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    original = store.reset_dispatch_cursors
+
+    def blocked_reset():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        loop.call_soon_threadsafe(entered.set)
+        try:
+            assert release.wait(10), "Shutdown never released the database operation"
+            if reset_fails:
+                raise RuntimeError("database reset failed")
+            return original()
+        finally:
+            finished.set()
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-automations_v2")
+    monkeypatch.setattr(store, "reset_dispatch_cursors", blocked_reset)
+    load_tasks = Mock(wraps=store.list_active_all_workspaces)
+    monkeypatch.setattr(store, "list_active_all_workspaces", load_tasks)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        scheduled_task_store=store,
+        scheduler_config=ScheduledTaskSchedulerConfig(startup_retry_seconds=0.01),
+    )
+    lifespan = app.router.lifespan_context(app)
+    await lifespan.__aenter__()
+    shutdown = None
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        retry = next(
+            t for t in asyncio.all_tasks() if t.get_name() == "scheduled-task-startup-retry"
+        )
+        shutdown = asyncio.create_task(lifespan.__aexit__(None, None, None))
+        await poll_until_async(lambda: retry.cancelling(), timeout_s=10)
+        assert not shutdown.done()
+        assert not finished.is_set()
+    finally:
+        release.set()
+        if shutdown is not None:
+            await shutdown
+        else:
+            await lifespan.__aexit__(None, None, None)
+    assert finished.is_set()
+    assert retry.done()
+    load_tasks.assert_not_called()
+    assert app.state.scheduled_task_scheduler is None

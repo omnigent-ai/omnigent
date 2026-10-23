@@ -140,6 +140,7 @@ These are the defaults in the server YAML configuration:
 
 ```yaml
 scheduled_task_scheduler:
+  startup_retry_seconds: 30  # Delay before retrying failed scheduler startup, in either mode
   poll_seconds: 30       # Time between checks for due tasks and expired startups
   renewal_seconds: 30    # Time between startup heartbeats
   lease_seconds: 120     # Lease duration after a successful renewal
@@ -149,20 +150,24 @@ scheduled_task_scheduler:
 ```
 
 Omit the section or individual settings to use defaults; an empty section also
-uses defaults. `OMNIGENT_CONFIG` selects the server YAML file. Application wrappers
-can instead pass `server_config`, or
+uses defaults. For the CLI, pass the YAML file with `omnigent server -c path/to/config.yaml`.
+Application wrappers can pass `server_config`; otherwise `create_app()` reads the
+file selected by `OMNIGENT_CONFIG`. Wrappers can also
 supply `scheduled_task_scheduler_config=ScheduledTaskSchedulerConfig(...)` to
 replace the YAML scheduler settings.
 
 Settings take effect at startup. Values must be positive and finite; lease seconds
 and capacities must be whole numbers. Renewal must be more frequent than expiry.
-Invalid settings fail startup when the flag is on; the section is ignored when
-it is off.
+Invalid settings fail startup when the flag is on. With the flag off, only
+`startup_retry_seconds` is read and validated; other scheduler settings are ignored.
 
 ## Switching schedulers
 
 Set `OMNIGENT_FEATURES=automations_v2` and restart all scheduler replicas together.
 The application requires a compatible store and execution/recovery callbacks.
+Built-in entrypoints, including the CLI and Docker server, do not yet supply these
+callbacks, so enabling the flag there fails startup. A deployment wrapper must
+pass them to `create_app()` before enabling the flag.
 The legacy Run now path still uses a local overlap guard, so it must join the
 claimed-run path before rollout. The executor integration must also handle a
 session that finishes while its run still says `starting`; the current recovery
@@ -173,8 +178,11 @@ set `OMNIGENT_FEATURES=-automations_v2` and restart all replicas. Legacy startup
 clears saved `next_run_at` values before creating future timers. Task definitions,
 run history, and running agent sessions are retained. Clearing the saved times
 prevents a later re-enable from replaying occurrences handled by the old timers.
-If clearing or startup fails, it retries every 30 seconds; task routes see the
-scheduler as unavailable until startup succeeds.
+If clearing or startup fails, it retries after `startup_retry_seconds` (default 30).
+Until startup succeeds, the scheduler is unavailable; persistent-mode task routes
+still return saved `next_run_at` values. Database reads and cursor resets run off
+the event loop. Shutdown waits for an ongoing cursor reset to finish, so a slow
+database write can delay shutdown.
 
 All replicas sharing a database must use the same mode, because legacy timers do
 not claim occurrences. Changing the environment of a running server does not

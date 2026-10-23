@@ -168,7 +168,6 @@ if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 _logger = logging.getLogger(__name__)
-_SCHEDULED_TASK_START_RETRY_SECONDS = 30
 
 _RECONNECT_BINDING_BATCH_SIZE = 128
 
@@ -1425,9 +1424,9 @@ def create_app(
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param scheduled_task_dispatch: Claimed-run execution and recovery callbacks;
         required only when automations_v2 is enabled.
-    :param scheduled_task_scheduler_config: Startup settings for persistent scheduling.
-        Overrides the server config's scheduled_task_scheduler section. Ignored
-        when automations_v2 is off; changes require restarting the app.
+    :param scheduled_task_scheduler_config: Overrides the server config's
+        scheduled_task_scheduler section. With automations_v2 off, only
+        startup_retry_seconds applies. Changes require restarting the app.
     :param project_store: Store for first-class projects (owner-private
         containers that group sessions). ``None`` disables the
         ``/v1/projects`` CRUD endpoints.
@@ -1569,7 +1568,6 @@ def create_app(
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
-    dispatch_config = None
     if automations_v2_enabled:
         if scheduled_task_store is None:
             raise ValueError(
@@ -1589,15 +1587,22 @@ def create_app(
                 "ScheduledTaskDispatchStore, or disable automations_v2 to use the "
                 "existing scheduler."
             )
-        scheduler_settings = resolved_server_config.get("scheduled_task_scheduler")
-        dispatch_config = (
-            scheduled_task_scheduler_config
-            if scheduled_task_scheduler_config is not None
-            else ScheduledTaskSchedulerConfig.model_validate(
-                {} if scheduler_settings is None else scheduler_settings
-            )
-        )
         scheduled_task_store.check_dispatch_support()
+    scheduler_settings = resolved_server_config.get("scheduled_task_scheduler")
+    if not automations_v2_enabled:
+        scheduler_settings = (
+            {"startup_retry_seconds": scheduler_settings["startup_retry_seconds"]}
+            if isinstance(scheduler_settings, dict)
+            and "startup_retry_seconds" in scheduler_settings
+            else {}
+        )
+    dispatch_config = (
+        scheduled_task_scheduler_config
+        if scheduled_task_scheduler_config is not None
+        else ScheduledTaskSchedulerConfig.model_validate(
+            {} if scheduler_settings is None else scheduler_settings
+        )
+    )
     if isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
         scheduled_task_store.configure_dispatch(automations_v2_enabled)
     resolved_extension_state = _resolve_extension_state(extension_state)
@@ -1867,7 +1872,6 @@ def create_app(
                 )
             else:
                 assert scheduled_task_dispatch is not None
-                assert dispatch_config is not None
                 assert isinstance(scheduled_task_store, ScheduledTaskDispatchStore)
                 scheduled_task_scheduler = PersistentTaskScheduler(
                     store=scheduled_task_store,
@@ -1889,7 +1893,19 @@ def create_app(
                     if not automations_v2_enabled and isinstance(
                         scheduled_task_store, ScheduledTaskDispatchStore
                     ):
-                        await asyncio.to_thread(scheduled_task_store.reset_dispatch_cursors)
+                        reset = asyncio.create_task(
+                            asyncio.to_thread(scheduled_task_store.reset_dispatch_cursors),
+                            name="scheduled-task-cursor-reset",
+                        )
+                        try:
+                            await asyncio.shield(reset)
+                        except asyncio.CancelledError:
+                            # A cancelled waiter cannot stop database writes already in progress.
+                            try:
+                                await reset
+                            except Exception:
+                                _logger.exception("Scheduling cursor reset failed during shutdown")
+                            raise
                     await scheduled_task_scheduler.start()
                 except Exception:
                     if isinstance(scheduled_task_scheduler, ScheduledTaskScheduler):
@@ -1899,7 +1915,7 @@ def create_app(
 
             async def retry_scheduler_start() -> None:
                 while True:
-                    await asyncio.sleep(_SCHEDULED_TASK_START_RETRY_SECONDS)
+                    await asyncio.sleep(dispatch_config.startup_retry_seconds)
                     try:
                         await start_scheduled_tasks()
                     except Exception:
@@ -1912,7 +1928,7 @@ def create_app(
             except Exception:
                 _logger.exception(
                     "Scheduled tasks could not start; retrying every %s seconds",
-                    _SCHEDULED_TASK_START_RETRY_SECONDS,
+                    dispatch_config.startup_retry_seconds,
                 )
                 scheduler_start_retry = asyncio.create_task(
                     retry_scheduler_start(), name="scheduled-task-startup-retry"
@@ -2056,6 +2072,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.

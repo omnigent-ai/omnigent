@@ -27,6 +27,7 @@ tests can drive the scheduler with a fake clock and manual timer firing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -145,7 +146,8 @@ class ScheduledTaskScheduler:
         if self._started:
             _logger.debug("scheduler: start() called but already started; ignoring")
             return
-        for task in self._store.list_active_all_workspaces():
+        tasks = await asyncio.to_thread(self._store.list_active_all_workspaces)
+        for task in tasks:
             try:
                 self._register(task)
             except RRuleValidationError as exc:

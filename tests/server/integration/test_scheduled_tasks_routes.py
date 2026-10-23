@@ -1933,8 +1933,13 @@ async def test_run_now_503_when_scheduler_not_running(
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("scheduler_available", [True, False])
 async def test_database_scheduler_crud_uses_persisted_next_run(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    scheduler_available: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from datetime import datetime
 
@@ -1943,6 +1948,9 @@ async def test_database_scheduler_crud_uses_persisted_next_run(
     assert isinstance(auth_app.state.scheduled_task_scheduler, PersistentTaskScheduler)
     assert auth_app.state.scheduled_task_scheduler.is_started
     store = auth_app.state.scheduled_task_scheduler._store
+    if not scheduler_available:
+        await auth_app.state.scheduled_task_scheduler.stop()
+        monkeypatch.setattr(auth_app.state, "scheduled_task_scheduler", None)
     created = await auth_client.post(
         "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
     )

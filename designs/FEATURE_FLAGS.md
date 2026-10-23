@@ -60,11 +60,11 @@ for Claude working-status acceptance and kill-switch verification.
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
 
-Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
+The built-in server entrypoints do not yet supply the required execution/recovery
+hooks. Enabling `automations_v2` there fails startup, even if only UI changes are
+needed. A deployment wrapper must provide the hooks through `create_app()`.
 
-The persistence layer is available, but the persistent scheduler and its flag
-wiring are not integrated yet. The startup-recovery and cleanup-sweep rollback
-instructions below apply once that integration lands.
+Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
 
 Even with the flag off, an interrupted deletion can leave a hidden task row for
 cleanup. During a mixed-version deployment, older replicas can still show and

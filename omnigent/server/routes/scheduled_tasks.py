@@ -37,7 +37,6 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.scheduled.dispatch_scheduler import PersistentTaskScheduler
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
@@ -139,13 +138,14 @@ class UpdateScheduledTaskRequest(BaseModel):
         return self
 
 
-def _next_run_at(task: ScheduledTask, scheduler: Any) -> str | None:
-    if isinstance(scheduler, PersistentTaskScheduler):
+def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
+    if getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
         return (
             datetime.fromtimestamp(task.next_run_at, UTC).isoformat()
             if task.next_run_at is not None
             else None
         )
+    scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
     return scheduler.next_run_at(task.id) if scheduler is not None else None
 
 
@@ -430,13 +430,15 @@ def create_scheduled_tasks_router(
                 ) from exc
             raise
         scheduler = _scheduler(request)
-        if scheduler is not None and not isinstance(scheduler, PersistentTaskScheduler):
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
             scheduler.add(task)
         # A freshly created task has no runs (last_run_status is None); its
         # next_run_at is available now that the scheduler armed it above.
         return _to_response(
             task,
-            next_run_at=_next_run_at(task, scheduler),
+            next_run_at=_next_run_at(task, request),
         )
 
     @router.get("/scheduled-tasks")
@@ -461,13 +463,12 @@ def create_scheduled_tasks_router(
         # dead run as ``failed`` rather than a stuck ``running``.
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks(task_ids)
-        scheduler = _scheduler(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     t,
                     last_run_status=latest_status.get(t.id),
-                    next_run_at=_next_run_at(t, scheduler),
+                    next_run_at=_next_run_at(t, request),
                 )
                 for t in tasks
             ]
@@ -485,11 +486,10 @@ def create_scheduled_tasks_router(
         running = store.list_running_runs_for_tasks([task.id])
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks([task.id])
-        scheduler = _scheduler(request)
         return _to_response(
             task,
             last_run_status=latest_status.get(task.id),
-            next_run_at=_next_run_at(task, scheduler),
+            next_run_at=_next_run_at(task, request),
         )
 
     @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
@@ -688,13 +688,15 @@ def create_scheduled_tasks_router(
                 ) from exc
             raise
         scheduler = _scheduler(request)
-        if scheduler is not None and not isinstance(scheduler, PersistentTaskScheduler):
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
             scheduler.update(updated)
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
             last_run_status=latest_status.get(updated.id),
-            next_run_at=_next_run_at(updated, scheduler),
+            next_run_at=_next_run_at(updated, request),
         )
 
     @router.delete("/scheduled-tasks/{scheduled_task_id}")
@@ -711,7 +713,9 @@ def create_scheduled_tasks_router(
         _require_owned(scheduled_task_id, owner_id)
         await asyncio.to_thread(store.delete, scheduled_task_id)
         scheduler = _scheduler(request)
-        if scheduler is not None and not isinstance(scheduler, PersistentTaskScheduler):
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
             scheduler.remove(scheduled_task_id)
         return {"deleted": True, "id": scheduled_task_id}
 
