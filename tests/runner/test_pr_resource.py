@@ -35,6 +35,7 @@ GITHUB_CAPABILITIES = {
     "linked_pr_diff": True,
     "label_editing": True,
     "merging": True,
+    "reviewer_editing": True,
 }
 # An ssh config host alias (``Host github.com-work`` / ``HostName github.com``).
 ALIAS_ORIGIN = "git@github.com-work:o/r.git"

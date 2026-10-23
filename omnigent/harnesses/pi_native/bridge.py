@@ -384,6 +384,16 @@ def write_extension_files(
     return extension_path(bridge_dir), config_path(bridge_dir)
 
 
+def write_agent_instructions(bridge_dir: Path, instructions: str | None) -> Path | None:
+    """Atomically replace owner-only startup instructions, or remove stale text."""
+    path = bridge_dir / "agent_instructions.md"
+    if instructions is None:
+        path.unlink(missing_ok=True)
+        return None
+    _atomic_text(path, instructions)
+    return path
+
+
 def refresh_config_auth_headers(bridge_dir: Path, auth_headers: dict[str, str]) -> bool:
     """
     Merge fresh headers into the ``authHeaders`` of an existing extension config.

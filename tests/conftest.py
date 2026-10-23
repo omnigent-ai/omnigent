@@ -514,6 +514,15 @@ def _isolate_origin_identity(
     monkeypatch.setattr(debug_logging, "_probe_workspace_id", lambda api_base: None)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_databricks_org_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register the org pin with monkeypatch so direct os.environ writes are undone."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, "")
+    monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
+
+
 @pytest.fixture
 def origin_identity_probe() -> None:
     """Opt in to the real workspace-id probe (see ``_isolate_origin_identity``)."""

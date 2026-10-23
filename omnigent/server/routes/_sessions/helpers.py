@@ -419,6 +419,35 @@ def _publish_policy_denied(session_id: str, reason: str, phase: str) -> None:
     session_stream.publish(session_id, event.model_dump())
 
 
+def _claude_native_permission_directories(suggestions: Any) -> list[str] | None:
+    """Return complete session directory grants offered by Claude's permission hook.
+
+    :param suggestions: Native ``permission_suggestions``; other update types are ignored.
+    :returns: Exact directory spellings, or None for absent or malformed directory grants.
+    """
+    if not isinstance(suggestions, list):
+        return None
+    directories: list[str] = []
+    for suggestion in suggestions:
+        if not isinstance(suggestion, dict):
+            return None
+        if suggestion.get("type") != "addDirectories":
+            continue
+        offered = suggestion.get("directories")
+        if (
+            suggestion.get("destination") != "session"
+            or not isinstance(offered, list)
+            or not offered
+            or any(
+                not isinstance(directory, str) or not directory.strip() or "\0" in directory
+                for directory in offered
+            )
+        ):
+            return None
+        directories.extend(offered)
+    return directories or None
+
+
 def _allow_auto_mode_eligible(tool_name: str, permission_mode: str | None) -> bool:
     """
     Whether a regular Claude permission prompt may offer a session-scoped auto-mode switch.
@@ -448,8 +477,8 @@ def _allow_all_edits_eligible(tool_name: str, permission_mode: str | None) -> bo
     plan card's "Yes, and use auto mode" option (exit plan mode AND
     switch the session into Claude's ``auto`` mode).
     Already-permissive modes (``acceptEdits`` / ``bypassPermissions``)
-    wouldn't prompt at all, so the switch would be inert. Used at BOTH
-    the stamp site (drives the UI button) and the verdict site (gates
+    do not need this mode switch; callers handle directory grants separately.
+    Used at BOTH the stamp site (drives the UI button) and the verdict site (gates
     the ``setMode`` decision), so the server never honors a
     client-supplied ``allow_all_edits`` flag on a tool/mode the
     affordance was never offered for.
@@ -5333,7 +5362,12 @@ def _publish_sandbox_status(*args: Any, **kwargs: Any) -> None:
 
 
 def _publish_sandbox_status_impl(
-    session_id: str, stage: str, error: str | None = None, *, provider: str | None = None
+    session_id: str,
+    stage: str,
+    error: str | None = None,
+    *,
+    provider: str | None = None,
+    details: str | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionSandboxStatusEvent` and update the
@@ -5359,6 +5393,9 @@ def _publish_sandbox_status_impl(
         ``None`` for non-terminal stages.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``.
         Later stages keep the cached launch's provider when omitted.
+    :param details: What the user needs to do when *stage* is
+        ``"action_required"``, e.g. ``"Sign in on your laptop."``. ``None`` for
+        other stages.
     """
     # "ready" evicts: from then on the session looks like any
     # host-bound session and the snapshot carries no launch state.
@@ -5370,6 +5407,7 @@ def _publish_sandbox_status_impl(
             "stage": stage,
             "error": error,
             "provider": provider or (previous.provider if previous else None),
+            "details": details if stage == "action_required" else None,
         }
     )
     log = _logger.error if stage == "failed" else _logger.info
@@ -5380,6 +5418,8 @@ def _publish_sandbox_status_impl(
             "sandbox_launch_failed" if stage == "failed" else "sandbox_launch_stage",
             session_id=session_id,
             stage=(previous.stage if previous else "unknown") if stage == "failed" else stage,
+            # Every stage row names the sandbox, even when the launch's host never connects.
+            provider=status.provider,
         ),
     )
     if status.stage == "ready":
@@ -5392,6 +5432,7 @@ def _publish_sandbox_status_impl(
         stage=status.stage,
         error=status.error,
         provider=status.provider,
+        details=status.details,
     )
     session_stream.publish(session_id, event.model_dump())
 
@@ -6455,7 +6496,7 @@ async def _provision_managed_sandbox(
     """
     from omnigent.server.managed_hosts import launch_managed_host, relaunch_managed_host
 
-    def _on_stage(stage: str) -> None:
+    def _on_stage(stage: str, details: str | None = None) -> None:
         """
         Relay a launch-pipeline stage to the session's progress surface.
 
@@ -6464,8 +6505,9 @@ async def _provision_managed_sandbox(
         :func:`_publish_sandbox_status` is thread-safe.
 
         :param stage: The stage just entered, e.g. ``"cloning"``.
+        :param details: What the user needs to do, for ``"action_required"``.
         """
-        _publish_sandbox_status(session_id, stage)
+        _publish_sandbox_status(session_id, stage, details=details)
 
     try:
         if relaunch_host is not None:

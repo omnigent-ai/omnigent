@@ -3231,14 +3231,20 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize(
+    "resource, added",
+    [("labels", "bug"), ("reviewers", {"login": "octocat", "kind": "user"})],
+)
+async def test_github_pr_edit_relays_the_runner_refusal(
+    client: httpx.AsyncClient, resource: str, added: object
+) -> None:
     """A provider refusal keeps the runner's status and message for the panel."""
     from omnigent.runner import github_resource
     from omnigent.server.routes import _host_filesystem
     from omnigent.server.routes.sessions import routes_resources
 
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/labels"
-    detail = "The GitHub account on the host cannot edit this pull request's labels."
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
+    detail = f"The GitHub account on the host cannot edit this pull request's {resource}."
     fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     timeouts: list[float | None] = []
@@ -3255,9 +3261,9 @@ async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncCl
     fake_runner.get, fake_runner.post = get, post  # type: ignore[method-assign]
 
     resp = await client.post(
-        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"]}
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": [added]}
     )
-    malformed = await client.post(path, json={"add": ["bug"]})
+    malformed = await client.post(path, json={"add": [added]})
     await client.get(path, params={"pr_url": "https://github.com/acme/widgets/pull/17"})
 
     assert resp.status_code == 400
@@ -3268,7 +3274,7 @@ async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncCl
     assert github_resource._PR_EDIT_REQUEST_SECONDS < routes_resources._PR_EDIT_PROXY_TIMEOUT_S
     assert github_resource._PR_EDIT_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
     assert fake_runner.post_json_calls == [
-        (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"], "remove": []})
+        (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": [added], "remove": []})
     ]
 
 
@@ -9745,6 +9751,7 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/diff/new.py", "github_diff"),
         ("/labels", "github_labels"),
         ("/merge-options", "github_merge_options"),
+        ("/reviewers", "github_reviewers"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -9799,6 +9806,12 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     "resource,body,op,params",
     [
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
+        (
+            "/reviewers",
+            {"remove": [{"login": "octocat", "kind": "user"}]},
+            "github_reviewers_update",
+            {"add": [], "remove": [{"login": "octocat", "kind": "user"}]},
+        ),
         (
             "/merge",
             {"merge_method": "squash", "expected_head": "a" * 40},

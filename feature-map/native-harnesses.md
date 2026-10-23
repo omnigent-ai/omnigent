@@ -10,6 +10,8 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `agent-instructions`: Pi native delivers authored instructions at launch/resume;
+  authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
@@ -75,6 +77,14 @@ implements them separately, so a fix for one harness does not reach the others.
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
 
+**Agent instructions (Pi native):** launch an agent whose spec contains inline
+instructions or references a bundled instruction file. Reopen its terminal and
+check the same authored role is present once. For a custom Pi-native agent,
+`executor.context_files: false` excludes automatic workspace/global notes, and
+`executor.system_prompt_mode: replace` replaces Pi's base prompt. Explicit agent
+instructions remain; these options do not restrict file access or extensions.
+The `omnigent pi` wrapper also appends its own startup instructions.
+
 **Working status:** watch the session's Chat indicator after sending from the
 new-session composer, an existing-session composer, or the agent terminal.
 Switch Terminal → Chat, close/reopen the viewer, and reload during quiet work.
@@ -102,6 +112,11 @@ before entering the harness menu. Then start a new CLI or web session.
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
+
+**Approval links:** open a pending permission's standalone approval link.
+Claude directory requests show the exact directories in Chat, Inbox, and the
+standalone page. Approve once, reject, or allow those directories for the
+session; the directory choice preserves the current permission mode.
 
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
@@ -277,6 +292,33 @@ Cross-harness journeys:
   before a terminal starts. The supported release must answer terminal and API
   input through the real Pi process; only model replies are scripted locally.
   Each case owns its stack and saves terminal recordings plus API evidence.
+- **`agent-instructions`, Pi native (own environment):**
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py::test_cold_resume_preserves_model_and_prompt_settings`
+  uploads a spec with a bundled instruction file through a real server, host,
+  runner and Pi terminal. A test-owned extension reads the real system prompt
+  at launch/resume with defaults, replacement/no-context and untrusted-project settings.
+  Authored instructions remain once. Default append mode keeps the project's
+  APPEND_SYSTEM.md at launch and falls back to the active global file on restart
+  after the project file is removed; no explicit append arguments are supplied.
+  An explicit `--no-approve` keeps the global file and excludes the project file.
+  Context follows its setting, and replacement excludes built-in/SYSTEM.md and
+  APPEND_SYSTEM.md prompts while preserving explicit user append input at launch
+  and resume. The selected model survives. No model call is made.
+  Run with the CI-pinned Pi executable:
+
+  ```sh
+  OMNIGENT_PI_PATH=/path/to/pi uv run --no-sync pytest tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py --reruns 0 -q
+  ```
+
+  Explicit append inputs, trust overrides, missing files and replacement
+  precedence and inaccessible directories are covered by
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_native_pi_preserves_append_discovery`.
+  Raw/resolved/absent specs and repeated user additions are covered by
+  `tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_pi_terminal_launches_required_terminal`.
+  `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
+  checks authored instructions in actual scripted-provider requests before and
+  after a real Pi fork with tool history. These checks do not prove browser
+  launch, OS sandbox access or live-model adherence to the instructions.
 - **`side-chat`, Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
@@ -400,6 +442,16 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`approvals`, Claude directory access:**
+  `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
+  checks Chat (including reload), Inbox, and standalone approval links against
+  a real server and browser. It supplies a synthetic native permission hook,
+  verifies both directory spellings are visible, and checks the returned
+  session grant preserves the offered scope without changing Auto mode.
+  To verify Claude itself, start it in a disposable home directory with a
+  worktree symlink pointing outside that home, request two edits in that
+  worktree, and approve directory access on the first prompt. The second edit
+  in the granted directory should proceed with Auto still enabled.
 - **`approvals`, Kiro delivery and manual retry:**
   `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_manual_retry`
   (own environment, real browser/server/runner/tmux, fake Kiro) drops the first
@@ -458,6 +510,27 @@ Cross-harness journeys:
   billing or recovery after the runner deletes the bridge directory.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`approvals`, Pi extension dialogs:**
+  `tests/e2e/test_pi_extension_ui_round_trip.py::test_real_pi_dialog_answers_and_continues`
+  runs real SDK and native Pi through an isolated server/runner with a scripted
+  provider, sandbox disabled: four dialog answers, decline, later-turn history
+  and native cancellation/card cleanup after the reconnect grace period.
+  `tests/e2e_ui/approvals/test_pi_extension_ui.py` checks confirmation layout
+  and multiline editor submission through Chat using injected hooks; select
+  and input matrices stay in component tests. Older servers use native TUI
+  dialogs on 404/405; supported servers deliver dialogs through the web only.
+  Read-only callers cannot publish cards. Native timeouts are capped at the
+  server limit, and cancelled waits stop re-parking (server/JS regressions).
+  Known gaps: stale sidebar “Needs response” after native cancellation,
+  Inbox/mobile, active SDK interruption, sandbox and Managed acceptance.
+  These scenarios own their isolated environments:
+
+  ```sh
+  uv run --no-sync pytest tests/e2e/test_pi_extension_ui_round_trip.py --reruns 0 -q
+  uv run --no-sync pytest tests/e2e_ui/approvals/test_pi_extension_ui.py --ui-skip-build --video=on --screenshot=on --reruns 0 -q
+  pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
+  ```
+
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
   (own environment, real server, runner, native CLI and tmux with local model
@@ -558,6 +631,23 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
+  vendor model):**
+  `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`
+  interrupts through the runner's real event route, and the next idle settles
+  a sub-agent dispatch as cancelled with its output.
+  `tests/runner/test_native_interrupt_runner.py::test_opencode_interrupt_fallbacks`
+  covers missing native session state and a failed abort. Neither runs
+  OpenCode. With the CLI on `PATH`,
+  `tests/e2e/test_opencode_native_wire_contract_e2e.py::test_opencode_native_wire_contract_against_real_server`
+  (opt-in `OMNIGENT_E2E_OPENCODE_NATIVE=1`) checks the abort call against a
+  real server, and the matrix test covers cancelling during startup. No test
+  interrupts a running OpenCode turn: configure an OpenAI-compatible loopback
+  provider that holds the reply open, interrupt once the request arrives, then
+  confirm the session goes idle without turning busy again, a reply released
+  afterwards never appears, and a follow-up in the same session completes. The
+  harness bench does not register opencode-native, so its interrupt probe does
+  not apply.
 - **`disconnect`, Claude startup (plain `uv run pytest`, no vendor CLI):**
   `tests/harnesses/claude_native/test_claude_native_readiness_exit.py` delivers
   a web message through the public bridge into a real retained dead tmux pane.
@@ -667,6 +757,9 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
   twelve rows above.
 - Approval and permission callbacks come from several harnesses, not only
   Claude. Restricting a gate to one harness breaks the others' approvals.
+- Claude directory grants cover only the displayed directories for the session.
+  A symlink may require both its visible and resolved paths. A mode switch alone
+  does not grant directory access, and read-only rules are separate grants.
 - Needing sign-in and not being installed are different states with different
   prompts. Reproduce on a host with the same credential situation as the reporter.
 - Some harnesses have a sign-in flow of their own when launched outside
@@ -683,3 +776,6 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
   above do not cover other harnesses' transports or runner-tunnel recovery.
 - The harness registry declares which harness supports effort, approvals, and
   resume. Check it before assuming a column applies.
+- OpenCode accepts an abort even when nothing is running, so an accepted
+  interrupt does not prove a turn was stopped. Check the session state and the
+  model request instead.

@@ -2311,10 +2311,10 @@ def _codex_rollout_records_from_session_items(
         items,
         interrupted_response_ids=interrupted_response_ids,
     )
-    items = _codex_items_with_outputs_in_call_order(items)
+    items = _codex_items_with_outputs_in_call_order(
+        [item for item in items if _session_item_response_id(item) not in interrupted_response_ids]
+    )
     for index, item in enumerate(items):
-        if _session_item_response_id(item) in interrupted_response_ids:
-            continue
         item_call_id = item.get("call_id")
         if (
             item.get("type") == "function_call_output"

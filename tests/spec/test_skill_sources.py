@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -1171,3 +1172,418 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
     names = [s.name for s in resolve_harness_skills(_ctx(ws, home), "antigravity-native")]
     assert names == ["neutral-skill"]
+
+
+def _write_plugin_command(commands_dir: Path, name: str, text: str) -> None:
+    """Write a ``<commands_dir>/<name>.md`` plugin command file."""
+    commands_dir.mkdir(parents=True, exist_ok=True)
+    (commands_dir / f"{name}.md").write_text(text)
+
+
+def _claude_home_with_plugin_command(
+    home: Path, *, plugin: str = "knowledge-base", marketplace: str = "mkt"
+) -> tuple[Path, Path]:
+    """Seed a fake ~/.claude with one enabled plugin carrying a skill and a command.
+
+    :returns: ``(home, install)`` where *install* is the plugin's install path.
+    """
+    _claude_home_with_plugin(
+        home, plugin=plugin, marketplace=marketplace, skill="kb-search", enabled=True
+    )
+    install = home / ".claude" / "plugins" / "cache" / marketplace / plugin / "1.0.0"
+    _write_plugin_command(
+        install / "commands",
+        "kb-review",
+        "---\n"
+        "description: Review a knowledge-base PR\n"
+        "argument-hint: --pr <number>\n"
+        "---\n"
+        "Review the KB pull request given as $ARGUMENTS.\n",
+    )
+    return home, install
+
+
+def _write_plugin_manifest(install: Path, **fields: object) -> None:
+    """Write the plugin's ``.claude-plugin/plugin.json`` with *fields*."""
+    (install / ".claude-plugin").mkdir(parents=True, exist_ok=True)
+    (install / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": install.parent.name, "version": "1.0.0", **fields})
+    )
+
+
+def test_claude_provider_surfaces_plugin_commands_namespaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A plugin's ``commands/<name>.md`` shows up next to its skills."""
+    home, _ = _claude_home_with_plugin_command(tmp_path / "home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    assert "knowledge-base:kb-search" in by_name
+    command = by_name.get("knowledge-base:kb-review")
+    assert command is not None
+    assert command.description == "Review a knowledge-base PR"
+    # Sibling files under commands/ are other commands, not skill resources.
+    assert command.skill_dir is None
+
+
+def test_plugin_command_without_frontmatter_uses_first_body_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Frontmatter is optional on plugin commands; the body's first line labels it."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home", plugin="tools")
+    _write_plugin_command(install / "commands", "deploy", "Deploy the current branch.\n")
+    _write_plugin_command(install / "commands", "headed", "# Ship it\n\nShip the branch.\n")
+    _write_plugin_command(install / "commands", "wordy", "Long first line " + "x" * 120 + "\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    command = by_name.get("tools:deploy")
+    assert command is not None
+    assert command.description == "Deploy the current branch."
+    assert command.content == "Deploy the current branch."
+    # A heading loses its marker and a long line is cut at 100 characters, as in Claude Code.
+    assert by_name["tools:headed"].description == "Ship it"
+    assert by_name["tools:wordy"].description == ("Long first line " + "x" * 120)[:97] + "..."
+
+
+def test_plugin_commands_respect_list_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``skills_filter`` list selects plugin commands by bare name, as it does skills."""
+    home, _ = _claude_home_with_plugin_command(tmp_path / "home")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    selected = _ctx(tmp_path / "ws", home, skills_filter=["kb-review"])
+    names = [s.name for s in resolve_harness_skills(selected, "claude-native")]
+    assert names == ["knowledge-base:kb-review"]
+
+
+def test_plugin_command_description_with_colon_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prose description containing ``: `` still labels the command."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(
+        install / "commands",
+        "kb-triage",
+        "---\ndescription: Triage a ticket: label, assign, and reply\n---\nTriage $ARGUMENTS.\n",
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    command = {s.name: s for s in out}["knowledge-base:kb-triage"]
+    assert command.description == "Triage a ticket: label, assign, and reply"
+
+
+def test_plugin_command_marked_not_user_invocable_is_hidden(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``user-invocable: false`` hides a command from the menu, as it does a skill."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(
+        install / "commands",
+        "kb-internal",
+        "---\ndescription: model-only step\nuser-invocable: false\n---\nbody\n",
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:kb-internal" not in names
+
+
+def test_plugin_command_frontmatter_name_replaces_its_file_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A frontmatter ``name`` renames the command in place; parent directories still prefix it."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(
+        install / "commands", "kb-old", "---\nname: kb-new\ndescription: renamed\n---\nbody\n"
+    )
+    _write_plugin_command(
+        install / "commands" / "reports",
+        "draft",
+        "---\nname: Weekly Report\ndescription: spaced\n---\nbody\n",
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-new" in names
+    assert "knowledge-base:reports:Weekly Report" in names
+    for absent in ("knowledge-base:kb-old", "knowledge-base:reports:draft"):
+        assert absent not in names
+
+
+def test_plugin_commands_namespace_nested_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nested files are ``<plugin>:<dir>:<name>``; hidden paths and any-case ``.md`` count."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "notes.txt").write_text("not a command")
+    _write_plugin_command(
+        install / "commands" / "group", "inner", "---\ndescription: nested\n---\nbody\n"
+    )
+    _write_plugin_command(install / "commands" / "group" / "deep", "leaf", "Deep command.\n")
+    _write_plugin_command(install / "commands" / ".drafts", "wip", "Hidden paths count.\n")
+    (install / "commands" / "SHOUT.MD").write_text("Only a lowercase .md is stripped.\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:group:inner" in names
+    assert "knowledge-base:group:deep:leaf" in names
+    assert "knowledge-base:.drafts:wip" in names
+    assert "knowledge-base:SHOUT.MD" in names
+    for absent in ("knowledge-base:notes", "knowledge-base:inner", "knowledge-base:group"):
+        assert absent not in names
+
+
+def test_plugin_command_directory_with_skill_md_is_one_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory holding ``skill.md`` is one command named by that file; siblings are ignored."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "legacy").mkdir()
+    (install / "commands" / "legacy" / "skill.md").write_text("Directory-named command.\n")
+    _write_plugin_command(install / "commands" / "legacy", "sibling", "Ignored next to skill.md\n")
+    (install / "commands" / "deep" / "er").mkdir(parents=True)
+    (install / "commands" / "deep" / "er" / "SKILL.md").write_text(
+        "---\nname: deepname\ndescription: Renamed by its frontmatter.\n---\nbody\n"
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    by_name = {s.name: s for s in out}
+    assert by_name["knowledge-base:kb-review"].description == "Review a knowledge-base PR"
+    assert by_name["knowledge-base:legacy"].description == "Directory-named command."
+    assert by_name["knowledge-base:deep:deepname"].description == "Renamed by its frontmatter."
+    for absent in (
+        "knowledge-base:legacy:skill",
+        "knowledge-base:legacy:sibling",
+        "knowledge-base:deep:er",
+    ):
+        assert absent not in by_name
+
+
+def test_plugin_commands_root_skill_md_collapses_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``skill.md`` directly under ``commands/`` makes the whole directory one command."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "SKILL.md").write_text(
+        "---\nname: rootskill\ndescription: Root SKILL.md under commands.\n---\nbody\n"
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-search" in names
+    assert "knowledge-base:rootskill" in names
+    for absent in ("knowledge-base:kb-review", "knowledge-base:commands"):
+        assert absent not in names
+
+
+def test_plugin_commands_stop_at_claude_code_depth_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Commands 31 directories deep are offered; the 32nd level is beyond Claude Code's bound."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    deepest = install / "commands" / Path(*(f"d{index}" for index in range(31)))
+    _write_plugin_command(deepest, "ok", "Thirty-one directories deep.\n")
+    _write_plugin_command(deepest / "d31", "too-deep", "Beyond Claude Code's depth bound.\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    deep_prefix = "knowledge-base:" + ":".join(f"d{index}" for index in range(31))
+    assert f"{deep_prefix}:ok" in names
+    assert f"{deep_prefix}:d31:too-deep" not in names
+
+
+def test_plugin_commands_do_not_follow_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Symlinked entries are skipped, so a directory cycle cannot mint duplicate commands."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    commands = install / "commands"
+    (commands / "loop").mkdir()
+    (commands / "loop" / "back").symlink_to(commands, target_is_directory=True)
+    (commands / "alias.md").symlink_to(commands / "kb-review.md")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert names.count("knowledge-base:kb-review") == 1
+    assert not any(":loop" in name or name == "knowledge-base:alias" for name in names)
+
+
+def test_plugin_commands_root_linked_outside_plugin_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``commands/`` symlink that leaves the plugin is not scanned."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    outside = tmp_path / "outside"
+    _write_plugin_command(outside, "leak", "---\ndescription: outside\n---\nbody\n")
+    (install / "commands" / "kb-review.md").unlink()
+    (install / "commands").rmdir()
+    (install / "commands").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-search" in names
+    assert "knowledge-base:leak" not in names
+
+
+@pytest.mark.parametrize("layout", ["missing", "self-link"])
+def test_plugin_without_usable_commands_root_still_lists_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, layout: str
+) -> None:
+    """A missing or self-linked ``commands/`` yields no commands, quietly, and keeps the skills."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    (install / "commands" / "kb-review.md").unlink()
+    (install / "commands").rmdir()
+    if layout == "self-link":
+        (install / "commands").symlink_to("commands")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.skill_sources"):
+        names = [
+            s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+        ]
+    assert names == ["knowledge-base:kb-search"]
+    assert "commands" not in caplog.text
+
+
+def test_plugin_command_over_size_limit_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code ignores command files over 1 MiB; a file at the limit is still offered."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    header = "---\ndescription: big\n---\n"
+    _write_plugin_command(install / "commands", "kb-huge", header + "x" * (1024 * 1024))
+    _write_plugin_command(
+        install / "commands", "kb-limit", header + "x" * (1024 * 1024 - len(header))
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-review" in names
+    assert "knowledge-base:kb-limit" in names
+    assert "knowledge-base:kb-huge" not in names
+
+
+def test_plugin_skill_wins_name_collision_with_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a plugin ships skills/x and commands/x.md, the skill entry wins."""
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="dup", marketplace="mkt", skill="review", enabled=True
+    )
+    install = home / ".claude" / "plugins" / "cache" / "mkt" / "dup" / "1.0.0"
+    _write_plugin_command(
+        install / "commands", "review", "---\ndescription: command flavor\n---\nbody\n"
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    out = resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+    matches = [s for s in out if s.name == "dup:review"]
+    assert len(matches) == 1
+    assert matches[0].skill_dir is not None  # the skill entry won, not the command
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [["./extra/epsilon.md", "./more-cmds/", "./skilldir/"], "./more-cmds/"],
+    ids=["list", "string"],
+)
+def test_plugin_manifest_commands_replace_the_default_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared: list[str] | str
+) -> None:
+    """Manifest ``commands`` paths load instead of ``commands/``, as files or directories."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_manifest(install, commands=declared)
+    _write_plugin_command(install / "extra", "epsilon", "---\ndescription: file\n---\nbody\n")
+    _write_plugin_command(install / "more-cmds", "zeta", "---\ndescription: dir\n---\nbody\n")
+    _write_plugin_command(install / "more-cmds" / "sub", "x", "Nested under a listed dir.\n")
+    (install / "skilldir").mkdir()
+    (install / "skilldir" / "SKILL.md").write_text(
+        "---\nname: sd\ndescription: skill dir\n---\nbody\n"
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:kb-search" in names
+    assert "knowledge-base:kb-review" not in names  # commands/ is no longer auto-loaded
+    assert "knowledge-base:zeta" in names
+    assert "knowledge-base:sub:x" in names
+    listed_file_and_skill_dir = isinstance(declared, list)
+    assert ("knowledge-base:epsilon" in names) is listed_file_and_skill_dir
+    assert ("knowledge-base:sd" in names) is listed_file_and_skill_dir
+
+
+def test_plugin_manifest_command_path_outside_plugin_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A manifest path that escapes the plugin root, or points nowhere, is logged and skipped."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(install.parent, "escaped", "---\ndescription: outside\n---\nbody\n")
+    _write_plugin_command(tmp_path, "absolute", "---\ndescription: outside\n---\nbody\n")
+    (install / "loop.md").symlink_to("loop.md")
+    _write_plugin_manifest(
+        install,
+        commands=[
+            "./commands/kb-review.md",
+            "../escaped.md",
+            str(tmp_path / "absolute.md"),
+            "./typo/missing.md",
+            "./bad\x00.md",
+            "./loop.md",
+        ],
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.skill_sources"):
+        names = [
+            s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+        ]
+    assert "knowledge-base:kb-review" in names
+    for absent in ("knowledge-base:escaped", "knowledge-base:absolute"):
+        assert absent not in names
+    assert "'../escaped.md' is outside the plugin" in caplog.text
+    assert "typo/missing.md is missing or not .md" in caplog.text
+    assert "'./bad\\x00.md' is unusable" in caplog.text
+    assert "'./loop.md' is unusable" in caplog.text
+
+
+def test_plugin_manifest_links_keep_their_declared_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared entry that is a symlink is followed and named as declared."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_command(install / "real-dir", "x", "---\ndescription: linked dir\n---\nbody\n")
+    (install / "alias.md").symlink_to(install / "commands" / "kb-review.md")
+    (install / "dir-link").symlink_to(install / "real-dir", target_is_directory=True)
+    _write_plugin_manifest(install, commands=["./alias.md", "./dir-link/"])
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
+    assert "knowledge-base:alias" in names
+    assert "knowledge-base:x" in names
+    for absent in ("knowledge-base:kb-review", "knowledge-base:real", "knowledge-base:dir-link"):
+        assert absent not in names
+
+
+def test_plugin_manifest_malformed_commands_field_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``commands`` value that is neither a path nor a list yields no commands and a warning."""
+    home, install = _claude_home_with_plugin_command(tmp_path / "home")
+    _write_plugin_manifest(install, commands={"path": "./commands/"})
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.skill_sources"):
+        names = [
+            s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")
+        ]
+    assert names == ["knowledge-base:kb-search"]
+    assert "manifest 'commands' must be a path or a list of paths" in caplog.text

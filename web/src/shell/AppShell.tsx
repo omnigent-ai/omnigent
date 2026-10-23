@@ -1,7 +1,8 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import { GridSessionsProvider } from "@/grid/GridSessionsContext";
+import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
+  type ComponentProps,
   type CSSProperties,
   lazy,
   Suspense,
@@ -88,6 +89,7 @@ import {
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
   terminalTabKey,
+  terminalDisplayLabel,
   useCreateTerminal,
   useDeleteTerminal,
 } from "@/hooks/useTerminals";
@@ -219,6 +221,12 @@ export function AppShell() {
       <AppShellImpl />
     </GridSessionsProvider>
   );
+}
+
+// Reads grid context here so pane focus changes don't re-render the whole shell.
+function GridSessionMain(props: ComponentProps<"main">) {
+  const grids = useGridSessions();
+  return <main {...props} data-grid-session={grids?.enabled ? grids.conversationId : undefined} />;
 }
 
 function AppShellImpl() {
@@ -2544,13 +2552,13 @@ function AppShellImpl() {
                     }}
                   />
                 )}
-                <main
+                <GridSessionMain
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
                 >
                   <Outlet />
-                </main>
+                </GridSessionMain>
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
@@ -2762,7 +2770,7 @@ function AppShellImpl() {
               if (terminalPendingClose === null) return null;
               const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose);
               if (!info) return null;
-              return info.session ? `${info.name} · ${info.session}` : info.name;
+              return terminalDisplayLabel(info);
             })()}
             onConfirm={confirmCloseTerminal}
             onCancel={() => setTerminalPendingClose(null)}

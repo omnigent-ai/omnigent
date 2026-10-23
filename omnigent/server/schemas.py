@@ -2012,9 +2012,11 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# ``failed`` are terminal. ``action_required`` is a provisioning-time
+# warning: the user needs to do what the status's ``details`` say.
 SandboxLaunchStage = Literal[
     "provisioning",
+    "action_required",
     "cloning",
     "starting",
     "connecting",
@@ -2034,13 +2036,17 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox) → ``cloning``
+        ``provisioning`` (creating the sandbox; ``action_required``
+        while it also needs the user to act) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -2049,6 +2055,7 @@ class SandboxStatus(BaseModel):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
 
 
 class NativeUsageBaseline(BaseModel):
@@ -3640,6 +3647,9 @@ class SessionSandboxStatusEvent(_SSEEventBase):
         pipeline order.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -3655,6 +3665,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
 
 
 class McpServerStartup(BaseModel):

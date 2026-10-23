@@ -993,15 +993,17 @@ class HostFsWriteFrame:
     runner is offline — currently the pull request panel's account/base
     preference (``op="github_set_preference"``), PR attach/remove
     (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
-    merges (``op="github_merge"``), and disabling auto-merge
-    (``op="github_disable_auto_merge"``), for every git provider; the op names are
+    reviewer edits (``op="github_reviewers_update"``), merges (``op="github_merge"``),
+    and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
+    provider; the op names are
     stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
     :param op: Write op name — ``"github_set_preference"``,
-        ``"github_prs_update"``, ``"github_labels_update"``, ``"github_merge"``, or
+        ``"github_prs_update"``, ``"github_labels_update"``,
+        ``"github_reviewers_update"``, ``"github_merge"``, or
         ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.

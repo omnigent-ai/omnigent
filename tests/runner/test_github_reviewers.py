@@ -267,6 +267,8 @@ def test_reviewer_field_failure_preserves_pr(lookup: str, error: str) -> None:
         "passing": 1,
         "failing": 0,
         "pending": 0,
+        "cancelled": 0,
+        "skipped": 0,
         "total": 1,
         "runs": [{"name": "unit", "bucket": "passing", "url": "https://example.com/check"}],
     }

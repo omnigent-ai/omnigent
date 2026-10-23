@@ -15,6 +15,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    ReviewerRef,
     ShellPrOp,
     ShellSegment,
     github_observer,
@@ -30,6 +31,7 @@ _CAPABILITIES = ProviderCapabilities(
     linked_pr_diff=True,
     label_editing=True,
     merging=True,
+    reviewer_editing=True,
 )
 
 
@@ -189,6 +191,25 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._disable_auto_merge(root, reference)
+
+    def review_candidates(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """List the repository's assignable users and its teams."""
+        from omnigent.runner import github_resource
+
+        return github_resource._review_candidates(root, reference)
+
+    def edit_reviewers(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[ReviewerRef],
+        remove: Sequence[ReviewerRef],
+    ) -> dict[str, Any]:
+        """Request and withdraw reviews through GitHub's requested reviewers API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_reviewers(root, reference, add=add, remove=remove)
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``gh pr`` or ``gh api`` segment."""

@@ -89,6 +89,19 @@ export function restoreReplyDraft(text: string, replyDraft?: StoredReplyDraft): 
     : { quotes: [], text };
 }
 
+export function appendReplyQuote(
+  draft: { quotes?: ReplyQuote[]; text: string },
+  text: string,
+): ReplyDraft {
+  return {
+    quotes: [
+      ...(draft.quotes ?? []),
+      { id: nanoid(), before: draft.text, text: text.replace(/\r\n?/g, "\n") },
+    ],
+    text: "",
+  };
+}
+
 export function removeReplyQuote(draft: ReplyDraft, id: string): ReplyDraft {
   const index = draft.quotes.findIndex((quote) => quote.id === id);
   if (index < 0) return draft;

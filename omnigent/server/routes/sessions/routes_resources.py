@@ -137,8 +137,9 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
-# Runner wait for a PR label or merge request, above the runner's 15-second budget for all of
-# its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
+# Runner wait for a PR label, reviewer, or merge request, above the runner's 15-second
+# budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
+# reported as failed.
 _PR_EDIT_PROXY_TIMEOUT_S = 20.0
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
@@ -577,7 +578,7 @@ def register_resources_routes(
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
             ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
-            ``"github_labels"`` / ``"github_merge_options"``.
+            ``"github_labels"`` / ``"github_merge_options"`` / ``"github_reviewers"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -990,8 +991,9 @@ def register_resources_routes(
         runner is offline but the host holding the workspace is connected.
 
         :param op: Host-side write op — ``"github_set_preference"``,
-            ``"github_prs_update"``, ``"github_labels_update"``, ``"github_merge"``,
-            or ``"github_disable_auto_merge"``.
+            ``"github_prs_update"``, ``"github_labels_update"``,
+            ``"github_reviewers_update"``, ``"github_merge"``, or
+            ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
@@ -3430,6 +3432,71 @@ def register_resources_routes(
             host_op="github_disable_auto_merge",
             params={"pr_url": body["pr_url"]},
             failure_detail="Cannot disable auto-merge",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/reviewers",
+        response_model=None,
+    )
+    async def list_session_github_reviewers(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the users and teams a review of the selected PR can be requested from.
+
+        Requires edit access, like the reviewer edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{login, kind, name}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_reviewers",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/reviewers",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_reviewers(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Request reviews on the selected PR and withdraw pending requests.
+
+        Uses the host's provider account; served by the runner when it's online,
+        else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` lists
+            of ``{login, kind}``.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_reviewers`` with the PR's resulting reviewers.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
+            host_op="github_reviewers_update",
+            params={
+                "pr_url": body["pr_url"],
+                "add": body.get("add", []),
+                "remove": body.get("remove", []),
+            },
+            failure_detail="Cannot update reviewers",
         )
 
     # Generic single-resource lookup — registered AFTER typed

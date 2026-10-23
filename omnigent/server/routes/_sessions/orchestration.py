@@ -3659,23 +3659,22 @@ async def _enrich_terminal_status_with_subagent_output(
     if status == "failed":
         context = normalize_failure_context(data.get("failure_context"))
         context.setdefault("failure_source", "external_status")
-        wire_detail = data.get("output")
+        wire_detail = data.get("failure_detail")
         if not isinstance(wire_detail, str) or not wire_detail.strip():
-            wire_detail = data.get("failure_detail")
+            wire_detail = data.get("output")
         for key, value in provider_error_context_from_text(wire_detail).items():
             context.setdefault(key, value)
         data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
+    failure_detail = data.get("failure_detail") if status == "failed" else None
+    if isinstance(failure_detail, str) and failure_detail.strip():
+        context.setdefault("detail_source", "external_status_failure_detail")
+        return {**data, "output": failure_detail.strip()}
     existing = data.get("output")
     if current_turn_only and isinstance(existing, str) and existing.strip():
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")
         return data
-    # The store's latest assistant text can be prose that preceded the error.
-    failure_detail = data.get("failure_detail") if status == "failed" else None
-    if isinstance(failure_detail, str) and failure_detail.strip():
-        context.setdefault("detail_source", "external_status_failure_detail")
-        return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
@@ -4672,6 +4671,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                provider=host.sandbox_provider,
             )
         else:
             _kick_managed_relaunch(
@@ -5303,7 +5303,7 @@ def _kick_managed_relaunch(
     tracker.begin(session_id)
     # Seed the relaunch's progress indicator immediately — the user is
     # typically watching the session page when "wake the sandbox" runs.
-    _publish_sandbox_status(session_id, "provisioning")
+    _publish_sandbox_status(session_id, "provisioning", provider=host.sandbox_provider)
     agent_store = getattr(app_state, "agent_store", None)
     if agent_store is None:
         _logger.warning(
@@ -5340,6 +5340,7 @@ def _kick_managed_wake(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    provider: str | None = None,
 ) -> None:
     """
     Spawn the background wake for a dormant resumable host.
@@ -5357,6 +5358,7 @@ def _kick_managed_wake(
         conversation_store=conversation_store,
         host_store=host_store,
         app_state=app_state,
+        provider=provider,
     )
 
 
@@ -5369,6 +5371,7 @@ def _kick_managed_wake_impl(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    provider: str | None = None,
 ) -> None:
     """
     Register and spawn the background WAKE for a dormant resumable host.
@@ -5387,6 +5390,8 @@ def _kick_managed_wake_impl(
     :param conversation_store: Store holding the session row.
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
+    :param provider: The dormant host's sandbox provider, e.g. ``"arclet"``,
+        which the seeded launch status names.
     """
     _logger.info(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
@@ -5398,7 +5403,7 @@ def _kick_managed_wake_impl(
     # Seed the progress indicator immediately — the user is watching the
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
-    _publish_sandbox_status(session_id, "provisioning")
+    _publish_sandbox_status(session_id, "provisioning", provider=provider)
     wake_agent_store = getattr(app_state, "agent_store", None)
     if wake_agent_store is None:
         _logger.warning(
@@ -5487,7 +5492,7 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, "failed", reason)
         return
 
-    def _on_stage(stage: str) -> None:
+    def _on_stage(stage: str, details: str | None = None) -> None:
         """Relay the wake's launch-pipeline stage to the session's progress surface.
 
         Without it the wake shows the single ``"provisioning"`` band that
@@ -5495,8 +5500,11 @@ async def _run_managed_wake(
         is already re-execing. resume_managed_host may invoke this from the
         worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
         thread-safe.
+
+        :param stage: The stage just entered, e.g. ``"starting"``.
+        :param details: What the user needs to do, for ``"action_required"``.
         """
-        _publish_sandbox_status(session_id, stage)
+        _publish_sandbox_status(session_id, stage, details=details)
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight

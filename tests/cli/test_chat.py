@@ -3181,6 +3181,71 @@ def test_materialize_bundle_overrides_brain_harness(
         _cleanup_materialized_override_bundle(materialized)
 
 
+@pytest.mark.parametrize("source_kind", ["file", "directory"])
+@pytest.mark.parametrize(
+    "instruction_kind",
+    ["sibling", "nested", "single-line", "empty", "inline", "missing", "outside"],
+)
+def test_materialize_override_bundle_preserves_instructions(
+    tmp_path: Path, source_kind: str, instruction_kind: str
+) -> None:
+    import yaml
+
+    root = tmp_path / "agent"
+    root.mkdir()
+    (root / "prompts").mkdir()
+    marker = {
+        "single-line": "agent.yaml",
+        "empty": "",
+    }.get(instruction_kind, "Resolved instructions from the source directory.\n")
+    (root / "AGENTS.md").write_text(marker)
+    (root / "prompts" / "system.md").write_text(marker)
+    (tmp_path / "outside.md").write_text("Do not read outside the agent directory.")
+    instructions = {
+        "sibling": "AGENTS.md",
+        "nested": "prompts/system.md",
+        "single-line": "AGENTS.md",
+        "empty": "AGENTS.md",
+        "inline": "Inline instructions.\nSecond line.",
+        "missing": "missing.md",
+        "outside": "../outside.md",
+    }[instruction_kind]
+    raw = {
+        "name": "instruction-materialization",
+        "instructions": instructions,
+        "executor": {"harness": "openai-agents", "model": "mock-model"},
+    }
+    if source_kind == "directory":
+        raw["spec_version"] = 1
+        raw["executor"] = {
+            "type": "omnigent",
+            "model": "mock-model",
+            "config": {"harness": "openai-agents"},
+        }
+    else:
+        raw["prompt"] = "Instructions must take precedence over this placeholder."
+    source_file = root / ("agent.yaml" if source_kind == "file" else "config.yaml")
+    original = yaml.safe_dump(raw)
+    source_file.write_text(original)
+    source = source_file if source_kind == "file" else root
+
+    materialized = _materialize_override_bundle(source, ChatOverrides(model="mock-overridden"))
+    try:
+        spec = load_spec(materialized)
+        expected = (
+            marker
+            if instruction_kind in ("sibling", "nested", "single-line", "empty")
+            else instructions
+        )
+        if source_kind == "file" and instruction_kind == "single-line":
+            expected += "\n"
+        assert spec.instructions == expected
+        assert spec.executor.model == "mock-overridden"
+        assert source_file.read_text() == original
+    finally:
+        _cleanup_materialized_override_bundle(materialized)
+
+
 def test_materialize_override_bundle_bakes_openai_env_auth_for_daemon_runner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

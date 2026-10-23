@@ -31,6 +31,7 @@ class Feature(StrEnum):
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
+    SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Local session grids with up to four live conversations",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SPLITTABLE_TERMINAL_VIEW_UI,
+        description="Split the main terminal view into several shell panes",
+        owner="web",
+        review_by_release="0.22.0",
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,

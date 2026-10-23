@@ -33,6 +33,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.server.integration.mock_llm_server import (
     anthropic_sse_text_response,
     anthropic_sse_tool_call_response,
@@ -332,7 +333,14 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
             assert gateway.classifier_requests > 0
             assert all(not result.get("is_error") for result in gateway.tool_results)
             assert "billing-notice-tool-completed" in json.dumps(gateway.tool_results)
-            config = json.loads((config_dir / ".claude.json").read_text())
-            assert config.get("autoModeClassifierBillingNoticeAcknowledgedAt", 0) > 0
+            # Claude persists config asynchronously after the tool can resume.
+            await poll_until_async(
+                lambda: (
+                    json.loads((config_dir / ".claude.json").read_text()).get(
+                        "autoModeClassifierBillingNoticeAcknowledgedAt", 0
+                    )
+                    > 0
+                ),
+            )
         finally:
             await terminals.shutdown()

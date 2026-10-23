@@ -898,26 +898,35 @@ async def test_content_search_distinguishes_older_runner_from_missing_resource(
 
 _LABELS_PATH = "/v1/sessions/conv_share/resources/github/labels"
 _LABELS_PR_URL = "https://github.com/acme/widgets/pull/17"
+_REVIEWERS_PATH = "/v1/sessions/conv_share/resources/github/reviewers"
+_REVIEWER = {"login": "octocat", "kind": "user"}
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path, added",
+    [(_LABELS_PATH, "bug"), (_REVIEWERS_PATH, _REVIEWER)],
+    ids=["labels", "reviewers"],
+)
 @pytest.mark.parametrize(
     "caller,expected",
     [("owner@example.com", 200), ("viewer@example.com", 403)],
     ids=["edit-allowed", "read-denied"],
 )
-async def test_pr_label_routes_require_edit(
+async def test_pr_edit_routes_require_edit(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
     caller: str,
     expected: int,
+    path: str,
+    added: object,
 ) -> None:
-    """Listing and editing PR labels act with the host's account, so viewers are refused."""
+    """PR label and reviewer routes act as the host's account, so viewers are refused."""
     headers = {"X-Forwarded-Email": caller}
-    listed = await client.get(_LABELS_PATH, params={"pr_url": _LABELS_PR_URL}, headers=headers)
+    listed = await client.get(path, params={"pr_url": _LABELS_PR_URL}, headers=headers)
     edited = await client.post(
-        _LABELS_PATH,
-        json={"pr_url": _LABELS_PR_URL, "add": ["bug"], "session_id": "untrusted"},
+        path,
+        json={"pr_url": _LABELS_PR_URL, "add": [added], "session_id": "untrusted"},
         headers=headers,
     )
 
@@ -925,10 +934,10 @@ async def test_pr_label_routes_require_edit(
     if expected == 403:
         assert runner_client.gets == runner_client.posts == []
         return
-    assert runner_client.gets == [_LABELS_PATH]
+    assert runner_client.gets == [path]
     assert runner_client.get_params == [{"pr_url": _LABELS_PR_URL}]
     assert runner_client.posts == [
-        (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"], "remove": []})
+        (path, {"pr_url": _LABELS_PR_URL, "add": [added], "remove": []})
     ]
 
 
@@ -980,10 +989,11 @@ async def test_pr_merge_routes_require_edit(
     "path,body",
     [
         (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"]}),
+        (_REVIEWERS_PATH, {"pr_url": _LABELS_PR_URL, "add": [_REVIEWER]}),
         (_MERGE_PATH, _MERGE_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "merge", "disable-auto-merge"],
+    ids=["labels", "reviewers", "merge", "disable-auto-merge"],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,

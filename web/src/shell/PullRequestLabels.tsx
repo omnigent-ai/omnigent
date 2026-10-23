@@ -2,6 +2,7 @@
 // the repository's labels. Pending edits show at once and settle to what the provider reports.
 
 import { useMemo, useState } from "react";
+import { cn } from "@/lib/utils";
 import { useMutationState } from "@tanstack/react-query";
 import { PlusIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -22,6 +23,11 @@ import {
   type PullRequestLabel,
   type PullRequestLabelChange,
 } from "@/hooks/usePullRequests";
+import {
+  PULL_REQUEST_CHIP_CLASS,
+  PullRequestChipAction,
+  PullRequestSectionHeader,
+} from "./PullRequestSection";
 
 /** The label's `#rrggbb` color, or undefined when the provider sent none. */
 function labelColor(label: PullRequestLabel): string | undefined {
@@ -51,20 +57,17 @@ function PullRequestLabelChip({
   return (
     <li
       title={label.description ?? undefined}
-      className="inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-full border border-border bg-muted/20 px-2 py-0.5 text-xs"
+      className={cn(PULL_REQUEST_CHIP_CLASS, "rounded-full")}
       style={color ? { backgroundColor: `${color}1f`, borderColor: `${color}80` } : undefined}
     >
       <LabelDot label={label} />
       <span className="min-w-0 truncate font-medium text-foreground">{label.name}</span>
       {onRemove && (
-        <button
-          type="button"
-          aria-label={`Remove label ${label.name}`}
+        <PullRequestChipAction
+          label={`Remove label ${label.name}`}
+          icon={XIcon}
           onClick={onRemove}
-          className="-mr-1 shrink-0 rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-        >
-          <XIcon aria-hidden className="size-3" />
-        </button>
+        />
       )}
     </li>
   );
@@ -92,8 +95,7 @@ function PullRequestLabelPicker({
           variant="ghost"
           size="icon-xs"
           aria-label="Edit labels"
-          // Negative margins keep the header row at text height, level with Reviewers.
-          className="-my-1 text-muted-foreground"
+          className="text-muted-foreground"
         >
           <PlusIcon aria-hidden className="size-3.5" />
         </Button>
@@ -185,22 +187,20 @@ export function PullRequestLabels({
 
   return (
     <section className="space-y-1.5" aria-labelledby="pull-request-labels-heading">
-      <div className="flex items-center gap-1">
-        <h3
-          id="pull-request-labels-heading"
-          className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
-        >
-          Labels
-        </h3>
-        {editable && (
-          <PullRequestLabelPicker
-            conversationId={conversationId}
-            prUrl={prUrl}
-            applied={applied}
-            onToggle={toggle}
-          />
-        )}
-      </div>
+      <PullRequestSectionHeader
+        id="pull-request-labels-heading"
+        title="Labels"
+        action={
+          editable && (
+            <PullRequestLabelPicker
+              conversationId={conversationId}
+              prUrl={prUrl}
+              applied={applied}
+              onToggle={toggle}
+            />
+          )
+        }
+      />
       {shown.length === 0 ? (
         <p className="text-ui text-muted-foreground">No labels.</p>
       ) : (

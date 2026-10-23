@@ -691,6 +691,85 @@ def test_merge_user_provider_config_handles_jsonc_trailing_commas(
     assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
 
 
+def _write_user_configs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, files: dict[str, str]
+) -> Path:
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    for name, text in files.items():
+        (cfg_dir / name).write_text(text, encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    return cfg_dir
+
+
+def test_merge_user_provider_config_deep_merges_all_user_config_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Files merge like ``opencode debug config``: later files win per key."""
+    _write_user_configs(
+        monkeypatch,
+        tmp_path,
+        {
+            "config.json": '{"provider": {"my-gw": {"options": '
+            '{"baseURL": "https://old/v1", "apiKey": "sk-user"}}}}',
+            "opencode.json": '{"provider": {"other": {"options": {"baseURL": "https://other/v1"}}}}',
+            "opencode.jsonc": '{\n  // pin the default model\n  "model": "my-gw/gpt-4",\n'
+            '  "provider": {"my-gw": {"options": {"baseURL": "https://new/v1"}}}\n}\n',
+        },
+    )
+
+    result = maybe_merge_user_provider_config({})
+
+    assert result["provider"] == {
+        "my-gw": {"options": {"baseURL": "https://new/v1", "apiKey": "sk-user"}},
+        "other": {"options": {"baseURL": "https://other/v1"}},
+    }
+    assert result["model"] == "my-gw/gpt-4"
+
+
+def test_merge_user_provider_config_later_plugin_list_replaces_earlier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Lists are replaced, not concatenated, across the user's files."""
+    _write_user_configs(
+        monkeypatch,
+        tmp_path,
+        {
+            "opencode.json": '{"plugin": ["/opt/plugins/from-json", "/opt/plugins/shared"]}',
+            "opencode.jsonc": '{"plugin": ["/opt/plugins/from-jsonc"]}',
+        },
+    )
+
+    result = maybe_merge_user_provider_config({"plugin": ["/tmp/omnigent-policy.js"]})
+
+    assert result["plugin"] == ["/tmp/omnigent-policy.js", "/opt/plugins/from-jsonc"]
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [b"{ not valid json", b"\xff\xfe not utf-8", b"[]"],
+    ids=["unparseable", "undecodable", "not-an-object"],
+)
+def test_merge_user_provider_config_skips_bad_file_keeps_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, broken: bytes
+) -> None:
+    """A file that cannot be used is skipped; the files around it still merge."""
+    cfg_dir = _write_user_configs(
+        monkeypatch,
+        tmp_path,
+        {
+            "config.json": '{"provider": {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}}',
+            "opencode.jsonc": '{"model": "my-gw/gpt-4"}',
+        },
+    )
+    (cfg_dir / "opencode.json").write_bytes(broken)
+
+    result = maybe_merge_user_provider_config({})
+
+    assert result["provider"] == {"my-gw": {"options": {"baseURL": "https://my-gw/v1"}}}
+    assert result["model"] == "my-gw/gpt-4"
+
+
 def test_build_mcp_block_preserves_custom_timeout() -> None:
     from types import SimpleNamespace as N
 

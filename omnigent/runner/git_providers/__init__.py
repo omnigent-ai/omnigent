@@ -33,6 +33,9 @@ Payload contract:
   the allowed ``methods`` (``merge``, ``squash``, ``rebase``) and the ``default``
   to preselect (null when none is allowed), and a merge or disabling
   auto-merge returns a ``session.github.pr_merge`` with ``pr_url``.
+- With ``reviewer_editing``, the review candidates are a ``list`` of
+  ``{login, kind, name}`` with ``has_more``, and a reviewer edit returns a
+  ``session.github.pr_reviewers`` with the PR's resulting ``reviewers``.
 - Changed files are a ``list`` of ``session.github.changed_file`` objects:
   ``path``, ``name``, ``status`` (``created``, ``modified``, ``deleted``, or
   ``renamed``), ``lines_added``, and ``lines_removed``. The PR diff is a
@@ -47,6 +50,9 @@ Additive fields:
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
+- ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``
+  buckets. Providers that do not expose cancelled and skipped as distinct buckets omit
+  these counts.
 - ``pr`` may carry ``author_id``, the PR author's stable id on the provider; optional,
   may be null.
 - A comment may carry ``author_id``, the author's stable id on the provider; optional,
@@ -73,7 +79,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any, Protocol, TypedDict, runtime_checkable
+from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -85,6 +91,7 @@ PR_DIFF_OBJECT = "session.github.pr_diff"
 PR_LABELS_OBJECT = "session.github.pr_labels"
 MERGE_OPTIONS_OBJECT = "session.github.merge_options"
 PR_MERGE_OBJECT = "session.github.pr_merge"
+PR_REVIEWERS_OBJECT = "session.github.pr_reviewers"
 # Info ``reason`` when no provider recognizes the workspace's git remote.
 UNSUPPORTED_REMOTE = "unsupported_remote"
 # PR diff ``unavailable_reason`` when the PR's repository is not the workspace's.
@@ -110,6 +117,9 @@ class ProviderCapabilities:
     :ivar merging: The user can merge the PR through
         :meth:`PullRequestFacet.merge_options` and :meth:`PullRequestFacet.merge`,
         and turn off its auto-merge with :meth:`PullRequestFacet.disable_auto_merge`.
+    :ivar reviewer_editing: The user can request and withdraw reviews through
+        :meth:`PullRequestFacet.review_candidates` and
+        :meth:`PullRequestFacet.edit_reviewers`.
     """
 
     account_switching: bool
@@ -118,10 +128,23 @@ class ProviderCapabilities:
     linked_pr_diff: bool
     label_editing: bool = False
     merging: bool = False
+    reviewer_editing: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ReviewerRef:
+    """A user or team a review is requested from.
+
+    :ivar login: A user's login, e.g. ``"octocat"``, or a team's slug, e.g. ``"core"``.
+    :ivar kind: ``"user"`` or ``"team"``.
+    """
+
+    login: str
+    kind: Literal["user", "team"]
 
 
 class CliStatus(TypedDict):
@@ -378,6 +401,31 @@ class PullRequestFacet(Protocol):
         The orchestrator calls it only with ``merging``.
 
         :returns: A ``session.github.pr_merge``.
+        :raises ValueError: With a user-facing message when the provider refuses.
+        """
+        ...
+
+    def review_candidates(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Return the users and teams a review can be requested from, as a ``list``.
+
+        The orchestrator calls it only with ``reviewer_editing``.
+        """
+        ...
+
+    def edit_reviewers(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[ReviewerRef],
+        remove: Sequence[ReviewerRef],
+    ) -> dict[str, Any]:
+        """Request reviews from ``add`` and withdraw the pending requests of ``remove``.
+
+        The orchestrator calls it only with ``reviewer_editing``, with disjoint
+        lists that are not both empty. Withdrawing a request the PR lacks is not an error.
+
+        :returns: A ``session.github.pr_reviewers`` with the PR's resulting ``reviewers``.
         :raises ValueError: With a user-facing message when the provider refuses.
         """
         ...

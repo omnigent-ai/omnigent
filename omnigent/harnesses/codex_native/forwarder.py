@@ -2374,6 +2374,7 @@ async def _drive_side_chat_requests(
                             codex_client,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
+                            bridge_dir=bridge_dir,
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")

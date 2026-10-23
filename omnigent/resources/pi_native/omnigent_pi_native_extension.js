@@ -74,8 +74,19 @@ function mintEvaluateElicitationId() {
   return `elicit_evaluate_${crypto.randomBytes(16).toString("hex")}`;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    function finish() {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", finish);
+      resolve();
+    }
+    const timer = setTimeout(finish, ms);
+    if (signal) {
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted) finish();
+    }
+  });
 }
 
 function readConfig() {
@@ -170,156 +181,74 @@ function relayCredentials() {
   return null;
 }
 
-/**
- * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
- * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
- *
- * This is the same endpoint used by the Claude Code, Codex, and Cursor native
- * hooks. It does NOT require an active Omnigent turn context on the harness
- * side — the endpoint evaluates against the session's full policy set directly.
- *
- * Verdict handling (parity with the native hooks):
- *   - POLICY_ACTION_DENY  → block the Pi tool call with the policy reason.
- *   - POLICY_ACTION_ALLOW / UNSPECIFIED (the engine default when no policy
- *       matches) → proceed.
- *   - POLICY_ACTION_ASK   → the server resolves ASK by PARKING this request
- *       (URL-based elicitation: it publishes an approval card to the web UI
- *       and holds the connection until a human resolves it), then returns a
- *       hard ALLOW/DENY — so a writable session never observes a raw ASK here.
- *       The park is realized by a generous client read budget plus re-attach
- *       retries (see the _PARK_* tuning above): if undici severs a long park
- *       (headersTimeout) we re-POST the SAME _omnigent_elicitation_id so the
- *       server re-attaches to the existing elicitation instead of opening a
- *       second approval card. A LEGITIMATE long-poll re-attach (the server is
- *       reachable and still holding the connection) is the only case that may
- *       loop toward the long park ceiling. If a raw ASK ever does come back
- *       (e.g. a read-only caller that cannot park), we re-evaluate up to
- *       _MAX_RAW_ASK_ROUNDS and then fail CLOSED.
- *
- * Fail CLOSED (a block verdict) whenever a usable verdict cannot be obtained:
- * the transient-retry budget for a genuine transport/5xx error is exhausted,
- * a raw ASK never collapses within _MAX_RAW_ASK_ROUNDS, or the long park
- * ceiling is reached. PHASE_TOOL_CALL is the SOLE enforcement point for a
- * native connector tool — the call is never re-checked server-side — so an
- * unevaluable policy MUST block, not proceed. This matches
- * omnigent.policies.types.FAIL_CLOSED_PHASES and the Python native hook's
- * fail_closed_hook_output(PreToolUse) → deny. (pi-native is itself a sole
- * gate, exactly like the Claude / Codex native hooks; an eventually-allowing
- * human-approval gate would defeat its own purpose, so the earlier fail-open
- * posture was wrong here.) A reachable server long-polling a parked ASK is
- * the deliberate exception: that is the human approval window, not an outage,
- * and we keep waiting (re-attaching) rather than blocking.
- *
- * @returns {Promise<{block: boolean, reason: string} | null>} A verdict.
- *   ``{block: true}`` either from a DENY or from failing closed; ``{block:
- *   false}`` on ALLOW; ``null`` only when the gate is structurally disabled
- *   (no server/session configured or no global fetch) so there is nothing to
- *   enforce against.
- */
-async function evalNativePolicyHttp(config, toolName, args) {
-  if (
-    !config ||
-    !config.serverUrl ||
-    !config.sessionId ||
-    typeof fetch !== "function"
-  )
-    return null;
-  // Prefer relay (non-expiring local token); fall back to direct server call.
+function mintPiUiElicitationId() {
+  return `elicit_pi_${crypto.randomBytes(16).toString("hex")}`;
+}
+
+const _UNSUPPORTED_ENDPOINT = Symbol("unsupported endpoint");
+
+// Shared long-poll transport for policy verdicts and extension dialogs.
+async function postParkedJson(config, relayPath, serverPath, payload, {
+  parkDeadline, signal, retryEmpty = false,
+}) {
   const relay = relayCredentials();
   const url = relay
-    ? `${relay.url}/policies/evaluate`
-    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
-  // Mint one stable re-attach id for this tool call. Every (re)POST carries
-  // it so a re-park lands on the SAME elicitation — no duplicate approval
-  // card. Kept for the whole call, across both the park loop and any
-  // transient-error retries.
-  const elicitationId = mintEvaluateElicitationId();
-  const body = JSON.stringify({
-    event: {
-      type: "PHASE_TOOL_CALL",
-      target: "",
-      data: { name: toolName, arguments: args },
-      context: {},
-    },
-    _omnigent_elicitation_id: elicitationId,
-  });
-  const reqHeaders = relay
-    ? {
-        "content-type": "application/json",
-        authorization: `Bearer ${relay.token}`,
-      }
-    : {
-        "content-type": "application/json",
-        ...freshAuthHeaders(config.authHeaders),
-      };
+    ? `${relay.url}${relayPath}`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}${serverPath}`;
+  const body = JSON.stringify(payload);
+  const requestHeaders = () => relay
+    ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+    : { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) };
 
-  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
-  // Independent transient-error budget so a server that is actually down
-  // resolves quickly (fail CLOSED) instead of riding the long park ceiling.
   let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
   let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-  // Bound on consecutive raw ASK rounds (see _MAX_RAW_ASK_ROUNDS).
-  let rawAskRounds = 0;
+  let emptyResponses = 0;
 
   while (true) {
-    if (Date.now() >= parkDeadline) {
-      // Park ceiling reached (well past any sane ask_timeout): the gate is
-      // wedged, not resolving. Fail CLOSED — PHASE_TOOL_CALL is the sole
-      // enforcement point, so a never-resolving gate must block, not proceed.
-      return failClosedVerdict();
-    }
-    // AbortController bounds each attempt under undici's headersTimeout so a
-    // long park is retried (re-attach) rather than thrown as a header
-    // timeout. AbortSignal.timeout would be terser but is newer; this form
-    // works on every Node that ships global fetch.
+    if (signal && signal.aborted) return null;
+    if (Date.now() >= parkDeadline) return null;
     const controller =
       typeof AbortController === "function" ? new AbortController() : null;
+    const remaining = parkDeadline - Date.now();
+    const attemptMs = Math.min(_PARK_ATTEMPT_TIMEOUT_MS, Math.max(remaining, 1));
     const timer = controller
-      ? setTimeout(() => controller.abort(), _PARK_ATTEMPT_TIMEOUT_MS)
+      ? setTimeout(() => controller.abort(), attemptMs)
       : null;
+    const callerSignal = signal;
+    const cancelAttempt = () => controller && controller.abort();
+    if (callerSignal) {
+      callerSignal.addEventListener("abort", cancelAttempt, { once: true });
+      if (callerSignal.aborted) cancelAttempt();
+    }
     const attemptStart = Date.now();
     let resp;
+    let text;
     try {
       resp = await fetch(url, {
         method: "POST",
-        headers: reqHeaders,
+        headers: requestHeaders(),
         body,
         ...(controller ? { signal: controller.signal } : {}),
       });
+      text = resp.ok ? await resp.text() : "";
     } catch (_err) {
+      if ((callerSignal && callerSignal.aborted) || Date.now() >= parkDeadline) return null;
       if (timer) clearTimeout(timer);
-      // Distinguish a LEGITIMATE long-poll re-attach from a GENUINE transport
-      // error. controller.signal.aborted alone is unreliable: once our
-      // per-attempt timer has fired it reads true even if a real connect
-      // reset raced the timer. A genuine connect error throws
-      // fast — well under _PARK_ATTEMPT_TIMEOUT_MS — whereas a real long-poll
-      // only aborts once the timer fires after holding the connection open
-      // the whole attempt. So require BOTH aborted AND that the attempt
-      // survived ~to the per-attempt timeout before treating it as a re-park.
       const aborted = !!(controller && controller.signal.aborted);
       const elapsed = Date.now() - attemptStart;
-      const isLongPollReattach =
-        aborted && elapsed >= _PARK_REATTACH_MIN_ELAPSED_MS;
+      const reattachFloor = Math.min(
+        _PARK_REATTACH_MIN_ELAPSED_MS,
+        Math.max(attemptMs - 5_000, attemptMs * 0.8),
+      );
+      const isLongPollReattach = aborted && elapsed >= reattachFloor;
       if (isLongPollReattach) {
-        // Re-park: the server held the connection the whole time, so re-POST
-        // the SAME elicitation id immediately (no backoff). This is the human
-        // approval window — keep waiting (bounded only by parkDeadline).
-        // A completed long-poll is a healthy round-trip, so refresh the
-        // transient budget the same way the ASK branch does. Without this the
-        // entry budget expires during the first park, and a genuine transport
-        // blip while the human is still deciding would fail closed with zero
-        // retries instead of getting its full transient window.
+        if (Date.now() >= parkDeadline) return null;
         transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
         transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
         continue;
       }
-      // Genuine transport error (connect refused / reset, or an abort that
-      // fired too early to be a real park) → charge it against the short
-      // transient budget. When that budget is exhausted, fail CLOSED.
-      if (Date.now() + transientBackoff >= transientDeadline) {
-        return failClosedVerdict();
-      }
-      await sleep(transientBackoff);
+      if (Date.now() + transientBackoff >= transientDeadline) return null;
+      await sleep(transientBackoff, signal);
       transientBackoff = Math.min(
         transientBackoff * 2,
         _TRANSIENT_RETRY_MAX_BACKOFF_MS,
@@ -327,65 +256,134 @@ async function evalNativePolicyHttp(config, toolName, args) {
       continue;
     } finally {
       if (timer) clearTimeout(timer);
+      if (callerSignal) callerSignal.removeEventListener("abort", cancelAttempt);
     }
+    if (callerSignal && callerSignal.aborted) return null;
 
     if (!resp.ok) {
-      // 5xx is transient (retry within budget, re-attaching); 4xx is final
-      // (a bad request won't succeed on retry). Either way, an unevaluable
-      // PHASE_TOOL_CALL fails CLOSED.
+      if (resp.status === 404 || resp.status === 405) return _UNSUPPORTED_ENDPOINT;
       if (resp.status >= 500) {
-        if (Date.now() + transientBackoff >= transientDeadline) {
-          return failClosedVerdict();
-        }
-        await sleep(transientBackoff);
+        if (Date.now() + transientBackoff >= transientDeadline) return null;
+        await sleep(transientBackoff, signal);
         transientBackoff = Math.min(
           transientBackoff * 2,
           _TRANSIENT_RETRY_MAX_BACKOFF_MS,
         );
         continue;
       }
-      return failClosedVerdict();
+      return null;
     }
 
-    let json;
-    try {
-      json = await resp.json();
-    } catch (_err) {
-      // Malformed body — not retryable, and we have no verdict. Fail CLOSED.
-      return failClosedVerdict();
-    }
-
-    const result = json && json.result;
-    if (result === "POLICY_ACTION_DENY") {
-      return {
-        block: true,
-        reason: json.reason || "blocked by Omnigent policy",
-      };
-    }
-    if (result === "POLICY_ACTION_ASK") {
-      // The gate did not park server-side (e.g. a read-only caller that cannot
-      // open an elicitation) yet still wants approval. Re-evaluate
-      // (re-attaching) so a gate that is about to collapse to a hard verdict
-      // gets the chance — but bound it: a raw ASK that NEVER collapses must
-      // not ride the 24h park ceiling and then proceed. After
-      // _MAX_RAW_ASK_ROUNDS we fail CLOSED, mirroring the Python native hook
-      // which denies a stray ASK rather than deferring (an unresolvable
-      // approval gate that eventually allows would defeat its purpose).
-      rawAskRounds += 1;
-      if (rawAskRounds >= _MAX_RAW_ASK_ROUNDS) {
-        return failClosedVerdict();
-      }
-      // Reset the transient budget since this is a healthy round-trip, not a
-      // failure, and give it a brief beat so we do not hot-loop a server that
-      // keeps returning ASK.
+    if (!text && retryEmpty) {
+      // Bound empty proxy responses; explicit server cancellation never re-parks.
+      if (++emptyResponses >= 3 || Date.now() >= parkDeadline) return null;
       transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
       transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+      // A server that answers immediately (consumed tombstone, a proxy that
+      // ends the long poll) would otherwise spin here with no delay.
+      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, signal);
       continue;
     }
-    // ALLOW / UNSPECIFIED / anything else → proceed.
-    return { block: false, reason: "" };
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_err) {
+      return null;
+    }
+    return json && typeof json === "object" ? json : null;
   }
+}
+
+async function parkPiExtensionUiHttp(config, request, opts = {}) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const timeoutMs = opts && typeof opts.timeout === "number" && opts.timeout > 0
+    ? opts.timeout : _PARK_TOTAL_BUDGET_MS;
+  return postParkedJson(config, "/hook/pi/extension-ui", "/hooks/pi-extension-ui", {
+    elicitation_id: mintPiUiElicitationId(),
+    request: { ...request, timeout: timeoutMs },
+  }, {
+    parkDeadline: Date.now() + timeoutMs,
+    signal: opts && opts.signal,
+    retryEmpty: true,
+  });
+}
+
+function extensionUiValue(response) {
+  return response && !response.cancelled && typeof response.value === "string"
+    ? response.value : undefined;
+}
+
+function wrapExtensionUi(ctx, config) {
+  if (!ctx || ctx.mode !== "tui" || !ctx.ui || ctx.ui.__omnigentUiWrapped) {
+    return;
+  }
+  const ui = ctx.ui;
+  ui.__omnigentUiWrapped = true;
+  const original = Object.fromEntries(
+    ["confirm", "select", "input", "editor"]
+      .filter((method) => typeof ui[method] === "function")
+      .map((method) => [method, ui[method].bind(ui)]),
+  );
+
+  if (original.confirm) ui.confirm = async (title, message, opts) => {
+    const request = { method: "confirm", title, message };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.confirm(title, message, opts);
+    return !!(verdict && verdict.confirmed === true);
+  };
+  if (original.select) ui.select = async (title, options, opts) => {
+    const request = {
+      method: "select",
+      title,
+      options: Array.isArray(options) ? options : [],
+    };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.select(title, options, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.input) ui.input = async (title, placeholder, opts) => {
+    const request = { method: "input", title, placeholder };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.input(title, placeholder, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.editor) ui.editor = async (title, prefill, opts) => {
+    const request = { method: "editor", title, prefill };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.editor(title, prefill, opts);
+    return extensionUiValue(verdict);
+  };
+}
+
+// A missing verdict blocks native tools; declining an ordinary dialog does not.
+async function evalNativePolicyHttp(config, toolName, args) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const payload = {
+    event: {
+      type: "PHASE_TOOL_CALL",
+      target: "",
+      data: { name: toolName, arguments: args },
+      context: {},
+    },
+    _omnigent_elicitation_id: mintEvaluateElicitationId(),
+  };
+  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
+  for (let round = 0; round < _MAX_RAW_ASK_ROUNDS; round += 1) {
+    const json = await postParkedJson(config, "/policies/evaluate", "/policies/evaluate", payload, {
+      parkDeadline,
+    });
+    if (!json || json === _UNSUPPORTED_ENDPOINT) return failClosedVerdict();
+    if (json.result === "POLICY_ACTION_DENY") {
+      return { block: true, reason: json.reason || "blocked by Omnigent policy" };
+    }
+    if (json.result !== "POLICY_ACTION_ASK") return { block: false, reason: "" };
+    if (round + 1 < _MAX_RAW_ASK_ROUNDS) await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+  }
+  return failClosedVerdict();
 }
 
 /**
@@ -2082,6 +2080,7 @@ module.exports = function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
     restoreCumulativeUsage();
+    wrapExtensionUi(ctx, config);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();

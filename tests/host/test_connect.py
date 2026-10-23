@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -6665,6 +6666,71 @@ def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
     configure_logging.assert_called_once_with("host", log_to_stderr=True)
 
 
+@pytest.mark.parametrize("failing_step", [None, "startup", "serve", "exit"])
+def test_run_host_process_prints_to_its_terminal_through_a_writer_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failing_step: str | None,
+) -> None:
+    """The host prints through terminal writers and restores its streams, even if a step fails."""
+    from omnigent import process_logging
+    from omnigent.host import connect as connect_mod
+    from omnigent.host import crash_reporting
+    from omnigent.process_logging import TerminalWriter
+
+    monkeypatch.setattr(process_logging, "_shared_terminal_writers", {})
+    monkeypatch.setattr(process_logging, "_live_terminal_writers", weakref.WeakSet())
+    monkeypatch.setattr(process_logging, "_threaded_terminal_mirrors", 0)
+    original_streams = (sys.stdout, sys.stderr)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    streams_while_serving: list[tuple[object, object]] = []
+
+    def serve(*_args: object, **_kwargs: object) -> bool:
+        streams_while_serving.append((sys.stdout, sys.stderr))
+        print("✓ Connected as 'test-host'")
+        if failing_step == "serve":
+            raise KeyboardInterrupt
+        return False
+
+    def fail(message: str) -> None:
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(connect_mod, "_serve_host_until_exit", serve)
+    configure_logging = patch(
+        "omnigent.host.connect.configure_process_logging", return_value=tmp_path / "host.log"
+    )
+    expected_error: contextlib.AbstractContextManager[object] = contextlib.nullcontext()
+    if failing_step == "startup":
+        configure_logging = patch(
+            "omnigent.host.connect.configure_process_logging",
+            side_effect=lambda *_a, **_k: fail("logging setup failed"),
+        )
+        expected_error = pytest.raises(RuntimeError, match="logging setup failed")
+    elif failing_step == "serve":
+        expected_error = pytest.raises(KeyboardInterrupt)
+    elif failing_step == "exit":
+
+        def fail_restore() -> None:
+            fail("signal handler restore failed")
+
+        monkeypatch.setattr(crash_reporting, "install_host_signal_handlers", lambda: fail_restore)
+        expected_error = pytest.raises(RuntimeError, match="signal handler restore failed")
+    with configure_logging, expected_error:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert (sys.stdout, sys.stderr) == original_streams
+    if failing_step != "startup":
+        [(stdout, stderr)] = streams_while_serving
+        assert isinstance(stdout, TerminalWriter)
+        assert isinstance(stderr, TerminalWriter)
+        assert "✓ Connected as 'test-host'\n" in capsys.readouterr().out
+
+
 def test_run_host_process_keys_its_tunnel_from_the_launch_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -9355,6 +9421,75 @@ def test_github_merge_ops_are_served_on_host(
     assert merged.payload == {"object": "session.github.pr_merge", "pr_url": url}
     assert calls[1][:2] == ["pr", "merge"]
     assert calls[1][-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+
+
+def test_github_reviewer_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host lists review candidates and requests reviews when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    calls: list[list[str]] = []
+    users = {"nodes": [{"login": "octocat", "name": ""}], "pageInfo": {"hasNextPage": False}}
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        if argv[:2] == ["api", "graphql"]:
+            return 0, json.dumps({"data": {"repository": {"assignableUsers": users}}}), ""
+        if argv[:2] == ["pr", "view"]:
+            requests = [{"__typename": "User", "login": "octocat"}]
+            return 0, json.dumps({"reviewRequests": requests, "latestReviews": []}), ""
+        return 0, "[]", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    octocat = {"login": "octocat", "kind": "user"}
+    try:
+        listed = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="reviewers",
+                op="github_reviewers",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url},
+            )
+        )
+        edited = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="reviewers-update",
+                op="github_reviewers_update",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "add": [octocat], "session_id": "untrusted"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert listed.status == "ok", listed
+    assert listed.payload == {
+        "object": "list",
+        "data": [{**octocat, "name": None}],
+        "has_more": False,
+    }
+    assert edited.status == "ok", edited
+    assert edited.payload == {
+        "object": "session.github.pr_reviewers",
+        "reviewers": [{**octocat, "state": "PENDING"}],
+    }
+    assert calls[2][-3:] == [
+        "repos/example/one/pulls/42/requested_reviewers",
+        "-f",
+        "reviewers[]=octocat",
+    ]
 
 
 def test_fs_search_reuses_the_changed_files_snapshot_across_requests(

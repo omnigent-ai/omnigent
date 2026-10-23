@@ -404,7 +404,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(

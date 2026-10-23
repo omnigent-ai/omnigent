@@ -5,6 +5,7 @@ import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDr
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
+import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
 import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
@@ -293,6 +294,8 @@ import {
   SIDEBAR_ROW,
   SIDEBAR_HOVER_HIGHLIGHT,
   SIDEBAR_ACTIVE_HIGHLIGHT,
+  SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+  SIDEBAR_GRID_SELECTED_RING,
   SIDEBAR_OPEN_MENU_HIGHLIGHT,
 } from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
@@ -3348,6 +3351,8 @@ function SessionFilterMenu({
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+  const [menuOpen, setMenuOpen] = useState(false);
+  const tooltip = useMenuGuardedTooltip(menuOpen);
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
@@ -3365,11 +3370,11 @@ function SessionFilterMenu({
     </DropdownMenuRadioGroup>
   );
   return (
-    <DropdownMenu>
-      <Tooltip disableHoverableContent>
+    <DropdownMenu onOpenChange={setMenuOpen}>
+      <Tooltip disableHoverableContent open={tooltip.open} onOpenChange={tooltip.onOpenChange}>
         <TooltipTrigger asChild>
           {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
-          <span className="inline-flex shrink-0">
+          <span className="inline-flex shrink-0" {...tooltip.triggerProps}>
             <DropdownMenuTrigger asChild>
               <Button
                 type="button"
@@ -3825,6 +3830,7 @@ function ConversationSection({
                   conversation={conv}
                   isActive={conv.id === activeConversationId}
                   inActiveGrid={gridMembers.has(conv.id)}
+                  gridSelected={conv.id === grids?.selectedSessionId}
                   gridsEnabled={grids?.enabled ?? false}
                   isPinned={pinnedConversationIds.includes(conv.id)}
                   onClick={onRowClick}
@@ -4597,6 +4603,7 @@ function ConversationRowImpl({
   conversation,
   isActive,
   inActiveGrid,
+  gridSelected,
   gridsEnabled,
   isPinned,
   onClick,
@@ -4612,6 +4619,7 @@ function ConversationRowImpl({
   // read, so only the two rows whose value flips re-render on a switch.
   isActive: boolean;
   inActiveGrid: boolean;
+  gridSelected: boolean;
   gridsEnabled: boolean;
   isPinned: boolean;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -5060,7 +5068,9 @@ function ConversationRowImpl({
         !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
         !selectionMode && menuOpen && "md:pr-20",
         selectionMode && "pr-2 pl-8",
-        !selectionMode && (isActive || inActiveGrid) && SIDEBAR_ACTIVE_HIGHLIGHT,
+        !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+        !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+        !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
@@ -5683,6 +5693,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
     prev.isActive === next.isActive &&
     prev.inActiveGrid === next.inActiveGrid &&
+    prev.gridSelected === next.gridSelected &&
     prev.gridsEnabled === next.gridsEnabled &&
     prev.isPinned === next.isPinned &&
     prev.selectionMode === next.selectionMode &&
@@ -6424,6 +6435,8 @@ function BulkActionBar({
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [moveSearch, setMoveSearch] = useState("");
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
+  const moveTooltip = useMenuGuardedTooltip(moveMenuOpen);
   // Worktree sessions among the selection each carry one local git branch
   // (git_branch); the delete modal lists them so each branch can be opted
   // into cleanup individually. `branchesToDelete` holds the session ids whose
@@ -6640,13 +6653,18 @@ function BulkActionBar({
             )}
             <DropdownMenu
               onOpenChange={(open) => {
+                setMoveMenuOpen(open);
                 if (!open) setMoveSearch("");
               }}
             >
-              <Tooltip disableHoverableContent>
+              <Tooltip
+                disableHoverableContent
+                open={moveTooltip.open}
+                onOpenChange={moveTooltip.onOpenChange}
+              >
                 <TooltipTrigger asChild>
                   {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
-                  <span className="inline-flex shrink-0">
+                  <span className="inline-flex shrink-0" {...moveTooltip.triggerProps}>
                     <DropdownMenuTrigger asChild>
                       <Button
                         type="button"

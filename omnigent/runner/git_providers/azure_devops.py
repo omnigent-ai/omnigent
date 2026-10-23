@@ -36,6 +36,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    ReviewerRef,
     ShellPrOp,
     ShellSegment,
     azure_devops_observer,
@@ -1174,6 +1175,31 @@ class AzureDevOpsPullRequests:
         :raises ValueError: Always.
         """
         raise ValueError("Merging Azure DevOps pull requests from Omnigent is not supported yet.")
+
+    def review_candidates(
+        self,
+        root: str,  # noqa: ARG002 - reviewer editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - reviewer editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps reviewer editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
+
+    def edit_reviewers(
+        self,
+        root: str,  # noqa: ARG002 - reviewer editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - reviewer editing is unsupported
+        *,
+        add: Sequence[ReviewerRef],  # noqa: ARG002 - reviewer editing is unsupported
+        remove: Sequence[ReviewerRef],  # noqa: ARG002 - reviewer editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps reviewer editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``az repos pr`` command, in order."""
