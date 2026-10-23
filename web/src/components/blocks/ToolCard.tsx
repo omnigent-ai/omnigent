@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CodeBlock,
   CodeBlockActions,
+  type CodeLanguage,
   CodeBlockContainer,
   CodeBlockContent,
   CodeBlockHeader,
@@ -31,14 +32,15 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
-import { dropTrailingPartialEscape, parseShellToolOutput, stripAnsi } from "@/lib/shellToolOutput";
+import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
+import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOutput";
 import { iconForTool } from "@/lib/toolIcon";
 import {
   type ToolRunCall,
   type ToolTitle,
   formatToolRunLabel,
   formatToolTitle,
-  shellCommandFor,
+  shellToolCall,
   splitEnvPrefix,
 } from "@/lib/toolTitle";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
@@ -179,7 +181,7 @@ export function ToolCard({
   duration,
 }: ToolCardProps) {
   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
-  const shellCommand = useMemo(() => shellCommandFor(name, args), [name, args]);
+  const shellCall = useMemo(() => shellToolCall(name, args), [name, args]);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const formattedOutput = useMemo(
     () => (output === null ? null : prettyPrintIfJson(output)),
@@ -208,9 +210,10 @@ export function ToolCard({
         onBodyClick={onBodyClick}
       />
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
-        {shellCommand !== null ? (
+        {shellCall !== null ? (
           <ShellTerminalPanel
-            command={shellCommand}
+            command={shellCall.command}
+            outputFormat={shellCall.outputFormat}
             argsCwd={typeof args.cwd === "string" && args.cwd.length > 0 ? args.cwd : null}
             inputJson={inputJson}
             output={output}
@@ -230,7 +233,7 @@ export function ToolCard({
             )}
           </>
         )}
-        {shellCommand === null &&
+        {shellCall === null &&
           output === null &&
           (state === "output-error" || state === "cancelled" || state === "no-output") && (
             <EmptyOutputState state={state} />
@@ -397,12 +400,14 @@ function ShellCommandLine({ command }: { command: string }) {
  */
 function ShellTerminalPanel({
   command,
+  outputFormat,
   argsCwd,
   inputJson,
   output,
   state,
 }: {
   command: string;
+  outputFormat: ShellOutputFormat;
   /** Working directory from the call's arguments (Codex sends one). */
   argsCwd: string | null;
   inputJson: string;
@@ -411,13 +416,21 @@ function ShellTerminalPanel({
 }) {
   const [wrap, setWrap] = useState(true);
   const [showRaw, setShowRaw] = useState(false);
-  const parsed = useMemo(() => (output === null ? null : parseShellToolOutput(output)), [output]);
+  const parsed = useMemo(
+    () => (output === null ? null : parseShellToolOutput(output, outputFormat)),
+    [output, outputFormat],
+  );
+  const rawOutput = useMemo(
+    () => (output === null ? null : showControlCharacters(prettyPrintIfJson(output))),
+    [output],
+  );
   const hasOutput = parsed !== null && parsed.text.length > 0;
   // sys_os_shell reports its working directory in the result instead.
   const cwd = argsCwd ?? parsed?.cwd ?? null;
-  // With no cwd line, float the actions so only the command's first line wraps
-  // around them; unwrapped lines cannot flow around a float, so they get a row.
-  const floatActions = cwd === null && wrap;
+  // With no cwd line the actions sit with the command: floated so only its
+  // first line wraps around them, or on a sticky row when lines do not wrap.
+  // Only the class changes on toggle, so the buttons keep focus.
+  const actionsBesideCommand = cwd === null;
   const actions = (
     <CodeBlockActions className="my-0 mr-0 shrink-0 gap-1">
       <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
@@ -441,12 +454,9 @@ function ShellTerminalPanel({
   return (
     <div className="space-y-2">
       <CodeBlockContainer language="bash" data-testid="shell-tool-terminal">
-        {(cwd !== null || !floatActions) && (
+        {cwd !== null && (
           <div className="flex items-center justify-between gap-2 px-3 pt-1.5">
-            <span
-              className="min-w-0 truncate font-mono text-muted-foreground text-xs"
-              title={cwd ?? undefined}
-            >
+            <span className="min-w-0 truncate font-mono text-muted-foreground text-xs" title={cwd}>
               {cwd}
             </span>
             {actions}
@@ -461,10 +471,21 @@ function ShellTerminalPanel({
             code={command}
             language="bash"
             wrap={wrap}
-            className={cn(TERMINAL_PRE_CLASS, floatActions ? "pt-2 pb-1" : "pt-1 pb-1")}
+            className={cn(
+              TERMINAL_PRE_CLASS,
+              actionsBesideCommand && wrap ? "pt-2 pb-1" : "pt-1 pb-1",
+            )}
             leading={
-              floatActions ? (
-                <div className="float-right mt-1.5 mr-3 -mb-1 ml-2">{actions}</div>
+              actionsBesideCommand ? (
+                <div
+                  className={
+                    wrap
+                      ? "float-right mt-1.5 mr-3 -mb-1 ml-2"
+                      : "sticky left-0 flex justify-end px-3 pt-1.5"
+                  }
+                >
+                  {actions}
+                </div>
               ) : undefined
             }
           />
@@ -489,16 +510,24 @@ function ShellTerminalPanel({
           state={state}
           exitCode={parsed?.exitCode ?? null}
           timedOut={parsed?.timedOut ?? false}
-          hasOutput={output !== null}
+          outputRecorded={output !== null}
         />
       </CodeBlockContainer>
       {showRaw && (
-        <CodePanel
-          title="Parameters"
-          text={inputJson}
-          copyText={inputJson}
-          copyLabel="Copy parameters"
-        />
+        <>
+          <CodePanel
+            title="Parameters"
+            text={inputJson}
+            copyText={inputJson}
+            copyLabel="Copy parameters"
+          />
+          {rawOutput !== null && (
+            <OutputSection
+              output={rawOutput}
+              language={outputFormat === "sys-os-json" ? "json" : "text"}
+            />
+          )}
+        </>
       )}
     </div>
   );
@@ -516,12 +545,13 @@ function ShellStatus({
   state,
   exitCode,
   timedOut,
-  hasOutput,
+  outputRecorded,
 }: {
   state: ToolState;
   exitCode: number | null;
   timedOut: boolean;
-  hasOutput: boolean;
+  /** Whether the call recorded any output string, even an empty one. */
+  outputRecorded: boolean;
 }) {
   let status: ReactNode;
   if (state === "input-available") {
@@ -541,7 +571,7 @@ function ShellStatus({
     status = <span className="text-destructive">failed</span>;
   } else if (state === "cancelled") {
     status = <span className="text-muted-foreground">cancelled</span>;
-  } else if (state === "no-output" && !hasOutput) {
+  } else if (state === "no-output" && !outputRecorded) {
     status = <span className="text-muted-foreground">no output recorded</span>;
   } else {
     return null;
@@ -585,18 +615,20 @@ function CodePanel({
   text,
   copyText,
   copyLabel,
+  language = "json",
 }: {
   title: string;
   text: string;
   copyText: string;
   copyLabel: string;
+  language?: CodeLanguage;
 }) {
   // Soft-wrap long lines by default so the panel never needs horizontal
   // scrolling to read; the toggle restores the scrolling view for when
   // column alignment matters (same affordance as chat code blocks).
   const [wrap, setWrap] = useState(true);
   return (
-    <CodeBlock code={text} language="json" wrap={wrap}>
+    <CodeBlock code={text} language={language} wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
@@ -636,10 +668,13 @@ function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => voi
 function OutputSection({
   output,
   renderPanel,
+  language,
 }: {
   output: string;
   /** Renders the (possibly truncated) text; defaults to a titled Output panel. */
   renderPanel?: (text: string) => ReactNode;
+  /** Highlighting for the default Output panel; JSON unless set. */
+  language?: CodeLanguage;
 }) {
   const [isExpanded, setIsExpanded] = useState(false);
   useEffect(() => setIsExpanded(false), [output]);
@@ -661,7 +696,13 @@ function OutputSection({
         {renderPanel ? (
           renderPanel(preview.text)
         ) : (
-          <CodePanel title="Output" text={preview.text} copyText={output} copyLabel="Copy output" />
+          <CodePanel
+            title="Output"
+            text={preview.text}
+            copyText={output}
+            copyLabel="Copy output"
+            language={language}
+          />
         )}
         {canExpand && !isExpanded && (
           <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-md bg-gradient-to-t from-background to-transparent" />

@@ -1,5 +1,5 @@
 import { createElement } from "react";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -266,36 +266,81 @@ describe("ToolCard shell terminal panel", () => {
     expect(screen.queryByText("Parameters")).toBeNull();
   });
 
-  it("reveals the raw parameters JSON on demand", () => {
-    // WHY: the original arguments stay available for debugging.
+  it("reveals the raw parameters and untouched output on demand", () => {
+    // WHY: the original arguments and output stay available for debugging,
+    // with control characters made visible instead of hidden or executed.
     const { container } = renderCard({
       name: "Bash",
       arguments: { command: "ls" },
-      output: "a.txt",
+      output: "\u001b[1ma.txt\u001b[0m",
       state: "output-available",
     });
     expand(container);
     fireEvent.click(screen.getByRole("button", { name: "Raw" }));
     expect(screen.getByText("Parameters")).toBeInTheDocument();
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(container.textContent).toContain("\\u001b[1ma.txt\\u001b[0m");
   });
 
-  it.each([
-    [JSON.stringify({ stdout: "", stderr: "boom", exit_code: 3 }), "exit 3", "boom"],
-    ["missing\n[exit code: 1]", "exit 1", "missing"],
-  ])("reports the exit code parsed from %s", (output, status, text) => {
-    // WHY: sys_os_shell and Codex report exit codes in different shapes; the
-    // footer must show both, and the suffix must not leak into the output.
+  it("reads the exit code in the output format of the tool that ran", () => {
+    // WHY: the panel must hand the parser the tool's own format; the suffix
+    // must not leak into the output.
     const { container } = renderCard({
-      name: output.startsWith("{") ? "sys_os_shell" : "shell",
+      name: "shell",
       arguments: { command: "make" },
-      output,
+      output: "missing\n[exit code: 1]",
       state: "output-available",
     });
     expand(container);
     const terminal = screen.getByTestId("shell-tool-terminal");
-    expect(screen.getByText(status)).toBeInTheDocument();
-    expect(terminal.textContent).toContain(text);
+    expect(screen.getByText("exit 1")).toBeInTheDocument();
     expect(terminal.textContent).not.toContain("[exit code");
+  });
+
+  it("copies the command as run and the output without escapes", async () => {
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const { container } = renderCard({
+      name: "shell",
+      arguments: { command: "/bin/zsh -lc 'git diff --stat'" },
+      output: "\u001b[32m+\u001b[m 1 file",
+      state: "output-available",
+    });
+    expand(container);
+    fireEvent.click(screen.getByRole("button", { name: "Copy command" }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith("git diff --stat"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy output" }));
+    await waitFor(() => expect(writeText).toHaveBeenLastCalledWith("+ 1 file"));
+  });
+
+  it("shows a Bash description in the row and the command in the panel", () => {
+    const { container } = renderCard({
+      name: "Bash",
+      arguments: { command: "ls docs", description: "List docs directory" },
+      output: "README.md",
+      state: "output-available",
+    });
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger.textContent).toContain("List docs directory");
+    expand(container);
+    expect(screen.getByTestId("shell-tool-terminal").textContent).toContain("ls docs");
+  });
+
+  it("keeps focus on the wrap toggle when there is no working directory", () => {
+    // WHY: the actions sit beside the command without a cwd line; toggling wrap
+    // must restyle them in place, not remount them and drop keyboard focus.
+    const { container } = renderCard({
+      name: "Bash",
+      arguments: { command: "make test" },
+      output: "ok",
+      state: "output-available",
+    });
+    expand(container);
+    const toggle = screen.getByRole("button", { name: "Disable word wrap" });
+    toggle.focus();
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "Enable word wrap" })).toBe(toggle);
+    expect(document.activeElement).toBe(toggle);
   });
 
   it("shows a running status while the command has no output yet", () => {

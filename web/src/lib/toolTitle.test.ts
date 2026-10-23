@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatToolRunLabel, formatToolTitle, shellCommandFor, splitEnvPrefix } from "./toolTitle";
+import { formatToolRunLabel, formatToolTitle, shellToolCall, splitEnvPrefix } from "./toolTitle";
 
 describe("formatToolTitle", () => {
   it("strips sys_os_shell down to the command string with no bold verb", () => {
@@ -7,6 +7,19 @@ describe("formatToolTitle", () => {
       verb: null,
       body: "ls -la",
       isShellCommand: true,
+    });
+  });
+
+  it("gives a prefixed omnigent shell tool the same row as its terminal panel", () => {
+    expect(formatToolTitle("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toEqual({
+      verb: null,
+      body: "ls -la",
+      isShellCommand: true,
+    });
+    // Other prefixed tools keep their existing fallback title.
+    expect(formatToolTitle("mcp__omnigent__sys_os_read", { path: "a.py" }, "path=a.py")).toEqual({
+      verb: null,
+      body: "mcp__omnigent__sys_os_read(path=a.py)",
     });
   });
 
@@ -316,32 +329,43 @@ describe("formatToolRunLabel", () => {
   });
 });
 
-describe("shellCommandFor", () => {
-  it("returns the unwrapped command for shell tools only", () => {
-    expect(shellCommandFor("shell", { command: "/bin/zsh -lc 'pnpm install'" })).toBe(
-      "pnpm install",
-    );
-    expect(shellCommandFor("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toBe("ls -la");
-    expect(shellCommandFor("Bash", { command: "git status", description: "Check" })).toBe(
-      "git status",
-    );
-    expect(shellCommandFor("Read", { command: "ls" })).toBeNull();
-    expect(shellCommandFor("Bash", { command: 42 })).toBeNull();
+describe("shellToolCall", () => {
+  const commandOf = (name: string, args: Record<string, unknown>) =>
+    shellToolCall(name, args)?.command ?? null;
+
+  it("returns the command for shell tools only", () => {
+    expect(commandOf("shell", { command: "/bin/zsh -lc 'pnpm install'" })).toBe("pnpm install");
+    expect(commandOf("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toBe("ls -la");
+    expect(commandOf("Bash", { command: "git status", description: "Check" })).toBe("git status");
+    expect(commandOf("Read", { command: "ls" })).toBeNull();
+    expect(commandOf("Bash", { command: 42 })).toBeNull();
+    // OpenAI's local_shell passes an argv array, which has no single command line.
+    expect(commandOf("local_shell", { command: ["ls", "-la"] })).toBeNull();
   });
 
   it("only unwraps Codex's shell, and keeps commands that are not one quoted word", () => {
     // Claude ran this wrapper itself, so it is shown and copied as run.
-    expect(shellCommandFor("Bash", { command: "bash -c 'make test'" })).toBe("bash -c 'make test'");
+    expect(commandOf("Bash", { command: "bash -c 'make test'" })).toBe("bash -c 'make test'");
     // Only `a` runs inside sh; stripping the outer quotes would mangle the rest.
-    expect(shellCommandFor("shell", { command: "sh -c 'a' && echo 'b'" })).toBe(
-      "sh -c 'a' && echo 'b'",
-    );
-    expect(shellCommandFor("shell", { command: String.raw`/bin/bash -lc 'echo '\''hi'\'''` })).toBe(
+    expect(commandOf("shell", { command: "sh -c 'a' && echo 'b'" })).toBe("sh -c 'a' && echo 'b'");
+    expect(commandOf("shell", { command: String.raw`/bin/bash -lc 'echo '\''hi'\'''` })).toBe(
       "echo 'hi'",
     );
-    expect(shellCommandFor("shell", { command: String.raw`/bin/zsh -lc "echo \"a b\""` })).toBe(
+    expect(commandOf("shell", { command: String.raw`/bin/zsh -lc "echo \"a b\""` })).toBe(
       'echo "a b"',
     );
+    // An empty wrapped command shows the wrapper rather than nothing.
+    expect(commandOf("shell", { command: "/bin/bash -lc ''" })).toBe("/bin/bash -lc ''");
+  });
+
+  it.each([
+    ["sys_os_shell", "sys-os-json"],
+    ["mcp__omnigent__sys_os_shell", "sys-os-json"],
+    ["shell", "codex-suffix"],
+    ["Bash", "plain"],
+    ["bash", "plain"],
+  ])("reads %s output as %s", (name, format) => {
+    expect(shellToolCall(name, { command: "ls" })?.outputFormat).toBe(format);
   });
 });
 
@@ -359,6 +383,9 @@ describe("splitEnvPrefix", () => {
     // Never split inside a value.
     ['FOO="a b"c make', { env: "", rest: 'FOO="a b"c make' }],
     ["FOO=$(a b) cmd", { env: "", rest: "FOO=$(a b) cmd" }],
+    ["FOO=a;b cmd", { env: "", rest: "FOO=a;b cmd" }],
+    ["FOO=a&&b cmd", { env: "", rest: "FOO=a&&b cmd" }],
+    ["FOO=a|b cmd", { env: "", rest: "FOO=a|b cmd" }],
   ])("splits %s", (command, expected) => {
     expect(splitEnvPrefix(command)).toEqual(expected);
   });

@@ -10,7 +10,7 @@ const longOutput = Array.from(
 const longCommand =
   '/bin/zsh -lc \'PATH="$HOME/.nvm/versions/node/v22.22.3/bin:$PATH" pnpm install ' +
   "--lockfile-only --ignore-scripts --filter @omnigent/web --filter @omnigent/desktop " +
-  "--reporter=append-only > /tmp/pr10811-catalog-lock.log 2>&1'";
+  "--reporter=append-only > /tmp/install.log 2>&1'";
 
 const longLineOutput = [
   "Scope: all 14 workspace projects",
@@ -104,7 +104,7 @@ export const ShellCompleted: Story = {
   args: {
     name: "shell",
     arguments: { command: "/bin/zsh -lc 'git status --short'", cwd: "/home/dev/omnigent" },
-    output: " M web/package.json\n M pnpm-workspace.yaml\n?? web/src/lib/shikiCatalog.ts",
+    output: " M web/package.json\n M pnpm-workspace.yaml\n?? web/src/lib/newFile.ts",
     state: "output-available",
     startedAt: null,
     duration: 0.08,
@@ -131,7 +131,7 @@ export const ShellLongLinesWrapped: Story = {
     name: "shell",
     arguments: {
       command: longCommand,
-      cwd: "/Users/dev/git/omnigent-worktrees/pr10811-shiki-review-20261022",
+      cwd: "/home/dev/omnigent",
     },
     output: longLineOutput,
     state: "output-available",
@@ -182,9 +182,9 @@ export const ShellSysOsShellResultCwd: Story = {
     arguments: { command: "git log --oneline -3" },
     output: JSON.stringify({
       stdout:
-        "c645d6d08 fix(web): let a long shell command use the full width\n" +
-        "af55a1f0a test(e2e-ui): regenerate visual baselines\n" +
-        "4016b026d fix(web): drop the empty header line\n",
+        "3f2a9c1 Add the settings page\n" +
+        "8b1e0d4 Fix the login redirect\n" +
+        "c47a2e9 Update dependencies\n",
       stderr: "",
       exit_code: 0,
       timed_out: false,

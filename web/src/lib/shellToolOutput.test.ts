@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dropTrailingPartialEscape, parseShellToolOutput, stripAnsi } from "./shellToolOutput";
+import { parseShellToolOutput } from "./shellToolOutput";
 
 describe("parseShellToolOutput", () => {
   it("reads sys_os_shell's structured stdout, stderr and exit_code", () => {
@@ -9,12 +9,17 @@ describe("parseShellToolOutput", () => {
       exit_code: 2,
       cwd: "/repo/web",
     });
-    expect(parseShellToolOutput(output)).toEqual({
+    expect(parseShellToolOutput(output, "sys-os-json")).toEqual({
       text: "built\nwarning: slow",
       exitCode: 2,
       timedOut: false,
       cwd: "/repo/web",
     });
+  });
+
+  it("keeps blank lines between stdout and stderr", () => {
+    const output = JSON.stringify({ stdout: "a\n\n", stderr: "b" });
+    expect(parseShellToolOutput(output, "sys-os-json").text).toBe("a\n\nb");
   });
 
   it("reports a sys_os_shell timeout", () => {
@@ -25,7 +30,7 @@ describe("parseShellToolOutput", () => {
       timed_out: true,
       error: "Command timed out after 30 seconds",
     });
-    expect(parseShellToolOutput(output)).toEqual({
+    expect(parseShellToolOutput(output, "sys-os-json")).toEqual({
       text: "partial",
       exitCode: null,
       timedOut: true,
@@ -34,19 +39,19 @@ describe("parseShellToolOutput", () => {
   });
 
   it("strips Codex's failure suffix into the exit code", () => {
-    expect(parseShellToolOutput("no such file\n[exit code: 1]")).toEqual({
+    expect(parseShellToolOutput("no such file\n[exit code: 1]", "codex-suffix")).toEqual({
       text: "no such file",
       exitCode: 1,
       timedOut: false,
       cwd: null,
     });
-    expect(parseShellToolOutput("[exit code: 127]").exitCode).toBe(127);
-    expect(parseShellToolOutput("boom\n\n[exit code: 3]").text).toBe("boom");
+    expect(parseShellToolOutput("[exit code: 127]", "codex-suffix").exitCode).toBe(127);
+    expect(parseShellToolOutput("boom\n\n[exit code: 3]", "codex-suffix").text).toBe("boom");
   });
 
   it("finds the exit code when Codex appends sandbox guidance after it", () => {
     const output = "bwrap: setting up uid map\n[exit code: 1]\n\nRetry outside the sandbox.";
-    expect(parseShellToolOutput(output)).toEqual({
+    expect(parseShellToolOutput(output, "codex-suffix")).toEqual({
       text: "bwrap: setting up uid map\n\nRetry outside the sandbox.",
       exitCode: 1,
       timedOut: false,
@@ -55,47 +60,31 @@ describe("parseShellToolOutput", () => {
   });
 
   it("keeps plain output, trims trailing newlines and leaves the exit code unknown", () => {
-    expect(parseShellToolOutput("hello\r\nworld\n\n")).toEqual({
+    expect(parseShellToolOutput("hello\r\nworld\n\n", "plain")).toEqual({
       text: "hello\nworld",
       exitCode: null,
       timedOut: false,
       cwd: null,
     });
     // JSON that is not a shell result renders verbatim.
-    expect(parseShellToolOutput('{"rows": 3}').text).toBe('{"rows": 3}');
+    expect(parseShellToolOutput('{"rows": 3}', "sys-os-json").text).toBe('{"rows": 3}');
   });
 
-  it("keeps ANSI colors for rendering, and stripAnsi removes them for copying", () => {
-    const colored = "\u001b[32mok\u001b[0m done";
-    expect(parseShellToolOutput(colored).text).toBe(colored);
-    expect(stripAnsi(colored)).toBe("ok done");
-    expect(stripAnsi("\u001b]0;title\u0007plain")).toBe("plain");
+  it("only reads the format the tool produces", () => {
+    // A Bash `cat` of a saved sys_os_shell result is just output.
+    const savedResult = '{"stdout": "saved", "exit_code": 7}';
+    expect(parseShellToolOutput(savedResult, "plain")).toEqual({
+      text: savedResult,
+      exitCode: null,
+      timedOut: false,
+      cwd: null,
+    });
+    expect(parseShellToolOutput("log\n[exit code: 1]", "plain").text).toBe("log\n[exit code: 1]");
   });
 
-  it("spells out git's short reset so colors do not bleed", () => {
-    expect(parseShellToolOutput("\u001b[31m-\u001b[m next").text).toBe("\u001b[31m-\u001b[0m next");
-  });
-
-  it("rewrites colon-form colors into the form the renderer understands", () => {
-    expect(parseShellToolOutput("\u001b[38:2::255:0:0mred\u001b[0m").text).toBe(
-      "\u001b[38;2;255;0;0mred\u001b[0m",
+  it("keeps color escapes and drops the rest", () => {
+    expect(parseShellToolOutput("\u001b[32mok\u001b[2K\u001b[0m done", "plain").text).toBe(
+      "\u001b[32mok\u001b[0m done",
     );
-    expect(parseShellToolOutput("\u001b[1;48:5:208mx").text).toBe("\u001b[1;48;5;208mx");
-  });
-
-  it("drops cursor and title escapes the transcript cannot replay", () => {
-    expect(
-      parseShellToolOutput("a\u001b[2K\u001b[1Gb \u001b]0;t\u0007\u001b[1mc\u001b[0m").text,
-    ).toBe("ab \u001b[1mc\u001b[0m");
-    // A title whose terminator was cut off must not leak into the text.
-    expect(parseShellToolOutput("done\u001b]0;build title").text).toBe("done");
-  });
-});
-
-describe("dropTrailingPartialEscape", () => {
-  it("removes an escape cut off by a preview limit", () => {
-    expect(dropTrailingPartialEscape("ok \u001b[3")).toBe("ok ");
-    expect(dropTrailingPartialEscape("ok \u001b")).toBe("ok ");
-    expect(dropTrailingPartialEscape("\u001b[32mok")).toBe("\u001b[32mok");
   });
 });

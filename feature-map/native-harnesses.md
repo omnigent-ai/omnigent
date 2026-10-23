@@ -35,7 +35,9 @@ implements them separately, so a fix for one harness does not reach the others.
   clicking it opens that file in the workspace viewer without expanding the
   row. Absolute paths open workspace-relative under the session root and
   host-absolute outside it; they stay plain text until the root is known.
-  Shell commands and multi-file patches have no file link.
+  Shell commands and multi-file patches have no file link. A shell row reads
+  `$ command` and expands to a terminal panel with the command, its output
+  and exit status.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.

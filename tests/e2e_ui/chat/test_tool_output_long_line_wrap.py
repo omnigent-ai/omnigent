@@ -212,8 +212,8 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     _expand_tool_output(page)
 
     # The panel reads like a terminal: the command (its `$` prompt is CSS-only)
-    # and the exit status parsed from sys_os_shell's JSON result, with the
-    # raw JSON hidden.
+    # and the exit status parsed from sys_os_shell's JSON result; the
+    # Parameters JSON stays behind Raw.
     terminal = page.get_by_test_id("shell-tool-terminal")
     expect(terminal).to_contain_text("python3 -c")
     expect(terminal.get_by_text("exit 0", exact=True)).to_be_visible()

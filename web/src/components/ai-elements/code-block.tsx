@@ -9,7 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
-import { stripAnsi } from "@/lib/shellToolOutput";
+import { stripAnsi } from "@/lib/ansi";
 import { cn } from "@/lib/utils";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import type { ComponentProps, CSSProperties, HTMLAttributes, ReactNode } from "react";

@@ -12,6 +12,8 @@
 // pre-existing `name(argsSummary)` shape with no bolded verb so we
 // never lose information for tools we haven't taught this module about.
 
+import type { ShellOutputFormat } from "@/lib/shellToolOutput";
+
 /**
  * Structured title for a tool call.
  * - `verb`: the static action phrase (e.g. "Read", "Start child
@@ -214,7 +216,9 @@ export function formatToolTitle(
   args: Record<string, unknown>,
   argsSummary?: string,
 ): ToolTitle {
-  const formatter = FORMATTERS[name];
+  // Prefixed omnigent shell tools get the same `$ command` row as their panel.
+  const formatter =
+    FORMATTERS[name] ?? (isShellTool(name) ? FORMATTERS[stripOmnigentPrefix(name)] : undefined);
   if (formatter !== undefined) {
     const title = formatter(args);
     if (title !== null && (title.verb !== null || title.body.length > 0)) {
@@ -304,7 +308,8 @@ function unwrapShellCommand(command: string): string {
   const trimmed = command.trim();
   const match = SHELL_WRAPPER_RE.exec(trimmed);
   if (match === null) return trimmed;
-  return decodeShellWord(match[1]!.trim())?.trim() ?? trimmed;
+  const inner = decodeShellWord(match[1]!.trim())?.trim();
+  return inner ? inner : trimmed;
 }
 
 /** Decode one shell word (`'it'\''s'`, `"a \"b\""`, `ls`), or `null` if it is not exactly one. */
@@ -329,22 +334,39 @@ export function isShellTool(name: string): boolean {
   return RUN_CATEGORIES[stripOmnigentPrefix(name)] === "shell";
 }
 
+/** A shell tool call: the command line it ran and how its output is shaped. */
+export interface ShellToolCall {
+  command: string;
+  outputFormat: ShellOutputFormat;
+}
+
+const SHELL_OUTPUT_FORMATS: Record<string, ShellOutputFormat> = {
+  sys_os_shell: "sys-os-json",
+  shell: "codex-suffix",
+};
+
 /**
- * The command line a shell tool call ran, or `null` when the call is not a
- * shell tool or carries no string `command`. Only Codex's `shell` adds a
+ * Describe a shell tool call, or return `null` when the call is not a shell
+ * tool or carries no string `command`. Only Codex's `shell` adds a
  * login-shell wrapper, so other harnesses' commands are shown as run.
  */
-export function shellCommandFor(name: string, args: Record<string, unknown>): string | null {
+export function shellToolCall(name: string, args: Record<string, unknown>): ShellToolCall | null {
   if (!isShellTool(name)) return null;
   const command = asString(args.command);
   if (command === null) return null;
-  return stripOmnigentPrefix(name) === "shell" ? unwrapShellCommand(command) : command;
+  const bareName = stripOmnigentPrefix(name);
+  return {
+    command: bareName === "shell" ? unwrapShellCommand(command) : command,
+    outputFormat: SHELL_OUTPUT_FORMATS[bareName] ?? "plain",
+  };
 }
 
 // Leading `NAME=value` assignments, with quoted values, e.g.
 // `PATH="$HOME/bin:$PATH" FOO=1 make` -> `PATH="$HOME/bin:$PATH" FOO=1 `.
-// Unquoted values stop at quotes and parens so `FOO="a b"c` never splits.
-const ENV_PREFIX_RE = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'()`]*)\s+)+/;
+// Unquoted values stop at quotes, parens and shell operators, so neither
+// `FOO="a b"c` nor `FOO=a;b` is split inside a value.
+const ENV_PREFIX_RE =
+  /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'()`;&|<>]*)\s+)+/;
 const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 /**
