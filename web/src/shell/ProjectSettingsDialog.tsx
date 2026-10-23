@@ -310,8 +310,7 @@ export function ProjectSettingsDialog({
   // Offer the control only for a model-taking harness; when it can only render
   // "No default" it stays visible but disabled with an explanatory hint.
   const supportsModelDefault = harnessTakesModel;
-  // The same ladder the composer validates a project effort against, so the
-  // dialog can't store a level the composer would ignore.
+  // Mirror the composer's effort ladder (Codex varies per model).
   const effortLadder = (pinnedModel: string) =>
     nativeEffortOptions(
       selectedNativeSpec?.harness,
@@ -323,10 +322,14 @@ export function ProjectSettingsDialog({
   const storedEffortMissing =
     effort !== NONE && !(effortOptions ?? []).some((e) => e.value === effort);
   const effortPickerEmpty = (effortOptions ?? []).length === 0 && effort === NONE;
+  // An empty Codex catalog says nothing about the stored effort, so keep it.
+  const effortLadderKnown =
+    selectedNativeSpec?.harness !== "codex-native" || (hostModelOptions ?? []).length > 0;
   const selectModel = (next: string) => {
     setModel(next);
     // Codex ladders differ per model; drop an effort the new model can't run.
-    if (effort !== NONE && !(effortLadder(next) ?? []).some((e) => e.value === effort)) {
+    const ladder = effortLadder(next) ?? [];
+    if (effortLadderKnown && effort !== NONE && !ladder.some((e) => e.value === effort)) {
       setEffort(NONE);
     }
   };

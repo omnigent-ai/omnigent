@@ -35,10 +35,11 @@ and steers messages while the agent is busy.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
-- `project-defaults`: Project settings store a default agent and, for Claude
-  Code, Codex, and Pi, a default model and reasoning effort; the new-session
-  composer opened in that project starts with them. States: no default, a Codex
-  effort the pinned model lacks, an explicit composer pick, another agent chosen.
+- `project-session-defaults`: Project settings store a default agent and, for
+  Claude Code, Codex, and Pi, a default model and reasoning effort; the
+  new-session composer opened in that project starts with them. States: no
+  default, a Codex effort the pinned model lacks, an explicit composer pick,
+  remembered Smart Routing, another agent chosen.
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
@@ -313,11 +314,10 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
-- **`project-defaults`:**
-  `tests/e2e_ui/sessions/test_project_settings_effort_default.py::test_project_effort_default_seeds_new_session`
+- **`project-session-defaults`:**
+  `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_effort_default_seeds_new_session`
   (real host and Claude CLI against the mock model),
-  `tests/e2e_ui/sessions/test_project_settings_effort_default.py::test_project_settings_effort_default_round_trips`,
-  `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_settings_model_default_round_trips`;
+  `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_settings_model_and_effort_defaults_round_trip`;
   ladder and precedence cases in `web/src/shell/ProjectSettingsDialog.test.tsx`
   and `web/src/shell/NewChatDialog.projectPrefill.test.tsx`.
 - **`effort-picker`, SDK in-session composer:**

@@ -1009,7 +1009,7 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.reasoning_effort).toBe("low");
   });
 
-  it("does not clobber a user's committed effort pick when the project config arrives late", async () => {
+  it("keeps a user's committed effort pick when the project config changes afterwards", async () => {
     setClaudeAgentAndModels();
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
     const { rerender } = renderLanding();
@@ -1026,6 +1026,41 @@ describe("NewChatLandingScreen project prefill", () => {
 
     const body = await submitAndReadBody();
     expect(body.reasoning_effort).toBe("medium");
+  });
+
+  it("lets a project effort without a model outrank remembered Smart Routing", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it("lets a project effort win over a landing draft that restored Smart Routing on", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitForClaudeAgent();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    unmount();
+
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
   });
 
   it("applies a Codex project effort only when the pinned model's ladder offers it", async () => {
