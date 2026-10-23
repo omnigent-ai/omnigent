@@ -741,8 +741,11 @@ async def test_list_session_resources_local_fallback_lists_default(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stable_id", [None, "a" * 32, "private-invalid-id"])
 async def test_claude_native_message_forwards_to_runner_without_persisting(
     client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    stable_id: str | None,
 ) -> None:
     """
     Claude-native web-chat input is runner injection, not Omnigent persistence.
@@ -752,6 +755,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
     the web UI render a non-terminal-originated user message.
     """
     fake_runner = _FakeRunnerClient(payload={})
+    caplog.set_level(logging.INFO)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
@@ -761,6 +765,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
             "type": "message",
             "data": {
                 "role": "user",
+                **({"stable_id": stable_id} if stable_id is not None else {}),
                 "content": [{"type": "input_text", "text": "hello claude"}],
             },
         },
@@ -806,9 +811,28 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "pending_id": body["pending_id"],
                 "delivery_attempt_id": forwarded["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
+                **(
+                    {"stable_id": stable_id, "input_stable_id": stable_id}
+                    if stable_id == "a" * 32
+                    else {}
+                ),
             },
         ),
     ]
+    received = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_received"
+    ]
+    assert len(received) == 1
+    assert received[0].session_id == "64a784c3aa907d1774f44313546947c6"
+    attrs = received[0].attributes
+    assert attrs["input_received_at_ms"] <= forwarded["input_enqueued_at_ms"]
+    assert attrs.get("input_stable_id") == (stable_id if stable_id == "a" * 32 else None)
+    assert "hello claude" not in json.dumps(attrs)
+    assert "private-invalid-id" not in json.dumps(attrs)
+    lifecycle = [getattr(record, "event_name", None) for record in caplog.records]
+    assert lifecycle.index("native_input_received") < lifecycle.index("native_input_enqueued")
 
 
 @pytest.mark.asyncio

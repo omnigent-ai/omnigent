@@ -4249,14 +4249,28 @@ def create_app(
                         and not conv.archived
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
+                    if conv.agent_id is None:
+                        reason = "no_agent"
+                    elif conv.archived:
+                        reason = "archived"
+                    else:
+                        reason = "recovery_required" if initialize_runtime else "idle"
+                    runner_session_initializer.log_decision(
+                        conv,
+                        generation=connection.generation,
+                        trigger="runner_connect",
+                        decision="initialize_now" if initialize_runtime else "defer",
+                        reason=reason,
+                        eager_recovery=conv.id in eager_root_ids,
+                        live_status=_session_status_cache.get(conv.id, conv.live_status),
+                        pending_elicitation_count=max(
+                            conv.pending_elicitation_count or 0,
+                            pending_elicitations.count_for(conv.id),
+                        ),
+                        has_last_task_error=_last_task_error_from_labels(conv.labels) is not None,
+                    )
                     # Idle trees reinitialize on demand; active trees recover now.
                     if not initialize_runtime:
-                        if conv.agent_id is None:
-                            reason = "no_agent"
-                        elif conv.archived:
-                            reason = "archived"
-                        else:
-                            reason = "idle"
                         _logger.info(
                             "Deferred runner session init until first use: session=%s reason=%s",
                             conv.id,
@@ -4264,6 +4278,8 @@ def create_app(
                             extra=debug_event(
                                 "runner_session_init_deferred",
                                 reason=reason,
+                                runner_generation=connection.generation,
+                                init_trigger="runner_connect",
                             ),
                         )
                     if initialize_runtime:
@@ -4273,6 +4289,7 @@ def create_app(
                             timeout=10.0,
                             generation=connection.generation,
                             store_slots=store_slots,
+                            trigger="runner_connect",
                         )
                         # A removed agent was already logged as expected.
                         if is_session_agent_removed(response):
