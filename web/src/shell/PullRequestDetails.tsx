@@ -26,6 +26,18 @@ function isAttachableMedia(file: File): boolean {
   return file.type.startsWith("image/") || file.type.startsWith("video/");
 }
 
+// The server's per-type limits, checked here so a too-large file isn't sent first.
+const MAX_IMAGE_ATTACHMENT_MB = 10;
+const MAX_VIDEO_ATTACHMENT_MB = 70;
+
+/** Why `file` is too large to attach, or `null` when it fits. */
+function attachmentSizeError(file: File): string | null {
+  const video = file.type.startsWith("video/");
+  const limitMb = video ? MAX_VIDEO_ATTACHMENT_MB : MAX_IMAGE_ATTACHMENT_MB;
+  if (file.size <= limitMb * 1024 * 1024) return null;
+  return `Couldn’t attach ${file.name || "the file"}: ${video ? "a video" : "an image"} can be at most ${limitMb} MB.`;
+}
+
 /** The markdown that embeds an uploaded attachment; a bare video URL renders as a player. */
 export function attachmentMarkdown(attachment: PullRequestAttachment, fileName: string): string {
   if (attachment.content_type.startsWith("video/")) return attachment.url;
@@ -353,13 +365,19 @@ function PullRequestDescriptionEditor({
 
   const attach = useCallback(
     (files: File[]) => {
-      const media = files.filter(isAttachableMedia);
-      if (media.length < files.length) {
+      const attachable = files.filter(isAttachableMedia);
+      if (attachable.length < files.length) {
         updateDescriptionDraft(draftKey, (current) => ({
           ...current,
           error: "Only images and videos can be attached.",
         }));
       }
+      const sizeErrors = attachable.map(attachmentSizeError);
+      const tooLarge = sizeErrors.find((error) => error !== null);
+      if (tooLarge) {
+        updateDescriptionDraft(draftKey, (current) => ({ ...current, error: tooLarge }));
+      }
+      const media = attachable.filter((_file, index) => sizeErrors[index] === null);
       const draftId = descriptionDrafts.get(draftKey)?.id;
       if (draftId === undefined) return;
       for (const file of media) {

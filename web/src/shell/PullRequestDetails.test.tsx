@@ -477,6 +477,29 @@ it("rejects other files and leaves text pastes alone", () => {
   expect(editor()).toHaveValue("Old body");
 });
 
+it("refuses files over the size limits without uploading them", () => {
+  const { uploads } = stubFetch();
+  renderDetails();
+  const sized = (name: string, type: string, mb: number) => {
+    const file = new File(["x"], name, { type });
+    Object.defineProperty(file, "size", { value: mb * 1024 * 1024 + 1 });
+    return file;
+  };
+
+  fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+  fireEvent.paste(editor(), { clipboardData: { files: [sized("big.png", "image/png", 10)] } });
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "Couldn’t attach big.png: an image can be at most 10 MB.",
+  );
+  fireEvent.paste(editor(), { clipboardData: { files: [sized("big.mp4", "video/mp4", 70)] } });
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "Couldn’t attach big.mp4: a video can be at most 70 MB.",
+  );
+
+  expect(uploads).toHaveLength(0);
+  expect(editor()).toHaveValue("Old body");
+});
+
 it("offers no uploads where the provider can't take them", () => {
   const { uploads } = stubFetch();
   renderDetails({ attachments: false });
