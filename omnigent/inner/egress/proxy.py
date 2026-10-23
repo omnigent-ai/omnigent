@@ -165,22 +165,20 @@ async def _open_upstream(
 
     The CONNECT target is the DNS-pinned IP, and plain HTTP also uses CONNECT
     (to port 80). Proxies that deny CONNECT to non-TLS ports (Squid's default)
-    or filter by hostname will refuse; the default proxy port is 3128.
-    Schemeless values are read as ``http://``; non-``http://`` proxy URLs are
-    ignored with a warning and the destination is dialed directly.
+    or filter by hostname will refuse. Schemeless proxy values are read as
+    ``http://``; any other scheme is logged as an error and ignored (direct dial).
     """
     proxies = urllib.request.getproxies_environment()
     proxy = proxies.get("https" if ssl_ctx else "http") or proxies.get("all")
-    p = urlparse(proxy if proxy and "://" in proxy else f"http://{proxy}") if proxy else None
-    if p and (p.scheme != "http" or not p.hostname):
-        # Unsupported (https://, socks*://): connect directly, as before proxy support.
-        logger.warning("Ignoring unsupported upstream proxy scheme %r", p.scheme)
+    p = urlparse(proxy if "://" in proxy else f"http://{proxy}") if proxy else None
+    if p and (p.scheme != "http" or not p.hostname):  # https:// would need TLS-in-TLS
+        logger.error("Unsupported upstream proxy scheme %r; connecting directly", p.scheme)
         p = None
-    if not p or urllib.request.proxy_bypass_environment(f"{host}:{port}"):
+    if not p or urllib.request.proxy_bypass_environment(f"{host}:{port}", proxies):
         return await asyncio.open_connection(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )
-    reader, writer = await asyncio.open_connection(p.hostname, p.port or 3128)
+    reader, writer = await asyncio.open_connection(p.hostname, p.port or 80)
     try:
         auth = b""
         if p.username:  # basic auth only; no NTLM/Kerberos
@@ -192,9 +190,11 @@ async def _open_upstream(
         writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n".encode() + auth + b"\r\n")
         await writer.drain()
         head = await reader.readuntil(b"\r\n\r\n")
-        status_line = head.split(b"\r\n", 1)[0].decode(errors="replace")
-        if status_line.split(" ", 2)[1:2] != ["200"]:
-            raise OSError(f"upstream proxy refused CONNECT: {status_line}")
+        version, _, rest = head.split(b"\r\n", 1)[0].partition(b" ")
+        code = rest[:3]
+        if not (version.startswith(b"HTTP/1.") and code.isdigit() and code.startswith(b"2")):
+            # Status code only: the proxy's reason text is untrusted.
+            raise OSError(f"upstream proxy refused CONNECT: {code.decode(errors='replace')[:3]}")
         if ssl_ctx:
             await writer.start_tls(ssl_ctx, server_hostname=host)
     except BaseException:

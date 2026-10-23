@@ -98,7 +98,9 @@ async def test_https_handshakes_with_original_host_over_tunnel(monkeypatch, tmp_
     "proxy_url",
     ["https://user:secret@127.0.0.1:1", "socks5://127.0.0.1:1"],
 )
-async def test_unsupported_proxy_scheme_connects_directly(monkeypatch, proxy_url, caplog):
+async def test_unsupported_proxy_scheme_logs_error_and_connects_directly(
+    monkeypatch, proxy_url, caplog
+):
     async def target(reader, writer):
         writer.write(b"direct")
         await writer.drain()
@@ -110,7 +112,39 @@ async def test_unsupported_proxy_scheme_connects_directly(monkeypatch, proxy_url
     assert await reader.read() == b"direct"
     writer.close()
     server.close()
+    assert "Unsupported upstream proxy scheme" in caplog.text
     assert "secret" not in caplog.text
+
+
+@pytest.mark.parametrize("reply", [b"garbage 200 OK", b"HTTP/1.1 502 secret-reason"])
+async def test_bad_connect_reply_is_rejected_without_echoing_reason(monkeypatch, reply):
+    async def proxy(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(reply + b"\r\n\r\n")
+        await writer.drain()
+        writer.close()
+
+    server, port = await _serve(proxy)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{port}")
+    with pytest.raises(OSError, match="refused CONNECT") as exc:
+        await _open_upstream("example.test", "203.0.113.5", 80)
+    server.close()
+    assert "reason" not in str(exc.value)
+
+
+async def test_any_2xx_connect_reply_is_accepted(monkeypatch):
+    async def proxy(reader, writer):
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 204 No Content\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+
+    server, port = await _serve(proxy)
+    monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{port}")
+    reader, writer = await _open_upstream("example.test", "203.0.113.5", 80)
+    assert await reader.read() == b"ok"
+    writer.close()
+    server.close()
 
 
 async def test_schemeless_proxy_is_read_as_http(monkeypatch):
