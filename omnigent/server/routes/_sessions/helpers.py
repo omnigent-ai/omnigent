@@ -4942,7 +4942,8 @@ def _publish_status(
     :param failure_origin: Stable slug naming the publish path behind a
         ``"failed"`` edge, e.g. ``"runner_disconnected_mid_turn"``. It
         distinguishes the causes sharing this log boundary. Recognized budget
-        refusals log at INFO; other failures log at ERROR. Ignored for non-failed edges.
+        refusals and marked terminal observations log at INFO; actual failures
+        log at ERROR. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
         the failure-log boundary. Malformed values cannot reject the status edge.
     """
@@ -5000,18 +5001,31 @@ def _publish_status(
         )
         attributes = {**failure_log_attributes(failure_context), **budget_attributes}
         logged_code = attributes.pop("code", failure_code)
-        # Keep budget refusals queryable without reporting an application fault.
-        log = _logger.info if budget_attributes else _logger.error
+        terminal_observation = origin == "native_terminal_status" and error is None
+        # Coarse terminal state and spending limits are observations. Only the
+        # provider/harness verdict determines the canonical failure category.
+        log = _logger.info if budget_attributes or terminal_observation else _logger.error
+        event_name = (
+            "native_terminal_status_observed"
+            if terminal_observation
+            else "session_turn_budget_exhausted"
+            if budget_attributes
+            else "session_turn_failed"
+        )
         log(
             "session turn %s for %s (origin=%s code=%s prev=%s): %s",
-            "blocked by budget" if budget_attributes else "failed",
+            "observed terminal error state"
+            if terminal_observation
+            else "blocked by budget"
+            if budget_attributes
+            else "failed",
             session_id,
             origin,
             logged_code,
             previous_status or "unknown",
             _failure_log_detail(error),
             extra=debug_event(
-                "session_turn_budget_exhausted" if budget_attributes else "session_turn_failed",
+                event_name,
                 session_id=session_id,
                 origin=origin,
                 code=logged_code,

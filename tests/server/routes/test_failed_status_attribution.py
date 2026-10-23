@@ -112,11 +112,20 @@ def test_budget_refusal_logs_informational_outcome_and_keeps_failed_status(
         helpers._publish_status(
             "conv_budget",
             "failed",
+            failure_origin="native_terminal_status",
+        )
+        helpers._publish_status(
+            "conv_budget",
+            "failed",
             ErrorDetail(code=code, message=message),
             failure_origin="external_session_status",
         )
 
-    (record,) = [r for r in caplog.records if getattr(r, "session_id", None) == "conv_budget"]
+    observation, record = [
+        r for r in caplog.records if getattr(r, "session_id", None) == "conv_budget"
+    ]
+    assert observation.levelno == logging.INFO
+    assert observation.event_name == "native_terminal_status_observed"
     row = record_to_row(record, source="server")
     assert row["event_name"] == (
         "session_turn_budget_exhausted" if budget_exhausted else "session_turn_failed"
@@ -128,8 +137,9 @@ def test_budget_refusal_logs_informational_outcome_and_keeps_failed_status(
         assert row["attributes"]["error_impact"] == "blocking"
         assert row["attributes"]["error_phase"] == "turn"
     assert published[0]["status"] == "failed"
-    assert published[0]["error"]["code"] == code
-    assert published[0]["error"]["message"] == message
+    assert published[0].get("error") is None
+    assert published[1]["error"]["code"] == code
+    assert published[1]["error"]["message"] == message
     assert helpers._session_status_cache["conv_budget"] == "failed"
 
 

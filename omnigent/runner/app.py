@@ -1669,6 +1669,10 @@ def create_runner_app(
         blocked_on: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if status == "failed":
+            # A terminal state signal carries no provider verdict; the native
+            # hook/transcript path supplies the actual turn failure separately.
+            event["status_source"] = "terminal_observation"
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
