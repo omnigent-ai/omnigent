@@ -1699,9 +1699,12 @@ def resolve_pi_native_provider(
     config = load_runtime_inference_config(base_config)
     binding = binding_for_harness(config, "pi-native")
     selection = _split_pi_native_model_selection(model)
-    # An allowlisted literal can itself start with a managed provider name.
-    if selection is not None and (binding is None or model not in (binding.model_allowlist or ())):
-        _, model = selection
+    if selection is not None:
+        _, stripped = selection
+        allowlist = binding.model_allowlist if binding is not None else None
+        # Prefer the picker target; retain an allowlisted literal only as a fallback.
+        if allowlist is None or stripped in allowlist or model not in allowlist:
+            model = stripped
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
         selected = resolve_bound_model(config, "pi-native", model)
