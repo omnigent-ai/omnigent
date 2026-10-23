@@ -1042,7 +1042,7 @@ def test_process_identity_unset_is_none() -> None:
     assert dl._process_identity() == (None, None)
 
 
-_HOSTED_API = "https://dbc-a5d4177a-49dc.cloud.databricks.com/api/2.0/omnigent"
+_HOSTED_API = "https://example.databricks.com/api/2.0/omnigent"
 
 
 @pytest.fixture
@@ -1055,29 +1055,28 @@ def _fail_get(url: str, **kwargs: object) -> httpx.Response:
     raise AssertionError(f"unexpected probe of {url}")
 
 
-def test_publish_origin_identity_probes_and_stores_workspace_id(
+def test_publish_origin_identity_probes_without_changing_auth_state(
     _data_dir: Path, origin_identity_probe: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A login that never recorded an org id: the proxy's header on an
-    # unauthenticated 401 supplies it, stored so the next process needs no request.
+    # An unauthenticated header can attribute logs but cannot update login state.
     from omnigent.cli_auth import load_databricks_org_id
 
     calls: list[str] = []
 
     def fake_get(url: str, **kwargs: object) -> httpx.Response:
         calls.append(url)
-        return httpx.Response(401, headers={"x-databricks-org-id": "1965859176160743"})
+        return httpx.Response(401, headers={"x-databricks-org-id": "123456"})
 
     monkeypatch.setattr(httpx, "get", fake_get)
 
-    assert dl.publish_origin_identity(_HOSTED_API) == "1965859176160743"
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
     assert calls == [f"{_HOSTED_API}/v1/me"]
-    assert dl._process_identity()[0] == "1965859176160743"
-    assert load_databricks_org_id(_HOSTED_API) == "1965859176160743"
+    assert dl._process_identity()[0] == "123456"
+    assert load_databricks_org_id(_HOSTED_API) is None
+    assert not (_data_dir / "auth_tokens.json").exists()
 
     monkeypatch.setattr(httpx, "get", _fail_get)
-    monkeypatch.setattr(dl, "_probed_workspace_ids", {})
-    assert dl.publish_origin_identity(_HOSTED_API) == "1965859176160743"
+    assert dl.publish_origin_identity(_HOSTED_API) == "123456"
 
 
 def test_publish_origin_identity_prefers_url_selector(

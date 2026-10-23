@@ -3267,9 +3267,12 @@ def _databricks_launch_materialization(
     """
     Resolve the Databricks-profile routing pieces of a Codex launch.
 
-    Uses the profile's own host so the gateway base URL matches the token
-    the profile-pinned auth command mints; a ``DATABRICKS_HOST`` override in
-    the runner env must not point the base URL at another workspace.
+    Uses the profile's own host, so a ``DATABRICKS_HOST`` override in the
+    runner env must not point the launch at another workspace. The gateway
+    and auth come from ucode state for that host when present (see
+    :func:`_databricks_codex_gateway`). Model discovery still uses the
+    profile's credentials; ucode state is keyed by the same host, so both
+    see that workspace's catalog.
 
     :param model: Optional explicit model pin; ``None`` resolves the
         catalog default.
@@ -3284,15 +3287,47 @@ def _databricks_launch_materialization(
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
+    base_url, auth_command, auth_refresh_interval_ms = _databricks_codex_gateway(host, profile)
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
-            base_url=_databricks_codex_base_url(host),
-            auth_command=_databricks_codex_auth_command(host, profile),
+            base_url=base_url,
+            auth_command=auth_command,
+            auth_refresh_interval_ms=auth_refresh_interval_ms,
         ),
         model=resolved_model,
         host=host,
     )
+
+
+def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | None]:
+    """
+    Return the Codex gateway base URL, auth command and refresh cadence for *host*.
+
+    ucode state is the source of truth for the gateway and auth; the
+    profile-derived gateway is the fallback.
+
+    :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
+    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+    :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
+        an auth command, else the profile-derived gateway with the default cadence.
+    """
+    from omnigent.onboarding.ucode_state import read_ucode_state
+
+    try:
+        workspace_state = read_ucode_state(host)
+    except (OSError, ValueError):  # unreadable ucode state keeps the profile path
+        # Host logging mirrors WARNINGs to the terminal; frames are debug-only.
+        _logger.warning(
+            "native-codex: could not read ucode state for %r",
+            host,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
+        )
+        workspace_state = None
+    agent = workspace_state.agent("codex") if workspace_state is not None else None
+    if agent is not None and agent.base_url and agent.auth_command:
+        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms
+    return _databricks_codex_base_url(host), _databricks_codex_auth_command(host, profile), None
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
@@ -3629,7 +3664,8 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     """Inference base URL a resolved launch pins, or None when it defers to Codex's own login.
 
     Mirrors how the launch is actually applied: the Databricks-profile branch of
-    :func:`build_native_codex_app` derives the base URL from the profile host,
+    :func:`build_native_codex_app` takes the base URL from ucode state for the
+    profile host, else derives it from that host (:func:`_databricks_codex_gateway`),
     while a generic provider carries it inside the generated
     ``model_providers.…`` config override.
 
@@ -3644,7 +3680,7 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
         host = _databricks_gateway_host(launch.profile)
         if not host:
             return None
-        return _databricks_codex_base_url(host.rstrip("/"))
+        return _databricks_codex_gateway(host.rstrip("/"), launch.profile)[0]
     for override in launch.config_overrides:
         _, sep, table = override.partition("=")
         if not sep or not override.startswith("model_providers."):

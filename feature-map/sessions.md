@@ -34,8 +34,9 @@ the header menu), and each place is a separate entry point.
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
-  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
-  the existing draft and attachments, and quotes can be removed before sending.
+  writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
+  interleaved comments and existing attachments; removing a quote keeps its comments.
+  Live side chats accept pasted images in every reply text field.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -337,7 +338,11 @@ side chat**. It appends a removable quote to the visible side-chat tab, includin
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
 new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
 text and choose **Reply** to quote it in that chat's composer. Adding a quote
-does not send a message; enter a question and send when ready.
+keeps existing comments before that quote. Edit between quotes or after the last
+one, then send when ready. Paste an image into any reply text field after the
+side chat has started. The first question is text-only; an image paste there
+explains that the chat must be started first. Grid sessions use the same reply
+composer and support interleaved comments and pasted images too.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -606,14 +611,14 @@ plain `uv run pytest`, which starts a private server for the test.
   above proves live-parent reuse with actual runner processes.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
-  checks pending/live tab reuse, draft preservation, and replies sent only to
-  the child. Hide Workspace and repeat Ask in side chat to verify
+  checks pending/live tab reuse, interleaved comments, pasted images, and replies
+  sent only to the child. Hide Workspace and repeat Ask in side chat to verify
   a new tab opens instead of changing the hidden draft.
 - **`side-chat-quotes`, mobile drawer Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
-  checks that Reply stays on screen and the quoted follow-up reaches only the
-  side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
-  checks quote removal, preserved text/files, read-only chats, and starting-tab
+  checks that Reply stays on screen and interleaved comments with a pasted image
+  reach only the side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
+  checks side-chat and grid composers, quote removal, preserved text/files, read-only chats, and starting-tab
   eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
   and parent isolation. In an embedded app, repeat text selection in both the
   parent and side chat and check the popup's theme and button styling.

@@ -577,6 +577,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
+        # The workspace this host is bound to (cli_auth.load_databricks_org_id),
+        # so runners keep routing to it when the stored record changes.
+        "OMNIGENT_DATABRICKS_ORG_PIN",
         # Auth provider selection. The env-unset default was flipped
         # to "accounts", so the whole CLI → daemon → local-server chain has
         # to agree on the mode. Without this, the daemon strips
