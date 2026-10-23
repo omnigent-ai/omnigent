@@ -138,12 +138,13 @@ const MonacoDiffViewer = lazy(() =>
  * - **addressed**: handled by the agent or user (status "addressed").
  *
  * Markdown spans with a different source/quote length may contain formatting
- * or entities. Leave their offsets for the editor's source map to resolve;
+ * or entities. Resolve them through the Markdown source map when available;
  * literal search would relocate them to an unrelated unformatted copy.
  */
 export function classifyAndRemapComments(
   comments: Comment[],
   fileContent: string,
+  remapFormatted?: (comment: Comment, content: string) => Comment,
 ): { open: Comment[]; addressed: Comment[] } {
   const open: Comment[] = [];
   const addressed: Comment[] = [];
@@ -173,7 +174,7 @@ export function classifyAndRemapComments(
       detectLang(c.path) === "markdown" &&
       c.end_index - c.start_index !== c.anchor_content.length
     ) {
-      open.push(c);
+      open.push(remapFormatted?.(c, fileContent) ?? c);
       continue;
     }
     // Search near the stored offset first to handle the common case of a
@@ -617,9 +618,31 @@ function FileViewerBody({
 
   const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
+  const [remapFormatted, setRemapFormatted] =
+    useState<(comment: Comment, content: string) => Comment>();
+  const needsMarkdownRemap = allComments.some(
+    (comment) =>
+      comment.status !== "addressed" &&
+      comment.anchor_content &&
+      detectLang(comment.path) === "markdown" &&
+      comment.end_index - comment.start_index !== comment.anchor_content.length,
+  );
+  useEffect(() => {
+    if (!needsMarkdownRemap || remapFormatted) return;
+    let cancelled = false;
+    import("./markdownCommentRemap").then(
+      ({ remapFormattedMarkdownComment }) => {
+        if (!cancelled) setRemapFormatted(() => remapFormattedMarkdownComment);
+      },
+      (error) => console.warn("Unable to load Markdown comment remapping", error),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [needsMarkdownRemap, remapFormatted]);
   const { open: openComments, addressed: addressedComments } = useMemo(
-    () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent],
+    () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
+    [allComments, fileContent, remapFormatted],
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {

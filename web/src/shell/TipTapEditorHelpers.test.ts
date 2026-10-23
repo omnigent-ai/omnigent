@@ -68,7 +68,7 @@ describe("repeated words in Markdown", () => {
     expect(rawFrom).toBe(raw.lastIndexOf("word") + 4);
   });
 
-  it("keeps the position fallback when hidden source text changes the occurrence count", () => {
+  it("keeps the legacy fallback without a Markdown manager when hidden text changes occurrence counts", () => {
     const raw = "word [Details](word) word";
     const doc = makeDoc("word Details word");
     expect(computeSelectionData(13, 17, doc, raw)).toEqual({

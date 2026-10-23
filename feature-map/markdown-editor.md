@@ -143,6 +143,15 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   persisted raw endpoints and every highlight again after a full page reload.
   This covers accumulated decorations and serialization, unlike single-comment
   tests or parser-only input matrices.
+  `tests/browser_ui/files/test_markdown_editor_journey.py::test_markdown_comment_boundary_save_reload`
+  checks raw endpoints and highlights after saving/reloading selections ending
+  on a CRLF soft break, hard break, or image next to duplicate text.
+  `test_markdown_existing_comment_after_autosave` checks an existing highlight
+  before clicking it or adding another comment.
+  `test_markdown_source_comment_after_external_edit` reloads externally changed
+  text and checks Source-mode ranges with formatting retained or removed.
+  These browser-contract cases reuse the file journey's mock backend; they do
+  not establish server persistence. Parser input matrices remain in unit tests.
 - `document-link`:
   `tests/e2e_ui/files/test_markdown_editor_link_popup.py::test_editor_link_popup_opens_relative_link_from_keyboard`
   opens a relative file from the keyboard-accessible link popup.
@@ -171,11 +180,12 @@ instead of treating one comparison clip as complete feature verification.
   a fix; preserve unsaved drafts when opening a fresh tab or reloading.
 - Comment offsets remain raw-source ranges; the quote is rendered text. A
   selection such as `wo**rd**` can span markup, and its minimal source range
-  ends at the last selected character, before the closing `**`. The parent
-  viewer does not literal-search remap Markdown ranges whose source and quote
-  lengths differ; the editor resolves them using its validated source map or
-  existing fallback. This does not repair previously mis-saved offsets or
-  guarantee tracking through arbitrary subsequent edits.
+  ends at the last selected character, before the closing `**`. Formatted
+  comments are remapped through the same parser in Edit and Source views,
+  preferring an exact stored range, then the closest verified source occurrence.
+  Unsupported or oversized documents retain stored ranges in Source mode.
+  This does not repair previously mis-saved offsets or guarantee tracking
+  through arbitrary subsequent edits.
 - The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
   It applies above 1 MiB regardless of the saved view preference. The choice
   stays fixed for that file visit so an autosave cannot replace an editor with
