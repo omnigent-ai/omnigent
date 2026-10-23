@@ -5010,6 +5010,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
                     "native_error_category": "invalid_request",
                     "detail_source": "hook_last_assistant_message",
                     "failure_source": "claude_hook",
+                    "transcript_error_context_state": "hook_details_present",
                     "native_session_id": "native-session",
                     "failure_id": "native-failure-synthetic",
                     "http_status": 400,
@@ -5039,6 +5040,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
     assert attrs["native_error_category"] == "invalid_request"
     assert attrs["detail_source"] == "hook_last_assistant_message"
     assert attrs["failure_source"] == "claude_hook"
+    assert attrs["transcript_error_context_state"] == "hook_details_present"
     assert attrs["native_session_id"] == "native-session"
     assert attrs["failure_id"] == "native-failure-synthetic"
     assert attrs["http_status"] == "400"
