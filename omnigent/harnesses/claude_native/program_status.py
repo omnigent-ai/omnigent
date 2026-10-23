@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -11,6 +12,10 @@ from omnigent.terminals.program_status import (
     ProgramStatusReader,
     blocked_reason,
 )
+
+# How long an error report may stand before its turn is failed without the
+# StopFailure hook. The hook normally follows within about a second.
+ERROR_HOOK_GRACE_S = 5.0
 
 
 class ClaudeProgramStatusPoller:
@@ -21,11 +26,19 @@ class ClaudeProgramStatusPoller:
         reader: ProgramStatusReader,
         fallback: SessionStatusPoller,
         on_status: Callable[[str, str | None], None],
+        *,
+        turn_is_active: Callable[[], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
+        self._turn_is_active = turn_is_active
+        self._clock = clock
         self._last: ProgramStatus | None = None
+        self._error_report: ProgramStatus | None = None
+        self._error_since: float | None = None
+        self._error_failed = False
         self._using_osc = False
         self._retired = False
         self._resync_lock = threading.Lock()
@@ -63,12 +76,39 @@ class ClaudeProgramStatusPoller:
                 if report.state != "error":
                     status = "running" if report.state in {"working", "blocked"} else "idle"
                     self._on_status(status, blocked_reason(report))
+            self._fail_if_hook_overdue(report)
         else:
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
             self._last = None
+            self._fail_if_hook_overdue(None)
             self._fallback.tick()
+
+    def _fail_if_hook_overdue(self, report: ProgramStatus | None) -> None:
+        """Fail an error turn whose StopFailure hook is overdue, once.
+
+        The runner counts a turn in flight until a hook edge clears it, so an
+        error report that stands past the grace means the hook was lost.
+        """
+        if (
+            report is None
+            or report.state != "error"
+            or self._turn_is_active is None
+            or not self._turn_is_active()
+        ):
+            self._error_report = None
+            self._error_since = None
+            self._error_failed = False
+            return
+        now = self._clock()
+        if report != self._error_report or self._error_since is None:
+            self._error_report = report
+            self._error_since = now
+            self._error_failed = False
+        elif not self._error_failed and now - self._error_since >= ERROR_HOOK_GRACE_S:
+            self._error_failed = True
+            self._on_status("failed", None)
 
     def resync(self) -> None:
         """Re-arm the next poll after a reconnect or a forwarded idle edge."""

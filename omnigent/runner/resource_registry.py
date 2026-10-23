@@ -1727,7 +1727,12 @@ class SessionResourceRegistry:
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 
-            return ClaudeProgramStatusPoller(reader, fallback, on_status)
+            return ClaudeProgramStatusPoller(
+                reader,
+                fallback,
+                on_status,
+                turn_is_active=lambda: self.session_turn_is_active(session_id),
+            )
         return fallback
 
     async def _handle_terminal_exit(
