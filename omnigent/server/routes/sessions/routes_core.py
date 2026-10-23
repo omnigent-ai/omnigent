@@ -985,14 +985,6 @@ def register_core_routes(
                         "or use placement='same_host'",
                         code=ErrorCode.INVALID_INPUT,
                     )
-            if body.host_type == "external":
-                if not source.host_id or not source.workspace:
-                    raise OmnigentError(
-                        "Sender needs a connected host and workspace", code=ErrorCode.INVALID_INPUT
-                    )
-                body = body.model_copy(
-                    update={"host_id": source.host_id, "workspace": source.workspace}
-                )
 
         # Checked before the session exists so a rejected create leaves nothing
         # behind.
@@ -1000,13 +992,31 @@ def register_core_routes(
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         if orchestration_source is not None:
-            await asyncio.to_thread(
+            source = await asyncio.to_thread(
                 require_orchestration_source,
                 request,
                 user_id,
                 conversation_store,
                 permission_store,
             )
+            if body.host_type == "external":
+                if not source.host_id or not source.workspace:
+                    raise OmnigentError(
+                        "Sender needs a connected host and workspace", code=ErrorCode.INVALID_INPUT
+                    )
+                try:
+                    body = type(body).model_validate(
+                        {
+                            **body.model_dump(exclude_unset=True),
+                            "host_id": source.host_id,
+                            "workspace": source.workspace,
+                        }
+                    )
+                except ValidationError as exc:
+                    raise OmnigentError(
+                        "Sender host/workspace is invalid for independent creation",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,

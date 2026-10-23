@@ -41,7 +41,12 @@ async def test_create_placement(placement, monkeypatch):
             await execute_tool(
                 tool_name="sys_session_create",
                 arguments=json.dumps(
-                    {"agent_id": "worker", "placement": placement, "message": "Start"}
+                    {
+                        "agent_id": "worker",
+                        "placement": placement,
+                        "message": "Start",
+                        "title": "Worker task",
+                    }
                 ),
                 server_client=client,
                 conversation_id="manager",
@@ -58,11 +63,15 @@ async def test_create_placement(placement, monkeypatch):
         assert requests[0].url.path == "/v1/sessions/orchestrated"
         assert "parent_session_id" not in body
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+        assert result["agent_id"] == "worker"
+        assert result["title"] == "Worker task"
         register.assert_not_called()
     if placement == "managed":
         assert "sandbox_provider" not in body
         assert body["host_type"] == "managed"
-        assert body["initial_input"]["data"]["content"][0]["text"] == "Start"
+        assert body["initial_input"]["data"]["content"][0]["text"] == (
+            "[Message from session manager]\nStart"
+        )
         assert "initial_items" not in body
     elif placement == "child":
         assert body["initial_items"][0]["data"]["content"][0]["text"] == "Start"
@@ -98,11 +107,14 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
 
 @pytest.mark.asyncio
-async def test_message_timeout_is_not_retried():
+@pytest.mark.parametrize("failure", ["timeout", "non_json"])
+async def test_message_timeout_is_not_retried(failure):
     requests = []
 
     def timeout(request):
         requests.append(request)
+        if failure == "non_json":
+            return httpx.Response(202, text="Accepted")
         raise httpx.ReadTimeout("uncertain")
 
     async with httpx.AsyncClient(
@@ -116,3 +128,65 @@ async def test_message_timeout_is_not_retried():
         )
     assert "do not automatically resend" in result
     assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spelling", ["hex", "dashed", "legacy", "invalid", "query", "fragment"])
+async def test_message_destination_is_a_uuid(spelling):
+    destination = uuid4()
+    supplied = {
+        "hex": destination.hex,
+        "dashed": str(destination),
+        "legacy": f"conv_{destination.hex}",
+        "invalid": "not-a-session-id",
+        "query": f"{destination.hex}?unexpected",
+        "fragment": f"{destination.hex}#unexpected",
+    }[spelling]
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": supplied, "message": "Work"}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    if spelling in ("hex", "dashed", "legacy"):
+        assert result == {"queued": True}
+        assert [str(r.url) for r in requests] == [
+            f"http://server/v1/sessions/{destination.hex}/events"
+        ]
+    else:
+        assert "error" in result
+        assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("message", [" ", "a" * 8001, 123], ids=["blank", "oversize", "non_text"])
+async def test_independent_initial_message_is_validated_before_creation(placement, message):
+    def unexpected(request):
+        pytest.fail("Invalid first task must not create a worker")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "message": message}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "initial message of 1–8000 characters" in result["error"]

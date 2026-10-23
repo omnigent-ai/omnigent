@@ -5,18 +5,26 @@ from typing import Any
 
 import httpx
 
-from omnigent.db.db_models import normalize_uuid
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.util.uuid import uuid_to_bytes
 
 
 async def execute_message_tool(
     args: dict[str, Any], client: httpx.AsyncClient | None, source_id: str | None
 ) -> str:
-    target = (
-        normalize_uuid(args.get("session_id")) if isinstance(args.get("session_id"), str) else None
-    )
+    target = args.get("session_id")
+    try:
+        target = uuid_to_bytes(target).hex() if isinstance(target, str) else None
+    except ValueError:
+        target = None
     message = args.get("message")
-    if not target or not isinstance(message, str) or not message.strip() or len(message) > 8000:
+    if (
+        not target
+        or len(target) != 32
+        or not isinstance(message, str)
+        or not message.strip()
+        or len(message) > 8000
+    ):
         return json.dumps({"error": "Provide a session_id and a message of 1–8000 characters"})
     if client is None or source_id is None:
         return json.dumps({"error": "Session messaging requires an authenticated runner"})
@@ -33,4 +41,9 @@ async def execute_message_tool(
         )
     if response.is_error:
         return json.dumps({"error": "Session message refused", "detail": response.text[:1000]})
-    return json.dumps(response.json())
+    try:
+        return json.dumps(response.json())
+    except ValueError:
+        return json.dumps(
+            {"error": "Delivery could not be confirmed; do not automatically resend"}
+        )

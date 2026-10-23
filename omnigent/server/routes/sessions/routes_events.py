@@ -3279,7 +3279,10 @@ def register_events_routes(
                     exc_info=True,
                 )
         if peer_message:
-            assert isinstance(request, Request)
+            if not isinstance(request, Request):
+                raise OmnigentError(
+                    "Session messages require a runner HTTP request", code=ErrorCode.FORBIDDEN
+                )
             await asyncio.to_thread(
                 require_orchestration_source,
                 request,

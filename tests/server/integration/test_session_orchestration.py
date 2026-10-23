@@ -152,11 +152,12 @@ async def test_child_inherits_source_sharing(auth_client, peers, db_uri):
     )
     assert response.status_code == 201, response.text
     child = response.json()
+    assert (await _send(auth_client, child, target)).get("queued") is True
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     permissions.grant("bob", source["id"], LEVEL_READ)
     captured.clear()
-    assert "error" in await _send(auth_client, child, target)
+    assert "Shared sessions cannot" in (await _send(auth_client, child, target))["detail"]
     assert not captured.get("posts")
 
 
@@ -265,7 +266,13 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
 async def test_creation_refuses_before_launch(
     auth_client, auth_app, peers, db_uri, placement, condition
 ):
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
     source, _, captured = peers
+    host_id = uuid4().hex
+    _register_online_host(auth_app, host_id, "alice")
+    SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/tmp")
+    assert auth_app.state.sandbox_config.managed_launch_supported
     if condition == "flag_off":
         auth_app.state.feature_flags = FeatureFlags()
     elif condition == "shared":
@@ -282,8 +289,14 @@ async def test_creation_refuses_before_launch(
             conversation_id=source["id"],
         )
     )
-    assert "error" in result, result
+    expected = {
+        "flag_off": "Session orchestration is disabled",
+        "shared": "Shared sessions cannot",
+        "binding": "requires the sender's bound runner",
+    }[condition]
+    assert expected in result["detail"], result
     assert not captured.get("posts")
+    assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
 
 
 async def test_same_host_still_requires_host_ownership(auth_client, auth_app, peers, db_uri):
@@ -304,6 +317,90 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     assert "error" in result, result
     assert not captured.get("posts")
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
+
+
+@pytest.mark.parametrize("move_before_recheck", [False, True])
+async def test_same_host_creation_uses_current_source_and_stays_private(
+    auth_client, auth_app, peers, db_uri, monkeypatch, move_before_recheck
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.sharing_settings import DefaultPublicSessions
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    hosts = [uuid4().hex for _ in range(3)]
+    for host_id, owner in zip(hosts, ("alice", "alice", "bob"), strict=True):
+        _register_online_host(auth_app, host_id, owner)
+        auth_app.state.host_store.upsert_on_connect(host_id, host_id, owner)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], hosts[0], workspace="/original")
+    auth_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
+    original_check = routes_core.require_orchestration_source
+    checks = 0
+
+    def check_source(*args, **kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 2 and move_before_recheck:
+            store.set_host_id(source["id"], hosts[1], workspace="/moved")
+        return original_check(*args, **kwargs)
+
+    monkeypatch.setattr(routes_core, "require_orchestration_source", check_source)
+    frames = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        frames.append((connection.host_id, frame))
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    response = await auth_client.post(
+        "/v1/sessions/orchestrated",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json={"agent_id": source["agent_id"], "host_id": hosts[2], "workspace": "/requested"},
+    )
+    assert response.status_code == 201, response.text
+    created = store.get_conversation(response.json()["id"])
+    expected_host = hosts[1] if move_before_recheck else hosts[0]
+    expected_workspace = "/moved" if move_before_recheck else "/original"
+    assert checks == 2
+    assert created.parent_conversation_id is None
+    assert (created.host_id, created.workspace) == (expected_host, expected_workspace)
+    assert frames and all(host == expected_host for host, _ in frames)
+    launches = [frame for _, frame in frames if isinstance(frame, HostLaunchRunnerFrame)]
+    assert len(launches) == 1 and launches[0].workspace == expected_workspace
+    grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(created.id)
+    assert [grant.user_id for grant in grants] == ["alice"]
+
+
+@pytest.mark.parametrize("shape", ["parent", "multipart"])
+async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, peers, shape):
+    from tests._helpers.session import post_session_bundle
+
+    source, _, _ = peers
+    headers = {ORCHESTRATION_SOURCE_HEADER: source["id"]}
+    if shape == "parent":
+        response = await auth_client.post(
+            "/v1/sessions/orchestrated",
+            headers=headers,
+            json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+        )
+        expected = "Orchestration creates independent sessions"
+    else:
+        response = await post_session_bundle(
+            auth_client.post, "/v1/sessions", b"unused", metadata={}, headers=headers
+        )
+        expected = "Independent sessions require agent_id"
+    assert response.status_code == 400, response.text
+    assert expected in response.text
 
 
 @pytest.mark.parametrize("provider", ["modal", "daytona", "embedding"])
@@ -366,6 +463,9 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         store = SqlAlchemyConversationStore(db_uri)
         assert store.get_conversation(session_id).parent_conversation_id is None
         assert "First task" in str(store.list_pending_inputs(session_id))
+        assert f"[Message from session {source['id']}]" in str(
+            store.list_pending_inputs(session_id)
+        )
         grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(session_id)
         assert [g.user_id for g in grants] == ["alice"]
     finally:

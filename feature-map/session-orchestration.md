@@ -70,6 +70,11 @@ can supply their own provider through the existing launcher interface.
 - A shared receiver can continue working but cannot message back while shared.
 - Privacy checks govern these tools. They do not confine arbitrary code holding
   owner credentials or sanitize shared content the manager reads.
+- The source token authenticates its runner, not an exact session within that
+  runner. Stable-ID runner pools using allow-listed tunnel tokens are unsupported;
+  this gate requires token-derived runner IDs and refuses other bindings.
+- Peer messages carry only task text and owner attribution. They do not forward
+  per-event model/tool overrides or a caller-supplied delivery ID.
 - Already admitted work can finish after sharing changes. Unsharing does not
   erase prior conversation content.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
@@ -78,4 +83,6 @@ can supply their own provider through the existing launcher interface.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
 - The server enforces the flag even though tool schemas are discoverable while
-  it is disabled. No schema migration or per-owner settings page is needed.
+  it is disabled. Peer messaging has no additional per-agent opt-in; creation
+  retains its existing `spawn` advertisement gate. No schema migration or
+  per-owner settings page is needed.

@@ -3327,9 +3327,8 @@ def _build_session_create_body(
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
-    ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
-    what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``parent_session_id`` defaults to ``conversation_id``; independent
+    placements remove it before using the gated endpoint. A non-empty ``title``, ``message``,
     ``model``, and ``reasoning_effort`` are included when provided; the
     message becomes the child's first queued user turn via
     ``initial_items``.
@@ -3445,7 +3444,7 @@ async def _execute_session_create(
     runner_workspace: Path | None = None,
 ) -> str:
     """
-    Create a child session (``sys_session_create``).
+    Create a child or an independent session (``sys_session_create``).
 
     Two modes, split on the provided argument (exactly one required):
 
@@ -3506,6 +3505,10 @@ async def _execute_session_create(
         return json.dumps({"error": "placement must be child, same_host or managed"})
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
+    message = args.get("message")
+    if placement != "child" and message is not None:
+        if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+            return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -3532,7 +3535,9 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        f"[Message from session {conversation_id}]\n{message}"
+        if placement == "managed" and message is not None
+        else message,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
@@ -3565,7 +3570,10 @@ async def _execute_session_create(
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "agent_id": agent_id})
+        denied = {"error": "access_denied", "agent_id": agent_id}
+        if placement != "child":
+            denied["detail"] = resp.text[:1000]
+        return json.dumps(denied)
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
@@ -3574,7 +3582,13 @@ async def _execute_session_create(
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
     if placement != "child":
-        handle = {"conversation_id": data["id"], "kind": "default", "status": "created"}
+        handle = {
+            "conversation_id": data["id"],
+            "kind": "default",
+            "status": data.get("status") or "created",
+            "agent_id": data.get("agent_id") or agent_id,
+            "title": data.get("title") or args.get("title"),
+        }
         if placement == "same_host" and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 

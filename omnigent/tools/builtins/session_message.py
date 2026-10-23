@@ -1,4 +1,4 @@
-"""Ordinary messages between independently owned sessions."""
+"""Ordinary messages between independent sessions owned by the same user."""
 
 from typing import Any
 
@@ -14,7 +14,7 @@ class SysSessionMessageTool(Tool):
     def description(cls) -> str:
         return (
             "Send work to another session owned by the same user. Requires session "
-            "orchestration enabled and the sending session to be private. The receiver "
+            "orchestration enabled and a private, non-scheduled sending session. The receiver "
             "may be shared: its readers will see your message. It uses normal queue/steering "
             "behavior without changing parentage or forwarding replies. Check results with "
             "sys_session_get_info/sys_session_get_history. Do not automatically retry an "
