@@ -16,6 +16,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
     StartupLeaseLost,
 )
+from omnigent.server.scheduled.schedule import occurrence_host_id
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_scheduler import FakeClock
 
@@ -42,6 +43,8 @@ def _task(store: SqlAlchemyScheduledTaskStore, seed: str = "task", **kwargs):
 
 
 async def _drain(scheduler: PersistentTaskScheduler) -> None:
+    if scheduler._recovery is not None:
+        await scheduler._recovery
     await asyncio.gather(*list(scheduler._startups.values()))
 
 
@@ -57,7 +60,7 @@ async def test_enabling_dispatch_does_not_replay_legacy_timer_occurrences(store,
     store.update(task.id, last_run_at=int(clock.now()))
     assert store.get(task.id).next_run_at is None
     fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
     await scheduler.poll_once()
     await _drain(scheduler)
     fire.assert_not_awaited()
@@ -79,7 +82,7 @@ async def test_bootstrap_retries_after_concurrent_metadata_edit(store, monkeypat
         return original(snapshot, next_run_at)
 
     monkeypatch.setattr(store, "initialize_next_run_at", initialize)
-    scheduler = PersistentTaskScheduler(store, AsyncMock())
+    scheduler = PersistentTaskScheduler(store, AsyncMock(), AsyncMock())
     await scheduler.poll_once()
     await _drain(scheduler)
     assert store.get(task.id).next_run_at is None
@@ -93,12 +96,18 @@ async def test_bootstrap_retries_after_concurrent_metadata_edit(store, monkeypat
 async def test_unfinished_fire_return_warns_and_leaves_run_for_recovery(store, caplog):
     task = _task(store)
     clock = FakeClock(task.next_run_at)
-    scheduler = PersistentTaskScheduler(store, AsyncMock(), now=clock.now)
+    recover = AsyncMock(return_value="failed")
+    scheduler = PersistentTaskScheduler(store, AsyncMock(), recover, now=clock.now)
     await scheduler.poll_once()
     await _drain(scheduler)
     run = store.list_runs(task.id)[0][0]
     assert run.status == "starting"
     assert "no final startup outcome was recorded" in caplog.text
+    clock.advance(120)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    recover.assert_awaited_once_with(run)
+    assert store.list_runs(task.id)[0][0].status == "failed"
 
 
 async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
@@ -117,7 +126,9 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
         assert lease.run.status == "starting"
         await lease.finish("running")
 
-    schedulers = [PersistentTaskScheduler(store, fire, now=clock.now) for _ in range(2)]
+    schedulers = [
+        PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now) for _ in range(2)
+    ]
     await asyncio.gather(*(scheduler.poll_once() for scheduler in schedulers))
     await asyncio.gather(*(_drain(scheduler) for scheduler in schedulers))
     assert len(fired) == 1
@@ -147,7 +158,9 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store) -> None
         assert lease.run.host_id == own.host_id
         await lease.finish("running")
 
-    scheduler = PersistentTaskScheduler(store, fire, owns_host=owns, now=clock.now, batch_size=1)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owns_host=owns, now=clock.now, batch_size=1
+    )
     await scheduler.poll_once()
     await _drain(scheduler)
     assert calls == [task.host_id for task in ordered]
@@ -166,7 +179,7 @@ async def test_startup_limit_leaves_unclaimed_work_for_next_poll(store) -> None:
         await release.wait()
         await lease.finish("running")
 
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, max_startups=1)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, max_startups=1)
     await scheduler.poll_once()
     await asyncio.wait_for(started.wait(), 10)
     assert len(store.list_due_tasks(int(clock.now()))) == 1
@@ -210,7 +223,9 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
         await release.wait()
         await lease.finish("running")
 
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, renewal_seconds=0.01)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), now=clock.now, renewal_seconds=0.01
+    )
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
@@ -435,7 +450,9 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
         finally:
             exited.set()
 
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, renewal_seconds=0.01)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, renewal_seconds=0.01
+    )
     try:
         await scheduler.poll_once()
         startups = list(scheduler._startups.values())
@@ -515,7 +532,9 @@ async def test_stop_prevents_a_poll_from_starting_more_work(store, monkeypatch, 
     if blocked_at == "claim":
         monkeypatch.setattr(store, "claim_scheduled_run", claim)
     fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, owns_host=owns)
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(return_value=None), now=clock.now, owns_host=owns
+    )
     poll = asyncio.create_task(scheduler.poll_once())
     try:
         await asyncio.wait_for(entered.wait(), 10)
@@ -534,6 +553,185 @@ async def test_stop_prevents_a_poll_from_starting_more_work(store, monkeypatch, 
         release.set()
         await asyncio.gather(poll, return_exceptions=True)
         await scheduler.stop()
+
+
+async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    fire_calls = 0
+
+    async def fire(task, lease):
+        nonlocal fire_calls
+        fire_calls += 1
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    reconciled = []
+
+    async def recover(run):
+        # This fake executor has not sent a prompt or created a sandbox.
+        assert cancelled.is_set()
+        reconciled.append(run)
+        return "failed"
+
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(started.wait(), 10)
+        clock.advance(120)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert cancelled.is_set()
+        assert reconciled[0].status == "starting"
+        assert store.list_runs(task.id)[0][0].status == "failed"
+        assert fire_calls == 1
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize("outcome", ["running", "failed"])
+async def test_new_owner_does_not_renew_other_process_claim(store, outcome) -> None:
+    task = _task(store, execution_target="managed_sandbox")
+    clock = FakeClock(task.next_run_at)
+    host = occurrence_host_id(task, f"schedule:{task.next_run_at}")
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=host,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    session_id = uuid.uuid4().hex
+    await lease.attach_session(session_id)
+    run = lease.run
+    recovered = AsyncMock(return_value=outcome)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, recovered, now=clock.now)
+    clock.advance(30)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.list_runs(task.id)[0][0].lease_expires_at == run.lease_expires_at
+    recovered.assert_not_awaited()
+    clock.advance(90)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    recovered.assert_awaited_once_with(run)
+    fire.assert_not_awaited()
+    recovered_run = store.list_runs(task.id)[0][0]
+    assert recovered_run.status == outcome
+    assert recovered_run.conversation_id == session_id
+    assert recovered_run.lease_expires_at is None
+    assert (recovered_run.finished_at is None) == (outcome == "running")
+
+
+async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
+    with workspace_scope(42):
+        tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
+        clock = FakeClock(max(task.next_run_at for task in tasks))
+        for task in tasks:
+            store.claim_scheduled_run(
+                task,
+                now=int(clock.now()),
+                next_run_at=int(clock.now()) + 3600,
+                host_id=task.host_id,
+                lease_seconds=120,
+            )
+    clock.advance(120)
+    runs = store.list_expired_starting_runs(int(clock.now()))
+    checked = []
+
+    async def owns(workspace, host):
+        assert workspace == 42
+        checked.append(host)
+        if host == runs[0].host_id:
+            raise RuntimeError("ownership lookup unavailable")
+        return host == runs[-1].host_id
+
+    async def recover(run):
+        assert current_workspace_id() == 42
+        assert run == runs[-1]
+        return "running"
+
+    recovery = AsyncMock(side_effect=recover)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, recovery, owns_host=owns, now=clock.now, batch_size=1
+    )
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert checked == [run.host_id for run in runs]
+        recovery.assert_awaited_once_with(runs[-1])
+        fire.assert_not_awaited()
+        assert store.list_expired_starting_runs(int(clock.now())) == runs[:2]
+        with workspace_scope(42):
+            assert store.list_runs(runs[-1].scheduled_task_id)[0][0].status == "running"
+    finally:
+        await scheduler.stop()
+
+
+async def test_late_recovery_result_cannot_overwrite_another_replica(store, monkeypatch):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    second_entered = asyncio.Event()
+    first_committed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_transition = store.transition_starting_run
+    results = []
+
+    def transition(snapshot, **kwargs):
+        result = original_transition(snapshot, **kwargs)
+        results.append(result)
+        if result is not None:
+            loop.call_soon_threadsafe(first_committed.set)
+        return result
+
+    monkeypatch.setattr(store, "transition_starting_run", transition)
+
+    async def preserve(snapshot):
+        assert snapshot == run
+        await asyncio.wait_for(second_entered.wait(), 10)
+        return "running"
+
+    async def stale_failure(snapshot):
+        assert snapshot == run
+        second_entered.set()
+        await asyncio.wait_for(first_committed.wait(), 10)
+        return "failed"
+
+    fire = AsyncMock()
+    schedulers = [
+        PersistentTaskScheduler(store, fire, recovery, now=clock.now)
+        for recovery in (preserve, stale_failure)
+    ]
+    try:
+        await asyncio.gather(*(scheduler.poll_once() for scheduler in schedulers))
+        await asyncio.wait_for(
+            asyncio.gather(*(_drain(scheduler) for scheduler in schedulers)), 10
+        )
+        assert len(results) == 2
+        assert results[0].status == "running"
+        assert results[1] is None
+        recorded = store.list_runs(task.id)[0][0]
+        assert recorded == results[0]
+        assert recorded.error is None
+        fire.assert_not_awaited()
+    finally:
+        await asyncio.gather(*(scheduler.stop() for scheduler in schedulers))
 
 
 async def test_lease_checkpoint_cannot_revive_expired_claim(store) -> None:
@@ -571,7 +769,7 @@ async def test_loop_retries_after_boot_database_outage_and_stops(store, monkeypa
         return result
 
     monkeypatch.setattr(store, "list_uninitialized_tasks", read)
-    scheduler = PersistentTaskScheduler(store, AsyncMock(), poll_seconds=0.01)
+    scheduler = PersistentTaskScheduler(store, AsyncMock(), AsyncMock(), poll_seconds=0.01)
     await scheduler.start()
     await scheduler.start()
     try:
@@ -590,6 +788,178 @@ async def test_loop_retries_after_boot_database_outage_and_stops(store, monkeypa
         await scheduler.stop()
 
 
+@pytest.mark.parametrize("failure", ["exception", "timeout", "unknown", "skipped", "invalid"])
+@pytest.mark.parametrize("deleted", [False, True])
+async def test_expired_cleanup_failure_is_retried_without_another_fire(
+    store, failure, deleted, caplog
+) -> None:
+    task = _task(store, execution_target="managed_sandbox")
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=occurrence_host_id(task, f"schedule:{task.next_run_at}"),
+        lease_seconds=120,
+    )
+    if deleted:
+        assert store.delete(task.id)
+    clock.advance(120)
+
+    async def recovery(run):
+        assert store.get(task.id) is not None
+        assert run.host_id == occurrence_host_id(task, f"schedule:{task.next_run_at}")
+        if recover.await_count == 1:
+            if failure == "unknown":
+                return None
+            if failure in {"skipped", "invalid"}:
+                return failure
+            if failure == "timeout":
+                await asyncio.Event().wait()
+            raise RuntimeError("cleanup unavailable")
+        return "failed"
+
+    recover = AsyncMock(side_effect=recovery)
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now, recovery_seconds=0.05)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert store.list_runs(task.id)[0] == [run]
+    if failure in {"skipped", "invalid"}:
+        assert "Invalid recovery result" in caplog.text
+    elif failure == "timeout":
+        assert "Recovery timed out" in caplog.text
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    if deleted:
+        assert store.get(task.id) is None
+        assert store.list_runs(task.id)[0] == []
+    else:
+        assert store.list_runs(task.id)[0][0].status == "failed"
+    assert recover.await_count == 2
+    fire.assert_not_awaited()
+
+
+async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, monkeypatch):
+    monkeypatch.setattr(store, "_cleanup_batch_size", 1)
+    deleted = [_task(store, f"deleted-{index}") for index in range(2)]
+    for task in deleted:
+        for index in range(2):
+            store.create_run(uuid.uuid4().hex, task.id, "succeeded", index)
+        # Simulate interruption after the deletion marker commits.
+        store.update(task.id, state="deleted")
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    original_list = store.list_expired_starting_runs
+    original_purge = store.purge_deleted_tasks
+    discovery_calls = 0
+    purge_cursors = []
+
+    def discover(*args, **kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        if discovery_calls == 1:
+            raise RuntimeError("recovery discovery unavailable")
+        return original_list(*args, **kwargs)
+
+    def purge(*, after=None, limit=100):
+        purge_cursors.append(after)
+        if len(purge_cursors) == 2:
+            raise RuntimeError("purge temporarily unavailable")
+        return original_purge(after=after, limit=limit)
+
+    monkeypatch.setattr(store, "list_expired_starting_runs", discover)
+    monkeypatch.setattr(store, "purge_deleted_tasks", purge)
+    fire = AsyncMock()
+    recover = AsyncMock(return_value="failed")
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now, batch_size=1)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert sum(len(store.list_runs(item.id)[0]) for item in deleted) == 3
+        recover.assert_not_awaited()
+        cursor = scheduler._cleanup_cursor
+        assert cursor is not None and cursor[2] is not None
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert scheduler._cleanup_cursor == cursor
+        recover.assert_awaited_once_with(run)
+        for _ in range(10):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            if scheduler._cleanup_cursor is None:
+                break
+        else:
+            pytest.fail("Deleted-task cleanup did not finish")
+        assert purge_cursors[:3] == [None, cursor, cursor]
+        assert all(store.get(item.id) is None for item in deleted)
+        assert store.list_runs(task.id)[0][0].status == "failed"
+        fire.assert_not_awaited()
+    finally:
+        await scheduler.stop()
+
+
+async def test_recovery_timeout_allows_inflight_transition_to_finish(store, monkeypatch, caplog):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    entered = asyncio.Event()
+    release = threading.Event()
+    committed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original = store.transition_starting_run
+
+    def delayed_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        result = original(*args, **kwargs)
+        loop.call_soon_threadsafe(committed.set)
+        return result
+
+    monkeypatch.setattr(store, "transition_starting_run", delayed_transition)
+    fire = AsyncMock()
+    recover = AsyncMock(return_value="running")
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        recover,
+        now=clock.now,
+        recovery_seconds=0.1,
+    )
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(entered.wait(), 10)
+        await asyncio.wait_for(_drain(scheduler), 10)
+        assert "Recovery timed out" in caplog.text
+        assert "an in-flight database update may still complete" in caplog.text
+        assert store.list_runs(task.id)[0][0].status == "starting"
+        release.set()
+        await asyncio.wait_for(committed.wait(), 10)
+        assert store.list_runs(task.id)[0][0].status == "running"
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        recover.assert_awaited_once()
+        fire.assert_not_awaited()
+    finally:
+        release.set()
+        await scheduler.stop()
+
+
 def test_d1_dispatch_is_rejected_before_polling(store, monkeypatch) -> None:
     from types import SimpleNamespace
 
@@ -597,7 +967,7 @@ def test_d1_dispatch_is_rejected_before_polling(store, monkeypatch) -> None:
         store, "_engine", SimpleNamespace(dialect=SimpleNamespace(name="cloudflare_d1"))
     )
     with pytest.raises(NotImplementedError, match="multi-statement transactions"):
-        PersistentTaskScheduler(store, AsyncMock())
+        PersistentTaskScheduler(store, AsyncMock(), AsyncMock())
 
 
 @pytest.mark.parametrize("bootstrap", [False, True])
@@ -617,7 +987,7 @@ async def test_subminimum_legacy_schedule_is_paused(store, bootstrap, caplog) ->
                 .values(next_run_at=None)
             )
     fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
     await scheduler.poll_once()
     await _drain(scheduler)
     await scheduler.poll_once()
@@ -667,6 +1037,54 @@ async def test_lease_expiring_while_waiting_for_row_lock_is_not_revived(
     assert store.list_runs(task.id)[0] == [run]
 
 
+async def test_slow_recovery_does_not_block_due_tasks_and_is_drained_on_stop(store) -> None:
+    expired_task = _task(store, "expired")
+    due_task = _task(store, "due")
+    clock = FakeClock(max(expired_task.next_run_at, due_task.next_run_at))
+    expired_run = store.claim_scheduled_run(
+        expired_task,
+        now=int(clock.now()),
+        next_run_at=int(clock.now()) + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    recovering = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def recover(run):
+        recovering.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def fire(task, lease):
+        assert task.id == due_task.id
+        await lease.finish("running")
+
+    recovery = AsyncMock(side_effect=recover)
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        recovery,
+        now=clock.now,
+        recovery_seconds=60,
+    )
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(recovering.wait(), 10)
+        await asyncio.gather(*list(scheduler._startups.values()))
+        assert store.list_runs(due_task.id)[0][0].status == "running"
+        await scheduler.poll_once()
+        recovery.assert_awaited_once_with(expired_run)
+        assert not cancelled.is_set()
+    finally:
+        await scheduler.stop()
+    assert cancelled.is_set()
+    assert store.list_runs(expired_task.id)[0] == [expired_run]
+
+
 @pytest.mark.parametrize("bootstrap", [False, True])
 @pytest.mark.parametrize("failure", ["validation", "calculation", "unexpected"])
 async def test_schedule_search_failure_preserves_next_run_at_and_retries(
@@ -713,7 +1131,7 @@ async def test_schedule_search_failure_preserves_next_run_at_and_retries(
     async def fire(task, lease):
         await lease.finish("running")
 
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now)
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(return_value=None), now=clock.now)
     try:
         await scheduler.poll_once()
         await _drain(scheduler)
@@ -742,7 +1160,15 @@ async def test_initialization_advances_pages_past_bad_rows_while_work_continues(
 
     legacy = sorted([_task(store, f"legacy-{i}") for i in range(5)], key=lambda task: task.id)
     due = _task(store, "due")
+    expired = _task(store, "expired")
     clock = FakeClock(due.next_run_at + 120)
+    store.claim_scheduled_run(
+        expired,
+        now=due.next_run_at,
+        next_run_at=due.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
     with store._session_immediate("test_uninitialized_tasks") as session:
         session.execute(
             update(SqlScheduledTask)
@@ -763,7 +1189,8 @@ async def test_initialization_advances_pages_past_bad_rows_while_work_continues(
     async def fire(task, lease):
         await lease.finish("running")
 
-    scheduler = PersistentTaskScheduler(store, fire, now=clock.now, batch_size=2)
+    recovery = AsyncMock(return_value="failed")
+    scheduler = PersistentTaskScheduler(store, fire, recovery, now=clock.now, batch_size=2)
     try:
         for expected in (2, 4, 5):
             await scheduler.poll_once()
@@ -773,6 +1200,8 @@ async def test_initialization_advances_pages_past_bad_rows_while_work_continues(
         assert store.get(legacy[0].id).next_run_at is None
         assert all(store.get(task.id).next_run_at is not None for task in legacy[1:])
         assert store.list_runs(due.id)[0][0].status == "running"
+        assert store.list_runs(expired.id)[0][0].status == "failed"
+        recovery.assert_awaited_once()
     finally:
         await scheduler.stop()
 
@@ -797,7 +1226,9 @@ async def test_heartbeat_stops_retrying_at_last_confirmed_expiry(store, monkeypa
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(store, "renew_starting_run", unavailable)
-    scheduler = PersistentTaskScheduler(store, AsyncMock(), now=clock.now, renewal_seconds=0.01)
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), now=clock.now, renewal_seconds=0.01
+    )
     with pytest.raises(StartupLeaseLost, match="expired"):
         await scheduler._heartbeat(lease)
     assert attempts == 2

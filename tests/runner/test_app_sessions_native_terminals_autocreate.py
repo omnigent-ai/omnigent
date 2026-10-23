@@ -10,7 +10,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -78,6 +78,7 @@ from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
+from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -1441,6 +1442,213 @@ def _stub_kimi_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         "build_kimi_session_home",
         lambda session_home, **_kwargs: {"KIMI_CODE_HOME": str(session_home)},
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launch_path", ["hermes", "devin", "hermes_spawn"])
+@pytest.mark.parametrize("dependency", ["construction", "refresh"])
+async def test_native_policy_hook_setup_keeps_tunnel_pings_responsive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_path: str, dependency: str
+) -> None:
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+    from omnigent.runner.transports.ws_tunnel.serve import _handle_tunnel_frame
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    terminal_name = "devin" if launch_path == "devin" else "hermes"
+    (_stub_devin_launch if terminal_name == "devin" else _stub_hermes_launch)(
+        tmp_path, monkeypatch
+    )
+
+    async def launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=workspace,
+            server_url="http://ap.example",
+            terminal_launch_args=None,
+            external_session_id=None,
+        )
+
+    monkeypatch.setattr(orchestration, "_pi_native_launch_config", launch_config)
+    loop = asyncio.get_running_loop()
+    auth_started = asyncio.Event()
+    auth_release = threading.Event()
+    auth_unblocked_by_ping: list[bool] = []
+    sent: list[str] = []
+
+    def wait_for_ping() -> None:
+        loop.call_soon_threadsafe(auth_started.set)
+        auth_unblocked_by_ping.append(auth_release.wait(timeout=budget(2)))
+
+    def token() -> str:
+        if dependency == "refresh":
+            wait_for_ping()
+        return "mock-policy-token"
+
+    def make_factory(server_url: str | None = None) -> Any:
+        if server_url is None:
+            return None
+        if dependency == "construction":
+            wait_for_ping()
+        return token
+
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", make_factory)
+
+    class Registry:
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **_kwargs: Any) -> None:
+            raise _TerminalLaunchCaptured
+
+    session_id = "5f0c2d7e9a8b4c6d8e1f2a3b4c5d6e7f"
+
+    async def setup() -> None:
+        if launch_path == "hermes_spawn":
+            env = await orchestration._resolve_native_spawn_env(
+                "hermes-native",
+                session_id,
+                server_client=cast(httpx.AsyncClient, NullServerClient()),
+                optional_labels=None,
+            )
+            assert env is not None
+        else:
+            builder = getattr(orchestration, f"_auto_create_{terminal_name}_terminal")
+            with pytest.raises(_TerminalLaunchCaptured):
+                await builder(session_id, Registry(), lambda *_args: None, server_client=None)
+
+    async def send_text(text: str) -> None:
+        sent.append(text)
+
+    task = asyncio.create_task(setup())
+    try:
+        await asyncio.wait_for(auth_started.wait(), timeout=budget(4))
+        await _handle_tunnel_frame(
+            cast(Any, None), encode_frame(PingFrame(ts=123)), send_text, {}, {}
+        )
+        auth_release.set()
+        await task
+    finally:
+        auth_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert auth_unblocked_by_ping == [True], f"policy hook {dependency} blocked the event loop"
+    assert decode_frame(sent[0]) == PongFrame(ts=123)
+    if terminal_name == "hermes":
+        from omnigent.harnesses.hermes_native import bridge as hermes_bridge
+
+        home = hermes_bridge.read_hermes_home(hermes_bridge.bridge_dir_for_session_id(session_id))
+        assert home is not None
+        wrapper = home / "omnigent-policy-hook.sh"
+    else:
+        from omnigent.harnesses.devin_native import bridge as devin_bridge
+
+        wrapper = devin_bridge.hook_wrapper_path(
+            devin_bridge.bridge_dir_for_session_id(session_id)
+        )
+    wrapper_text = wrapper.read_text()
+    assert "mock-policy-token" in wrapper_text
+    assert session_id in wrapper_text
+    assert wrapper.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_count", [1, 3])
+@pytest.mark.parametrize("writer_fails", [False, True])
+async def test_cancelled_policy_writer_drains_before_a_replacement_launch(
+    tmp_path: Path, cancel_count: int, writer_fails: bool
+) -> None:
+    from omnigent.runner.native import orchestration
+
+    loop = asyncio.get_running_loop()
+    launch_lock = asyncio.Lock()
+    first_started = asyncio.Event()
+    first_finished = asyncio.Event()
+    release_first = threading.Event()
+    replacement_attempted = asyncio.Event()
+    replacement_entered = asyncio.Event()
+    wrapper = tmp_path / "policy-hook.sh"
+    writes: list[str] = []
+
+    def first_writer() -> Path:
+        loop.call_soon_threadsafe(first_started.set)
+        try:
+            if not release_first.wait(timeout=budget(5)):
+                raise AssertionError("Test did not release the first policy writer")
+            wrapper.write_text("cancelled launch")
+            writes.append("cancelled")
+            if writer_fails:
+                raise OSError("synthetic write failure after cancellation")
+            return wrapper
+        finally:
+            loop.call_soon_threadsafe(first_finished.set)
+
+    def replacement_writer() -> Path:
+        wrapper.write_text("replacement launch")
+        writes.append("replacement")
+        return wrapper
+
+    async def first_launch() -> None:
+        async with launch_lock:
+            await orchestration._write_native_policy_hook(first_writer)
+
+    async def replacement_launch() -> Path:
+        replacement_attempted.set()
+        async with launch_lock:
+            replacement_entered.set()
+            return await orchestration._write_native_policy_hook(replacement_writer)
+
+    first = asyncio.create_task(first_launch())
+    replacement: asyncio.Task[Path] | None = None
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=budget(3))
+        first.cancel("cancelled policy launch")
+        await asyncio.sleep(0)
+        replacement = asyncio.create_task(replacement_launch())
+        await asyncio.wait_for(replacement_attempted.wait(), timeout=budget(3))
+        for _ in range(cancel_count - 1):
+            first.cancel("repeated cancellation")
+            await asyncio.sleep(0)
+        assert launch_lock.locked()
+        assert not first.done(), "Cancellation released a still-writing launch"
+        assert not replacement_entered.is_set()
+        assert not first_finished.is_set()
+
+        release_first.set()
+        with pytest.raises(asyncio.CancelledError, match="cancelled policy launch"):
+            await asyncio.wait_for(first, timeout=budget(3))
+        assert first_finished.is_set()
+        assert await asyncio.wait_for(replacement, timeout=budget(3)) == wrapper
+        assert writes == ["cancelled", "replacement"]
+        assert wrapper.read_text() == "replacement launch"
+        assert not launch_lock.locked()
+    finally:
+        release_first.set()
+        await asyncio.wait_for(first_finished.wait(), timeout=budget(3))
+        await asyncio.gather(
+            first, *([replacement] if replacement is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_policy_writer_propagates_a_failure_without_cancellation() -> None:
+    from omnigent.runner.native import orchestration
+
+    failure = OSError("synthetic policy write failure")
+
+    def write() -> None:
+        raise failure
+
+    with pytest.raises(OSError) as raised:
+        await orchestration._write_native_policy_hook(write)
+    assert raised.value is failure
 
 
 @pytest.mark.parametrize(
