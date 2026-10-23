@@ -64,6 +64,9 @@ from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
 from omnigent.native._native_forwarder_health import (
+    bind_forwarder_session as bind_native_forwarder_session,
+)
+from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
 from omnigent.native._native_forwarder_health import (
@@ -2189,6 +2192,8 @@ async def supervise_forwarder(
     """
     # Bind bridge dir so failed durable-event posts can be dead-lettered (#1120).
     _dead_letter_dir.set(bridge_dir)
+    # Sub-agent mirror posts keep this session's pane from reading idle.
+    bind_native_forwarder_session(session_id)
     # Resume backfill and live notifications can post concurrently. Serialize
     # durable items per AP session so an older retry cannot land after a newer item.
     _conversation_item_locks.set({})

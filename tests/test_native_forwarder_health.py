@@ -123,3 +123,33 @@ def test_note_post_success_stamps_last_post_at(monkeypatch: pytest.MonkeyPatch) 
         assert health.last_post_at() is None
     finally:
         health.clear()
+
+
+async def test_post_success_stamps_the_bound_forwarder_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forwarder task's posts, including those from tasks it spawns for
+    sub-agent mirrors, stamp the session it bound; unbound posts stamp none."""
+    import asyncio
+
+    clock = _FakeClock(start=500.0)
+    monkeypatch.setattr(health, "time", clock)
+    health.clear()
+
+    async def forwarder(session_id: str) -> None:
+        health.bind_forwarder_session(session_id)
+        # A child mirror's post runs in a task the forwarder spawned.
+        await asyncio.create_task(asyncio.to_thread(health.note_post_success))
+
+    try:
+        await asyncio.create_task(forwarder("conv_parent"))
+        health.note_post_success()
+        assert health.session_posted_within("conv_parent", 120.0)
+        assert not health.session_posted_within("conv_other", 120.0)
+        clock.now = 620.0
+        assert not health.session_posted_within("conv_parent", 120.0)
+        health.clear()
+        clock.now = 500.0
+        assert not health.session_posted_within("conv_parent", 120.0)
+    finally:
+        health.clear()
