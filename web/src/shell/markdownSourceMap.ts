@@ -49,7 +49,7 @@ const cache = new WeakMap<
 >();
 
 // Lex with the editor's configured marked instance, once per source string.
-// A tokenizer error is reported once and cached as null for later documents.
+// A failed lex is cached as null and rethrown to the caller for reporting.
 function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken[] | null {
   const previous = tokenCache.get(manager);
   if (previous?.source === source) return previous.tokens;

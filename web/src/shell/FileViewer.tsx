@@ -128,6 +128,14 @@ const MonacoDiffViewer = lazy(() =>
 // Helpers
 // ---------------------------------------------------------------------------
 
+function isFormattedMarkdownAnchor(comment: Comment): boolean {
+  return (
+    !!comment.anchor_content &&
+    detectLang(comment.path) === "markdown" &&
+    comment.end_index - comment.start_index !== comment.anchor_content.length
+  );
+}
+
 /**
  * Classify comments into open/addressed and remap open draft comments to
  * their correct absolute offsets when the file content has changed.
@@ -137,9 +145,7 @@ const MonacoDiffViewer = lazy(() =>
  *   (never silently dropped).
  * - **addressed**: handled by the agent or user (status "addressed").
  *
- * Markdown spans with a different source/quote length may contain formatting
- * or entities. Resolve them through the Markdown source map when available;
- * literal search would relocate them to an unrelated unformatted copy.
+ * Markdown formatting/entity spans use the source map to avoid unrelated literal copies.
  */
 export function classifyAndRemapComments(
   comments: Comment[],
@@ -170,10 +176,7 @@ export function classifyAndRemapComments(
       open.push(c);
       continue;
     }
-    if (
-      detectLang(c.path) === "markdown" &&
-      c.end_index - c.start_index !== c.anchor_content.length
-    ) {
+    if (isFormattedMarkdownAnchor(c)) {
       open.push(remapFormatted?.(c, fileContent) ?? c);
       continue;
     }
@@ -621,11 +624,7 @@ function FileViewerBody({
   const [remapFormatted, setRemapFormatted] =
     useState<(comment: Comment, content: string) => Comment>();
   const needsMarkdownRemap = allComments.some(
-    (comment) =>
-      comment.status !== "addressed" &&
-      comment.anchor_content &&
-      detectLang(comment.path) === "markdown" &&
-      comment.end_index - comment.start_index !== comment.anchor_content.length,
+    (comment) => comment.status !== "addressed" && isFormattedMarkdownAnchor(comment),
   );
   useEffect(() => {
     if (!needsMarkdownRemap || remapFormatted) return;

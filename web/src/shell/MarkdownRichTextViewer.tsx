@@ -11,10 +11,8 @@
 //
 // Key design choices:
 //   • Decorations never touch the document → markdown serialisation is clean.
-//   • Comment anchor mapping uses doc.textBetween("\n") for plain-text offsets,
-//     avoiding markdown-syntax drift.
-//   • ProseMirror positions are stable integers; binary search maps text
-//     offsets to PM positions without bespoke offset-inversion code.
+//   • Comment anchors use the validated Markdown source map, with a
+//     text-offset fallback for documents the map cannot verify.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
