@@ -3549,6 +3549,9 @@ def register_resources_routes(
     @router.post(
         "/sessions/{session_id}/resources/github/attachments",
         response_model=None,
+        # Multipart is CORS-safelisted, so only the Origin check stops a
+        # cross-site page uploading under the PR account.
+        dependencies=[Depends(require_trusted_origin)],
     )
     async def upload_session_github_attachment(
         request: Request,
