@@ -8,6 +8,7 @@ from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
+from omnigent.models.model_fallbacks import PI_ANTHROPIC_THINKING_REQUIRED
 from omnigent.models.model_metadata import ModelCapability, ModelMetadata
 
 if TYPE_CHECKING:
@@ -88,10 +89,22 @@ class PiModelEntry(TypedDict):
     id: str
     input: NotRequired[list[str]]
     reasoning: NotRequired[bool]
+    thinkingLevelMap: NotRequired[dict[str, str | None]]
     # Omitted when the catalog reports no limit; Pi then applies its own
     # defaults (128000 / 16384).
     contextWindow: NotRequired[int]
     maxTokens: NotRequired[int]
+
+
+def pi_model_with_thinking_defaults(entry: PiModelEntry) -> PiModelEntry:
+    """Disable Pi's off level only for known models that require thinking.
+
+    Explicit maps win; unknown models retain Pi's default level mapping.
+    """
+    model = entry["id"].lower().removeprefix("system.ai.").removeprefix("databricks-")
+    if model in PI_ANTHROPIC_THINKING_REQUIRED.model_ids and "thinkingLevelMap" not in entry:
+        return {**entry, "reasoning": True, "thinkingLevelMap": {"off": None}}
+    return entry
 
 
 def pi_model_is_reasoning(model_id: str) -> bool:

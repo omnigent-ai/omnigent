@@ -245,3 +245,79 @@ def test_generic_model_ambiguous_catalog_does_not_guess_capability(monkeypatch, 
     )
     entry = pi_generic_model_json_entry("custom-model")
     assert "reasoning" not in entry and "contextWindow" not in entry
+
+
+@pytest.mark.parametrize(
+    ("model", "requires_thinking"),
+    [
+        ("system.ai.claude-opus-5-5", True),
+        ("databricks-claude-sonnet-5-5", True),
+        ("claude-fable-5-1", True),
+        ("system.ai.claude-opus-5", False),
+        ("system.ai.claude-haiku-5-5", False),
+        ("system.ai.claude-opus-5-50", False),
+    ],
+)
+@pytest.mark.parametrize("catalog_available", [False, True])
+def test_native_and_sdk_agree_on_anthropic_thinking(model, requires_thinking, catalog_available):
+    from omnigent.harnesses.pi_native.credentials import PiProviderConfig
+    from omnigent.inner.pi_executor import _build_models_json
+
+    catalog = ModelEntry(id=model, family="claude", metadata=ModelMetadata(context_window=1000000))
+    native = PiProviderConfig(
+        provider_id="omnigent",
+        api="anthropic-messages",
+        base_url="https://gateway.example/anthropic",
+        api_key="synthetic",
+        auth_header=True,
+        model=model,
+        extra_models=[pi_model_json_entry(catalog)] if catalog_available else [],
+    ).to_models_config()["providers"]["omnigent"]
+    sdk = _build_models_json(
+        "https://gateway.example",
+        "synthetic",
+        {"claude": "https://gateway.example/anthropic"},
+        model=model,
+        catalog_models=[catalog] if catalog_available else [],
+    )["providers"]["databricks-anthropic"]
+    for provider in (native, sdk):
+        assert provider["compat"]["forceAdaptiveThinking"] is True
+        entry = next(row for row in provider["models"] if row["id"] == model)
+        assert entry.get("thinkingLevelMap") == ({"off": None} if requires_thinking else None)
+        if requires_thinking:
+            assert entry["reasoning"] is True
+        if catalog_available:
+            assert entry["contextWindow"] == 1000000
+
+
+def test_openai_compatible_claude_keeps_off_available():
+    from omnigent.harnesses.pi_native.credentials import PiProviderConfig
+    from omnigent.inner.pi_executor import _build_models_json
+    from omnigent.models.pi_model_compatibility import pi_generic_model_json_entry
+
+    model = "claude-opus-5-5"
+    native = PiProviderConfig(
+        provider_id="omnigent",
+        api="openai-completions",
+        base_url="https://gateway.example/v1",
+        api_key="synthetic",
+        auth_header=True,
+        model=model,
+        extra_models=[pi_generic_model_json_entry(model)],
+    ).to_models_config()["providers"]["omnigent"]
+    sdk = _build_models_json(
+        "https://gateway.example",
+        "synthetic",
+        {"openai": "https://gateway.example/v1"},
+        model=model,
+    )["providers"]["databricks-completions"]
+    for provider in (native, sdk):
+        assert "thinkingLevelMap" not in provider["models"][0]
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "anthropic-compatible-model"])
+def test_explicit_thinking_map_wins_over_fallback(model: str) -> None:
+    from omnigent.models.pi_model_compatibility import pi_model_with_thinking_defaults
+
+    entry = {"id": model, "thinkingLevelMap": {"off": "low"}}
+    assert pi_model_with_thinking_defaults(entry) is entry

@@ -1,4 +1,4 @@
-"""Owned static model tables for Smart Routing and background titles.
+"""Owned static model tables for routing, background titles and Pi compatibility.
 
 Pre-launch picker listings carry no static stand-ins anymore — the live
 harness probes (see ``omnigent.host.connect``) are their source of truth.
@@ -22,6 +22,15 @@ class StaticModelFallback:
     owner: str
     provenance: str
     discovery_gap: str
+
+
+# The gateway catalog does not yet describe whether thinking can be disabled.
+PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
+    model_ids=("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Measured Databricks Anthropic endpoints rejecting thinking.type.disabled",
+    discovery_gap="model listings advertise reasoning but not the supported thinking levels",
+)
 
 
 #: Curated preference ORDER for codex's current arms — a ranking hint only

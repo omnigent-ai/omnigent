@@ -71,8 +71,8 @@ from omnigent.models.pi_model_compatibility import (
     databricks_model_aliases,
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
-    pi_model_is_reasoning,
     pi_model_json_entry,
+    pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
@@ -869,7 +869,10 @@ def _build_models_json(
             registered_model = replace(catalog_model, id=model)
         # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
         # not assignable to it (dict value types are invariant), so copy.
-        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        model_entry = pi_model_json_entry(registered_model)
+        if provider_name == "databricks-anthropic":
+            model_entry = pi_model_with_thinking_defaults(model_entry)
+        entry: _JsonObject = dict(model_entry)
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
@@ -904,6 +907,7 @@ def _build_models_json(
                 "apiKey": token,
                 "api": "anthropic-messages",
                 "authHeader": True,
+                "compat": {"forceAdaptiveThinking": True},
                 "models": provider_models["databricks-anthropic"],
             },
             # system.ai.* models not needing Responses API (Gemini, Llama) → mlflow gateway.
@@ -964,11 +968,14 @@ def _build_models_json(
                 url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
                 for url in (base_urls or {}).values()
             ):
-                entry = dict(pi_generic_model_json_entry(model))
+                model_entry = pi_generic_model_json_entry(model)
             else:
-                entry = {"id": model, "input": ["text", "image"]}
-                if pi_model_is_reasoning(model):
-                    entry["reasoning"] = True
+                model_entry = pi_model_json_entry(
+                    model_catalog.ModelEntry(id=model, family="other")
+                )
+            if provider["api"] == "anthropic-messages":
+                model_entry = pi_model_with_thinking_defaults(model_entry)
+            entry = dict(model_entry)
             provider["models"] = [*provider["models"], entry]
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
