@@ -7761,6 +7761,7 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.inner.databricks_executor import DatabricksAuthError
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
@@ -7800,7 +7801,8 @@ def create_runner_app(
                     f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
                 )
                 body = resp.json() if resp.status_code == 200 else None
-            except (httpx.HTTPError, ValueError):
+            except (httpx.HTTPError, DatabricksAuthError, ValueError):
+                # Unreachable, unsigned (host credentials broken) or unparseable.
                 return True
             status = body.get("status") if isinstance(body, dict) else None
             if not isinstance(status, str) or status in _IN_FLIGHT_SESSION_STATUSES:
@@ -7880,6 +7882,15 @@ def create_runner_app(
                     _logger.info(
                         "native pane reaper: pane for conversation %s was replaced after "
                         "it was judged idle; leaving the new one",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    return
+                # A message can reuse the pane while the reap waits for the lock.
+                if await _native_pane_is_busy(pane):
+                    _logger.info(
+                        "native pane reaper: pane for conversation %s became busy while "
+                        "the reap waited; leaving it",
                         conv_id,
                         extra={"session_id": conv_id},
                     )

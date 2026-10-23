@@ -14,6 +14,7 @@ import pytest
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_aliases import NATIVE_HARNESSES, native_terminal_name
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
@@ -337,19 +338,19 @@ async def test_runner_busy_check_reads_output_from_the_screen_not_tmux_activity(
 
 
 class _SessionStatusServerClient(NullServerClient):
-    """Answers the runner's session GET with ``reply``, or fails it when ``None``.
+    """Answers the runner's session GET with ``reply``, or raises it when it is an exception.
 
     ``reply`` is ``(HTTP status, JSON body)``; an exception body stands for one
     that does not parse.
     """
 
     def __init__(self) -> None:
-        self.reply: tuple[int, object] | None = None
+        self.reply: tuple[int, object] | Exception = httpx.ConnectError("server unreachable")
 
     async def get(self, url: str, **kwargs: object) -> object:  # type: ignore[override]
         del url, kwargs
-        if self.reply is None:
-            raise httpx.ConnectError("server unreachable")
+        if isinstance(self.reply, Exception):
+            raise self.reply
         status_code, body = self.reply
 
         def parse() -> object:
@@ -385,8 +386,9 @@ async def test_runner_busy_check_settles_a_running_record_the_server_has_settled
     pane = PaneRef("conv_lost_idle", terminal_resource_id("codex", "main"), "codex", tmp_path)
     app.state.native_pane_status["conv_lost_idle"] = "running"
 
-    assert await reaper._is_busy(pane), "an unreachable server must not settle the record"
     for reply in (
+        httpx.ConnectError("server unreachable"),
+        DatabricksAuthError("host credentials cannot sign the request"),
         (503, {"status": "idle"}),
         (200, ValueError("not JSON")),
         (200, ["idle"]),
@@ -535,3 +537,44 @@ async def test_runner_reap_leaves_a_pane_replaced_after_the_scan_listed_it(
         await asyncio.gather(forwarder, return_exceptions=True)
         native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
         native_runtime._AUTO_CODEX_APP_SERVERS.pop(conv, None)
+
+
+async def test_runner_reap_leaves_a_pane_a_turn_reused_while_it_waited(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A message that reuses the live pane while the reap waits for the ensure lock
+    keeps it: the reap re-checks busy once it holds the lock.
+    """
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    conv = "conv_reap_reused"
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    registry._by_conversation[conv] = {("claude", "main"): instance}
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    forwarder, _server = _start_sidecars(conv, "claude")
+    lock = app.state.native_terminal_ensure_locks["claude"].setdefault(conv, asyncio.Lock())
+    pane = PaneRef(conv, terminal_resource_id("claude", "main"), "claude", tmp_path, instance)
+    try:
+        async with lock:
+            reap = asyncio.create_task(reaper._reap(pane))
+            await asyncio.sleep(0)
+            # The ensure path holding the lock found the pane alive; its turn starts.
+            app.state.active_turns[conv] = None
+        await reap
+
+        assert registry.get(conv, "claude", "main") is instance
+        assert not forwarder.done(), "the reused pane's forwarder was cancelled"
+    finally:
+        app.state.active_turns.pop(conv, None)
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
