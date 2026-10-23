@@ -334,8 +334,6 @@ def test_stop_signal_report_names_a_running_stop_command(tmp_path: Path) -> None
     assert str(attrs["parent_chain"]).startswith(os.path.basename(sys.executable))
 
 
-
-
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
 def test_stop_signal_exit_row_reaches_the_terminal_mirror(tmp_path: Path) -> None:
     """The terminal mirror writes from a thread, so the signal exit waits for it briefly."""
