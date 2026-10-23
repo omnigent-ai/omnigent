@@ -1058,6 +1058,7 @@ async def _reconnect_fires_connect_hook(
     fake_pm: Any,
     *,
     wait_for_recover: str,
+    init_payloads: list[dict[str, Any]] | None = None,
     runner_client: httpx.AsyncClient | None = None,
     expect_recovered: bool = True,
 ) -> AsyncIterator[list[str]]:
@@ -1075,6 +1076,8 @@ async def _reconnect_fires_connect_hook(
 
     With ``runner_client``, keep the real relay and replace only its transport.
 
+    :param init_payloads: When given, collects the session-init payloads the hook
+        sends to the stub client (not collected when ``runner_client`` is set).
     :yields: The list of session ids the recovery helper ran for.
     """
     from omnigent.runner.routing import RoutedRunner
@@ -1094,6 +1097,8 @@ async def _reconnect_fires_connect_hook(
 
     class _StubClient:
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
+            if init_payloads is not None and args and args[0] == "/v1/sessions":
+                init_payloads.append(kwargs["json"])
             return _StubResponse()
 
     def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -1394,6 +1399,253 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
             assert sessions_module._last_task_error_from_labels(cleared.labels) is None
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("dispatching", [True, False], ids=["message-dispatching", "idle"])
+async def test_on_runner_connect_suppresses_recovery_only_while_a_message_dispatches(
+    tunnel_three_layer_stack: _TunnelStack,
+    dispatching: bool,
+) -> None:
+    """The reconnect hook skips the recovery turn only while a message is being dispatched.
+
+    A message that relaunches a stopped runner forwards its item once that runner connects. The
+    initializer sends one init per connection, so if the hook's init started a recovery turn from
+    history, the message would queue behind it. With no message in flight, a reconnect still
+    recovers an interrupted turn.
+
+    Mutation check: drop ``suppress_recovery_turn`` from ``_on_runner_connect``'s init, and the
+    ``message-dispatching`` case fails.
+    """
+    from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes._sessions.orchestration import _mark_dispatch_in_flight
+
+    create_resp = await tunnel_three_layer_stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    # Bound via the store, not PATCH, so no relay races the reconnect (see _bind_failed_session).
+    get_conversation_store().replace_runner_id(session_id, _RUNNER_ID)
+
+    init_payloads: list[dict[str, Any]] = []
+    with _mark_dispatch_in_flight(session_id) if dispatching else contextlib.nullcontext():
+        async with _reconnect_fires_connect_hook(
+            tunnel_three_layer_stack.ap_app,
+            tunnel_three_layer_stack.fake_pm,
+            wait_for_recover=session_id,
+            init_payloads=init_payloads,
+        ):
+            pass
+
+    envelopes = [
+        parse_runner_session_init_envelope(payload)
+        for payload in init_payloads
+        if payload.get("session_id") == session_id
+    ]
+    assert envelopes, f"no session init for {session_id!r}; recorded {init_payloads!r}"
+    assert all(
+        envelope is not None and envelope.suppress_recovery_turn is dispatching
+        for envelope in envelopes
+    ), envelopes
+
+
+class _ServerHistoryClient(NullServerClient):
+    """A runner's server client that reads session history from the server under test.
+
+    Session init loads history to decide on a recovery turn, so ``/items`` reads go to the real
+    server. Every other call stays a no-op, as in :class:`NullServerClient`.
+    """
+
+    def __init__(self, ap_client: httpx.AsyncClient) -> None:
+        self._ap_client = ap_client
+
+    async def get(self, url: str, **kwargs: Any) -> Any:
+        if url.rstrip("/").endswith("/items"):
+            return await self._ap_client.get(url, params=kwargs.get("params"))
+        return await super().get(url, **kwargs)
+
+
+async def _runner_idle(runner_app: FastAPI, session_id: str) -> None:
+    """Wait until *session_id* has no active turn, buffered messages included."""
+    quiet = 0
+    while quiet < 3:
+        turn = runner_app.state.active_turns.get(session_id)
+        if turn is None:
+            quiet += 1
+            await asyncio.sleep(0.05)
+        else:
+            quiet = 0
+            await asyncio.wait({turn})
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_relaunching_message_is_the_only_turn_when_the_reconnect_init_wins(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A message that relaunches a runner lost mid-turn is its only turn, end to end.
+
+    The runner was lost during a tool call, so the session is ``failed`` with
+    ``runner_disconnected`` and history ends in an unanswered function_call. A failed session
+    recovers when its runner connects, so the connect hook's init runs first and the message
+    path's suppressed init reuses it. The server route, tunnel, connect hook, initializer and a
+    fresh runner are real; only the host's launch is stubbed.
+
+    Mutation check: drop ``suppress_recovery_turn`` from ``_on_runner_connect``'s init, and the
+    runner resumes the old work first, with the message buffered behind it.
+    """
+    import uuid
+
+    from omnigent.entities import FunctionCallData, MessageData, NewConversationItem
+    from omnigent.host.frames import HostHelloFrame
+    from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
+    from omnigent.server.background_session_titles import BACKGROUND_SESSION_TITLES_HEADER
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    ap_app, ap_client = tunnel_three_layer_stack.ap_app, tunnel_three_layer_stack.ap_client
+    store = get_conversation_store()
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    host_id = uuid.uuid4().hex
+    store.set_host_id(session_id, host_id, workspace=str(tmp_path))
+    store.replace_runner_id(session_id, "runner-lost")  # no tunnel: the route relaunches it
+    ap_app.state.host_registry.register(
+        host_id,
+        AsyncMock(),
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="relaunch-host"),
+        owner=None,
+    )
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_old",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "OLD: run the tool loop"}]
+                ),
+            ),
+            NewConversationItem(
+                type="function_call",
+                response_id="resp_old",
+                data=FunctionCallData(
+                    agent="claude", name="sys_os_shell", arguments="{}", call_id="call_old"
+                ),
+            ),
+        ],
+    )
+    # What losing the runner mid-turn leaves behind (see ``_bind_failed_session``).
+    sessions_module._session_status_cache[session_id] = "failed"
+    await sessions_module._persist_session_status_error_labels(
+        session_id,
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+        store,
+    )
+
+    turns: list[str] = []
+    release = asyncio.Event()
+    echo_turn = _EchoHarness.run_turn
+
+    async def _held_turn(self: _EchoHarness, request: Any, ctx: Any) -> None:
+        turns.append(json.dumps(request.input or []))
+        await release.wait()  # a resumed tool loop runs for minutes
+        await echo_turn(self, request, ctx)
+
+    monkeypatch.setattr(_EchoHarness, "run_turn", _held_turn)
+
+    hook_init_done = asyncio.Event()
+    real_recovered = sessions_module._publish_runner_recovered_status
+
+    async def _recovered(sid: str, store_arg: Any, **kwargs: Any) -> None:
+        await real_recovered(sid, store_arg, **kwargs)  # the hook calls it after its init
+        if sid == session_id:
+            hook_init_done.set()
+
+    monkeypatch.setattr(sessions_module, "_publish_runner_recovered_status", _recovered)
+
+    relaunched_pm = FakeProcessManager()
+    relaunched: dict[str, Any] = {}
+
+    async def _resolve_spec(agent_id: str, session_id: str | None = None) -> Any:
+        record = get_agent_store().get(agent_id)
+        return (
+            None
+            if record is None
+            else get_agent_cache().load(agent_id, record.bundle_location).spec
+        )
+
+    async def _launch(conv: Any, conversation_store: Any, *args: Any) -> Any:
+        """Stand in for the host: a fresh runner, under a rotated binding, connects its tunnel."""
+        del args
+        conversation_store.replace_runner_id(conv.id, "runner-relaunched")
+        runner_app = create_runner_app(
+            process_manager=relaunched_pm,
+            spec_resolver=_resolve_spec,
+            server_client=_ServerHistoryClient(ap_client),  # type: ignore[arg-type]
+        )
+        communicator = await _connect_runner_tunnel(ap_app, "runner-relaunched")
+        relaunched.update(runner_app=runner_app, communicator=communicator)
+        await _send_hello_and_wait(
+            communicator, ap_app, "runner-relaunched", harnesses=[_TEST_HARNESS_NAME]
+        )
+        relaunched["forwarder"] = asyncio.create_task(
+            _forward_requests_to_runner(communicator, runner_app)
+        )
+        # The order the bug needs: the connect hook's init runs before the message path's.
+        await asyncio.wait_for(hook_init_done.wait(), timeout=budget(10.0))
+        return sessions_module._HostLaunchAttempt(runner_id="runner-relaunched", acknowledged=True)
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch)
+    try:
+        post = asyncio.create_task(
+            ap_client.post(
+                f"/v1/sessions/{session_id}/events",
+                headers={BACKGROUND_SESSION_TITLES_HEADER: "off"},  # its harness call isn't a turn
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "NEW: are you finished?"}],
+                    },
+                },
+            )
+        )
+        await asyncio.wait({post}, timeout=budget(10.0))  # it reaches a turn-holding runner
+        release.set()
+        resp = await post
+        assert resp.status_code < 300, resp.text
+        await asyncio.wait_for(_runner_idle(relaunched["runner_app"], session_id), budget(10.0))
+    finally:
+        release.set()
+        forwarder = relaunched.get("forwarder")
+        if forwarder is not None:
+            forwarder.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await forwarder
+        communicator = relaunched.get("communicator")
+        if communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await communicator.wait(timeout=budget(2.0))
+        await relaunched_pm.shutdown()
+
+    ran = ["the message" if "NEW: are you finished?" in turn else "the old work" for turn in turns]
+    assert ran == ["the message"], f"the relaunched runner ran {ran}"
 
 
 @pytest.mark.asyncio
