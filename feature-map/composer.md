@@ -293,8 +293,9 @@ Other connection providers alone do not enable the managed MCP picker.
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
-  away: its tooltip should stay visible. Check outside-click and Escape
-  dismissal, Tab focus, and Enter submission; no session should be created.
+  away: its tooltip should stay visible. Check dismissal by outside click,
+  Escape, or moving keyboard focus away, plus Tab focus and Enter submission;
+  no session should be created.
   Choose a working directory and check that the tooltip disappears and Start
   enables. Repeat with a phone viewport and touch input. Component coverage:
   `web/src/shell/NewChatDialog.test.tsx`.

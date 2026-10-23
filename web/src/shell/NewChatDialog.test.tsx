@@ -6007,8 +6007,37 @@ describe("NewChatLandingScreen", () => {
       fireEvent.click(screen.getByTestId("workspace-picker-select"));
       await waitFor(() => expect(submit).toBeEnabled());
       expect(screen.queryByText(reason)).not.toBeInTheDocument();
-      expect(trigger).not.toHaveAttribute("tabindex");
+      expect(trigger).toHaveAttribute("tabindex", "-1");
       expect(trigger).not.toHaveAttribute("aria-disabled");
+    },
+  );
+
+  it.each(["{Enter}", "[Space]"])(
+    "pins the explanation with %s on the wrapper and hands focus to Start when ready",
+    async (key) => {
+      const user = userEvent.setup();
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("repo"),
+      );
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      const trigger = submit.parentElement!;
+      act(() => trigger.focus());
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+      await user.keyboard(key);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        "Enter a message to get started",
+      );
+      expect(trigger).toHaveFocus();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "inspect the repo" },
+      });
+      expect(submit).toBeEnabled();
+      expect(submit).toHaveFocus();
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
     },
   );
 

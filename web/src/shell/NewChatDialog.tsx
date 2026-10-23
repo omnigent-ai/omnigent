@@ -9,7 +9,15 @@ import {
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
@@ -5136,7 +5144,7 @@ export function NewChatLandingScreen() {
                       : message.trim().length === 0 && files.length === 0
                         ? "Enter a message to get started"
                         : null;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (submitDisabledReason !== null) return;
     setSubmitTooltipState("closed");
     if (document.activeElement === submitTooltipTriggerRef.current) {
@@ -7288,7 +7296,7 @@ export function NewChatLandingScreen() {
                           <span
                             ref={submitTooltipTriggerRef}
                             role={submitDisabledReason !== null ? "group" : undefined}
-                            tabIndex={submitDisabledReason !== null ? 0 : undefined}
+                            tabIndex={submitDisabledReason !== null ? 0 : -1}
                             aria-label={submitDisabledReason !== null ? "Start session" : undefined}
                             aria-disabled={submitDisabledReason !== null ? true : undefined}
                             onPointerDown={(event) => {
@@ -7313,7 +7321,6 @@ export function NewChatLandingScreen() {
                           >
                             <ComposerSendButton
                               disabled={!canSubmit}
-                              className="disabled:opacity-50"
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
                               data-testid="new-chat-landing-submit"
