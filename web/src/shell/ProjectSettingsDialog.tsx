@@ -8,7 +8,7 @@
 // worktree forks from (which overrides the user-global default in Settings ›
 // Git), and — when the default agent is a native harness with a model choice
 // (Claude Code / Codex / Pi) — a default model and reasoning effort for new
-// sessions. SDK agents' effort stays per-agent run config. The host and agent
+// sessions. The host and agent
 // pickers reuse the composer's components; the working directory reuses its
 // filesystem browser (inline, so it scrolls inside the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
@@ -43,6 +43,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -237,7 +239,7 @@ export function ProjectSettingsDialog({
     const agentUnresolved = agentId != null && selectedAgent === null;
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
-    if (supportsEffortDefault && effort !== NONE) config.effort = effort;
+    if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
     else if (!agentUnresolved) delete config.effort;
 
     updateConfig.mutate(
@@ -317,19 +319,29 @@ export function ProjectSettingsDialog({
       hostModelOptions ?? [],
       pinnedModel === NONE ? null : pinnedModel,
     );
+  // Fixed ladders are always known; a Codex ladder only once the catalog
+  // resolves the model (or its default row), so an unresolved one keeps the level.
+  const effortLadderKnown = (pinnedModel: string) => {
+    if (selectedNativeSpec?.harness !== "codex-native") return true;
+    const options = hostModelOptions ?? [];
+    const target = pinnedModel === NONE ? options.find((m) => m.isDefault)?.id : pinnedModel;
+    return findNativeModelOption(options, target) !== null;
+  };
   const effortOptions = supportsModelDefault ? effortLadder(model) : null;
   const supportsEffortDefault = effortOptions !== null;
-  const storedEffortMissing =
-    effort !== NONE && !(effortOptions ?? []).some((e) => e.value === effort);
-  const effortPickerEmpty = (effortOptions ?? []).length === 0 && effort === NONE;
-  // An empty Codex catalog says nothing about the stored effort, so keep it.
-  const effortLadderKnown =
-    selectedNativeSpec?.harness !== "codex-native" || (hostModelOptions ?? []).length > 0;
+  const effortInLadder = (options: typeof effortOptions, level: string) =>
+    (options ?? []).some((e) => e.value === level);
+  // A stored level a known ladder lacks would never apply, so show and save no default.
+  const effortValue =
+    effort !== NONE && effortLadderKnown(model) && !effortInLadder(effortOptions, effort)
+      ? NONE
+      : effort;
+  const storedEffortMissing = effortValue !== NONE && !effortInLadder(effortOptions, effortValue);
+  const effortPickerEmpty = (effortOptions ?? []).length === 0 && effortValue === NONE;
   const selectModel = (next: string) => {
     setModel(next);
     // Codex ladders differ per model; drop an effort the new model can't run.
-    const ladder = effortLadder(next) ?? [];
-    if (effortLadderKnown && effort !== NONE && !ladder.some((e) => e.value === effort)) {
+    if (effort !== NONE && effortLadderKnown(next) && !effortInLadder(effortLadder(next), effort)) {
       setEffort(NONE);
     }
   };
@@ -588,7 +600,7 @@ export function ProjectSettingsDialog({
               }
             >
               <Select
-                value={effort}
+                value={effortValue}
                 onValueChange={setEffort}
                 onOpenChange={onDropdownOpenChange}
                 disabled={isLoading || effortPickerEmpty}
@@ -603,7 +615,9 @@ export function ProjectSettingsDialog({
                       {e.label}
                     </SelectItem>
                   ))}
-                  {storedEffortMissing && <SelectItem value={effort}>{effort}</SelectItem>}
+                  {storedEffortMissing && (
+                    <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
+                  )}
                 </SelectContent>
               </Select>
             </Field>

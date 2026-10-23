@@ -3820,7 +3820,9 @@ export function NewChatLandingScreen() {
     const selectionHarness =
       selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
+    // Every model-picker commit also settles the effort (routing and Fusion clear it).
     userPickedModelRef.current = true;
+    userPickedEffortRef.current = true;
     if (model === MODEL_SELECT_SMART) {
       setPickedModel("");
       setPickedEffort("");
@@ -3903,6 +3905,7 @@ export function NewChatLandingScreen() {
   const selectFusionModel = (modelUid: string) => {
     if (!selectedNativeHarness) return;
     userPickedModelRef.current = true;
+    userPickedEffortRef.current = true;
     setPickedModel(modelUid);
     setPickedEffort("");
     setCostControlMode(null);
@@ -4468,11 +4471,8 @@ export function NewChatLandingScreen() {
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
     if (!selectedNativeHarness || autoRoutingSelected) return;
-    // A *valid* project-configured default model is an explicit pin: a
-    // remembered routing "on" must not re-enter routing and clear it (the
-    // setter drops the model pick when routing turns on). An invalid stored
-    // id never seeds a pin, so it must not suppress the remembered routing.
-    // A valid project effort pins the same way (routing would drop it).
+    // A valid project model or effort is an explicit pin that remembered routing
+    // would drop; an invalid stored value seeds no pin and doesn't suppress it.
     if (projectDefaultModelValid != null && !userPickedModelRef.current) return;
     if (projectDefaultEffortValid != null && !userPickedEffortRef.current) return;
     const storedRouting =

@@ -1063,6 +1063,36 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.cost_control_mode_override).not.toBe("on");
   });
 
+  it("keeps an explicit Smart Routing pick when a project effort arrives afterwards", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { rerender } = renderRoutingLanding();
+    await waitForClaudeAgent();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    rerender(<NewChatLandingScreen />);
+
+    const body = await submitAndReadBody();
+    expect(body.cost_control_mode_override).toBe("on");
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("leaves the project effort off when the user switches to another agent", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderLanding();
+    await waitForClaudeAgent();
+    selectAgent("ag_hello");
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("applies a Codex project effort only when the pinned model's ladder offers it", async () => {
     const codexAgentId = "ag_codex";
     vi.mocked(useAvailableAgents).mockReturnValue({

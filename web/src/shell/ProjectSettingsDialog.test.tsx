@@ -465,6 +465,8 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(screen.queryByTestId("project-settings-effort")).not.toBeInTheDocument(),
     );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenLastCalledWith("p_1", { agent_id: "ag_1" }));
   });
 
   it("clears the effort default when the default agent is cleared", async () => {
@@ -542,39 +544,61 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("keeps a stored Codex effort when the model changes while the catalog is unavailable", async () => {
-    availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
-    getProjectMock.mockResolvedValue({
-      id: "p_1",
-      name: "Work",
-      config: { agent_id: "ag_codex", model: "gpt-5.5", effort: "high" },
-    });
-    renderDialog();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("high"),
-    );
-    await pickSelectOption("project-settings-model", "No default");
-    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("high");
-    fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_codex", effort: "high" }),
-    );
-  });
+  it.each([
+    { label: "the catalog is unavailable, plain save", catalog: [], clearModel: false },
+    { label: "the catalog is unavailable, model cleared", catalog: [], clearModel: true },
+    {
+      label: "the catalog lists neither model nor a default, model cleared",
+      catalog: [
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+      clearModel: true,
+    },
+  ])(
+    "keeps a stored Codex effort while its ladder is unknown ($label)",
+    async ({ catalog, clearModel }) => {
+      availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+      hostModelOptionsMock.mockReturnValue({ data: catalog });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { agent_id: "ag_codex", model: "gpt-5.5", effort: "high" },
+      });
+      renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High"),
+      );
+      if (clearModel) await pickSelectOption("project-settings-model", "No default");
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          agent_id: "ag_codex",
+          ...(clearModel ? {} : { model: "gpt-5.5" }),
+          effort: "high",
+        }),
+      );
+    },
+  );
 
-  it("keeps a stored Codex effort while the host catalog is unavailable", async () => {
+  it("drops a stored Codex effort that the loaded model's ladder lacks", async () => {
     availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [{ id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") }],
+    });
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { agent_id: "ag_codex", effort: "high" },
+      config: { agent_id: "ag_codex", model: "gpt-mini", effort: "xhigh" },
     });
     renderDialog();
     await waitFor(() =>
-      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("high"),
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("GPT mini"),
     );
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_codex", effort: "high" }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_codex", model: "gpt-mini" }),
     );
   });
 });
