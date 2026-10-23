@@ -235,6 +235,7 @@ class RunnerSessionInitializer:
                     trigger=trigger,
                     decision="skip",
                     reason="agent_removed",
+                    agent_id=agent_id,
                 )
                 # The user removed the agent (`omnigent agent remove`). The runner
                 # could only reject this init; the session reports the removal on
@@ -387,7 +388,7 @@ class RunnerSessionInitializer:
                 "init_trigger": trigger,
                 "init_attempt_id": init_attempt_id,
             }
-            # Record recovery policy separately from the explicit caller trigger.
+            # resume/suppress flags describe recovery behavior; init_trigger names the caller.
             _logger.info(
                 "Initializing runner session",
                 extra=debug_event(

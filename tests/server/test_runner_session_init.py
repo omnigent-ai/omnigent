@@ -607,6 +607,9 @@ async def test_initializer_skips_a_session_whose_agent_was_removed(
     assert client.calls == []
     records = [r for r in caplog.records if r.name == "omnigent.server.runner_session_init"]
     assert [(r.levelname, r.exc_info) for r in records] == [("INFO", None)]
+    assert records[0].event_name == "runner_session_init_decision"
+    assert records[0].attributes["reason"] == "agent_removed"
+    assert records[0].attributes["agent_id"] == conversation.agent_id
 
     present = RunnerSessionInitializer(  # type: ignore[arg-type]
         _Registry(), server_version="test", agent_store=_Agents(conversation.agent_id)
