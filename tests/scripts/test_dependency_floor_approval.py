@@ -81,8 +81,24 @@ def _review(login: str, state: str = "APPROVED", sha: str = "head", at: str = "2
             False,
             "has not approved",
         ),
+        (
+            LABEL,
+            [_labeled("reviewer")],
+            [_review("reviewer"), _review("reviewer", "DISMISSED", at="3")],
+            False,
+            "has not approved",
+        ),
         (LABEL, [_labeled("reviewer")], [_review("author")], False, "has not approved"),
+        (LABEL, [], [_review("reviewer")], False, "No `dependency-floor-approved` labeled event"),
+        (LABEL, [_labeled("reviewer")], [_review("reviewer", sha="")], False, "names no commit"),
         (LABEL, [_labeled("Reviewer")], [_review("reviewer")], True, "@Reviewer at head"),
+        (
+            LABEL,
+            [_labeled("reviewer")],
+            [_review("reviewer"), _review("reviewer", "COMMENTED", sha="other", at="3")],
+            True,
+            "@reviewer at head",
+        ),
         (LABEL, [_labeled("reviewer")], [_review("reviewer", sha="rebased")], True, "at rebased"),
         (
             LABEL,
@@ -99,8 +115,12 @@ def _review(login: str, state: str = "APPROVED", sha: str = "head", at: str = "2
         "latest-labeler-wins",
         "labeler-never-reviewed",
         "labeler-requested-changes",
+        "labeler-approval-dismissed",
         "only-author-approved",
+        "label-without-labeled-event",
+        "approval-without-commit",
         "labeler-approved-head",
+        "comment-after-approval",
         "labeler-approved-same-waivers-before-rebase",
         "labeler-approved-before-waiver-edit",
     ],
@@ -141,26 +161,60 @@ def test_new_waiver_needs_label_and_approval_from_another_maintainer(
     ids=["unchanged", "waiver-added", "deletion-moves-waiver", "reordered", "waiver-removed"],
 )
 def test_evaluate_compares_head_with_the_merge_base(approval, base, head, approved) -> None:
-    def encoded(text: str) -> dict:
-        return {"content": base64.b64encode(text.encode()).decode()}
+    decision = _evaluate(approval, _routes(base, head))
+    assert decision.approved is approved, decision.reason
 
-    routes = {
+
+def _encoded(text: str) -> dict:
+    return {"content": base64.b64encode(text.encode()).decode()}
+
+
+def _routes(base: str, head: str, labels=(), timeline=(), reviews=()) -> dict:
+    return {
         f"repos/{REPO}/pulls/7": {
             "head": {"sha": "head"},
             "base": {"sha": "main-tip"},
             "user": {"login": "author"},
-            "labels": [],
+            "labels": [{"name": name} for name in labels],
         },
         f"repos/{REPO}/compare/main-tip...head?per_page=1": {"merge_base_commit": {"sha": "fork"}},
-        f"repos/{REPO}/contents/pyproject.toml?ref=head": encoded(head),
-        f"repos/{REPO}/contents/pyproject.toml?ref=fork": encoded(base),
-        f"repos/{REPO}/issues/7/timeline?per_page=100&page=1": [],
-        f"repos/{REPO}/pulls/7/reviews?per_page=100&page=1": [],
+        f"repos/{REPO}/contents/pyproject.toml?ref=head": _encoded(head),
+        f"repos/{REPO}/contents/pyproject.toml?ref=fork": _encoded(base),
+        f"repos/{REPO}/issues/7/timeline?per_page=100&page=1": list(timeline),
+        f"repos/{REPO}/pulls/7/reviews?per_page=100&page=1": list(reviews),
     }
-    decision = approval.evaluate(
-        REPO, 7, request=lambda args: routes[args[1]], maintainer_lookup=lambda repo: {"reviewer"}
+
+
+def _evaluate(approval, routes: dict, expected_head: str | None = None):
+    return approval.evaluate(
+        REPO,
+        7,
+        request=lambda args: routes[args[1]],
+        maintainer_lookup=lambda repo: {"reviewer"},
+        expected_head=expected_head,
     )
-    assert decision.approved is approved, decision.reason
+
+
+def test_evaluate_approves_through_the_reviewed_commit(approval) -> None:
+    head = _pyproject(WAIVER, f"    {CERTIFI}")
+    routes = _routes(
+        _pyproject(f"    {CERTIFI}"),
+        head,
+        labels=LABEL,
+        timeline=[_labeled("reviewer")],
+        reviews=[_review("reviewer", sha="approved")],
+    )
+    routes[f"repos/{REPO}/contents/pyproject.toml?ref=approved"] = _encoded(head)
+    decision = _evaluate(approval, routes, expected_head="head")
+    assert decision.approved, decision.reason
+    assert "approved by maintainer @reviewer at approved" in decision.reason
+
+
+def test_evaluate_fails_when_the_head_moved_since_the_event(approval) -> None:
+    routes = _routes(_pyproject(f"    {CERTIFI}"), _pyproject(f"    {CERTIFI}"))
+    decision = _evaluate(approval, routes, expected_head="older")
+    assert not decision.approved
+    assert "PR head changed" in decision.reason
 
 
 def test_rule_name_matches_the_lint_and_runs_in_the_required_check(approval) -> None:
@@ -180,3 +234,5 @@ def test_rule_name_matches_the_lint_and_runs_in_the_required_check(approval) -> 
     step = next(s for s in job["steps"] if s.get("name") == "Require dependency floor approval")
     assert step["if"] == "${{ !cancelled() }}"
     assert step["env"]["PYTHONPATH"] == "${{ github.workspace }}"
+    assert step["env"]["EXPECTED_HEAD"] == "${{ github.event.pull_request.head.sha }}"
+    assert '--expected-head "$EXPECTED_HEAD"' in step["run"]

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Require a second maintainer for a new young-dependency-floor waiver.
-
-A waiver comment in pyproject.toml is self-attested, so a PR that newly waives a
-requirement (compared with its merge base) also needs a maintainer other than
-the author to add the approval label and approve a commit carrying that waiver.
-Binding the label to an approved commit keeps a later edit from riding on it.
-"""
+"""Require a second maintainer's label and approval for a new young-dependency-floor waiver."""
 
 from __future__ import annotations
 
@@ -66,7 +60,9 @@ def floor_decision(
         for event in timeline
         if event.get("event") == "labeled" and (event.get("label") or {}).get("name") == LABEL
     ]
-    labeler = labelers[-1] if labelers else "unknown"
+    if not labelers:
+        return FloorDecision(False, f"No `{LABEL}` labeled event was found. {ask}")
+    labeler = labelers[-1]
     if labeler.casefold() == author.casefold():
         return FloorDecision(False, f"`{LABEL}` was added by the author. {ask}")
     if labeler.casefold() not in {login.casefold() for login in maintainer_logins}:
@@ -77,6 +73,8 @@ def floor_decision(
     if review is None or str(review.get("state") or "").upper() != "APPROVED":
         return FloorDecision(False, f"@{labeler} added `{LABEL}` but has not approved. {ask}")
     approved_sha = str(review.get("commit_id") or "")
+    if not approved_sha:
+        return FloorDecision(False, f"@{labeler}'s approval names no commit. {ask}")
     if not new_waivers <= waivers_at(approved_sha):
         return FloorDecision(
             False, f"@{labeler} approved {approved_sha[:9]}, before these waivers. {ask}"
@@ -91,9 +89,12 @@ def evaluate(
     pr_number: int,
     request: Callable[[list[str]], Any] = gh_json,
     maintainer_lookup: Callable[[str], set[str]] = maintainers,
+    expected_head: str | None = None,
 ) -> FloorDecision:
     pull = request(["api", f"repos/{repository}/pulls/{pr_number}"])
     head_sha = pull["head"]["sha"]
+    if expected_head and head_sha != expected_head:
+        return FloorDecision(False, "PR head changed during evaluation; its own run decides.")
     compare = request(
         ["api", f"repos/{repository}/compare/{pull['base']['sha']}...{head_sha}?per_page=1"]
     )
@@ -121,8 +122,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", type=int, required=True)
+    parser.add_argument("--expected-head", help="Fail if the PR head is no longer this SHA")
     args = parser.parse_args()
-    decision = evaluate(args.repository, args.pr_number)
+    decision = evaluate(args.repository, args.pr_number, expected_head=args.expected_head)
     print(decision.reason if decision.approved else f"::error::{decision.reason}")
     return 0 if decision.approved else 1
 

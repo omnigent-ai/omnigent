@@ -93,7 +93,9 @@ jobs:
           REPO:       ${{ github.repository }}
           PR:         ${{ github.event.pull_request.number }}
           PYTHONPATH: ${{ github.workspace }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 .github/scripts/dependency_floor_approval.py \
             --repository "$REPO" \
-            --pr-number "$PR"
+            --pr-number "$PR" \
+            --expected-head "$EXPECTED_HEAD"

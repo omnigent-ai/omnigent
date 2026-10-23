@@ -275,6 +275,7 @@ normalize-locks: _ensure-uv
 
 # Resolve the declared dependencies through a package mirror without writing
 # uv.lock; fails when a floor needs a release the mirror does not serve yet.
+# Dependency groups resolve too, so a dev-only gap can fail it as well.
 # No `_ensure-uv`: its `uv sync` would re-resolve and rewrite uv.lock first.
 [group('lint')]
 check-internal-mirror index="https://pypi-proxy.cloud.databricks.com/simple":

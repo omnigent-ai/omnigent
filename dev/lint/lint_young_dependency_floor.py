@@ -1,14 +1,7 @@
-"""Flag dependency floors that only a release inside the uv cooldown satisfies.
+"""Flag published floors that only a release inside uv.lock's cooldown satisfies.
 
-Mirrors that embargo young releases (such as the Databricks PyPI proxy) install
-from the floors in pyproject.toml, not from uv.lock, so a floor at or above a
-locked release uploaded inside uv.lock's ``exclude-newer-span`` makes omnigent
-uninstallable there. Only ``[project]`` dependencies and extras are checked;
-dependency groups never reach published metadata.
-
-Release age approximates what a mirror serves, and only locked versions are
-known: a young release uv.lock does not pin, or an older one a mirror withholds,
-is only caught by ``just check-internal-mirror``.
+Mirrors that embargo young releases install from these floors, not from uv.lock.
+Only locked versions are known, so ``just check-internal-mirror`` stays authoritative.
 """
 
 from __future__ import annotations
@@ -22,7 +15,7 @@ from pathlib import Path
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from dev.lint._framework import disabled_rules_by_line
 
@@ -41,7 +34,7 @@ HINT = (
 )
 
 # Specifier operators whose version bounds the admitted releases from below.
-_LOWER_BOUND_OPERATORS = frozenset({">=", ">", "==", "~="})
+_LOWER_BOUND_OPERATORS = frozenset({">=", ">", "==", "~=", "==="})
 _SPAN_RE = re.compile(r"P(\d+)D")
 _TABLE_RE = re.compile(r"^\[+([^\]]+)\]+")
 _REQUIREMENT_TABLES = frozenset({"project", "project.optional-dependencies"})
@@ -100,11 +93,14 @@ def _requirement_lines(
 
 def _floor(requirement: Requirement) -> Version | None:
     """Highest lower bound in the requirement's specifier, or None if unbounded."""
-    bounds = [
-        Version(spec.version.removesuffix(".*"))
-        for spec in requirement.specifier
-        if spec.operator in _LOWER_BOUND_OPERATORS
-    ]
+    bounds = []
+    for spec in requirement.specifier:
+        if spec.operator not in _LOWER_BOUND_OPERATORS:
+            continue
+        try:
+            bounds.append(Version(spec.version.removesuffix(".*")))
+        except InvalidVersion:  # `===` accepts arbitrary strings
+            continue
     return max(bounds, default=None)
 
 
@@ -123,7 +119,9 @@ def _locked_uploads(lock: dict) -> dict[str, list[tuple[Version, datetime]]]:
 def find_violations(pyproject_text: str, lock_text: str, now: datetime) -> list[str]:
     """Return ``path:line: message`` for each floor forcing a release inside the cooldown."""
     lock = tomllib.loads(lock_text)
-    span = lock.get("options", {}).get("exclude-newer-span", "")
+    span = lock.get("options", {}).get("exclude-newer-span")
+    if span is None:
+        return ["uv.lock: no exclude-newer-span; this lint needs the uv cooldown in uv.toml"]
     span_match = _SPAN_RE.fullmatch(span)
     if span_match is None:
         return [f"uv.lock: exclude-newer-span {span!r} is not a P<days>D duration"]
