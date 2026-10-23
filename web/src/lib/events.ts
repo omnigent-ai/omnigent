@@ -265,6 +265,8 @@ export interface ElicitationRequest {
    * ``setMode(auto)`` in the hook decision.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that

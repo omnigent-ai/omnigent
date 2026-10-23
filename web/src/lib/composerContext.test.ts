@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeComposerContextState, type ComposerContextState } from "./composerContext";
+import {
+  absoluteWorkspacePath,
+  normalizeComposerContextState,
+  type ComposerContextState,
+} from "./composerContext";
 import {
   composerContextFromLabels,
   composerContextFromMetadata,
@@ -49,5 +53,23 @@ describe("composer context", () => {
       working_directory: { path: "/repo" },
       worktree: { mode: "new", branch_name: "feature/context", base_branch: "main" },
     });
+  });
+});
+
+describe("absoluteWorkspacePath", () => {
+  it.each([
+    ["docs/a.md", "/repo", "/repo/docs/a.md"],
+    ["docs/a.md", "/repo/", "/repo/docs/a.md"],
+    ["notes.md", "/", "/notes.md"],
+    ["docs\\a.md", "C:\\work\\", "C:\\work\\docs\\a.md"],
+    ["/tmp/a.md", "/repo", "/tmp/a.md"],
+    ["C:\\tmp\\a.md", "/repo", "C:\\tmp\\a.md"],
+  ])("joins %s onto root %s as %s", (path, root, expected) => {
+    expect(absoluteWorkspacePath(path, root)).toBe(expected);
+  });
+
+  it("keeps an absolute path without a root but cannot place a relative one", () => {
+    expect(absoluteWorkspacePath("/tmp/a.md", null)).toBe("/tmp/a.md");
+    expect(absoluteWorkspacePath("docs/a.md", null)).toBeNull();
   });
 });

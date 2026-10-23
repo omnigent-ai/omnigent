@@ -85,6 +85,17 @@ def _paste_image(target: Locator, filename: str) -> None:
     )
 
 
+def _wait_for_blocked_reply(page: Page, mock_url: str, who: str) -> None:
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        response = httpx.get(f"{mock_url}/gate/pending", timeout=5.0)
+        response.raise_for_status()
+        if response.json()["pending"]:
+            return
+        page.wait_for_timeout(50)
+    pytest.fail(f"{who} never reached the blocked LLM response")
+
+
 def _start_side_chat(page: Page, entrypoint: str, question: str) -> None:
     if entrypoint == "slash":
         page.get_by_placeholder("Send a message…").fill(f"/side {question}")
@@ -634,15 +645,7 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         assert len(side_chat_forks) == 1
         child_id = side_chat_forks[0]
 
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            response = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0)
-            response.raise_for_status()
-            if response.json()["pending"]:
-                break
-            page.wait_for_timeout(50)
-        else:
-            pytest.fail("The side chat never reached the blocked LLM response")
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The side chat")
 
         parent_items = _items(base_url, session_id)
         page.get_by_test_id("side-chat-input").fill(followup)
@@ -668,6 +671,60 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         assert followup in str(_items(base_url, child_id))
         assert question not in str(_items(base_url, session_id))
         expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+
+
+def test_side_chat_opened_while_parent_runs_answers_only_its_question(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """A side chat forked mid-turn must not run the parent's unanswered message itself."""
+    base_url, session_id = seeded_session
+    parent_question = f"main-task-{session_id}: keep working on the main task"
+    question = f"side-task-{session_id}: answer this side question"
+    parent_reply = "The main task is done."
+    repeated_parent_reply = "Answering the main task again."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply, "block": True}, {"text": repeated_parent_reply}],
+        key=f"main-task-{session_id}",
+        match=f"main-task-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The side answer."}],
+        key=f"side-task-{session_id}",
+        match=f"side-task-{session_id}",
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        page.get_by_placeholder("Send a message…").fill(parent_question)
+        page.get_by_role("button", name="Send", exact=True).click()
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The parent")
+        _start_side_chat(page, "panel", question)
+
+        pane = page.locator(".side-chat-backdrop")
+        expect(pane.locator(_ASSISTANT).filter(has_text="The side answer.")).to_be_visible(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        assert len(side_chat_forks) == 1
+        assert repeated_parent_reply not in str(_items(base_url, side_chat_forks[0]))
+        expect(pane.get_by_text(repeated_parent_reply, exact=True)).to_have_count(0)
+
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+        expect(page.locator(_ASSISTANT).filter(has_text=parent_reply)).to_be_visible(
+            timeout=30_000
+        )
+        model_inputs = [
+            json.dumps(request.get("input", []))
+            for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+        ]
+        assert sum(parent_question in text and question not in text for text in model_inputs) == 1
     finally:
         httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
 

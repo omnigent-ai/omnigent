@@ -46,6 +46,9 @@ catalog:
   '@shikijs/transformers': 4.5.0
   '@shikijs/stream': 4.5.0
   vite: 8.1.6
+  # Keep workspace test runners and their coverage provider on one release.
+  vitest: 4.1.12
+  '@vitest/coverage-v8': 4.1.12
 
 overrides:
   # Keep build-tool upgrades explicit and validate their bundles: incompatible

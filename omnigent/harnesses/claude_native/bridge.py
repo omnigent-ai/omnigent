@@ -43,6 +43,7 @@ import os
 import queue
 import re
 import secrets
+import select
 import shlex
 import socket
 import socketserver
@@ -7245,6 +7246,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/pi/extension-ui",
                 "/hook/observe-tool",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -7278,6 +7280,9 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
+                return
+            if self.path == "/hook/pi/extension-ui":
+                self._handle_pi_extension_ui(payload)
                 return
             name = payload.get("name")
             arguments = payload.get("arguments")
@@ -7420,19 +7425,40 @@ def _tool_relay_handler_factory(
             self._respond_hook_output(hook_output)
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
+            self._proxy_parked_request(payload, "/policies/evaluate")
+
+        def _handle_pi_extension_ui(self, payload: _JsonObject) -> None:
+            self._proxy_parked_request(payload, "/hooks/pi-extension-ui", watch_disconnect=True)
+
+        def _proxy_parked_request(
+            self, payload: _JsonObject, path: str, *, watch_disconnect: bool = False
+        ) -> None:
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            import urllib.parse as _up
-
-            session_component = _up.quote(session_id, safe="")
-            url = f"/v1/sessions/{session_component}/policies/evaluate"
+            session_component = urllib.parse.quote(session_id, safe="")
+            url = f"/v1/sessions/{session_component}{path}"
             future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
             try:
+                if watch_disconnect:
+                    deadline = time.monotonic() + 86400.0
+                    while not future.done():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Dialog wait expired")
+                        try:
+                            readable, _, _ = select.select([self.connection], [], [], 0.1)
+                            if readable:
+                                # EOF or pipelined bytes end this single-request wait.
+                                return
+                        except OSError:
+                            return
                 resp = future.result(timeout=86400.0)
             except Exception as exc:  # noqa: BLE001
                 self._send_policy_proxy_error(exc)
                 return
+            finally:
+                # Closing a dialog releases the upstream parked card.
+                future.cancel()
             raw = resp.content
             self.send_response(resp.status_code)
             for header in ("Content-Type", "Content-Length"):

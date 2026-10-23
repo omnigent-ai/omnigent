@@ -21,6 +21,7 @@ import {
   containsMarkdownTable,
   dispatchInitialPrompt,
   failedSessionLastError,
+  isComposerReadOnly,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
@@ -53,7 +54,7 @@ import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 // or hide the share button from managers.
 
 function composerState(permissionLevel: number | null) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = isComposerReadOnly(permissionLevel, null, null);
   const canType = !isReadOnly;
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
@@ -90,6 +91,17 @@ describe("Composer permission gating", () => {
     const state = composerState(null);
     expect(state.isReadOnly).toBe(false);
     expect(state.canType).toBe(true);
+  });
+
+  it("a structural read-only reason locks the composer at any level", () => {
+    expect(isComposerReadOnly(4, "Mirrored transcript", null)).toBe(true);
+    expect(isComposerReadOnly(null, "Mirrored transcript", null)).toBe(true);
+  });
+
+  it("a temporary send block keeps the level-1 startup fallback editable", () => {
+    // A client-only conversation falls back to level 1 before its session
+    // exists; the send block, not read-only, is what holds submission.
+    expect(isComposerReadOnly(1, null, "Starting the session…")).toBe(false);
   });
 });
 

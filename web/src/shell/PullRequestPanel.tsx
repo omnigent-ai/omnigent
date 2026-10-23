@@ -1269,7 +1269,9 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         </div>
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
-        <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
+        <div className="shrink-0 border-b border-border p-2 [&>:first-child]:mt-0">
+          {linkControls}
+        </div>
       )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p

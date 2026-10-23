@@ -5583,6 +5583,54 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
     _run(_test())
 
 
+@pytest.mark.parametrize(
+    "method, handler_mode, expected",
+    [
+        ("confirm", "accept", {"confirmed": True}),
+        ("select", "accept", {"value": "Allow"}),
+        ("notify", "missing", None),
+        ("confirm", "missing", {"confirmed": False}),
+        ("confirm", "timeout", {"confirmed": False}),
+    ],
+)
+def test_pi_extension_ui_rpc_round_trip(method: str, handler_mode: str, expected: dict | None):
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request",
+                id="dialog",
+                method=method,
+                title="Continue?",
+                options=["Allow", "Block"],
+                timeout=20,
+            ),
+            _rpc_frame(type="agent_end", messages=[]),
+            _rpc_frame(type="agent_settled"),
+        ]
+    )
+
+    async def answer(elicitation_id: str, params: ElicitationRequestParams) -> ElicitationResult:
+        assert elicitation_id == "elicit_pi_dialog"
+        assert params.mode == "form" and params.message == "Continue?"
+        if handler_mode == "timeout":
+            await asyncio.sleep(1)
+        return ElicitationResult(action="accept", content={"0": "Allow"})
+
+    if handler_mode != "missing":
+        executor._form_elicitation_handler = answer
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert rpc.process is not None and isinstance(rpc.process.stdin, _FakeStreamWriter)
+    commands = [json.loads(line) for line in b"".join(rpc.process.stdin.data).splitlines()]
+    responses = [cmd for cmd in commands if cmd.get("type") == "extension_ui_response"]
+    assert responses == (
+        [] if expected is None else [{"type": "extension_ui_response", "id": "dialog", **expected}]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reasoning effort → pi thinking level
 # ---------------------------------------------------------------------------
@@ -5932,6 +5980,30 @@ def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
     assert _SESSION_KEY not in executor._session_states, "the RPC session was kept"
     # ``_PiRpcSession.close`` terminates the process and then clears it.
     assert rpc.process is None, "the pi process was not closed"
+
+
+def test_extension_answer_write_failure_evicts_waiting_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request", id="dialog", method="confirm", title="Continue?"
+            ),
+        ]
+    )
+    send = rpc.send_command
+
+    async def fail_answer(command: dict) -> None:
+        if command.get("type") == "extension_ui_response":
+            raise BrokenPipeError("test dialog response write failed")
+        await send(command)
+
+    monkeypatch.setattr(rpc, "send_command", fail_answer)
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, ExecutorError) for event in events)
+    _assert_session_evicted(executor, rpc)
 
 
 def _retry_recovery_frames(recovered: str) -> list[str]:
