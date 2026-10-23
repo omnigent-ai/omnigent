@@ -116,6 +116,12 @@ class MainActivity : AppCompatActivity() {
     // Bumped on every server load so a late cookie callback can't load a stale one.
     private var loadGeneration = 0
 
+    // True while [releaseSessionCookies] waits on an expiry for the current load.
+    private var releasingSessionCookies = false
+
+    // The server whose crash-recovery page waits for that release to finish.
+    private var recoveryAfterRelease: String? = null
+
     // CookieManager.setCookie's completion is async; substitutable so a test
     // can hold the callback across a server switch (SessionTokenBindingTest).
     @androidx.annotation.VisibleForTesting
@@ -368,7 +374,10 @@ class MainActivity : AppCompatActivity() {
         // A page left running under the cover keeps calling its server and could start a
         // sign-in of its own; the session's page loads fresh once it is ready.
         if (webView.url != null) webView.loadUrl(BLANK_PAGE)
-        oidcController().connect(serverUrl, interactive)
+        // Clear another port's session before sign-in sets this server's cookie; the old
+        // session stops first so its renewals can't reinstall the cookie meanwhile.
+        oidcSession?.stop()
+        releaseSessionCookies(pinnedOrigin) { oidcController().connect(serverUrl, interactive) }
     }
 
     private fun oidcController(): OidcSessionController =
@@ -1045,21 +1054,26 @@ class MainActivity : AppCompatActivity() {
             // The local recovery page has no bridge — surface the pill straight
             // away as the recovery affordance.
             revealServerSwitcherNow()
-            // Offline page (no network) so it can't re-trigger the crash.
-            webView.loadDataWithBaseURL(
-                null,
-                recoveryErrorHtml(serverUrl),
-                "text/html",
-                "utf-8",
-                null,
-            )
+            // Its Reload link would skip a pending release; show it once the old session is gone.
+            if (releasingSessionCookies) {
+                recoveryAfterRelease = serverUrl
+                return
+            }
+            showRecoveryPage(serverUrl)
             return
         }
 
         // Reload the user's route; a blank or foreign URL falls back to the root.
         val reloadUrl =
             if (lastUrl != null && originOf(lastUrl) == pinnedOrigin) lastUrl else serverUrl
+        // A pending release finishes this server's load (or native connect) itself.
+        if (releasingSessionCookies) return
         loadReleasingSessionCookies(reloadUrl, pinnedOrigin)
+    }
+
+    // Offline page (no network) so it can't re-trigger the crash.
+    private fun showRecoveryPage(serverUrl: String) {
+        webView.loadDataWithBaseURL(null, recoveryErrorHtml(serverUrl), "text/html", "utf-8", null)
     }
 
     /**
@@ -1433,32 +1447,41 @@ class MainActivity : AppCompatActivity() {
         connectServer(serverUrl, interactive)
     }
 
-    /**
-     * Load [serverUrl] once no other origin's session is left for its host:
-     * cookies are host-scoped, not port-scoped. The owner per host is recorded;
-     * an unrecorded host is ambiguous only if another saved server shares it.
-     */
+    /** Load [serverUrl] once [releaseSessionCookies] has cleared [origin]'s host. */
     private fun loadReleasingSessionCookies(
         serverUrl: String,
         origin: String?,
+    ) = releaseSessionCookies(origin) { webView.loadUrl(serverUrl) }
+
+    /**
+     * Run [then] once no other origin's session is left for [origin]'s host:
+     * cookies are host-scoped, not port-scoped. The owner per host is recorded;
+     * an unrecorded host is ambiguous only if another saved server shares it.
+     */
+    private fun releaseSessionCookies(
+        origin: String?,
+        then: () -> Unit,
     ) {
         val generation = ++loadGeneration
+        releasingSessionCookies = false
+        recoveryAfterRelease = null
         val host = origin?.let { Uri.parse(it).host }
-        if (origin == null || host == null) {
-            webView.loadUrl(serverUrl)
-            return
-        }
+        if (origin == null || host == null) return then()
         val store = ServerStore(this)
         val owner = store.sessionCookieOwner(host) ?: unrecordedSessionOwner(store, host, origin)
-        val load = {
+        val proceed = {
             store.recordSessionCookieOwner(host, origin)
-            webView.loadUrl(serverUrl)
+            val recovery = recoveryAfterRelease
+            recoveryAfterRelease = null
+            if (recovery != null) showRecoveryPage(recovery) else then()
         }
-        if (owner == origin) return load()
+        if (owner == origin) return proceed()
+        releasingSessionCookies = true
         expireSessionCookies(origin, generation) { cleared ->
             if (isDestroyed || generation != loadGeneration) return@expireSessionCookies
+            releasingSessionCookies = false
             if (cleared) {
-                load()
+                proceed()
             } else {
                 // Never hand the old session to this server; let the user retry.
                 startActivity(Intent(this, ConnectActivity::class.java))
