@@ -4395,6 +4395,39 @@
         "title": "NativeUsageBaseline",
         "type": "object"
       },
+      "OpenFileRequest": {
+        "additionalProperties": false,
+        "description": "A workspace-relative file to show, without reading or modifying it.",
+        "properties": {
+          "path": {
+            "description": "Workspace-relative file path.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "OpenFileRequest",
+        "type": "object"
+      },
+      "OpenFileResponse": {
+        "description": "Delivery to live streams is not an acknowledgement from a file viewer.",
+        "properties": {
+          "subscribers": {
+            "format": "int64",
+            "title": "Subscribers",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "subscribers"
+        ],
+        "title": "OpenFileResponse",
+        "type": "object"
+      },
       "OutputFileDoneEvent": {
         "description": "A streamed file output completed materializing.\n\nEmitted by `_emit_file_annotation_events` in\n`omnigent/runtime/workflow.py` once per file annotation in\nthe assistant's output. `filename` and `content_type` are\nonly populated when the originating annotation carried them.",
         "properties": {
@@ -6010,7 +6043,8 @@
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
             "turn.completed": "#/components/schemas/TurnCompletedEvent",
             "turn.failed": "#/components/schemas/TurnFailedEvent",
-            "turn.started": "#/components/schemas/TurnStartedEvent"
+            "turn.started": "#/components/schemas/TurnStartedEvent",
+            "ui.open_file": "#/components/schemas/UiOpenFileEvent"
           },
           "propertyName": "type"
         },
@@ -6125,6 +6159,9 @@
           },
           {
             "$ref": "#/components/schemas/BrowserActionRequestEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UiOpenFileEvent"
           },
           {
             "$ref": "#/components/schemas/PolicyDeniedEvent"
@@ -9519,6 +9556,39 @@
           "session_id"
         ],
         "title": "TurnStartedEvent",
+        "type": "object"
+      },
+      "UiOpenFileEvent": {
+        "description": "Ask current session viewers to open a workspace-relative file; never replayed.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "ui.open_file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "path"
+        ],
+        "title": "UiOpenFileEvent",
         "type": "object"
       },
       "UpdateCodexGoalStatusRequest": {
@@ -17661,6 +17731,59 @@
           }
         },
         "summary": "Stream Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/ui/open-file": {
+      "post": {
+        "description": "Ask current viewers to open a workspace-relative file.\n\nRequires session edit access. Requests are transient and never replayed.\nThe subscriber count measures stream delivery, not successful display:\nbackground subscribers may ignore the request, and the viewer retains\nits normal filesystem permissions, error handling and unsaved-edit guard.",
+        "operationId": "open_file_v1_sessions__session_id__ui_open_file_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenFileResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open File",
         "tags": [
           "sessions"
         ]
