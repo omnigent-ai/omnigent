@@ -35,7 +35,6 @@ mlflow = "2026-09-05T00:00:00Z"
 mlflow-skinny = "2026-09-05T00:00:00Z"
 mlflow-tracing = "2026-09-05T00:00:00Z"
 nimble-python = "2026-07-29T00:00:00Z"
-pillow = "2026-10-17T00:00:00Z"
 
 [manifest]
 members = [
@@ -3490,7 +3489,7 @@ requires-dist = [
     { name = "opentelemetry-sdk", marker = "extra == 'tracing'", specifier = ">=1.20,<2" },
     { name = "packaging", specifier = ">=23,<27" },
     { name = "pexpect", marker = "sys_platform != 'win32'", specifier = ">=4.9,<5" },
-    { name = "pillow", specifier = ">=13,<14" },
+    { name = "pillow", specifier = ">=12.2,<14" },
     { name = "prompt-toolkit", specifier = ">=3.0,<4" },
     { name = "protobuf", specifier = ">=6,<8" },
     { name = "protobuf", marker = "extra == 'antigravity'", specifier = ">=7,<8" },

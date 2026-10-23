@@ -32,6 +32,7 @@ from omnigent.harnesses.claude_native.bridge import (
     TranscriptReadResult,
     _display_text,
     _transcript_items_from_entry,
+    _transcript_timestamp,
     compute_transcript_cumulative_cost,
     read_active_session_id,
     read_bridge_id,
@@ -59,6 +60,9 @@ from omnigent.native._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
+)
+from omnigent.native._native_supersession import (
+    post_clear_supersession as _post_clear_supersession,
 )
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -552,8 +556,11 @@ class _PendingCompaction:
     :param transcript_path: Claude transcript path from the ``PreCompact``
         hook as a string, or ``None`` when absent. Also used for
         correlation with wildcard semantics.
-    :param seen_at: Unix timestamp the ``PreCompact`` was observed, e.g.
-        ``1779922393.2``. Diagnostic only.
+    :param seen_at: Unix timestamp the ``PreCompact`` fired (its hook
+        record's ``recorded_at``), e.g. ``1779922393.2``, or ``None`` when the
+        record carried none or the token was minted by a standalone completion
+        hook. The hook-driven snapshot only binds to a ``compact_boundary``
+        written after it; an undated token has no lower bound.
     """
 
     seq: int
@@ -4349,6 +4356,7 @@ async def _forward_available_status_events(
                             else None
                         ),
                         event_cursor=record.event_cursor,
+                        recorded_at=record.recorded_at,
                     )
                 elif compaction_status == "completed":
                     # Secondary, best-effort persist. The transcript's
@@ -4366,6 +4374,7 @@ async def _forward_available_status_events(
                             else None
                         ),
                     )
+                    summary_not_before: float | None = None
                     if seq is None:
                         # No pending token: either the transcript path already
                         # persisted this boundary (a trailing ack to absorb),
@@ -4375,6 +4384,10 @@ async def _forward_available_status_events(
                         # exactly one boundary in the latter case, or resume
                         # reloads the full pre-compaction history.
                         seq = await _claim_standalone_completion(bridge_dir)
+                    else:
+                        # Only a boundary written after this ``PreCompact`` fired
+                        # belongs to the compaction being completed.
+                        summary_not_before = await _pending_compaction_seen_at(bridge_dir, seq)
                     if seq is not None:
                         # Persist the boundary with the SAME hold-cursor +
                         # backoff discipline as the transcript path (P2-2). A
@@ -4400,6 +4413,7 @@ async def _forward_available_status_events(
                                 client,
                                 session_id=session_id,
                                 bridge_dir=bridge_dir,
+                                summary_not_before=summary_not_before,
                                 allow_snapshot_fallback=compaction_retry_tracker.snapshot_fallback_due(
                                     snapshot_retry_key
                                 ),
@@ -5490,6 +5504,7 @@ async def _prescan_precompact_edges(
                 str(record.transcript_path) if record.transcript_path is not None else None
             ),
             event_cursor=record.event_cursor,
+            recorded_at=record.recorded_at,
         )
 
 
@@ -5644,112 +5659,6 @@ def _validated_transcript_state(
         cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, end_offset),
         seen_source_ids=state.seen_source_ids,
     )
-
-
-async def _post_clear_supersession(
-    client: httpx.AsyncClient,
-    *,
-    old_session_id: str,
-    new_session_id: str,
-    agent_name: str,
-) -> None:
-    """
-    Notify the superseded session that a ``/clear`` rotated it away.
-
-    Posts three best-effort events to the OLD conversation, in order:
-
-    1. An ``external_session_status: idle`` so the old conversation's
-       "Working…" spinner stops — its terminal moved to the new session,
-       so it will never receive the turn-end edge that would normally
-       clear it.
-    2. A persisted assistant ``message`` item linking to the new
-       conversation, so a later reload of the cleared conversation
-       explains what happened and offers the continuation link. This is
-       the durable record — it survives reconnects.
-    3. A transient ``external_session_superseded`` event the server
-       republishes as ``session.superseded``, so a client *actively*
-       viewing the old conversation auto-redirects to the new one.
-
-    Each failure is logged and swallowed: the rotation has already
-    completed and reset forwarder state, and a notification error must
-    not disrupt the poll loop or stop the new session from forwarding.
-
-    :param client: Omnigent HTTP client (``base_url`` = AP server).
-    :param old_session_id: Superseded conversation id, e.g. ``"conv_old"``.
-    :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
-    :param agent_name: Agent name to stamp on the notice message — an
-        assistant ``message`` item requires one.
-    :returns: None.
-    """
-    if old_session_id == new_session_id:
-        # Defensive: never address the notice/redirect at the live session.
-        # The caller resolves the old id from the pre-rotation forwarder
-        # state, but if that ever collapses to the new id, posting here
-        # would dump the "you were cleared" banner onto the active chat.
-        return
-    try:
-        status_resp = await client.post(
-            f"/v1/sessions/{url_component(old_session_id)}/events",
-            json={
-                "type": "external_session_status",
-                "data": {"status": "idle"},
-            },
-        )
-        status_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-            extra={"session_id": old_session_id},
-        )
-    notice = (
-        "This conversation was ended by `/clear`. "
-        f"Continue in [the new chat](/c/{new_session_id}). "
-        "You can also send a message here to resume this conversation."
-    )
-    try:
-        item_resp = await client.post(
-            f"/v1/sessions/{url_component(old_session_id)}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "message",
-                    "item_data": {
-                        "role": "assistant",
-                        "agent": agent_name,
-                        "content": [{"type": "output_text", "text": notice}],
-                    },
-                },
-            },
-        )
-        item_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-            extra={"session_id": old_session_id},
-        )
-    try:
-        event_resp = await client.post(
-            f"/v1/sessions/{url_component(old_session_id)}/events",
-            json={
-                "type": "external_session_superseded",
-                "data": {"target_conversation_id": new_session_id},
-            },
-        )
-        event_resp.raise_for_status()
-    except httpx.HTTPError:
-        _logger.warning(
-            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
-            old_session_id,
-            new_session_id,
-            exc_info=True,
-            extra={"session_id": old_session_id},
-        )
 
 
 async def _post_external_conversation_item(
@@ -6574,21 +6483,21 @@ def _compaction_summary_boundary(
     return None
 
 
-def _restore_preserved_compaction_messages(
+def _latest_compact_summary_uuid(
     transcript_path: Path,
-    messages: list[tuple[str, dict[str, object]]],
     *,
-    expected_summary_uuid: str | None = None,
-) -> list[tuple[str, dict[str, object]]]:
-    """Restore recent turns retained outside the summary's parent chain.
+    not_before: float | None = None,
+) -> str:
+    """Return the summary uuid of the transcript's latest ``compact_boundary``.
 
-    Incomplete references raise so the caller retries instead of committing a
-    snapshot that permanently drops retained context.
-
-    Visibility matches claude_agent_sdk._internal.sessions._is_visible_message.
+    Raises while that boundary or its ``isCompactSummary`` record is not on
+    disk yet, or when the boundary predates ``not_before`` (Claude writes it
+    after ``PreCompact``, so an older one belongs to an earlier compaction);
+    the caller retries instead of snapshotting the pre-compaction history.
     """
     records: dict[str, dict[str, object]] = {}
-    boundaries: list[dict[str, object]] = []
+    boundary: dict[str, object] | None = None
+    summaries: list[dict[str, object]] = []
     with transcript_path.open(encoding="utf-8") as transcript:
         for line in transcript:
             try:
@@ -6599,24 +6508,65 @@ def _restore_preserved_compaction_messages(
                 continue
             records[record["uuid"]] = record
             if record.get("type") == "system" and record.get("subtype") == "compact_boundary":
-                boundaries.append(record)
-    boundary: dict[str, object] | None
-    if expected_summary_uuid is not None:
-        summary = records.get(expected_summary_uuid)
-        if (
-            summary is None
-            or summary.get("type") != "user"
-            or summary.get("isCompactSummary") is not True
-            or not isinstance(summary.get("parentUuid"), str)
-        ):
-            raise ValueError("Claude compaction summary identity is not available")
-        boundary = _compaction_summary_boundary(records, summary)
-        if boundary is None:
-            raise ValueError("Claude compaction summary boundary is not available")
-    else:
-        boundary = boundaries[-1] if boundaries else None
+                boundary = record
+            elif record.get("type") == "user" and record.get("isCompactSummary") is True:
+                summaries.append(record)
     if boundary is None:
-        return messages
+        raise ValueError("Claude compaction boundary is not available yet")
+    boundary_written_at = _transcript_timestamp(boundary.get("timestamp"))
+    if not_before is not None and (
+        boundary_written_at is None or boundary_written_at < not_before
+    ):
+        raise ValueError("Claude compaction boundary predates the pending compaction")
+    summary_uuid = next(
+        (
+            summary["uuid"]
+            for summary in reversed(summaries)
+            if _compaction_summary_boundary(records, summary) == boundary
+        ),
+        None,
+    )
+    if not isinstance(summary_uuid, str):
+        raise ValueError("Claude compaction summary is not available yet")
+    return summary_uuid
+
+
+def _restore_preserved_compaction_messages(
+    transcript_path: Path,
+    messages: list[tuple[str, dict[str, object]]],
+    *,
+    expected_summary_uuid: str,
+) -> list[tuple[str, dict[str, object]]]:
+    """Restore recent turns retained outside the summary's parent chain.
+
+    The snapshot is bound to ``expected_summary_uuid``: its ``isCompactSummary``
+    record and ``compact_boundary`` must already be in the transcript.
+    Incomplete references raise so the caller retries instead of committing a
+    snapshot that permanently drops retained context.
+
+    Visibility matches claude_agent_sdk._internal.sessions._is_visible_message.
+    """
+    records: dict[str, dict[str, object]] = {}
+    with transcript_path.open(encoding="utf-8") as transcript:
+        for line in transcript:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not isinstance(record.get("uuid"), str):
+                continue
+            records[record["uuid"]] = record
+    summary = records.get(expected_summary_uuid)
+    if (
+        summary is None
+        or summary.get("type") != "user"
+        or summary.get("isCompactSummary") is not True
+        or not isinstance(summary.get("parentUuid"), str)
+    ):
+        raise ValueError("Claude compaction summary identity is not available")
+    boundary = _compaction_summary_boundary(records, summary)
+    if boundary is None:
+        raise ValueError("Claude compaction summary boundary is not available")
     metadata = boundary.get("compactMetadata")
     if not isinstance(metadata, dict):
         return messages
@@ -6675,7 +6625,7 @@ def _restore_preserved_compaction_messages(
         or _compaction_summary_boundary(records, summary) != boundary
     ):
         raise ValueError("Claude compaction summary is not available yet")
-    if expected_summary_uuid is not None and anchor != expected_summary_uuid:
+    if anchor != expected_summary_uuid:
         raise ValueError("Claude compaction summary does not match the active item")
     snapshot: list[tuple[str, dict[str, object]]] = []
     included: set[str] = set()
@@ -6720,6 +6670,7 @@ async def _persist_native_compaction_item(
     bridge_dir: Path,
     summary_override: str | None = None,
     summary_source_id: str | None = None,
+    summary_not_before: float | None = None,
     allow_snapshot_fallback: bool = False,
 ) -> None:
     """
@@ -6736,7 +6687,10 @@ async def _persist_native_compaction_item(
     transcript via ``get_session_messages`` and restores turns retained by
     Claude's compaction metadata. It includes them as ``compacted_messages``
     so session resume in ephemeral environments can reconstruct context
-    without the CLI's local transcript files.
+    without the CLI's local transcript files. Both paths bind the snapshot
+    to one ``isCompactSummary`` record and raise until Claude has written
+    it, so a completion hook processed before the boundary reaches disk
+    retries instead of snapshotting the pre-compaction history.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -6748,7 +6702,11 @@ async def _persist_native_compaction_item(
         text) falls back to a generic placeholder.
     :param summary_source_id: Transcript item source id for the
         ``isCompactSummary`` path. When supplied, the local snapshot must
-        resolve the same Claude summary UUID; hook-driven calls omit it.
+        resolve the same Claude summary UUID; hook-driven calls omit it and
+        bind to the transcript's latest ``compact_boundary`` instead.
+    :param summary_not_before: Unix timestamp the completed compaction's
+        ``PreCompact`` fired, for hook-driven calls. A latest boundary
+        written before it belongs to an earlier compaction and is retried.
     :param allow_snapshot_fallback: Persist the unchanged SDK snapshot, or
         no snapshot if the SDK read failed, when the local retry budget is spent.
     :raises _CompactionSnapshotError: If the native snapshot cannot be read
@@ -6814,6 +6772,14 @@ async def _persist_native_compaction_item(
             raise ValueError("Claude session reader returned no usable messages")
         sdk_message_count = len(native_messages)
         transcript_path = read_transcript_path(bridge_dir)
+        if expected_summary_uuid is None:
+            if transcript_path is None:
+                raise ValueError("Claude transcript path is unavailable")
+            expected_summary_uuid = await asyncio.to_thread(
+                _latest_compact_summary_uuid,
+                transcript_path,
+                not_before=summary_not_before,
+            )
         if transcript_path is not None:
             native_messages = await asyncio.to_thread(
                 _restore_preserved_compaction_messages,
@@ -6821,9 +6787,7 @@ async def _persist_native_compaction_item(
                 native_messages,
                 expected_summary_uuid=expected_summary_uuid,
             )
-        if expected_summary_uuid is not None and not any(
-            message_id == expected_summary_uuid for message_id, _ in native_messages
-        ):
+        if not any(message_id == expected_summary_uuid for message_id, _ in native_messages):
             raise ValueError("Claude compaction snapshot does not contain the active summary")
     except Exception as exc:
         if not allow_snapshot_fallback:
@@ -7314,6 +7278,7 @@ async def _note_precompact(
     claude_session_id: str | None,
     transcript_path: str | None,
     event_cursor: int | None = None,
+    recorded_at: float | None = None,
 ) -> None:
     """
     Record that a ``PreCompact`` fired, minting a fresh pending token.
@@ -7338,6 +7303,10 @@ async def _note_precompact(
     :param transcript_path: Claude transcript path from the hook, or ``None``.
     :param event_cursor: Hook ``event_cursor`` of this ``PreCompact`` record,
         or ``None`` to always mint (no idempotency key).
+    :param recorded_at: Unix timestamp the hook process recorded the
+        ``PreCompact``, or ``None`` to leave the token undated. The hook-driven
+        snapshot only binds to a boundary written after this stamp, so a late
+        poll must not date the token later than the hook fired.
     :returns: None.
     """
 
@@ -7355,7 +7324,7 @@ async def _note_precompact(
                     seq=next_seq,
                     claude_session_id=claude_session_id,
                     transcript_path=transcript_path,
-                    seen_at=time.time(),
+                    seen_at=recorded_at,
                 ),
                 last_seq=next_seq,
                 persisted_seqs=state.persisted_seqs,
@@ -7445,6 +7414,32 @@ async def _consume_pending_compaction(
         return pending.seq
 
     return await asyncio.to_thread(_check)
+
+
+async def _pending_compaction_seen_at(bridge_dir: Path, seq: int) -> float | None:
+    """
+    Return when the pending ``PreCompact`` for ``seq`` fired, if known.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param seq: The pending compaction sequence number being completed.
+    :returns: The token's ``seen_at``, or ``None`` when ``seq`` is not the
+        pending token or the token was minted by a standalone completion.
+        Standalone tokens carry neither a session id nor a transcript path;
+        older forwarders stamped them with the hook's poll time, which must
+        not date the boundary. They therefore have no lower bound: a standalone
+        completion processed before Claude writes the new records binds to the
+        newest boundary already on disk.
+    """
+
+    def _read() -> float | None:
+        pending = _read_compaction_state(bridge_dir).pending
+        if pending is None or pending.seq != seq:
+            return None
+        if pending.claude_session_id is None and pending.transcript_path is None:
+            return None
+        return pending.seen_at
+
+    return await asyncio.to_thread(_read)
 
 
 async def _mark_compaction_persisted(
@@ -7713,7 +7708,6 @@ async def _claim_standalone_completion(bridge_dir: Path) -> int | None:
                     seq=next_seq,
                     claude_session_id=None,
                     transcript_path=None,
-                    seen_at=time.time(),
                 ),
                 last_seq=next_seq,
                 persisted_seqs=state.persisted_seqs,

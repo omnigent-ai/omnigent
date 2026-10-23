@@ -20,6 +20,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -12996,17 +12997,18 @@ class _ScriptedPolicyClient:
         self.steps = list(steps)
         self.calls = 0
         self.bodies: list[dict[str, object] | None] = []
+        self.urls: list[str] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
         """Replay the next step as a minimal httpx-Response-shaped namespace.
 
-        :param url: Evaluate path (ignored).
+        :param url: Forwarded session path, recorded for routing checks.
         :param json: Forwarded EvaluationRequest; recorded for identity checks.
         :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
-        del url
+        self.urls.append(url)
         self.bodies.append(json)
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
@@ -13364,6 +13366,77 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_pi_extension_ui_relay_path_proxies_to_session_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool relay forwards ``/hook/pi/extension-ui`` to the session hook."""
+
+    client = _ScriptedPolicyClient({"type": "extension_ui_response", "confirmed": True})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/pi/extension-ui",
+            {
+                "elicitation_id": "elicit_pi_" + "ab" * 16,
+                "request": {"method": "confirm", "title": "Clear?", "message": "Lost."},
+            },
+        )
+        assert json.loads(body) == {"type": "extension_ui_response", "confirmed": True}
+        assert client.urls == ["/v1/sessions/conv_hook_eval/hooks/pi-extension-ui"]
+        assert client.bodies[0]["elicitation_id"] == "elicit_pi_" + "ab" * 16
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_bytes", [False, True])
+async def test_pi_dialog_disconnect_cancels_upstream_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_bytes: bool
+) -> None:
+    """Client EOF or pipelined bytes release the upstream wait without spinning."""
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class WaitingClient:
+        async def post(self, url, json):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, WaitingClient())
+    info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+    from urllib.parse import urlsplit
+
+    url = urlsplit(info["url"])
+    _, writer = await asyncio.open_connection(url.hostname, url.port)
+    try:
+        body = json.dumps({"elicitation_id": "cancel-check", "request": {"method": "confirm"}})
+        writer.write(
+            (
+                "POST /hook/pi/extension-ui HTTP/1.1\r\n"
+                f"Host: {url.netloc}\r\nAuthorization: Bearer {info['token']}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+            ).encode()
+        )
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if extra_bytes:
+            writer.write(b"unexpected pipelined bytes")
+            await writer.drain()
+        else:
+            writer.close()
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+    finally:
+        writer.close()
+        with suppress(ConnectionResetError):
+            await writer.wait_closed()
+        relay.close()
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

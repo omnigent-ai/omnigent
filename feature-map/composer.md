@@ -39,6 +39,15 @@ and steers messages while the agent is busy.
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
+  Codex, and Devin native sessions steps through every mode in the chip's menu,
+  including Full Access and Dangerous, wrapping while the chip is clickable. States:
+  slash/mention menu acting on Tab, chip disabled, session in a mode the chip can't switch back to
+  (Codex read-only, Claude Don't ask; menu only), change in flight (Shift+Tab
+  holds focus without sending another request; Tab still moves focus forward), change
+  refused or failed (next press moves past it, or retries it when it is the only
+  other mode), no other mode (native focus move, no
+  `aria-keyshortcuts`).
 - `managed-mcp-picker`: choose administrator-configured services before launch
   on a host or sandbox. States: loading, empty, error/retry, selected, unavailable,
   remembered selection, explicitly none, restored connection needing sign-in.
@@ -120,6 +129,8 @@ and steers messages while the agent is busy.
   it is connected; click it to open the host menu.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
+- With focus in the prompt, press Shift+Tab to step the permission mode without
+  opening the menu; the draft and focus stay put.
 - For a custom `claude-sdk` or `codex` agent session, open configuration and
   pick an effort rung; the ladder is the harness's declared family (anthropic
   or openai) and the pick persists on the session. Changing effort after a
@@ -315,6 +326,18 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`permission-mode-hotkey`:** in session with a real Claude CLI,
+  `tests/e2e_ui/chat/test_claude_native_permission_switch_from_dont_ask.py::test_shift_tab_cycles_permission_mode_from_composer`.
+  The E2E is nightly; Codex and Devin have component tests but no dedicated
+  shortcut E2E in the suite.
+  Component tests cover the in-flight, refused, downgraded, next-lap, menu-reset,
+  Codex/Devin full cycles, slash-menu, viewer, read-only
+  and unreachable states in `web/src/pages/ChatPage.composer.test.tsx`, mention-menu
+  priority in `web/src/pages/ChatPage.mention.test.tsx`; mode ordering and
+  wraparound are in
+  `web/src/lib/permissionModeCycle.test.ts`.
+  `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
+  page leaves the launch mode unchanged and does not prevent focus traversal.
 - **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
   permission-mode picker has component coverage in
   `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort

@@ -28,7 +28,7 @@ lifecycle metadata.
 
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
-| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI flag reserved for the automation rollout. Defining and exposing the flag does not change scheduling behavior by itself. |
+| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires claimed-run fire/recovery hooks and a transactional store; coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
@@ -60,11 +60,11 @@ for Claude working-status acceptance and kill-switch verification.
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
 
-Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
+The built-in server entrypoints do not yet supply the required execution/recovery
+hooks. Enabling `automations_v2` there fails startup, even if only UI changes are
+needed. A deployment wrapper must provide the hooks through `create_app()`.
 
-The persistence layer is available, but the persistent scheduler and its flag
-wiring are not integrated yet. The startup-recovery and cleanup-sweep rollback
-instructions below apply once that integration lands.
+Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
 
 Even with the flag off, an interrupted deletion can leave a hidden task row for
 cleanup. During a mixed-version deployment, older replicas can still show and

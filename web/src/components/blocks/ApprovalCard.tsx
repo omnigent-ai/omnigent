@@ -390,7 +390,9 @@ export function ApprovalCard({
         ? "Codex needs input"
         : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
           ? "Cursor has questions"
-          : "Claude has questions";
+          : policyName.startsWith("pi_") || phase.startsWith("pi_")
+            ? "Pi needs your input"
+            : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -782,7 +784,7 @@ export function ApprovalCard({
               </>
             ) : showGatingMessage ? (
               <>
-                <ElicitationMessage message={message} />
+                <ElicitationMessage message={message} className="whitespace-pre-line" />
                 {agyPermission?.actionDescription && (
                   <span
                     className="text-sm text-muted-foreground"
@@ -888,7 +890,7 @@ export function ApprovalCard({
           </>
         ) : (
           <>
-            <ElicitationMessage message={message} />
+            <ElicitationMessage message={message} className="whitespace-pre-line" />
             {agyPermission?.actionDescription && (
               <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
                 {agyPermission.actionDescription}

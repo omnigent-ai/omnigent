@@ -8,6 +8,7 @@ retain configuration, fault injection and behavioral assertions.
 | Need | Primitive | Existing example |
 | --- | --- | --- |
 | Bundle bytes and upload with caller metadata/client | `bundle_files`, `post_session_bundle` in [session.py](session.py) | [Headless subagent](../e2e/test_codex_native_headless_subagent_e2e.py) |
+| Send text through the session events API | `send_user_text` in [session.py](session.py), with caller-owned client/session | [Pi dialogs](../e2e/test_pi_extension_ui_round_trip.py), [native Codex](../e2e/test_host_codex_native_e2e.py) |
 | Trusted fixture with Python tools, custom policies, or host paths | `operator_agent_store`, `post_operator_session` in [operator_agents.py](operator_agents.py) | [Image result policies](../integration/test_mcp_image_http_round_trip.py) |
 | Browser-suite session for an explicit identity | `create_user_session` in [_multi_user_server.py](../e2e_ui/collaboration/_multi_user_server.py) | [Default-public sessions](../e2e_ui/collaboration/test_default_public_sessions.py) |
 | Isolated local server | `isolated_local_server` in [live_server.py](live_server.py) | [Multi-user server](../e2e_ui/collaboration/_multi_user_server.py) |

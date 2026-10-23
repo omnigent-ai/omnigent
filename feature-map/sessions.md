@@ -257,7 +257,9 @@ the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
 the same board. Open sidebar appears on the board or, when the board is hidden,
 in the conversation header. On desktop, hovering previews the sidebar and clicking
-opens it. The macOS app uses its existing titlebar toggle, Search, and Settings.
+opens it. At md and wider, the macOS app uses its existing titlebar toggle, Search,
+and Settings; in a narrower window it uses the conversation header's Open sidebar
+button and the drawer's Search and Settings, all right of or below the window buttons.
 On macOS desktop, the board and its controls stay below the window title bar,
 including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
@@ -318,7 +320,8 @@ a separate action that leaves the session connected.
 
 **Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
 parent composer, or choose **Start a new side chat** from the composer's add
-tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
+tray. Selecting assistant text also offers **Ask in side chat** unless the
+composer is read-only. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -342,7 +345,9 @@ keeps existing comments before that quote. Edit between quotes or after the last
 one, then send when ready. Paste an image into any reply text field after the
 side chat has started. The first question is text-only; an image paste there
 explains that the chat must be started first. Grid sessions use the same reply
-composer and support interleaved comments and pasted images too.
+composer and support interleaved comments and pasted images too. A viewer whose
+composer is read-only (for example a Read grant) gets neither **Reply** nor
+**Ask in side chat** when selecting parent text.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -614,6 +619,9 @@ plain `uv run pytest`, which starts a private server for the test.
   checks pending/live tab reuse, interleaved comments, pasted images, and replies
   sent only to the child. Hide Workspace and repeat Ask in side chat to verify
   a new tab opens instead of changing the hidden draft.
+  `tests/e2e_ui/collaboration/test_sharing_journey.py::test_share_grant_downgrade_revoke_journey`
+  checks that an Edit collaborator is offered Reply on selected text and a
+  Read viewer is not.
 - **`side-chat-quotes`, mobile drawer Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
   checks that Reply stays on screen and interleaved comments with a pasted image
@@ -781,7 +789,8 @@ plain `uv run pytest`, which starts a private server for the test.
   stays unbound.
 - Ask in side chat reuses only a visible, writable tab belonging to the current
   parent. Hidden, ended, and currently starting tabs are ineligible; another
-  selection opens a new unsent tab. Ended chats do not offer Reply.
+  selection opens a new unsent tab. Ended chats do not offer Reply, and a
+  read-only parent composer offers neither Reply nor Ask in side chat.
 - A phone-width browser run does not prove the mobile side-chat drawer in the
   embedded web app or the native apps. Both style the drawer only inside the
   app's own page area: placed outside it, the drawer stays off screen when

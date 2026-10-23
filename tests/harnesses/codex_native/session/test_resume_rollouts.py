@@ -1133,12 +1133,23 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
 
 @pytest.mark.parametrize(
     "separator_type",
-    [None, "resource_event", "error", "routing_decision", "slash_command", "terminal_command"],
+    [
+        None,
+        "resource_event",
+        "error",
+        "routing_decision",
+        "slash_command",
+        "terminal_command",
+        "interrupted_user",
+        "interrupted_assistant",
+        "interrupted_call",
+        "interrupted_output",
+    ],
 )
 def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
     separator_type: str | None,
 ) -> None:
-    """Parallel outputs replay in call order even with omitted metadata between them."""
+    """Omitted metadata and interrupted turns cannot split a replayed output run."""
 
     def call(call_id: str) -> dict[str, Any]:
         return {
@@ -1159,11 +1170,33 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
             "output": f"{call_id} done",
         }
 
+    separators: list[dict[str, Any]] = []
+    interrupted = separator_type is not None and separator_type.startswith("interrupted_")
+    if interrupted:
+        if separator_type == "interrupted_call":
+            separator = call("call_cancelled")
+        elif separator_type == "interrupted_output":
+            separator = output("call_cancelled")
+        else:
+            role = "user" if separator_type == "interrupted_user" else "assistant"
+            separator = {
+                "type": "message",
+                "role": role,
+                "content": [
+                    {
+                        "type": f"{'input' if role == 'user' else 'output'}_text",
+                        "text": "cancelled",
+                    }
+                ],
+            }
+        separators.append({**separator, "response_id": "codex_cancelled"})
+    elif separator_type is not None:
+        separators.append({"type": separator_type})
     items = [
         call("call_a"),
         call("call_b"),
         output("call_b"),
-        *([{"type": separator_type}] if separator_type is not None else []),
+        *separators,
         output("call_orphan"),
         output("call_a"),
         {
@@ -1174,8 +1207,18 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
             "content": [{"type": "output_text", "text": "both finished"}],
         },
     ]
+    if interrupted:
+        items.append(
+            {
+                "type": "message",
+                "response_id": "codex_cancelled",
+                "role": "assistant",
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            }
+        )
     ordered = codex_native._codex_items_with_outputs_in_call_order(items)
-    if separator_type is not None:
+    if separator_type is not None and not interrupted:
         assert ordered[3] is items[3]
     assert items[2]["call_id"] == "call_b"
     records = codex_native._codex_rollout_records_from_session_items(

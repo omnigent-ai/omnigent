@@ -67,7 +67,10 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useDeleteTerminal: () => ({}),
 }));
 vi.mock("./GridSessionsContext", () => ({
-  useGridSessions: () => ({ closePane: vi.fn() }),
+  useGridSessions: () => {
+    const [selectedSessionId, selectSession] = useState("first");
+    return { closePane: vi.fn(), selectedSessionId, selectSession };
+  },
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
@@ -80,7 +83,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
-        <button type="button" onClick={() => context.openFile("notes.md", { line: 7 })}>
+        <button type="button" onClick={() => context.openFile("notes.md", { line: 7, endLine: 9 })}>
           Open citation
         </button>
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
@@ -101,6 +104,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-maximized={String(props.maximized)}
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
+        data-end-line={props.filePosition?.endLine}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
         <span>{props.filePosition?.line}</span>
@@ -227,6 +231,7 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   let workspace = screen.getByRole("complementary", { name: "Workspace" });
   expect(workspace).toHaveAttribute("data-width", "480");
   expect(workspace).toHaveTextContent("notes.md7agent-first");
+  expect(workspace).toHaveAttribute("data-end-line", "9");
   fireEvent.change(within(workspace).getByRole("textbox", { name: "File draft" }), {
     target: { value: "Unsaved edit" },
   });
@@ -266,9 +271,6 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   expect(readSessionWorkspaceState("first").widthPx).toBe(320);
   expect(readSessionWorkspaceState("second").widthPx).toBe(900);
   expect(readSessionWorkspaceState("grid:saved")).toEqual({ open: false, widthPx: 504 });
-  // Removing the active session chooses a remaining cell.
-  view.rerender(tree(splitGrid("first", "first", "third", "bottom")!));
-  expect(first).toHaveAttribute("data-active", "true");
   view.unmount();
   render(tree());
   fireEvent.click(screen.getByRole("button", { name: "Expand grid workspace" }));

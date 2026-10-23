@@ -37,18 +37,22 @@ export const FILE_LINK_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehypePlugins
 // from its (unhardened) href so it matches the real filename on disk.
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 
-// An href that can only be a protocol URL, a protocol-relative URL, or an
-// in-page anchor, never a path to a file in the session workspace. The
-// lookahead keeps a cited position off the scheme branch: `notes.md:12` is a
-// filename plus a line number, but is otherwise shaped exactly like a scheme.
-const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+)?$)|\/\/|#)/;
-const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+))?$/;
-const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?\d+(?:C\d+)?)?$/i;
+// A protocol, protocol-relative or in-page href, never a workspace file. A `:12`
+// position is a file citation; a `:12-18` range only after a file extension
+// (`notes.md:12-18`), so `skype:555-1234` (and `Makefile:12-18`) stays a link.
+const NON_FILE_HREF =
+  /^(?:[a-zA-Z][a-zA-Z0-9+-]*:(?!\d+(?::\d+)?$)|[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+|-\d+)?$)|\/\/|#)/;
+// Column and range are mutually exclusive in the colon form.
+const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+)|-(\d+))?$/;
+// A range's end column is matched but discarded.
+const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?(\d+)(?:C\d+)?)?$/i;
 
 export interface WorkspaceFileCitation {
   path: string;
   line: number | null;
   column?: number;
+  /** Last line of a cited range; only set when it follows `line`. */
+  endLine?: number;
   hasPosition: boolean;
 }
 
@@ -56,14 +60,25 @@ export interface WorkspaceFileCitation {
 export function splitWorkspaceFileCitation(text: string): WorkspaceFileCitation {
   const match = text.match(COLON_POSITION_SUFFIX) ?? text.match(HASH_POSITION_SUFFIX);
   if (!match || match.index === undefined) return { path: text, line: null, hasPosition: false };
-  const line = Number(match[1]);
+  const rawLine = Number(match[1]);
+  const line = Number.isSafeInteger(rawLine) && rawLine > 0 ? rawLine : null;
   const column = Number(match[2]);
+  const endLine = Number(match[3]);
   return {
     path: text.slice(0, match.index),
-    line: Number.isSafeInteger(line) && line > 0 ? line : null,
+    line,
     ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}),
+    ...(line !== null && Number.isSafeInteger(endLine) && endLine > line ? { endLine } : {}),
     hasPosition: true,
   };
+}
+
+/** File name plus cited position, or null when the text has no directory. */
+export function shortFileCitationLabel(text: string): string | null {
+  const { path } = splitWorkspaceFileCitation(text);
+  const slash = path.lastIndexOf("/");
+  if (slash < 0 || slash === path.length - 1) return null;
+  return text.slice(slash + 1);
 }
 
 // Where a file link's href is parked once the path moves to the data
@@ -100,7 +115,9 @@ export function rewriteFileUriLinks() {
       if (citation.line && /^[^:?#]+\.[\w-]+$/.test(citation.path)) {
         node.properties = {
           ...node.properties,
-          href: `${citation.path}#L${citation.line}${citation.column ? `C${citation.column}` : ""}`,
+          href: `${citation.path}#L${citation.line}${citation.column ? `C${citation.column}` : ""}${
+            citation.endLine ? `-L${citation.endLine}` : ""
+          }`,
         };
         return;
       }

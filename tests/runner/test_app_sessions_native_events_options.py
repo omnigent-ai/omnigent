@@ -500,6 +500,44 @@ async def test_events_compact_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_claude_native_types_clear_into_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a claude-native session types
+    Claude Code's own ``/clear`` into the pane and returns 200.
+
+    Claude Code's /clear hook rotates the terminal onto a fresh Omnigent
+    session, so the web /clear must run inside Claude Code.
+    """
+    captured: list[str] = []
+
+    def _fake_inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        """Record the typed command without touching tmux."""
+        captured.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a/events",
+            json={"type": "clear"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured == ["/clear"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, OSError])
 async def test_events_compact_on_native_session_returns_503_when_bridge_not_ready(
     monkeypatch: pytest.MonkeyPatch,
@@ -668,6 +706,54 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
     )
     # /compact is a control signal, not a state change.
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_codex_native_types_clear_into_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a codex-native session types
+    Codex's own ``/clear`` into its tmux pane and returns 200.
+
+    Codex's /clear starts a fresh thread in the same terminal; the forwarder
+    then rotates the Omnigent session, so the web /clear must run inside Codex.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    tmux_calls: list[tuple[str, list[str]]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        """Record tmux send-keys calls without touching tmux."""
+        tmux_calls.append((socket_path, list(args)))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+
+    conv_id = "5b6a0c3d0f1e4a7b8c9d0e1f2a3b4c5d"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    socket = str(instance.socket_path)
+    assert tmux_calls == [
+        (socket, ["send-keys", "-t", "main", "C-u"]),
+        (socket, ["send-keys", "-l", "-t", "main", "/clear"]),
+        (socket, ["send-keys", "-t", "main", "Enter"]),
+    ]
 
 
 @pytest.mark.asyncio
