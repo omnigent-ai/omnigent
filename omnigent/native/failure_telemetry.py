@@ -21,6 +21,7 @@ _TEXT_FIELDS = frozenset(
         "failure_decision",
         "suppression_reason",
         "native_error_category",
+        "transcript_error_context_state",
         "native_error_message",
         "native_harness",
         "native_session_id",

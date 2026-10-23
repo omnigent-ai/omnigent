@@ -265,6 +265,8 @@ export interface ElicitationRequest {
    * ``setMode(auto)`` in the hook decision.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
@@ -983,6 +985,11 @@ export interface BrowserActionRequestEvent {
   args: Record<string, unknown>;
 }
 
+export interface UiOpenFileEvent {
+  type: "ui_open_file";
+  path: string;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -1041,4 +1048,5 @@ export type StreamEvent =
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent
-  | BrowserActionRequestEvent;
+  | BrowserActionRequestEvent
+  | UiOpenFileEvent;

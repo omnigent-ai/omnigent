@@ -89,6 +89,36 @@ session impact or changes KPI eligibility.
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
   `history_len`, `last_item_type`, and the resulting `status`.
 
+### Stack capture during runner event-loop stalls
+
+The runner starts the same dedicated-thread watchdog used by the server while
+its app lifespan is serving. It emits `runner_event_loop_stalled` after five
+seconds without event-loop progress, at most once per minute across all stalls
+and tunnel reconnects. Startup and shutdown are outside the monitored interval.
+Thread startup failure emits `runner_event_loop_watchdog_failed`; serving
+continues without stack capture.
+
+The warning carries `pid`, `stalled_s`, `threshold_s`, `loop_thread_id`, and
+`report_interval_s`. The existing debug sink adds `runner_id`, the primary
+session ID when present, `hostname`, and the client version. Join by runner ID,
+PID, and time with `runner_connected` and `runner_tunnel_health`; the watchdog
+belongs to the process, so it has no connection ID. Its `stack_trace` column
+contains the sampled blocking Python frame locations, bounded to 64 frames and
+8,192 UTF-8 bytes, with no source lines, arguments, or locals. It can capture a
+synchronous credential, filesystem, or subprocess wait before that call returns,
+independently of the event loop and its default executor.
+
+A native extension holding the GIL or a whole-process/VM pause can also prevent
+the watchdog thread from running. A sample collected just after such a pause
+may show resuming execution; it does not establish what caused the pause. An
+absent sample does not prove a healthy runner, particularly when client telemetry
+is disabled or unavailable. Correlate simultaneous process stalls with separate
+host resource and lifecycle evidence. The watchdog never closes a tunnel or
+restarts work.
+
+Use `process_role="runner"` in the isolated example below to verify the runner
+event name and captured stack without interrupting a running session.
+
 ## Server events (`source = 'server'`)
 
 ### Stack capture during event-loop stalls
@@ -104,7 +134,7 @@ sample a blocking call before the loop recovers. Startup and shutdown are not
 monitored. If the watchdog thread cannot start, the server continues serving
 and emits `server_event_loop_watchdog_failed` at ERROR.
 
-The warning includes `stalled_s`, `threshold_s`, `loop_thread_id`, and
+The warning includes `pid`, `stalled_s`, `threshold_s`, `loop_thread_id`, and
 `report_interval_s` attributes. The message stays on one line; the sampled stack
 is stored once in the debug-log table's `stack_trace` column, carried by the log
 record's `captured_stack_trace` field. It contains at most 64 frames and 8,192
@@ -143,7 +173,7 @@ uv run --no-sync python - <<'PY'
 import asyncio
 import logging
 import time
-from omnigent.server.event_loop_watchdog import monitor_event_loop
+from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter(
@@ -268,10 +298,45 @@ when the context exits.
   `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
   The latter measures content activity, not the time of a status transition.
   A relay cache hit does not load conversation metadata solely for logging.
-- `runner_session_init_started`: `resume_interrupted_turn`,
-  `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
-  reconnect hook; resume set is a sub-agent restore; suppress set is a
-  message forward.
+- `runner_session_init_decision`: reconnect decisions are `initialize_now` or
+  `defer`, with `reason` (`idle`, `archived`, `no_agent`, or `recovery_required`),
+  `live_status`, pending elicitation count, last-task-error presence, and eager
+  recovery state. Initializer callers record `start`, `join_in_flight`, or
+  `reuse_completed`; a removed agent records `skip` with `reason=agent_removed`.
+  Every decision includes the session, runner, `runner_generation`, `init_trigger`,
+  `has_agent`, `archived`, `server_version`, and `server_commit_sha`. The commit is
+  `unknown` when the installed package lacks build metadata.
+- `runner_session_init_started`, `runner_session_initialized`, and
+  `runner_session_init_failed` share `init_attempt_id`, `runner_generation`,
+  `init_trigger`, and server build identity. Completion and failure include
+  `duration_ms` for the handshake. Joined/cached callers reference the same attempt
+  ID in their decisions, even when their HTTP requests or triggers differ.
+  `reuse_completed` describes task completion, not success: a failed task awaiting
+  eviction can still be observed. Check the attempt's completion/failure event.
+  `init_trigger` distinguishes `runner_connect`, `web_message`, `retry_session`,
+  `native_control`, and `child_recovery`; other ensure callers that pass the shared
+  initializer use `session_ensure`. The direct-POST fallback without an initializer
+  does not emit these initialization diagnostics (including scheduled dispatch and
+  Codex goal launch).
+  Direct callers that do not identify their trigger record `unspecified`.
+  Recovery flags and `recovery_id` remain on the start event; the flags alone do
+  not uniquely identify the caller.
+
+An interactive native terminal does not establish that the separate runtime
+handshake has run. To investigate delayed initialization, first find the
+connection's decision using the session, runner, and generation. A `defer` decision
+followed later by a web-message trigger is different from a handshake that started
+immediately and took a long time to complete.
+
+For native message events, start at `native_input_received`, before initialization can block
+delivery. Join using the session and HTTP `request_id`, or `input_stable_id` when
+available, then follow the initialization decision/attempt and
+`native_input_enqueued` / `native_input_forward_started`. The receipt timestamp is
+when the authorized request reached the route, not the time the user clicked Send.
+These events can also come from CLI/REPL or server startup-input dispatch through
+the same route. `web_message` names that initialization callsite, not the client UI.
+The receipt contains no message text, and a receipt without a completion does not
+establish a failed delivery by itself. These logs do not change KPI classification.
 
 ## Native event ingestion
 

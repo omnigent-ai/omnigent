@@ -51,6 +51,10 @@ function Probe() {
       <button type="button" onClick={() => grids?.closePane("third")}>
         Close third
       </button>
+      <button type="button" onClick={() => grids?.selectSession("third")}>
+        Select third
+      </button>
+      <output data-testid="selected">{grids?.selectedSessionId}</output>
       <output data-testid="count">{grids?.grids.length ?? 0}</output>
       <button type="button" onClick={() => grids?.split("first", "second", "right")}>
         Split
@@ -211,7 +215,12 @@ it("keeps a trimmed custom name through layout changes and reloads", () => {
   fireEvent.click(screen.getByText("Rename"));
   fireEvent.click(screen.getByText("Add third"));
   expect(screen.getByTestId("name")).toHaveTextContent("My work");
+  expect(screen.getByTestId("selected")).toHaveTextContent("first");
+  fireEvent.click(screen.getByText("Select third"));
+  expect(screen.getByTestId("selected")).toHaveTextContent("third");
+  // Removing the selected session falls back to the first remaining cell.
   fireEvent.click(screen.getByText("Close third"));
+  expect(screen.getByTestId("selected")).toHaveTextContent("first");
   fireEvent.click(screen.getByText("Swap"));
   expect(screen.getByTestId("order")).toHaveTextContent("second,first");
   const path = screen.getByTestId("path").textContent!;

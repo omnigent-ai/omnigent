@@ -61,6 +61,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -72,6 +73,8 @@ from omnigent import config as _config
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
     MERGE_OPTIONS_OBJECT,
+    PR_ATTACHMENT_OBJECT,
+    PR_DETAILS_OBJECT,
     PR_LABELS_OBJECT,
     PR_MERGE_OBJECT,
     PR_REVIEWERS_OBJECT,
@@ -175,8 +178,11 @@ def _in_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
-def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
-    timeout = _gh_timeout_seconds()
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` raises the per-call limit for a slow call, such as a video upload.
+    timeout = timeout or _gh_timeout_seconds()
     if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
@@ -1853,3 +1859,161 @@ def _apply_reviewer_edit(
             "GitHub updated the reviewers but could not list them. Refresh to see them."
         )
     return {"object": PR_REVIEWERS_OBJECT, "reviewers": _shape_reviewers(data)}
+
+
+_DETAILS_EDIT_TIMED_OUT = (
+    "GitHub took too long to update the pull request. Refresh to see whether it applied."
+)
+# One attachment upload's ``gh`` calls share this budget, under the server's wait,
+# so a video has time to reach GitHub.
+_ATTACHMENT_REQUEST_SECONDS = 110.0
+_ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
+
+
+def _edit_details(
+    root: str, reference: PullRequestRef, *, title: str | None, body: str | None
+) -> dict[str, Any]:
+    """Update the PR's title and/or body with one pull requests API ``PATCH``.
+
+    The body travels in a JSON file, since a long description could pass the
+    command-line length limit as a field.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the edit must not run as another.
+            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+        fields = {
+            key: value for key, value in (("title", title), ("body", body)) if value is not None
+        }
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", encoding="utf-8", delete_on_close=False
+        ) as payload:
+            json.dump(fields, payload)
+            payload.close()
+            rc, out, err = _gh(
+                [
+                    "api",
+                    *host,
+                    "-X",
+                    "PATCH",
+                    f"repos/{reference.repository}/pulls/{reference.number}",
+                    "--input",
+                    payload.name,
+                ],
+                cwd=root,
+                token=token,
+            )
+        if _gh_timed_out.get():
+            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+    try:
+        result = json.loads(out) if out.strip() else None
+    except ValueError:
+        result = None
+    if rc != 0 or not isinstance(result, dict):
+        message = result.get("message") if isinstance(result, dict) else None
+        if re.search(r"\(HTTP 40[134]\)", err):
+            raise ValueError("The GitHub account on the host cannot edit this pull request.")
+        if isinstance(message, str) and "(HTTP 422)" in err:
+            raise ValueError(f"GitHub rejected the change: {message}")
+        raise ValueError("GitHub could not update the pull request. Refresh to retry.")
+    body_after = result.get("body")
+    return {
+        "object": PR_DETAILS_OBJECT,
+        "title": str(result.get("title") or ""),
+        "body": body_after if isinstance(body_after, str) else "",
+    }
+
+
+def _attachments_endpoint(host: str) -> str:
+    """The user attachments upload URL that ``gh --attach`` posts to on ``host``."""
+    if host == "github.com":
+        return "https://uploads.github.com/user-attachments/assets"
+    return f"https://{host}/api/uploads/user-attachments/assets"
+
+
+def _is_attachment_url(url: str, host: str) -> bool:
+    """Whether ``url`` is a user-attachments asset on ``host``, as an upload returns."""
+    return (
+        re.fullmatch(rf"https://{re.escape(host)}/user-attachments/assets/[0-9a-f-]+", url)
+        is not None
+    )
+
+
+def _upload_attachment(
+    root: str, reference: PullRequestRef, *, name: str, content_type: str, content: bytes
+) -> dict[str, Any]:
+    """Upload a file to GitHub's user attachments as the PR's selected account.
+
+    GitHub keeps the file whether or not a description ends up linking to it.
+    """
+    with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the upload must not run as another.
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
+        rc, out, _ = _gh(
+            ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
+            cwd=root,
+            token=token,
+        )
+        repository_id = out.strip()
+        if rc != 0 or not repository_id.isdigit():
+            if _gh_timed_out.get():
+                raise ValueError(_ATTACHMENT_TIMED_OUT)
+            raise ValueError("GitHub could not find this pull request's repository.")
+        query = (
+            f"content_type={quote(content_type, safe='')}"
+            f"&name={quote(name, safe='')}&repository_id={repository_id}"
+        )
+        with tempfile.NamedTemporaryFile(suffix=f"-{name}", delete_on_close=False) as upload:
+            upload.write(content)
+            upload.close()
+            rc, out, err = _gh(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"{_attachments_endpoint(reference.host)}?{query}",
+                    "-H",
+                    "Content-Type: application/octet-stream",
+                    "--input",
+                    upload.name,
+                ],
+                cwd=root,
+                token=token,
+                timeout=_ATTACHMENT_REQUEST_SECONDS,
+            )
+        if _gh_timed_out.get():
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
+    try:
+        result = json.loads(out) if out.strip() else None
+    except ValueError:
+        result = None
+    url = result.get("url") if isinstance(result, dict) else None
+    if rc == 0 and isinstance(url, str) and _is_attachment_url(url, reference.host):
+        return {
+            "object": PR_ATTACHMENT_OBJECT,
+            "url": url,
+            "name": name,
+            "content_type": content_type,
+        }
+    if re.search(r"\(HTTP 40[134]\)", err):
+        raise ValueError(
+            "The GitHub account on the host needs push access to attach files "
+            "to this pull request."
+        )
+    errors = result.get("errors") if isinstance(result, dict) else None
+    detail = next(
+        (
+            error["message"]
+            for error in (errors if isinstance(errors, list) else [])
+            if isinstance(error, dict) and isinstance(error.get("message"), str)
+        ),
+        None,
+    )
+    if detail and "(HTTP 422)" in err:
+        raise ValueError(f"GitHub rejected the file: {detail}")
+    raise ValueError("GitHub could not upload the file. Try again.")

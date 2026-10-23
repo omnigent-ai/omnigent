@@ -144,22 +144,27 @@ async def write_workspace_from_host(
     workspace: str,
     session_id: str,
     params: dict[str, Any],
+    timeout: float = _FS_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Send a ``host.fs_write_request`` frame and await its result.
 
     The write counterpart of :func:`read_workspace_from_host` — for the small set
     of host-servable writes (currently ``"github_set_preference"``,
     ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
-    ``"github_merge"``, and ``"github_disable_auto_merge"``) so a preference change,
-    a PR attach/remove, a label or reviewer edit, or a merge works when the session's
-    runner is offline. Shares the result frame, the ``pending_fs_requests``
-    correlation map, and the error mapping with reads.
+    ``"github_details_update"``, ``"github_attachment_upload"``, ``"github_merge"``,
+    and ``"github_disable_auto_merge"``) so a preference change, a PR attach/remove,
+    a label, reviewer, title, or description edit, an attachment upload, or a merge
+    works when the session's runner is offline.
+    Shares the result frame, the ``pending_fs_requests`` correlation map, and the
+    error mapping with reads.
 
     :param op: Write op name — currently ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
-        ``"github_reviewers_update"``, ``"github_merge"``, or
+        ``"github_reviewers_update"``, ``"github_details_update"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or
         ``"github_disable_auto_merge"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
+    :param timeout: Seconds to wait for the host, longer for a slow op like an upload.
     :returns: The refreshed payload on success.
     :raises HostFsError: When the host reports a failure (reproduces the runner's
         response).
@@ -185,17 +190,17 @@ async def write_workspace_from_host(
                 f"host '{host_conn.host_id}' connection lost during fs write"
             ) from exc
         try:
-            result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+            result = await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError as exc:
             _logger.warning(
                 "host '%s' did not answer fs write op %r within %.0fs",
                 host_conn.host_id,
                 op,
-                _FS_TIMEOUT_S,
+                timeout,
             )
             raise HostFsUnavailableError(
                 f"host '{host_conn.host_id}' did not respond to fs write within "
-                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
+                f"{timeout:.0f}s (it may be running an older version)"
             ) from exc
     finally:
         host_conn.pending_fs_requests.pop(request_id, None)

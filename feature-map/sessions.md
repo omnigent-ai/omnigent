@@ -34,8 +34,9 @@ the header menu), and each place is a separate entry point.
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
-  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
-  the existing draft and attachments, and quotes can be removed before sending.
+  writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
+  interleaved comments and existing attachments; removing a quote keeps its comments.
+  Live side chats accept pasted images in every reply text field.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -68,8 +69,9 @@ the header menu), and each place is a separate entry point.
   itself or explicitly reconnect a remembered Arca host. States: reconnecting
   (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
-  directory…**. Choose an existing host directory to fork the conversation into
-  a new session; the original remains available and missing files are not restored.
+  directory…**. Choose an existing host directory, optionally with a new git
+  worktree of it, to fork the conversation into a new session; the original
+  remains available and missing files are not restored.
 - `compaction-model-recovery`: a Codex turn that failed while compacting on the
   previous model shows the provider's error and why on a gray error card, with
   **Fork session…**. A spent-budget card is gray for every harness, since it
@@ -256,7 +258,9 @@ the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
 the same board. Open sidebar appears on the board or, when the board is hidden,
 in the conversation header. On desktop, hovering previews the sidebar and clicking
-opens it. The macOS app uses its existing titlebar toggle, Search, and Settings.
+opens it. At md and wider, the macOS app uses its existing titlebar toggle, Search,
+and Settings; in a narrower window it uses the conversation header's Open sidebar
+button and the drawer's Search and Settings, all right of or below the window buttons.
 On macOS desktop, the board and its controls stay below the window title bar,
 including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
@@ -276,9 +280,11 @@ and send a follow-up after its parent runner is replaced.
 **Missing workspace, desktop and mobile:** open a conversation whose working
 directory is no longer available and choose **Continue in another directory…**
 on the error card. The dialog explains the new session and missing files, then
-lets you type or browse for an existing directory on a connected host. Choose
-**Continue** to open the new session with the copied conversation. A missing
-destination stays in the dialog with an error and creates no session.
+lets you type or browse for an existing directory on a connected host. Optionally
+name a branch under **Git worktree** to continue in a new worktree of that
+repository instead. Choose **Continue** to open the new session with the copied
+conversation. A missing destination stays in the dialog with an error and
+creates no session.
 The action also appears on an eligible error card inside a Canvas conversation
 or side chat; it continues that conversation, including when another parent
 conversation is open alongside it.
@@ -317,7 +323,8 @@ a separate action that leaves the session connected.
 
 **Side-chat lifecycle:** use **Workspace → + → Side chat**, type `/side` in the
 parent composer, or choose **Start a new side chat** from the composer's add
-tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
+tray. Selecting assistant text also offers **Ask in side chat** unless the
+composer is read-only. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
 after stopping; this relaunches the parent and both use one runner. Sending to
@@ -337,7 +344,13 @@ side chat**. It appends a removable quote to the visible side-chat tab, includin
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
 new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
 text and choose **Reply** to quote it in that chat's composer. Adding a quote
-does not send a message; enter a question and send when ready.
+keeps existing comments before that quote. Edit between quotes or after the last
+one, then send when ready. Paste an image into any reply text field after the
+side chat has started. The first question is text-only; an image paste there
+explains that the chat must be started first. Grid sessions use the same reply
+composer and support interleaved comments and pasted images too. A viewer whose
+composer is read-only (for example a Read grant) gets neither **Reply** nor
+**Ask in side chat** when selecting parent text.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -606,14 +619,17 @@ plain `uv run pytest`, which starts a private server for the test.
   above proves live-parent reuse with actual runner processes.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
-  checks pending/live tab reuse, draft preservation, and replies sent only to
-  the child. Hide Workspace and repeat Ask in side chat to verify
+  checks pending/live tab reuse, interleaved comments, pasted images, and replies
+  sent only to the child. Hide Workspace and repeat Ask in side chat to verify
   a new tab opens instead of changing the hidden draft.
+  `tests/e2e_ui/collaboration/test_sharing_journey.py::test_share_grant_downgrade_revoke_journey`
+  checks that an Edit collaborator is offered Reply on selected text and a
+  Read viewer is not.
 - **`side-chat-quotes`, mobile drawer Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
-  checks that Reply stays on screen and the quoted follow-up reaches only the
-  side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
-  checks quote removal, preserved text/files, read-only chats, and starting-tab
+  checks that Reply stays on screen and interleaved comments with a pasted image
+  reach only the side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
+  checks side-chat and grid composers, quote removal, preserved text/files, read-only chats, and starting-tab
   eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
   and parent isolation. In an embedded app, repeat text selection in both the
   parent and side chat and check the popup's theme and button styling.
@@ -776,7 +792,8 @@ plain `uv run pytest`, which starts a private server for the test.
   stays unbound.
 - Ask in side chat reuses only a visible, writable tab belonging to the current
   parent. Hidden, ended, and currently starting tabs are ineligible; another
-  selection opens a new unsent tab. Ended chats do not offer Reply.
+  selection opens a new unsent tab. Ended chats do not offer Reply, and a
+  read-only parent composer offers neither Reply nor Ask in side chat.
 - A phone-width browser run does not prove the mobile side-chat drawer in the
   embedded web app or the native apps. Both style the drawer only inside the
   app's own page area: placed outside it, the drawer stays off screen when
@@ -813,8 +830,10 @@ plain `uv run pytest`, which starts a private server for the test.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.
 - Continuing in another directory preserves conversation history, not files
-  from the missing workspace. Existing worktree recreation and sandbox creation
-  belong to the ordinary fork dialog, not this recovery action.
+  from the missing workspace. A new worktree starts from the `HEAD` of the
+  chosen repository's main checkout, never from the missing worktree's branch.
+  Existing worktree recreation and sandbox creation belong to the ordinary fork
+  dialog, not this recovery action.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.

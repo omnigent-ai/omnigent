@@ -3217,6 +3217,99 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
     assert result == "https://myapp-1234.aws.databricksapps.com"
 
 
+@pytest.mark.parametrize("refresh_credentials", [False, True])
+@pytest.mark.parametrize("use_pin", [False, True])
+def test_databricks_preflight_rejects_workspace_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh_credentials: bool, use_pin: bool
+) -> None:
+    """A successful cached or refreshed bearer cannot validate the wrong workspace."""
+    import httpx
+
+    from omnigent.cli_auth import pin_databricks_org_id, store_databricks_auth
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    auth_file = tmp_path / "auth_tokens.json"
+    monkeypatch.setattr("omnigent.cli_auth._token_file_path", lambda: auth_file)
+    store_databricks_auth(
+        server, "https://example.databricks.com", org_id="123456" if use_pin else "123"
+    )
+    original_auth = auth_file.read_bytes()
+    if use_pin:
+        pin_databricks_org_id(server, "123")
+    responses = []
+    if refresh_credentials:
+        responses.append(
+            httpx.Response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'})
+        )
+    responses.append(httpx.Response(200, headers={"x-databricks-org-id": "123456"}))
+    monkeypatch.setattr(httpx, "get", lambda url, **kwargs: responses.pop(0))
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda **kwargs: {"Authorization": "Bearer cached", "X-Databricks-Org-Id": "123"},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda workspace: cli._DatabricksWorkspaceAuthInfo(token="fresh", profile_name=None),
+    )
+    monkeypatch.setattr(cli, "_databricks_login", lambda *args, **kwargs: pytest.fail("login"))
+
+    with pytest.raises(
+        click.ClickException, match=r"Requested workspace 123,.*reports workspace 123456\."
+    ):
+        cli._ensure_databricks_server_auth(server, non_interactive=True)
+
+    assert not responses
+    assert auth_file.read_bytes() == original_auth
+
+
+@pytest.mark.parametrize("selected_org_id", [None, "123"])
+def test_databricks_preflight_remembers_verified_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected_org_id: str | None
+) -> None:
+    """An authenticated probe remembers a matching or newly discovered workspace."""
+    import httpx
+
+    from omnigent.cli_auth import pin_databricks_org_id, store_token
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    auth_file = tmp_path / "auth_tokens.json"
+    monkeypatch.setattr("omnigent.cli_auth._token_file_path", lambda: auth_file)
+    store_token(server, "saved-token", user_id="alice@example.com", expires_at=0)
+    if selected_org_id:
+        pin_databricks_org_id(server, selected_org_id)
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda url, **kwargs: httpx.Response(200, headers={"x-databricks-org-id": "123"}),
+    )
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **kwargs: {})
+
+    cli._ensure_databricks_server_auth(server, non_interactive=True)
+
+    saved = json.loads(auth_file.read_text())[server]
+    assert saved["org_id"] == "123"
+    assert saved["token"] == "saved-token"
+
+
+def test_databricks_preflight_keeps_explicit_selector_for_inline_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inline browser login must use the workspace selected before URL normalization."""
+    _patch_auth_preflight(monkeypatch, probe_status=302, tty=True)
+    selectors: list[str | None] = []
+    monkeypatch.setattr(
+        cli,
+        "_databricks_login",
+        lambda server, workspace, org_id=None: selectors.append(org_id),
+    )
+    resolved = cli._resolve_server_url("https://example.databricks.com/api/2.0/omnigent?o=123")
+
+    cli._ensure_databricks_server_auth(resolved.api_base)
+
+    assert selectors == ["123"]
+
+
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

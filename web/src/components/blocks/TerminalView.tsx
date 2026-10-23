@@ -187,7 +187,10 @@ export function TerminalView({
     const target = resolveTerminalWorkspaceFileLink(uri, current.root, current.home);
     if (target === null) return false;
     if (target.line === null) current.openFile(target.path);
-    else current.openFile(target.path, { line: target.line });
+    else {
+      const { line, endLine } = target;
+      current.openFile(target.path, { line, ...(endLine ? { endLine } : {}) });
+    }
     return true;
   }, []);
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });

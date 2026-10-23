@@ -35,7 +35,9 @@ implements them separately, so a fix for one harness does not reach the others.
   clicking it opens that file in the workspace viewer without expanding the
   row. Absolute paths open workspace-relative under the session root and
   host-absolute outside it; they stay plain text until the root is known.
-  Shell commands and multi-file patches have no file link.
+  Shell commands and multi-file patches have no file link. A shell row reads
+  `$ command` and expands to a terminal panel with the command, its output
+  and exit status.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
@@ -43,6 +45,9 @@ implements them separately, so a fix for one harness does not reach the others.
   stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `idle-reap`: a finished native pane left alone past the idle window closes
+  with its forwarder, helper server and tool relay; the next message brings it
+  back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
   them, including delayed spawns; an unresolved spawn does not keep an idle
   runner re-reading unchanged conversations.
@@ -113,6 +118,11 @@ before entering the harness menu. Then start a new CLI or web session.
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
 
+**Approval links:** open a pending permission's standalone approval link.
+Claude directory requests show the exact directories in Chat, Inbox, and the
+standalone page. Approve once, reject, or allow those directories for the
+session; the directory choice preserves the current permission mode.
+
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin.
@@ -130,6 +140,13 @@ Probes run only on expansion.
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown for a newly connected or requested host → See more. The modal auto-opens
 only when the server enables the `import_review` release feature.
+
+**Idle reap:** finish a turn, then leave the session alone past the idle window:
+a web session with its Terminal view open but untouched or its tabs closed, a
+sub-agent an orchestrator dispatched and never reopened, or a CLI-launched
+`omnigent <name>` whose local terminal sits without keystrokes. The Terminal
+view loses the pane; the next message from Chat, the orchestrator, or the CLI
+brings it back with the conversation.
 
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
@@ -170,8 +187,13 @@ skill when one is linked above.
 Claude Code also reads machine-wide managed settings outside `CLAUDE_CONFIG_DIR`.
 Native Claude mock fixtures reject a managed `ANTHROPIC_BASE_URL` pointing away
 from the mock before creating the session, including in workflow-owned runs.
-This is a blocked prerequisite, not a skipped or passing acceptance check. Use
-a clean container or CI runner without that override; do not edit machine policy.
+For a journey that needs scripted replies, this is a blocked prerequisite, not
+a skipped or passing acceptance check. Use a clean container or CI runner
+without that override; do not edit machine policy. A journey that only needs
+some reply (such as `idle-reap`) can run live through the managed gateway
+instead: remove the instance's mock Claude provider (`repro-claude` in
+`$VERIFY_ENV/config/config.yaml`) so the session uses the managed credential,
+and label the evidence live with the model the pane shows.
 The render-parity journey additionally requires each web and terminal prompt
 marker to reach the mock under the configured model. A rendered reply or a
 background request alone is not routing evidence.
@@ -338,6 +360,16 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`model-and-effort`, Pi inference bindings (component):**
+  `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
+  checks default/literal inputs and generated picker options, including a literal
+  ID beginning with `omnigent/`; bare and picker-qualified unlisted IDs are rejected.
+  `tests/runtime/test_inference_routing.py::test_pi_picker_preserves_models_with_colliding_ids`
+  checks both picker rows when a bare ID and a prefixed literal collide. The allowed
+  picker target wins; an exact literal is a fallback when that target is not allowed.
+  Literal fallback requires an allowlist; decoding without one is unchanged.
+  Browser acceptance is separate: select each row in the new-session composer,
+  launch, and confirm Pi reports the model that row represents.
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -437,6 +469,16 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`approvals`, Claude directory access:**
+  `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
+  checks Chat (including reload), Inbox, and standalone approval links against
+  a real server and browser. It supplies a synthetic native permission hook,
+  verifies both directory spellings are visible, and checks the returned
+  session grant preserves the offered scope without changing Auto mode.
+  To verify Claude itself, start it in a disposable home directory with a
+  worktree symlink pointing outside that home, request two edits in that
+  worktree, and approve directory access on the first prompt. The second edit
+  in the granted directory should proceed with Auto still enabled.
 - **`approvals`, Kiro delivery and manual retry:**
   `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_manual_retry`
   (own environment, real browser/server/runner/tmux, fake Kiro) drops the first
@@ -495,6 +537,27 @@ Cross-harness journeys:
   billing or recovery after the runner deletes the bridge directory.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`approvals`, Pi extension dialogs:**
+  `tests/e2e/test_pi_extension_ui_round_trip.py::test_real_pi_dialog_answers_and_continues`
+  runs real SDK and native Pi through an isolated server/runner with a scripted
+  provider, sandbox disabled: four dialog answers, decline, later-turn history
+  and native cancellation/card cleanup after the reconnect grace period.
+  `tests/e2e_ui/approvals/test_pi_extension_ui.py` checks confirmation layout
+  and multiline editor submission through Chat using injected hooks; select
+  and input matrices stay in component tests. Older servers use native TUI
+  dialogs on 404/405; supported servers deliver dialogs through the web only.
+  Read-only callers cannot publish cards. Native timeouts are capped at the
+  server limit, and cancelled waits stop re-parking (server/JS regressions).
+  Known gaps: stale sidebar “Needs response” after native cancellation,
+  Inbox/mobile, active SDK interruption, sandbox and Managed acceptance.
+  These scenarios own their isolated environments:
+
+  ```sh
+  uv run --no-sync pytest tests/e2e/test_pi_extension_ui_round_trip.py --reruns 0 -q
+  uv run --no-sync pytest tests/e2e_ui/approvals/test_pi_extension_ui.py --ui-skip-build --video=on --screenshot=on --reruns 0 -q
+  pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
+  ```
+
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
   (own environment, real server, runner, native CLI and tmux with local model
@@ -595,6 +658,23 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`idle-reap`:** start the instance with `OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S=60`
+  in the environment of `verify-env start`; the runner log then shows
+  `native pane reaper started (idle_timeout=60.0s`. A host-launched runner also
+  needs `OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S`.
+  Finish one turn in each harness in scope and stop typing in its pane. A pane
+  counts as busy for 120 s after its screen last changed and the reaper scans
+  every 60 s, so expect the reap 3 to 5 minutes later. Record the Terminal view,
+  then check the runner log for `reaping idle native pane for conversation <id>`,
+  that `tool_relay.json` is gone from the session's bridge directory, and that no
+  `codex app-server` or `opencode serve` for the session remains. Send one more
+  message and check the pane returns with the earlier turn. Component tests,
+  plain `uv run --no-sync pytest --reruns 0`: `tests/terminals/test_pane_reaper.py`
+  (busy evidence, re-create during a reap, registry coverage) and
+  `tests/runner/test_comment_relay.py::test_idle_pane_reap_closes_comment_relay`.
+  `tests/server/integration/test_codex_model_change_after_idle_reap.py` covers
+  Codex reap-then-resume through a real server with a scripted app-server, not
+  the Codex CLI; it crashes an xdist worker, so run it with `-p no:xdist`.
 - **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
   vendor model):**
   `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`
@@ -721,6 +801,15 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
   twelve rows above.
 - Approval and permission callbacks come from several harnesses, not only
   Claude. Restricting a gate to one harness breaks the others' approvals.
+- Claude directory grants cover only the displayed directories for the session.
+  A symlink may require both its visible and resolved paths. A mode switch alone
+  does not grant directory access, and read-only rules are separate grants.
+- Idle reap: an open Terminal view spares a pane only for 120 s after human
+  input, so leaving it open does not keep the pane. With the default one-hour
+  window an idle top-level runner can exit first and clean everything up,
+  which hides a leak; use the short window. The reaper logs reaps, not spared
+  panes: for one that never goes, check for a screen that keeps changing, a
+  fresh approval marker, and a `running` record the server still agrees with.
 - Needing sign-in and not being installed are different states with different
   prompts. Reproduce on a host with the same credential situation as the reporter.
 - Some harnesses have a sign-in flow of their own when launched outside
