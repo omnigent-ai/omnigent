@@ -632,7 +632,7 @@ def configure_mock_llm(
         agent spec. Omitting it allocates an independent content queue when
         ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
         existing queues. The helper in ``tests/e2e/conftest.py`` instead uses
-        the match token as its explicit key and has no ``required_tools`` parameter.
+        the match token as its explicit key.
     :param match: Optional substring to match against the user text for
         content-based routing (in addition to model-name routing).
     :param required_tools: Only consume responses when these tools are advertised.

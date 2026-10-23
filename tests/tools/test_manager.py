@@ -550,9 +550,20 @@ def _spawn_spec() -> AgentSpec:
     return AgentSpec(spec_version=1, spawn=True)
 
 
-def test_advise_models_hidden_when_routing_disabled() -> None:
+@pytest.mark.parametrize(
+    "caps",
+    [
+        pytest.param(_FakeRoutingCaps(routing_client=None), id="no-router"),
+        pytest.param(
+            SimpleNamespace(
+                routing_client=None, routing_backends=None, remote_routing_available=False
+            ),
+            id="remote-server-does-not-route",
+        ),
+    ],
+)
+def test_advise_models_hidden_when_routing_disabled(caps: Any) -> None:
     """sys_advise_models must not appear when no router is configured."""
-    caps = _FakeRoutingCaps(routing_client=None)
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
@@ -582,6 +593,24 @@ def test_advise_models_exposed_when_routing_enabled() -> None:
     with patch("omnigent.runtime._globals._caps", new=caps):
         names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_list_models" in names
+    assert "sys_advise_models" in names
+
+
+def test_advise_models_exposed_when_only_the_remote_server_routes() -> None:
+    """A runner carries no routing backends, so it reads the server's answer.
+
+    Routing backends are built in the server process. A runner attached to a
+    remote server therefore has none, and gating on its own caps alone hid
+    ``sys_advise_models`` from every session — including those whose server
+    routes and whose ``sys_advise_models`` calls the server intercepts.
+    """
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=None,
+        remote_routing_available=True,
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
     assert "sys_advise_models" in names
 
 

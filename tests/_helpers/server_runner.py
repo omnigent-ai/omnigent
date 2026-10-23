@@ -42,6 +42,7 @@ class ServerRunner:
         binding_token: str,
         health_timeout: float,
         poll_interval: float,
+        server_args: Sequence[str] = (),
     ) -> None:
         self.root = root
         self.workspace = workspace if workspace is not None else root / "workspace"
@@ -60,6 +61,7 @@ class ServerRunner:
         self._health_timeout = health_timeout
         self._poll_interval = poll_interval
         self._server_bootstrap = server_bootstrap
+        self._server_args = list(server_args)
         self._server_env = dict(server_env)
         self._base_env = dict(base_env) if base_env is not None else None
         self._server_cwd = server_cwd
@@ -158,6 +160,7 @@ class ServerRunner:
                 self.database_uri,
                 "--artifact-location",
                 str(self.artifact_location),
+                *self._server_args,
             ],
             self.server_home,
             {"OMNIGENT_RUNNER_TUNNEL_TOKEN": self._token, **self._server_env},
@@ -239,11 +242,13 @@ def server_runner(
     health_timeout: float = 120.0,
     poll_interval: float = 1.0,
     wait_ready: bool = True,
+    server_args: Sequence[str] = (),
 ) -> Iterator[ServerRunner]:
     """Yield a ready server; explicitly call start_runner with scenario overrides.
 
     A supplied base_env replaces ambient inheritance for both processes.
-    Environment overrides set values; None removes a variable.
+    Environment overrides set values; None removes a variable. ``server_args``
+    are appended to the server CLI (for example ``--config path``).
     Set wait_ready=False to start both processes before waiting for the runner.
     Cleanup applies even when readiness fails. Detached Omnigent descendants
     are attributed only to this stack's directories, never the whole machine.
@@ -262,6 +267,7 @@ def server_runner(
             binding_token=binding_token or secrets.token_urlsafe(32),
             health_timeout=health_timeout,
             poll_interval=poll_interval,
+            server_args=server_args,
         )
         # Register before process callbacks so direct children terminate first.
         for scope in (root, stack.runner_home / ".omnigent", stack.server_home / ".omnigent"):
