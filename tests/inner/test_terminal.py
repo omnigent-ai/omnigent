@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import itertools
 import json
 import logging
 import shutil
@@ -697,6 +698,58 @@ def test_threaded_idle_watcher_treats_probe_start_failure_as_unknown(
     assert instance.running is True
 
 
+class _RecordingStopEvent:
+    """Stop event that never sleeps, records each requested wait, and stops after *ticks*."""
+
+    def __init__(self, ticks: int) -> None:
+        self.timeouts: list[float] = []
+        self._ticks = ticks
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.timeouts.append(float(timeout or 0.0))
+        return len(self.timeouts) >= self._ticks
+
+
+def test_threaded_idle_watcher_backs_off_and_throttles_logs_while_descriptors_are_exhausted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sustained EMFILE at probe start backs off to the cap and warns once, not per retry."""
+    instance = TerminalInstance(
+        name="shell",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    stop_event = _RecordingStopEvent(ticks=40)
+    attempt_marks: list[int] = []
+
+    def _no_descriptors(*args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        attempt_marks.append(len(stop_event.timeouts))
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _no_descriptors)
+
+    with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
+        instance._idle_watch_loop_threaded(
+            stop_event,  # type: ignore[arg-type]
+            poll_interval_s=1.0,
+        )
+
+    delays = [
+        sum(stop_event.timeouts[start:end]) for start, end in itertools.pairwise(attempt_marks)
+    ]
+    warnings = [record for record in caplog.records if "could not start" in record.getMessage()]
+    assert instance.running is True
+    assert delays == [2.0, 3.0, 5.0, 9.0, *[17.0] * 15], f"retry delays: {delays}"
+    assert len(warnings) == 1, (
+        f"{len(warnings)} warnings for {len(attempt_marks)} failed probe starts"
+    )
+
+
 def test_threaded_idle_watcher_treats_confirmation_start_failure_as_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -911,6 +964,170 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
     await instance._stop_idle_watcher()
     assert not exited.is_set()
     assert instance.running is True
+
+
+@pytest.mark.asyncio
+async def test_async_idle_watcher_backoff_resets_after_probes_start_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Start-failure delays double up to a cap and restart from the base after recovery.
+
+    A cycle whose capture starts but whose pane-death probe cannot start still
+    counts as a failure, so alternating starts cannot pin the delay at its base.
+    """
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    no_descriptors = None
+    outcomes: list[_ProcessWithStdout | None] = [
+        *[no_descriptors] * 6,
+        _ProcessWithStdout(stdout=b"$ "),
+        no_descriptors,
+        _ProcessWithStdout(stdout=b"$ "),
+        _ProcessWithStdout(stdout=b"0 "),
+        *[no_descriptors] * 2,
+    ]
+
+    async def _create_subprocess_exec(
+        *cmd: str,
+        stdout: object,
+        stderr: object,
+    ) -> _ProcessWithStdout:
+        del cmd, stdout, stderr
+        outcome = outcomes.pop(0)
+        if not outcomes:
+            instance.running = False
+        if outcome is None:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return outcome
+
+    delays: list[float] = []
+    backoff = instance._probe_start_backoff_seconds
+
+    def _recording_backoff() -> float:
+        delays.append(backoff())
+        return delays[-1]
+
+    instance._probe_start_backoff_seconds = _recording_backoff  # type: ignore[method-assign]
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _create_subprocess_exec)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.001)
+
+    with caplog.at_level(logging.DEBUG, logger=terminal_mod.__name__):
+        await asyncio.wait_for(instance._idle_watch_loop(lambda: None), timeout=1.0)
+
+    assert delays == [0.001, 0.002, 0.004, 0.008, 0.016, 0.016, 0.016, 0.001, 0.002]
+    start_failures = [r for r in caplog.records if "could not start" in r.getMessage()]
+    assert [r.levelno for r in start_failures] == [logging.WARNING] + [logging.DEBUG] * 8
+    recoveries = [r for r in caplog.records if "started again" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in recoveries] == [
+        (logging.INFO, "tmux probes for terminal runtime:main started again after 7 failures")
+    ]
+
+
+def test_probe_start_warning_repeats_once_the_log_interval_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Start failures warn again once the throttle window has elapsed."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    clock = iter([1000.0, 1059.9, 1060.0, 1061.0])
+    monkeypatch.setattr(terminal_mod, "time", SimpleNamespace(monotonic=lambda: next(clock)))
+    exhausted = OSError(errno.EMFILE, "Too many open files")
+
+    with caplog.at_level(logging.DEBUG, logger=terminal_mod.__name__):
+        for _ in range(4):
+            instance._log_probe_start_failure("capture-pane", exhausted)
+
+    start_failures = [r for r in caplog.records if "could not start" in r.getMessage()]
+    assert [r.levelno for r in start_failures] == [
+        logging.WARNING,
+        logging.DEBUG,
+        logging.WARNING,
+        logging.DEBUG,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("threaded", [False, True], ids=["async", "threaded"])
+@pytest.mark.parametrize(
+    ("session_probe_fails", "expected_delays"),
+    [(False, [0.001, 0.002, 0.004, 0.001]), (True, [0.001, 0.002, 0.004, 0.001, 0.001])],
+    ids=["session-exists", "session-unknown"],
+)
+async def test_idle_watcher_backoff_resets_when_has_session_runs_after_a_failed_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    threaded: bool,
+    session_probe_fails: bool,
+    expected_delays: list[float],
+) -> None:
+    """A has-session that starts ends a start-failure streak, even when it fails inconclusively."""
+    instance = TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    no_descriptors = None
+    outcomes: list[_ProcessWithStdout | None] = [
+        *[no_descriptors] * 3,
+        _ProcessWithStdout(returncode=1, stderr=b"server busy"),
+        _ProcessWithStdout(returncode=1, stderr=b"server busy")
+        if session_probe_fails
+        else _ProcessWithStdout(),
+        no_descriptors,
+    ]
+
+    def _next_probe(*_args: object, **_kwargs: object) -> _ProcessWithStdout:
+        outcome = outcomes.pop(0)
+        if not outcomes:
+            instance.running = False
+        if outcome is None:
+            raise OSError(errno.EMFILE, "Too many open files")
+        return outcome
+
+    async def _create_subprocess_exec(*args: object, **kwargs: object) -> _ProcessWithStdout:
+        return _next_probe(*args, **kwargs)
+
+    delays: list[float] = []
+    backoff = instance._probe_start_backoff_seconds
+
+    def _recording_backoff() -> float:
+        delays.append(backoff())
+        return delays[-1]
+
+    instance._probe_start_backoff_seconds = _recording_backoff  # type: ignore[method-assign]
+    monkeypatch.setattr(terminal_mod.subprocess, "run", _next_probe)
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", _create_subprocess_exec)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.001)
+
+    with caplog.at_level(logging.DEBUG, logger=terminal_mod.__name__):
+        if threaded:
+            instance._idle_watch_loop_threaded(
+                _RecordingStopEvent(ticks=100),  # type: ignore[arg-type]
+                poll_interval_s=0.001,
+            )
+        else:
+            await asyncio.wait_for(instance._idle_watch_loop(lambda: None), timeout=1.0)
+
+    assert delays == expected_delays
+    recoveries = [r.getMessage() for r in caplog.records if "started again" in r.getMessage()]
+    assert recoveries == ["tmux probes for terminal runtime:main started again after 3 failures"]
 
 
 @pytest.mark.asyncio

@@ -328,8 +328,11 @@ _EXIT_DIAGNOSTIC_SCROLLBACK_LINES = 100
 _EXIT_STATUS_REFRESH_SECONDS = 0.1
 _EXIT_STATUS_POLL_SECONDS = 0.01
 _PANE_EXIT_STATUS_FORMAT = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
-# Avoid adding probe pressure while the host cannot start another process.
+# Avoid adding probe pressure while the host cannot start another process:
+# consecutive start failures double this delay, and repeat warnings are throttled.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+_TMUX_PROBE_START_FAILURE_MAX_DOUBLINGS = 4
+_TMUX_PROBE_START_FAILURE_LOG_INTERVAL_SECONDS = 60.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -1174,6 +1177,11 @@ class TerminalInstance:
     # session"). ``None`` until such a probe fails.
     _last_capture_probe_error: str | None = field(default=None, repr=False)
     _last_session_probe_error: str | None = field(default=None, repr=False)
+    # Shared by the watcher thread and event-loop probes; a lost update only
+    # shifts one backoff step or log line.
+    _probe_start_failures: int = field(default=0, init=False, repr=False)
+    _probe_start_warned_at: float = field(default=float("-inf"), init=False, repr=False)
+    _probe_start_streak_warned: bool = field(default=False, init=False, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1351,6 +1359,54 @@ class TerminalInstance:
                 "error_truncated": len(error) > _PROBE_ERROR_MAX_CHARS,
             }
         )
+
+    def _log_probe_start_failure(
+        self, probe: str, exc: BaseException, *, outcome: str = "liveness remains unknown"
+    ) -> None:
+        """Count a probe that could not start, warning at most once per log interval.
+
+        :param probe: tmux probe that failed to start, e.g. ``"capture-pane"``.
+        :param exc: Start error, typically ``EMFILE`` or ``EAGAIN``.
+        :param outcome: How the caller treats the failure, for the log line.
+        """
+        self._probe_start_failures += 1
+        now = time.monotonic()
+        level = logging.DEBUG
+        if now - self._probe_start_warned_at >= _TMUX_PROBE_START_FAILURE_LOG_INTERVAL_SECONDS:
+            level = logging.WARNING
+            self._probe_start_warned_at = now
+            self._probe_start_streak_warned = True
+        logger.log(
+            level,
+            "tmux %s probe could not start for terminal %s:%s (%d consecutive); %s: %s",
+            probe,
+            self.name,
+            self.session_key,
+            self._probe_start_failures,
+            outcome,
+            exc,
+        )
+
+    def _note_probe_started(self) -> None:
+        """Reset the start-failure streak once a probe process has started."""
+        if self._probe_start_failures == 0:
+            return
+        logger.log(
+            logging.INFO if self._probe_start_streak_warned else logging.DEBUG,
+            "tmux probes for terminal %s:%s started again after %d failures",
+            self.name,
+            self.session_key,
+            self._probe_start_failures,
+        )
+        self._probe_start_failures = 0
+        self._probe_start_streak_warned = False
+
+    def _probe_start_backoff_seconds(self) -> float:
+        """Delay before retrying after the current streak of probe start failures."""
+        doublings = min(
+            max(self._probe_start_failures - 1, 0), _TMUX_PROBE_START_FAILURE_MAX_DOUBLINGS
+        )
+        return _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS * 2**doublings
 
     def _log_tmux_unavailable(
         self, consecutive_failures: int, *, exit_callback_present: bool
@@ -2081,16 +2137,10 @@ class TerminalInstance:
                     "-e",
                 )
             except _TmuxProcessStartError as exc:
-                logger.warning(
-                    "tmux capture-pane probe could not start for terminal %s:%s; "
-                    "liveness remains unknown: %s",
-                    self.name,
-                    self.session_key,
-                    exc,
-                )
+                self._log_probe_start_failure("capture-pane", exc)
                 consecutive_capture_failures = 0
                 self._probe_failures.clear()
-                await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
+                await asyncio.sleep(self._probe_start_backoff_seconds())
                 continue
             except RuntimeError as exc:
                 self._remember_probe_failure("capture-pane", exc, started_at)
@@ -2107,7 +2157,7 @@ class TerminalInstance:
                     consecutive_capture_failures = 0
                     self._probe_failures.clear()
                     if session_exists is None:
-                        await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
+                        await asyncio.sleep(self._probe_start_backoff_seconds())
                     continue
                 consecutive_capture_failures += 1
                 if consecutive_capture_failures < _IDLE_EXIT_FAILURE_THRESHOLD:
@@ -2125,8 +2175,9 @@ class TerminalInstance:
             self._remember_pane_snapshot(snapshot)
             pane_dead = await self._pane_is_dead_async()
             if pane_dead is None:
-                await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
+                await asyncio.sleep(self._probe_start_backoff_seconds())
                 continue
+            self._note_probe_started()
             if pane_dead:
                 await self._capture_exit_snapshot()
                 # Retained dead panes must release attached clients and report
@@ -2293,16 +2344,10 @@ class TerminalInstance:
             try:
                 snapshot = self._capture_pane_for_idle_or_none()
             except _TmuxProcessStartError as exc:
-                logger.warning(
-                    "tmux capture-pane probe could not start for terminal %s:%s; "
-                    "liveness remains unknown: %s",
-                    self.name,
-                    self.session_key,
-                    exc,
-                )
+                self._log_probe_start_failure("capture-pane", exc)
                 consecutive_capture_failures = 0
                 self._probe_failures.clear()
-                if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
+                if stop_event.wait(self._probe_start_backoff_seconds()):
                     return
                 continue
             if snapshot is None:
@@ -2311,7 +2356,7 @@ class TerminalInstance:
                     consecutive_capture_failures = 0
                     self._probe_failures.clear()
                     if session_exists is None and stop_event.wait(
-                        _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS
+                        self._probe_start_backoff_seconds()
                     ):
                         return
                     continue
@@ -2330,9 +2375,10 @@ class TerminalInstance:
             self._remember_pane_snapshot(snapshot)
             pane_dead = self._pane_is_dead()
             if pane_dead is None:
-                if stop_event.wait(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS):
+                if stop_event.wait(self._probe_start_backoff_seconds()):
                     return
                 continue
+            self._note_probe_started()
             if pane_dead:
                 self._capture_exit_snapshot_sync()
                 # Retained dead panes must release attached clients and report
@@ -2407,15 +2453,10 @@ class TerminalInstance:
         try:
             self._tmux_output_sync("has-session", "-t", self.tmux_target)
         except _TmuxProcessStartError as exc:
-            logger.warning(
-                "tmux has-session probe could not start for terminal %s:%s; "
-                "liveness remains unknown: %s",
-                self.name,
-                self.session_key,
-                exc,
-            )
+            self._log_probe_start_failure("has-session", exc)
             return None
         except _TmuxCommandFailedError as exc:
+            self._note_probe_started()
             self._remember_probe_failure("has-session", exc, started_at)
             self._last_session_probe_error = str(exc)
             logger.warning(
@@ -2427,9 +2468,11 @@ class TerminalInstance:
             )
             return None
         except RuntimeError as exc:
+            self._note_probe_started()
             self._remember_probe_failure("has-session", exc, started_at)
             self._last_session_probe_error = str(exc)
             return False
+        self._note_probe_started()
         return True
 
     def _pane_is_dead(self) -> bool | None:
@@ -2453,13 +2496,7 @@ class TerminalInstance:
                 "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
         except _TmuxProcessStartError as exc:
-            logger.warning(
-                "tmux pane-death probe could not start for terminal %s:%s; "
-                "liveness remains unknown: %s",
-                self.name,
-                self.session_key,
-                exc,
-            )
+            self._log_probe_start_failure("pane-death", exc)
             return None
         except RuntimeError:
             return False
@@ -2560,17 +2597,14 @@ class TerminalInstance:
             )
         except OSError as exc:
             if _is_transient_tmux_process_start_error(exc):
-                logger.warning(
-                    "tmux liveness probe could not start for terminal %s:%s; "
-                    "preserving optimistic running state: %s",
-                    self.name,
-                    self.session_key,
-                    exc,
+                self._log_probe_start_failure(
+                    "liveness", exc, outcome="preserving optimistic running state"
                 )
                 return self.running
             self.running = False
             return False
 
+        self._note_probe_started()
         try:
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
@@ -2622,13 +2656,7 @@ class TerminalInstance:
                 "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
         except _TmuxProcessStartError as exc:
-            logger.warning(
-                "tmux pane-death probe could not start for terminal %s:%s; "
-                "liveness remains unknown: %s",
-                self.name,
-                self.session_key,
-                exc,
-            )
+            self._log_probe_start_failure("pane-death", exc)
             return None
         except RuntimeError:
             return False
@@ -2641,15 +2669,10 @@ class TerminalInstance:
         try:
             await self._tmux_output("has-session", "-t", self.tmux_target)
         except _TmuxProcessStartError as exc:
-            logger.warning(
-                "tmux has-session probe could not start for terminal %s:%s; "
-                "liveness remains unknown: %s",
-                self.name,
-                self.session_key,
-                exc,
-            )
+            self._log_probe_start_failure("has-session", exc)
             return None
         except _TmuxCommandFailedError as exc:
+            self._note_probe_started()
             self._remember_probe_failure("has-session", exc, started_at)
             self._last_session_probe_error = str(exc)
             logger.warning(
@@ -2661,9 +2684,11 @@ class TerminalInstance:
             )
             return None
         except RuntimeError as exc:
+            self._note_probe_started()
             self._remember_probe_failure("has-session", exc, started_at)
             self._last_session_probe_error = str(exc)
             return False
+        self._note_probe_started()
         return True
 
     async def _tmux(self, *args: str) -> None:

@@ -56,6 +56,8 @@ class HostDaemonRecord:
     :param host_id: Stable host id advertised to the server.
     :param resolved_server_url: Concrete URL owned by a local-mode daemon.
     :param config_sig: Signature of server-affecting launch configuration.
+    :param open_file_limit: Daemon's soft open-file limit after startup, which
+        its runners inherit; ``None`` when unknown.
     :param workspace_id: Databricks workspace id the daemon connects to, as
         the server reported it at startup, e.g. ``"123"``; ``None`` when
         unknown or for records written by older daemons.
@@ -70,6 +72,7 @@ class HostDaemonRecord:
     host_id: str | None = None
     resolved_server_url: str | None = None
     config_sig: str | None = None
+    open_file_limit: int | None = None
     workspace_id: str | None = None
 
 
@@ -384,6 +387,7 @@ def record_from_json(raw: Mapping[str, object]) -> HostDaemonRecord | None:
         value = raw.get(key)
         return value if isinstance(value, str) and value else None
 
+    open_file_limit = raw.get("open_file_limit")
     return HostDaemonRecord(
         pid=pid,
         target=target,
@@ -394,6 +398,11 @@ def record_from_json(raw: Mapping[str, object]) -> HostDaemonRecord | None:
         host_id=_text("host_id"),
         resolved_server_url=_text("resolved_server_url"),
         config_sig=_text("config_sig"),
+        open_file_limit=(
+            open_file_limit
+            if isinstance(open_file_limit, int) and not isinstance(open_file_limit, bool)
+            else None
+        ),
         workspace_id=_text("workspace_id"),
     )
 

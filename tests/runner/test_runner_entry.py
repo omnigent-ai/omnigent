@@ -3317,16 +3317,18 @@ def test_main_reports_tunnel_rejection_without_traceback(
     assert "Traceback" not in stderr
 
 
-def test_main_configures_runner_process_logging(
+def test_main_configures_logging_and_raises_open_file_limit_before_the_tunnel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Runner process logs are configured through the shared process logger.
+    Runner process logs use the shared process logger, and a runner started
+    without a host daemon raises its open-file limit before serving.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
     captured: dict[str, Any] = {}
+    startup: list[str] = []
 
     def _capture_process_logging(destination: str, **kwargs: Any) -> None:
         """
@@ -3346,10 +3348,15 @@ def test_main_configures_runner_process_logging(
 
         :returns: None.
         """
+        startup.append("tunnel")
 
     monkeypatch.setattr(
         "omnigent.process_logging.configure_process_logging",
         _capture_process_logging,
+    )
+    monkeypatch.setattr(
+        "omnigent.runner._entry.raise_soft_open_file_limit",
+        lambda: startup.append("raise open-file limit"),
     )
     monkeypatch.setattr(
         "omnigent.runner._entry._run_tunnel_from_env",
@@ -3359,6 +3366,7 @@ def test_main_configures_runner_process_logging(
     main()
 
     assert captured == {"destination": "runner", "force": True}
+    assert startup == ["raise open-file limit", "tunnel"]
 
 
 def test_main_preserves_runtime_import_path(

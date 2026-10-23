@@ -39,6 +39,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RunnerTunnelAuthRejectedError,
 )
 from omnigent.util.event_loop_watchdog import monitor_event_loop
+from omnigent.util.open_file_limit import raise_soft_open_file_limit
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -2212,6 +2213,8 @@ def main() -> None:
 
     configure_process_logging("runner", force=True)
     _install_crash_logging()
+    # Covers runners started without a host daemon.
+    raise_soft_open_file_limit()
     _maybe_prewarm_ambient_detection()
     try:
         asyncio.run(_run_tunnel_from_env())

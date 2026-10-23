@@ -29,6 +29,8 @@ from omnigent.host.daemon_lifecycle import (
     write_daemon_record,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.util import open_file_limit
+from omnigent.util.open_file_limit import OpenFileLimit
 from omnigent.util.tls import client_ssl_context
 
 
@@ -286,6 +288,9 @@ def test_background_daemon_claims_record_before_connecting(
         "omnigent.host.daemon_lifecycle.probe_workspace_id",
         lambda url, *, org_id=None, **_kwargs: "7",
     )
+    monkeypatch.setattr(
+        open_file_limit, "raise_soft_open_file_limit", lambda: OpenFileLimit(10240, 2**63 - 1)
+    )
 
     connected: list[str] = []
 
@@ -305,6 +310,7 @@ def test_background_daemon_claims_record_before_connecting(
     assert payload["pid"] == os.getpid()
     assert payload["host_id"] == _HOST_ID
     assert payload["config_sig"] == "config-signature"
+    assert payload["open_file_limit"] == 10240
     assert payload["workspace_id"] == "7"
     assert connected == [f"{target}|{target}"]
     assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is False
@@ -337,6 +343,7 @@ def test_background_daemon_loser_exits_before_connecting(
         "omnigent.host.connect.run_host_process",
         lambda **_kw: pytest.fail("losing daemon must not connect"),
     )
+    monkeypatch.setattr(open_file_limit, "raise_soft_open_file_limit", lambda: None)
     monkeypatch.setattr(
         identity_module,
         "load_or_create_host_identity",

@@ -47,12 +47,20 @@ from omnigent.cli import (
     cli as cli_group,
 )
 from omnigent.host.local_server import LocalServerStartup
+from omnigent.util.open_file_limit import OpenFileLimit, ProcessOpenFiles
 
 
 @pytest.fixture(autouse=True)
 def _stable_current_host_id(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep daemon-reuse tests independent of the developer's real config."""
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_abc")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_open_file_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``host`` from raising pytest's own limit or reading unrelated real pids."""
+    monkeypatch.setattr(cli, "raise_soft_open_file_limit", lambda: None)
+    monkeypatch.setattr(cli, "host_process_open_files", lambda root_pid, *, inherited_limit: [])
 
 
 class _Proc:
@@ -130,6 +138,7 @@ def _write_daemon_registry_record(
     host_id: str | None = "host_abc",
     config_sig: str | None = None,
     resolved_server_url: str | None = None,
+    open_file_limit: int | None = None,
 ) -> None:
     """Write a daemon registry JSON fixture.
 
@@ -148,6 +157,8 @@ def _write_daemon_registry_record(
         ``"3f9a1c2b4d5e6f70"``, or ``None`` for a legacy record.
     :param resolved_server_url: Concrete local server URL, e.g.
         ``"http://127.0.0.1:8123"``, or ``None``.
+    :param open_file_limit: Daemon's recorded soft open-file limit, e.g.
+        ``65536``, or ``None`` for a record that predates it.
     """
     digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
     path = tmp_path / "daemons" / f"{digest}.json"
@@ -164,11 +175,33 @@ def _write_daemon_registry_record(
                 "host_id": host_id,
                 "resolved_server_url": resolved_server_url,
                 "config_sig": config_sig,
+                **({} if open_file_limit is None else {"open_file_limit": open_file_limit}),
             },
             sort_keys=True,
         )
         + "\n"
     )
+
+
+@pytest.mark.parametrize("open_file_limit", [None, 10240], ids=["predates-limit", "recorded"])
+def test_daemon_record_reads_the_optional_open_file_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_file_limit: int | None
+) -> None:
+    """A record written before daemons recorded their open-file limit still loads."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        open_file_limit=open_file_limit,
+    )
+
+    record = cli._find_daemon_record("https://server.example.com")
+
+    assert record is not None
+    assert record.open_file_limit == open_file_limit
 
 
 def test_ensure_host_daemon_remote_spawns_server_flag(
@@ -1345,6 +1378,7 @@ def test_foreground_connect_registers_status_record(
     monkeypatch.setattr(cli, "_load_effective_config", dict)
     monkeypatch.setattr(cli, "_load_or_create_host_id", lambda: "host_abc")
     monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server, **kw: None)
+    monkeypatch.setattr(cli, "raise_soft_open_file_limit", lambda: OpenFileLimit(10240, 10240))
     observed: list[cli._HostDaemonRecord] = []
 
     def _fake_run_host_process(server_url: str, **_kw: object) -> None:
@@ -1364,6 +1398,7 @@ def test_foreground_connect_registers_status_record(
     assert observed[0].target == "https://server.example.com"
     assert observed[0].pid == cli.os.getpid()
     assert observed[0].host_id == "host_abc"
+    assert observed[0].open_file_limit == 10240
     assert cli._list_daemon_records(include_legacy=False) == []
 
 
@@ -1764,7 +1799,15 @@ def test_host_status_json_reports_daemon_host_and_sessions(
         mode="server",
         server_url="https://server.example.com",
         log_path="/tmp/daemon.log",
+        open_file_limit=10240,
     )
+    open_file_reads: list[tuple[int, int | None]] = []
+
+    def _fake_open_files(root_pid: int, *, inherited_limit: int | None) -> list[ProcessOpenFiles]:
+        open_file_reads.append((root_pid, inherited_limit))
+        return [ProcessOpenFiles(pid=4250, count=9000, limit=10240)]
+
+    monkeypatch.setattr(cli, "host_process_open_files", _fake_open_files)
 
     runner_status_calls: list[str] = []
 
@@ -1812,6 +1855,11 @@ def test_host_status_json_reports_daemon_host_and_sessions(
     assert '"runner_online": true' in result.output
     assert '"id": "conv_other"' not in result.output
     assert runner_status_calls == ["runner_abc"]
+    assert open_file_reads == [(4242, 10240)]
+    [daemon] = json.loads(result.output)["daemons"]
+    assert daemon["open_files"] == [
+        {"pid": 4250, "count": 9000, "limit": 10240, "near_limit": True}
+    ]
 
 
 def test_host_status_reports_unreachable_daemon_without_traceback(
@@ -1920,6 +1968,7 @@ def _daemon_payload(**overrides: Any) -> dict[str, Any]:
         "log_path": _LONG_LOG_PATH,
         "host_id": "host_77599b2c44934910b00cfdfda3ba21fc",
         "host_status": "online",
+        "open_files": [{"pid": 45870, "count": 41, "limit": 65536, "near_limit": False}],
         "sessions": [],
         "error": None,
     }
@@ -1966,11 +2015,58 @@ def test_host_status_lines_fit_the_terminal_width() -> None:
     which is how the log path and the URL end up merged into one target.
     """
     width = 60
-    rendered = _render_host_status(width=width, payload=_daemon_payload())
+    busiest = {"pid": 4194304, "count": 1048570, "limit": 1048576, "near_limit": True}
+    rendered = _render_host_status(width=width, payload=_daemon_payload(open_files=[busiest]))
 
     for line in rendered.split("\n"):
         visible = _ANSI_RE.sub("", line)
         assert len(visible) < width, f"line fills or overflows the terminal: {visible!r}"
+
+
+@pytest.mark.parametrize(
+    ("busiest", "expected", "highlighted"),
+    [
+        pytest.param(
+            {"pid": 45870, "count": 41, "limit": 65536, "near_limit": False},
+            "  fds=41/65536 (pid 45870)",
+            False,
+            id="headroom",
+        ),
+        pytest.param(
+            {"pid": 45870, "count": 251, "limit": 256, "near_limit": True},
+            "  fds=251/256 (pid 45870) near limit",
+            True,
+            id="near-limit",
+        ),
+        pytest.param(
+            {"pid": 45870, "count": 41, "limit": None, "near_limit": False},
+            "  fds=41 (pid 45870)",
+            False,
+            id="limit-unknown",
+        ),
+    ],
+)
+def test_host_status_shows_descriptor_use_of_the_busiest_host_process(
+    busiest: dict[str, Any], expected: str, highlighted: bool
+) -> None:
+    """The process closest to its open-file limit is reported, in yellow once near it."""
+    rendered = _render_host_status(
+        width=80,
+        payload=_daemon_payload(
+            open_files=[busiest, {"pid": 45867, "count": 12, "limit": 65536, "near_limit": False}]
+        ),
+    )
+
+    [line] = [line for line in rendered.split("\n") if "fds=" in line]
+    assert _ANSI_RE.sub("", line).rstrip() == expected
+    assert ("\x1b[33m" in line) is highlighted
+
+
+def test_host_status_omits_descriptor_line_when_counts_are_unavailable() -> None:
+    """Offline daemons and platforms without descriptor counts print no ``fds=`` line."""
+    rendered = _render_host_status(width=80, payload=_daemon_payload(open_files=[]))
+
+    assert "fds=" not in rendered
 
 
 def test_host_status_links_the_daemon_log_path() -> None:

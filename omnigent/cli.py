@@ -118,6 +118,7 @@ from omnigent.process_logging import (
     process_log_dir_reference,
 )
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.open_file_limit import host_process_open_files, raise_soft_open_file_limit
 from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
 from omnigent.util.uuid import normalize_uuid
@@ -3389,6 +3390,7 @@ def _foreground_daemon_record(
     target: str,
     server_url: str,
     host_id: str | None,
+    open_file_limit: int | None = None,
 ) -> _HostDaemonRecord:
     """
     Build the registry record for the current foreground host process.
@@ -3398,6 +3400,7 @@ def _foreground_daemon_record(
     :param server_url: Concrete Omnigent server URL being connected to, e.g.
         ``"http://127.0.0.1:8123"``.
     :param host_id: Local host id, e.g. ``"host_abc123"``.
+    :param open_file_limit: This process's soft open-file limit, e.g. ``65536``.
     :returns: Daemon registry record for ``os.getpid()``.
     """
     mode = "local" if target == _LOCAL_DAEMON_MARKER else "server"
@@ -3411,6 +3414,7 @@ def _foreground_daemon_record(
         host_id=host_id,
         resolved_server_url=server_url.rstrip("/") if mode == "local" else None,
         config_sig=server_config_signature(include_features=mode == "local"),
+        open_file_limit=open_file_limit,
     )
 
 
@@ -9716,6 +9720,8 @@ def host(
     # gates the Ctrl-C stop-server prompt so we never offer to stop a server
     # we didn't bring up.
     spawned_local_server = False
+    # Raised before the local server and runner zygote spawn so they inherit it.
+    open_file_limit = raise_soft_open_file_limit()
     if not server:
         startup = ensure_local_omnigent_server()
         server = startup.url
@@ -9724,6 +9730,7 @@ def host(
         target=target,
         server_url=server,
         host_id=_load_or_create_host_id(),
+        open_file_limit=open_file_limit.soft if open_file_limit else None,
     )
     previous = _claim_foreground_daemon_record(record)
     # Only offer to stop the local server after a clean stop (Ctrl-C / normal
@@ -10290,14 +10297,23 @@ def _base_daemon_status_payload(record: _HostDaemonRecord) -> _HostPayload:
     """
     base_url = _daemon_base_url(record)
     host_id = record.host_id or _load_existing_host_id()
+    online = _pid_is_recorded_daemon(record)
+    open_files = (
+        host_process_open_files(record.pid, inherited_limit=record.open_file_limit)
+        if online
+        else []
+    )
     return {
         "target": record.target,
         "mode": record.mode,
         "server_url": base_url,
         "pid": record.pid,
-        "process": "online" if _pid_is_recorded_daemon(record) else "offline",
+        "process": "online" if online else "offline",
         "log_path": record.log_path,
         "host_id": host_id,
+        "open_files": [
+            {**entry._asdict(), "near_limit": entry.near_limit} for entry in open_files
+        ],
         "host_status": None,
         "sessions": [],
         "error": None,
@@ -10721,6 +10737,23 @@ def _add_host_payload_sessions_table(console: Console, payload: _HostPayload) ->
     console.print(table)
 
 
+def _host_open_files_line(busiest: _HostJsonObject) -> str:
+    """
+    Render descriptor usage for the host process closest to its limit.
+
+    :param busiest: First ``open_files`` entry, e.g.
+        ``{"pid": 4321, "count": 251, "limit": 256, "near_limit": True}``.
+    :returns: Rich markup, highlighted when the process is near its limit.
+    """
+    count = _host_markup(busiest.get("count"))
+    limit = busiest.get("limit")
+    usage = count if limit is None else f"{count}/{_host_markup(limit)}"
+    line = f"  fds={usage} (pid {_host_markup(busiest.get('pid'))})"
+    if busiest.get("near_limit") is True:
+        return f"[yellow]{line} near limit[/yellow]"
+    return line
+
+
 def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
     """
     Render host status as one block per daemon target.
@@ -10753,6 +10786,9 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
         )
         console.print(f"  server={_host_linked(server_text, target=server_link)}")
         console.print(f"  host_id={_host_markup(payload.get('host_id'))}")
+        open_files = payload.get("open_files")
+        if isinstance(open_files, list) and open_files and isinstance(open_files[0], dict):
+            console.print(_host_open_files_line(open_files[0]))
         if payload.get("log_path"):
             log_text = _host_shorten(
                 payload.get("log_path"),
