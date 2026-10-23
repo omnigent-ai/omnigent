@@ -24,7 +24,7 @@ interface AskUserQuestionFormProps {
  *
  * Single-select: when the custom row is selected, the custom text
  * is the answer (and must be non-empty). Otherwise the selected
- * option label is the answer.
+ * option label is the answer. Text editors preserve whitespace and allow empty text.
  *
  * Multi-select: the answer is the union of selected option labels
  * and (the custom text, when the custom row is selected and the
@@ -45,6 +45,7 @@ function answerForQuestion(
     return all.length > 0 ? all : null;
   }
   if (customSelected) {
+    if (question.textInput) return customText;
     return customValue || null;
   }
   return typeof selection === "string" && selection ? selection : null;
@@ -74,12 +75,12 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
   // the answer).
   const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
     const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = false;
+    for (const q of questions) initial[questionKey(q)] = q.textInput !== undefined;
     return initial;
   });
   const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = "";
+    for (const q of questions) initial[questionKey(q)] = q.textInput?.default ?? "";
     return initial;
   });
 
