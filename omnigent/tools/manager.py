@@ -446,12 +446,17 @@ class ToolManager:
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
 
-        The spawn writes are child-only and ``sys_session_share`` is
-        owner-authority-bounded, both enforced at dispatch/server level;
-        the opt-ins control advertisement, not authority.
+        Send/close remain child-only. Create also supports independent
+        placements behind the orchestration gate. ``sys_session_message``
+        is always advertised; the deployment flag and server ownership/privacy
+        checks authorize peer sends. Sharing retains its separate opt-in.
+        Spec opt-ins control advertisement, not server authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """
+        from omnigent.tools.builtins.session_message import SysSessionMessageTool
+
+        self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()

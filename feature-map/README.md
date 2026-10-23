@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Session orchestration](./session-orchestration.md) covers private-owner
+  messaging, top-level worker creation, polling results and sharing restrictions.
+
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 

@@ -84,6 +84,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_message import SysSessionMessageTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -474,7 +475,8 @@ _BROWSER_TIMEOUT_ERROR = (
 # unconditionally for policy enforcement (independent of the spec's
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
-    _COMMENT_TOOLS
+    {SysSessionMessageTool.name()}
+    | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
@@ -597,6 +599,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysSessionMessageTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -863,7 +866,8 @@ def _bounded_discovery_result(
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
-    _OS_ENV_TOOLS
+    {SysSessionMessageTool.name()}
+    | _OS_ENV_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
     | _TERMINAL_TOOLS
@@ -3323,9 +3327,8 @@ def _build_session_create_body(
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
-    ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
-    what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``parent_session_id`` defaults to ``conversation_id``; independent
+    placements remove it before using the gated endpoint. A non-empty ``title``, ``message``,
     ``model``, and ``reasoning_effort`` are included when provided; the
     message becomes the child's first queued user turn via
     ``initial_items``.
@@ -3441,7 +3444,7 @@ async def _execute_session_create(
     runner_workspace: Path | None = None,
 ) -> str:
     """
-    Create a child session (``sys_session_create``).
+    Create a child or an independent session (``sys_session_create``).
 
     Two modes, split on the provided argument (exactly one required):
 
@@ -3452,8 +3455,9 @@ async def _execute_session_create(
       inside the caller's working directory) via the multipart
       ``POST /v1/sessions`` create.
 
-    Both modes force ``parent_session_id`` to the caller (child-only).
-    The child inherits the caller's runner (server-side affinity), so a
+    The default placement forces ``parent_session_id`` to the caller.
+    Independent placements use the server's gated orchestration endpoint.
+    A child inherits the caller's runner (server-side affinity), so a
     queued initial message starts a turn immediately. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
@@ -3496,6 +3500,15 @@ async def _execute_session_create(
                 )
             }
         )
+    placement = args.get("placement", "child")
+    if placement not in ("child", "same_host", "managed"):
+        return json.dumps({"error": "placement must be child, same_host or managed"})
+    if placement != "child" and has_config_path:
+        return json.dumps({"error": "Independent sessions require agent_id"})
+    message = args.get("message")
+    if placement != "child" and message is not None:
+        if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+            return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -3522,18 +3535,57 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        message,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
+    headers: dict[str, str] = {}
+    if placement != "child":
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+        body.pop("parent_session_id")
+        # The server derives the same host/workspace from this bound source.
+        headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
+        if placement == "managed":
+            body["host_type"] = "managed"
+            initial_items = body.pop("initial_items", None)
+            if isinstance(initial_items, list) and initial_items:
+                body["initial_input"] = initial_items[0]
+        else:
+            body.pop("initial_items", None)
     try:
-        resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+        endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
+            info = await server_client.get("/v1/info")
+            info.raise_for_status()
+            host_id = (
+                uuid.uuid4().hex if info.json().get("request_managed_sandbox_host_id") else None
+            )
+            if host_id is not None:
+                body["host_id"] = host_id
+            resp = await post_on_host(
+                server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
+            )
+        else:
+            resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
+    if placement != "child" and resp.status_code in (404, 405):
+        return json.dumps(
+            {
+                "error": "Independent session creation is unavailable on this server "
+                "or the agent was not found",
+            }
+        )
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "agent_id": agent_id})
+        denied = {"error": "access_denied", "agent_id": agent_id}
+        if placement != "child":
+            denied["detail"] = resp.text[:1000]
+        return json.dumps(denied)
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
@@ -3541,6 +3593,25 @@ async def _execute_session_create(
     data = resp.json()
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
+    if placement != "child":
+        handle = {
+            "conversation_id": data["id"],
+            "kind": "default",
+            "status": data.get("status") or "created",
+            "agent_id": data.get("agent_id") or agent_id,
+            "title": data.get("title") or args.get("title"),
+        }
+        if placement == "same_host" and args.get("message"):
+            from omnigent.runner.session_message import execute_message_tool
+
+            handle["initial_message"] = json.loads(
+                await execute_message_tool(
+                    {"session_id": data["id"], "message": args["message"]},
+                    server_client,
+                    conversation_id,
+                )
+            )
+        return json.dumps(handle)
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
@@ -6682,6 +6753,10 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
+        elif tool_name == SysSessionMessageTool.name():
+            from omnigent.runner.session_message import execute_message_tool
+
+            output = await execute_message_tool(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

@@ -74,6 +74,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_permission_mode,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
 
 _logger = logging.getLogger(__name__)
 
@@ -887,6 +888,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         host_id=task.host_id,
         workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task.id},
     )
     reasoning_effort = task.reasoning_effort
     if reasoning_effort is None:

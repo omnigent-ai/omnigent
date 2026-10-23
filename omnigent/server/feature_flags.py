@@ -20,6 +20,7 @@ _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 class Feature(StrEnum):
     """Canonical release-feature keys accepted by ``OMNIGENT_FEATURES``."""
 
+    SESSION_ORCHESTRATION = "session_orchestration"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
@@ -47,6 +48,13 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.SESSION_ORCHESTRATION,
+        description="Private-owner session messaging and independent worker creation",
+        owner="server",
+        review_by_release="0.22.0",
+        frontend_visible=False,
+    ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
         description=(
