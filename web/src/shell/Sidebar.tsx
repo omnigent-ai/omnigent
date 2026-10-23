@@ -7283,9 +7283,11 @@ function ProjectFolderMenu({
           data-testid="project-actions"
           className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           onPointerDown={(e) => {
-            pressPointerRef.current = e.pointerType === "mouse" ? "mouse" : "touch";
+            // Only treat as touch if explicitly a touch or pen event; default to mouse.
+            const isTouchLike = e.pointerType === "touch" || e.pointerType === "pen";
+            pressPointerRef.current = isTouchLike ? "touch" : "mouse";
             // Touch and pen skip Radix's press toggle so a scroll start never opens the menu.
-            if (pressPointerRef.current === "touch") e.preventDefault();
+            if (isTouchLike) e.preventDefault();
           }}
           onPointerCancel={() => {
             pressPointerRef.current = null;
