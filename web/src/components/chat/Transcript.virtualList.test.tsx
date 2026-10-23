@@ -133,6 +133,11 @@ it("measures rows at their unrounded border-box height", () => {
   expect(measure(row, undefined, instance as never)).toBe(
     measureElement(row, undefined, instance as never),
   );
+
+  // A first mount has no cached size; read the unrounded box, not offsetHeight.
+  instance.itemSizeCache.clear();
+  row.getBoundingClientRect = () => ({ height: 58.796875 }) as DOMRect;
+  expect(measure(row, undefined, instance as never)).toBe(58.796875);
 });
 
 it("publishes navigation that distinguishes loaded and missing turns", async () => {

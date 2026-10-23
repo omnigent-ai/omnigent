@@ -557,6 +557,8 @@ function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): v
 }
 /** Physical "is this scroll element at (or within a hair of) its bottom". */
 const BOTTOM_EPSILON_PX = 8;
+/** Space between virtualized rows, shared by the virtualizer's offsets and the list's layout. */
+const ROW_GAP_PX = 16;
 const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
@@ -729,14 +731,20 @@ export function VirtualBubbleList({
       const key = bubbleKey(bubbles[index]!);
       return rowKeyAliasRef.current.get(key) ?? key;
     },
-    // Matches the list's `gap-4` between rows.
-    gap: 16,
+    gap: ROW_GAP_PX,
     overscan: 6,
     scrollMargin,
     // Unrounded, unlike the library default: in-flow rows sit at their exact
     // heights, so rounded sizes would drift each row off its virtual offset.
-    measureElement: (element, entry, instance) =>
-      entry?.borderBoxSize?.[0]?.blockSize ?? measureElement(element, entry, instance),
+    measureElement: (element, entry, instance) => {
+      const observed = entry?.borderBoxSize?.[0]?.blockSize;
+      if (observed !== undefined) return observed;
+      // On mount the library falls back to a cached size, else the rounded offsetHeight.
+      const key = instance.options.getItemKey(instance.indexFromElement(element));
+      return instance.itemSizeCache.has(key)
+        ? measureElement(element, entry, instance)
+        : element.getBoundingClientRect().height;
+    },
   });
 
   // An assistant bubble is keyed by its first item, so a history page that
@@ -1046,8 +1054,9 @@ export function VirtualBubbleList({
   return (
     <div
       ref={wrapperRef}
-      className="flex w-full flex-col gap-4"
+      className="flex w-full flex-col"
       style={{
+        rowGap: ROW_GAP_PX,
         paddingTop: firstItem ? firstItem.start - scrollMargin : 0,
         paddingBottom: lastItem ? totalSize - (lastItem.end - scrollMargin) : totalSize,
       }}
