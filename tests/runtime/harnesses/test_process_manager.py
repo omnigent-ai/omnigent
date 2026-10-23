@@ -47,6 +47,7 @@ from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     NoLiveHarnessError,
     _default_tmp_parent,
+    _ensure_private_dir,
     _kill_orphan_runners,
     _model_env_key,
     _pid_alive,
@@ -247,6 +248,51 @@ def test_default_tmp_parent_is_per_uid_on_posix(
     assert parent == Path(f"/tmp/omnigent-{os.getuid()}")
     # The shared parent that locked out other users must be gone.
     assert parent != Path("/tmp/omnigent")
+
+
+@pytest.mark.posix_only
+def test_ensure_private_dir_tightens_a_permissive_existing_dir(tmp_path: Path) -> None:
+    """A pre-existing socket directory loses group and other write access."""
+    target = tmp_path / "harness"
+    target.mkdir(mode=0o777)
+    target.chmod(0o777)
+
+    _ensure_private_dir(target)
+
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.posix_only
+def test_ensure_private_dir_accepts_an_owned_symlink(tmp_path: Path) -> None:
+    """An operator's own symlinked socket root is kept, and its target tightened."""
+    target = tmp_path / "private"
+    target.mkdir(mode=0o775)
+    target.chmod(0o775)
+    link = tmp_path / "short"
+    link.symlink_to(target, target_is_directory=True)
+
+    _ensure_private_dir(link)
+
+    assert target.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("planted", ["directory", "symlink"])
+def test_ensure_private_dir_rejects_a_dir_another_user_planted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, planted: str
+) -> None:
+    """A planted path at the predictable name fails instead of hosting sockets."""
+    target = tmp_path / "planted-target"
+    target.mkdir(mode=0o777)
+    path = target
+    if planted == "symlink":
+        path = tmp_path / "planted-link"
+        path.symlink_to(target, target_is_directory=True)
+    # Pretend another uid is running, so every path here belongs to "someone else".
+    monkeypatch.setattr(os, "getuid", lambda: os.geteuid() + 1)
+
+    with pytest.raises(OSError, match="not a directory owned by the current user"):
+        _ensure_private_dir(path)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Symlink path is POSIX-only.")
@@ -717,8 +763,15 @@ async def test_get_client_respawns_after_crash(
 
 
 @pytest.mark.posix_only
-@pytest.mark.parametrize("response_id", [None, "resp_socket_lost"])
-@pytest.mark.parametrize("removed_path", ["socket", "instance", "parent"])
+@pytest.mark.parametrize(
+    ("removed_path", "response_id"),
+    [
+        ("socket", None),
+        ("socket", "resp_socket_lost"),
+        ("instance", None),
+        ("parent", "resp_socket_lost"),
+    ],
+)
 async def test_get_client_respawns_when_socket_pathname_vanishes(
     manager: HarnessProcessManager,
     caplog: pytest.LogCaptureFixture,
