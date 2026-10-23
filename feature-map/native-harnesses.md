@@ -792,6 +792,16 @@ Cross-harness journeys:
   derived skill/MCP plugin listing still works; a 502 shows an inventory error.
   Codex and Cursor keep their existing derived listings.
 
+**Pi persisted history:** for `chat-render` and `tool-history`, send a prompt
+from the native terminal and complete a tool turn, then reload Chat. Each prompt,
+call, result and final answer should appear once. Extension regressions in
+`tests/harnesses/pi_native/test_pi_native_extension.py` cover bounded retry,
+stable item identity and policy evaluation after delivery failure; server
+idempotency is covered by
+`tests/server/integration/test_sessions_external_item_idempotency.py`.
+A prolonged outage still surfaces a delivery failure; transient streaming chunks
+are not replayed. Component checks do not establish desktop rendering parity.
+
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
 and orphan results. The existing
