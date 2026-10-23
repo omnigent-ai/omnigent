@@ -389,7 +389,8 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
       return null;
     for (let i = 0; i < tokenBlock.text.length; i++) {
       starts.push(tokenBlock.starts[i]);
-      ends.push(tokenBlock.ends[i]);
+      const end = tokenBlock.ends[i];
+      ends.push(raw[end - 1] === "\r" && raw[end] === "\n" ? end + 1 : end);
       positions.push(documentBlock.positions[i]);
     }
   }
@@ -413,8 +414,7 @@ export function markdownSourceMap(
     map = buildMap(doc, raw, manager);
   } catch (error) {
     // Custom tokenizer failures must preserve the legacy comment path.
-    if (import.meta.env.DEV)
-      console.warn("Markdown source map failed; using legacy anchors", error);
+    console.warn("Markdown source map failed; using legacy anchors", error);
   }
   cache.set(doc, { raw, manager, map });
   return map;

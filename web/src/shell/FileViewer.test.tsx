@@ -1124,6 +1124,27 @@ function makeAnchoredComment(
 }
 
 describe("classifyAndRemapComments", () => {
+  it("uses source-aware remapping only for open formatted Markdown anchors", () => {
+    const formatted = makeAnchoredComment({
+      id: "formatted",
+      path: "doc.md",
+      start_index: 0,
+      end_index: 16,
+      anchor_content: "say word now",
+    });
+    const literal = { ...formatted, id: "literal", end_index: 12 };
+    const addressed = { ...formatted, id: "addressed", status: "addressed" as const };
+    const remapped = { ...formatted, start_index: 7, end_index: 19 };
+    const remap = vi.fn(() => remapped);
+    const result = classifyAndRemapComments(
+      [formatted, literal, addressed],
+      "prefix say word now",
+      remap,
+    );
+    expect(result.open).toEqual([remapped, { ...literal, start_index: 7, end_index: 19 }]);
+    expect(result.addressed).toEqual([addressed]);
+    expect(remap).toHaveBeenCalledExactlyOnceWith(formatted, "prefix say word now");
+  });
   it.each(["doc.md", "doc.markdown", "doc.MD"])(
     "preserves a markup-spanning raw range in %s instead of relocating to a literal copy",
     (path) => {

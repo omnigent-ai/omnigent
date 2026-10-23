@@ -147,13 +147,20 @@ export function computeSelectionData(
   if (!anchor_content.trim()) return null;
 
   const map = markdownSourceMap(doc, rawContent, manager);
-  const indexes = map && exactRange(map.positions, from, map.positions, to - 1);
-  if (map && indexes) {
-    const [first, last] = indexes;
+  if (map) {
+    const first = lowerBound(map.positions, from);
+    const end = lowerBound(map.positions, to);
     const start_index = map.starts[first];
-    const end_index = map.ends[last];
-    const range = mappedRange(doc, map, start_index, end_index, anchor_content);
-    if (range?.from === from && range.to === to) {
+    const end_index = map.ends[end - 1];
+    const range =
+      first < end ? mappedRange(doc, map, start_index, end_index, anchor_content) : null;
+    if (
+      range &&
+      range.from >= from &&
+      range.to <= to &&
+      !doc.textBetween(from, range.from, SEP) &&
+      !doc.textBetween(range.to, to, SEP)
+    ) {
       return { start_index, end_index, anchor_content };
     }
   }
@@ -185,4 +192,44 @@ export function computeSelectionData(
     end_index: idx + anchor_content.length,
     anchor_content,
   };
+}
+
+function lowerBound(values: number[], value: number): number {
+  let start = 0;
+  let end = values.length;
+  while (start < end) {
+    const middle = (start + end) >>> 1;
+    if (values[middle] < value) start = middle + 1;
+    else end = middle;
+  }
+  return start;
+}
+
+export function remapMarkdownComment(
+  doc: ProseMirrorNode,
+  comment: Comment,
+  rawContent: string,
+  manager: MarkdownManager,
+): Comment {
+  const anchor = comment.anchor_content;
+  if (!anchor) return comment;
+  const map = markdownSourceMap(doc, rawContent, manager);
+  if (!map || mappedRange(doc, map, comment.start_index, comment.end_index, anchor)) return comment;
+  const text = doc.textBetween(0, doc.content.size, SEP);
+  let best = comment;
+  let distance = Infinity;
+  for (let index = text.indexOf(anchor); index !== -1; index = text.indexOf(anchor, index + 1)) {
+    const from = textOffsetToPmPos(doc, index);
+    const to = textOffsetToPmPos(doc, index + anchor.length);
+    const captured = computeSelectionData(from, to, doc, rawContent, manager);
+    if (!captured) continue;
+    const range = mappedRange(doc, map, captured.start_index, captured.end_index, anchor);
+    if (!range || range.from < from || range.to > to) continue;
+    const candidateDistance = Math.abs(captured.start_index - comment.start_index);
+    if (candidateDistance < distance) {
+      best = { ...comment, ...captured };
+      distance = candidateDistance;
+    }
+  }
+  return best;
 }

@@ -264,12 +264,6 @@ function MarkdownRichTextViewerInner({
       });
   }, [content]);
 
-  // Stable ref to the raw server content for comment offset mapping.
-  const contentRef = useRef(content);
-  useEffect(() => {
-    contentRef.current = content;
-  }, [content]);
-
   // Baseline used to detect actual edits vs TipTap normalisation.
   const baselineRef = useRef<string | null>(null);
   // Immutable snapshots share unchanged subtrees, so dirty checks need no
@@ -561,7 +555,7 @@ function MarkdownRichTextViewerInner({
       )}
       <MarkdownCommentPlugin
         editor={editor}
-        contentRef={contentRef}
+        content={content}
         commentStateRef={commentStateRef}
         comments={comments}
         isDirty={isDirty}

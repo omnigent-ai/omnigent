@@ -127,6 +127,46 @@ const cases: [string, string, number, string?][] = [
 ];
 
 describe("validated Markdown source positions", () => {
+  it.each<[string, number, number, number, number, string]>([
+    ["alpha\r\nbeta", 1, 7, 0, 7, "alpha\n"],
+    ["> alpha\r\n> beta", 2, 8, 2, 9, "alpha\n"],
+    ["alpha\nbeta", 1, 7, 0, 6, "alpha\n"],
+    ["alpha\rbeta", 1, 7, 0, 6, "alpha\n"],
+    ["word  \nnext\n\nword\n\n[details](word)", 1, 6, 0, 4, "word"],
+    [`[label](${"x".repeat(59)}) word **word**![alt](image.png)\n\n`, 12, 17, 76, 80, "word"],
+    ["![alt](image.png)**word** word", 1, 6, 19, 23, "word"],
+  ])(
+    "maps text beside non-text boundaries: %s",
+    (raw, from, to, start_index, end_index, anchor_content) => {
+      const doc = parse(raw);
+      const expected = { start_index, end_index, anchor_content };
+      expect(computeSelectionData(from, to, doc, raw, editor.markdown)).toEqual(expected);
+      const restored = findPmRangeForComment(doc, expected as Comment, raw, editor.markdown)!;
+      expect(restored.from).toBeGreaterThanOrEqual(from);
+      expect(restored.to).toBeLessThanOrEqual(to);
+      expect(doc.textBetween(restored.from, restored.to, "\n")).toBe(anchor_content);
+    },
+  );
+
+  it("reports unexpected mapping errors in production and caches the failed map", () => {
+    const raw = "word word";
+    const doc = parse(raw);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const traversal = vi.spyOn(doc, "forEach").mockImplementation(() => {
+      throw new TypeError("mapper bug");
+    });
+    vi.stubEnv("DEV", false);
+    try {
+      expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
+      expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(traversal).toHaveBeenCalledTimes(1);
+    } finally {
+      traversal.mockRestore();
+      warn.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
   it.each(
     [
       ["plain", callTable],
@@ -300,8 +340,11 @@ describe("validated Markdown source positions", () => {
     const tokens = new manager.instance.Lexer(manager.instance.defaults).lex(raw);
     tokens[0] = { type: "unsupported", raw: tokens[0].raw };
     const lexer = vi.spyOn(manager.instance.Lexer.prototype, "lex").mockReturnValueOnce(tokens);
-    expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
-    lexer.mockRestore();
+    try {
+      expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
+    } finally {
+      lexer.mockRestore();
+    }
     const positions: number[] = [];
     doc.descendants((node, pos) => {
       if (node.isText && node.text?.includes("word"))
