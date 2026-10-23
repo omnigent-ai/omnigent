@@ -5644,6 +5644,52 @@ def test_build_connect_headers_retains_auth_factory(
     assert token_calls == [1, 1, 1]
 
 
+@pytest.mark.parametrize("status", [401, 403, "redirect", 503])
+@pytest.mark.parametrize("login_repaired", [False, True])
+async def test_rejected_host_bearer_rediscovers_repaired_credentials(
+    monkeypatch: pytest.MonkeyPatch, status: int | str, login_repaired: bool
+) -> None:
+    """Auth refusals discard the resolver; an outage keeps its warm cache."""
+    import omnigent.runner._entry as entry_mod
+
+    credential = "rejected-token"
+    resolved: list[str] = []
+
+    def make_factory(*, server_url: str | None = None) -> Callable[[], str]:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        resolved.append(credential)
+        cached = credential
+        return lambda: cached
+
+    rejection = (
+        InvalidURI("https://example.test/oidc/authorize", "scheme isn't ws or wss")
+        if status == "redirect"
+        else _invalid_status(status)
+    )
+    spy = _ConnectSpy([rejection, rejection])
+    _patch_connect(monkeypatch, spy)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    host = _host()
+    host._ever_connected = True
+    with pytest.raises(type(rejection)):
+        await host._connect_and_serve()
+
+    if login_repaired:
+        credential = "repaired-token"
+    with pytest.raises(type(rejection)):
+        await host._connect_and_serve()
+
+    auth_rejected = status != 503
+    expected_token = credential if auth_rejected else "rejected-token"
+    assert [call["additional_headers"]["Authorization"] for call in spy.calls] == [
+        "Bearer rejected-token",
+        f"Bearer {expected_token}",
+    ]
+    assert resolved == (["rejected-token", credential] if auth_rejected else ["rejected-token"])
+
+
 def test_build_connect_headers_slice_key_only_on_workspace_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
