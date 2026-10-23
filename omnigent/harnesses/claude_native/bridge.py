@@ -226,6 +226,9 @@ _TOOL_RELAY_FILE = "tool_relay.json"
 # on every relay start, so hooks survive runner restarts (new port).
 _TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
+# Written into the pane's private dir just before Omnigent kills the pane, so the
+# runner reads the exit as Omnigent's own close rather than the terminal dying.
+_EXPECTED_CLOSE_FILE = "expected_close"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -4714,6 +4717,7 @@ def kill_session(
     bridge_dir: Path,
     *,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    expected_close: bool = False,
 ) -> None:
     """
     Forcefully terminate the Claude tmux session via ``kill-session``.
@@ -4740,14 +4744,43 @@ def kill_session(
         advertised by the runner, e.g. ``30.0``. A short value is
         appropriate for the UI path — a missing ``tmux.json`` means
         there is no live session to kill.
+    :param expected_close: ``True`` when Omnigent ends the pane to fail a
+        turn itself (a delivery timeout). The runner then reads the exit
+        as expected instead of a terminal crash; see
+        :func:`pane_closed_by_omnigent`.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _run_tmux(
-        info["socket_path"], "kill-session", "-t", info["tmux_target"], allow_missing_target=True
-    )
+    marker = Path(info["socket_path"]).parent / _EXPECTED_CLOSE_FILE
+    if expected_close:
+        with contextlib.suppress(OSError):
+            marker.touch()
+    try:
+        _run_tmux(
+            info["socket_path"],
+            "kill-session",
+            "-t",
+            info["tmux_target"],
+            allow_missing_target=True,
+        )
+    except RuntimeError:
+        if expected_close:
+            marker.unlink(missing_ok=True)
+        raise
+
+
+def pane_closed_by_omnigent(private_dir: Path) -> bool:
+    """
+    Return whether Omnigent itself killed the Claude pane in *private_dir*.
+
+    :param private_dir: The terminal instance's private dir, which holds its
+        tmux socket, e.g. ``/tmp/omnigent-terminal-abc/``.
+    :returns: ``True`` when :func:`kill_session` was asked for an expected
+        close and the kill did not fail.
+    """
+    return (private_dir / _EXPECTED_CLOSE_FILE).exists()
 
 
 @_serialize_bridge_injection

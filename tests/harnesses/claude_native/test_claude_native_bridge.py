@@ -54,6 +54,7 @@ from omnigent.harnesses.claude_native.bridge import (
     inject_user_message,
     is_auth_slash_command,
     kill_session,
+    pane_closed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -5854,6 +5855,86 @@ def test_kill_session_raises_on_unexpected_tmux_failure(
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="permission denied"):
         kill_session(bridge_dir)
+
+
+def test_expected_close_marks_the_pane_before_the_kill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A kill Omnigent asks for marks the pane's private dir before tmux kills it.
+
+    The runner reads the pane's exit moments later. The marker must already
+    exist when the kill runs, or the exit reads as the terminal dying on its own.
+    """
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+    marked_at_kill: list[bool] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        marked_at_kill.append(pane_closed_by_omnigent(private_dir))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    kill_session(bridge_dir, expected_close=True)
+
+    assert marked_at_kill == [True]
+    assert pane_closed_by_omnigent(private_dir)
+
+
+def test_failed_expected_close_kill_leaves_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kill that fails did not close the pane, so a later exit is still a crash."""
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="permission denied"):
+        kill_session(bridge_dir, expected_close=True)
+
+    assert not pane_closed_by_omnigent(private_dir)
+
+
+def test_kill_session_without_expected_close_leaves_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    kill_session(bridge_dir)
+
+    assert not pane_closed_by_omnigent(private_dir)
 
 
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(

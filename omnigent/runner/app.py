@@ -1851,6 +1851,19 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
+        # Omnigent killed this pane after a delivery timeout. The turn's own
+        # error is the failure; a terminal-exit failure would be a second one.
+        if event.expected_close:
+            _logger.info(
+                "required terminal %s closed by its turn's delivery timeout; "
+                "the turn reports that error: session=%s",
+                event.terminal_name,
+                event.session_id,
+                extra={"session_id": event.session_id},
+            )
+            _release_required_terminal_session(event.session_id)
+            return
+
         # A required terminal exit ends the session. Tear down any registered
         # Codex app-server alongside it; this is a no-op for other harnesses.
         _teardown_task = asyncio.create_task(
