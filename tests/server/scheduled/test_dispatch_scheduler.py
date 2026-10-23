@@ -664,9 +664,10 @@ async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
         store, fire, recovery, owns_host=owns, now=clock.now, batch_size=1
     )
     try:
-        await scheduler.poll_once()
-        await _drain(scheduler)
-        assert checked == [run.host_id for run in runs]
+        for index in range(len(runs)):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            assert checked == [run.host_id for run in runs[: index + 1]]
         recovery.assert_awaited_once_with(runs[-1])
         fire.assert_not_awaited()
         assert store.list_expired_starting_runs(int(clock.now())) == runs[:2]
@@ -1233,3 +1234,50 @@ async def test_heartbeat_stops_retrying_at_last_confirmed_expiry(store, monkeypa
         await scheduler._heartbeat(lease)
     assert attempts == 2
     assert store.list_runs(task.id)[0] == [run]
+
+
+async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(store):
+    tasks = [_task(store, f"expired-{index}") for index in range(3)]
+    clock = FakeClock(max(task.next_run_at for task in tasks))
+    for task in tasks:
+        store.claim_scheduled_run(
+            task,
+            now=int(clock.now()),
+            next_run_at=int(clock.now()) + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+    clock.advance(120)
+    runs = store.list_expired_starting_runs(int(clock.now()))
+    deleted = _task(store, "deleted")
+    store.update(deleted.id, state="deleted")
+    recover = AsyncMock(return_value=None)
+    scheduler = PersistentTaskScheduler(store, AsyncMock(), recover, now=clock.now, batch_size=1)
+    try:
+        for index in range(len(runs)):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            assert [call.args[0] for call in recover.await_args_list] == runs[: index + 1]
+            assert store.get(deleted.id) is None
+            if index == 0:
+                later = _task(store, "expires-during-scan")
+                later_run = store.claim_scheduled_run(
+                    later,
+                    now=int(clock.now()),
+                    next_run_at=int(clock.now()) + 3600,
+                    host_id=None,
+                    lease_seconds=120,
+                )
+                clock.advance(120)
+        # New expirations wait for the next scan, so older uncertain work gets a turn.
+        # The empty page ends this scan; the following poll revisits uncertain work.
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert recover.await_count == len(runs)
+        for run in [*runs, later_run]:
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            assert recover.await_args.args == (run,)
+        assert recover.await_count == 2 * len(runs) + 1
+    finally:
+        await scheduler.stop()

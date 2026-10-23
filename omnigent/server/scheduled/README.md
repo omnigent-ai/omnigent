@@ -82,11 +82,16 @@ checks host ownership, stops any local startup still active for the run, and ask
 that the prompt was never sent. Recovery must inspect the session and resources
 before deciding what to preserve or clean up. It never sends another prompt.
 
-Each server runs one recovery sweep at a time. The sweep handles expired runs in
-pages, then removes eligible history for deleted tasks. Slow recovery does not
-block new runs, but a large backlog can delay deleted-task cleanup. Deleting a
-task immediately hides it and prevents new runs; unfinished claimed runs remain
-until their result or cleanup is recorded.
+Each server runs one recovery pass at a time. Each pass inspects at most
+`batch_size` expired runs, then removes a bounded page of eligible history for
+deleted tasks. The next pass continues where it left off. The scan keeps its
+original expiry cutoff until it reaches the end, then starts over to revisit
+uncertain outcomes and include newly expired leases. Slow recovery does not block
+new runs, and deletion cleanup gets a turn between recovery pages.
+
+A failed deletion is logged and skipped until the next scan so other tasks can
+be cleaned up. Deleting a task immediately hides it and prevents new runs;
+unfinished claimed runs remain until their result or cleanup is recorded.
 
 Shutdown cancels and waits for local startup and recovery work. Unfinished runs
 remain in the database for a later recovery sweep.

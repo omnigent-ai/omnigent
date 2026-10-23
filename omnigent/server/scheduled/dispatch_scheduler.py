@@ -218,6 +218,8 @@ class PersistentTaskScheduler:
         self._stopped = False
         self._initialization_cursor: TaskCursor | None = None
         self._cleanup_cursor: DeletedTaskCursor | None = None
+        self._recovery_cursor: DispatchCursor | None = None
+        self._recovery_cutoff: int | None = None
 
     @property
     def is_started(self) -> bool:
@@ -327,63 +329,63 @@ class PersistentTaskScheduler:
             _logger.exception("Could not finish deleted-task cleanup; retrying next poll")
 
     async def _reconcile(self) -> None:
-        cutoff = int(self._now())
-        cursor: DispatchCursor | None = None
-        while True:
-            runs = await asyncio.to_thread(
-                self._store.list_expired_starting_runs,
-                cutoff,
-                after=cursor,
-                limit=self._batch_size,
-            )
-            if not runs:
-                return
-            for run in runs:
-                assert run.lease_expires_at is not None
-                cursor = (run.lease_expires_at, run.workspace_id, run.id)
-                try:
-                    async with asyncio.timeout(self._recovery_seconds):
-                        if await self._owns_host(run.workspace_id, run.host_id):
-                            local = self._startups.get((run.workspace_id, run.id))
-                            if local is not None:
-                                local.cancel()
-                                await asyncio.gather(local, return_exceptions=True)
-                            with workspace_scope(run.workspace_id):
-                                status = await self._on_expired(run)
-                                if status is not None:
-                                    if status not in ("running", "failed"):
-                                        raise ValueError(
-                                            f"Invalid recovery result {status!r}. "
-                                            "Expected 'running', 'failed', or None "
-                                            "to check again later."
-                                        )
-                                    await asyncio.to_thread(
-                                        self._store.transition_starting_run,
-                                        run,
-                                        now=self._now,
-                                        status=status,
-                                        expired=True,
-                                        error="Run startup did not complete before its lease "
-                                        "expired; recovery marked the run as failed."
-                                        if status == "failed"
-                                        else None,
-                                        error_code="startup_expired"
-                                        if status == "failed"
-                                        else None,
+        # Keep the cutoff fixed until the scan wraps so new expirations cannot
+        # indefinitely postpone retrying uncertain outcomes from earlier pages.
+        if self._recovery_cutoff is None:
+            self._recovery_cutoff = int(self._now())
+        runs = await asyncio.to_thread(
+            self._store.list_expired_starting_runs,
+            self._recovery_cutoff,
+            after=self._recovery_cursor,
+            limit=self._batch_size,
+        )
+        for run in runs:
+            assert run.lease_expires_at is not None
+            self._recovery_cursor = (run.lease_expires_at, run.workspace_id, run.id)
+            try:
+                async with asyncio.timeout(self._recovery_seconds):
+                    if await self._owns_host(run.workspace_id, run.host_id):
+                        local = self._startups.get((run.workspace_id, run.id))
+                        if local is not None:
+                            local.cancel()
+                            await asyncio.gather(local, return_exceptions=True)
+                        with workspace_scope(run.workspace_id):
+                            status = await self._on_expired(run)
+                            if status is not None:
+                                if status not in ("running", "failed"):
+                                    raise ValueError(
+                                        f"Invalid recovery result {status!r}. "
+                                        "Expected 'running', 'failed', or None "
+                                        "to check again later."
                                     )
-                except TimeoutError:
-                    _logger.warning(
-                        "Recovery timed out for run %s; an in-flight database update may "
-                        "still complete. If the run remains starting, a later sweep "
-                        "will check it again",
-                        run.id,
-                    )
-                except Exception:
-                    _logger.exception(
-                        "Could not finish recovery for run %s after its startup lease expired; "
-                        "will check the run again on a later poll",
-                        run.id,
-                    )
+                                await asyncio.to_thread(
+                                    self._store.transition_starting_run,
+                                    run,
+                                    now=self._now,
+                                    status=status,
+                                    expired=True,
+                                    error="Run startup did not complete before its lease "
+                                    "expired; recovery marked the run as failed."
+                                    if status == "failed"
+                                    else None,
+                                    error_code="startup_expired" if status == "failed" else None,
+                                )
+            except TimeoutError:
+                _logger.warning(
+                    "Recovery timed out for run %s; an in-flight database update may "
+                    "still complete. If the run remains starting, a later sweep "
+                    "will check it again",
+                    run.id,
+                )
+            except Exception:
+                _logger.exception(
+                    "Could not finish recovery for run %s after its startup lease expired; "
+                    "will check the run again on a later poll",
+                    run.id,
+                )
+        if len(runs) < self._batch_size:
+            self._recovery_cursor = None
+            self._recovery_cutoff = None
 
     async def _claim_due(self) -> None:
         cutoff = int(self._now())

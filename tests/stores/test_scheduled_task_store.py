@@ -1868,3 +1868,57 @@ def test_deleted_cleanup_pages_past_live_claims_across_tasks(store, monkeypatch)
             runs, _ = store.list_runs(task_id)
             assert len(runs) == 3
             assert all(run.status == "starting" for run in runs)
+
+
+@pytest.mark.parametrize("limit, resume", [(1, False), (10, False), (1, True)])
+def test_deleted_cleanup_passes_failing_task_and_retries_on_next_scan(
+    store, monkeypatch, caplog, limit, resume
+):
+    tasks = []
+    for workspace in (31, 32):
+        with workspace_scope(workspace):
+            task = _due_task(store, "deleted")
+            store.update(task.id, state="deleted")
+            tasks.append(task)
+    cursor = None
+    if resume:
+        monkeypatch.setattr(store, "_cleanup_batch_size", 1)
+        with workspace_scope(31):
+            for index in range(2):
+                store.create_run(_uid(f"history-{index}"), tasks[0].id, "succeeded", index)
+        cursor = store.purge_deleted_tasks(limit=limit)
+        assert cursor is not None and cursor[2] is not None
+    original = store._purge_deleted_task_page
+    failing = True
+    attempted = []
+
+    def purge(task_id, *, after=None):
+        from omnigent.db.db_models import current_workspace_id
+
+        workspace = current_workspace_id()
+        attempted.append(workspace)
+        if workspace == 31 and failing:
+            raise RuntimeError("cleanup unavailable for this task")
+        return original(task_id, after=after)
+
+    monkeypatch.setattr(store, "_purge_deleted_task_page", purge)
+    for _ in range(3):
+        cursor = store.purge_deleted_tasks(after=cursor, limit=limit)
+        if cursor is None:
+            break
+    else:
+        pytest.fail("Cleanup failed to advance past a failing task")
+    assert attempted == [31, 32]
+    assert tasks[0].id in caplog.text
+    with workspace_scope(31):
+        assert store.get(tasks[0].id).state == "deleted"
+    with workspace_scope(32):
+        assert store.get(tasks[1].id) is None
+    failing = False
+    for _ in range(3):
+        cursor = store.purge_deleted_tasks(after=cursor, limit=limit)
+        if cursor is None:
+            break
+    assert attempted[2:] and all(workspace == 31 for workspace in attempted[2:])
+    with workspace_scope(31):
+        assert store.get(tasks[0].id) is None

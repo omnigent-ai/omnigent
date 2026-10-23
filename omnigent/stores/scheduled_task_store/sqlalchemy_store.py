@@ -550,15 +550,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 )
             tasks = list(session.execute(stmt).tuples())
         for workspace_id, task_id in tasks:
-            with workspace_scope(workspace_id):
-                run_cursor = (
-                    after[2]
-                    if after is not None and after[:2] == (workspace_id, task_id)
-                    else None
+            try:
+                with workspace_scope(workspace_id):
+                    run_cursor = (
+                        after[2]
+                        if after is not None and after[:2] == (workspace_id, task_id)
+                        else None
+                    )
+                    next_run_cursor = self._purge_deleted_task_page(task_id, after=run_cursor)
+                if next_run_cursor is not None:
+                    return (workspace_id, task_id, next_run_cursor)
+            except Exception:
+                _logger.exception(
+                    "Could not clean up deleted task %s in workspace %s; "
+                    "continuing with other tasks and retrying on the next scan",
+                    task_id,
+                    workspace_id,
                 )
-                next_run_cursor = self._purge_deleted_task_page(task_id, after=run_cursor)
-            if next_run_cursor is not None:
-                return (workspace_id, task_id, next_run_cursor)
         return (tasks[-1][0], tasks[-1][1], None) if len(tasks) == limit else None
 
     # ── Runs ─────────────────────────────────────────────────────
