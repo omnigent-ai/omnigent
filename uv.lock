@@ -35,7 +35,6 @@ mlflow = "2026-09-05T00:00:00Z"
 mlflow-skinny = "2026-09-05T00:00:00Z"
 mlflow-tracing = "2026-09-05T00:00:00Z"
 nimble-python = "2026-07-29T00:00:00Z"
-pillow = "2026-10-17T00:00:00Z"
 
 [manifest]
 members = [
