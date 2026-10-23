@@ -1463,6 +1463,46 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
+  it("previews the cycled launch model and its effort ladder with the draft focused", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "unfinished task" } });
+    act(() => input.focus());
+
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
+    expect(
+      await screen.findByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"),
+    ).toHaveAttribute("aria-checked", "true");
+    for (const effort of ["Medium", "High", "xHigh"]) {
+      fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(effort);
+    }
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("Medium");
+    expect(await screen.findByTestId("new-chat-landing-agent-effort-medium")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("unfinished task");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    await act(async () => fireEvent.submit(screen.getByTestId("new-chat-landing-composer")));
+    expect((await readCreateBody()).body).toMatchObject({
+      agent_id: "a2",
+      model_override: "databricks-gpt-5-6",
+      reasoning_effort: "medium",
+    });
+  });
+
   it("drills into the selected harness's model submenu on Ctrl+Shift+M and focuses its model", async () => {
     const user = userEvent.setup();
     mockAgents(DEFAULT_LANDING_AGENTS);

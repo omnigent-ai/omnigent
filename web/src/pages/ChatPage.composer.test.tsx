@@ -6259,6 +6259,97 @@ describe("Composer config gear", () => {
 
   const gear = () => document.querySelector('[data-testid="composer-config-gear"]');
 
+  it("previews cycled model and effort without disturbing a working draft", async () => {
+    const previous = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState(previous, true));
+    const options = [
+      { id: "opus", displayName: "Opus" },
+      { id: "sonnet", displayName: "Sonnet" },
+    ];
+    let resolveModel: () => void = () => {};
+    const setModel = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveModel = resolve;
+        }),
+    );
+    const setEffort = vi.fn(async (effort: string | null) => {
+      useChatStore.setState({ sessionReasoningEffort: effort });
+    });
+    useChatStore.setState({
+      setModel,
+      setEffort,
+      llmModel: "opus",
+      sessionReasoningEffort: "medium",
+      codexModelOptions: options,
+    });
+    const props = composerProps({
+      status: "streaming",
+      isWorking: true,
+      showModels: true,
+      modelPickerKind: "claude",
+      codexModelOptions: options,
+    });
+    renderWithTooltips(<Composer {...props} />);
+    const input = textarea();
+    fireEvent.change(input, { target: { value: "unfinished follow-up" } });
+    input.focus();
+
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true });
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(setModel).toHaveBeenCalledTimes(1);
+    expect(setEffort).not.toHaveBeenCalled();
+
+    await act(async () => {
+      useChatStore.setState({ llmModel: "sonnet" });
+      resolveModel();
+    });
+    expect(await screen.findByTestId("composer-agent-model-sonnet")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("high"));
+    expect(await screen.findByTestId("composer-agent-effort-high")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(input, { key: "Escape", code: "Escape" });
+    expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("unfinished follow-up");
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it.each([{ permissionLevel: 1 }, { unreachable: true }])(
+    "ignores model and effort shortcuts when the config is disabled: %j",
+    (overrides) => {
+      const previous = useChatStore.getState();
+      onTestFinished(() => useChatStore.setState(previous, true));
+      const setModel = vi.fn();
+      const setEffort = vi.fn();
+      useChatStore.setState({ setModel, setEffort });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: CLAUDE_MODEL_OPTIONS,
+            ...overrides,
+          })}
+        />,
+      );
+      fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, altKey: true });
+      fireEvent.keyDown(window, { code: "KeyE", ctrlKey: true, altKey: true });
+      expect(setModel).not.toHaveBeenCalled();
+      expect(setEffort).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("composer-agent-menu")).toBeNull();
+    },
+  );
+
   it("renders when the session has a switchable knob (effort)", () => {
     renderWithTooltips(<Composer {...composerProps({ showEffort: true })} />);
     expect(gear()).not.toBeNull();
@@ -6946,34 +7037,51 @@ describe("Composer config gear", () => {
     },
   );
 
-  it("leaves no lingering error indicator when a session config update fails", async () => {
-    const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
-    const options = [
-      { id: "opus", model: "opus", displayName: "Opus" },
-      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
-    ] as never;
-    useChatStore.setState({ setModel, codexModelOptions: options });
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: true,
-          modelPickerKind: "claude",
-          codexModelOptions: options,
-        })}
-      />,
-    );
+  it.each(["menu", "shortcut"])(
+    "leaves no lingering error indicator when a %s config update fails",
+    async (entry) => {
+      const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
+      const options = [
+        { id: "opus", model: "opus", displayName: "Opus" },
+        { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+      ] as never;
+      useChatStore.setState({ setModel, codexModelOptions: options, llmModel: "opus" });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            modelPickerKind: "claude",
+            codexModelOptions: options,
+          })}
+        />,
+      );
 
-    await openSessionModels();
-    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
-    await waitFor(() =>
-      expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
-    );
-    await waitFor(() =>
-      expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
-    );
-    expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
-    expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
-  });
+      if (entry === "menu") {
+        await openSessionModels();
+        fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+      } else {
+        textarea().focus();
+        fireEvent.keyDown(textarea(), { code: "KeyM", ctrlKey: true, altKey: true });
+      }
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith("sonnet", { expectConfirmation: true }),
+      );
+      if (entry === "menu") {
+        await waitFor(() =>
+          expect(screen.getByTestId("composer-agent-edit")).not.toHaveAttribute("data-disabled"),
+        );
+      } else {
+        expect(await screen.findByTestId("composer-agent-model-opus")).toHaveAttribute(
+          "aria-checked",
+          "true",
+        );
+        expect(textarea()).toHaveFocus();
+        expect(screen.getByTestId("composer-agent-config-value")).toHaveTextContent("Opus");
+      }
+      expect(screen.queryByTestId("composer-config-error")).not.toBeInTheDocument();
+      expect(screen.queryByText("Host stopped responding")).not.toBeInTheDocument();
+    },
+  );
 
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
     // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
