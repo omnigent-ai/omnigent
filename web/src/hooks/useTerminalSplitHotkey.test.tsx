@@ -13,9 +13,9 @@ function press(init: KeyboardEventInit): KeyboardEvent {
   return event;
 }
 
-function setup(axis: TerminalSplitAxis, enabled = true, isMac = false) {
+function setup(axis: TerminalSplitAxis, isMac = false) {
   const onSplit = vi.fn();
-  const result = renderHook(() => useTerminalSplitHotkey(axis, onSplit, enabled, isMac));
+  const result = renderHook(() => useTerminalSplitHotkey(axis, onSplit, isMac));
   return { onSplit, ...result };
 }
 
@@ -34,17 +34,13 @@ describe("useTerminalSplitHotkey", () => {
   });
 
   it("uses Cmd instead of Ctrl on macOS", () => {
-    const { onSplit } = setup("rows", true, true);
+    const { onSplit } = setup("rows", true);
     press(SPLIT_DOWN);
     press({ code: "Minus", metaKey: true, altKey: true });
     expect(onSplit).toHaveBeenCalledOnce();
   });
 
-  it("ignores disabled, view-toggle, incomplete, repeated, in-dialog, and AltGraph chords", () => {
-    const disabled = setup("columns", false);
-    press(SPLIT_RIGHT);
-    expect(disabled.onSplit).not.toHaveBeenCalled();
-
+  it("ignores view-toggle, incomplete, repeated, in-dialog, and AltGraph chords", () => {
     const right = setup("columns");
     const down = setup("rows");
     // Without Shift this is the Chat/Terminal toggle.

@@ -174,8 +174,11 @@ function SplitMenu({
   shells: string[];
   onPick: (shell: string) => void;
 }) {
-  // The chord skips the picker and opens the default shell.
-  useTerminalSplitHotkey(axis, () => onPick(shells[0]), !disabled);
+  // The chord skips the picker and opens the default shell. It stays bound while a
+  // create is pending so a second press is still claimed instead of reaching the PTY.
+  useTerminalSplitHotkey(axis, () => {
+    if (!disabled) onPick(shells[0]);
+  });
   return (
     <DropdownMenu>
       <HeaderTooltip label={label} shortcut={SPLIT_TERMINAL_KEYS[axis]}>

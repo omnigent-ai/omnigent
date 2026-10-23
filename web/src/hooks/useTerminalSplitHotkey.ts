@@ -22,19 +22,16 @@ export function terminalSplitHotkeyAxis(
   return null;
 }
 
-/** Bind the chord for ``axis`` while ``enabled``. */
+/** Bind the chord for ``axis`` while mounted. */
 export function useTerminalSplitHotkey(
   axis: TerminalSplitAxis,
   onSplit: () => void,
-  enabled: boolean,
   isMac = isMacPlatform(),
 ): void {
   const latest = useRef(onSplit);
   latest.current = onSplit;
 
   useEffect(() => {
-    if (!enabled) return;
-
     const handler = (event: globalThis.KeyboardEvent): void => {
       if (terminalSplitHotkeyAxis(event, isMac) !== axis || isFocusInDialogOrMenu()) return;
       event.preventDefault();
@@ -47,5 +44,5 @@ export function useTerminalSplitHotkey(
     // Capture before the focused xterm can forward the chord to its PTY.
     window.addEventListener("keydown", handler, true);
     return () => window.removeEventListener("keydown", handler, true);
-  }, [axis, enabled, isMac]);
+  }, [axis, isMac]);
 }

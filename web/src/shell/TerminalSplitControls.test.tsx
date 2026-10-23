@@ -20,6 +20,7 @@ const BASH_KEY = "terminal:terminal_bash_u-1";
 
 const fixture = vi.hoisted(() => ({
   createTerminal: vi.fn(),
+  createPending: false,
   deleteTerminal: vi.fn(),
   declaredShells: ["zsh", "bash"],
   mobile: false,
@@ -33,13 +34,14 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => fixtu
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: () => ({ terminals: fixture.terminals }),
-  useCreateTerminal: () => ({ mutate: fixture.createTerminal, isPending: false }),
+  useCreateTerminal: () => ({ mutate: fixture.createTerminal, isPending: fixture.createPending }),
   useDeleteTerminal: () => ({ mutate: fixture.deleteTerminal, isPending: false }),
 }));
 
 beforeEach(() => {
   fixture.createTerminal.mockReset();
   fixture.deleteTerminal.mockReset();
+  fixture.createPending = false;
   fixture.declaredShells = ["zsh", "bash"];
   fixture.mobile = false;
   fixture.terminals = [AGENT];
@@ -143,6 +145,15 @@ it("splits right with the preferred shell from the keyboard, skipping the picker
       focusedKey: BASH_KEY,
     }),
   );
+});
+
+it("claims the split chord without a second shell while one is being created", () => {
+  fixture.createPending = true;
+  renderControls("conv_controls_pending");
+
+  // false: the chord was claimed, so a focused terminal never receives it.
+  expect(fireEvent.keyDown(window, { code: "Minus", ctrlKey: true, altKey: true })).toBe(false);
+  expect(fixture.createTerminal).not.toHaveBeenCalled();
 });
 
 function saveSplit(conversationId: string, focusedKey: string) {
