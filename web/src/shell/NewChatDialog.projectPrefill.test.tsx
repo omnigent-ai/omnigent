@@ -1145,6 +1145,62 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  it("keeps the remembered effort when the remembered Codex model can't run the project effort", async () => {
+    const codexAgentId = "ag_codex";
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: codexAgentId,
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    const ladder = (...efforts: string[]) =>
+      efforts.map((reasoningEffort) => ({ reasoningEffort }));
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+          supportedReasoningEfforts: ladder("low", "high", "xhigh"),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "codex-native": { model: "gpt-mini", effort: "low" } }),
+    );
+    // No project model, so the session runs the remembered model; its ladder lacks xhigh.
+    setProjectConfig({ host_id: "host_1", agent_id: codexAgentId, effort: "xhigh" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+    const body = await submitAndReadBody();
+    expect(body.model_override).toBe("gpt-mini");
+    expect(body.reasoning_effort).toBe("low");
+  });
+
+  it("seeds a Pi-only project effort for a Pi agent", async () => {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi", harness: "pi-native" }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    setProjectConfig({ host_id: "host_1", agent_id: "ag_pi", effort: "minimal" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Pi/),
+    );
+    expect((await submitAndReadBody()).reasoning_effort).toBe("minimal");
+  });
+
   it("still seeds the recent workspace when the worktree probe errors", async () => {
     // A non-400 failure from /worktrees leaves the hook's data undefined for
     // good. The seed must fall back to the candidate as-is (treat the probe

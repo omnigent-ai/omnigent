@@ -8,9 +8,9 @@
 // worktree forks from (which overrides the user-global default in Settings ›
 // Git), and — when the default agent is a native harness with a model choice
 // (Claude Code / Codex / Pi) — a default model and reasoning effort for new
-// sessions. The host and agent
-// pickers reuse the composer's components; the working directory reuses its
-// filesystem browser (inline, so it scrolls inside the modal).
+// sessions. The host and agent pickers reuse the composer's components; the
+// working directory reuses its filesystem browser (inline, so it scrolls inside
+// the modal).
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
@@ -340,10 +340,11 @@ export function ProjectSettingsDialog({
   const effortPickerEmpty = (effortOptions ?? []).length === 0 && effortValue === NONE;
   const selectModel = (next: string) => {
     setModel(next);
-    // Codex ladders differ per model; drop an effort the new model can't run.
-    if (effort !== NONE && effortLadderKnown(next) && !effortInLadder(effortLadder(next), effort)) {
-      setEffort(NONE);
-    }
+    // Keep only the shown level, and only if the new model's ladder can run it.
+    const dropEffort =
+      effortValue === NONE ||
+      (effortLadderKnown(next) && !effortInLadder(effortLadder(next), effortValue));
+    if (dropEffort) setEffort(NONE);
   };
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.

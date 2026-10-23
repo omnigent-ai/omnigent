@@ -469,6 +469,54 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenLastCalledWith("p_1", { agent_id: "ag_1" }));
   });
 
+  it("offers Pi's own effort ladder and stores a Pi-only level", async () => {
+    const piAgent = pickerAgent({
+      id: "ag_pi",
+      name: "pi-native-ui",
+      display_name: "Pi",
+      harness: "pi-native",
+    });
+    availableAgentsMock.mockReturnValue({ data: [piAgent] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_pi" } });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    await pickSelectOption("project-settings-effort", "Minimal");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_pi", effort: "minimal" }),
+    );
+  });
+
+  it("does not restore a hidden stored Codex effort when the model changes", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          supportedReasoningEfforts: ladder("low", "xhigh"),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_codex", model: "gpt-mini", effort: "xhigh" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("GPT mini"),
+    );
+    await pickSelectOption("project-settings-model", "GPT-5.5");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_codex", model: "gpt-5.5" }),
+    );
+  });
+
   it("clears the effort default when the default agent is cleared", async () => {
     availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
     getProjectMock.mockResolvedValue({

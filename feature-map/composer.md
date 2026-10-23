@@ -37,9 +37,11 @@ and steers messages while the agent is busy.
   change (the pill keeps the applied level).
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
-  new-session composer opened in that project starts with them. States: no
-  default, a Codex effort the pinned model lacks, an explicit composer pick,
-  remembered Smart Routing, another agent chosen.
+  new-session composer opened in that project starts with them (CLI, API, and
+  scheduled creates don't apply model or effort). States: no default, a Codex
+  effort the pinned model lacks (or, with no project model, the remembered
+  model lacks), an explicit composer pick, remembered Smart Routing, another
+  agent chosen.
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
