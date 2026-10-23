@@ -42,7 +42,9 @@ HINT = (
     "Keep the floor below that release and let uv.lock pin it. For an urgent bump\n"
     "(e.g. a security fix), confirm the mirror serves it with\n"
     "`just check-internal-mirror`, then add above the requirement:\n"
-    "  # custom-lint: disable-next=young-dependency-floor -- <why urgent; mirror checked>"
+    "  # custom-lint: disable-next=young-dependency-floor -- <why urgent; mirror checked>\n"
+    "A maintainer other than the PR author must then add the `dependency-floor-approved`\n"
+    "label, or the required Maintainer Approval check stays red."
 )
 
 # Specifier operators whose version bounds the admitted releases from below.

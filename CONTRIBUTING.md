@@ -145,6 +145,9 @@ without writing `uv.lock`. The `young-dependency-floor` custom lint fails when a
 floor needs a release inside the uv cooldown. An urgent bump, such as a security
 fix, may keep that floor once the mirror serves the release: suppress the lint
 on the requirement with a `custom-lint: disable-next` comment that says why.
+Adding or changing that waiver keeps the required Maintainer Approval check red
+until a maintainer other than the author runs `just check-internal-mirror` and
+adds the `dependency-floor-approved` label.
 
 Common checks:
 

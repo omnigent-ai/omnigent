@@ -32,7 +32,8 @@ package mirrors that embargo new releases (see the dependency notes in
 `CONTRIBUTING.md`) and run `just check-internal-mirror` when you can reach the
 Databricks PyPI proxy. If a mirror lacks the version you need, keep the floor
 below it and pin the newer release only in `uv.lock`; do not work around the
-mirror with a local or temporary index.
+mirror with a local or temporary index. Never add the `dependency-floor-approved`
+label yourself; a maintainer other than the PR author adds it.
 
 ## Committing
 
