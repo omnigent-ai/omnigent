@@ -5951,6 +5951,53 @@ describe("NewChatLandingScreen", () => {
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
   });
 
+  it.each(["message", "attachment"] as const)(
+    "keeps the missing-directory explanation visible for a %s draft until a directory is selected",
+    async (draftKind) => {
+      localStorage.removeItem(RECENT_KEY);
+      useHostFilesystemMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { entries: [], truncated: false },
+      } as unknown as ReturnType<typeof useHostFilesystem>);
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      expect(screen.queryByTestId("new-chat-landing-submit-reason")).not.toBeInTheDocument();
+      if (draftKind === "message") {
+        fireEvent.change(input, { target: { value: "inspect the repo" } });
+      } else {
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+      }
+      const reason = screen.getByTestId("new-chat-landing-submit-reason");
+      expect(reason).toHaveAttribute("role", "status");
+      expect(reason).toBeVisible();
+      expect(reason).toHaveTextContent("Please choose a host and working directory");
+      expect(input).toHaveAccessibleDescription(reason.textContent!);
+
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      expect(submit).toBeDisabled();
+      fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason.textContent!);
+      fireEvent.pointerDown(submit.parentElement!, { pointerType: "mouse" });
+      fireEvent.click(submit.parentElement!);
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+      expect(reason).toBeVisible();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+      const pathInput = screen.getByTestId("workspace-picker-path-input");
+      fireEvent.change(pathInput, { target: { value: "/work/repo" } });
+      fireEvent.keyDown(pathInput, { key: "Enter" });
+      fireEvent.click(screen.getByTestId("workspace-picker-select"));
+      await waitFor(() => expect(submit).toBeEnabled());
+      expect(screen.queryByTestId("new-chat-landing-submit-reason")).not.toBeInTheDocument();
+      expect(input).not.toHaveAttribute("aria-describedby");
+    },
+  );
+
   it("shows the default shortcut in the new-chat submit tooltip", async () => {
     renderLanding();
     await waitFor(() =>
@@ -8365,7 +8412,9 @@ describe("NewChatLandingScreen skills menu", () => {
     );
     renderLanding({}, "/", undefined, true);
     typeMessage("/review");
-    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("slash-command-menu")).getByText("Loading skills…"),
+    ).toBeInTheDocument();
     const input = screen.getByTestId("new-chat-landing-input");
     fireEvent.keyDown(input, { key: "Enter" });
     fireEvent.keyDown(input, { key: "Tab" });

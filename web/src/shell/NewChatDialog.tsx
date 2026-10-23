@@ -9,7 +9,7 @@ import {
   HarnessPickerConfigPage,
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
@@ -2354,6 +2354,7 @@ export function NewChatLandingScreen() {
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const submitFeedbackId = useId();
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
   const dictation = useDictationInsert(message, setMessage, textareaRef);
@@ -5092,8 +5093,9 @@ export function NewChatLandingScreen() {
     }
   }, [pickerLoading, pickerSelectionError, pickerEdits]);
 
+  const hasDraft = message.trim().length > 0 || files.length > 0;
   const canSubmit =
-    (message.trim().length > 0 || files.length > 0) &&
+    hasDraft &&
     !mcpAuthorizing &&
     mcpSelectionError === null &&
     !pickerLoading &&
@@ -5106,10 +5108,7 @@ export function NewChatLandingScreen() {
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
 
-  // Why submit is disabled, surfaced as the button's tooltip. Checked in the
-  // order a user fills the form — location first, then message — so the
-  // tooltip always names the next missing input. Null when nothing is
-  // actionable (submitting, or mid-create).
+  // Show the next missing input below the draft and in the button's tooltip.
   const submitDisabledReason = canSubmit
     ? null
     : mcpAuthorizing || mcpSelectionError
@@ -5135,6 +5134,7 @@ export function NewChatLandingScreen() {
                       : message.trim().length === 0 && files.length === 0
                         ? "Enter a message to get started"
                         : null;
+  const submitFeedback = hasDraft ? submitDisabledReason : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -6792,6 +6792,7 @@ export function NewChatLandingScreen() {
                 onPaste,
                 placeholder: pillSkills.length > 0 ? "" : placeholderText,
                 "aria-label": placeholderText,
+                "aria-describedby": submitFeedback ? submitFeedbackId : undefined,
                 rows: 1,
                 autoFocus: !isMobileViewport,
                 "data-testid": "new-chat-landing-input",
@@ -6872,6 +6873,15 @@ export function NewChatLandingScreen() {
                         data-testid="new-chat-landing-attachment-error"
                       >
                         {attachmentError}
+                      </ComposerFeedbackRow>
+                    )}
+                    {submitFeedback && (
+                      <ComposerFeedbackRow
+                        id={submitFeedbackId}
+                        role="status"
+                        data-testid="new-chat-landing-submit-reason"
+                      >
+                        {submitFeedback}
                       </ComposerFeedbackRow>
                     )}
                     {/* No own bg — the pill paints the surface. An explicit bg-card
@@ -7264,9 +7274,15 @@ export function NewChatLandingScreen() {
                     <TooltipProvider>
                       <Tooltip>
                         <TooltipTrigger asChild>
-                          <span className="inline-flex shrink-0">
+                          <span
+                            className={cn(
+                              "inline-flex shrink-0",
+                              !canSubmit && "cursor-not-allowed",
+                            )}
+                          >
                             <ComposerSendButton
                               disabled={!canSubmit}
+                              className="disabled:opacity-50"
                               label={creating ? "Starting session" : "Start session"}
                               busy={creating}
                               data-testid="new-chat-landing-submit"
