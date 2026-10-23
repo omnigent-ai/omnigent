@@ -8,12 +8,14 @@ import importlib
 import io
 import logging
 import os
+import queue
 import signal
 import sys
 import tarfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -69,7 +71,9 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
+from tests.budgets import budget
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2559,6 +2563,28 @@ async def test_runner_shutdown_closes_terminal_registry(
     sync_clients: list[_TrackingSyncClient] = []
     terminal_sweeps: list[int] = []
     bridge_sweeps: list[int] = []
+    watching = False
+    watchdog_roles: list[str] = []
+    stall_records: queue.Queue[logging.LogRecord] = queue.Queue()
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            stall_records.put(record)
+
+    @contextmanager
+    def monitor(**kwargs: Any):
+        nonlocal watching
+        watchdog_roles.append(kwargs["process_role"])
+        watching = True
+        try:
+            with watchdog.monitor_event_loop(
+                **kwargs,
+                stall_threshold_s=budget(0.2),
+                sample_interval_s=budget(0.02),
+            ):
+                yield
+        finally:
+            watching = False
 
     class _FakeProcessManager:
         def __init__(self) -> None:
@@ -2568,10 +2594,12 @@ async def test_runner_shutdown_closes_terminal_registry(
             process_managers.append(self)
 
         async def start(self, *, sweep_orphans: bool = True) -> None:
+            assert not watching
             assert sweep_orphans is expected_sweep_orphans
             self.started = True
 
         async def shutdown(self) -> None:
+            assert not watching
             self.shutdown_called = True
 
     def _terminal_registry_factory(
@@ -2629,12 +2657,25 @@ async def test_runner_shutdown_closes_terminal_registry(
         "omnigent.runner.identity.get_stable_runner_id",
         lambda: "runner-test-id",
     )
+    monkeypatch.setattr(entry_mod, "monitor_event_loop", monitor, raising=False)
 
     app = entry_mod.create_app()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
-    async with app.router.lifespan_context(app):
-        pass
+    handler = Capture()
+    watchdog._logger.addHandler(handler)
+    try:
+        async with app.router.lifespan_context(app):
+            # Block only this test loop until the independent watchdog captures it.
+            record = stall_records.get(timeout=budget(2))
+            assert watching
+            assert record.event_name == "runner_event_loop_stalled"
+            assert "test_runner_shutdown_closes_terminal_registry" in record.captured_stack_trace
+    finally:
+        watchdog._logger.removeHandler(handler)
+        handler.close()
 
+    assert watchdog_roles == ["runner"]
+    assert not watching
     assert process_managers and process_managers[0].started
     assert process_managers[0].shutdown_called
     assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
