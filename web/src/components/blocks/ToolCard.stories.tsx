@@ -226,3 +226,42 @@ export const ShellAnsiColors: Story = {
   },
   play: async ({ canvasElement }) => expand(canvasElement),
 };
+
+// A phone-width card: the actions get their own row instead of crowding the
+// first command line or the folder.
+const narrowCard: Story["decorators"] = [
+  (Story) => (
+    <div className="w-80">
+      <Story />
+    </div>
+  ),
+];
+
+export const ShellNarrowWithoutCwd: Story = {
+  args: {
+    name: "shell",
+    arguments: { command: longCommand },
+    output: "Lockfile is up to date, resolution step is skipped",
+    state: "output-available",
+    startedAt: null,
+    duration: 13.6,
+  },
+  decorators: narrowCard,
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+export const ShellNarrowWithCwd: Story = {
+  args: {
+    name: "shell",
+    arguments: {
+      command: "/bin/zsh -lc 'git status --short'",
+      cwd: "/home/dev/omnigent/web/src/components",
+    },
+    output: " M blocks/ToolCard.tsx\n?? blocks/NewCard.tsx",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.08,
+  },
+  decorators: narrowCard,
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
