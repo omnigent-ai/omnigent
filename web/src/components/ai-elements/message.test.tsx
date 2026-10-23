@@ -120,10 +120,40 @@ describe("MessageResponse", () => {
       ["a query string", `${asset}?q=secret`],
       ["another GitHub path", "https://github.com/attacker/repo/raw/main/pixel.png"],
       ["plain http", asset.replace("https:", "http:")],
+      ["a fragment", `${asset}#x`],
+      ["a trailing slash", `${asset}/`],
+      ["a lookalike host", asset.replace("github.com", "github.com.evil.example")],
+      ["userinfo", asset.replace("https://", "https://github.com@evil.example/")],
+      ["an id that isn't a UUID", "https://github.com/user-attachments/assets/deadbeef"],
     ])("still blocks %s", async (_case, url) => {
       render(<MessageResponse allowGitHubAttachmentImages>{`![leak](${url})`}</MessageResponse>);
 
       expect(await screen.findByText("[Image blocked: leak]")).toBeTruthy();
+      expect(document.querySelector("img")).toBeNull();
+    });
+
+    it("drops every other attribute a raw-HTML GitHub image carries", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {`<img src="${asset}" alt="shot" srcset="https://evil.example/x.png 1x">`}
+        </MessageResponse>,
+      );
+
+      const image = await screen.findByRole("img", { name: "shot" });
+      expect(image).toHaveAttribute("src", asset);
+      expect(image).not.toHaveAttribute("srcset");
+    });
+
+    it("doesn't treat a raw parked-image tag as a GitHub image", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {
+            'before <omnigent-github-image src="https://evil.example/x.png"></omnigent-github-image>'
+          }
+        </MessageResponse>,
+      );
+
+      await screen.findByText(/before/);
       expect(document.querySelector("img")).toBeNull();
     });
 

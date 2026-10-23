@@ -19,7 +19,7 @@ const PR_URL = "https://github.com/acme/app/pull/7";
 const INFO_KEY = ["github-info", "conv_1", PR_URL];
 const DETAILS_PATH = "/v1/sessions/conv_1/resources/github/details";
 const ATTACHMENTS_PATH = "/v1/sessions/conv_1/resources/github/attachments";
-const ASSET_URL = "https://github.com/user-attachments/assets/1234";
+const ASSET_URL = "https://github.com/user-attachments/assets/0f1e2d3c-aaaa-bbbb-cccc-1234567890ab";
 
 afterEach(() => {
   vi.unstubAllGlobals();

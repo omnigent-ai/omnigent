@@ -39,7 +39,10 @@ export const GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS = createStreamdownRehyp
 
 // An image GitHub hosts for a PR or issue, e.g. a pasted screenshot. Exact shape
 // only, so loading it can reach nothing but GitHub's asset store.
-const GITHUB_ATTACHMENT_IMAGE = /^https:\/\/github\.com\/user-attachments\/assets\/[0-9a-f-]+$/i;
+const GITHUB_ATTACHMENT_IMAGE =
+  /^https:\/\/github\.com\/user-attachments\/assets\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The only attributes a restored image keeps, so nothing like `srcset` can load elsewhere.
+const GITHUB_IMAGE_ATTRIBUTES = ["src", "alt", "title", "width", "height"];
 // Harden checks only `img` tags, so a parked image passes through it untouched.
 const PARKED_GITHUB_IMAGE_TAG = "omnigent-github-image";
 
@@ -231,7 +234,11 @@ function restoreGitHubAttachmentImages() {
     visitElements(tree, (node) => {
       if (node.tagName !== PARKED_GITHUB_IMAGE_TAG) return;
       node.tagName = "img";
-      node.properties = { ...node.properties, referrerPolicy: "no-referrer" };
+      const kept = GITHUB_IMAGE_ATTRIBUTES.filter((name) => node.properties?.[name] !== undefined);
+      node.properties = {
+        ...Object.fromEntries(kept.map((name) => [name, node.properties?.[name]])),
+        referrerPolicy: "no-referrer",
+      };
     });
   };
 }
@@ -296,7 +303,8 @@ function createStreamdownRehypePlugins(
     if (allowGitHubAttachmentImages) plugins.push(restoreGitHubAttachmentImages);
   }
 
-  if (markFileLinks && !sawSanitize) {
+  // Sanitize must run first: it drops raw HTML that could forge a parked image.
+  if ((markFileLinks || allowGitHubAttachmentImages) && !sawSanitize) {
     throw new Error("Streamdown default rehype plugins carry no sanitize step");
   }
 
