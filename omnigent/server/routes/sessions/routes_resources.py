@@ -408,7 +408,7 @@ def register_resources_routes(
         conversation: Conversation,
         runner_path: str,
     ) -> Response:
-        """Stream a file download from the runner without buffering it.
+        """Resume an idle runner if needed and stream a file without buffering it.
 
         The runner serves the bytes straight from disk; forwarding them
         chunk by chunk keeps the server's memory flat however large the
@@ -426,10 +426,29 @@ def register_resources_routes(
             predates downloads.
         :raises HTTPException: 502 when no runner can be reached.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        try:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id,
+                conversation=conversation,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            # Restarting a runner needs edit access, even when its files are
+            # shared with read-only viewers. Live downloads keep the read gate.
+            conversation = await _validate_session(session_id, request, LEVEL_EDIT)
+            _, conversation = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conversation,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router or get_server_runner_router(),
+                raise_host_refusal=True,
+            )
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id,
+                conversation=conversation,
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
