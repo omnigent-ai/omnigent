@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native.bridge import bridge_dir_for_session_id
 from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 from omnigent.inner._proc import process_alive
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
@@ -30,12 +31,15 @@ from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.server.integration.mock_llm_server import (
     anthropic_sse_text_response,
     anthropic_sse_tool_call_response,
+    sse_text_response,
 )
 
 pytestmark = pytest.mark.timeout(900, method="signal")
 _MODEL = "pi-mock-sonnet"
 _CALL_IDS = ["toolu_par_a", "toolu_par_b"]
 _MIXED_TEXT = "Reading both seeded files."
+_RESPONSES_MODEL = "gpt-mock-resume"
+_RECOVERED_OUTPUT = "Contents recovered from the missing call."
 
 
 def _wait(predicate: Callable[[], Any]) -> Any:
@@ -117,7 +121,8 @@ def pi_fork_rig(
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
-            assert self.path.split("?", 1)[0] == "/v1/messages"
+            path = self.path.split("?", 1)[0]
+            assert path in {"/v1/messages", "/v1/responses"}
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             bearer = self.headers.get("Authorization")
             api_key = self.headers.get("X-Api-Key")
@@ -129,7 +134,21 @@ def pi_fork_rig(
             requests.append(body)
             if command_auth and len(requests) == 1:
                 token_file.write_text("rotated-during-tools")
-            payload = replies.pop(0).encode()
+            if path == "/v1/responses":
+                pending = set()
+                for item in body["input"]:
+                    if item.get("type") == "function_call":
+                        pending.add(item["call_id"])
+                    elif item.get("type") == "function_call_output":
+                        if item["call_id"] not in pending:
+                            self.send_error(400, "No tool call found for function call output")
+                            return
+                        pending.remove(item["call_id"])
+                payload = sse_text_response(
+                    f"RESPONSES-RESUME-{len(requests)}", model=_RESPONSES_MODEL, stream=True
+                ).encode()
+            else:
+                payload = replies.pop(0).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Content-Length", str(len(payload)))
@@ -150,6 +169,12 @@ def pi_fork_rig(
                             "base_url": f"http://127.0.0.1:{sidecar.server_port}",
                             **auth,
                             "models": {"default": _MODEL},
+                        },
+                        "openai": {
+                            "base_url": f"http://127.0.0.1:{sidecar.server_port}/v1",
+                            "api_key": "mock-key",
+                            "wire_api": "responses",
+                            "models": {"default": _RESPONSES_MODEL},
                         },
                     }
                 }
@@ -208,8 +233,9 @@ def pi_fork_rig(
         assert not auth_failures, auth_failures
 
 
+@pytest.mark.parametrize("resume_api", ["anthropic", "responses"])
 def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
-    pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path
+    pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path, resume_api: str
 ) -> None:
     client, runner_id, requests = pi_fork_rig
     spec = _materialize_pi_agent_spec(tmp_path)
@@ -232,6 +258,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         )
         response.raise_for_status()
         items = response.json()["data"]
+        assert not [item for item in items if item["type"] == "error"], items
         return (
             items
             if any(
@@ -264,18 +291,81 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         assert max(calls) < min(outputs), "Both calls must precede their outputs"
         assert _MIXED_TEXT in json.dumps(items)
 
-        fork = client.post(f"/v1/sessions/{session_id}/fork", json={})
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "response_id": "lost-call-turn",
+                    "item_type": "function_call_output",
+                    "item_data": {"call_id": "toolu_missing", "output": _RECOVERED_OUTPUT},
+                },
+            },
+        ).raise_for_status()
+        fork = client.post(
+            f"/v1/sessions/{session_id}/fork",
+            json={"model_override": _RESPONSES_MODEL} if resume_api == "responses" else {},
+        )
         fork.raise_for_status()
         fork_id = fork.json()["id"]
         session_ids.append(fork_id)
         bind_session_runner(client.patch, "", fork_id, runner_id)
         send_message(fork_id, "What did the tools return?")
-        _wait(lambda: items_with_reply(fork_id, "FORK-RESUME-OK"))
+        reply = "RESPONSES-RESUME-3" if resume_api == "responses" else "FORK-RESUME-OK"
+        _wait(lambda: items_with_reply(fork_id, reply))
 
         assert len(requests) == 3
-        assert all(
-            json.dumps(request.get("system")).count(instructions) == 1 for request in requests
-        )
+        assert all(json.dumps(request).count(instructions) == 1 for request in requests)
+        if resume_api == "responses":
+
+            def assert_responses_history() -> None:
+                history = requests[-1]["input"]
+                calls = [item for item in history if item.get("type") == "function_call"]
+                results = [item for item in history if item.get("type") == "function_call_output"]
+                assert sorted(item["call_id"] for item in calls) == _CALL_IDS
+                assert sorted(item["call_id"] for item in results) == _CALL_IDS
+                assert all(item["name"] == "read" for item in calls)
+                assert json.dumps(history).count(_RECOVERED_OUTPUT) == 1
+                assert "Recovered tool output" in json.dumps(history)
+                assert all(f"{name}-contents" in json.dumps(history) for name in ("alpha", "beta"))
+
+            assert_responses_history()
+            terminal_url = f"/v1/sessions/{fork_id}/resources/terminals"
+            terminal = client.get(f"{terminal_url}/terminal_pi_main").json()["metadata"]
+            client.delete(f"{terminal_url}/terminal_pi_main").raise_for_status()
+            _wait(
+                lambda: (
+                    subprocess.run(
+                        [
+                            "tmux",
+                            "-S",
+                            terminal["tmux_socket"],
+                            "has-session",
+                            "-t",
+                            terminal["tmux_target"],
+                        ],
+                        capture_output=True,
+                        timeout=10,
+                    ).returncode
+                    != 0
+                )
+            )
+            bridge = (
+                tmp_path / "home/.omnigent/pi-native" / bridge_dir_for_session_id(fork_id).name
+            )
+            session_files = list((bridge / "sessions").glob("*.jsonl"))
+            assert session_files, "The fork must have written a native session before cold resume"
+            for session_file in session_files:
+                session_file.unlink()
+            client.post(
+                terminal_url,
+                json={"terminal": "pi", "session_key": "main", "ensure_native_terminal": True},
+            ).raise_for_status()
+            send_message(fork_id, "Continue after a cold resume without rerunning the tools.")
+            _wait(lambda: items_with_reply(fork_id, "RESPONSES-RESUME-4"))
+            assert len(requests) == 4
+            assert_responses_history()
+            return
         history = requests[-1]["messages"]
         uses, results = [], []
         previous_uses: list[str] = []
@@ -293,6 +383,8 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
             results.extend(current_results)
         assert sorted(uses) == sorted(results) == _CALL_IDS
         assert _MIXED_TEXT in json.dumps(history)
+        assert _RECOVERED_OUTPUT in json.dumps(history)
+        assert "Recovered tool output" in json.dumps(history)
         assert all(f"{name}-contents" in json.dumps(history) for name in ("alpha", "beta"))
     finally:
         for session_id in reversed(session_ids):
