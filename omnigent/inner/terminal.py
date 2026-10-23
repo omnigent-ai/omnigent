@@ -2004,9 +2004,9 @@ class TerminalInstance:
 
     def start_idle_watcher(
         self,
-        on_idle: Callable[[], None | Awaitable[None]],
+        on_idle: Callable[[], Awaitable[None] | None],
         *,
-        on_exit: Callable[[], None | Awaitable[None]] | None = None,
+        on_exit: Callable[[], Awaitable[None] | None] | None = None,
     ) -> None:
         """Start a background task that fires ``on_idle`` each time the pane
         becomes quiet (no change for ``_IDLE_THRESHOLD_SECONDS``).
@@ -2034,9 +2034,9 @@ class TerminalInstance:
 
     async def _idle_watch_loop(
         self,
-        on_idle: Callable[[], None | Awaitable[None]],
+        on_idle: Callable[[], Awaitable[None] | None],
         *,
-        on_exit: Callable[[], None | Awaitable[None]] | None = None,
+        on_exit: Callable[[], Awaitable[None] | None] | None = None,
     ) -> None:
         """
         Asyncio polling loop driving an :class:`_IdleDetector`.
@@ -2047,7 +2047,7 @@ class TerminalInstance:
         """
         detector = _IdleDetector()
 
-        async def _fire(callback: Callable[[], None | Awaitable[None]], kind: str) -> bool:
+        async def _fire(callback: Callable[[], Awaitable[None] | None], kind: str) -> bool:
             """Invoke a callback. Returns False if it raised and the watcher should exit."""
             try:
                 result = callback()

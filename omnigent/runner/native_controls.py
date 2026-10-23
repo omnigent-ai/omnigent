@@ -115,6 +115,49 @@ async def _drive_claude_pane(
         return await asyncio.to_thread(function, *args, **kwargs)
 
 
+def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
+    """
+    Return a model-switch next step when the terminal is waiting on the person, else ``None``.
+
+    :param exc: The exception the prompt wait or ``/model`` injection raised.
+    :returns: Client-facing detail ending with the pane tail the bridge
+        captured, or ``None`` for failures with no person-actionable cause.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudePromptTimeout,
+        ClaudeSignInPending,
+        ClaudeTerminalDialog,
+        ClaudeTerminalExited,
+        ClaudeUserPromptPending,
+        terminal_failure_tail,
+    )
+
+    if isinstance(exc, ClaudeSignInPending):
+        # The bridge's remediation targets the chat card's live link, which this reply lacks.
+        return f"{exc.title}. Finish the sign-in in the terminal, then switch models again."
+    if isinstance(exc, ClaudeUserPromptPending):
+        next_step = (
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again."
+        )
+    elif isinstance(exc, ClaudeTerminalDialog):
+        next_step = (
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again."
+        )
+    elif isinstance(exc, ClaudeTerminalExited):
+        next_step = "The Claude Code terminal has exited. Relaunch it, then switch models again."
+    elif isinstance(exc, ClaudePromptTimeout):
+        # Also raised for a slow boot or a startup crash, so hint rather than prescribe.
+        next_step = (
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+        )
+    else:
+        return None
+    return next_step + terminal_failure_tail(str(exc))
+
+
 # How long the detached watcher keeps answering a /model confirm dialog that
 # pops after the active turn settles (a mid-turn switch queues in the
 # composer), and how often it looks. Long turns are common; the watch is
@@ -456,6 +499,8 @@ def build_native_controls(
 
         if ready_deadline is None:
             ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+        backend_before_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        process_before_ready = getattr(backend_before_ready, "proc", None)
         try:
             state = await asyncio.wait_for(
                 _ready_codex_bridge_for_settings(conv_id),
@@ -479,6 +524,13 @@ def build_native_controls(
                     "detail": "Codex-native settings update requires a loaded Codex bridge.",
                 },
             ), settings
+
+        backend_after_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        if backend_after_ready is not backend_before_ready or (
+            getattr(backend_after_ready, "proc", None) is not process_before_ready
+        ):
+            # Readiness already launched a replacement; keep one recovery per request.
+            retry_unreachable = False
 
         bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
         settings = dict(settings)
@@ -598,7 +650,7 @@ def build_native_controls(
                         "detail": "Codex did not confirm the settings update in time.",
                     },
                 ), settings
-        except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
+        except Exception as exc:  # surface app-server settings failures.
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
                 conv_id,
@@ -923,7 +975,7 @@ def build_native_controls(
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )
-        except Exception:  # noqa: BLE001 — write-back is best-effort
+        except Exception:  # write-back is best-effort
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
@@ -1243,7 +1295,7 @@ def build_native_controls(
                 await asyncio.to_thread(
                     confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
                 )
-            except Exception:  # noqa: BLE001 — best-effort; the report reconciles
+            except Exception:  # best-effort; the report reconciles
                 _logger.debug(
                     "late model-dialog watch errored for session=%s",
                     conv_id,
@@ -1350,11 +1402,13 @@ def build_native_controls(
         command = f"/model {model_arg}"
 
         def _model_failed(exc: BaseException) -> JSONResponse:
+            # Always log the full cause; the reply carries it only when actionable.
+            safe_detail = _client_safe_error_detail(exc, context="claude-native model change")
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "claude_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native model change"),
+                    "detail": _claude_model_change_blocked_detail(exc) or safe_detail,
                 },
             )
 

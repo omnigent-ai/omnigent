@@ -455,7 +455,7 @@ def register_mcp_routes(
             if family.base_url:
                 conn["base_url"] = family.base_url
             return conn or None
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.warning(
                 "/v1/summarize: failed to resolve provider %r",
                 provider_name,

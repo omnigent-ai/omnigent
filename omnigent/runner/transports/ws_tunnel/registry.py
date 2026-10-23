@@ -489,7 +489,7 @@ class TunnelRegistry:
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         finally:
             with self._lock:
@@ -786,7 +786,7 @@ class TunnelRegistry:
                             session.diagnostics.enqueued(
                                 frame, session.outbound_queue.qsize(), requested_at
                             )
-                        except Exception:  # noqa: BLE001 — recording failures are best-effort.
+                        except Exception:  # recording failures are best-effort.
                             _logger.debug(
                                 "Runner %s outbound queue diagnostics failed",
                                 session.runner_id,

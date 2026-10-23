@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -763,6 +764,24 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+
+
+def test_launch_runner_superseded_runner_ids_round_trip() -> None:
+    """Named, empty, and absent supersession lists stay distinct on the wire."""
+    for ids in (("runner_old",), ()):
+        frame = HostLaunchRunnerFrame(
+            request_id="req_s",
+            binding_token="tok",
+            workspace="/w",
+            session_id="conv_s",
+            superseded_runner_ids=ids,
+        )
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+    legacy = HostLaunchRunnerFrame(request_id="req_l", binding_token="tok", workspace="/w")
+    assert "superseded_runner_ids" not in encode_host_frame(legacy)
+    decoded = decode_host_frame(encode_host_frame(legacy))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.superseded_runner_ids is None
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
@@ -2302,6 +2321,9 @@ def test_fs_result_null_payload_round_trip() -> None:
         (None, "runner exited with code 1", None),
         (None, None, None),
         ("some_future_code", "any text", None),
+        # A launch-handler fault is a generic failure: the server cannot
+        # describe its cause, so the host's text must not be surfaced.
+        (LAUNCH_HANDLER_FAILED_ERROR_CODE, "host failed to handle the launch request: x", None),
     ],
 )
 def test_classify_launch_refusal(

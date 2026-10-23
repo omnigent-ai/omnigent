@@ -41,7 +41,7 @@ if sys.platform != "win32":
     import tty
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -83,6 +83,12 @@ from omnigent._wrapper_labels import (
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.databricks_ai_gateway import (
+    CLAUDE_CODE_AGENT,
+    is_databricks_ai_gateway_url,
+    is_ug_route,
+    with_gateway_attribution_lines,
+)
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -2369,7 +2375,7 @@ def _fetch_external_session_id_for_redirect(
         if resp.status_code >= 400:
             return None
         payload = resp.json()
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "failed to fetch external Claude session id for redirect; session=%s",
             session_id,
@@ -2872,7 +2878,7 @@ def _ucode_config_for_profile(
             live_catalog = discover_databricks_claude_catalog(creds.host, creds.token)
             live_models = live_catalog.families
             routable_models = live_catalog.model_ids
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Recoverable fallback; frames are debug-only so a TTY-mirrored
             # host console stays concise.
             _logger.warning(
@@ -2910,7 +2916,9 @@ def _ucode_config_for_profile(
         # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
         # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
-        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
+        _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
+            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
+        ),
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
@@ -3085,10 +3093,19 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         default_env_var = ALIAS_MODEL_ENV_VARS.get(base_alias)
         if default_env_var:
             pin_env.setdefault(default_env_var, family.default_model)
+    attribution_env: dict[str, str] = {}
+    if is_databricks_ai_gateway_url(family.base_url):
+        # Keep any headers the user already sends; the config env replaces theirs.
+        attribution_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(family.base_url),
+        )
     return ClaudeNativeUcodeConfig(
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
+            **attribution_env,
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(
@@ -3357,6 +3374,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     model = _connect_broker_default_model()
+    adopted_ug_route = False
 
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -3379,6 +3397,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 if k in _CONNECT_BROKER_UCODE_ENV_ALLOWLIST
             }
             env = {**env, **allowed, _UCODE_CLAUDE_BASE_URL_ENV: ucode_base_url}
+            adopted_ug_route = True
             # The served model is adopted only alongside a trusted (guarded) base
             # URL; a model with no/off-host URL falls back to the catalog default
             # rather than trusting a half-validated state entry.
@@ -3390,6 +3409,11 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
                 "connected workspace host) — using the profile-derived gateway route.",
             )
 
+    env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+        env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+        CLAUDE_CODE_AGENT,
+        via_ug=adopted_ug_route,
+    )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
 
@@ -3412,7 +3436,9 @@ def resolve_native_claude_config(
        model → ambient detection), falling back to the spec's own
        ``executor.profile`` (ucode) when it routed to legacy databricks;
     2. when spec-less (``omnigent claude``): an explicit per-family default
-       → global ``auth:`` (→ ucode) → ambient detection;
+       → global ``auth:`` (→ ucode, or ``None`` when Claude Code managed
+       gateway settings own routing) → ambient detection. A spec that pins no
+       auth/profile also takes the global ``auth:`` step after step 1;
     3. otherwise ``None`` (Claude's own login).
 
     Credentials are controlled exclusively by the spec or by
@@ -3433,6 +3459,7 @@ def resolve_native_claude_config(
         resolve_bound_model,
         resolve_bound_provider,
     )
+    from omnigent.onboarding.ambient import claude_managed_gateway_routes
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         default_provider_for_harness,
@@ -3473,6 +3500,20 @@ def resolve_native_claude_config(
         )
         if ucode_config is not None:
             return ucode_config
+        if spec.executor.auth is None and not (
+            spec.executor.profile or spec.executor.config.get("profile")
+        ):
+            # A spec that pins no route must match the spec-less New Chat
+            # preview (step 2), which also routes a global databricks ``auth:``.
+            global_auth = _load_global_auth()
+            if isinstance(global_auth, DatabricksAuth):
+                if claude_managed_gateway_routes(_managed_settings_paths()):
+                    return None
+                ucode_config = _ucode_config_for_profile(
+                    global_auth.profile, refresh_models=refresh_models
+                )
+                if ucode_config is not None:
+                    return ucode_config
         # The spec named no provider and no usable ucode profile — fall through to
         # the managed-connect-host broker fallback (step 4) rather than giving up.
     else:
@@ -3484,6 +3525,10 @@ def resolve_native_claude_config(
         # A global databricks auth block → ucode.
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
+            if claude_managed_gateway_routes(_managed_settings_paths()):
+                # Claude Code's managed settings override any env we pass, so a
+                # ucode route would only mislabel where inference goes.
+                return None
             return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
         if global_auth is not None:
             # A global api_key auth: let Claude's own login handle it (parity
@@ -3593,7 +3638,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -3906,7 +3951,7 @@ async def _attach_direct_tmux(
                 await watcher
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001 - watcher failure is secondary to attach outcome
+            except Exception:  # watcher failure is secondary to attach outcome
                 _logger.warning(
                     "direct-tmux pane watcher failed during attach cleanup", exc_info=True
                 )
@@ -4029,7 +4074,7 @@ async def _attach_with_transcript_forwarder(
                 await forwarder
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # The forwarder is best-effort mirroring. A bug there
                 # (corrupt transcript JSONL, file-system error, anything
                 # uncaught in the parser) must not skip the Omnigent terminal
@@ -4127,7 +4172,7 @@ async def _attach_with_reconnect(
         if not first_attempt and recover is not None:
             try:
                 await recover()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _logger.warning(
                     "%s-native reconnect recovery callback raised; retrying attach anyway",
                     session_name.lower(),
@@ -5637,7 +5682,7 @@ def _claude_transcript_records_from_session_items(
                         "subtype": "compact_boundary",
                         "content": "Conversation compacted",
                         "isMeta": False,
-                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                        "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
                         "uuid": boundary_uuid,
                         "level": "info",
                         # Claude scans every compact_boundary and destructures
@@ -5840,7 +5885,7 @@ def _claude_transcript_record_from_session_item(
         "userType": "external",
         "sessionId": session_id,
         "cwd": str(cwd),
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "message": message,
         **extra,
     }

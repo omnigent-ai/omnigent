@@ -19,8 +19,8 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
-- `rename`: from the row, the header menu, or the header title; long titles are
-  limited.
+- `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
+  on desktop; long titles are limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -34,8 +34,9 @@ the header menu), and each place is a separate entry point.
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
-  writable side chat; Reply on side-chat text quotes it in that chat. Both keep
-  the existing draft and attachments, and quotes can be removed before sending.
+  writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
+  interleaved comments and existing attachments; removing a quote keeps its comments.
+  Live side chats accept pasted images in every reply text field.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
@@ -92,7 +93,10 @@ the header menu), and each place is a separate entry point.
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
-  per-tab.
+  per-tab. On macOS the browser toolbar can also import the current site's
+  cookies from a local Chrome profile into that same session jar (Site scope
+  picks the host or a parent domain); the copy is in-memory and never written
+  back to Chrome.
 - `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps
   drafts and board state; resize, focus, and close controls adjust the split.
@@ -133,25 +137,46 @@ the header menu), and each place is a separate entry point.
 
 ## How to get to it (user POV)
 
-**Session grids:** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+**Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript and composer; one shared Workspace panel follows the active cell. Open the session full screen
+transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
+each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
+only the active cell. Choices survive reloads and follow the session into full
+screen; drafts and terminal connections survive view changes. Shared-session
+terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
-their `/grid/<id>` URL on the same browser. Double-click a grid title or use
+their `/grid/<id>` URL on the same desktop browser. All sessions in the open grid
+are highlighted in the sidebar. Mobile-width viewports, touch-primary devices, and
+the iOS/Android apps hide grid menus and saved entries; grid URLs show a desktop-only
+message without changing saved grids. Narrowing an open grid unmounts its cells
+and disconnects terminal views; widening it restores the saved layout and reconnects.
+The coarse-primary-pointer check also blocks tablets with attached keyboards;
+touch-capable desktops whose primary pointer is fine remain eligible.
+Double-click a grid title or use
 its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
 identify the session shown in Workspace. The grid header toggles the shared
-panel; its width is saved per grid and stays fixed when switching sessions.
+panel; it spans the full app height beside the grid header and cells. Its width
+is saved per grid and stays fixed when switching sessions; the header shrinks
+with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
-fills the grid area. Drag a cell titlebar onto another cell to swap positions,
-or focus the title and press Space, choose a cell with the arrow keys, and
+fills the grid area, including its header. Drag a cell titlebar onto another cell
+to swap positions. With exactly two sessions side by side, drop a titlebar
+near the whole grid's top/bottom edge to stack them. When stacked, use the
+left/right edge to place them side by side, including along the dragged cell's
+side. Only edges that change orientation appear; their preview spans the grid.
+The center swaps positions and Escape cancels the preview.
+Alternatively, focus the title and press Space, choose a cell with the arrow keys, and
 press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
 only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
+Grids wait for account identity; if it is unavailable, use Reload to retry.
+Failed sends restore text and supported attachments unless the cell has a newer draft.
+Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
 sessions** on the empty landing. Choose a machine, harness, and recent count
@@ -179,6 +204,12 @@ pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions.
+
+**Rename shortcut:** in an owner-managed top-level session on desktop, press
+Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
+The header title becomes an input with its text selected. Enter or blur saves;
+Escape cancels. The shortcut leaves terminals, code editors, and open menus or
+dialogs alone. It is listed in Keyboard shortcuts and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -307,7 +338,11 @@ side chat**. It appends a removable quote to the visible side-chat tab, includin
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
 new unsent tab. In the desktop side-chat pane or mobile drawer, select transcript
 text and choose **Reply** to quote it in that chat's composer. Adding a quote
-does not send a message; enter a question and send when ready.
+keeps existing comments before that quote. Edit between quotes or after the last
+one, then send when ready. Paste an image into any reply text field after the
+side chat has started. The first question is text-only; an image paste there
+explains that the chat must be started first. Grid sessions use the same reply
+composer and support interleaved comments and pasted images too.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
@@ -334,18 +369,18 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
-  the four-pane limit, independent sends and live updates, reloads, pane closure,
+  the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
+  per-cell terminal input, switching without reattaching, active-cell shortcuts,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar
-  reopening/deletion, titlebar rearrangement and cancellation, narrow-view
-  workspaces, and missing/disabled grid routes. With the flag absent or false,
+  reopening/deletion, highlighting all grid members, titlebar rearrangement and cancellation,
+  mobile and tablet entry-point gating (including resize and reload), identity recovery, and missing/disabled grid routes. With the flag absent or false,
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
   `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
-  `grid_sessions_display_ui` on the isolated server. Also check a collapsed
-  sidebar and narrow viewport manually.
+  `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`
@@ -360,6 +395,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
+  The desktop shortcut, including draft preservation, cancellation, and reload:
+  `tests/e2e_ui/sessions/test_header_session_menu.py::test_rename_hotkey_from_composer_persists_and_cancels`.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
@@ -574,14 +611,14 @@ plain `uv run pytest`, which starts a private server for the test.
   above proves live-parent reuse with actual runner processes.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
-  checks pending/live tab reuse, draft preservation, and replies sent only to
-  the child. Hide Workspace and repeat Ask in side chat to verify
+  checks pending/live tab reuse, interleaved comments, pasted images, and replies
+  sent only to the child. Hide Workspace and repeat Ask in side chat to verify
   a new tab opens instead of changing the hidden draft.
 - **`side-chat-quotes`, mobile drawer Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
-  checks that Reply stays on screen and the quoted follow-up reaches only the
-  side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
-  checks quote removal, preserved text/files, read-only chats, and starting-tab
+  checks that Reply stays on screen and interleaved comments with a pasted image
+  reach only the side chat. Component coverage in `web/src/components/chat/SideChatPane.test.tsx`
+  checks side-chat and grid composers, quote removal, preserved text/files, read-only chats, and starting-tab
   eligibility; `web/src/pages/ChatPage.composer.test.tsx` checks target routing
   and parent isolation. In an embedded app, repeat text selection in both the
   parent and side chat and check the popup's theme and button styling.
@@ -653,7 +690,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
-  tabs; all should be signed out.
+  tabs; all should be signed out. Chrome cookie import needs a real Keychain and
+  Chrome profile, so it is manual: sign into a site in Chrome, open that site in
+  the pane, click the cookie button, confirm the native prompt, and check the
+  page is signed in while an unrelated site in the same session is not.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide

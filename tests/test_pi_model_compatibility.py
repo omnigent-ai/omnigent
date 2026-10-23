@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import (
+    ModelCapability,
+    ModelMetadata,
+    ModelReasoningMetadata,
+    ModelWireAPI,
+)
 from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_model_json_entry,
@@ -95,22 +100,35 @@ def test_vendor_floor_keeps_reasoning_flag_despite_catalog(
     assert entry.get("reasoning") is True
 
 
-def test_enriched_live_entry_carries_catalog_reasoning() -> None:
-    """The wire-only live listing picks up the MLflow catalog's reasoning capability."""
+@pytest.mark.parametrize("live_efforts", [None, frozenset({"high"})])
+def test_enriched_live_entry_carries_catalog_reasoning(live_efforts) -> None:
+    """Live capabilities and reasoning details survive catalog enrichment."""
+    live_reasoning = ModelReasoningMetadata(efforts=live_efforts) if live_efforts else None
+    catalog_reasoning = ModelReasoningMetadata(efforts=frozenset({"low"}))
     live = ModelEntry(
         id="system.ai.gpt-6-luna",
         family="openai",
-        metadata=ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES})),
+        metadata=ModelMetadata(
+            supported_capabilities=frozenset({ModelCapability.TOOL_USE}),
+            wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+            reasoning=live_reasoning,
+        ),
     )
     catalog = ModelEntry(
         id="databricks-gpt-6-luna",
         family="openai",
-        metadata=ModelMetadata(supported_capabilities=_REASONING, context_window=400_000),
+        metadata=ModelMetadata(
+            supported_capabilities=_REASONING,
+            context_window=400_000,
+            reasoning=catalog_reasoning,
+        ),
     )
 
     (enriched,) = enrich_databricks_model_catalog((live,), (catalog,))
 
     assert enriched.metadata.supports(ModelCapability.REASONING) is True
+    assert enriched.metadata.supports(ModelCapability.TOOL_USE) is True
+    assert enriched.metadata.reasoning == (live_reasoning or catalog_reasoning)
     assert enriched.metadata.wire_apis == frozenset({ModelWireAPI.OPENAI_RESPONSES})
     assert pi_model_json_entry(enriched) == {
         "id": "system.ai.gpt-6-luna",
@@ -118,6 +136,38 @@ def test_enriched_live_entry_carries_catalog_reasoning() -> None:
         "contextWindow": 400_000,
         "reasoning": True,
     }
+
+
+@pytest.mark.parametrize("live_reasoning", [None, False, True])
+@pytest.mark.parametrize("catalog_reasoning", [False, True])
+def test_gateway_catalog_falls_back_to_vendor_metadata(
+    monkeypatch, live_reasoning, catalog_reasoning
+):
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider: (
+            [
+                ModelInfo(
+                    name="gpt-6-luna",
+                    provider="openai",
+                    supports_reasoning=catalog_reasoning,
+                    max_input_tokens=400_000,
+                    max_output_tokens=128_000,
+                )
+            ]
+            if provider == "openai"
+            else []
+        ),
+    )
+    live = _entry(
+        "system.ai.gpt-6-luna", reasoning=live_reasoning, wire=ModelWireAPI.OPENAI_RESPONSES
+    )
+    expected = catalog_reasoning if live_reasoning is None else live_reasoning
+    (enriched,) = enrich_databricks_model_catalog((live,), ())
+    assert enriched.metadata.supports(ModelCapability.REASONING) is expected
+    assert enriched.metadata.context_window == 400_000
+    assert enriched.metadata.wire_apis == live.metadata.wire_apis
+    assert (pi_model_json_entry(enriched).get("reasoning") is True) is expected
 
 
 @pytest.mark.parametrize("reasoning", [True, False, None])

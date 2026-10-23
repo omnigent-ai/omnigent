@@ -1,6 +1,7 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -9,8 +10,9 @@ import shutil
 import socket
 import tempfile
 import textwrap
+import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -45,7 +47,8 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -1007,7 +1010,7 @@ class TestToolServer(unittest.TestCase):
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 stdout, stderr = await proc.communicate()
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -1129,7 +1132,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
@@ -1165,7 +1168,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -1188,7 +1191,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args, *, call_id=None):
                 self.assertEqual(call_id, "call-1")
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
@@ -3744,6 +3747,270 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
     assert _resolve_pi_skill_args(["alpha"], None) == ["--no-skills"]
 
 
+def test_resolve_pi_skill_args_finds_pi_native_skills_layout(tmp_path: Path) -> None:
+    """``skills_filter='all'`` surfaces a skill shipped in Pi's own ``.pi/skills/<name>/``
+    layout via ``--skill``.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    pi_skills_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(pi_skills_root, "grilling")
+
+    args = _resolve_pi_skill_args("all", bundle)
+
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert str(pi_skills_root / "grilling") in paths, (
+        f"bundle skill under .pi/skills/ was not exposed via --skill; got args={args}"
+    )
+
+
+def test_resolve_pi_skill_args_named_subset_spans_both_skill_roots(tmp_path: Path) -> None:
+    """A named filter resolves skills from ``skills/`` and ``.pi/skills/``
+    alike, and ``skills/`` wins when both roots ship the same name.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_skill_args
+
+    bundle = tmp_path / "bundle"
+    flat_root = bundle / "skills"
+    pi_root = bundle / ".pi" / "skills"
+    _make_pi_skill_dir(flat_root, "shared")
+    _make_pi_skill_dir(pi_root, "shared")
+    _make_pi_skill_dir(pi_root, "grilling")
+
+    args = _resolve_pi_skill_args(["grilling", "shared", "missing"], bundle)
+
+    assert args[0] == "--no-skills"
+    paths = [args[i + 1] for i, tok in enumerate(args) if tok == "--skill"]
+    assert paths == [str(pi_root / "grilling"), str(flat_root / "shared")], f"got {paths}"
+
+
+def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> None:
+    """Each bundled extension entry point is passed via ``--extension`` so bundled extensions
+    load regardless of Pi's cwd.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_args
+
+    bundle = tmp_path / "bundle"
+    marker_dir = bundle / ".pi" / "extensions" / "marker"
+    marker_dir.mkdir(parents=True)
+    (marker_dir / "index.js").write_text("module.exports = function () {};\n")
+
+    assert _resolve_pi_bundle_extension_args(bundle) == [
+        "--extension",
+        str(marker_dir / "index.js"),
+    ]
+    assert _resolve_pi_bundle_extension_args(None) == []
+    assert _resolve_pi_bundle_extension_args(tmp_path / "no-extensions") == []
+
+
+def test_resolve_pi_bundle_extension_entries_discovery_shapes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Entry discovery mirrors Pi's own: top-level ``*.js``/``*.ts``
+    files, subdir ``index.ts`` over ``index.js``, ``package.json``
+    ``pi.extensions`` manifests over index files (file entries inside the
+    extension dir only), dotfiles and ``node_modules`` skipped. A broken
+    manifest falls back to the index file with a warning.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    ext_root.mkdir(parents=True)
+    (ext_root / "flat.js").write_text("module.exports = function () {};\n")
+    (ext_root / ".hidden.js").write_text("skip me\n")
+    (ext_root / "node_modules").mkdir()
+    (ext_root / "node_modules" / "index.js").write_text("skip me\n")
+    ts_dir = ext_root / "a-ts-ext"
+    ts_dir.mkdir()
+    (ts_dir / "index.ts").write_text("export default function () {}\n")
+    (ts_dir / "index.js").write_text("compiled; index.ts must win\n")
+    manifest_dir = ext_root / "b-manifest-ext"
+    manifest_dir.mkdir()
+    (manifest_dir / "main.js").write_text("module.exports = function () {};\n")
+    (manifest_dir / "index.js").write_text("manifest entry must win\n")
+    (manifest_dir / "lib").mkdir()
+    broken_dir = ext_root / "c-broken-manifest"
+    broken_dir.mkdir()
+    (broken_dir / "package.json").write_text("{not json")
+    (broken_dir / "index.js").write_text("module.exports = function () {};\n")
+    (tmp_path / "outside.js").write_text("must never be loaded\n")
+    (manifest_dir / "package.json").write_text(
+        json.dumps(
+            {
+                "pi": {
+                    "extensions": [
+                        "lib",
+                        "../../../outside.js",
+                        str(tmp_path / "outside.js"),
+                        "main.js",
+                    ]
+                }
+            }
+        )
+    )
+    (ext_root / "empty-dir").mkdir()
+
+    with caplog.at_level(logging.WARNING):
+        entries = _resolve_pi_bundle_extension_entries(ext_root)
+
+    assert entries == [
+        ts_dir / "index.ts",
+        manifest_dir / "main.js",
+        broken_dir / "index.js",
+        ext_root / "flat.js",
+    ], f"got {entries}"
+    assert "could not read extension manifest" in caplog.text
+    assert caplog.text.count("skipping manifest extension entry") == 3
+
+
+def test_resolve_pi_bundle_extension_entries_root_entry_wins(tmp_path: Path) -> None:
+    """An entry point directly under ``.pi/extensions`` makes that directory
+    the single extension, so child directories are not scanned — as in Pi.
+    """
+    from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_entries
+
+    ext_root = tmp_path / ".pi" / "extensions"
+    child = ext_root / "child"
+    child.mkdir(parents=True)
+    (child / "index.js").write_text("module.exports = function () {};\n")
+    (ext_root / "index.js").write_text("module.exports = function () {};\n")
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "index.js"]
+
+    (ext_root / "main.js").write_text("module.exports = function () {};\n")
+    (ext_root / "package.json").write_text(json.dumps({"pi": {"extensions": ["main.js"]}}))
+    assert _resolve_pi_bundle_extension_entries(ext_root) == [ext_root / "main.js"]
+
+
+def test_read_pi_bundle_context_follows_pi_candidate_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The bundle-root context file is read by content in Pi's own precedence order; a missing,
+    blank or undecodable file yields nothing, the last with a warning instead of failing
+    executor construction.
+    """
+    from omnigent.inner.pi_executor import _read_pi_bundle_context
+
+    assert _read_pi_bundle_context(None) is None
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.md").write_text("   \n")
+    assert _read_pi_bundle_context(bundle) is None
+
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+    assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Override guidance."
+
+    (bundle / "AGENTS.override.md").write_bytes(b"Caf\xe9 guidance\n")
+    with caplog.at_level(logging.WARNING):
+        assert _read_pi_bundle_context(bundle) == "Bundle guidance marker."
+    assert "could not read bundle context file" in caplog.text
+    (bundle / "AGENTS.md").unlink()
+    assert _read_pi_bundle_context(bundle) is None
+    (bundle / "AGENTS.override.md").unlink()
+    (bundle / "CLAUDE.md").write_text("Claude guidance.\n")
+    assert _read_pi_bundle_context(bundle) == "Claude guidance."
+
+
+def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
+    """The bundle-root context file is an automatic context file: it is dropped with
+    ``context_files=False`` and not appended twice when the composed instructions
+    already carry it (``instructions: AGENTS.md``).
+    """
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "AGENTS.md").write_text("Bundle guidance marker.\n")
+
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        enabled = PiExecutor(bundle_dir=bundle)
+        disabled = PiExecutor(bundle_dir=bundle, context_files=False)
+
+    assert enabled._with_bundle_context("Agent prompt.") == (
+        "Agent prompt.\n\nBundle guidance marker."
+    )
+    assert enabled._with_bundle_context("") == "Bundle guidance marker."
+    adopted = "Bundle guidance marker.\n\nFramework notes."
+    assert enabled._with_bundle_context(adopted) == adopted
+    reflowed = "Bundle   guidance\nmarker.\n\nFramework notes."
+    assert enabled._with_bundle_context(reflowed) == reflowed
+    # Quoting the text inside other instructions is not adoption.
+    quoted = 'Agent prompt. Sample wording, not policy: "Bundle guidance marker."'
+    assert enabled._with_bundle_context(quoted) == f"{quoted}\n\nBundle guidance marker."
+    assert disabled._with_bundle_context("Agent prompt.") == "Agent prompt."
+    assert "--no-context-files" in disabled._extra_args
+
+    # Parser-adopted AGENTS.md and Pi's AGENTS.override.md context must both survive.
+    (bundle / "AGENTS.override.md").write_text("Override guidance.\n")
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        layered = PiExecutor(bundle_dir=bundle)
+    assert layered._with_bundle_context(adopted) == f"{adopted}\n\nOverride guidance."
+
+
+@pytest.mark.parametrize("system_prompt_mode", ["append", "replace"])
+def test_pi_subprocess_receives_bundle_resources_from_session_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, system_prompt_mode: str
+) -> None:
+    """Pi discovers ``.pi/extensions``, ``.pi/skills`` and ``AGENTS.md`` relative
+    to its cwd, so the executor must pass bundle resources explicitly while
+    keeping the session workspace as cwd. The bundle context travels in the one
+    content-bearing prompt flag of the active mode.
+    """
+    from omnigent.inner import pi_executor as pi_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    ext_entry = bundle / ".pi" / "extensions" / "ext" / "index.ts"
+    ext_entry.parent.mkdir(parents=True)
+    ext_entry.write_text("export default function (pi) {}\n")
+    skill_dir = _make_pi_skill_dir(bundle / ".pi" / "skills", "grilling")
+    (bundle / "AGENTS.md").write_text("BUNDLE_CONTEXT_MARKER: answer like a pirate.\n")
+
+    captured: dict[str, object] = {}
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["argv"] = list(args)
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProcess()
+
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(
+            cwd=str(workspace), bundle_dir=bundle, system_prompt_mode=system_prompt_mode
+        )
+
+    async def _drive() -> None:
+        with patch.object(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={})):
+            try:
+                await executor._ensure_rpc("session", "You are the bundle agent.", "gpt-4o", [])
+            finally:
+                await executor.close()
+
+    _run(_drive())
+
+    assert captured["cwd"] == str(workspace), "pi must keep the session workspace as its cwd"
+    argv = list(captured["argv"])
+    pairs = list(itertools.pairwise(argv))
+    assert ("--extension", str(ext_entry)) in pairs, f"got argv={argv}"
+    assert ("--skill", str(skill_dir)) in pairs, f"got argv={argv}"
+    composed = "You are the bundle agent.\n\nBUNDLE_CONTEXT_MARKER: answer like a pirate."
+    prompt_values = [
+        argv[i + 1]
+        for i, tok in enumerate(argv)
+        if tok in ("--system-prompt", "--append-system-prompt")
+    ]
+    if system_prompt_mode == "append":
+        assert "--system-prompt" not in argv
+        assert prompt_values == [composed]
+    else:
+        assert argv[argv.index("--system-prompt") + 1] == composed
+        # Replace mode keeps its empty append, which suppresses APPEND_SYSTEM.md.
+        assert prompt_values == [composed, ""]
+
+
 # ---------------------------------------------------------------------------
 # Databricks gateway default-model + models.json parity tests — the pi
 # mirror of the claude-sdk default plumbing. The ucode-cached
@@ -3864,6 +4131,19 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
 
 def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
     """Pi reuses UC availability and enriches aliases with MLflow limits."""
+    lookup_threads = []
+    vendor_model = ModelInfo(
+        name="gpt-next",
+        provider="openai",
+        supports_reasoning=True,
+        max_input_tokens=400_000,
+        max_output_tokens=128_000,
+    )
+
+    def vendor_models(provider):
+        lookup_threads.append(threading.get_ident())
+        return [vendor_model] if provider == "openai" else []
+
     responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
     entries = (
         ModelEntry(
@@ -3884,27 +4164,24 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
         ) as fetch,
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            return_value=(
-                ModelEntry(
-                    id="databricks-gpt-next",
-                    family="openai",
-                    metadata=ModelMetadata(
-                        context_window=400_000,
-                        max_output_tokens=128_000,
-                    ),
-                ),
-            ),
+            return_value=(),
         ) as enrich,
+        patch(
+            "omnigent.onboarding.providers.get_models",
+            side_effect=vendor_models,
+        ),
     ):
         executor = PiExecutor(gateway=True)
         first = _run(executor._load_gateway_model_wire_apis())
         second = _run(executor._load_gateway_model_wire_apis())
 
+    assert lookup_threads and threading.get_ident() not in lookup_threads
     assert first["databricks-gpt-next"] == responses
     assert second is first
     assert executor._gateway_model_entries is not None
     assert executor._gateway_model_entries[0].metadata.context_window == 400_000
     assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    assert executor._gateway_model_entries[0].metadata.supports(ModelCapability.REASONING) is True
     fetch.assert_called_once_with("https://h.example.com", "tok")
     enrich.assert_called_once_with("databricks")
 
@@ -3929,7 +4206,8 @@ def test_gateway_wire_catalog_failure_is_cached() -> None:
     fetch.assert_called_once_with("https://h.example.com", "tok")
 
 
-def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> None:
+@pytest.mark.parametrize("failure_stage", ["catalog", "vendor_fallback"])
+def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails(failure_stage) -> None:
     """MLflow downtime does not erase workspace-discovered picker models."""
     entries = (
         ModelEntry(
@@ -3950,14 +4228,23 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
         ),
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            side_effect=OSError("offline"),
+            return_value=(),
+            side_effect=OSError("offline") if failure_stage == "catalog" else None,
         ),
+        patch(
+            "omnigent.onboarding.providers.find_catalog_models",
+            side_effect=AttributeError("malformed catalog capabilities"),
+        ) as lookup,
     ):
         executor = PiExecutor(gateway=True)
         wire_catalog = _run(executor._load_gateway_model_wire_apis())
+        assert _run(executor._load_gateway_model_wire_apis()) is wire_catalog
 
     assert wire_catalog["system.ai.gpt-live"] == frozenset({ModelWireAPI.OPENAI_RESPONSES})
     assert executor._gateway_model_entries == entries
+
+    if failure_stage == "vendor_fallback":
+        lookup.assert_called_once_with("system.ai.gpt-live")
 
 
 def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
@@ -4088,6 +4375,18 @@ def test_models_json_lists_only_live_gateway_models() -> None:
     assert [m["id"] for m in providers["databricks-mlflow"]["models"]] == [
         "system.ai.llama-catalog"
     ]
+
+
+def test_models_json_attributes_only_unity_gateway_providers() -> None:
+    """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
+    providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
+
+    attributed = {name for name, provider in providers.items() if "headers" in provider}
+    assert attributed == {"databricks-openai", "databricks-mlflow"}
+    assert providers["databricks-openai"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
 
 
 def test_models_json_unknown_gpt_metadata_fails_toward_responses() -> None:
@@ -4804,6 +5103,90 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     assert "FAKE_HOST_SECRET" not in allowlist
 
 
+def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
+    """Only the bundle roots that contributed a ``--skill`` / ``--extension`` path are granted,
+    in a stable order; no bundle or no resources grants nothing.
+    """
+    from omnigent.inner.pi_executor import _pi_bundle_resource_roots
+
+    bundle = tmp_path / "bundle"
+    args = [
+        "--no-tools",
+        "--skill",
+        str(bundle / ".pi" / "skills" / "grilling"),
+        "--extension",
+        str(bundle / ".pi" / "extensions" / "ext" / "index.js"),
+    ]
+
+    assert _pi_bundle_resource_roots(bundle, args) == [
+        bundle / ".pi" / "skills",
+        bundle / ".pi" / "extensions",
+    ]
+    assert _pi_bundle_resource_roots(bundle, ["--no-tools"]) == []
+    assert _pi_bundle_resource_roots(None, args) == []
+
+
+def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_path) -> None:
+    """A sandboxed Pi is granted the bundle resource directories it is passed."""
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, SandboxPolicy] = {}
+
+    def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        captured["policy"] = sandbox
+        return "/fake/launcher"
+
+    def _fake_resolve_sandbox(_os_env: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[cwd.resolve(strict=False)],
+            write_files=[],
+            allow_network=False,
+        )
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    bundle = tmp_path / "bundle"
+    flat_skills = bundle / "skills"
+    pi_skills = bundle / ".pi" / "skills"
+    extensions = bundle / ".pi" / "extensions"
+    _make_pi_skill_dir(flat_skills, "alpha")
+    _make_pi_skill_dir(pi_skills, "grilling")
+    (extensions / "ext").mkdir(parents=True)
+    (extensions / "ext" / "index.js").write_text("module.exports = function () {};\n")
+    (bundle / "AGENTS.md").write_text("Bundle guidance.\n")
+
+    def _granted_read_roots(skills_filter: str = "all") -> list[Path]:
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+            executor = PiExecutor(
+                cwd=str(workspace),
+                bundle_dir=bundle,
+                os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                skills_filter=skills_filter,
+            )
+        assert executor._sandboxed is True
+        return [root.resolve(strict=False) for root in captured["policy"].read_roots or []]
+
+    granted = _granted_read_roots()
+    assert flat_skills.resolve() in granted
+    assert pi_skills.resolve() in granted
+    assert extensions.resolve() in granted
+    assert bundle.resolve() not in granted
+
+    # ``skills: none`` passes no --skill flags, so only the extensions root is granted.
+    granted = _granted_read_roots(skills_filter="none")
+    assert extensions.resolve() in granted
+    assert flat_skills.resolve() not in granted
+    assert pi_skills.resolve() not in granted
+
+
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:
     """The generated bridge extension carries the live server's token
     through the full ``run_turn`` → ``_ensure_tool_server`` →
@@ -5200,6 +5583,54 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
     _run(_test())
 
 
+@pytest.mark.parametrize(
+    "method, handler_mode, expected",
+    [
+        ("confirm", "accept", {"confirmed": True}),
+        ("select", "accept", {"value": "Allow"}),
+        ("notify", "missing", None),
+        ("confirm", "missing", {"confirmed": False}),
+        ("confirm", "timeout", {"confirmed": False}),
+    ],
+)
+def test_pi_extension_ui_rpc_round_trip(method: str, handler_mode: str, expected: dict | None):
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request",
+                id="dialog",
+                method=method,
+                title="Continue?",
+                options=["Allow", "Block"],
+                timeout=20,
+            ),
+            _rpc_frame(type="agent_end", messages=[]),
+            _rpc_frame(type="agent_settled"),
+        ]
+    )
+
+    async def answer(elicitation_id: str, params: ElicitationRequestParams) -> ElicitationResult:
+        assert elicitation_id == "elicit_pi_dialog"
+        assert params.mode == "form" and params.message == "Continue?"
+        if handler_mode == "timeout":
+            await asyncio.sleep(1)
+        return ElicitationResult(action="accept", content={"0": "Allow"})
+
+    if handler_mode != "missing":
+        executor._form_elicitation_handler = answer
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert rpc.process is not None and isinstance(rpc.process.stdin, _FakeStreamWriter)
+    commands = [json.loads(line) for line in b"".join(rpc.process.stdin.data).splitlines()]
+    responses = [cmd for cmd in commands if cmd.get("type") == "extension_ui_response"]
+    assert responses == (
+        [] if expected is None else [{"type": "extension_ui_response", "id": "dialog", **expected}]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reasoning effort → pi thinking level
 # ---------------------------------------------------------------------------
@@ -5549,6 +5980,30 @@ def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
     assert _SESSION_KEY not in executor._session_states, "the RPC session was kept"
     # ``_PiRpcSession.close`` terminates the process and then clears it.
     assert rpc.process is None, "the pi process was not closed"
+
+
+def test_extension_answer_write_failure_evicts_waiting_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request", id="dialog", method="confirm", title="Continue?"
+            ),
+        ]
+    )
+    send = rpc.send_command
+
+    async def fail_answer(command: dict) -> None:
+        if command.get("type") == "extension_ui_response":
+            raise BrokenPipeError("test dialog response write failed")
+        await send(command)
+
+    monkeypatch.setattr(rpc, "send_command", fail_answer)
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, ExecutorError) for event in events)
+    _assert_session_evicted(executor, rpc)
 
 
 def _retry_recovery_frames(recovered: str) -> list[str]:

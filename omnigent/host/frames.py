@@ -30,7 +30,10 @@ from pydantic import ValidationError
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+    CAP_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -45,6 +48,12 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+# when the host's launch handler raised before any runner process was spawned
+# (a post-spawn fault is not reported as a failure). Unlike the codes above
+# this is not a categorical refusal: the server cannot describe the cause from
+# its own state, so it stays a generic failure.
+LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
 
 # Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
 # tail, whose last line the server keeps when it shortens the report for storage.
@@ -69,6 +78,7 @@ CAP_MCP_REGISTRY = "mcp_registry"
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
@@ -286,6 +296,11 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param superseded_runner_ids: Runners this launch replaces, which the
+        host stops once the new runner is alive. ``None`` (an older server)
+        falls back to stopping every runner launched for ``session_id``; an
+        empty tuple stops none, e.g. after /clear moved the old runner to
+        another session.
     """
 
     request_id: str
@@ -294,6 +309,7 @@ class HostLaunchRunnerFrame:
     session_id: str | None = None
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
+    superseded_runner_ids: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -975,15 +991,20 @@ class HostFsWriteFrame:
     The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
     this carries the small set of writes the host can serve when the session's
     runner is offline — currently the pull request panel's account/base
-    preference (``op="github_set_preference"``) and PR attach/remove
-    (``op="github_prs_update"``), for every git provider; the op names are
+    preference (``op="github_set_preference"``), PR attach/remove
+    (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
+    reviewer edits (``op="github_reviewers_update"``), merges (``op="github_merge"``),
+    and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
+    provider; the op names are
     stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
-    :param op: Write op name — ``"github_set_preference"`` or
-        ``"github_prs_update"``.
+    :param op: Write op name — ``"github_set_preference"``,
+        ``"github_prs_update"``, ``"github_labels_update"``,
+        ``"github_reviewers_update"``, ``"github_merge"``, or
+        ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1420,17 +1441,18 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.LAUNCH_RUNNER.value,
-                "request_id": frame.request_id,
-                "binding_token": frame.binding_token,
-                "workspace": frame.workspace,
-                "session_id": frame.session_id,
-                "harness": frame.harness,
-                "inference_config": frame.inference_config,
-            }
-        )
+        payload: dict[str, Any] = {
+            "kind": HostFrameKind.LAUNCH_RUNNER.value,
+            "request_id": frame.request_id,
+            "binding_token": frame.binding_token,
+            "workspace": frame.workspace,
+            "session_id": frame.session_id,
+            "harness": frame.harness,
+            "inference_config": frame.inference_config,
+        }
+        if frame.superseded_runner_ids is not None:
+            payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
+        return _encode_payload(payload)
     if isinstance(frame, HostLaunchRunnerResultFrame):
         return _encode_payload(
             {
@@ -2346,6 +2368,12 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        # Absent (an older server) is distinct from an empty list.
+        superseded_runner_ids=(
+            tuple(_optional_str_list(msg, "superseded_runner_ids"))
+            if "superseded_runner_ids" in msg
+            else None
+        ),
     )
 
 

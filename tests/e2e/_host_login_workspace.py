@@ -55,6 +55,7 @@ class HostLoginWorkspace(AbstractContextManager):
         self.upstream_url = upstream_url
         self.authorizations = 0
         self.token_exchanges = 0
+        self.authenticated_requests: list[str] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _WorkspaceHandler)
         self.server.daemon_threads = True
         self.server.workspace = self
@@ -147,6 +148,7 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
             self._json(404, {})
 
     def _forward(self) -> None:
+        self.workspace.authenticated_requests.append(self.path)
         relative = self.path.removeprefix(MOUNT)
         headers = {
             name: value
@@ -180,6 +182,7 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
                 "Content-Type", response.headers.get("Content-Type", "application/json")
             )
             self.send_header("Content-Length", str(len(response.content)))
+            self.send_header("X-Databricks-Org-Id", WORKSPACE_ID)
             self.end_headers()
             self.wfile.write(response.content)
 

@@ -404,7 +404,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.REBUILD,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
-        instruction_delivery=_ID.NOT_DELIVERED,
+        instruction_delivery=_ID.AGENT_STARTUP_ADDITIVE,
     ),
     # streaming=False is LIVE-VERIFIED: a bench run observed 0 text deltas.
     "cursor-native": _C(
@@ -1105,7 +1105,7 @@ def plugin_state() -> HarnessPluginState:
             if error is not None:
                 raise ValueError(error)
             contributions.append(contribution)
-        except Exception as exc:  # noqa: BLE001 - broken plugins must not break core startup.
+        except Exception as exc:  # broken plugins must not break core startup.
             load_errors[entry_point.name] = str(exc)
             _logger.warning(
                 "could not load harness plugin entry point %s (%s)",
@@ -1260,7 +1260,7 @@ def harness_catalog() -> list[dict[str, object]]:
     # importable without pulling in the onboarding/config stack at module load.
     try:
         from omnigent.onboarding.harness_install import ui_setup_steps
-    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+    except Exception:  # a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         ui_setup_steps = None  # type: ignore[assignment]
     rows: list[dict[str, object]] = []
@@ -1289,7 +1289,7 @@ def harness_catalog() -> list[dict[str, object]]:
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
             rows.append(acp_row)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break the catalog
+    except Exception:  # a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)
     return rows
 
@@ -1310,7 +1310,7 @@ def harness_setup_steps_by_spelling() -> dict[str, list[dict[str, str | None]]]:
     """
     try:
         from omnigent.onboarding.harness_install import ui_installable_harnesses, ui_setup_steps
-    except Exception:  # noqa: BLE001 — a broken onboarding import must not break the catalog
+    except Exception:  # a broken onboarding import must not break the catalog
         _logger.debug("setup-step metadata unavailable", exc_info=True)
         return {}
     # Cover the picker ids (catalog rows) plus every installable spelling

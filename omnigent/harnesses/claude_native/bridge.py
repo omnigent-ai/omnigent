@@ -43,6 +43,7 @@ import os
 import queue
 import re
 import secrets
+import select
 import shlex
 import socket
 import socketserver
@@ -79,6 +80,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
 )
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
+    launcher_password_prompt,
     sign_in_next_step,
     sign_in_running_elsewhere,
 )
@@ -415,6 +417,13 @@ _OCCUPIED_INPUT_DISMISS_TIMEOUT_S = 3.0
 _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
+# What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
+_SHELL_MODE_SURFACE = "shell mode"
+# Ctrl+U, CSI-u encoded like the other clearing keys. Claude Code leaves shell
+# mode on it only with the cursor at the start of the line, so a typed command
+# takes two: the first clears the line, the second switches the box back to
+# chat input. Neither submits, and unlike Escape neither interrupts a turn.
+_CLEAR_LINE_KEY = "\x1b[117;5u"
 # The dismissal every surface drawn over the input box advertises in its
 # footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
 # an action with "/", so the task details panels print "Esc/Enter/Space to
@@ -503,6 +512,7 @@ _CONFIRM_DIALOG_RETRY_INTERVAL_S = 0.75
 # surfaces in the web UI error banner instead of only in the terminal.
 _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
+_TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
@@ -4183,8 +4193,9 @@ def inject_user_message(
     Between the two, anything the person left occupying the composer
     from the embedded terminal — a ctrl+r history search, a rewind
     dialog, a ``/config`` panel, ``!`` shell mode — is dismissed with
-    Escape (see :func:`_restore_occupied_input`), so the message reclaims
-    the input box instead of being typed into that surface.
+    Escape, or cleared when it is a typed shell command (see
+    :func:`_restore_occupied_input`), so the message reclaims the input box
+    instead of being typed into that surface.
 
     Delivered as one bracketed paste via ``tmux load-buffer`` (from a
     temp file) + ``paste-buffer -p`` so interior newlines ride as raw CR
@@ -4500,6 +4511,8 @@ def _verify_submit_accepted(
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
         ownership of the web input remains unconfirmed.
+    :raises RuntimeError: Pane capture remains unavailable after submitting;
+        delivery cannot be confirmed safely.
     """
     start = time.monotonic()
     last_enter = start
@@ -4532,6 +4545,10 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
+        # An empty capture can be a repaint or failed tmux read. It proves
+        # neither that the draft cleared nor that another Enter is safe.
+        if not pane.strip():
+            continue
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
@@ -4567,7 +4584,7 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=True,
+        draft_still_present=_draft_in_input_box(pane, needle),
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -4575,6 +4592,12 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if not pane.strip():
+        raise RuntimeError(
+            f"Claude Code {what} delivery could not be confirmed within "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because terminal capture is unavailable. "
+            "Inspect the terminal before retrying; the message may already have been delivered."
+        )
     return False
 
 
@@ -4722,13 +4745,9 @@ def kill_session(
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    try:
-        _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
-    except RuntimeError as exc:
-        detail = str(exc).lower()
-        if "can't find session" in detail or "no server running on" in detail:
-            return
-        raise
+    _run_tmux(
+        info["socket_path"], "kill-session", "-t", info["tmux_target"], allow_missing_target=True
+    )
 
 
 @_serialize_bridge_injection
@@ -5525,7 +5544,7 @@ class _UnixHTTPConnection(HTTPConnection):
         self.sock = sock
 
 
-def _run_tmux(socket_path: str, *args: str) -> None:
+def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
 
@@ -5538,6 +5557,8 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         was launched on, e.g. ``"/tmp/.../tmux.sock"``.
     :param args: Arguments after ``tmux -S <socket_path>``, e.g.
         ``("send-keys", "-l", "-t", "claude:0.0", "hello")``.
+    :param allow_missing_target: Treat a confirmed missing tmux server or
+        target as success.
     :returns: None.
     :raises RuntimeError: If the subprocess exits non-zero or times
         out.
@@ -5567,6 +5588,11 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     if proc.returncode != 0:
         delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+        if allow_missing_target:
+            from omnigent.inner.terminal import _tmux_reports_target_gone
+
+            if _tmux_reports_target_gone(detail):
+                return
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
@@ -5911,7 +5937,10 @@ def _restore_occupied_input(
     restores a checkpoint, and shell mode runs the message as a bash
     command. Every one of them documents Escape as its way out ("Esc to
     cancel"), which commits nothing and hands the empty input box back, so
-    the web-UI message wins the pane.
+    the web-UI message wins the pane. The exception is a shell-mode box
+    holding a typed command, which Escape leaves in shell mode: that command
+    is cleared from the box instead (see :func:`_shell_mode_draft`), the way
+    an unsent chat draft is cleared before a paste.
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -5994,8 +6023,15 @@ def _restore_occupied_input(
             if unclearable_seen:
                 return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
-            _logger.info("claude-native: dismissing %s covering the input box", surface)
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+            if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
+                # Escape keeps a typed shell command in shell mode, so the
+                # command is cleared instead, as a chat draft is before a paste.
+                _logger.info("claude-native: clearing a shell-mode draft from the input box")
+                for _ in range(2):
+                    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _CLEAR_LINE_KEY)
+            else:
+                _logger.info("claude-native: dismissing %s covering the input box", surface)
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -6048,7 +6084,25 @@ def _occupying_surface(pane: str) -> str | None:
         return _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
-    return "shell mode"
+    return _SHELL_MODE_SURFACE
+
+
+def _shell_mode_draft(pane: str) -> bool:
+    """
+    Return whether the input box is in shell mode with a command typed.
+
+    Escape takes an empty shell-mode box back to chat input, but Claude Code
+    keeps a box holding a typed command in shell mode, so that one is
+    cleared with :data:`_CLEAR_LINE_KEY` instead.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the composer row leads with the shell-mode glyph
+        and carries text after it.
+    """
+    row = _composer_row(pane)
+    if row is None or not row.strip().startswith(_SHELL_MODE_GLYPH):
+        return False
+    return bool(row.strip()[len(_SHELL_MODE_GLYPH) :].strip())
 
 
 def _composer_row(pane: str) -> str | None:
@@ -6365,7 +6419,22 @@ def _format_terminal_failure_tail(pane: str) -> str:
     tail = "\n".join(lines[-_TERMINAL_FAILURE_TAIL_LINES:])
     if len(tail) > _TERMINAL_FAILURE_TAIL_CHARS:
         tail = "…" + tail[-_TERMINAL_FAILURE_TAIL_CHARS:]
-    return f" Last terminal output:\n{tail}"
+    return f"{_TERMINAL_FAILURE_TAIL_PREFIX}{tail}"
+
+
+def terminal_failure_tail(message: str) -> str:
+    """
+    Return the terminal-output block a readiness failure message ends with.
+
+    Lets a caller that rewords a failure for its own action (a model switch
+    rather than a chat message) keep the pane text that names the cause.
+
+    :param message: A failure message, e.g. ``str(ClaudePromptTimeout(...))``.
+    :returns: The block :func:`_format_terminal_failure_tail` appended, or
+        ``""`` when the message carries none.
+    """
+    _, prefix, tail = message.partition(_TERMINAL_FAILURE_TAIL_PREFIX)
+    return f"{prefix}{tail}" if prefix else ""
 
 
 def _terminal_dialog_headline(pane: str) -> str | None:
@@ -6451,6 +6520,8 @@ def _wait_for_claude_prompt_ready(
         consecutive polls. Raised within a poll interval instead of waiting
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
+        A launcher password prompt (see :func:`launcher_password_prompt`) on
+        two consecutive polls is reported the same way.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -6485,6 +6556,7 @@ def _wait_for_claude_prompt_ready(
     dialog_headline: str | None = None
     sign_in_url: str | None = None
     waited_on_sign_in = False
+    waited_on_password = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -6516,6 +6588,17 @@ def _wait_for_claude_prompt_ready(
                 "prompt, then resend your message." + _format_terminal_failure_tail(pane)
             )
         dialog_headline = headline
+        # A launcher asking for a password, e.g. sudo writing managed settings.
+        # Only the person can type it, so report it rather than wait out the
+        # budget and reap the pane holding the prompt.
+        at_password_prompt = launcher_password_prompt(pane)
+        if at_password_prompt and waited_on_password:
+            raise ClaudeTerminalDialog(
+                "Claude Code's launch command is waiting for a password in its terminal, "
+                "so the message was not delivered. Open the terminal, enter the password, "
+                "then resend your message." + _format_terminal_failure_tail(pane)
+            )
+        waited_on_password = at_password_prompt
         # A launcher sign-in prompt printed before Claude Code runs: an address
         # to open, often with a device code. Real when the same address shows
         # on two consecutive polls. Fail now with the link rather than wait out
@@ -7163,6 +7246,7 @@ def _tool_relay_handler_factory(
                 "/tool",
                 "/policies/evaluate",
                 "/hook/claude/evaluate-policy",
+                "/hook/pi/extension-ui",
                 "/hook/observe-tool",
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
@@ -7196,6 +7280,9 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
+                return
+            if self.path == "/hook/pi/extension-ui":
+                self._handle_pi_extension_ui(payload)
                 return
             name = payload.get("name")
             arguments = payload.get("arguments")
@@ -7338,19 +7425,40 @@ def _tool_relay_handler_factory(
             self._respond_hook_output(hook_output)
 
         def _handle_policy_evaluate(self, payload: _JsonObject) -> None:
+            self._proxy_parked_request(payload, "/policies/evaluate")
+
+        def _handle_pi_extension_ui(self, payload: _JsonObject) -> None:
+            self._proxy_parked_request(payload, "/hooks/pi-extension-ui", watch_disconnect=True)
+
+        def _proxy_parked_request(
+            self, payload: _JsonObject, path: str, *, watch_disconnect: bool = False
+        ) -> None:
             if policy_client is None or session_id is None:
                 self.send_error(HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            import urllib.parse as _up
-
-            session_component = _up.quote(session_id, safe="")
-            url = f"/v1/sessions/{session_component}/policies/evaluate"
+            session_component = urllib.parse.quote(session_id, safe="")
+            url = f"/v1/sessions/{session_component}{path}"
             future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
             try:
+                if watch_disconnect:
+                    deadline = time.monotonic() + 86400.0
+                    while not future.done():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Dialog wait expired")
+                        try:
+                            readable, _, _ = select.select([self.connection], [], [], 0.1)
+                            if readable:
+                                # EOF or pipelined bytes end this single-request wait.
+                                return
+                        except OSError:
+                            return
                 resp = future.result(timeout=86400.0)
             except Exception as exc:  # noqa: BLE001
                 self._send_policy_proxy_error(exc)
                 return
+            finally:
+                # Closing a dialog releases the upstream parked card.
+                future.cancel()
             raw = resp.content
             self.send_response(resp.status_code)
             for header in ("Content-Type", "Content-Length"):
@@ -8736,7 +8844,9 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #
 # - DROPPED — pure UI affordances (``/help``, ``/login``) and local
 #   config (``/permissions``, ``/add-dir``). No conversation-visible
-#   effect; surfacing them in the web UI is noise.
+#   effect; surfacing them in the web UI is noise. This includes the
+#   panels (``/export``, ``/usage``) that leave no transcript record, so a
+#   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
 #   ``/model``, ``/ultrareview``). A web observer needs to see these,
@@ -8753,6 +8863,7 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "cost",
         "doctor",
         "exit",
+        "export",
         "fast",
         "feedback",
         "help",
@@ -8762,6 +8873,7 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "logout",
         "mcp",
         "memory",
+        "mobile",
         "onboarding",
         "permissions",
         "plugin",
@@ -8769,10 +8881,17 @@ _CLAUDE_CLI_DROPPED_COMMANDS: frozenset[str] = frozenset(
         "quit",
         "release-notes",
         "resume",
+        "rewind",
+        "sandbox",
         "save",
+        "skills",
+        "stats",
         "status",
+        "tasks",
         "terminal-setup",
+        "theme",
         "upgrade",
+        "usage",
         "verbose",
     }
 )

@@ -46,6 +46,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 
@@ -619,6 +620,14 @@ export function ChatHeader({
           <AgentInfoButton
             agent={boundAgent}
             sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
+        )}
+        {/* Split the Terminal view into shell panes — self-gates to null
+            unless the feature is on and the agent terminal is shown. */}
+        {!pending && conversationId && (
+          <TerminalSplitControls
+            conversationId={conversationId}
             permissionLevel={permissionLevel}
           />
         )}

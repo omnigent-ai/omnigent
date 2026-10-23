@@ -44,7 +44,12 @@ from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
-from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+from omnigent.databricks_ai_gateway import (
+    CLAUDE_CODE_AGENT,
+    is_databricks_ai_gateway_url,
+    is_ug_route,
+    with_gateway_attribution_lines,
+)
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
@@ -101,6 +106,8 @@ logger = logging.getLogger(__name__)
 # producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
+# Claude Code floors a thinking budget at this size and requires max_tokens above it.
+_CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
@@ -108,6 +115,54 @@ _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
+
+CLAUDE_AUTH_FAILED_CODE = "claude_sdk_auth_failed"
+CLAUDE_AUTH_FAILED_TITLE = "Claude Code could not authenticate"
+# Failed ResultMessages carry no structured auth signal (unlike api_retry's
+# status), so Claude Code's (2.1.x) failure wording is the only input. A bare
+# "Run /login" is insufficient: billing/device-enrollment errors suggest it too.
+_CLAUDE_AUTH_FAILURE_MARKERS = (
+    "failed to authenticate",
+    "authentication failed",
+    "authentication_error",
+    "not authenticated",
+    "not logged in",
+    "not signed in",
+    "login expired",
+    "please login again",
+    "run /login to sign in",
+    "run /login to authenticate",
+    "run /login and sign in",
+    "oauth session expired",
+    "oauth token revoked",
+    "credential is expired or revoked",
+    "invalid api key",
+    "disabled api key authentication",
+)
+
+# Claude Code ends its failure lines with "." or a " \u00b7 Run /login" clause.
+_TRAILING_PUNCTUATION = ".!: \u00b7"
+
+
+def is_claude_auth_failure_text(text: str) -> bool:
+    """Whether *text* is Claude Code reporting that it could not authenticate."""
+    normalized = " ".join(text.replace("`", "").lower().split())
+    return any(marker in normalized for marker in _CLAUDE_AUTH_FAILURE_MARKERS)
+
+
+def _claude_auth_remediation(*, databricks_profile: bool, gateway: bool) -> str:
+    """The next step for a Claude Code authentication failure in this transport mode."""
+    if databricks_profile:
+        return "Check your selected ~/.databrickscfg profile."
+    if gateway:
+        return (
+            "Check your provider's base URL and auth command (ANTHROPIC_BASE_URL / gateway auth)."
+        )
+    return (
+        "Sign in to Claude Code on the host that runs this agent (`claude auth login`), "
+        f"or run `{cli_invocation()} setup` there to give the agent a Claude API key or gateway."
+    )
+
 
 # ---------------------------------------------------------------------------
 # TypeAliases for Omnigent JSON-shaped boundary values. The SDK exchanges
@@ -368,7 +423,9 @@ def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ig
     """If ``value`` contains an inline ``data:*;base64,...`` URI, return its
     ``(media_type, base64_char_count)``; otherwise ``None``.
 
-    A resolved attachment block looks like::
+    A resolved attachment block looks like:
+
+    .. code-block:: text
 
         {"type": "input_image",
          "filename": "screenshot.png",
@@ -1036,7 +1093,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
                     " > ".join(("opus", "sonnet", "haiku", "fable")),
                 )
                 return servable
-    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+    except Exception:  # the bundled catalog is the last resort
         logger.warning(
             "claude-sdk: live Databricks model discovery failed for profile %r; "
             "falling back to the bundled catalog",
@@ -1108,7 +1165,7 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
     try:
         listing = model_catalog.listing_for_provider(provider)
-    except Exception:  # noqa: BLE001 — best-effort; unpinned aliases are the safe default
+    except Exception:  # best-effort; unpinned aliases are the safe default
         logger.warning(
             "claude-sdk: could not list the gateway's models; leaving "
             "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
@@ -1141,6 +1198,35 @@ def _claude_settings_payload(
     if model_overrides:
         settings["modelOverrides"] = model_overrides
     return json.dumps(settings, separators=(",", ":")) if settings else None
+
+
+def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
+    """Read the ``env`` block of Claude Code's user ``settings.json``.
+
+    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
+    relative value is relative to the CLI's working directory.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: The string-valued entries, e.g.
+        ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
+        when the file is missing, unreadable, or has no ``env`` object.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
+    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    env = settings.get("env") if isinstance(settings, dict) else None
+    if not isinstance(env, dict):
+        return {}
+    return {
+        key: value for key, value in env.items() if isinstance(key, str) and isinstance(value, str)
+    }
 
 
 def _resolve_gateway_env(
@@ -1260,6 +1346,11 @@ def _resolve_gateway_env(
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
+        gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(base_url),
+        )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     return gateway_env
@@ -1598,6 +1689,7 @@ class ClaudeSDKExecutor(Executor):
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
         api_key_helper: str | None = None,
+        system_prompt_preset: str | None = None,
     ) -> None:
         """Create a ClaudeSDKExecutor.
 
@@ -1610,6 +1702,8 @@ class ClaudeSDKExecutor(Executor):
                 sandbox the Claude CLI process itself on supported Linux
                 hosts, but does not enable native OS tools.
             model: Override the model name.
+            system_prompt_preset: Set to ``claude_code`` to append agent
+                instructions to Claude Code's prompt. Unset preserves the custom prompt.
             permission_mode: SDK permission mode (default: auto
                 so the agent runs autonomously with background safety checks).
             gateway: If True, route through a vendor-neutral gateway
@@ -1681,6 +1775,9 @@ class ClaudeSDKExecutor(Executor):
                 f"Databricks provider with `{cli_invocation()} setup`, to route through "
                 "the Databricks Anthropic gateway."
             )
+        if system_prompt_preset not in (None, "claude_code"):
+            raise ValueError("system_prompt_preset must be 'claude_code' or unset")
+        self._system_prompt_preset = system_prompt_preset
         self._cwd = cwd
         self._os_env_spec = os_env
         self._os_env = os_env is not None
@@ -1910,7 +2007,7 @@ class ClaudeSDKExecutor(Executor):
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
@@ -2133,7 +2230,7 @@ class ClaudeSDKExecutor(Executor):
                     try:
                         with suppress(Exception):
                             await asyncio.wait_for(process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         _kill_process_tree(process)
                         with suppress(Exception):
                             await process.wait()
@@ -2678,6 +2775,13 @@ class ClaudeSDKExecutor(Executor):
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
         if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+        if resolved.setting_sources == [] and not self._gateway:
+            # The CLI then skips the user settings env, which may hold the only provider endpoint.
+            env = {**_claude_user_settings_env(self._cwd), **env}
+        max_output_tokens = cfg.extra.get("max_tokens")
+        if max_output_tokens is not None:
+            max_output_tokens = int(max_output_tokens)
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(max_output_tokens)
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
@@ -2695,6 +2799,12 @@ class ClaudeSDKExecutor(Executor):
             "extra_args": {"no-session-persistence": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
+        if self._system_prompt_preset == "claude_code":
+            options_kwargs["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": system_prompt,
+            }
         # Only forward ``setting_sources`` when explicitly set.
         # ``None`` lets the SDK apply its default
         # (``["user", "project"]`` when ``skills`` is non-None).
@@ -2708,6 +2818,11 @@ class ClaudeSDKExecutor(Executor):
             options_kwargs["setting_sources"] = resolved.setting_sources
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
+        if (
+            max_output_tokens is not None
+            and max_output_tokens <= _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS
+        ):
+            options_kwargs["thinking"] = {"type": "disabled"}
         # Databricks opus/fable endpoints reject thinking.type="enabled"
         # (HTTP 400); they require "adaptive" instead (those tiers are
         # adaptive-only). Sonnet is fine, so scope to those tiers only.
@@ -2758,12 +2873,14 @@ class ClaudeSDKExecutor(Executor):
 
         # Log the full configuration for debugging
         logger.info(
-            "ClaudeSDKExecutor: model=%s, gateway=%s, base_url=%s, tools=%d, thinking=%r",
+            "ClaudeSDKExecutor: model=%s, gateway=%s, base_url=%s, tools=%d, thinking=%r, "
+            "system_prompt_preset=%s",
             model or "(default)",
             self._gateway,
             env.get("ANTHROPIC_BASE_URL", "(not set)"),
             len(tools),
             options_kwargs.get("thinking"),
+            self._system_prompt_preset or "custom",
         )
 
         # Run the query, streaming events as they arrive.
@@ -2781,6 +2898,11 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        terminal_auth_failure = False
+        auth_remediation = _claude_auth_remediation(
+            databricks_profile=self._gateway_uses_databricks_profile,
+            gateway=bool(self._gateway),
+        )
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -2876,7 +2998,7 @@ class ClaudeSDKExecutor(Executor):
                     for message in messages
                     if isinstance(message.message, dict)
                 ]
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Failed to read Claude post-compaction session messages "
                     "(session=%s); preserving full server history instead of "
@@ -2965,7 +3087,7 @@ class ClaudeSDKExecutor(Executor):
                     client.query(sdk_prompt, session_id=session_key),
                     timeout=_QUERY_START_TIMEOUT_SECONDS,
                 )
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
@@ -3192,7 +3314,14 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_error = failure_text
+                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            # Keep the next step in the message too: the REPL and
+                            # SDK stream render only code/message.
+                            terminal_error = (
+                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
+                                if terminal_auth_failure
+                                else failure_text
+                            )
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -3262,23 +3391,12 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
-                                if self._gateway_uses_databricks_profile:
-                                    auth_hint = "Check your selected ~/.databrickscfg profile."
-                                elif self._gateway:
-                                    auth_hint = (
-                                        "Check your provider's base URL and auth command "
-                                        "(ANTHROPIC_BASE_URL / gateway auth)."
-                                    )
-                                else:
-                                    auth_hint = (
-                                        "Check your Claude CLI login status "
-                                        "(`claude /status`) or API key configuration."
-                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    f"{auth_hint}"
+                                    f"{auth_remediation}"
                                 )
+                                terminal_auth_failure = True
                                 break
 
                             if error_status == 404:
@@ -3294,6 +3412,7 @@ class ClaudeSDKExecutor(Executor):
                                     f"({retry_error}, status={error_status}). "
                                     f"{endpoint_hint}"
                                 )
+                                terminal_auth_failure = False
                                 break
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
                             compaction_occurred = True
@@ -3389,7 +3508,16 @@ class ClaudeSDKExecutor(Executor):
                 compaction_event = _build_compaction_complete_event()
                 if compaction_event is not None:
                     yield compaction_event
-            yield ExecutorError(message=terminal_error, usage=turn_usage)
+            if terminal_auth_failure:
+                yield ExecutorError(
+                    message=terminal_error,
+                    usage=turn_usage,
+                    code=CLAUDE_AUTH_FAILED_CODE,
+                    title=CLAUDE_AUTH_FAILED_TITLE,
+                    remediation=auth_remediation,
+                )
+            else:
+                yield ExecutorError(message=terminal_error, usage=turn_usage)
             return
 
         # ── LLM_RESPONSE policy evaluation ───────────────────────

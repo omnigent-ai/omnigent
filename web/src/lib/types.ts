@@ -547,11 +547,13 @@ export interface Session {
 /**
  * Stages of a managed-sandbox launch, in pipeline order. `cloning`
  * only occurs when the session requested a repository workspace;
- * `ready` and `failed` are terminal (`ready` is delivered via SSE
- * only — the snapshot field clears to null on success).
+ * `action_required` is a warning while provisioning: the user needs to
+ * do something, described by the status's `details`. `ready` and
+ * `failed` are terminal (`ready` is delivered via SSE only — the
+ * snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
+  "provisioning" | "action_required" | "cloning" | "starting" | "connecting" | "ready" | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors
@@ -566,6 +568,8 @@ export interface SandboxStatus {
   error?: string | null;
   /** Sandbox provider being launched, e.g. `"arclet"`; absent from older servers. */
   provider?: string | null;
+  /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
+  details?: string | null;
 }
 
 /** Host-discovered menu metadata. Invocation resolves the full skill on the runner. */

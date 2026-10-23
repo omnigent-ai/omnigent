@@ -72,6 +72,7 @@ _EXTERNAL_OUTPUT_REASONING_DELTA = "external_output_reasoning_delta"
 _STATUS_RUNNING = "running"
 _STATUS_IDLE = "idle"
 _STATUS_FAILED = "failed"
+_MESSAGE_ABORTED_ERROR = "MessageAbortedError"
 
 # Appended to a failed edge's output when opencode reports a provider-auth
 # error so the web surface can prompt a re-auth (matches the codex-native
@@ -230,7 +231,7 @@ class OpenCodeNativeForwarder:
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
-        except Exception:  # noqa: BLE001 - seeding is best effort.
+        except Exception:  # seeding is best effort.
             _logger.debug("OpenCode forwarder could not seed dedupe from history", exc_info=True)
             return
         for message in messages:
@@ -263,7 +264,7 @@ class OpenCodeNativeForwarder:
                 self.state.mark(self._key("message", message_id))
         try:
             await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+        except Exception:  # usage re-post is best effort.
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after seeding", exc_info=True
             )
@@ -279,7 +280,7 @@ class OpenCodeNativeForwarder:
         """
         try:
             messages = await self._opencode.list_messages(self._opencode_session_id)
-        except Exception:  # noqa: BLE001 - catch-up is best effort.
+        except Exception:  # catch-up is best effort.
             _logger.debug("OpenCode forwarder could not catch up from history", exc_info=True)
             return
         for message in messages:
@@ -316,7 +317,7 @@ class OpenCodeNativeForwarder:
                 await self._flush_pending_text()
         try:
             await self._post_session_usage()
-        except Exception:  # noqa: BLE001 - usage re-post is best effort.
+        except Exception:  # usage re-post is best effort.
             _logger.debug(
                 "OpenCode forwarder could not re-post usage after catch-up", exc_info=True
             )
@@ -350,7 +351,7 @@ class OpenCodeNativeForwarder:
                     # Clean stream end (server closed): reconnect.
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001 - reconnect on any transient SSE failure.
+                except Exception:  # reconnect on any transient SSE failure.
                     _logger.warning(
                         "OpenCode forwarder SSE error for session=%s; reconnecting",
                         self._session_id,
@@ -609,13 +610,17 @@ class OpenCodeNativeForwarder:
             return
         self._msg_role[message_id] = role
         if role == "assistant":
-            # This turn's per-turn ``response_id`` — the running/idle edges carry
-            # it so the web chat can correlate them with the tool-call items that
-            # already stamp the same id (renders in-flight tool calls live).
-            self._active_message_id = message_id
-            if self._bridge_dir is not None:
-                update_active_message_id(self._bridge_dir, message_id, status="busy")
-            await self._begin_turn_if_needed()
+            error = info.get("error")
+            # OpenCode can update an aborted message after its turn ended; that must
+            # not reopen the turn.
+            if not (isinstance(error, Mapping) and error.get("name") == _MESSAGE_ABORTED_ERROR):
+                # This turn's per-turn ``response_id`` — the running/idle edges carry
+                # it so the web chat can correlate them with the tool-call items that
+                # already stamp the same id (renders in-flight tool calls live).
+                self._active_message_id = message_id
+                if self._bridge_dir is not None:
+                    update_active_message_id(self._bridge_dir, message_id, status="busy")
+                await self._begin_turn_if_needed()
             self._record_assistant_usage(message_id, info)
             await self._post_session_usage()
 
@@ -927,7 +932,7 @@ class OpenCodeNativeForwarder:
         await self._flush_pending_text()
         name = error.get("name") if isinstance(error, Mapping) else None
         data = error.get("data") if isinstance(error, Mapping) else None
-        if name == "MessageAbortedError":
+        if name == _MESSAGE_ABORTED_ERROR:
             await self._end_turn()
             return
         message = data.get("message") if isinstance(data, Mapping) else None
@@ -1004,7 +1009,7 @@ class OpenCodeNativeForwarder:
             await self._opencode.reply_permission(
                 request.request_id, reply_body(reply, message="omnigent-policy")
             )
-        except Exception:  # noqa: BLE001 - reply is best effort; log and move on.
+        except Exception:  # reply is best effort; log and move on.
             _logger.warning(
                 "OpenCode permission reply failed for request=%s",
                 request.request_id,
@@ -1031,7 +1036,7 @@ class OpenCodeNativeForwarder:
         )
         try:
             verdict = await self._policy_evaluator(normalized)
-        except Exception:  # noqa: BLE001 - policy errors fail closed.
+        except Exception:  # policy errors fail closed.
             _logger.warning("OpenCode policy evaluation failed", exc_info=True)
             return "ask"
         if verdict is None:
