@@ -248,7 +248,7 @@ class PersistentTaskScheduler:
             await asyncio.sleep(self._poll_seconds)
 
     async def poll_once(self) -> None:
-        """One non-overlapping poll; useful for deterministic tests and embedders."""
+        """Serialize due-task polling and start recovery in the background if idle."""
         async with self._poll_lock:
             if self._stopped:
                 return
@@ -341,6 +341,12 @@ class PersistentTaskScheduler:
                             with workspace_scope(run.workspace_id):
                                 status = await self._on_expired(run)
                                 if status is not None:
+                                    if status not in ("running", "failed"):
+                                        raise ValueError(
+                                            f"Invalid recovery result {status!r}. "
+                                            "Expected 'running', 'failed', or None "
+                                            "to check again later."
+                                        )
                                     await asyncio.to_thread(
                                         self._store.transition_starting_run,
                                         run,
@@ -355,6 +361,13 @@ class PersistentTaskScheduler:
                                         if status == "failed"
                                         else None,
                                     )
+                except TimeoutError:
+                    _logger.warning(
+                        "Recovery timed out for run %s; an in-flight database update may "
+                        "still complete. If the run remains starting, a later sweep "
+                        "will check it again",
+                        run.id,
+                    )
                 except Exception:
                     _logger.exception(
                         "Could not finish recovery for run %s after its startup lease expired; "

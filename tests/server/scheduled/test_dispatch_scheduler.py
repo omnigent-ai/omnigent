@@ -575,6 +575,7 @@ async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store
 
     async def recover(run):
         # This fake executor has not sent a prompt or created a sandbox.
+        assert cancelled.is_set()
         reconciled.append(run)
         return "failed"
 
@@ -787,10 +788,10 @@ async def test_loop_retries_after_boot_database_outage_and_stops(store, monkeypa
         await scheduler.stop()
 
 
-@pytest.mark.parametrize("failure", ["exception", "timeout", "unknown"])
+@pytest.mark.parametrize("failure", ["exception", "timeout", "unknown", "skipped", "invalid"])
 @pytest.mark.parametrize("deleted", [False, True])
 async def test_expired_cleanup_failure_is_retried_without_another_fire(
-    store, failure, deleted
+    store, failure, deleted, caplog
 ) -> None:
     task = _task(store, execution_target="managed_sandbox")
     clock = FakeClock(task.next_run_at)
@@ -811,6 +812,8 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         if recover.await_count == 1:
             if failure == "unknown":
                 return None
+            if failure in {"skipped", "invalid"}:
+                return failure
             if failure == "timeout":
                 await asyncio.Event().wait()
             raise RuntimeError("cleanup unavailable")
@@ -822,6 +825,10 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
     await scheduler.poll_once()
     await _drain(scheduler)
     assert store.list_runs(task.id)[0] == [run]
+    if failure in {"skipped", "invalid"}:
+        assert "Invalid recovery result" in caplog.text
+    elif failure == "timeout":
+        assert "Recovery timed out" in caplog.text
     await scheduler.poll_once()
     await _drain(scheduler)
     if deleted:
@@ -831,6 +838,126 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         assert store.list_runs(task.id)[0][0].status == "failed"
     assert recover.await_count == 2
     fire.assert_not_awaited()
+
+
+async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, monkeypatch):
+    monkeypatch.setattr(store, "_cleanup_batch_size", 1)
+    deleted = [_task(store, f"deleted-{index}") for index in range(2)]
+    for task in deleted:
+        for index in range(2):
+            store.create_run(uuid.uuid4().hex, task.id, "succeeded", index)
+        # Simulate interruption after the deletion marker commits.
+        store.update(task.id, state="deleted")
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    original_list = store.list_expired_starting_runs
+    original_purge = store.purge_deleted_tasks
+    discovery_calls = 0
+    purge_cursors = []
+
+    def discover(*args, **kwargs):
+        nonlocal discovery_calls
+        discovery_calls += 1
+        if discovery_calls == 1:
+            raise RuntimeError("recovery discovery unavailable")
+        return original_list(*args, **kwargs)
+
+    def purge(*, after=None, limit=100):
+        purge_cursors.append(after)
+        if len(purge_cursors) == 2:
+            raise RuntimeError("purge temporarily unavailable")
+        return original_purge(after=after, limit=limit)
+
+    monkeypatch.setattr(store, "list_expired_starting_runs", discover)
+    monkeypatch.setattr(store, "purge_deleted_tasks", purge)
+    fire = AsyncMock()
+    recover = AsyncMock(return_value="failed")
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now, batch_size=1)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert sum(len(store.list_runs(item.id)[0]) for item in deleted) == 3
+        recover.assert_not_awaited()
+        cursor = scheduler._cleanup_cursor
+        assert cursor is not None and cursor[2] is not None
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert scheduler._cleanup_cursor == cursor
+        recover.assert_awaited_once_with(run)
+        for _ in range(10):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            if scheduler._cleanup_cursor is None:
+                break
+        else:
+            pytest.fail("Deleted-task cleanup did not finish")
+        assert purge_cursors[:3] == [None, cursor, cursor]
+        assert all(store.get(item.id) is None for item in deleted)
+        assert store.list_runs(task.id)[0][0].status == "failed"
+        fire.assert_not_awaited()
+    finally:
+        await scheduler.stop()
+
+
+async def test_recovery_timeout_allows_inflight_transition_to_finish(store, monkeypatch, caplog):
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    store.claim_scheduled_run(
+        task,
+        now=int(clock.now()),
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    entered = asyncio.Event()
+    release = threading.Event()
+    committed = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original = store.transition_starting_run
+
+    def delayed_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        result = original(*args, **kwargs)
+        loop.call_soon_threadsafe(committed.set)
+        return result
+
+    monkeypatch.setattr(store, "transition_starting_run", delayed_transition)
+    fire = AsyncMock()
+    recover = AsyncMock(return_value="running")
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        recover,
+        now=clock.now,
+        recovery_seconds=0.1,
+    )
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(entered.wait(), 10)
+        await asyncio.wait_for(_drain(scheduler), 10)
+        assert "Recovery timed out" in caplog.text
+        assert "an in-flight database update may still complete" in caplog.text
+        assert store.list_runs(task.id)[0][0].status == "starting"
+        release.set()
+        await asyncio.wait_for(committed.wait(), 10)
+        assert store.list_runs(task.id)[0][0].status == "running"
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        recover.assert_awaited_once()
+        fire.assert_not_awaited()
+    finally:
+        release.set()
+        await scheduler.stop()
 
 
 def test_d1_dispatch_is_rejected_before_polling(store, monkeypatch) -> None:

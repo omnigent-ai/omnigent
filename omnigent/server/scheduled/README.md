@@ -99,6 +99,9 @@ constructing `PersistentTaskScheduler`:
 | `on_expired(run)` | Inspect an interrupted startup and preserve delivered work or clean up abandoned resources. |
 | `owns_host(workspace_id, host_id)` | Decide whether this replica should start or recover work for the host. The default allows every host. |
 
+`owns_host` is awaited during due-task polling, so it must return promptly and
+respect cancellation.
+
 The executor uses the existing `lease.run`, rather than inserting another run.
 It calls `lease.check()` before external actions and `lease.attach_session(id)`
 after creating the session, so recovery can find it. When startup is safely handed
