@@ -57,6 +57,7 @@ from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
+    ElicitationResult,
     InjectionConsumedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -270,6 +271,15 @@ class ExecutorAdapter(HarnessApp):
         ):
             executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
                 self._stable_elicitation_choice_handler
+            )
+        # PiExecutor parks ``ctx.ui`` dialogs as form elicitations. Decline must
+        # not abort the turn (unlike the binary permission card).
+        if (
+            hasattr(executor, "_form_elicitation_handler")
+            and executor._form_elicitation_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._form_elicitation_handler = (  # type: ignore[attr-defined]
+                self._stable_form_elicitation_handler
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
@@ -924,6 +934,21 @@ class ExecutorAdapter(HarnessApp):
             return None
         answer = (result.content or {}).get("answer")
         return answer if isinstance(answer, str) else None
+
+    async def _stable_form_elicitation_handler(
+        self,
+        elicitation_id: str,
+        params: ElicitationRequestParams,
+    ) -> ElicitationResult:
+        """Forward a form without treating a decline as turn cancellation."""
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error(
+                "form elicitation callback fired with no active turn context; cancelling"
+            )
+            return ElicitationResult(action="cancel")
+
+        return await ctx.elicit(elicitation_id, params)
 
     async def _stable_policy_evaluator(
         self,

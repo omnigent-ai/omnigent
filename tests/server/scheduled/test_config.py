@@ -13,7 +13,7 @@ def test_rejects_invalid_settings(field, value):
         ScheduledTaskSchedulerConfig.model_validate({field: value})
 
 
-@pytest.mark.parametrize("field", ["poll_seconds", "renewal_seconds"])
+@pytest.mark.parametrize("field", ["poll_seconds", "renewal_seconds", "recovery_seconds"])
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_intervals_must_be_finite(field, value):
     with pytest.raises(ValidationError):
@@ -40,6 +40,7 @@ def test_partial_settings_keep_defaults_and_are_immutable():
         "lease_seconds": 120,
         "batch_size": 100,
         "max_startups": 100,
+        "recovery_seconds": 30,
     }
     with pytest.raises(ValidationError, match="frozen"):
         config.lease_seconds = 10

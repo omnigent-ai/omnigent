@@ -24,7 +24,9 @@ and the recording protocol for comparing revisions.
 - `changes`: select a changed Markdown file, then exit diff to edit it.
 - `direct-link`: open a session URL with a selected Markdown file.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
-  Source at that line, rather than the rich editor.
+  Source at that line, rather than the rich editor. Right-clicking or
+  long-pressing the link offers Copy path, which copies its path (absolute
+  when the workspace root is known).
 - `tool-row`: click the path on an agent's Read, Write, or Edit row for a
   Markdown file, including one the agent just created; absolute paths open too.
 - `document-link`: follow a relative file link inside the editor's link popup.
@@ -139,6 +141,10 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/browser_ui/files/test_file_line_navigation.py::test_citation_preserves_offline_markdown_draft_with_diff_preference`
   exercises a citation, offline editing, and the dirty-navigation guard. Its
   health polling uses simulated time; it is not a performance sample.
+- `chat-link` Copy path: the "copying a file link's path" component tests in
+  `web/src/components/blocks/ChatMarkdown.fileLinks.test.tsx` cover openable,
+  missing, and unverified links. Manually long-press a link in the mobile apps
+  and right-click one in the desktop app; neither should open the file.
 - `changes`: manually open Markdown from Changes, exit diff, edit and save,
   then re-enter diff and verify the saved edit. The standard CUJ starts from a
   direct link; it does not establish this entry point's correctness.

@@ -131,6 +131,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  appendReplyQuote,
   restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -1146,6 +1147,7 @@ export function ChatPage() {
       isWorking={isWorking}
       showsWorking={showsWorking}
       runnerOnline={runnerOnline}
+      lastTaskError={failedSessionLastError(activeSession)}
       liveness={liveness}
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
@@ -1290,6 +1292,8 @@ interface MainAgentSurfaceProps {
    * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
+  /** Active session's last task error when it has failed; forwarded to MainTerminalView so the stopped-terminal state shows why. */
+  lastTaskError?: Session["lastTaskError"];
   /** Derived open-session liveness — drives the reconnect hint/banner. */
   liveness: SessionLiveness;
   agentsError: unknown;
@@ -1352,6 +1356,17 @@ interface MainAgentSurfaceProps {
   subAgentLabel: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
+}
+
+/**
+ * The failure cause to surface on a session's terminal/stopped UI, or null.
+ * Only a failed session exposes it, mirroring the chat error pill; a stale
+ * error left on a session that has since recovered stays hidden.
+ */
+export function failedSessionLastError(
+  session: Pick<Session, "status" | "lastTaskError"> | null | undefined,
+): Session["lastTaskError"] | null {
+  return session?.status === "failed" ? (session.lastTaskError ?? null) : null;
 }
 
 /**
@@ -1457,6 +1472,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   isWorking,
   showsWorking,
   runnerOnline,
+  lastTaskError,
   liveness,
   agentsError,
   disabled,
@@ -1717,6 +1733,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
+          lastTaskError={isActive ? lastTaskError : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
           sandboxOffline={isActive && liveness.kind === "host_asleep"}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
@@ -1758,16 +1775,20 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             sandboxLaunching={sandboxLaunching}
             spacerMeasureRef={spacerMeasureRef}
           />
-          {/* Floating reply button — scoped to the conversation container. */}
-          <SelectionPopup
-            containerRef={conversationRef}
-            onReply={(text) => composerRef.current?.appendReplyQuote(text)}
-            onAskInSideChat={
-              supportsSideChat(selectionSessionHarness)
-                ? (text) => composerRef.current?.startSideChat(text)
-                : undefined
-            }
-          />
+          {/* Floating reply button — scoped to the conversation container.
+          Withheld when the composer refuses quotes (read-only grant or a
+          structurally non-interactive session), as SideChatPane does. */}
+          {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
+            <SelectionPopup
+              containerRef={conversationRef}
+              onReply={(text) => composerRef.current?.appendReplyQuote(text)}
+              onAskInSideChat={
+                supportsSideChat(selectionSessionHarness)
+                  ? (text) => composerRef.current?.startSideChat(text)
+                  : undefined
+              }
+            />
+          )}
 
           <Composer
             ref={composerRef}
@@ -2222,6 +2243,19 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
+ * Whether the composer refuses input: a read-only grant or a structurally
+ * non-interactive session. A temporary send block keeps the level-1 fallback
+ * of a still-starting client-only conversation editable.
+ */
+export function isComposerReadOnly(
+  permissionLevel: number | null,
+  readOnlyReason: string | null,
+  sendDisabledReason: string | null,
+): boolean {
+  return readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
+}
+
+/**
  * Pill above the composer tallying running background tasks (a dev server, a
  * background shell, a sub-agent), shown independently of the "Working…" shimmer.
  *
@@ -2379,8 +2413,7 @@ function ComposerImpl(
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
-  const isReadOnly =
-    readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
+  const isReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
   // A pending elicitation addressed to this session parks the turn
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
@@ -3243,7 +3276,7 @@ function ComposerImpl(
       if (target?.parentId === sourceId) {
         store.updateSideChatComposer(target.childId, (current) => ({
           ...current,
-          quotes: [...(current.quotes ?? []), selectedText],
+          ...appendReplyQuote(current, selectedText),
         }));
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);

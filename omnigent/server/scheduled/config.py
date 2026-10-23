@@ -15,6 +15,7 @@ class ScheduledTaskSchedulerConfig(BaseModel):
     lease_seconds: int = Field(default=120, gt=0)
     batch_size: int = Field(default=100, gt=0)
     max_startups: int = Field(default=100, gt=0)
+    recovery_seconds: float = Field(default=30, gt=0)
 
     @model_validator(mode="after")
     def check_renewal_interval(self) -> Self:

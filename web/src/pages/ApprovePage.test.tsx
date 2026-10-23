@@ -87,6 +87,43 @@ describe("ApprovePage states", () => {
     expect(bold.parentElement?.textContent).toBe("Claude wants to call Bash");
   });
 
+  it.each([
+    {
+      button: "Approve & allow directories for this session",
+      verdict: { action: "accept", content: { allow_directories: true } },
+    },
+    { button: "Approve", verdict: { action: "accept" } },
+    { button: "Reject", verdict: { action: "decline" } },
+  ])("offers directory scope while preserving the $button choice", async ({ button, verdict }) => {
+    const directories = ["/worktrees/branch", "/mount/real-branch"];
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: "pending",
+          message: "Claude wants to call **Edit**",
+          policy_name: "claude_native_permission",
+          permission_directories: directories,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ queued: false }));
+    renderPage();
+
+    const control = await screen.findByRole("button", { name: button });
+    for (const directory of directories) {
+      expect(screen.getByText(directory, { selector: "code" })).toBeInTheDocument();
+    }
+    fireEvent.click(control);
+    const posts = vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]![0]).toBe("/v1/sessions/sess_1/elicitations/eli_1/resolve");
+    expect(JSON.parse(posts[0]![1]!.body as string)).toEqual(verdict);
+    expect(
+      await screen.findByText(verdict.action === "accept" ? "Approved" : "Rejected"),
+    ).toBeInTheDocument();
+  });
+
   it("shows the resolved state when the elicitation is no longer pending", async () => {
     // WHY: a `status: "resolved"` payload means the prompt was already
     // resolved/timed-out/cancelled — no buttons, just an informational alert.

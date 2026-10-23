@@ -88,7 +88,6 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
-from omnigent.server.event_loop_watchdog import monitor_event_loop
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
@@ -156,6 +155,7 @@ from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
     from omnigent.entities import Conversation

@@ -576,8 +576,18 @@ def test_workflows_connect_selection_to_jobs():
     peer_check = next(
         step for step in web_steps if step.get("name") == "Validate changed dependency peers"
     )
-    assert "needs.scope.outputs.dependency == 'true'" in peer_check["if"]
+    assert peer_check["if"] == "github.event_name == 'pull_request'"
     assert "check_npm_peers.py --base HEAD^1" in peer_check["run"]
+    peer_setup = next(
+        step
+        for step in web_steps
+        if step.get("name") == "Set up uv for dependency peer validation"
+    )
+    assert peer_setup["if"] == peer_check["if"]
+    # Full CI must retain the consumers checked for dependency-only changes.
+    for name in ("Install other workspace dependencies", "Test and build workspace consumers"):
+        step = next(step for step in web_steps if step.get("name") == name)
+        assert "if" not in step
     e2e_steps = workflows["e2e"]["jobs"]["e2e"]["steps"]
     e2e_run = next(step for step in e2e_steps if step.get("uses") == "./.github/actions/e2e-run")
     action = yaml.safe_load((ROOT / ".github/actions/e2e-run/action.yml").read_text())

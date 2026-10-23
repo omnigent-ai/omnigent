@@ -96,7 +96,7 @@ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
-import { isAbsoluteComposerPath } from "@/lib/composerContext";
+import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -1511,11 +1511,7 @@ function FileViewerBody({
                   aria-label={`Copy file path: ${path}`}
                   className="min-w-0 cursor-pointer truncate rounded text-left font-mono text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   onClick={() => {
-                    const absolutePath = isAbsoluteComposerPath(path)
-                      ? path
-                      : workspaceRoot
-                        ? `${workspaceRoot.replace(/[\\/]+$/, "")}${workspaceRoot.includes("\\") ? "\\" : "/"}${path}`
-                        : null;
+                    const absolutePath = absoluteWorkspacePath(path, workspaceRoot);
                     if (absolutePath === null) {
                       toast.error("Workspace path unavailable");
                       return;

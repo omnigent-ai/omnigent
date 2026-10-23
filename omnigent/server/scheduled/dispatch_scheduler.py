@@ -1,4 +1,4 @@
-"""Poll due tasks and supervise startup leases; callback contracts are in README.md."""
+"""Database polling, startup leases, and recovery; see README.md for callback contracts."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -17,6 +18,7 @@ from omnigent.server.scheduled.schedule import (
     scheduled_trigger_key,
 )
 from omnigent.stores.scheduled_task_store.dispatch import (
+    DeletedTaskCursor,
     DispatchCursor,
     ScheduledTaskDispatchStore,
     TaskCursor,
@@ -30,7 +32,7 @@ class StartupLeaseLost(RuntimeError):
 
 
 class StartupLease:
-    """Serialize database updates for one locally owned startup."""
+    """Serialize heartbeats and executor checkpoints for one locally owned startup."""
 
     def __init__(
         self,
@@ -152,6 +154,7 @@ class StartupLease:
 
 
 ClaimedFire = Callable[[ScheduledTask, StartupLease], Awaitable[None]]
+ReconcileStartup = Callable[[ScheduledTaskRun], Awaitable[Literal["running", "failed"] | None]]
 OwnsHost = Callable[[int, str | None], Awaitable[bool]]
 
 
@@ -160,12 +163,13 @@ async def _owns_every_host(_workspace_id: int, _host_id: str | None) -> bool:
 
 
 class PersistentTaskScheduler:
-    """Poll due tasks and supervise bounded concurrent startups."""
+    """Poll due tasks, supervise bounded concurrent startups, and recover expired leases."""
 
     def __init__(
         self,
         store: ScheduledTaskDispatchStore,
         on_fire: ClaimedFire,
+        on_expired: ReconcileStartup,
         *,
         owns_host: OwnsHost = _owns_every_host,
         now: Callable[[], float] = time.time,
@@ -174,6 +178,7 @@ class PersistentTaskScheduler:
         lease_seconds: int = DEFAULT_SCHEDULER_CONFIG.lease_seconds,
         batch_size: int = DEFAULT_SCHEDULER_CONFIG.batch_size,
         max_startups: int = DEFAULT_SCHEDULER_CONFIG.max_startups,
+        recovery_seconds: float = DEFAULT_SCHEDULER_CONFIG.recovery_seconds,
     ) -> None:
         config = ScheduledTaskSchedulerConfig(
             poll_seconds=poll_seconds,
@@ -181,11 +186,13 @@ class PersistentTaskScheduler:
             lease_seconds=lease_seconds,
             batch_size=batch_size,
             max_startups=max_startups,
+            recovery_seconds=recovery_seconds,
         )
         store.check_dispatch_support()
         store.configure_dispatch(True)
         self._store = store
         self._on_fire = on_fire
+        self._on_expired = on_expired
         self._owns_host = owns_host
         self._now = now
         self._poll_seconds = config.poll_seconds
@@ -193,11 +200,14 @@ class PersistentTaskScheduler:
         self._lease_seconds = config.lease_seconds
         self._batch_size = config.batch_size
         self._max_startups = config.max_startups
+        self._recovery_seconds = config.recovery_seconds
         self._loop: asyncio.Task[None] | None = None
+        self._recovery: asyncio.Task[None] | None = None
         self._startups: dict[tuple[int, str], asyncio.Task[None]] = {}
         self._poll_lock = asyncio.Lock()
         self._stopped = False
         self._initialization_cursor: TaskCursor | None = None
+        self._cleanup_cursor: DeletedTaskCursor | None = None
 
     @property
     def is_started(self) -> bool:
@@ -218,11 +228,14 @@ class PersistentTaskScheduler:
             loop.cancel()
             await asyncio.gather(loop, return_exceptions=True)
         startups = list(self._startups.values())
+        if self._recovery is not None:
+            startups.append(self._recovery)
         for task in startups:
             task.cancel()
         await asyncio.gather(*startups, return_exceptions=True)
         self._startups.clear()
         self._loop = None
+        self._recovery = None
 
     async def _run(self) -> None:
         while True:
@@ -235,10 +248,14 @@ class PersistentTaskScheduler:
             await asyncio.sleep(self._poll_seconds)
 
     async def poll_once(self) -> None:
-        """One non-overlapping poll; useful for deterministic tests and embedders."""
+        """Serialize due-task polling and start recovery in the background if idle."""
         async with self._poll_lock:
             if self._stopped:
                 return
+            if self._recovery is None or self._recovery.done():
+                self._recovery = asyncio.create_task(
+                    self._recover(), name="scheduled-task-recovery"
+                )
             try:
                 await self._initialize()
             except Exception:
@@ -283,6 +300,80 @@ class PersistentTaskScheduler:
                 _logger.warning("Paused task %s with an invalid schedule", task.id, exc_info=True)
             return False
         return True
+
+    async def _recover(self) -> None:
+        try:
+            await self._reconcile()
+        except Exception:
+            _logger.exception(
+                "Could not check runs with expired startup leases; "
+                "recovery will try again on the next poll"
+            )
+        try:
+            self._cleanup_cursor = await asyncio.to_thread(
+                self._store.purge_deleted_tasks, after=self._cleanup_cursor, limit=self._batch_size
+            )
+        except Exception:
+            _logger.exception("Could not finish deleted-task cleanup; retrying next poll")
+
+    async def _reconcile(self) -> None:
+        cutoff = int(self._now())
+        cursor: DispatchCursor | None = None
+        while True:
+            runs = await asyncio.to_thread(
+                self._store.list_expired_starting_runs,
+                cutoff,
+                after=cursor,
+                limit=self._batch_size,
+            )
+            if not runs:
+                return
+            for run in runs:
+                assert run.lease_expires_at is not None
+                cursor = (run.lease_expires_at, run.workspace_id, run.id)
+                try:
+                    async with asyncio.timeout(self._recovery_seconds):
+                        if await self._owns_host(run.workspace_id, run.host_id):
+                            local = self._startups.get((run.workspace_id, run.id))
+                            if local is not None:
+                                local.cancel()
+                                await asyncio.gather(local, return_exceptions=True)
+                            with workspace_scope(run.workspace_id):
+                                status = await self._on_expired(run)
+                                if status is not None:
+                                    if status not in ("running", "failed"):
+                                        raise ValueError(
+                                            f"Invalid recovery result {status!r}. "
+                                            "Expected 'running', 'failed', or None "
+                                            "to check again later."
+                                        )
+                                    await asyncio.to_thread(
+                                        self._store.transition_starting_run,
+                                        run,
+                                        now=self._now,
+                                        status=status,
+                                        expired=True,
+                                        error="Run startup did not complete before its lease "
+                                        "expired; recovery marked the run as failed."
+                                        if status == "failed"
+                                        else None,
+                                        error_code="startup_expired"
+                                        if status == "failed"
+                                        else None,
+                                    )
+                except TimeoutError:
+                    _logger.warning(
+                        "Recovery timed out for run %s; an in-flight database update may "
+                        "still complete. If the run remains starting, a later sweep "
+                        "will check it again",
+                        run.id,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Could not finish recovery for run %s after its startup lease expired; "
+                        "will check the run again on a later poll",
+                        run.id,
+                    )
 
     async def _claim_due(self) -> None:
         cutoff = int(self._now())

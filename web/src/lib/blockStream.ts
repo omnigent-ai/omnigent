@@ -928,6 +928,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         codexCommand: event.codexCommand,
         allowAllEdits: event.allowAllEdits,
         allowAutoMode: event.allowAutoMode,
+        permissionDirectories: event.permissionDirectories,
         rememberScope: event.rememberScope,
         codexPersistModes: event.codexPersistModes,
         agyPermission: event.agyPermission,

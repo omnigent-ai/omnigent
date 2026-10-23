@@ -1803,11 +1803,29 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         )
         token_ttl_s = MANAGED_TOKEN_TTL_S
     elif provider == "openshell":
+        openshell_section = _parse_provider_section(raw, "openshell")
+        if openshell_section is not None:
+            _reject_unknown_keys(
+                openshell_section,
+                {
+                    "image",
+                    "env",
+                    "cluster",
+                    "workspace",
+                    "providers",
+                    "node_selector",
+                    "runtime_class",
+                },
+                "sandbox.openshell",
+            )
         launcher_factory = _openshell_launcher_factory(
             image=_parse_provider_image(raw, "openshell"),
             env=_parse_provider_env(raw, "openshell"),
             cluster=_parse_provider_string(raw, "openshell", "cluster"),
             workspace=_parse_provider_string(raw, "openshell", "workspace"),
+            providers=_parse_provider_string_list(raw, "openshell", "providers"),
+            node_selector=_parse_provider_str_mapping(raw, "openshell", "node_selector"),
+            runtime_class=_parse_provider_string(raw, "openshell", "runtime_class"),
         )
         token_ttl_s = OPENSHELL_MANAGED_TOKEN_TTL_S
     elif provider in ("kubernetes", "agent_sandbox"):
@@ -2645,6 +2663,9 @@ def _openshell_launcher_factory(
     env: list[str] | None,
     cluster: str | None,
     workspace: str | None,
+    providers: list[str] | None,
+    node_selector: dict[str, str] | None,
+    runtime_class: str | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: openshell`` path.
@@ -2661,6 +2682,8 @@ def _openshell_launcher_factory(
     :param workspace: OpenShell workspace for sandbox lifecycle, or
         ``None`` to resolve from ``$OMNIGENT_OPENSHELL_WORKSPACE``
         then ``"default"``.
+    :param providers: OpenShell credential provider names attached to
+        every created sandbox.
     :returns: A factory producing parameterized OpenShell launchers.
     """
 
@@ -2668,7 +2691,15 @@ def _openshell_launcher_factory(
         """Construct the OpenShell launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.openshell import OpenShellSandboxLauncher
 
-        return OpenShellSandboxLauncher(image=image, env=env, cluster=cluster, workspace=workspace)
+        return OpenShellSandboxLauncher(
+            image=image,
+            env=env,
+            cluster=cluster,
+            workspace=workspace,
+            providers=providers,
+            node_selector=node_selector,
+            runtime_class=runtime_class,
+        )
 
     return _build
 
@@ -2886,6 +2917,25 @@ def _parse_provider_env(raw: dict[str, object], provider: str) -> list[str] | No
             "'GIT_TOKEN']"
         )
     return [name.strip() for name in env]
+
+
+def _parse_provider_string_list(
+    raw: dict[str, object], provider: str, key: str
+) -> list[str] | None:
+    """Extract and validate an optional provider-name list."""
+    section = _parse_provider_section(raw, provider)
+    if section is None:
+        return None
+    value = section.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(
+        isinstance(name, str) and name.strip() for name in value
+    ):
+        raise ValueError(
+            f"server config 'sandbox.{provider}.{key}' must be a list of non-empty strings"
+        )
+    return [name.strip() for name in value]
 
 
 def _parse_provider_string(raw: dict[str, object], provider: str, key: str) -> str | None:

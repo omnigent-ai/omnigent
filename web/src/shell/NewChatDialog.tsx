@@ -10,7 +10,7 @@ import {
   HarnessPickerSubContent,
 } from "@/components/composer/HarnessPicker";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "@/lib/routing";
+import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import {
@@ -948,12 +948,17 @@ export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
  * server is the authority — this only gates the submit button so an
  * obviously unusable value gets inline feedback instead of a 422.
  *
+ * The host may not carry an ``@``: that is embedded ``user:token@host``
+ * userinfo, which the server refuses so a token never reaches a session
+ * label or a sandbox Pod spec. Refusing it here keeps it out of the
+ * request as well.
+ *
  * @param url Value the user typed in the repository input.
  * @returns true when ``url.trim()`` matches one of the two forms.
  */
 export function isValidSandboxRepoUrl(url: string): boolean {
   const t = url.trim();
-  return /^https:\/\/[^\s#/]+\/[^\s#]+$/.test(t) || /^git@[^\s#:]+:[^\s#]+$/.test(t);
+  return /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
 }
 
 /**
@@ -2155,7 +2160,9 @@ export function resetLandingDraft(): void {
 
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
+  const linkedPrompt = searchParams.get("prompt");
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
@@ -2328,7 +2335,20 @@ export function NewChatLandingScreen() {
           autoSeededBranch: "",
         };
 
-  const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [message, setMessage] = useState<string>(() =>
+    linkedPrompt?.trim() ? linkedPrompt : (restoredDraft?.message ?? ""),
+  );
+  useEffect(() => {
+    if (!searchParams.has("prompt")) return;
+    if (linkedPrompt?.trim()) setMessage(linkedPrompt);
+    // Consume the link once so returning to the composer preserves edits.
+    const remaining = new URLSearchParams(searchParams);
+    remaining.delete("prompt");
+    navigate(
+      { search: remaining.toString(), hash: location.hash },
+      { replace: true, state: location.state },
+    );
+  }, [linkedPrompt, searchParams, location.hash, location.state, navigate]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.

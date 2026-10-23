@@ -38,6 +38,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.util.event_loop_watchdog import monitor_event_loop
 from omnigent.util.keep_awake import keep_awake_enabled, run_keep_awake_monitor
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
@@ -1718,7 +1719,8 @@ def create_app(
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await _start_pm()
         try:
-            yield
+            with monitor_event_loop(process_role="runner"):
+                yield
         finally:
             await _stop_pm()
 
