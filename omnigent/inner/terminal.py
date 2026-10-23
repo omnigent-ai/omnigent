@@ -2394,9 +2394,12 @@ class TerminalInstance:
                 time.monotonic() - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
-            self._screen_watched_at = time.monotonic()
+            # The change stamp lands first, so a reader never pairs a fresh capture
+            # with the previous change time.
+            watched_at = time.monotonic()
             if detector.changed_this_tick:
-                self._screen_changed_at = self._screen_watched_at
+                self._screen_changed_at = watched_at
+            self._screen_watched_at = watched_at
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.

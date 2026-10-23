@@ -7779,7 +7779,8 @@ def create_runner_app(
                 if is_native_harness(
                     resource_registry.terminal_resource_role(conv_id, terminal_id)
                 ):
-                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+                    instance = _pane_reaper_registry.get(conv_id, name, "main")
+                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
             return panes
 
         async def _server_confirms_turn_in_flight(conv_id: str) -> bool:
@@ -7798,9 +7799,10 @@ def create_runner_app(
                 resp = await server_client.get(
                     f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
                 )
-            except httpx.HTTPError:
+                body = resp.json() if resp.status_code == 200 else None
+            except (httpx.HTTPError, ValueError):
                 return True
-            status = resp.json().get("status") if resp.status_code == 200 else None
+            status = body.get("status") if isinstance(body, dict) else None
             if not isinstance(status, str) or status in _IN_FLIGHT_SESSION_STATUSES:
                 return True
             _logger.info(
@@ -7863,7 +7865,9 @@ def create_runner_app(
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             conv_id = pane.conversation_id
-            reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+            reaped = pane.instance
+            if reaped is None:
+                reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
             # Launch and ensure paths hold this lock, so a message that re-creates
             # the session waits for the reap, then starts its own pane, forwarder,
             # helper server and relay instead of having them torn down here.
@@ -7873,6 +7877,12 @@ def create_runner_app(
             async with lock:
                 current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
                 if current is not None and current is not reaped:
+                    _logger.info(
+                        "native pane reaper: pane for conversation %s was replaced after "
+                        "it was judged idle; leaving the new one",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
                     return
                 try:
                     await resource_registry.close_terminal(conv_id, pane.terminal_id)

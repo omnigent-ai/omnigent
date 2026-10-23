@@ -337,17 +337,27 @@ async def test_runner_busy_check_reads_output_from_the_screen_not_tmux_activity(
 
 
 class _SessionStatusServerClient(NullServerClient):
-    """Answers the runner's session GET with ``status``, or fails it when ``None``."""
+    """Answers the runner's session GET with ``reply``, or fails it when ``None``.
+
+    ``reply`` is ``(HTTP status, JSON body)``; an exception body stands for one
+    that does not parse.
+    """
 
     def __init__(self) -> None:
-        self.status: str | None = None
+        self.reply: tuple[int, object] | None = None
 
     async def get(self, url: str, **kwargs: object) -> object:  # type: ignore[override]
         del url, kwargs
-        if self.status is None:
+        if self.reply is None:
             raise httpx.ConnectError("server unreachable")
-        body = {"status": self.status}
-        return SimpleNamespace(status_code=200, json=lambda: body)
+        status_code, body = self.reply
+
+        def parse() -> object:
+            if isinstance(body, Exception):
+                raise body
+            return body
+
+        return SimpleNamespace(status_code=status_code, json=parse)
 
 
 async def test_runner_busy_check_settles_a_running_record_the_server_has_settled(
@@ -376,9 +386,15 @@ async def test_runner_busy_check_settles_a_running_record_the_server_has_settled
     app.state.native_pane_status["conv_lost_idle"] = "running"
 
     assert await reaper._is_busy(pane), "an unreachable server must not settle the record"
-    server.status = "running"
-    assert await reaper._is_busy(pane)
-    server.status = "idle"
+    for reply in (
+        (503, {"status": "idle"}),
+        (200, ValueError("not JSON")),
+        (200, ["idle"]),
+        (200, {"status": "running"}),
+    ):
+        server.reply = reply
+        assert await reaper._is_busy(pane), f"reply {reply!r} must keep the pane"
+    server.reply = (200, {"status": "idle"})
     assert not await reaper._is_busy(pane)
     assert app.state.native_pane_status["conv_lost_idle"] == "idle"
 
@@ -480,3 +496,42 @@ async def test_runner_reap_releases_sidecars_before_a_recreate_takes_over(
         native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
         for servers in _HELPER_SERVERS.values():
             servers.pop(conv, None)
+
+
+async def test_runner_reap_leaves_a_pane_replaced_after_the_scan_listed_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relaunch that replaces the pane while the scan's last busy check is still
+    awaiting is not reaped: the reap closes only the terminal the scan listed.
+    """
+    conv = "conv_reap_replaced"
+    registry = TerminalRegistry()
+    listed = make_test_terminal_instance("codex", "main", tmp_path)
+    registry._by_conversation[conv] = {("codex", "main"): listed}
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    monkeypatch.setattr(resource_registry, "terminal_resource_role", lambda *_args: "codex-native")
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    [pane] = reaper._list_native_panes()
+    assert pane.instance is listed
+    replacement = make_test_terminal_instance("codex", "main", tmp_path / "replacement")
+    registry._by_conversation[conv] = {("codex", "main"): replacement}
+    forwarder, server = _start_sidecars(conv, "codex")
+    try:
+        await reaper._reap(pane)
+
+        assert registry.get(conv, "codex", "main") is replacement
+        assert not forwarder.done(), "the replacement's forwarder was cancelled"
+        assert server is not None and not server.closed
+    finally:
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        native_runtime._AUTO_CODEX_APP_SERVERS.pop(conv, None)
