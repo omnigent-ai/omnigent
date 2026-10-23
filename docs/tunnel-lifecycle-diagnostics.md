@@ -89,6 +89,36 @@ session impact or changes KPI eligibility.
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
   `history_len`, `last_item_type`, and the resulting `status`.
 
+### Stack capture during runner event-loop stalls
+
+The runner starts the same dedicated-thread watchdog used by the server while
+its app lifespan is serving. It emits `runner_event_loop_stalled` after five
+seconds without event-loop progress, at most once per minute across all stalls
+and tunnel reconnects. Startup and shutdown are outside the monitored interval.
+Thread startup failure emits `runner_event_loop_watchdog_failed`; serving
+continues without stack capture.
+
+The warning carries `pid`, `stalled_s`, `threshold_s`, `loop_thread_id`, and
+`report_interval_s`. The existing debug sink adds `runner_id`, the primary
+session ID when present, `hostname`, and the client version. Join by runner ID,
+PID, and time with `runner_connected` and `runner_tunnel_health`; the watchdog
+belongs to the process, so it has no connection ID. Its `stack_trace` column
+contains the sampled blocking Python frame locations, bounded to 64 frames and
+8,192 UTF-8 bytes, with no source lines, arguments, or locals. It can capture a
+synchronous credential, filesystem, or subprocess wait before that call returns,
+independently of the event loop and its default executor.
+
+A native extension holding the GIL or a whole-process/VM pause can also prevent
+the watchdog thread from running. A sample collected just after such a pause
+may show resuming execution; it does not establish what caused the pause. An
+absent sample does not prove a healthy runner, particularly when client telemetry
+is disabled or unavailable. Correlate simultaneous process stalls with separate
+host resource and lifecycle evidence. The watchdog never closes a tunnel or
+restarts work.
+
+Use `process_role="runner"` in the isolated example below to verify the runner
+event name and captured stack without interrupting a running session.
+
 ## Server events (`source = 'server'`)
 
 ### Stack capture during event-loop stalls
@@ -104,7 +134,7 @@ sample a blocking call before the loop recovers. Startup and shutdown are not
 monitored. If the watchdog thread cannot start, the server continues serving
 and emits `server_event_loop_watchdog_failed` at ERROR.
 
-The warning includes `stalled_s`, `threshold_s`, `loop_thread_id`, and
+The warning includes `pid`, `stalled_s`, `threshold_s`, `loop_thread_id`, and
 `report_interval_s` attributes. The message stays on one line; the sampled stack
 is stored once in the debug-log table's `stack_trace` column, carried by the log
 record's `captured_stack_trace` field. It contains at most 64 frames and 8,192
@@ -143,7 +173,7 @@ uv run --no-sync python - <<'PY'
 import asyncio
 import logging
 import time
-from omnigent.server.event_loop_watchdog import monitor_event_loop
+from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 handler = logging.StreamHandler()
 handler.setFormatter(logging.Formatter(

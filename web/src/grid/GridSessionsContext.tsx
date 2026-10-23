@@ -40,7 +40,7 @@ interface GridSessionsContextValue {
   closePane: (sessionId: string) => void;
   deleteGrid: (id: string) => void;
   renameGrid: (id: string, name: string) => void;
-  swapPanes: (firstId: string, secondId: string) => void;
+  swapPanes: (firstId: string, secondId: string, edge?: SplitEdge) => void;
 }
 
 const GridSessionsContext = createContext<GridSessionsContextValue | null>(null);
@@ -137,9 +137,9 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         }
       },
       deleteGrid,
-      swapPanes: (firstId, secondId) => {
+      swapPanes: (firstId, secondId, edge) => {
         if (!activeGrid) return;
-        const layout = swapGridSessions(activeGrid.layout, firstId, secondId);
+        const layout = swapGridSessions(activeGrid.layout, firstId, secondId, edge);
         if (layout !== activeGrid.layout)
           save(grids.map((grid) => (grid.id === activeGrid.id ? { ...grid, layout } : grid)));
       },
@@ -154,5 +154,5 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
 }
 
 export function gridTitle(grid: SessionGrid): string {
-  return grid.name || `Grid · ${gridSessionIds(grid.layout).length} sessions`;
+  return `${grid.name || "Grid"} · ${gridSessionIds(grid.layout).length} sessions`;
 }

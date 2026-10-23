@@ -768,6 +768,29 @@ def _parse_approval_input(text: str) -> _ApprovalVerdict:
     return _ApprovalVerdict.REFUSE
 
 
+# How another client's verdict settles the ASK this REPL is prompting for,
+# paired with the transcript line that reports it.
+_RESOLVED_ELSEWHERE: dict[str, tuple[_ApprovalVerdict, str]] = {
+    "accept": (_ApprovalVerdict.APPROVE_ONCE, "approved elsewhere"),
+    "decline": (_ApprovalVerdict.REFUSE, "declined elsewhere"),
+    "cancel": (_ApprovalVerdict.REFUSE, "cancelled elsewhere"),
+}
+
+
+def _resolved_elsewhere_verdict(action: str | None) -> _ApprovalVerdict:
+    """Verdict for an external resolution; anything but ``accept`` refuses."""
+    return _RESOLVED_ELSEWHERE.get(action or "", (_ApprovalVerdict.REFUSE, ""))[0]
+
+
+def _resolved_elsewhere_label(action: str | None, reason: str | None) -> str:
+    """Transcript line for an ASK another client settled, e.g. ``"declined elsewhere"``."""
+    if action in _RESOLVED_ELSEWHERE:
+        return _RESOLVED_ELSEWHERE[action][1]
+    if reason == "unanswered":
+        return "expired unanswered · refused"
+    return "resolved elsewhere · no verdict recorded · refused"
+
+
 class _ApprovalState:
     """
     Per-REPL holder for pending approvals and the session
@@ -802,6 +825,9 @@ class _ApprovalState:
         # ctx fields.
         self._current_policy: str | None = None
         self._current_phase: str | None = None
+        # Server id of the current ASK, so a resolved event from another
+        # client only settles the prompt when it is for this elicitation.
+        self._current_elicitation_id: str | None = None
         # When True, the current approval is URL-mode-only and
         # keyboard input (y/a/n) should be rejected.
         self._url_mode: bool = False
@@ -852,7 +878,12 @@ class _ApprovalState:
         self._always.add((policy_name, phase))
 
     def begin(
-        self, policy_name: str, phase: str, *, url_mode: bool = False
+        self,
+        policy_name: str,
+        phase: str,
+        *,
+        elicitation_id: str | None = None,
+        url_mode: bool = False,
     ) -> asyncio.Future[bool]:
         """
         Start a new approval — create the future the hook awaits.
@@ -860,7 +891,9 @@ class _ApprovalState:
         Records the identity of the ASK so
         :meth:`resolve_verdict` can cache an "always" decision
         against the right ``(policy_name, phase)`` pair
-        without the caller having to re-pass them.
+        without the caller having to re-pass them, and so
+        :meth:`resolve_elsewhere` can tell this elicitation's
+        resolved event apart from any other's.
 
         If a previous approval's future is still open (the user
         never answered before a new ASK arrived), refuse the
@@ -871,6 +904,9 @@ class _ApprovalState:
         :param policy_name: Deciding policy's name from the
             :class:`ElicitationRequestCtx`.
         :param phase: Phase string from the ctx.
+        :param elicitation_id: Server-assigned id of this ASK,
+            e.g. ``"elicit_abc123"``. ``None`` when unknown; the
+            prompt then only settles through keyboard input.
         :returns: The future to await. Resolves to ``True`` on
             approve (one or always) and ``False`` on refuse.
         """
@@ -878,6 +914,7 @@ class _ApprovalState:
             self._future.set_result(False)
         self._current_policy = policy_name
         self._current_phase = phase
+        self._current_elicitation_id = elicitation_id or None
         self._url_mode = url_mode
         self._future = asyncio.get_running_loop().create_future()
         return self._future
@@ -909,7 +946,29 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
         return True
+
+    def resolve_elsewhere(self, elicitation_id: str, action: str | None) -> bool:
+        """
+        Settle the pending approval from another client's resolution of
+        the same elicitation.
+
+        The server publishes ``elicitation_resolved`` for every elicitation
+        in the session, so only an event carrying this ASK's id may release
+        the gate. ``accept`` approves once; a decline, cancel, or
+        verdict-less clear refuses fail-closed.
+
+        :param elicitation_id: Id carried by the resolved event.
+        :param action: MCP verdict carried by the event, or ``None``.
+        :returns: ``True`` iff the pending approval was for this
+            elicitation and has now been resolved.
+        """
+        if not self.pending or not elicitation_id:
+            return False
+        if elicitation_id != self._current_elicitation_id:
+            return False
+        return self.resolve_verdict(_resolved_elsewhere_verdict(action))
 
     def cancel(self) -> None:
         """
@@ -925,6 +984,7 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
 
 
 class _FieldInputState:
@@ -1126,7 +1186,12 @@ def _make_elicitation_prompt(
                     f"n = refuse[/{fmt.accent}]",
                 ),
             )
-        future = state.begin(ctx.policy_name, ctx.phase, url_mode=bool(_is_external_url))
+        future = state.begin(
+            ctx.policy_name,
+            ctx.phase,
+            elicitation_id=ctx.elicitation_id,
+            url_mode=bool(_is_external_url),
+        )
         return await future
 
     return _on_elicitation_request
@@ -3663,22 +3728,17 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-        # When an elicitation is resolved externally (via the standalone
-        # approval page), the server publishes ``elicitation_resolved``.
-        # Wake the parked ``_ApprovalState`` future so the REPL unblocks.
-        # The ``elicitation_resolved`` event doesn't carry the verdict
-        # (accept/decline), but ``_handle_elicitation`` will POST a
-        # redundant resolve that the server silently ignores (already
-        # resolved). We approve here so the REPL unblocks; the actual
-        # outcome is whatever the user chose on the page.
+        # ``elicitation_resolved`` fans out for every elicitation in the
+        # session, from any client; release the parked approval only for the
+        # ASK this REPL is prompting for, with the verdict the event carries.
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            if approval_state.pending:
-                approval_state.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
+            if approval_state.resolve_elsewhere(event.elicitation_id, event.action):
+                label = _resolved_elsewhere_label(event.action, event.reason)
                 host.output(
                     Text.from_markup(
-                        f"   [{fmt.muted}]› resolved via approval page[/{fmt.muted}]",
+                        f"   [{fmt.muted}]› {label}[/{fmt.muted}]",
                     ),
                 )
             if tape_entry is not None:

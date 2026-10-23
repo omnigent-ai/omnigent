@@ -15,9 +15,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.harnesses.codex_native import app_server as codex_app_server
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+from omnigent.harnesses.codex_native.bridge import (
+    CodexNativeBridgeState,
+    codex_home_for_bridge_dir,
+    write_bridge_state,
+    write_unmirrored_codex_settings,
+)
 
 _JsonObject = dict[str, Any]
 
@@ -32,6 +39,34 @@ class _FakeCodexClient:
     async def request(self, method: str, params: _JsonObject) -> _JsonObject:
         self.calls.append((method, params))
         return self.responses.get(method, {"result": {}})
+
+
+_CATALOG: _JsonObject = {
+    "result": {
+        "data": [
+            {
+                "id": model,
+                "supportedReasoningEfforts": [{"reasoningEffort": effort} for effort in efforts],
+            }
+            for model, efforts in (
+                ("gpt-5.5", ["low", "medium", "high", "xhigh"]),
+                ("gpt-6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+            )
+        ],
+        "nextCursor": None,
+    }
+}
+
+
+def _write_parent_settings(bridge_dir: Path, model: str | None, effort: str | None) -> None:
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f'{key} = "{value}"\n'
+        for key, value in (("model", model), ("model_reasoning_effort", effort))
+        if value
+    ]
+    (codex_home / "config.toml").write_text("".join(lines), encoding="utf-8")
 
 
 def _text_items(text: str) -> list[_JsonObject]:
@@ -87,6 +122,82 @@ async def test_fork_sends_ephemeral_fork_rpc_and_returns_child_id() -> None:
     # Required by codex >= 0.154.0 for an ephemeral fork.
     assert params["excludeTurns"] is True
     assert "side conversation" in params["developerInstructions"]
+    assert "model" not in params
+    assert "config" not in params
+
+
+@pytest.mark.parametrize(
+    ("config", "unmirrored", "expected"),
+    [
+        # A web switch mirrored into config.toml.
+        (("gpt-6-sol", "max"), {}, {"model": "gpt-6-sol", "effort": "max"}),
+        # A switch whose config.toml mirror failed.
+        (
+            ("gpt-5.5", "high"),
+            {"model": "gpt-6-sol", "effort": "max"},
+            {"model": "gpt-6-sol", "effort": "max"},
+        ),
+        # An effort the model does not advertise is clamped.
+        (("gpt-5.5", "max"), {}, {"model": "gpt-5.5", "effort": "xhigh"}),
+        (("gpt-6-sol", None), {}, {"model": "gpt-6-sol"}),
+        ((None, "high"), {}, {"effort": "high"}),
+        (None, {}, {}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_parent_side_chat_settings_follow_the_parent_thread(
+    tmp_path: Path,
+    config: tuple[str | None, str | None] | None,
+    unmirrored: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    if config is not None:
+        _write_parent_settings(tmp_path, *config)
+    write_unmirrored_codex_settings(tmp_path, unmirrored)
+    client = _FakeCodexClient({"model/list": _CATALOG})
+
+    assert await side_chat.parent_side_chat_settings(client, tmp_path) == expected
+
+
+@pytest.mark.asyncio
+async def test_parent_side_chat_settings_keep_the_effort_when_the_catalog_fails(
+    tmp_path: Path,
+) -> None:
+    _write_parent_settings(tmp_path, "gpt-6-sol", "max")
+    client = SimpleNamespace(request=AsyncMock(side_effect=RuntimeError("app-server unavailable")))
+
+    settings = await side_chat.parent_side_chat_settings(client, tmp_path)
+
+    assert settings == {"model": "gpt-6-sol", "effort": "max"}
+    client.request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_parent_side_chat_settings_reuse_the_parent_turns_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_app_server, "_effort_catalog_misses", {})
+    socket_path = str(tmp_path / "app-server.sock")
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path=socket_path,
+            thread_id="thread_parent",
+            codex_home=str(codex_home_for_bridge_dir(tmp_path)),
+        ),
+    )
+    _write_parent_settings(tmp_path, "gpt-6-sol", "max")
+    await codex_app_server.resolve_codex_effort_for_model(
+        _FakeCodexClient({"model/list": _CATALOG}), "max", "gpt-6-sol", transport=socket_path
+    )
+    side_client = _FakeCodexClient({})
+
+    settings = await side_chat.parent_side_chat_settings(side_client, tmp_path)
+
+    assert settings == {"model": "gpt-6-sol", "effort": "max"}
+    assert side_client.calls == []
 
 
 @pytest.mark.asyncio
@@ -422,6 +533,41 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     assert client.calls[0][1]["ephemeral"] is True
     assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
+
+
+@pytest.mark.asyncio
+async def test_drive_side_chat_requests_forks_with_the_parents_switched_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The app-server's launch -c model would otherwise pair the old model with the new effort.
+    _write_parent_settings(tmp_path, "gpt-6-sol", "max")
+    client = _FakeCodexClient(
+        {
+            "model/list": _CATALOG,
+            "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
+            "turn/start": {"result": {"turn": {"id": "turn_1"}}},
+        }
+    )
+    side_chat.request_side_chat(tmp_path, "q")
+
+    async def _stop(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(fwd, "_sleep", _stop)
+    with pytest.raises(asyncio.CancelledError):
+        await fwd._drive_side_chat_requests(
+            client,
+            ap_client=AsyncMock(),
+            bridge_dir=tmp_path,
+            target=SimpleNamespace(thread_id="thread_parent", session_id="conv_parent"),
+        )
+
+    forks = [params for method, params in client.calls if method == "thread/fork"]
+    assert len(forks) == 1
+    assert forks[0]["model"] == "gpt-6-sol"
+    assert forks[0]["config"] == {"model_reasoning_effort": "max"}
+    assert "side conversation" in forks[0]["developerInstructions"]
+    assert [method for method, _ in client.calls][-1] == "turn/start"
 
 
 @pytest.mark.asyncio

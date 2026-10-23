@@ -113,6 +113,11 @@ before entering the harness menu. Then start a new CLI or web session.
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
 
+**Approval links:** open a pending permission's standalone approval link.
+Claude directory requests show the exact directories in Chat, Inbox, and the
+standalone page. Approve once, reject, or allow those directories for the
+session; the directory choice preserves the current permission mode.
+
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin.
@@ -437,6 +442,16 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`approvals`, Claude directory access:**
+  `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
+  checks Chat (including reload), Inbox, and standalone approval links against
+  a real server and browser. It supplies a synthetic native permission hook,
+  verifies both directory spellings are visible, and checks the returned
+  session grant preserves the offered scope without changing Auto mode.
+  To verify Claude itself, start it in a disposable home directory with a
+  worktree symlink pointing outside that home, request two edits in that
+  worktree, and approve directory access on the first prompt. The second edit
+  in the granted directory should proceed with Auto still enabled.
 - **`approvals`, Kiro delivery and manual retry:**
   `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_manual_retry`
   (own environment, real browser/server/runner/tmux, fake Kiro) drops the first
@@ -495,6 +510,27 @@ Cross-harness journeys:
   billing or recovery after the runner deletes the bridge directory.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
+- **`approvals`, Pi extension dialogs:**
+  `tests/e2e/test_pi_extension_ui_round_trip.py::test_real_pi_dialog_answers_and_continues`
+  runs real SDK and native Pi through an isolated server/runner with a scripted
+  provider, sandbox disabled: four dialog answers, decline, later-turn history
+  and native cancellation/card cleanup after the reconnect grace period.
+  `tests/e2e_ui/approvals/test_pi_extension_ui.py` checks confirmation layout
+  and multiline editor submission through Chat using injected hooks; select
+  and input matrices stay in component tests. Older servers use native TUI
+  dialogs on 404/405; supported servers deliver dialogs through the web only.
+  Read-only callers cannot publish cards. Native timeouts are capped at the
+  server limit, and cancelled waits stop re-parking (server/JS regressions).
+  Known gaps: stale sidebar “Needs response” after native cancellation,
+  Inbox/mobile, active SDK interruption, sandbox and Managed acceptance.
+  These scenarios own their isolated environments:
+
+  ```sh
+  uv run --no-sync pytest tests/e2e/test_pi_extension_ui_round_trip.py --reruns 0 -q
+  uv run --no-sync pytest tests/e2e_ui/approvals/test_pi_extension_ui.py --ui-skip-build --video=on --screenshot=on --reruns 0 -q
+  pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
+  ```
+
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
   (own environment, real server, runner, native CLI and tmux with local model
@@ -721,6 +757,9 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
   twelve rows above.
 - Approval and permission callbacks come from several harnesses, not only
   Claude. Restricting a gate to one harness breaks the others' approvals.
+- Claude directory grants cover only the displayed directories for the session.
+  A symlink may require both its visible and resolved paths. A mode switch alone
+  does not grant directory access, and read-only rules are separate grants.
 - Needing sign-in and not being installed are different states with different
   prompts. Reproduce on a host with the same credential situation as the reporter.
 - Some harnesses have a sign-in flow of their own when launched outside

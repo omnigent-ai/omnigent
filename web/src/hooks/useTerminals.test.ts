@@ -431,6 +431,33 @@ describe("terminalsReconcileInterval", () => {
   });
 });
 
+describe("useTerminals listCompleteAt", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ["a soft runner status", () => mockResponse(null, { ok: false, status: 502 }), 0],
+    ["a hard failure", () => mockResponse(null, { ok: false, status: 500 }), 0],
+    ["a real answer", () => mockResponse({ object: "list", data: [] }), 1],
+  ])("is stamped only for a complete runner answer (%s)", async (label, response, stamped) => {
+    fetchMock.mockImplementation(async () => response());
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useTerminals(`conv_complete_${label}`), {
+      wrapper: ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children),
+    });
+
+    // A hard failure goes through the hook's one retry (about 1s of backoff).
+    await vi.waitFor(() => expect(result.current.isFetching).toBe(false), { timeout: 5000 });
+    expect(Math.sign(result.current.listCompleteAt ?? 0)).toBe(stamped);
+  });
+});
+
 describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
   beforeEach(() => {
     fetchMock.mockReset();

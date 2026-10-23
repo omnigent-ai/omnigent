@@ -34,7 +34,7 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
@@ -702,6 +702,14 @@ describe("sandbox repository helpers", () => {
     // Embedded fragment/whitespace belongs in the branch input, not here.
     ["https://github.com/org/repo#main", false],
     ["https://github.com/org/a repo", false],
+    // Embedded credentials: the server refuses these so a token never lands
+    // in a session label or Pod spec, and refusing here keeps it out of the
+    // create request too.
+    ["https://user:token@github.com/org/repo", false],
+    ["https://token@github.com/org/repo", false],
+    ["git@user:token@github.com:org/repo", false],
+    // A host with only slashes for a path is what the server calls unusable.
+    ["https://github.com//", false],
   ])("isValidSandboxRepoUrl(%j) === %j", (url, expected) => {
     expect(isValidSandboxRepoUrl(url)).toBe(expected);
   });
@@ -1297,6 +1305,24 @@ function mockClaudeModels(
   );
 }
 
+function LandingNavigationProbe() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="landing-location">
+        {location.pathname + location.search + location.hash}
+      </output>
+      <button type="button" onClick={() => navigate("?debug=1")}>
+        Change unrelated query
+      </button>
+      <button type="button" onClick={() => navigate("?prompt=Another+request")}>
+        Open another prompt link
+      </button>
+    </>
+  );
+}
+
 function renderLanding(
   infoOverrides: Partial<ServerInfo> = {},
   route = "/",
@@ -1335,6 +1361,7 @@ function renderLanding(
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
+            <LandingNavigationProbe />
             {onRender ? (
               <Profiler id="landing" onRender={onRender}>
                 <NewChatLandingScreen />
@@ -1355,6 +1382,75 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
     (key) => key.textContent ?? "",
   );
 }
+
+describe("prompt URL handoff", () => {
+  beforeEach(setupLandingMocks);
+
+  it("prefills prompt without starting a session", () => {
+    const prompt = 'src/example.ts\nExplain a + b & fix "λ" <script> as plain text';
+    renderLanding({}, `/?${new URLSearchParams({ prompt, o: "123" })}#composer`);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(prompt);
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?o=123#composer");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves unrelated query parameters while consuming prompt", () => {
+    renderLanding({}, "/?prompt=Linked&task=Unrelated");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("does not treat task as a prompt parameter", () => {
+    renderLanding({}, "/?task=Unrelated");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("keeps edits when unrelated query parameters change", () => {
+    renderLanding({}, "/?prompt=Initial");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Edited by the user" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Change unrelated query" }));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Edited by the user");
+    fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Another request");
+  });
+
+  it("overrides an old draft with a new link, then restores subsequent edits", () => {
+    const first = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Old draft" },
+    });
+    first.unmount();
+    const linked = renderLanding({}, "/?prompt=Linked+request", undefined, true);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked request");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Revised link" },
+    });
+    linked.unmount();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Revised link");
+  });
+
+  it.each(["", "   ", "\n\t"])("ignores an empty prompt (%j) without erasing a draft", (prompt) => {
+    const first = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep my draft" },
+    });
+    first.unmount();
+    renderLanding({}, `/?${new URLSearchParams({ prompt })}`);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep my draft");
+  });
+
+  it("preserves a deployment prefix and project context", () => {
+    renderLanding({}, "/omnigent/?project=docs&prompt=Review+this&o=123#composer");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Review this");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent(
+      "/omnigent/?project=docs&o=123#composer",
+    );
+  });
+});
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
 /** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */

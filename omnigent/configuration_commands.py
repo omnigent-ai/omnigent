@@ -17,6 +17,7 @@ import yaml
 from filelock import FileLock, Timeout
 
 from omnigent.cli_auth import open_server_client
+from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 from omnigent.config import global_config_path, load_global_config
 from omnigent.configuration_profile import (
     ConfigurationSave,
@@ -62,12 +63,12 @@ def _local(plugin_path: Path | None) -> PortableConfiguration:
 async def _request(
     server: str, operation: ConfigurationSave | None = None
 ) -> ConfigurationSnapshot:
-    from omnigent.cli_auth import store_databricks_org_id
+    from omnigent.cli_auth import pin_databricks_org_id
     from omnigent.runner._entry import _make_auth_token_factory
 
     resolved = ServerUrl.from_api_base(server)
     if resolved.is_workspace_hosted and resolved.org_id is not None:
-        store_databricks_org_id(resolved.api_base, resolved.org_id)
+        pin_databricks_org_id(resolved.api_base, resolved.org_id)
     server = resolved.api_base
 
     factory = _make_auth_token_factory(
@@ -91,7 +92,9 @@ class _CloudGroup(click.Group):
         try:
             return super().invoke(ctx)
         except (ValueError, OSError, Timeout, httpx.HTTPError, yaml.YAMLError) as exc:
-            raise click.ClickException(str(exc)) from exc
+            error = click.ClickException(str(exc))
+            setattr(error, SUPPRESS_RECOVERY_HINT_ATTR, True)
+            raise error from exc
 
 
 @click.group("cloud", cls=_CloudGroup)

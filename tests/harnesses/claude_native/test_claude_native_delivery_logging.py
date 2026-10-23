@@ -186,7 +186,16 @@ def test_delivery_diagnostics(
         assert all(attempt["submit_sent"] for attempt in attempts)
         assert all(attempt["verification"] == "draft_absent" for attempt in attempts)
 
+    assert attrs["content_leading_char"] == (
+        "slash" if scenario == "unknown_command" else "letter"
+    )
+    assert attrs["content_word_count"] == len(secret.split())
+    assert attrs["content_non_ascii"] is False
+    assert "claude_code_version" not in attrs
+
     if scenario in {"normal", "empty_capture"}:
+        assert attrs["draft_queued_placeholder_visible"] is False
+        assert attrs["draft_prompt_row_framed"] is False
         assert attrs["draft_polls"] == 1
         assert attrs["draft_empty_captures"] == 0
         assert attrs["draft_wait_ms"] == 0
@@ -369,3 +378,82 @@ def test_tmux_cleanup_failure_preserves_first_operation(
     attrs = record_to_row(record, source="runner")["attributes"]
     assert attrs["tmux_operation"] == "paste-buffer"
     assert attrs["tmux_returncode"] == "1"
+
+
+_RULE = "─" * 40
+
+
+@pytest.mark.parametrize(
+    ("content", "leading"),
+    [
+        ("fix the bug", "letter"),
+        ("42 more", "digit"),
+        ("/review now", "slash"),
+        ("!git status", "bang"),
+        ("@notes.md", "at"),
+        ("# remember", "hash"),
+        ("? keys", "question"),
+        ("\u00e9t\u00e9", "non_ascii"),
+        ("- item", "other"),
+        ("  \n ", "none"),
+    ],
+)
+def test_content_shape_names_only_the_leading_character_class(content: str, leading: str) -> None:
+    shape = delivery_diagnostics._content_shape(content)
+    assert shape["content_leading_char"] == leading
+    assert shape["content_word_count"] == len(content.split())
+    assert shape["content_non_ascii"] is (not content.isascii())
+
+
+def test_delivery_summary_reports_a_queued_submit_and_the_claude_version(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A message Claude queued behind a busy turn, and the build that queued it, are visible."""
+    (tmp_path / "context.json").write_text(
+        json.dumps({"context_window_size": 200000, "claude_code_version": "2.1.299"})
+    )
+    private = "!d\u00e9j\u00e0 vu again"
+    queued_pane = (
+        f"{_RULE}\n\u276f\u00a0Press up to edit queued messages\n{_RULE}\n  esc to interrupt\n"
+    )
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        delivery_diagnostics.start_attempt()
+        delivery_diagnostics.record_verification(
+            draft_still_present=False,
+            pane=queued_pane,
+            needle=content,
+            prompt_glyph="\u276f",
+            start=0.0,
+            retries=0,
+            polls=1,
+        )
+
+    with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
+        deliver(tmp_path, content=private)
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    attrs = record.attributes
+    assert attrs["submit_queued_placeholder_visible"] is True
+    assert attrs["submit_prompt_row_framed"] is True
+    assert attrs["claude_code_version"] == "2.1.299"
+    assert attrs["content_leading_char"] == "bang"
+    assert attrs["content_word_count"] == 3
+    assert attrs["content_non_ascii"] is True
+    assert "vu again" not in json.dumps(record_to_row(record, "harness"))
+
+
+@pytest.mark.parametrize("context", [None, "not json", '["a list"]', '{"claude_code_version": 7}'])
+def test_unreadable_status_snapshot_omits_the_claude_version(
+    context: str | None, tmp_path: Path
+) -> None:
+    if context is not None:
+        (tmp_path / "context.json").write_text(context)
+    assert delivery_diagnostics._claude_code_version(tmp_path) == {}

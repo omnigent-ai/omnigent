@@ -3659,23 +3659,22 @@ async def _enrich_terminal_status_with_subagent_output(
     if status == "failed":
         context = normalize_failure_context(data.get("failure_context"))
         context.setdefault("failure_source", "external_status")
-        wire_detail = data.get("output")
+        wire_detail = data.get("failure_detail")
         if not isinstance(wire_detail, str) or not wire_detail.strip():
-            wire_detail = data.get("failure_detail")
+            wire_detail = data.get("output")
         for key, value in provider_error_context_from_text(wire_detail).items():
             context.setdefault(key, value)
         data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
+    failure_detail = data.get("failure_detail") if status == "failed" else None
+    if isinstance(failure_detail, str) and failure_detail.strip():
+        context.setdefault("detail_source", "external_status_failure_detail")
+        return {**data, "output": failure_detail.strip()}
     existing = data.get("output")
     if current_turn_only and isinstance(existing, str) and existing.strip():
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")
         return data
-    # The store's latest assistant text can be prose that preceded the error.
-    failure_detail = data.get("failure_detail") if status == "failed" else None
-    if isinstance(failure_detail, str) and failure_detail.strip():
-        context.setdefault("detail_source", "external_status_failure_detail")
-        return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(

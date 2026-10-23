@@ -4720,17 +4720,56 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
       render(<Composer {...composerProps()} ref={ref} />);
 
       act(() => ref.current?.startSideChat("first selection"));
+      act(() =>
+        useChatStore.getState().updateSideChatComposer(childId, (current) => ({
+          ...current,
+          text: "first answer",
+        })),
+      );
       act(() => ref.current?.startSideChat("second selection"));
 
       expect(useChatStore.getState().sideChatToOpen).toBeNull();
       expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
-        text: "my question",
+        text: "",
         files: [],
-        quotes: ["first selection", "second selection"],
+        quotes: [
+          { id: expect.any(String), before: "my question", text: "first selection" },
+          { id: expect.any(String), before: "first answer", text: "second selection" },
+        ],
       });
       expect(textarea()).toHaveValue("");
     },
   );
+
+  it("interleaves replies to parent selections before starting a side chat", () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.startSideChat("First passage"));
+    const childId = useChatStore.getState().sideChatToOpen!.childId;
+    const pane = (
+      <QueryClientProvider client={new QueryClient()}>
+        <SideChatPane childId={childId} selectionParentId="conv_test" onStart={onStart} />
+      </QueryClientProvider>
+    );
+    const view = render(pane);
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "First answer" },
+    });
+    act(() => ref.current?.startSideChat("Second passage"));
+    const between = screen.getByRole("textbox", { name: "Reply text before quote 2" });
+    expect(between).toHaveValue("First answer");
+    fireEvent.change(between, { target: { value: "Edited first answer" } });
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "Second answer" },
+    });
+    view.unmount();
+    render(pane);
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(onStart).toHaveBeenCalledExactlyOnceWith(
+      "> First passage\n\nEdited first answer\n\n> Second passage\n\nSecond answer",
+    );
+  });
 
   it("keeps a selection made during side-chat creation in a new pending tab", async () => {
     let resolveStart!: () => void;
