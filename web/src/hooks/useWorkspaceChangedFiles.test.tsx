@@ -969,6 +969,31 @@ describe("resolveChatFilePath", () => {
     ["C:\\Users\\u\\ws\\a.ts", ROOT, HOME, null, "Windows drive path → unresolvable"],
     ["C:/Users/u/ws/a.ts", ROOT, HOME, null, "Windows drive path, forward slashes"],
     ["\\\\host\\share\\a.ts", ROOT, HOME, null, "Windows UNC path → unresolvable"],
+    [
+      "Z:/Share/Job Hunting/report.pdf",
+      "Z:\\Share\\Job Hunting",
+      null,
+      abs("report.pdf"),
+      "mapped drive workspace",
+    ],
+    [
+      "z:/SHARE/Job Hunting/notes.md",
+      "Z:/Share/Job Hunting",
+      null,
+      abs("notes.md"),
+      "Windows root matching is case insensitive",
+    ],
+    [
+      "Z:/Other/report.pdf",
+      "C:/work",
+      null,
+      abs("Z:/Other/report.pdf"),
+      "other drive stays host absolute",
+    ],
+    ["\\\\host\\share\\a.ts", "C:/work", null, abs("//host/share/a.ts"), "UNC stays host absolute"],
+    ["Z:/Share/../secret.pdf", "C:/work", null, null, "Windows traversal rejected"],
+    ["Z:/Share/report.pdf:secret", "C:/work", null, null, "alternate data stream rejected"],
+    ["\\\\?\\C:\\secret.pdf", "C:/work", null, null, "device namespace rejected"],
   ])("%o (root=%o, home=%o) → %o (%s)", (text, root, home, expected, _why) => {
     expect(
       resolveChatFilePath(text as string, root as string | null, home as string | null),
@@ -1694,6 +1719,16 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
       ["/Users/me", "Users/me", "absolute path drops its leading slash"],
       ["/a/b/c", "a/b/c", "deep absolute path drops only the leading slash"],
       ["/my docs/f", "my%20docs/f", "segments are still percent-encoded"],
+      [
+        "Z:/Share/Job Hunting/report.pdf",
+        "Z%3A/Share/Job%20Hunting/report.pdf",
+        "drive path stays absolute",
+      ],
+      [
+        "//fileserver/share/Job Hunting/notes.md",
+        "%5C%5Cfileserver%5Cshare%5CJob%20Hunting%5Cnotes.md",
+        "UNC avoids proxy slash merging",
+      ],
     ])("%s -> %s (%s)", (location, expected) => {
       const seg = browseLocationSegment(location);
       expect(seg, expected).toBe(expected);
@@ -1707,6 +1742,8 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
       ["src/app.ts", null],
       ["/", "host"],
       ["/Users/me", "host"],
+      ["Z:/Share/Job Hunting/report.pdf", "host"],
+      ["//fileserver/share/notes.md", "host"],
     ])("%s -> %s", (location, expected) => {
       expect(browseLocationBase(location)).toBe(expected);
     });

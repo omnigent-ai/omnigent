@@ -537,6 +537,8 @@ class _HelperProcessClient:
 
         helper_cwd = self.cwd
         credential_runtime: CredentialProxyRuntime | None = None
+        if IS_WINDOWS and not sandbox.active:
+            self._tmpdir = create_private_tmpdir()
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])

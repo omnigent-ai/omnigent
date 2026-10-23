@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
-from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
+from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload, message_item
+from tests.e2e_ui.files.test_pdf_rendering import _PDF_CONTENT
 
 _CODE_BODY = '[data-streamdown="code-block-body"]'
 _LONG_WORD = "horizontalScrolling" * 14
@@ -375,3 +378,121 @@ def test_single_line_drag_selects_only_that_line(
     page.mouse.up()
 
     assert page.evaluate("() => window.getSelection().toString()").strip() == _CLOSING_LINE
+
+
+@pytest.mark.parametrize("location", ["drive", "unc"])
+def test_windows_deliverable_links_open_and_download(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    location: str,
+    tmp_path: Path,
+    browser_downloads: dict[str, tuple[str, str, bytes]],
+) -> None:
+    """Drive/UNC links retain their owning session through previews and downloads."""
+    chat = chat_session_contract
+    parent = "Z:/Share/Job Hunting" if location == "drive" else "//fileserver/share/Job Hunting"
+    href = parent if location == "drive" else "file://fileserver/share/Job%20Hunting"
+    _seed_assistant_message(
+        chat, f"[Generated PDF](<{href}/report.pdf>)\n\n[Generated notes](<{href}/notes.md>)"
+    )
+    api = f"/v1/sessions/{chat.session_id}"
+    environment = f"{api}/resources/environments/default"
+    chat.contract.json(
+        environment,
+        {"metadata": {"root": "C:/workspace", "reachable": {"unconfined": True, "roots": []}}},
+    )
+    chat.contract.json(f"{environment}/changes", list_payload([]))
+    chat.contract.json(f"{api}/comments", [])
+    files = {
+        "report.pdf": ("application/pdf", _PDF_CONTENT),
+        "notes.md": ("text/markdown", "# Generated delivery notes\n\nReady to review.\n"),
+    }
+    from urllib.parse import quote
+
+    for name, (media, body) in files.items():
+        target = f"{parent}/{name}"
+        segment = (
+            quote(target, safe="/")
+            if location == "drive"
+            else quote(target.replace("/", "\\"), safe="")
+        )
+        browser_downloads[f"{environment}/filesystem/{segment}?download=true&base=host"] = (
+            media,
+            name,
+            body.encode(),
+        )
+    requested = []
+
+    def serve(route: Route) -> None:
+        parsed = urlparse(route.request.url)
+        path = unquote(parsed.path.split("/filesystem/", 1)[1]).replace("\\", "/")
+        assert parse_qs(parsed.query).get("base") == ["host"]
+        requested.append(path)
+        if path == parent:
+            route.fulfill(
+                json=list_payload(
+                    [
+                        {
+                            "name": name,
+                            "path": name,
+                            "type": "file",
+                            "bytes": len(body),
+                            "modified_at": 1,
+                        }
+                        for name, (_, body) in files.items()
+                    ]
+                )
+            )
+            return
+        assert path.startswith(parent + "/")
+        name = path.rsplit("/", 1)[1]
+        media, body = files[name]
+        if parse_qs(parsed.query).get("download") == ["true"]:
+            route.fulfill(
+                content_type=media,
+                body=body.encode(),
+                headers={"Content-Disposition": f'attachment; filename="{name}"'},
+            )
+        else:
+            route.fulfill(
+                json={
+                    "object": "session.environment.filesystem.file_content",
+                    "path": path,
+                    "content_type": media,
+                    "encoding": "utf-8",
+                    "content": body,
+                    "bytes": len(body),
+                }
+            )
+
+    chat.contract.json(f"{environment}/filesystem", list_payload([]))
+    chat.contract.route(
+        re.compile(rf"^{re.escape(chat.base_url + environment)}/filesystem/.*$"), serve
+    )
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    page.goto(chat.url)
+    expect(page.get_by_text("[blocked]", exact=False)).to_have_count(0)
+    for label, name in (("Generated PDF", "report.pdf"), ("Generated notes", "notes.md")):
+        page.get_by_role("button", name=label, exact=True).click()
+        viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(viewer).to_be_visible()
+        if name.endswith(".pdf"):
+            expect(viewer.locator("canvas").first).to_be_visible(timeout=30_000)
+            expect(viewer.get_by_text("Hello PDF")).to_be_visible(timeout=30_000)
+        else:
+            expect(viewer.get_by_text("Generated delivery notes", exact=True)).to_be_visible()
+        page.screenshot(path=str(tmp_path / f"{location}-{name}.png"))
+        with page.expect_download() as event:
+            overflow = page.get_by_role("button", name="More actions", exact=True)
+            if overflow.is_visible():
+                overflow.click()
+                page.get_by_role("menuitem", name="Download file", exact=True).click()
+            else:
+                page.get_by_role("button", name="View settings", exact=True).click()
+                page.get_by_role("menuitem", name="Download file", exact=True).click()
+        download = event.value
+        assert download.failure() is None, (download.url, requested)
+        assert download.suggested_filename == name
+        assert Path(download.path()).read_bytes() == files[name][1].encode()
+    assert f"{parent}/report.pdf" in requested
+    assert f"{parent}/notes.md" in requested

@@ -3,6 +3,7 @@ import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
+import { isWindowsFilePath } from "@/lib/workspaceFilePaths";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -86,6 +87,11 @@ export function shortFileCitationLabel(text: string): string | null {
 // through only when `new URL(href, base).hash` round-trips, and a bare "#"
 // parses to an empty hash, so it would be blocked like any unresolvable URL.
 const PARKED_FILE_HREF = "#omnigent-file";
+const WINDOWS_FILE_FRAGMENT = "#omnigent-windows-file=";
+
+function isWindowsFileHref(href: string): boolean {
+  return isWindowsFilePath(href.replace(/%5c/gi, "\\"));
+}
 
 interface HastElement {
   type: string;
@@ -108,8 +114,16 @@ export function rewriteFileUriLinks() {
   return (tree: HastElement) => {
     visitElements(tree, (node) => {
       if (node.tagName !== "a") return;
-      const href = node.properties?.href;
+      let href = node.properties?.href;
       if (typeof href !== "string") return;
+      // A fragment preserves the path through sanitize without admitting a scheme.
+      if (isWindowsFileHref(href) && !href.startsWith("//")) {
+        node.properties = {
+          ...node.properties,
+          href: WINDOWS_FILE_FRAGMENT + encodeURIComponent(href),
+        };
+        return;
+      }
       // A basename citation looks like a URL scheme to sanitize (README.md:12).
       const citation = splitWorkspaceFileCitation(href);
       if (citation.line && /^[^:?#]+\.[\w-]+$/.test(citation.path)) {
@@ -124,7 +138,10 @@ export function rewriteFileUriLinks() {
       if (!/^file:/i.test(href)) return;
       const path = fileUriToLocalPath(href);
       if (!path) return;
-      node.properties = { ...node.properties, href: path };
+      node.properties = {
+        ...node.properties,
+        href: isWindowsFilePath(path) ? WINDOWS_FILE_FRAGMENT + encodeURIComponent(path) : path,
+      };
     });
   };
 }
@@ -144,7 +161,7 @@ function fileUriToLocalPath(href: string): string | null {
   } catch {
     return null;
   }
-  if (url.protocol !== "file:" || url.hostname || url.search) return null;
+  if (url.protocol !== "file:" || url.search) return null;
   // Validate the decoded form: that is the path the FileViewer will open.
   let path: string;
   try {
@@ -156,9 +173,14 @@ function fileUriToLocalPath(href: string): string | null {
   if (!path.startsWith("/") || path.startsWith("//") || path === "/" || /[?#]/.test(path)) {
     return null;
   }
-  if (!url.hash) return url.pathname;
+  const localPath = url.hostname
+    ? `\\\\${url.hostname}${url.pathname.replaceAll("/", "\\")}`
+    : /^\/[A-Za-z]:\//.test(url.pathname)
+      ? url.pathname.slice(1)
+      : url.pathname;
+  if (!url.hash) return localPath;
   const cited = splitWorkspaceFileCitation(`${path}${url.hash}`);
-  return cited.hasPosition ? `${url.pathname}${url.hash}` : null;
+  return cited.hasPosition ? `${localPath}${url.hash}` : null;
 }
 
 /**
@@ -189,9 +211,19 @@ export function markWorkspaceFileLinks() {
   return (tree: HastElement) => {
     visitElements(tree, (node) => {
       if (node.tagName !== "a") return;
-      const href = node.properties?.href;
-      if (typeof href !== "string" || !href) return;
-      if (NON_FILE_HREF.test(href) || href.includes("?")) return;
+      const originalHref = node.properties?.href;
+      if (typeof originalHref !== "string" || !originalHref) return;
+      let href = originalHref;
+      if (href.startsWith(WINDOWS_FILE_FRAGMENT)) {
+        try {
+          href = decodeURIComponent(href.slice(WINDOWS_FILE_FRAGMENT.length));
+        } catch {
+          return;
+        }
+        if (!isWindowsFileHref(href)) return;
+      }
+      if (href.startsWith("//")) return;
+      if ((NON_FILE_HREF.test(href) && !isWindowsFileHref(href)) || href.includes("?")) return;
       const cited = splitWorkspaceFileCitation(href);
       if (href.includes("#") && !cited.hasPosition) return;
       node.properties = {

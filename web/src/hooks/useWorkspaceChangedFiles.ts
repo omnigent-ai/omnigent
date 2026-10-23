@@ -24,6 +24,7 @@ import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
+import { isWindowsFilePath } from "@/lib/workspaceFilePaths";
 import { useChatStore } from "@/store/chatStore";
 
 /** True while this session’s agent loop is live, including visible grid panes. */
@@ -489,6 +490,7 @@ export function useWorkspaceAllFiles(
  */
 export function browseLocationSegment(location: string): string {
   if (location === "" || location === "/") return "";
+  if (location.startsWith("//")) return encodeURIComponent(location.replaceAll("/", "\\"));
   // A per-segment-encoded path with LITERAL slash separators and NO leading
   // "%2F" — for BOTH workspace-relative and host-absolute locations. An
   // absolute location's leading slash is stripped here and re-added by the
@@ -510,7 +512,7 @@ export function browseLocationSegment(location: string): string {
  * @returns ``"host"`` when absolute, else ``null``.
  */
 export function browseLocationBase(location: string): "host" | null {
-  return location.startsWith("/") ? "host" : null;
+  return location.startsWith("/") || isWindowsFilePath(location) ? "host" : null;
 }
 
 /**
@@ -757,7 +759,25 @@ export function resolveChatFilePath(
   // any stripping so a "trusted" absolute path doesn't carry these markers
   // past the existence-check heuristic and trigger a fetch that can't match.
   if (text.includes("://") || text.includes("?") || text.includes("#")) return null;
-  // Windows paths (`C:\x`, `\\host\x`) would otherwise pass as one relative segment.
+  const windows = !!root && isWindowsFilePath(root);
+  if (windows) {
+    const path = text.replaceAll("\\", "/");
+    const normalizedRoot = root.replaceAll("\\", "/").replace(/\/+$/, "");
+    const absolute = isWindowsFilePath(path);
+    if (/^[A-Za-z]:/.test(path) && !absolute) return null;
+    const tail = absolute ? path.replace(/^(?:[A-Za-z]:\/|\/\/)/, "") : path;
+    const invalidCharacter =
+      /[<>:"|?*]/.test(tail) || Array.from(tail).some((c) => c.charCodeAt(0) < 32);
+    if (invalidCharacter || hasUnsafeSegments(tail)) return null;
+    if (!absolute)
+      return path.startsWith("/") || path.startsWith("~") ? null : { path, trusted: false };
+    if (path.toLowerCase() === normalizedRoot.toLowerCase()) return null;
+    const prefix = `${normalizedRoot}/`;
+    return {
+      path: path.toLowerCase().startsWith(prefix.toLowerCase()) ? path.slice(prefix.length) : path,
+      trusted: true,
+    };
+  }
   if (/^[A-Za-z]:/.test(text) || text.includes("\\")) return null;
   let p = text;
   if (home && (p === "~" || p.startsWith("~/"))) {

@@ -15895,7 +15895,7 @@
             }
           },
           {
-            "description": "When `True`, stream the complete file as an attachment with no size cap instead of the capped JSON envelope. A directory rejects it with 400.",
+            "description": "Return the complete file as an attachment. Runners stream without a size cap. Windows host-served downloads reject truncated previews above 10 MiB. Directories reject it with 400.",
             "in": "query",
             "name": "download",
             "required": false,

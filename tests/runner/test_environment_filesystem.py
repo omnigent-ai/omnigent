@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, BinaryIO
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -102,6 +103,32 @@ async def test_list_environment_root(
     names = {e["name"] for e in body["data"]}
     assert "hello.txt" in names
     assert "src" in names
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires native Windows path semantics")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,content",
+    [("delivery notes.md", b"# Delivery notes\n"), ("report.pdf", b"%PDF-1.4\n%%EOF\n")],
+)
+async def test_windows_absolute_file_read_and_download(
+    client: httpx.AsyncClient, workspace: Path, name: str, content: bytes
+) -> None:
+    """Read probes and downloads use the owning Windows process, including spaces."""
+    target = workspace / name
+    target.write_bytes(content)
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/filesystem"
+    absolute = quote(str(target), safe="")
+    listing = await client.get(base)
+    assert listing.status_code == 200
+    assert name in {entry["name"] for entry in listing.json()["data"]}
+    for segment in (quote(name), absolute):
+        preview = await client.get(f"{base}/{segment}")
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["content"] == content.decode()
+        download = await client.get(f"{base}/{segment}?download=true")
+        assert download.status_code == 200, download.text
+        assert download.content == content
 
 
 @pytest.mark.asyncio

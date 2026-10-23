@@ -3691,8 +3691,22 @@ async def test_filesystem_path_omits_absent_cursors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("client_path", "runner_path"),
+    [
+        ("Users/me/reports", "%2FUsers/me/reports"),
+        ("Z%3A/Share/Job%20Hunting/report.pdf", "Z%3A/Share/Job%20Hunting/report.pdf"),
+        ("Z%3A/Share/Job%20Hunting/notes.md", "Z%3A/Share/Job%20Hunting/notes.md"),
+        (
+            "%5C%5Cfileserver%5Cshare%5CJob%20Hunting%5Creport.pdf",
+            "%5C%5Cfileserver%5Cshare%5CJob%20Hunting%5Creport.pdf",
+        ),
+    ],
+)
 async def test_filesystem_base_host_forwards_an_absolute_path(
     client: httpx.AsyncClient,
+    client_path: str,
+    runner_path: str,
 ) -> None:
     """``?base=host`` reads a bare ``{path}`` as an absolute host path and
     forwards it to the runner ``%2F``-encoded.
@@ -3708,14 +3722,14 @@ async def test_filesystem_base_host_forwards_an_absolute_path(
 
     resp = await client.get(
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
-        "/filesystem/Users/me/reports?limit=1000&order=asc&base=host",
+        f"/filesystem/{client_path}?limit=1000&order=asc&base=host",
     )
 
     assert resp.status_code == 200
     forwarded_url = fake_runner.calls[0][1]
     # The runner receives an absolute path: the leading slash re-added and
     # sent as %2F, interior slashes literal.
-    assert "/filesystem/%2FUsers/me/reports?" in forwarded_url
+    assert f"/filesystem/{runner_path}?" in forwarded_url
 
 
 @pytest.mark.asyncio
@@ -9235,6 +9249,118 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
         "unconfined": True,
         "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
     }
+
+
+@pytest.fixture
+def windows_host_app(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> FastAPI:
+    import sys
+
+    monkeypatch.setattr(sys.modules[__name__], "_OFFLINE_WORKSPACE", "C:\\workspace")
+    return request.getfixturevalue("offline_env_app")
+
+
+@pytest.mark.parametrize(
+    "target,root,relative",
+    [
+        ("Z:/Share/Job Hunting/report.pdf", "Z:\\", "Share\\Job Hunting\\report.pdf"),
+        (
+            "\\\\fileserver\\share\\Job Hunting\\notes.md",
+            "\\\\fileserver\\share\\",
+            "Job Hunting\\notes.md",
+        ),
+        ("delivery notes.md", "C:\\workspace", "delivery notes.md"),
+    ],
+)
+@pytest.mark.parametrize("download", [False, True])
+async def test_windows_files_use_the_owning_host_without_restarting_the_runner(
+    windows_host_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    root: str,
+    relative: str,
+    download: bool,
+) -> None:
+    import base64
+
+    from omnigent.server.routes import _host_filesystem
+
+    content = b"%PDF-1.4\n\xff\n%%EOF\n" if target.endswith(".pdf") else b"# Delivery notes\n"
+    media = "application/pdf" if target.endswith(".pdf") else "text/markdown"
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["workspace"] == root
+        assert kwargs["params"]["path"] == relative
+        assert kwargs["session_id"] == _OFFLINE_SESSION
+        return {
+            "object": "session.environment.filesystem.file_content",
+            "encoding": "base64",
+            "content": base64.b64encode(content).decode(),
+            "content_type": media,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    url = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem/" + quote(
+        target, safe=""
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=windows_host_app), base_url="http://server"
+    ) as client:
+        response = await client.get(url, params={"download": str(download).lower()})
+    assert response.status_code == 200, response.text
+    if download:
+        assert response.content == content
+        assert response.headers["content-type"].startswith(media)
+        assert "attachment" in response.headers["content-disposition"]
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-content-type-options"] == "nosniff"
+    else:
+        assert response.json()["content"] == base64.b64encode(content).decode()
+
+
+async def test_windows_host_download_never_returns_truncated_bytes(
+    windows_host_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "object": "session.environment.filesystem.file_content",
+            "truncated": True,
+            "content": "partial",
+        }
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=windows_host_app), base_url="http://server"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem/notes.md?download=true"
+        )
+    assert response.status_code == 413
+
+
+@pytest.mark.parametrize(
+    "path", [r"\\?\C:\secret.txt", "Z:/Share/../secret.txt", "Z:/Share/report.pdf:secret"]
+)
+async def test_windows_host_rejects_device_traversal_and_stream_paths(
+    windows_host_app: FastAPI, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        pytest.fail("Invalid paths must be rejected before accessing the host")
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=windows_host_app), base_url="http://server"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem/"
+            + quote(path, safe="")
+        )
+    assert response.status_code == 400
 
 
 @pytest.mark.asyncio

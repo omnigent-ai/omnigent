@@ -116,6 +116,28 @@ function renderMarkdown(
 }
 
 describe("markdown links to workspace files", () => {
+  it.each([
+    ["Z:/Share/Job Hunting/report.pdf", "Z:/Share/Job Hunting", "report.pdf"],
+    ["Z:/Share/Job Hunting/notes.md", "Z:/Share/Job Hunting", "notes.md"],
+    [String.raw`Z:\Share\Job Hunting\report.pdf`, String.raw`Z:\Share\Job Hunting`, "report.pdf"],
+    [
+      String.raw`\\\\fileserver\share\Job Hunting\notes.md`,
+      String.raw`\\fileserver\share\Job Hunting`,
+      "notes.md",
+    ],
+    ["file:///Z:/Share/Job%20Hunting/report.pdf", "Z:/Share/Job Hunting", "report.pdf"],
+    [
+      "file://fileserver/share/Job%20Hunting/notes.md",
+      String.raw`\\fileserver\share\Job Hunting`,
+      "notes.md",
+    ],
+  ])("opens an authorized Windows deliverable %s", (href, root, expected) => {
+    renderMarkdown(`[Deliverable](<${href}>)`, [expected], { ...FILE_VIEWER, workspaceRoot: root });
+    expect(screen.queryByText(/\[blocked\]/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Deliverable" }));
+    expect(openFile).toHaveBeenCalledWith(expected);
+  });
+
   it("plays an existing root-level recording outside the changed-file list", async () => {
     fetchMock.mockResolvedValue(dirListing(["demo.webm"]));
     renderMarkdown("[Screen recording](demo.webm)", [], FILE_VIEWER_WITH_SESSION);

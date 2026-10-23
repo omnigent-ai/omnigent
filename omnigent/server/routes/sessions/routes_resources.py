@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import functools
 import mimetypes
@@ -681,13 +682,14 @@ def register_resources_routes(
         :param absolute: Whether the path is host-absolute.
         :returns: The encoded segment.
         """
-        if ".." in relative_path.split("/"):
+        if ".." in relative_path.replace("\\", "/").split("/"):
             raise OmnigentError(
                 "Parent path segments are not permitted",
                 code=ErrorCode.INVALID_INPUT,
             )
-        quoted = urllib.parse.quote(relative_path.lstrip("/"))
-        return "%2F" + quoted if absolute else quoted
+        leading_slash = absolute and relative_path.startswith("/")
+        quoted = urllib.parse.quote(relative_path.lstrip("/") if leading_slash else relative_path)
+        return "%2F" + quoted if leading_slash else quoted
 
     def _mutating_runner_path(
         session_id: str,
@@ -740,12 +742,8 @@ def register_resources_routes(
         ``C:\\Users\\...`` path would slip through at the collaborator level
         and be stopped only by the runner rejecting it further down.
 
-        Note this is the AUTHORIZATION predicate, not the wire-format one.
-        Deciding how to encode the path for the runner stays
-        ``startswith("/")``, because that is a URL question and URLs use ``/``
-        on every platform. The two can disagree only for a Windows-style
-        path, where the result is a stricter gate plus a runner-side refusal
-        — closed on both counts.
+        The wire encoder preserves Windows drive and UNC roots. Authorization
+        recognizes every platform's absolute form before choosing a transport.
 
         :param client_path: Client-supplied path; a leading ``/`` is absolute.
         :param within_workspace: Level required for a workspace-relative path.
@@ -893,10 +891,11 @@ def register_resources_routes(
 
         :param request: Incoming request, for the ``base`` query value.
         :param client_path: Path captured from the route's ``{path}``.
-        :returns: ``(absolute, path)`` — ``path`` carries a leading slash iff
-            ``absolute``.
+        :returns: ``(absolute, path)``, preserving the owning host's root syntax.
         """
         absolute = request.query_params.get("base") == "host" or client_path.startswith("/")
+        if ntpath.isabs(client_path) and not client_path.startswith("/"):
+            return True, client_path
         if absolute:
             return True, "/" + client_path.lstrip("/")
         return False, client_path
@@ -978,6 +977,45 @@ def register_resources_routes(
             # Any other host FS failure (e.g. git_status_failed 500) mirrors the
             # runner proxy, which wraps non-200/404 responses as a 502.
             raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _read_windows_workspace_file(
+        session_id: str,
+        conversation: Conversation,
+        path: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resolve unconfined Windows reads on the owning host, including mapped drives."""
+        workspace = conversation.workspace or ""
+        drive, _ = ntpath.splitdrive(workspace)
+        if not drive or not ntpath.isabs(workspace):
+            return None
+        reach = await _environment_reach_for_session(conversation)
+        if reach is None or not reach[1]:
+            return None
+        if ntpath.isabs(path):
+            normalized = path.replace("/", "\\")
+            drive, tail = ntpath.splitdrive(normalized)
+            if (
+                not drive
+                or normalized.startswith(("\\\\?\\", "\\\\.\\"))
+                or any(part in {".", ".."} for part in tail.split("\\"))
+                or any(character in tail for character in ":\x00")
+            ):
+                raise HTTPException(status_code=400, detail="Invalid Windows file path")
+            root, relative = drive + "\\", tail.lstrip("\\")
+        else:
+            root, relative = workspace, path
+        payload = await _read_workspace_via_host(
+            session_id,
+            conversation,
+            "list_or_read",
+            {**params, "path": relative},
+            workspace_override=root,
+        )
+        if payload is not None and ntpath.isabs(path) and payload.get("object") == "list":
+            for entry in payload.get("data", []):
+                entry["path"] = entry["name"]
+        return payload
 
     async def _write_workspace_via_host(
         session_id: str,
@@ -2921,9 +2959,9 @@ def register_resources_routes(
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
-        :param download: When ``True``, stream the complete file as an
-            attachment with no size cap instead of the capped JSON
-            envelope. A directory rejects it with 400.
+        :param download: Return the complete file as an attachment. Runners
+            stream without a size cap. Windows host-served downloads reject
+            truncated previews above 10 MiB. Directories reject it with 400.
         :returns: File content or directory listing, or the raw file.
         """
         params: dict[str, str] = {"limit": str(limit), "order": order}
@@ -2939,6 +2977,39 @@ def register_resources_routes(
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
         conv, owner = await _authorize_browse_read_with_owner(session_id, request, relative_path)
+
+        host_file = (
+            await _read_windows_workspace_file(session_id, conv, relative_path, params)
+            if environment_id == "default"
+            else None
+        )
+        if host_file is not None:
+            if not download:
+                return _skip_gzip_for_binary(request, host_file)
+            if host_file.get("object") == "list":
+                raise HTTPException(status_code=400, detail="Cannot download a directory")
+            if host_file.get("truncated"):
+                raise HTTPException(
+                    status_code=413,
+                    detail="Host download exceeds the preview limit; use a current runner for streaming downloads",
+                )
+            content = host_file["content"]
+            body = (
+                base64.b64decode(content, validate=True)
+                if host_file.get("encoding") == "base64"
+                else content.encode("utf-8")
+            )
+            filename = urllib.parse.quote(ntpath.basename(relative_path), safe="")
+            skip_gzip(request)
+            return Response(
+                content=body,
+                media_type=host_file.get("content_type") or "application/octet-stream",
+                headers={
+                    "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
 
         # The owner may browse a workspace symlink's outside target by absolute
         # path already, so the runner is told it may follow the link; everyone

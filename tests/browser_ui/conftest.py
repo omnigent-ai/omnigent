@@ -109,6 +109,29 @@ RouteHandler = Callable[[Route], None]
 WebSocketHandler = Callable[[WebSocketRoute], None]
 
 
+@pytest.fixture
+def browser_downloads(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[str, str, bytes]]:
+    """Explicit attachment responses for downloads that bypass Playwright routing."""
+    responses: dict[str, tuple[str, str, bytes]] = {}
+    original_get = _SpaHandler.do_GET
+
+    def serve(handler: _SpaHandler) -> None:
+        response = responses.get(handler.path)
+        if response is None:
+            original_get(handler)
+            return
+        media_type, filename, body = response
+        handler.send_response(200)
+        handler.send_header("Content-Type", media_type)
+        handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    monkeypatch.setattr(_SpaHandler, "do_GET", serve)
+    return responses
+
+
 @dataclass
 class BrowserContract:
     """Explicit browser-backend contract with a default-deny safety net."""

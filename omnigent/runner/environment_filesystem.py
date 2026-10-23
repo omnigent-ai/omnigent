@@ -12,9 +12,12 @@ filesystem service.
 from __future__ import annotations
 
 import base64
+import ntpath
 import os
 import re
 import stat
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec, cast
@@ -486,8 +489,8 @@ def is_absolute_request(path: str) -> bool:
     """Whether a client-supplied path names an absolute location.
 
     The filesystem routes accept either a workspace-relative path (the
-    historical contract) or an absolute one. A path is absolute exactly
-    when it starts with ``/`` — the same rule the filesystem itself uses.
+    historical contract) or an absolute one. POSIX, Windows drive, and UNC
+    forms take the absolute authorization path on every platform.
     ``~`` is deliberately NOT expanded here: the environment metadata
     already reports ``home``, so the caller expands it and sends a real
     path rather than relying on whose home the runner would guess.
@@ -496,7 +499,7 @@ def is_absolute_request(path: str) -> bool:
         ``"/etc/hosts"``.
     :returns: ``True`` for absolute paths.
     """
-    return path.startswith("/")
+    return ntpath.isabs(path)
 
 
 def resolve_browse_target(
@@ -534,11 +537,23 @@ def resolve_browse_target(
     """
     if "\x00" in absolute_path:
         raise InvalidPath("Path contains NUL bytes")
+    if absolute_path.startswith(("\\\\?\\", "\\\\.\\")):
+        raise InvalidPath("Device paths are not supported")
+    if not os.path.isabs(absolute_path):
+        raise InvalidPath("Absolute path is not valid on this host")
     # An unconfined environment's reach IS the filesystem root — stating it as
     # a root keeps every return below a containment check, rather than having
     # one branch hand back an unchecked path.
     allowed = (
-        [*roots, ReachableRoot(path=Path("/"), access="write", origin="unconfined", kind="tree")]
+        [
+            *roots,
+            ReachableRoot(
+                path=Path(Path(absolute_path).anchor).resolve(),
+                access="write",
+                origin="unconfined",
+                kind="tree",
+            ),
+        ]
         if unconfined
         else roots
     )
@@ -776,6 +791,33 @@ class CallerProcessFilesystem:
         validated = _validate_path(path) if path else ""
         return validated or ".", validated
 
+    async def _run_filesystem_script(self, script: str) -> OpResult:
+        """Run read probes natively on unsandboxed Windows; retain sandbox checks elsewhere."""
+        if os.name != "nt" or not self._unconfined:
+            return await _run_os_env_async(self._os_env.shell, _python_script_command(script))
+
+        def run() -> OpResult:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-I", "-X", "utf8", "-c", script],
+                    cwd=self._root,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return {"error": str(exc), "exit_code": 1}
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.returncode,
+            }
+
+        return await run_sync_on_thread(run)
+
     async def list_dir(
         self,
         path: str = "",
@@ -862,10 +904,7 @@ class CallerProcessFilesystem:
                 "print(json.dumps({'es': es, 'has_more': has_more}))",
             ]
         )
-        result = await _run_os_env_async(
-            self._os_env.shell,
-            _python_script_command(_script),
-        )
+        result = await self._run_filesystem_script(_script)
         if "error" in result or result.get("exit_code") != 0:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
 
@@ -1315,10 +1354,7 @@ print(json.dumps({'r': results, 't': truncated}))
                 "    'r': r, 'dev': s.st_dev, 'ino': s.st_ino}))",
             ]
         )
-        result = await _run_os_env_async(
-            self._os_env.shell,
-            _python_script_command(_script),
-        )
+        result = await self._run_filesystem_script(_script)
         if "error" in result or result.get("exit_code", 1) != 0:
             return None
         try:
