@@ -7761,7 +7761,6 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.inner.databricks_executor import DatabricksAuthError
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
@@ -7789,23 +7788,30 @@ def create_runner_app(
 
             Most native turns report their end to the server, which relays it here.
             When that relay is lost, the runner's record says ``running`` until the
-            session is deleted; the server has the edge, so it settles the record.
+            session is deleted; the server's status settles it.
 
             :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
             :returns: ``False`` when the server reports the session settled, after
                 updating the runner's record to match; ``True`` otherwise,
                 including when the server cannot be asked.
             """
+            epoch = _turn_bind_epoch.get(conv_id)
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
                 )
                 body = resp.json() if resp.status_code == 200 else None
-            except (httpx.HTTPError, DatabricksAuthError, ValueError):
-                # Unreachable, unsigned (host credentials broken) or unparseable.
+            except Exception:  # noqa: BLE001 - any failure to ask the server keeps the pane
                 return True
             status = body.get("status") if isinstance(body, dict) else None
             if not isinstance(status, str) or status in _IN_FLIGHT_SESSION_STATUSES:
+                return True
+            # A turn that started while the reply was in flight makes the reply stale.
+            if (
+                conv_id in _active_turns
+                or _turn_bind_epoch.get(conv_id) != epoch
+                or _native_pane_status.get(conv_id) != "running"
+            ):
                 return True
             _logger.info(
                 "native pane reaper: server reports %s for conversation %s, whose turn "

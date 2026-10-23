@@ -346,9 +346,12 @@ class _SessionStatusServerClient(NullServerClient):
 
     def __init__(self) -> None:
         self.reply: tuple[int, object] | Exception = httpx.ConnectError("server unreachable")
+        # Runs while the request is in flight, e.g. to start a turn.
+        self.while_in_flight: Callable[[], None] = lambda: None
 
     async def get(self, url: str, **kwargs: object) -> object:  # type: ignore[override]
         del url, kwargs
+        self.while_in_flight()
         if isinstance(self.reply, Exception):
             raise self.reply
         status_code, body = self.reply
@@ -389,14 +392,21 @@ async def test_runner_busy_check_settles_a_running_record_the_server_has_settled
     for reply in (
         httpx.ConnectError("server unreachable"),
         DatabricksAuthError("host credentials cannot sign the request"),
+        RuntimeError("client closed"),
         (503, {"status": "idle"}),
         (200, ValueError("not JSON")),
         (200, ["idle"]),
+        (200, {}),
         (200, {"status": "running"}),
     ):
         server.reply = reply
         assert await reaper._is_busy(pane), f"reply {reply!r} must keep the pane"
     server.reply = (200, {"status": "idle"})
+    # The server read its status before a new turn started, so the reply is stale.
+    server.while_in_flight = lambda: app.state.turn_bind_epoch.__setitem__("conv_lost_idle", 1)
+    assert await reaper._is_busy(pane), "an idle read before a new turn must not settle it"
+    assert app.state.native_pane_status["conv_lost_idle"] == "running"
+    server.while_in_flight = lambda: None
     assert not await reaper._is_busy(pane)
     assert app.state.native_pane_status["conv_lost_idle"] == "idle"
 
