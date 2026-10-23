@@ -723,10 +723,27 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+@pytest.mark.parametrize(
+    "harness,message_text,rejected_auth,active_turn",
+    [
+        ("claude-native", "set up the worktree", False, False),
+        ("claude-native", "/login", True, False),
+        ("claude-native", "/logout", True, False),
+        ("claude-native", " \n/login workspace", True, False),
+        ("claude-native", "/login-help", False, False),
+        ("claude-native", "Explain /login", False, False),
+        ("codex-native", "/login", False, False),
+        ("claude-native", "/login", True, True),
+    ],
+)
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    message_text: str,
+    rejected_auth: bool,
+    active_turn: bool,
 ) -> None:
     """
     A resend that reuses the web client's stable message id is answered with
@@ -755,7 +772,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
         "type": "message",
         "data": {
             "role": "user",
-            "content": [{"type": "input_text", "text": "set up the worktree"}],
+            "content": [{"type": "input_text", "text": message_text}],
             "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
         },
     }
@@ -767,25 +784,58 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             "omnigent.server.routes._sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
-        agent = await create_test_agent(client, name="claude-native-ui")
+        agent = await create_test_agent(
+            client,
+            name=f"{harness}-ui",
+            executor={"type": "omnigent", "config": {"harness": harness}},
+        )
         created = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": agent["id"],
                 "labels": {
                     "omnigent.ui": "terminal",
-                    "omnigent.wrapper": "claude-code-native-ui",
+                    "omnigent.wrapper": (
+                        "claude-code-native-ui"
+                        if harness == "claude-native"
+                        else "codex-native-ui"
+                    ),
                 },
             },
         )
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
+        if active_turn:
+            sessions_module._publish_status(session_id, "running", response_id="response_active")
+        before = (await client.get(f"/v1/sessions/{session_id}")).json()
+        published: list[tuple[str, dict[str, Any]]] = []
+        _capture_published(monkeypatch, published)
         try:
 
             def message_forwards() -> int:
                 return sum(1 for r in forwarded if r.url.path.endswith("/events"))
 
             first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            if rejected_auth:
+                assert first.status_code == 400, first.text
+                assert first.json()["error"]["code"] == "invalid_input"
+                assert "omni setup" in first.json()["error"]["message"]
+                assert message_forwards() == 0
+                assert pending_inputs.snapshot_for(session_id) == []
+                after = (await client.get(f"/v1/sessions/{session_id}")).json()
+                assert after["items"] == before["items"]
+                assert after["status"] == before["status"]
+                if active_turn:
+                    assert sessions_module._session_active_response_cache[session_id] == (
+                        "response_active"
+                    )
+                assert not any(
+                    event.get("type") in {"response.error", "response.failed"}
+                    or (event.get("type") == "session.status" and event.get("status") == "failed")
+                    for published_session, event in published
+                    if published_session == session_id
+                )
+                return
             assert first.status_code == 202, first.text
             assert message_forwards() == 1
             # The runner learns the message's id so a failed turn can name it.
