@@ -8336,3 +8336,94 @@ def test_get_conversation_keeps_distinct_query_names(
         "omnigent.conversation_store.select_conversation_metadata_by_id",
         "omnigent.conversation_store.select_conversation_labels",
     ], names
+
+
+@pytest.mark.parametrize("limit", [1, 3, 50])
+def test_list_interrupted_host_sessions_spans_workspaces_and_filters(
+    conversation_store: SqlAlchemyConversationStore, limit: int
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    stale_before = 1_000
+    disconnected = {"omnigent.last_task_error_code": "runner_disconnected"}
+
+    def seed(
+        status: str | None,
+        *,
+        host: bool = True,
+        labels: dict[str, str] | None = None,
+        parent: str | None = None,
+        archived: bool = False,
+    ) -> str:
+        conv = conversation_store.create_conversation(
+            runner_id="runner-gone",
+            parent_conversation_id=parent,
+            kind="sub_agent" if parent else "default",
+        )
+        if host:
+            conversation_store.set_host_id(conv.id, "a" * 32, workspace="/work")
+        if status is not None:
+            conversation_store.set_session_live_status(conv.id, status)
+        if labels:
+            conversation_store.set_labels(conv.id, labels)
+        if archived:
+            conversation_store.update_conversation(conv.id, archived=True)
+        return conv.id
+
+    expected = {
+        (0, seed("running")),
+        (0, seed("waiting")),
+        (0, seed("failed", labels=disconnected)),
+    }
+    root = seed("idle")
+    seed("failed", labels={"omnigent.last_task_error_code": "response_failed"})
+    seed("failed")
+    seed("running", host=False)
+    seed("running", parent=root)
+    seed("running", archived=True)
+    with workspace_scope(424242):
+        expected.add((424242, seed("failed", labels=disconnected)))
+
+    actual: set[tuple[int, str]] = set()
+    after = None
+    while True:
+        page, after = conversation_store.list_interrupted_host_sessions(
+            stale_before=stale_before, after=after, limit=limit
+        )
+        actual.update((workspace_id, conv.id) for workspace_id, conv in page)
+        if after is None:
+            break
+    assert actual == expected
+
+    # A fresh runner stamp means the turn may still be live on another replica.
+    conversation_store.touch_runner_liveness(["runner-gone"], stale_before)
+    page, _ = conversation_store.list_interrupted_host_sessions(
+        stale_before=stale_before, after=None, limit=50
+    )
+    assert {(ws, conv.id) for ws, conv in page} == {
+        item for item in expected if _live_status(conversation_store, item) == "failed"
+    }
+    with pytest.raises(ValueError, match="limit must be positive"):
+        conversation_store.list_interrupted_host_sessions(stale_before=0, after=None, limit=0)
+
+
+def _live_status(
+    conversation_store: SqlAlchemyConversationStore, item: tuple[int, str]
+) -> str | None:
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(item[0]):
+        conv = conversation_store.get_conversation(item[1])
+    assert conv is not None
+    return conv.live_status
+
+
+@pytest.mark.parametrize("status", ["idle", "failed"])
+def test_settle_orphaned_live_status_writes_requested_status(
+    conversation_store: SqlAlchemyConversationStore, status: str
+) -> None:
+    conv = conversation_store.create_conversation(runner_id="runner-gone")
+    conversation_store.set_session_live_status(conv.id, "running")
+    assert conversation_store.settle_orphaned_live_status(conv.id, 1_000, status=status)  # type: ignore[arg-type]
+    assert conversation_store.get_conversation(conv.id).live_status == status
+    assert not conversation_store.settle_orphaned_live_status(conv.id, 1_000, status=status)  # type: ignore[arg-type]

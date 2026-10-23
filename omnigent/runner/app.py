@@ -217,6 +217,13 @@ _logger = logging.getLogger(__name__)
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
+# Continuation for a server-requested recovery turn when the server sends no prompt.
+_DEFAULT_RECOVERY_PROMPT = (
+    "Your runner was interrupted while this task was active. "
+    "Continue the existing task from its current state. "
+    "Check any interrupted operation's outcome before repeating it."
+)
+
 
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
@@ -1263,6 +1270,9 @@ def create_runner_app(
     _live_response_id: dict[str, str] = {}
     app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
+    # Sessions this process initialized. Resource routes also fill
+    # _session_start_cache, so only this set proves a runner survived an outage.
+    _session_served: set[str] = set()
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
     # session_id → the harness the session actually runs, when it differs from
     # the spec's. Smart Routing pins a routed child's harness on the
@@ -2385,6 +2395,9 @@ def create_runner_app(
 
         raw_id = body.get("session_id")
         set_current_session_id(raw_id if isinstance(raw_id, str) else None)
+        # A session this process already served means the runner survived the
+        # outage, so a host-restart continuation would be false.
+        runner_survived = isinstance(raw_id, str) and raw_id in _session_served
         _logger.info(
             "Runner session initialization started",
             extra=debug_event("runner_session_init_started", stage="session_init"),
@@ -3043,6 +3056,7 @@ def create_runner_app(
             if init_context.envelope is not None
             and init_context.envelope.resume_interrupted_turn
             and not _suppress_recovery
+            and not (init_context.envelope.recovery_prompt is not None and runner_survived)
             else None
         )
         history: list[_JsonObject]
@@ -3116,6 +3130,7 @@ def create_runner_app(
                     _session_histories[session_id] = []
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
+                assert init_context.envelope is not None
                 recovery_body: _JsonObject = {
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
@@ -3124,9 +3139,7 @@ def create_runner_app(
                         {
                             "type": "input_text",
                             "text": (
-                                "Your runner was interrupted while this task was active. "
-                                "Continue the existing task from its current state. "
-                                "Check any interrupted operation's outcome before repeating it."
+                                init_context.envelope.recovery_prompt or _DEFAULT_RECOVERY_PROMPT
                             ),
                         }
                     ],
@@ -3143,6 +3156,7 @@ def create_runner_app(
                 _background_tasks.add(recovery_task)
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
+        _session_served.add(session_id)
         status = "running" if session_id in _active_turns else "idle"
         # The recovery decision and its inputs, so a turn that restarted after a
         # reconnect can be attributed to the history heuristic, the server's
@@ -3464,6 +3478,7 @@ def create_runner_app(
         _session_cursor_model_names.pop(session_id, None)
         _drop_session_claude_launch_config(session_id)
         _session_start_cache.pop(session_id, None)
+        _session_served.discard(session_id)
         _session_workspace_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)

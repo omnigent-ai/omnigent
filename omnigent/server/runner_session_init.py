@@ -152,8 +152,13 @@ class RunnerSessionInitializer:
         resume_interrupted_turn: bool = False,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
+        recovery_prompt: str | None = None,
     ) -> httpx.Response:
-        """Initialize once for the current connection and persisted snapshot."""
+        """Initialize once for the current connection and persisted snapshot.
+
+        ``recovery_prompt`` overrides the runner's continuation text when
+        ``resume_interrupted_turn`` starts a recovery turn.
+        """
         runner_id = conversation.runner_id
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
@@ -222,6 +227,7 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                recovery_prompt=recovery_prompt,
             )
 
             async def post_session_init() -> httpx.Response:
@@ -328,7 +334,8 @@ class RunnerSessionInitializer:
     ) -> httpx.Response:
         with runner_log_scope(session_id, runner_id):
             # The flags name the caller: neither set is the tunnel-reconnect
-            # hook, resume is a sub-agent restore, suppress is a message forward.
+            # hook, resume is a sub-agent restore or a managed-host auto-resume,
+            # suppress is a message forward.
             _logger.info(
                 "Initializing runner session",
                 extra=debug_event(

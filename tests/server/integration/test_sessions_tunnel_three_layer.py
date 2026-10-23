@@ -38,7 +38,7 @@ import io
 import json
 import tarfile
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -345,7 +345,9 @@ class _TunnelStack:
 
 
 @pytest_asyncio.fixture()
-async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack]:
+async def tunnel_three_layer_stack(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> AsyncIterator[_TunnelStack]:
     """Wire Omnigent server + WS-tunneled runner + EchoHarness in-process.
 
     Lifecycle: build stores, init runtime, override the test harness
@@ -359,8 +361,12 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
     communicator → fake PM → runtime globals → DBOS) so DBOS
     background threads observe a clean exit before pytest-asyncio
     closes the loop.
+
+    Indirect parametrization may pass a callable mapping the DB URI to extra
+    ``create_app`` keyword arguments.
     """
     db_uri = f"sqlite:///{tmp_path / 'test.db'}"
+    extra_app_kwargs = getattr(request, "param", lambda _uri: {})(db_uri)
 
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -414,6 +420,7 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
         conversation_store=conv_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
+        **extra_app_kwargs,
     )
     set_runner_router(ap_app.state.runner_router)
 
@@ -1060,6 +1067,8 @@ async def _reconnect_fires_connect_hook(
     wait_for_recover: str,
     runner_client: httpx.AsyncClient | None = None,
     expect_recovered: bool = True,
+    init_posts: list[dict[str, Any]] | None = None,
+    init_status: str | None = None,
 ) -> AsyncIterator[list[str]]:
     """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
 
@@ -1074,6 +1083,8 @@ async def _reconnect_fires_connect_hook(
     can assert on the post-recovery state.
 
     With ``runner_client``, keep the real relay and replace only its transport.
+    Otherwise the stub runner records session-init bodies in ``init_posts``
+    and answers with ``init_status``.
 
     :yields: The list of session ids the recovery helper ran for.
     """
@@ -1083,6 +1094,8 @@ async def _reconnect_fires_connect_hook(
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
 
+    posts = init_posts if init_posts is not None else []
+
     class _StubResponse:
         status_code = 200
 
@@ -1090,10 +1103,16 @@ async def _reconnect_fires_connect_hook(
             return None
 
         def json(self) -> dict[str, object]:
-            return {}
+            return {} if init_status is None else {"status": init_status}
 
     class _StubClient:
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
+            body = kwargs.get("json") or {}
+            posts.append(body)
+            if init_status == "error" and body.get("session_init", {}).get(
+                "resume_interrupted_turn"
+            ):
+                raise ConnectionError("runner went away during resume")
             return _StubResponse()
 
     def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
@@ -1394,6 +1413,103 @@ async def test_on_runner_connect_clears_disconnect_failure_on_idle_reconnect(
             assert sessions_module._last_task_error_from_labels(cleared.labels) is None
     finally:
         sessions_module._session_status_cache.pop(session_id, None)
+
+
+def _auto_resume_app_kwargs(enabled: bool) -> Callable[[str], dict[str, Any]]:
+    def build(db_uri: str) -> dict[str, Any]:
+        from omnigent.server.managed_hosts import (
+            ManagedSandboxAutoResumeConfig,
+            ManagedSandboxConfig,
+            ManagedSandboxDeployment,
+        )
+        from omnigent.stores.host_store import HostStore
+
+        return {
+            "host_store": HostStore(db_uri),
+            "sandbox_config": ManagedSandboxDeployment.single(
+                ManagedSandboxConfig(
+                    server_url="https://omnigent.example.com",
+                    launcher_factory=lambda: None,  # type: ignore[arg-type,return-value]
+                    token_ttl_s=3600,
+                    provider="remote",
+                ),
+                auto_resume_interrupted=ManagedSandboxAutoResumeConfig(
+                    enabled=enabled, recovery_prompt="The host restarted; carry on."
+                ),
+            ),
+        }
+
+    return build
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    ("tunnel_three_layer_stack", "enabled", "init_status"),
+    [
+        (_auto_resume_app_kwargs(True), True, "running"),
+        (_auto_resume_app_kwargs(True), True, "idle"),
+        (_auto_resume_app_kwargs(True), True, "error"),
+        (_auto_resume_app_kwargs(False), False, "idle"),
+    ],
+    indirect=["tunnel_three_layer_stack"],
+)
+async def test_on_runner_connect_resumes_interrupted_managed_session(
+    tunnel_three_layer_stack: _TunnelStack, enabled: bool, init_status: str
+) -> None:
+    """With auto-resume on, a disconnected top-level managed session gets a continuation."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    ap_client = tunnel_three_layer_stack.ap_client
+    target = await _bind_failed_session(
+        ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+    sibling = await _bind_failed_session(
+        ap_client,
+        error_code="runner_disconnected",
+        error_message="Runner disconnected unexpectedly.",
+    )
+    host = ap_app.state.host_store.register_managed_host(
+        host_id="a" * 32,
+        name="managed-a",
+        user_id="alice",
+        token="launch-token",
+        provider="remote",
+        sandbox_id="sb-1",
+        token_expires_at=2**31 - 1,
+    )
+    get_conversation_store().set_host_id(target, host.host_id, workspace="/work")
+    posts: list[dict[str, Any]] = []
+
+    try:
+        async with _reconnect_fires_connect_hook(
+            ap_app,
+            tunnel_three_layer_stack.fake_pm,
+            wait_for_recover=sibling,
+            init_posts=posts,
+            init_status=init_status,
+        ) as recovered:
+            init = next(post for post in posts if post["session_id"] == target)["session_init"]
+            other = next(post for post in posts if post["session_id"] == sibling)["session_init"]
+            assert init["resume_interrupted_turn"] is enabled
+            assert init["recovery_prompt"] == (
+                "The host restarted; carry on." if enabled else None
+            )
+            assert other["resume_interrupted_turn"] is False
+            # A started continuation clears the disconnect through its own
+            # running edge; otherwise the reconnect clears it as before.
+            if enabled and init_status in {"running", "error"}:
+                assert target not in recovered
+                assert sessions_module._session_status_cache.get(target) == "failed"
+            else:
+                assert target in recovered
+    finally:
+        sessions_module._session_status_cache.pop(target, None)
+        sessions_module._session_status_cache.pop(sibling, None)
 
 
 @pytest.mark.asyncio

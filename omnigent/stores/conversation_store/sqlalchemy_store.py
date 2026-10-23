@@ -7,7 +7,7 @@ import logging
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import PureWindowsPath
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
@@ -49,6 +49,7 @@ from omnigent.db.db_models import (
     SqlUserDailyCost,
     current_workspace_id,
     uuid_to_bytes,
+    workspace_scope,
 )
 from omnigent.db.enum_codecs import (
     decode_item_status,
@@ -98,6 +99,7 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    LAST_TASK_ERROR_CODE_LABEL_KEY,
     MAX_PENDING_INPUTS,
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
@@ -108,6 +110,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    InterruptedSessionCursor,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -4014,7 +4017,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._session_immediate, "settle_intentionally_stopped_session", write
         )
 
-    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+    def settle_orphaned_live_status(
+        self,
+        conversation_id: str,
+        stale_before: int,
+        *,
+        status: Literal["idle", "failed"] = "idle",
+    ) -> bool:
         """Settle a stale running row with one conditional update."""
 
         def write(session: Session) -> bool:
@@ -4037,12 +4046,103 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlConversationMetadata.runner_last_seen < stale_before,
                         ),
                     )
-                    .values(live_status=encode_session_live_status("idle"))
+                    .values(live_status=encode_session_live_status(status))
                 ),
             )
             return result.rowcount == 1
 
         return run_write_transaction(self._session_immediate, "settle_orphaned_live_status", write)
+
+    def list_interrupted_host_sessions(
+        self,
+        *,
+        stale_before: int,
+        after: InterruptedSessionCursor | None,
+        limit: int,
+    ) -> tuple[list[tuple[int, Conversation]], InterruptedSessionCursor | None]:
+        """Page interrupted host-bound top-level sessions across workspaces.
+
+        The metadata scan rides ``ix_conversation_metadata_live_status``: the
+        mid-turn and failed codes are contiguous, so one keyset range over
+        ``(live_status, workspace_id, id)`` bounds every page. Parent, archive,
+        and failure-cause filters run against the conversation tables, which
+        may live on a separate database.
+        """
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        mid_turn = [encode_session_live_status("running"), encode_session_live_status("waiting")]
+        failed = encode_session_live_status("failed")
+        codes = [*mid_turn, failed]
+        with self._session("list_interrupted_host_session_candidates") as session:
+            stmt = (
+                select(
+                    SqlConversationMetadata.live_status,
+                    SqlConversationMetadata.workspace_id,
+                    SqlConversationMetadata.id,
+                    SqlConversationMetadata.host_id,
+                    SqlConversationMetadata.kind,
+                    SqlConversationMetadata.runner_last_seen,
+                )
+                .where(
+                    SqlConversationMetadata.live_status >= min(codes),
+                    SqlConversationMetadata.live_status <= max(codes),
+                )
+                .order_by(
+                    SqlConversationMetadata.live_status.asc(),
+                    SqlConversationMetadata.workspace_id.asc(),
+                    SqlConversationMetadata.id.asc(),
+                )
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    tuple_(
+                        SqlConversationMetadata.live_status,
+                        SqlConversationMetadata.workspace_id,
+                        SqlConversationMetadata.id,
+                    )
+                    > after
+                )
+            rows = session.execute(stmt).all()
+        if not rows:
+            return [], None
+        last = rows[-1]
+        cursor: InterruptedSessionCursor | None = (
+            (last.live_status, last.workspace_id, last.id) if len(rows) == limit else None
+        )
+        top_level = encode_conversation_kind("default")
+        candidates: dict[int, list[str]] = {}
+        failed_ids: set[tuple[int, str]] = set()
+        for row in rows:
+            if row.live_status not in codes or row.host_id is None or row.kind != top_level:
+                continue
+            if row.live_status in mid_turn and (
+                row.runner_last_seen is not None and row.runner_last_seen >= stale_before
+            ):
+                continue
+            candidates.setdefault(row.workspace_id, []).append(row.id)
+            if row.live_status == failed:
+                failed_ids.add((row.workspace_id, row.id))
+        matches: list[tuple[int, Conversation]] = []
+        for workspace_id, ids in candidates.items():
+            with workspace_scope(workspace_id):
+                found = self.get_conversations(ids)
+            for conversation_id in ids:
+                conversation = found.get(conversation_id)
+                if (
+                    conversation is None
+                    or conversation.archived
+                    or conversation.parent_conversation_id is not None
+                    or conversation.host_id is None
+                ):
+                    continue
+                if (workspace_id, conversation_id) in failed_ids and (
+                    conversation.labels.get(LAST_TASK_ERROR_CODE_LABEL_KEY)
+                    != "runner_disconnected"
+                ):
+                    continue
+                matches.append((workspace_id, conversation))
+        return matches, cursor
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """

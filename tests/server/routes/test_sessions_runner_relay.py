@@ -3338,7 +3338,7 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
     interrupted.
     """
     from omnigent.runtime import session_stream
-    from omnigent.server.child_session_recovery import _interrupted
+    from omnigent.server.child_session_recovery import session_was_interrupted
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
 
@@ -3367,7 +3367,7 @@ async def test_offline_sweep_saved_subagent_turn_without_a_cached_edge(
             assert refreshed.live_status == "running"
             assert persisted is None
             assert store.list_items(parent.id).data == []
-            assert _interrupted(refreshed)
+            assert session_was_interrupted(refreshed)
         else:
             assert persisted is not None and persisted["code"] == "runner_disconnected"
             assert child.id not in sessions_module._session_background_task_count_cache
