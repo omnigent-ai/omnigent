@@ -2,22 +2,39 @@ package ai.omnigent.android
 
 import android.content.Intent
 import android.view.View
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import androidx.test.core.app.ApplicationProvider
+import org.junit.After
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.util.concurrent.Executor
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class SessionTokenBindingTest {
     private val pinned = "https://example.com:9443"
     private val token = "eyJ.eyJ.sig"
+
+    // Servers take the OIDC path; a baseline manifest loads the page without native sign-in.
+    @Before
+    fun readManifestsWithoutTheNetwork() {
+        MainActivity.manifestReader = { ServerManifest.BASELINE }
+        MainActivity.oidcWorker = Executor { it.run() }
+    }
+
+    @After
+    fun restoreManifestReader() {
+        MainActivity.manifestReader = { ServerManifest.fetch(it) }
+        MainActivity.oidcWorker = null
+    }
 
     @Test
     fun `session cookie includes HttpOnly flag`() {
@@ -114,13 +131,14 @@ class SessionTokenBindingTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(pinned)
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
-        val loadedBefore = shadowOf(webViewOf(activity)).lastLoadedUrl
         activity.installSessionCookie = { _, _, callback -> callback(false) }
 
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com:8443")
         controller.newIntent(Intent(activity, MainActivity::class.java))
 
-        assertTrue(shadowOf(webViewOf(activity)).lastLoadedUrl == loadedBefore)
+        // The old page may be blanked first, but the new server never loads.
+        val lastLoaded = shadowOf(webViewOf(activity)).lastLoadedUrl
+        assertFalse(lastLoaded?.startsWith("https://example.com:8443") == true)
         val next = checkNotNull(shadowOf(activity).nextStartedActivity)
         assertTrue(next.component?.className == ConnectActivity::class.java.name)
         assertTrue(activity.isFinishing)
@@ -131,14 +149,15 @@ class SessionTokenBindingTest {
         ServerStore(ApplicationProvider.getApplicationContext()).connect(pinned)
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
-        val loadedBefore = shadowOf(webViewOf(activity)).lastLoadedUrl
         activity.installSessionCookie = { _, _, callback -> callback(true) }
         activity.readCookies = { "theme=dark; ap_session=parent-domain" }
 
         ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com:8443")
         controller.newIntent(Intent(activity, MainActivity::class.java))
 
-        assertTrue(shadowOf(webViewOf(activity)).lastLoadedUrl == loadedBefore)
+        // The old page may be blanked first, but the new server never loads.
+        val lastLoaded = shadowOf(webViewOf(activity)).lastLoadedUrl
+        assertFalse(lastLoaded?.startsWith("https://example.com:8443") == true)
         val next = checkNotNull(shadowOf(activity).nextStartedActivity)
         assertTrue(next.component?.className == ConnectActivity::class.java.name)
         assertTrue(activity.isFinishing)
@@ -146,6 +165,73 @@ class SessionTokenBindingTest {
 
     // Robolectric's CookieManager ignores expiry writes, so record them at the seam,
     // installed before onCreate runs the first load.
+    @Test
+    fun `renderer death during a pending release still runs the new server's native connect`() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        // The OIDC controller keeps the reader it was built with, so record before launching.
+        val fetched = mutableListOf<String>()
+        MainActivity.manifestReader = { url ->
+            fetched += url
+            ServerManifest.BASELINE
+        }
+        ServerStore(context).connect(pinned)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val pending = mutableListOf<(Boolean) -> Unit>()
+        activity.installSessionCookie = { _, _, callback -> pending += callback }
+        activity.readCookies = { null }
+
+        val otherPort = "https://example.com:8443"
+        ServerStore(context).connect(otherPort)
+        controller.newIntent(Intent(activity, MainActivity::class.java))
+        val dead = webViewOf(activity)
+        dead.webViewClient.onRenderProcessGone(dead, rendererGone())
+        while (pending.isNotEmpty()) pending.removeAt(0)(true)
+
+        assertTrue(fetched.any { it.startsWith(otherPort) })
+        assertTrue(checkNotNull(shadowOf(webViewOf(activity)).lastLoadedUrl).startsWith(otherPort))
+        assertTrue(ServerStore(context).sessionCookieOwner("example.com") == otherPort)
+    }
+
+    @Test
+    fun `an exhausted crash budget during a pending release waits to offer Reload`() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val fetched = mutableListOf<String>()
+        MainActivity.manifestReader = { url ->
+            fetched += url
+            ServerManifest.BASELINE
+        }
+        ServerStore(context).connect(pinned)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        repeat(3) { webViewOf(activity).let { it.webViewClient.onRenderProcessGone(it, rendererGone(crashed = true)) } }
+        val pending = mutableListOf<(Boolean) -> Unit>()
+        activity.installSessionCookie = { _, _, callback -> pending += callback }
+        activity.readCookies = { null }
+
+        val otherPort = "https://example.com:8443"
+        ServerStore(context).connect(otherPort)
+        controller.newIntent(Intent(activity, MainActivity::class.java))
+        fetched.clear()
+        webViewOf(activity).let { it.webViewClient.onRenderProcessGone(it, rendererGone(crashed = true)) }
+
+        // No Reload link (which would reach the new server) until the old session is gone.
+        val replacement = shadowOf(webViewOf(activity))
+        assertTrue(replacement.lastLoadDataWithBaseURL == null && replacement.lastLoadedUrl == null)
+        while (pending.isNotEmpty()) pending.removeAt(0)(true)
+
+        assertTrue(shadowOf(webViewOf(activity)).lastLoadDataWithBaseURL?.data?.contains("Reload") == true)
+        assertFalse(shadowOf(webViewOf(activity)).lastLoadedUrl?.startsWith(otherPort) == true)
+        assertTrue(fetched.isEmpty())
+    }
+
+    private fun rendererGone(crashed: Boolean = false) =
+        object : RenderProcessGoneDetail() {
+            override fun didCrash(): Boolean = crashed
+
+            override fun rendererPriorityAtExit(): Int = WebView.RENDERER_PRIORITY_IMPORTANT
+        }
+
     private fun launchRecordingCookieWrites(writes: MutableList<String>): MainActivity {
         val controller = Robolectric.buildActivity(MainActivity::class.java)
         controller.get().installSessionCookie = { _, cookie, callback ->
