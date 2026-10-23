@@ -331,6 +331,8 @@ def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
     )
 
 
+# The code a Codex-native forwarder sends when the provider's bearer helper failed.
+CODEX_PROVIDER_AUTH_FAILED_CODE = "codex_provider_auth_failed"
 # Provider model-not-found shapes, matched narrowly so unrelated 404s, auth,
 # rate-limit, and budget failures keep their own handling.
 # Claude Code: "There's an issue with the selected model (<id>). It may not exist..."
@@ -462,6 +464,10 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    CODEX_PROVIDER_AUTH_FAILED_CODE: (
+        "Codex couldn't get a model credential from the configured provider's auth command "
+        "on the host."
+    ),
     CODEX_COMPACTION_MODEL_FAILED: (
         "Codex couldn't compact the conversation on the previous model, so this turn didn't run."
     ),
@@ -485,6 +491,11 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     ),
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
+
+
+# Codes a Codex-native forwarder may diagnose itself and send on a failed status
+# edge (``error_code``); the server classifies every other failure.
+FORWARDED_TURN_ERROR_CODES = frozenset({CODEX_PROVIDER_AUTH_FAILED_CODE})
 
 
 def describe_failure_code(code: str | None) -> str | None:
