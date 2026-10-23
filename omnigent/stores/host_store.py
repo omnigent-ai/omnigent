@@ -66,6 +66,7 @@ class Host:
     :param host_id: Stable identifier from the host's local
         ``~/.omnigent/config.yaml``, e.g. ``"host_a1b2c3d4..."``.
     :param name: Human-readable name, e.g. ``"corey-laptop"``.
+    :param display_name: Optional owner-assigned label, separate from host identity.
     :param user_id: User ID from the Databricks auth Bearer token,
         e.g. ``"corey.zumar@databricks.com"``.
     :param status: ``"online"`` or ``"offline"``.
@@ -76,13 +77,15 @@ class Host:
         (see :data:`HOST_LIVENESS_TTL_S`).
     :param sandbox_provider: Sandbox provider backing a SERVER-MANAGED
         host (``host_type="managed"`` sessions), e.g. ``"modal"``.
-        ``None`` for external (user-connected) hosts — non-``None``
-        marks the host as server-managed.
+        ``None`` for ordinary user-connected hosts. Attached boxes also keep
+        their provider so the existing resume path can wake them.
     :param sandbox_id: Provider-assigned id of the sandbox generation
         currently backing a managed host, e.g. ``"sb-a1b2c3"`` — what
         termination is issued against. ``None`` for external hosts and
         managed hosts whose prior generation was reaped while the durable
         host/session binding remains available for relaunch.
+    :param sandbox_attached: Reusable sandbox, created by a provider or attached later.
+        Externally owned; must never be deleted or replaced by Omnigent.
     :param terminating_sandbox_id: Provider-assigned id detached from the
         active generation and awaiting provider termination. A newly launched
         generation may coexist in ``sandbox_id`` while this cleanup retries.
@@ -107,6 +110,9 @@ class Host:
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
+    # Append optional fields to preserve existing positional constructors.
+    sandbox_attached: bool = False
+    display_name: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -172,12 +178,14 @@ def _row_to_host(row: SqlHost) -> Host:
     return Host(
         host_id=row.host_id,
         name=row.name,
+        display_name=row.display_name,
         user_id=row.user_id,
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
+        sandbox_attached=bool(row.sandbox_attached),
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
         account_generation=row.account_generation,
@@ -213,8 +221,10 @@ def delete_host_in_session(session: Session, row: SqlHost) -> Host:
         )
         .values(host_id=None)
     )
-    if row.sandbox_provider is None or (
-        row.sandbox_id is None and row.terminating_sandbox_id is None
+    if (
+        row.sandbox_attached
+        or row.sandbox_provider is None
+        or (row.sandbox_id is None and row.terminating_sandbox_id is None)
     ):
         session.execute(
             sql_delete(SqlHost).where(
@@ -475,10 +485,12 @@ class HostStore:
         user_id = row.user_id
         generation = row.account_generation
         name = row.name
+        display_name = row.display_name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
+        sandbox_attached = row.sandbox_attached
         terminating_sandbox_id = row.terminating_sandbox_id
 
         bound_ids = list(
@@ -515,6 +527,7 @@ class HostStore:
             host_id=new_host_id,
             user_id=user_id,
             name=name,
+            display_name=display_name,
             status=encode_host_status("online"),
             created_at=created_at,
             updated_at=now,
@@ -522,6 +535,7 @@ class HostStore:
             token_expires_at=token_expires_at,
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
+            sandbox_attached=sandbox_attached,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
         )
@@ -614,6 +628,8 @@ class HostStore:
             account_generation=generation,
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
+            sandbox_attached=bool(existing.sandbox_attached),
+            display_name=existing.display_name,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
         )
 
@@ -811,7 +827,7 @@ class HostStore:
         with self._session("list_current_managed_sandbox_hosts_page") as session:
             stmt = (
                 select(SqlHost)
-                .where(SqlHost.sandbox_id.is_not(None))
+                .where(SqlHost.sandbox_id.is_not(None), SqlHost.sandbox_attached.is_(False))
                 .order_by(
                     SqlHost.sandbox_id.asc(),
                     SqlHost.workspace_id.asc(),
@@ -848,7 +864,10 @@ class HostStore:
         with self._session("list_terminating_managed_sandbox_hosts_page") as session:
             stmt = (
                 select(SqlHost)
-                .where(SqlHost.terminating_sandbox_id.is_not(None))
+                .where(
+                    SqlHost.terminating_sandbox_id.is_not(None),
+                    SqlHost.sandbox_attached.is_(False),
+                )
                 .order_by(
                     SqlHost.terminating_sandbox_id.asc(),
                     SqlHost.workspace_id.asc(),
@@ -888,6 +907,41 @@ class HostStore:
                 return None
             return _row_to_host(row)
 
+    def set_display_name(
+        self, host_id: str, *, user_id: str, display_name: str | None
+    ) -> Host | None:
+        """Set an owner's reusable-host label without changing identity or liveness."""
+        if display_name is not None and (
+            not display_name
+            or len(display_name) > 64
+            or display_name != display_name.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in display_name)
+        ):
+            raise ValueError(
+                "display_name must be 1–64 characters without surrounding whitespace or controls"
+            )
+
+        def write(session: Session) -> Host | None:
+            require_active_account(session, user_id)
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.user_id == user_id,
+                    SqlHost.deleted_at.is_(None),
+                    SqlHost.sandbox_attached.is_(True),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            require_active_account(session, user_id, generation=row.account_generation)
+            row.display_name = display_name
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "rename_sandbox_host", write)
+
     def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
         """
         Whether a host row already holds *host_id*, or *name* for *user_id*.
@@ -915,7 +969,13 @@ class HostStore:
             return row is not None
 
     def reserve_sandbox_host(
-        self, *, host_id: str, name: str, user_id: str, provider: str
+        self,
+        *,
+        host_id: str,
+        name: str,
+        user_id: str,
+        provider: str,
+        attached_sandbox_id: str | None = None,
     ) -> Host | None:
         """Classify a self-registering sandbox before provisioning starts.
 
@@ -923,7 +983,8 @@ class HostStore:
         arriving after a launch timeout retains this classification. Existing
         rows keep their liveness, credentials, identity and sandbox binding.
         Returns None for a deleted host, a conflicting provider or a name
-        already held by another identity for this owner.
+        already held by another identity for this owner. ``attached_sandbox_id``
+        atomically records an externally owned box; ownership cannot be changed.
         """
 
         def write(session: Session) -> Host | None:
@@ -936,6 +997,30 @@ class HostStore:
                 )
                 .with_for_update()
             ).scalar_one_or_none()
+            if attached_sandbox_id is not None:
+                other = session.execute(
+                    select(SqlHost)
+                    .where(
+                        SqlHost.workspace_id == current_workspace_id(),
+                        SqlHost.host_id != host_id,
+                        SqlHost.sandbox_provider == provider,
+                        (SqlHost.sandbox_id == attached_sandbox_id)
+                        | (SqlHost.terminating_sandbox_id == attached_sandbox_id),
+                    )
+                    .limit(1)
+                ).scalar_one_or_none()
+                if other is not None:
+                    if (
+                        other.user_id == user_id
+                        and other.sandbox_attached
+                        and other.sandbox_id == attached_sandbox_id
+                        and other.deleted_at is None
+                    ):
+                        require_active_account(
+                            session, user_id, generation=other.account_generation
+                        )
+                        return _row_to_host(other)
+                    return None
             if row is None:
                 name_owner = session.execute(
                     select(SqlHost.host_id).where(
@@ -956,6 +1041,8 @@ class HostStore:
                     created_at=now,
                     updated_at=now,
                     sandbox_provider=provider,
+                    sandbox_id=attached_sandbox_id,
+                    sandbox_attached=attached_sandbox_id is not None,
                 )
                 session.add(row)
             else:
@@ -967,6 +1054,10 @@ class HostStore:
                         "refusing to reserve it"
                     )
                 require_active_account(session, user_id, generation=row.account_generation)
+                if bool(row.sandbox_attached) != (attached_sandbox_id is not None):
+                    return None
+                if attached_sandbox_id is not None and row.sandbox_id != attached_sandbox_id:
+                    return None
                 if row.sandbox_provider not in {None, provider}:
                     return None
                 row.sandbox_provider = provider
@@ -1037,6 +1128,7 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
+        sandbox_attached: bool = False,
     ) -> Host:
         """
         Create a server-managed sandbox host with its credential.
@@ -1081,6 +1173,7 @@ class HostStore:
                 token_expires_at=token_expires_at,
                 sandbox_provider=provider,
                 sandbox_id=sandbox_id,
+                sandbox_attached=sandbox_attached,
             )
             session.add(row)
             return _row_to_host(row)
@@ -1116,6 +1209,8 @@ class HostStore:
                 return None
             if existing.deleted_at is not None:
                 return None
+            if existing.sandbox_attached:
+                raise ValueError("cannot replace an externally owned sandbox")
             require_active_account(session, user_id, generation=existing.account_generation)
             if existing.user_id != user_id:
                 raise ValueError(
@@ -1316,7 +1411,7 @@ class HostStore:
 
         run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
 
-    def delete_host(self, host_id: str) -> Host | None:
+    def delete_host(self, host_id: str, *, user_id: str | None = None) -> Host | None:
         """
         Logically delete a host and retain pending sandbox cleanup.
 
@@ -1327,10 +1422,13 @@ class HostStore:
         deletion with managed-host generation replacement.
 
         :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
-        :returns: The latest host snapshot, or ``None`` when already absent.
+        :param user_id: When supplied, require this active account to own the host.
+        :returns: The latest host snapshot, or ``None`` when absent or owned by another user.
         """
 
         def write(session: Session) -> Host | None:
+            if user_id is not None:
+                require_active_account(session, user_id)
             row = session.execute(
                 select(SqlHost)
                 .where(
@@ -1339,7 +1437,7 @@ class HostStore:
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if row is None:
+            if row is None or (user_id is not None and row.user_id != user_id):
                 return None
             return delete_host_in_session(session, row)
 
@@ -1375,6 +1473,7 @@ class HostStore:
                         SqlHost.sandbox_id == sandbox_id,
                         SqlHost.updated_at == expected_updated_at,
                         SqlHost.sandbox_provider.is_not(None),
+                        SqlHost.sandbox_attached.is_(False),
                         SqlHost.deleted_at.is_(None),
                         SqlHost.terminating_sandbox_id.is_(None),
                     )

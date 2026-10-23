@@ -486,6 +486,9 @@ describe("displayNameForHost", () => {
     expect(displayNameForHost(local, "host_local", "Unknown client")).toBe("HR4V76FMWY");
     expect(displayNameForHost(local, "host_other", "Mozilla/5.0 (Macintosh)")).toBe("HR4V76FMWY");
     expect(displayNameForHost(local, null, "Mozilla/5.0 (Macintosh)")).toBe("HR4V76FMWY");
+    expect(
+      displayNameForHost({ ...local, display_name: "My project" }, null, "Unknown client"),
+    ).toBe("My project");
   });
 });
 

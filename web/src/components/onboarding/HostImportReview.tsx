@@ -69,7 +69,7 @@ export function ImportReviewGate() {
 /** Loading copy while the target isn't online; the default once it's fetching inventory. */
 function connectingMessage(host: Host | null, runner: ImportReviewTarget["runner"]) {
   if (host?.status === "online") return undefined;
-  if (host) return `Connecting to ${host.name}…`;
+  if (host) return `Connecting to ${host.display_name ?? host.name}…`;
   if (runner === "remote") return "Connecting to Arca…";
   if (runner === "local") return "Connecting this Mac…";
   return "Connecting…";
@@ -83,7 +83,7 @@ function RequestedImportReview({ target }: { target: ImportReviewTarget }) {
   return (
     <InventoryModal
       hostId={target.hostId}
-      hostName={host?.name}
+      hostName={host?.display_name ?? host?.name}
       loadingMessage={connectingMessage(host, target.runner)}
       inventory={inventory}
       open
@@ -127,7 +127,7 @@ function NewHostImportReview() {
   return (
     <InventoryModal
       hostId={candidate.host_id}
-      hostName={(hosts?.length ?? 0) > 1 ? candidate.name : undefined}
+      hostName={(hosts?.length ?? 0) > 1 ? (candidate.display_name ?? candidate.name) : undefined}
       inventory={inventory}
       open
       onOpenChange={(next) => {

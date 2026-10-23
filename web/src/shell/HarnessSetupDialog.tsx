@@ -120,8 +120,8 @@ export function HarnessSetupDialog({
         const ready = result.configured_harnesses[h] === true;
         showToast(
           ready
-            ? `${name} is ready on ${host?.name}.`
-            : `${name} installed on ${host?.name} — one more step to finish setup.`,
+            ? `${name} is ready on ${host?.display_name ?? host?.name}.`
+            : `${name} installed on ${host?.display_name ?? host?.name} — one more step to finish setup.`,
         );
       },
       onError: (err) => showToast(`Couldn't install ${name}: ${err.message}`, { duration: 0 }),
@@ -136,16 +136,16 @@ export function HarnessSetupDialog({
       <DialogContent className="sm:max-w-lg" data-testid="harness-setup-dialog">
         <DialogHeader>
           <DialogTitle>
-            Set up {name} on {host?.name}
+            Set up {name} on {host?.display_name ?? host?.name}
           </DialogTitle>
           {/* Only show a description when it adds something the title doesn't:
               the done / needs-more-setup states. The generic "complete these
               steps…" just echoes the title, so it's omitted for the common
               checklist case. */}
           {allDone ? (
-            <DialogDescription>{`${name} is ready on ${host?.name}.`}</DialogDescription>
+            <DialogDescription>{`${name} is ready on ${host?.display_name ?? host?.name}.`}</DialogDescription>
           ) : collapsed ? (
-            <DialogDescription>{`${name} needs a bit more setup on ${host?.name}.`}</DialogDescription>
+            <DialogDescription>{`${name} needs a bit more setup on ${host?.display_name ?? host?.name}.`}</DialogDescription>
           ) : null}
         </DialogHeader>
 
@@ -157,7 +157,7 @@ export function HarnessSetupDialog({
           // signpost that would contradict the "is ready" description.
           <p className="py-1 text-ui text-muted-foreground" data-testid="harness-setup-empty">
             Run <code className="rounded bg-muted px-1 py-0.5 font-mono text-sm">omni setup</code>{" "}
-            on {host?.name} to finish setting up {name}.
+            on {host?.display_name ?? host?.name} to finish setting up {name}.
           </p>
         ) : hasSteps ? (
           <ul className="flex flex-col gap-3 py-1">
@@ -255,7 +255,8 @@ function SetupStepRow({
               rather than stranded at the bottom of the dialog. */}
           {step.kind === "install" && installing ? (
             <span className="text-sm text-muted-foreground" data-testid="harness-setup-installing">
-              Installing on {host?.name} — this can take a few minutes for larger agents.
+              Installing on {host?.display_name ?? host?.name} — this can take a few minutes for
+              larger agents.
             </span>
           ) : (
             detail && <span className="text-sm text-muted-foreground">{detail}</span>

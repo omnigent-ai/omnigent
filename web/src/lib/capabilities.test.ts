@@ -7,7 +7,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // resolveServerInfo is imported dynamically inside each probe (below) so every
 // test starts from a fresh module cache; only the pure helpers are static.
-import { sandboxOptionLabel, sandboxProviderOptions } from "./capabilities";
+import {
+  sandboxDiscoveryProviders,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "./capabilities";
 import type { ServerInfo } from "./capabilities";
 
 /** A ServerInfo with only the sandbox fields a test cares about set. */
@@ -86,6 +90,23 @@ describe("sandboxProviderOptions", () => {
     const options = sandboxProviderOptions(info({}));
     expect(options).toEqual([null]);
     expect(sandboxOptionLabel(options[0])).toBe("New Sandbox");
+  });
+});
+
+describe("sandboxDiscoveryProviders", () => {
+  it.each([false, true])("discovers static boxes with creation enabled=%s", async (creation) => {
+    const resolved = await probe({
+      managed_sandboxes_enabled: creation,
+      sandbox_provider: creation ? "modal" : null,
+      sandbox_providers: creation ? ["modal"] : [],
+      sandbox_provider_capabilities: { modal: {}, static: { reusable_hosts: true } },
+    });
+    expect(sandboxDiscoveryProviders(resolved)).toEqual(["static"]);
+    if (creation) expect(sandboxProviderOptions(resolved)).toEqual(["modal"]);
+  });
+
+  it("does not invent discovery for older servers", () => {
+    expect(sandboxDiscoveryProviders(info({ sandbox_providers: ["modal"] }))).toEqual([]);
   });
 });
 
@@ -303,4 +324,9 @@ describe("custom agents settings capability", () => {
       expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
     },
   );
+});
+
+it("labels reusable provider creation as a new static sandbox", () => {
+  expect(sandboxOptionLabel("modal", true)).toBe("New static sandbox");
+  expect(sandboxOptionLabel("modal")).toBe("Modal Sandbox");
 });

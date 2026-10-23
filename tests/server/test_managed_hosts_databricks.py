@@ -116,8 +116,14 @@ def test_shared_server_identity_cannot_be_configured(section: dict[str, object])
         )
 
 
-def test_build_owner_launcher_binds_the_owners_resolver() -> None:
+def test_build_owner_launcher_binds_the_owners_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[str] = []
+    principals: list[str] = []
+    monkeypatch.setattr(
+        DatabricksSandboxLauncher,
+        "bind_principal",
+        lambda _launcher, principal: principals.append(principal),
+    )
 
     def resolve(user_id: str) -> dict[str, object] | None:
         seen.append(user_id)
@@ -129,6 +135,7 @@ def test_build_owner_launcher_binds_the_owners_resolver() -> None:
     with pytest.raises(OwnerCredentialMissingError, match="Connect Databricks"):
         launcher.prepare()
     assert seen == ["alice@example.com"]
+    assert principals == seen
 
 
 def test_build_owner_launcher_without_a_resolver_refuses_not_falls_back() -> None:

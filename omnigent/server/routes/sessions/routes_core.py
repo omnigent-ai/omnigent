@@ -562,11 +562,17 @@ def register_core_routes(
 
         # Reject an unconfigured provider on the POST rather than in the
         # background launch.
-        if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
+        selected_provider = sandbox_config.for_provider(sandbox_provider)
+        if selected_provider is None:
             offered = ", ".join(sandbox_config.launchable_providers()) or "none"
             raise OmnigentError(
                 f"sandbox provider '{sandbox_provider}' is not configured "
                 f"on this server — available: {offered}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not selected_provider.managed_launch_supported:
+            raise OmnigentError(
+                "sandbox provider does not support creating new sandboxes; select an existing sandbox",
                 code=ErrorCode.INVALID_INPUT,
             )
         # Reject several repos on a provider that clones only one, with a clear

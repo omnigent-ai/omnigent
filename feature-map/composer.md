@@ -277,6 +277,26 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **Reusable sandbox hosts:**
+  `tests/e2e_ui/start_session/test_start_session.py::test_attached_sandbox_wakes_and_remains_a_reusable_picker_target`
+  checks controller discovery (including error, empty and retry states), attachment,
+  optional static-provider creation, discovery with creation disabled and no
+  registered reusable hosts, optional controller state in saved rows (separate
+  from host connectivity), reuse during a controller outage, rename from the sandbox
+  row inside the picker (pointer, keyboard and mobile touch), focus restoration and reload,
+  wake and reuse across two create requests, and clearing the label in mobile Clone session;
+  ad hoc sandbox hosts stay hidden. Clone session shares the discovery dialog,
+  covered with creation enabled and disabled by
+  `web/src/shell/ForkSessionDialog.test.tsx`. The shared naming dialog's
+  failure, save and clear paths are checked by
+  `web/src/shell/StaticSandboxName.test.tsx`. The browser stubs provider
+  responses. `web/src/shell/StaticSandboxPicker.test.tsx` covers omitted/missing
+  state, timeouts, stale results, cache reuse and user/provider isolation, while
+  `tests/server/integration/test_hosts_api.py::test_attach_api_reuses_one_tunnel_for_two_session_launches`
+  exercises read-only discovery, attachment authorization and two launches through
+  the real host tunnel. See the
+  [provider capability and attachment API](../docs/extending/attached_sandboxes.md)
+  for setup and manual verification.
 - **`offline-hosts`:**
   `tests/e2e_ui/start_session/test_start_session.py::test_start_session_keeps_offline_host_selected`
   covers the connected-host and managed-sandbox variants with stubbed host responses.

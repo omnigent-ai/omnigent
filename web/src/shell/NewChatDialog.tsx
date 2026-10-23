@@ -129,7 +129,12 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  sandboxDiscoveryProviders,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -153,6 +158,8 @@ import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { StaticSandboxPicker, StaticSandboxState } from "./StaticSandboxPicker";
+import { StaticSandboxEdit, StaticSandboxName } from "./StaticSandboxName";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
@@ -426,10 +433,11 @@ function createdHarnessOptions({
 
 /** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
 export function displayNameForHost(
-  host: Pick<Host, "host_id" | "name">,
+  host: Pick<Host, "host_id" | "name" | "display_name">,
   thisMachineHostId: string | null,
   userAgent: string,
 ): string {
+  if (host.display_name) return host.display_name;
   if (thisMachineHostId === null || host.host_id !== thisMachineHostId) return host.name;
   return localMachineLabel(userAgent, host.name);
 }
@@ -470,7 +478,12 @@ function HostOption({
 }) {
   const isOnline = host.status === "online";
   return (
-    <span className="flex w-full min-w-0 items-center gap-1">
+    <span
+      className={cn(
+        "w-full min-w-0 items-center",
+        host.sandbox_attached ? "grid grid-cols-[16px_minmax(0,1fr)_auto] gap-x-2" : "flex gap-1",
+      )}
+    >
       <span className="flex size-4 shrink-0 items-center justify-center">
         {cloud ? (
           <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
@@ -486,7 +499,7 @@ function HostOption({
       </span>
       <span className="min-w-0 flex-1 truncate">
         {displayName}
-        {displayName !== host.name && (
+        {displayName !== host.name && !host.sandbox_attached && (
           <span className="text-xs text-muted-foreground"> • {host.name}</span>
         )}
         {subtitle && <span className="text-xs text-muted-foreground"> • {subtitle}</span>}
@@ -1534,7 +1547,7 @@ export function AgentHarnessPicker({
   const selectedWarningMessage = selectedUnavailable
     ? harnessWarningMessage(
         selectedEntry.display_name,
-        host?.name,
+        host?.display_name ?? host?.name,
         selectedReadiness.reason,
         selectedEntry.harness,
       )
@@ -1673,7 +1686,12 @@ export function AgentHarnessPicker({
         : harnessWarningBadgeText(readiness.reason, collapsedBadge);
     const warningMessage =
       blockedReason ??
-      harnessWarningMessage(agent.display_name, host?.name, readiness.reason, agent.harness);
+      harnessWarningMessage(
+        agent.display_name,
+        host?.display_name ?? host?.name,
+        readiness.reason,
+        agent.harness,
+      );
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -2418,13 +2436,21 @@ export function NewChatLandingScreen() {
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
   // provider.
-  const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
+  const sandboxLabelForProvider = (provider: string | null) =>
+    sandboxOptionLabel(
+      provider,
+      info !== "loading" &&
+        provider !== null &&
+        info.sandbox_provider_capabilities?.[provider]?.reusable_hosts === true,
+    );
+  const sandboxLabel = sandboxLabelForProvider(info !== "loading" ? info.sandbox_provider : null);
   // One picker row per configured provider; a single-provider server
   // yields exactly one.
   const sandboxProviderRows = useMemo(
     () => (info !== "loading" ? sandboxProviderOptions(info) : []),
     [info],
   );
+  const discoveryProviders = info !== "loading" ? sandboxDiscoveryProviders(info) : [];
   // The provider a sandbox pick defaults to: the sticky last pick when the
   // server still offers it, else the first offered row. Mirrors the sticky
   // host choice — the composer reopens on the provider used last. Null until
@@ -2495,6 +2521,12 @@ export function NewChatLandingScreen() {
   const onboardingHostSettled = useRef(false);
   const [connectingThisMachine, setConnectingThisMachine] = useState(false);
   const [hostMenuOpen, setHostMenuOpen] = useState(false);
+  const hostPickerRef = useRef<HTMLButtonElement>(null);
+  const [editingHost, setEditingHost] = useState<Host | null>(null);
+  const editSandboxName = (host: Host) => {
+    setHostMenuOpen(false);
+    setEditingHost(host);
+  };
   // Error surfaced when "Run on this machine" fails (sign-in needed, enrollment
   // declined, server unreachable). Rendered in the composer body with a retry,
   // so the failure isn't silently swallowed and the user isn't stranded on the
@@ -2692,6 +2724,8 @@ export function NewChatLandingScreen() {
   const createAttemptRef = useRef<symbol | null>(null);
   const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [wakingHostId, setWakingHostId] = useState<string | null>(null);
+  const [discoveryProvider, setDiscoveryProvider] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
   const [offlineHostLimit, setOfflineHostLimit] = useState(0);
@@ -2773,7 +2807,7 @@ export function NewChatLandingScreen() {
   const thisMachineHostId = resolveThisMachineHostId(
     desktopHost?.hostId ?? null,
     isCurrentServerLocal(),
-    onlineHosts.map((host) => host.host_id),
+    onlineHosts.filter((host) => !host.sandbox_provider).map((host) => host.host_id),
   );
   // When it's already in the host list (online or offline) we connect via that
   // row. With another live host there is already a valid place to run, so do
@@ -5138,7 +5172,7 @@ export function NewChatLandingScreen() {
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
-    sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
+    sandboxProvider !== null ? sandboxLabelForProvider(sandboxProvider) : sandboxLabel;
   const selectedHostDisplayName = selectedHost
     ? displayNameForHost(selectedHost, thisMachineHostId, navigator.userAgent)
     : null;
@@ -5298,6 +5332,27 @@ export function NewChatLandingScreen() {
     setPickedAgentId(PENDING_AGENT_ID);
     setPickedHarness(null);
   };
+
+  async function wakeAttachedHost(hostId: string) {
+    setWakingHostId(hostId);
+    setCreateError(null);
+    try {
+      const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/wake`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const body = await response.json();
+        throw new Error(body.detail || "Could not wake sandbox");
+      }
+      await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      selectHost(hostId);
+      void queryClient.invalidateQueries({ queryKey: ["sandbox-discovery"] });
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : "Could not wake sandbox");
+    } finally {
+      setWakingHostId(null);
+    }
+  }
 
   function selectHost(hostId: string) {
     // Persist the explicit pick even when it matches the current selection, so
@@ -6101,11 +6156,13 @@ export function NewChatLandingScreen() {
   // Keep the selected host and this machine's reconnect action above the fold.
   const listedHosts = [
     ...onlineHosts,
-    ...offlineHosts.filter((host) => host.host_id === selectedHostId || isReconnectRow(host)),
+    ...offlineHosts.filter(
+      (host) => host.sandbox_attached || host.host_id === selectedHostId || isReconnectRow(host),
+    ),
   ];
   // Preserve /v1/hosts order: most recently updated first.
   const otherOfflineHosts = offlineHosts.filter(
-    (host) => host.host_id !== selectedHostId && !isReconnectRow(host),
+    (host) => !host.sandbox_attached && host.host_id !== selectedHostId && !isReconnectRow(host),
   );
   const cloudHosts = listedHosts.filter(isCloudHostEntry);
   const localHosts = listedHosts.filter((host) => !isCloudHostEntry(host));
@@ -6123,30 +6180,64 @@ export function NewChatLandingScreen() {
     showArcaOption;
   const renderHostMenuItem = (host: Host) => {
     const reconnect = isReconnectRow(host);
+    const wakeable = host.sandbox_attached && host.status === "offline";
     return (
       <DropdownMenuItem
         key={host.host_id}
         onSelect={() => {
-          if (reconnect) pendingConnectRef.current = true;
+          if (wakeable) void wakeAttachedHost(host.host_id);
+          else if (reconnect) pendingConnectRef.current = true;
           else selectHost(host.host_id);
         }}
-        disabled={reconnect ? connectingThisMachine : host.status !== "online"}
+        disabled={
+          wakeable
+            ? wakingHostId !== null
+            : reconnect
+              ? connectingThisMachine
+              : host.status !== "online"
+        }
         data-testid={
           reconnect
             ? "new-chat-landing-run-on-this-machine"
             : `new-chat-landing-host-${host.host_id}`
         }
         data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
-        title={`${host.name} — ${host.status}`}
-        className={reconnect ? "group" : undefined}
+        title={`${host.display_name ?? host.name} — ${host.status}`}
+        className={cn("group/sandbox", reconnect && "group")}
+        aria-description={
+          host.sandbox_attached ? "Right Arrow to edit the sandbox name." : undefined
+        }
+        onKeyDown={(event) => {
+          if (host.sandbox_attached && event.key === "ArrowRight") {
+            event.preventDefault();
+            editSandboxName(host);
+          }
+        }}
       >
         <HostOption
           host={host}
           cloud={isCloudHostEntry(host)}
           displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
-          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+          subtitle={
+            wakeable
+              ? wakingHostId === host.host_id
+                ? "Waking…"
+                : "Offline · click to wake"
+              : host.host_id === arcaHostId
+                ? "Arca instance"
+                : undefined
+          }
           action={
-            reconnect ? (
+            host.sandbox_attached ? (
+              <span className="contents">
+                <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
+                <StaticSandboxState
+                  host={host}
+                  enabled={hostMenuOpen}
+                  className="col-span-2 col-start-2 row-start-2"
+                />
+              </span>
+            ) : reconnect ? (
               <span
                 className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
                 data-testid="new-chat-landing-use-this-machine"
@@ -6908,6 +6999,7 @@ export function NewChatLandingScreen() {
                     </div>
                     {/* Host chip */}
                     <DropdownMenu
+                      open={hostMenuOpen}
                       onOpenChange={(open) => {
                         setHostMenuOpen(open);
                         if (!open) setOfflineHostLimit(0);
@@ -6934,6 +7026,7 @@ export function NewChatLandingScreen() {
                       >
                         <DropdownMenuTrigger asChild>
                           <ComposerHostTrigger
+                            ref={hostPickerRef}
                             label={
                               sandboxSelected
                                 ? `Host: ${hostLabel}`
@@ -6957,6 +7050,9 @@ export function NewChatLandingScreen() {
                         sideOffset={6}
                         className="composer-host-menu min-w-[220px] max-w-[min(360px,calc(100vw-24px))]"
                         data-testid="new-chat-landing-host-menu"
+                        onCloseAutoFocus={(event) => {
+                          if (editingHost) event.preventDefault();
+                        }}
                       >
                         {hasCloudOptions && (
                           <div className="px-2 py-1 text-xs leading-[18px] text-muted-foreground/75">
@@ -6990,7 +7086,9 @@ export function NewChatLandingScreen() {
                                   <span className="flex size-4 shrink-0 items-center justify-center">
                                     <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
                                   </span>
-                                  <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                                  <span className="text-sm">
+                                    {sandboxLabelForProvider(provider)}
+                                  </span>
                                 </span>
                               </DropdownMenuItem>
                             ))
@@ -7128,6 +7226,19 @@ export function NewChatLandingScreen() {
                           </>
                         )}
                         <DropdownMenuSeparator />
+                        {discoveryProviders.map((provider) => (
+                          <DropdownMenuItem
+                            key={`discover-${provider}`}
+                            onSelect={() => setDiscoveryProvider(provider)}
+                            className="composer-host-connect text-muted-foreground"
+                          >
+                            <PlusIcon className="size-4" aria-hidden="true" />
+                            <span>
+                              Existing Static Sandbox
+                              {discoveryProviders.length > 1 && ` (${provider})`}
+                            </span>
+                          </DropdownMenuItem>
+                        ))}
                         {/* Persistent escape hatch: open the connect-a-host
                     instructions. Present even with zero hosts so a fresh user
                     is never stuck. */}
@@ -7339,7 +7450,7 @@ export function NewChatLandingScreen() {
           {selectedAgentUnconfigured && (
             <HarnessSetupNotice
               agentName={selectedAgent?.display_name}
-              hostName={harnessWarningHost?.name}
+              hostName={harnessWarningHost?.display_name ?? harnessWarningHost?.name}
               harness={selectedAgent?.harness ?? null}
               reason={harnessUnavailableReasonOnHost(selectedAgent?.harness, harnessWarningHost)}
               featureEnabled={harnessInstallEnabled}
@@ -7366,7 +7477,7 @@ export function NewChatLandingScreen() {
               <TriangleAlertIcon className="size-3.5 shrink-0" />
               <span>
                 {smartRoutingDroppedMessage(smartRoutingDropped, {
-                  hostName: harnessWarningHost?.name,
+                  hostName: harnessWarningHost?.display_name ?? harnessWarningHost?.name,
                   fallbackAgentName: selectedAgent?.display_name,
                 })}
               </span>
@@ -7498,6 +7609,25 @@ export function NewChatLandingScreen() {
           </div>
         </footer>
       ) : null}
+
+      {discoveryProvider !== null && (
+        <StaticSandboxPicker
+          provider={discoveryProvider}
+          onClose={() => setDiscoveryProvider(null)}
+          onSelect={selectHost}
+        />
+      )}
+
+      {editingHost && (
+        <StaticSandboxName
+          host={editingHost}
+          onClose={() => setEditingHost(null)}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            hostPickerRef.current?.focus();
+          }}
+        />
+      )}
 
       {/* Connect-host instructions, reachable from the host dropdown even when
           no hosts are online — the zero-host escape hatch. */}

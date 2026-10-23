@@ -326,7 +326,9 @@ function HostSelect({
             componentId="settings.harnesses.host"
           >
             <HostStatusDot online={selected?.status === "online"} />
-            <span className="max-w-40 truncate">{selected?.name ?? "Select a host"}</span>
+            <span className="max-w-40 truncate">
+              {selected?.display_name ?? selected?.name ?? "Select a host"}
+            </span>
             <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
@@ -343,7 +345,7 @@ function HostSelect({
                 className="gap-1.5 data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
               >
                 <HostStatusDot online={online} />
-                <span className="min-w-0 flex-1 truncate">{h.name}</span>
+                <span className="min-w-0 flex-1 truncate">{h.display_name ?? h.name}</span>
                 {!online && <span className="text-xs text-muted-foreground">Offline</span>}
               </DropdownMenuItem>
             );
@@ -686,7 +688,8 @@ function HarnessDetail({
           </>
         ) : (
           <p className="text-ui text-muted-foreground">
-            Set up {entry.name} on {host.name} to manage its MCP servers, skills, and plugins.
+            Set up {entry.name} on {host.display_name ?? host.name} to manage its MCP servers,
+            skills, and plugins.
           </p>
         )}
       </div>
@@ -705,7 +708,7 @@ function MachineField({ host }: { host: Host }) {
     <div className="mt-6 grid max-w-xl grid-cols-[8rem_1fr] items-center gap-3">
       <span className="text-ui text-muted-foreground">Machine</span>
       <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-ui">
-        {host.name}
+        {host.display_name ?? host.name}
       </div>
     </div>
   );
@@ -728,12 +731,12 @@ function HarnessWarning({
 }) {
   const copy =
     reason === "readiness-error"
-      ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
+      ? `${entry.name} isn’t working on ${host.display_name ?? host.name}. Run setup again to fix it.`
       : mode === "reconfigure"
-        ? `${entry.name} can’t sign in on ${host.name}. Its credential is missing, so new sessions can’t use ${entry.name}.`
+        ? `${entry.name} can’t sign in on ${host.display_name ?? host.name}. Its credential is missing, so new sessions can’t use ${entry.name}.`
         : mode === "update"
-          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+          ? `${entry.name} is out of date on ${host.display_name ?? host.name}. Update it so new sessions can use ${entry.name}.`
+          : `${entry.name} isn’t set up on ${host.display_name ?? host.name}, so new sessions can’t use ${entry.name}.`;
   const action = !installable
     ? "Set up"
     : mode === "update"
@@ -770,7 +773,8 @@ function ReadyNotice({
       <CheckCircle2Icon className="size-4 shrink-0" aria-hidden />
       <p>
         {entry.name}
-        {version ? ` ${version}` : ""} is ready on {host.name}. Checked just now.
+        {version ? ` ${version}` : ""} is ready on {host.display_name ?? host.name}. Checked just
+        now.
       </p>
     </div>
   );
@@ -784,15 +788,15 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
     return (
       <p className="text-ui text-muted-foreground">
         {error instanceof ApiError && error.status === 501
-          ? `Update ${host.name} to see launch settings.`
-          : `Couldn't load launch settings from ${host.name}.`}
+          ? `Update ${host.display_name ?? host.name} to see launch settings.`
+          : `Couldn't load launch settings from ${host.display_name ?? host.name}.`}
       </p>
     );
   }
   const source = {
-    env: `From OMNIGENT_${harness.replace(/-native$/, "").toUpperCase()}_PATH on ${host.name}.`,
-    config: `From harness.${harness} in ~/.omnigent/config.yaml on ${host.name}.`,
-    default: `Default command on ${host.name}.`,
+    env: `From OMNIGENT_${harness.replace(/-native$/, "").toUpperCase()}_PATH on ${host.display_name ?? host.name}.`,
+    config: `From harness.${harness} in ~/.omnigent/config.yaml on ${host.display_name ?? host.name}.`,
+    default: `Default command on ${host.display_name ?? host.name}.`,
   }[data.command_source];
   return (
     <section className="flex flex-col gap-4">
@@ -846,7 +850,7 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
         ) : (
           <p className="text-ui text-muted-foreground">
             {data.configured_args == null
-              ? `Update ${host.name} to see environment settings.`
+              ? `Update ${host.display_name ?? host.name} to see environment settings.`
               : "Cannot separate environment values for this env wrapper. Command and arguments are shown unchanged."}
           </p>
         )}
@@ -857,7 +861,7 @@ function StartupSettings({ host, harness }: { host: Host; harness: string }) {
           <p className="rounded-xl border border-border p-3 text-ui">
             {data.arg_count === 0
               ? "None configured"
-              : `${data.arg_count} configured argument${data.arg_count === 1 ? "" : "s"}. Update ${host.name} to view values.`}
+              : `${data.arg_count} configured argument${data.arg_count === 1 ? "" : "s"}. Update ${host.display_name ?? host.name} to view values.`}
           </p>
         ) : (
           <StartupArguments args={data.args} />

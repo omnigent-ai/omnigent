@@ -127,6 +127,7 @@ async def _connect_host(
     registry: HostRegistry,
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
+    token: str | None = None,
     configured_harnesses: dict[str, bool | str] | None = None,
     gateway_inference: dict[str, bool] | None = None,
 ) -> ApplicationCommunicator:
@@ -143,7 +144,10 @@ async def _connect_host(
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
-    comm = ApplicationCommunicator(app, _websocket_scope(path))
+    scope = _websocket_scope(path)
+    if token is not None:
+        scope["headers"] = [(b"x-omnigent-host-token", token.encode())]
+    comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
@@ -205,6 +209,7 @@ async def test_list_hosts_returns_connected_host(
     # field must be present and None so clients can tell it apart from
     # server-managed hosts without a schema sniff.
     assert hosts[0]["sandbox_provider"] is None
+    assert hosts[0]["sandbox_id"] is None
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(
@@ -247,6 +252,7 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
     # host process dials the tunnel.
     assert hosts[0]["status"] == "offline"
     assert hosts[0]["sandbox_provider"] == "modal"
+    assert hosts[0]["sandbox_id"] == "sb-12345"
 
 
 async def test_get_host_returns_details(
@@ -269,6 +275,7 @@ async def test_get_host_returns_details(
     # Detail endpoint mirrors list_hosts: a tunnel-connected host is
     # not sandbox-backed, so the field is present and None.
     assert data["sandbox_provider"] is None
+    assert data["sandbox_id"] is None
 
 
 async def test_hosts_api_surfaces_configured_harnesses(
@@ -1507,3 +1514,293 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
     assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
     # The callback owns the event; the tunnel must not log a session-less duplicate.
     assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+
+
+@pytest.mark.parametrize("supports_creation", [False, True])
+async def test_attach_api_reuses_one_tunnel_for_two_session_launches(
+    host_api_app, supports_creation
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+    from omnigent.onboarding.sandboxes.types import SandboxInfo
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    app, registry, store, conversations = host_api_app
+    loop = asyncio.get_running_loop()
+    connections = []
+
+    def connect(start):
+        connections.append(
+            asyncio.run_coroutine_threadsafe(
+                _connect_host(
+                    app, registry, host_id=start.host_id, name=start.host_name, token=start.token
+                ),
+                loop,
+            ).result(timeout=10)
+        )
+
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        reusable_hosts=True,
+        attachments={"devbox": "local"},
+        on_host_start=connect,
+    )
+    fake.list_for_user = lambda *, owner: [SandboxInfo("devbox", name="My devbox")]
+    fake.supports_managed_launch = supports_creation
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            token_ttl_s=3600,
+            provider="modal",
+            launcher_factory=lambda: fake,
+            managed_launch_supported=supports_creation,
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        inventory = await client.get("/v1/hosts/sandboxes?provider=modal")
+        assert inventory.json() == {
+            "sandboxes": [{"sandbox_id": "devbox", "name": "My devbox", "state": None}]
+        }
+        assert store.list_hosts("local") == []
+        assert not fake.host_starts and not fake.provisioned_names
+        payload = {"provider": "modal", "sandbox_id": "devbox", "name": "My devbox"}
+        attached = await client.post("/v1/hosts/attach", json=payload)
+        assert attached.status_code == 200, attached.text
+        host_id = attached.json()["host_id"]
+        before = store.get_host(host_id)
+        renamed = await client.patch(f"/v1/hosts/{host_id}", json={"display_name": "My project"})
+        assert renamed.json() == {"host_id": host_id, "display_name": "My project"}
+        assert store.get_host(host_id).updated_at == before.updated_at
+        assert (await client.get(f"/v1/hosts/{host_id}")).json()["display_name"] == "My project"
+        assert (await client.get(f"/v1/hosts/{host_id}")).json()["sandbox_id"] == "devbox"
+        retry = await client.post("/v1/hosts/attach", json=payload)
+        assert retry.json() == attached.json()
+        fake.attachments.clear()
+        denied = await client.post("/v1/hosts/attach", json=payload)
+        assert denied.status_code == 403  # Listing or prior attachment never grants access.
+        hosts = (await client.get("/v1/hosts")).json()["hosts"]
+        assert len(hosts) == 1 and hosts[0]["sandbox_attached"] is True
+        assert hosts[0]["sandbox_id"] == "devbox"
+        assert hosts[0]["name"] == before.name and hosts[0]["display_name"] == "My project"
+        cleared = await client.patch(f"/v1/hosts/{host_id}", json={"display_name": None})
+        assert cleared.json()["display_name"] is None
+        assert len(connections) == 1
+        comm = connections[0]
+        try:
+
+            async def respond():
+                while True:
+                    output = await comm.receive_output(timeout=10)
+                    if output["type"] != "websocket.send":
+                        continue
+                    frame = decode_host_frame(output["text"])
+                    if isinstance(frame, HostLaunchRunnerFrame):
+                        await comm.send_input(
+                            {
+                                "type": "websocket.receive",
+                                "text": encode_host_frame(
+                                    HostLaunchRunnerResultFrame(
+                                        request_id=frame.request_id, status="launched"
+                                    )
+                                ),
+                            }
+                        )
+                        return
+
+            runner_ids = []
+            for _ in range(2):
+                conv = conversations.create_conversation(agent_id=None)
+                responder = asyncio.create_task(respond())
+                response = await client.post(
+                    f"/v1/hosts/{host_id}/runners",
+                    json={
+                        "session_id": conv.id,
+                        "workspace": "/tmp/test-workspace",
+                    },
+                )
+                await responder
+                assert response.status_code == 200, response.text
+                assert conversations.get_conversation(conv.id).host_id == host_id
+                runner_ids.append(response.json()["runner_id"])
+            assert len(set(runner_ids)) == 2
+            assert (await client.delete(f"/v1/hosts/{host_id}")).status_code == 200
+            assert store.get_host(host_id) is None
+            start = fake.host_starts[0]
+            assert store.resolve_launch_token(host_id, start.token) is None
+            assert not fake.provisioned_names and not fake.terminated
+        finally:
+            await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            await comm.wait(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "owner,box,status,opted_in",
+    [
+        (None, "devbox", 401, True),
+        ("bob", "devbox", 403, True),
+        ("alice", "foreign", 403, True),
+        ("alice", "devbox", 400, False),
+    ],
+)
+async def test_attach_api_requires_provider_authorization(
+    multi_user_app, owner, box, status, opted_in
+):
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    app, _, store, _ = multi_user_app
+    fake = FakeSandboxLauncher(
+        can_resume=True, attachments={"devbox": "alice"} if opted_in else None
+    )
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            token_ttl_s=3600,
+            provider="modal",
+            launcher_factory=lambda: fake,
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        if owner is None:
+            with pytest.raises(OmnigentError) as denied:
+                await client.post(
+                    "/v1/hosts/attach",
+                    json={
+                        "provider": "modal",
+                        "sandbox_id": box,
+                        "name": "Devbox",
+                    },
+                )
+            assert denied.value.http_status == status
+            return
+        response = await client.post(
+            "/v1/hosts/attach",
+            headers={"x-test-user": owner} if owner else {},
+            json={"provider": "modal", "sandbox_id": box, "name": "Devbox"},
+        )
+    assert response.status_code == status
+    assert store.list_hosts(owner or "local") == []
+    assert fake.host_starts == []
+
+
+async def test_discovery_is_owner_scoped_and_read_only(multi_user_app):
+    import click
+
+    from omnigent.onboarding.sandboxes.types import SandboxInfo
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    app, _, store, _ = multi_user_app
+    calls = []
+
+    class Discoverable(FakeSandboxLauncher):
+        def bind_principal(self, principal):
+            self.principal = principal
+
+        def list_for_user(self, *, owner):
+            assert self.principal == owner
+            calls.append(owner)
+            if owner == "denied":
+                raise PermissionError("no access")
+            if owner == "unavailable":
+                raise click.ClickException("controller unavailable")
+            return [
+                SandboxInfo(f"{owner}-{i}", name=f"Box {i}", state="running" if i else None)
+                for i in range(2)
+            ]
+
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            token_ttl_s=3600,
+            provider="modal",
+            launcher_factory=lambda: Discoverable(can_resume=True, reusable_hosts=True),
+        )
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        url = "/v1/hosts/sandboxes?provider=modal"
+        with pytest.raises(OmnigentError) as denied:
+            await client.get(url)
+        assert denied.value.http_status == 401 and not calls
+        for owner in ("alice", "bob"):
+            response = await client.get(url, headers={"x-test-user": owner})
+            assert response.status_code == 200
+            assert response.json() == {
+                "sandboxes": [
+                    {
+                        "sandbox_id": f"{owner}-{i}",
+                        "name": f"Box {i}",
+                        "state": "running" if i else None,
+                    }
+                    for i in range(2)
+                ]
+            }
+            assert store.list_hosts(owner) == []
+        for owner, status in (("denied", 403), ("unavailable", 502)):
+            response = await client.get(url, headers={"x-test-user": owner})
+            assert response.status_code == status
+        app.state.sandbox_config.configs[0].launcher_factory = lambda: FakeSandboxLauncher(
+            can_resume=True, reusable_hosts=True
+        )
+        response = await client.get(url, headers={"x-test-user": "alice"})
+        assert response.json() == {"sandboxes": []}
+        app.state.sandbox_config.configs[0].launcher_factory = FakeSandboxLauncher
+        response = await client.get(url, headers={"x-test-user": "alice"})
+        assert response.status_code == 400
+
+
+@pytest.mark.parametrize("method,action", [("POST", "/wake"), ("DELETE", ""), ("PATCH", "")])
+async def test_attached_host_actions_require_host_owner(multi_user_app, method, action):
+    app, _, store, _ = multi_user_app
+    host = store.reserve_sandbox_host(
+        host_id=_HOST_ID,
+        name="Devbox",
+        user_id="alice",
+        provider="modal",
+        attached_sandbox_id="devbox",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.request(
+            method,
+            f"/v1/hosts/{host.host_id}{action}",
+            headers={"x-test-user": "bob"},
+            **({"json": {"display_name": "Foreign"}} if method == "PATCH" else {}),
+        )
+    assert response.status_code == 404
+    assert store.get_host(host.host_id) == host
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"display_name": ""},
+        {"display_name": " "},
+        {"display_name": " padded"},
+        {"display_name": "x" * 65},
+        {"display_name": "bad\nname"},
+        {"display_name": "bad\x00name"},
+        {"display_name": "Good", "name": "changed"},
+    ],
+)
+async def test_sandbox_rename_validates_input(host_api_app, body):
+    app, _, store, _ = host_api_app
+    store.reserve_sandbox_host(
+        host_id=_HOST_ID,
+        name="original",
+        user_id="local",
+        provider="static",
+        attached_sandbox_id="box",
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(f"/v1/hosts/{_HOST_ID}", json=body)
+    assert response.status_code == 422
+    assert store.get_host(_HOST_ID).display_name is None
+
+
+async def test_sandbox_rename_requires_authentication(multi_user_app):
+    app, _, _, _ = multi_user_app
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        with pytest.raises(OmnigentError) as denied:
+            await client.patch(f"/v1/hosts/{_HOST_ID}", json={"display_name": "My project"})
+    assert denied.value.http_status == 401

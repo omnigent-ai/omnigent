@@ -161,17 +161,19 @@ export function HarnessCatalog({
     const noun = KINDS.find((k) => k.id === kind)?.noun;
     if (loading) return <Notice>Loading {noun}…</Notice>;
     if (kind === "mcps" && inventory.mcpUnsupported)
-      return <Notice>Please update host {host.name} to list MCP servers.</Notice>;
+      return (
+        <Notice>Please update host {host.display_name ?? host.name} to list MCP servers.</Notice>
+      );
     if (failed(kind))
       return (
         <Notice>
-          Couldn't load {noun} from {host.name}.
+          Couldn't load {noun} from {host.display_name ?? host.name}.
         </Notice>
       );
     if (count === 0)
       return (
         <Notice>
-          No {noun} found on {host.name}.
+          No {noun} found on {host.display_name ?? host.name}.
         </Notice>
       );
     return list;
@@ -370,7 +372,11 @@ function PluginPage({
           </TabsTrigger>
         </TabsList>
         <TabsContent value="skills">
-          {needsUpdate && <Notice>Update {host.name} to read installed plugin skills.</Notice>}
+          {needsUpdate && (
+            <Notice>
+              Update {host.display_name ?? host.name} to read installed plugin skills.
+            </Notice>
+          )}
           <ul className="flex flex-col gap-2">
             {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
             {skills.map(({ name, id }) => (
@@ -395,7 +401,7 @@ function PluginPage({
               plugin.enabled === false
                 ? "This plugin is disabled. Enable it in Claude Code to inspect MCP tools."
                 : plugin.marketplace !== undefined && !plugin.mcp_entries
-                  ? `Update ${host.name} to inspect installed plugin MCP tools.`
+                  ? `Update ${host.display_name ?? host.name} to inspect installed plugin MCP tools.`
                   : undefined
             }
           />
@@ -436,7 +442,7 @@ function SkillPage({
       ) : query.error ? (
         <Notice>
           {query.error instanceof ApiError && query.error.status === 501
-            ? `Update ${host.name} to see skill contents.`
+            ? `Update ${host.display_name ?? host.name} to see skill contents.`
             : "Couldn't load skill contents."}
         </Notice>
       ) : query.data ? (
@@ -597,7 +603,7 @@ function McpRow({
         ) : query.error ? (
           <Notice>
             {query.error instanceof ApiError && query.error.status === 501
-              ? `Update ${host.name} to list tools.`
+              ? `Update ${host.display_name ?? host.name} to list tools.`
               : query.error instanceof ApiError && query.error.status === 503
                 ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
                 : `Couldn't reach ${server.name}.`}

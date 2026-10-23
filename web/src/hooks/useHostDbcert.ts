@@ -186,7 +186,7 @@ export function useHostDbcert(
   return {
     show: refreshMode !== null && expired && expiresAt !== dismissedExpiry,
     refreshMode,
-    hostName: host?.name ?? "",
+    hostName: host?.display_name ?? host?.name ?? "",
     phase,
     refresh,
     dismiss: () => setDismissedExpiry(expiresAt),
