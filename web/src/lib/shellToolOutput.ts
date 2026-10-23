@@ -5,6 +5,8 @@ export interface ShellToolOutput {
   exitCode: number | null;
   /** Whether the command was killed for running past its timeout. */
   timedOut: boolean;
+  /** Working directory the command ran in, when the output reports it. */
+  cwd: string | null;
 }
 
 // The last `[exit code: N]` line that ends the output or is followed by a
@@ -31,7 +33,7 @@ const TRAILING_PARTIAL_ESCAPE_RE = /\u001b(?:\[[0-?]*[ -/]*)?$/;
 /**
  * Parse a shell tool's raw output into the text a terminal would show plus
  * the exit code. `sys_os_shell` returns `{stdout, stderr, exit_code,
- * timed_out}` JSON, Codex `shell` appends `[exit code: N]` when the command
+ * timed_out, cwd}` JSON, Codex `shell` appends `[exit code: N]` when the command
  * failed, and other harnesses (Claude `Bash`, Pi/OpenCode `bash`) return
  * plain text.
  */
@@ -41,13 +43,14 @@ export function parseShellToolOutput(output: string): ShellToolOutput {
 
   const text = normalizeOutputText(output);
   const match = Array.from(text.matchAll(EXIT_CODE_LINE_RE)).at(-1);
-  if (match === undefined) return { text, exitCode: null, timedOut: false };
+  if (match === undefined) return { text, exitCode: null, timedOut: false, cwd: null };
   const before = text.slice(0, match.index).replace(/\n+$/, "");
   const after = text.slice(match.index + match[0].length);
   return {
     text: before.length === 0 ? after.replace(/^\n+/, "") : before + after,
     exitCode: Number(match[1]),
     timedOut: false,
+    cwd: null,
   };
 }
 
@@ -63,6 +66,7 @@ function parseStructuredOutput(output: string): ShellToolOutput | null {
   const stdout = Reflect.get(parsed, "stdout");
   const stderr = Reflect.get(parsed, "stderr");
   const exitCode = Reflect.get(parsed, "exit_code");
+  const cwd = Reflect.get(parsed, "cwd");
   if (typeof stdout !== "string" && typeof stderr !== "string") return null;
   const parts = [stdout, stderr]
     .filter((part): part is string => typeof part === "string")
@@ -72,6 +76,7 @@ function parseStructuredOutput(output: string): ShellToolOutput | null {
     text: parts.join("\n"),
     exitCode: typeof exitCode === "number" && Number.isInteger(exitCode) ? exitCode : null,
     timedOut: Reflect.get(parsed, "timed_out") === true,
+    cwd: typeof cwd === "string" && cwd.length > 0 ? cwd : null,
   };
 }
 

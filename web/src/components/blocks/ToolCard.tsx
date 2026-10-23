@@ -211,7 +211,7 @@ export function ToolCard({
         {shellCommand !== null ? (
           <ShellTerminalPanel
             command={shellCommand}
-            cwd={typeof args.cwd === "string" && args.cwd.length > 0 ? args.cwd : null}
+            argsCwd={typeof args.cwd === "string" && args.cwd.length > 0 ? args.cwd : null}
             inputJson={inputJson}
             output={output}
             state={state}
@@ -397,13 +397,14 @@ function ShellCommandLine({ command }: { command: string }) {
  */
 function ShellTerminalPanel({
   command,
-  cwd,
+  argsCwd,
   inputJson,
   output,
   state,
 }: {
   command: string;
-  cwd: string | null;
+  /** Working directory from the call's arguments (Codex sends one). */
+  argsCwd: string | null;
   inputJson: string;
   output: string | null;
   state: ToolState;
@@ -412,6 +413,8 @@ function ShellTerminalPanel({
   const [showRaw, setShowRaw] = useState(false);
   const parsed = useMemo(() => (output === null ? null : parseShellToolOutput(output)), [output]);
   const hasOutput = parsed !== null && parsed.text.length > 0;
+  // sys_os_shell reports its working directory in the result instead.
+  const cwd = argsCwd ?? parsed?.cwd ?? null;
   // With no cwd line, float the actions so only the command's first line wraps
   // around them; unwrapped lines cannot flow around a float, so they get a row.
   const floatActions = cwd === null && wrap;

@@ -3,11 +3,17 @@ import { dropTrailingPartialEscape, parseShellToolOutput, stripAnsi } from "./sh
 
 describe("parseShellToolOutput", () => {
   it("reads sys_os_shell's structured stdout, stderr and exit_code", () => {
-    const output = JSON.stringify({ stdout: "built\n", stderr: "warning: slow\n", exit_code: 2 });
+    const output = JSON.stringify({
+      stdout: "built\n",
+      stderr: "warning: slow\n",
+      exit_code: 2,
+      cwd: "/repo/web",
+    });
     expect(parseShellToolOutput(output)).toEqual({
       text: "built\nwarning: slow",
       exitCode: 2,
       timedOut: false,
+      cwd: "/repo/web",
     });
   });
 
@@ -23,6 +29,7 @@ describe("parseShellToolOutput", () => {
       text: "partial",
       exitCode: null,
       timedOut: true,
+      cwd: null,
     });
   });
 
@@ -31,6 +38,7 @@ describe("parseShellToolOutput", () => {
       text: "no such file",
       exitCode: 1,
       timedOut: false,
+      cwd: null,
     });
     expect(parseShellToolOutput("[exit code: 127]").exitCode).toBe(127);
     expect(parseShellToolOutput("boom\n\n[exit code: 3]").text).toBe("boom");
@@ -42,6 +50,7 @@ describe("parseShellToolOutput", () => {
       text: "bwrap: setting up uid map\n\nRetry outside the sandbox.",
       exitCode: 1,
       timedOut: false,
+      cwd: null,
     });
   });
 
@@ -50,6 +59,7 @@ describe("parseShellToolOutput", () => {
       text: "hello\nworld",
       exitCode: null,
       timedOut: false,
+      cwd: null,
     });
     // JSON that is not a shell result renders verbatim.
     expect(parseShellToolOutput('{"rows": 3}').text).toBe('{"rows": 3}');

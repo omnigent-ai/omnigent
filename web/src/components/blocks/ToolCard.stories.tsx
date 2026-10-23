@@ -175,6 +175,28 @@ export const ShellRunning: Story = {
   play: async ({ canvasElement }) => expand(canvasElement),
 };
 
+// sys_os_shell reports its working directory in the result, not the arguments.
+export const ShellSysOsShellResultCwd: Story = {
+  args: {
+    name: "sys_os_shell",
+    arguments: { command: "git log --oneline -3" },
+    output: JSON.stringify({
+      stdout:
+        "c645d6d08 fix(web): let a long shell command use the full width\n" +
+        "af55a1f0a test(e2e-ui): regenerate visual baselines\n" +
+        "4016b026d fix(web): drop the empty header line\n",
+      stderr: "",
+      exit_code: 0,
+      timed_out: false,
+      cwd: "/home/dev/omnigent",
+    }),
+    state: "output-available",
+    startedAt: null,
+    duration: 0.05,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
 // Claude's Bash carries no cwd, so the actions share the command's line.
 export const ShellLongCommandWithoutCwd: Story = {
   args: {

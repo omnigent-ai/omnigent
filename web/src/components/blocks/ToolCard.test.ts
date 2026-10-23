@@ -326,6 +326,18 @@ describe("ToolCard shell terminal panel", () => {
     expect(screen.queryByText(genericMessage)).toBeNull();
   });
 
+  it("shows the working directory sys_os_shell reports in its result", () => {
+    // WHY: sys_os_shell has no cwd argument; its result carries the real one.
+    const { container } = renderCard({
+      name: "sys_os_shell",
+      arguments: { command: "pwd" },
+      output: JSON.stringify({ stdout: "/repo/web\n", stderr: "", exit_code: 0, cwd: "/repo/web" }),
+      state: "output-available",
+    });
+    expand(container);
+    expect(screen.getByTitle("/repo/web")).toBeInTheDocument();
+  });
+
   it("shows when sys_os_shell killed a command for timing out", () => {
     const { container } = renderCard({
       name: "sys_os_shell",
