@@ -157,10 +157,8 @@ export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
 ];
 
 /**
- * Create-time effort ladder for a native harness, or `null` when it takes none.
- * Claude Code and Pi are fixed; Codex reads `model` (or the default row) from
- * `modelOptions`, and an unresolved model yields no levels. Devin is omitted:
- * Project settings has no Devin model default.
+ * Create-time effort ladder for a native harness (`null` = none). Codex uses
+ * `model` or the catalog default; Devin is omitted (no project model default).
  */
 export function nativeEffortOptions(
   harness: string | null | undefined,

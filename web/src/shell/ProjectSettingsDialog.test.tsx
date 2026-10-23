@@ -517,8 +517,22 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("clears the effort default when the default agent is cleared", async () => {
-    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+  it.each([
+    {
+      label: "is cleared",
+      change: () => fireEvent.click(screen.getByRole("button", { name: "Clear" })),
+      saved: {},
+    },
+    {
+      label: "changes",
+      change: () => {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_codex"));
+      },
+      saved: { agent_id: "ag_codex" },
+    },
+  ])("drops the effort default when the default agent $label", async ({ change, saved }) => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexAgent()] });
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -528,29 +542,9 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("Max"),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    change();
     fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
-  });
-
-  it("drops the effort default when the default agent changes", async () => {
-    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexAgent()] });
-    getProjectMock.mockResolvedValue({
-      id: "p_1",
-      name: "Work",
-      config: { agent_id: "ag_claude", effort: "high" },
-    });
-    renderDialog();
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High"),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_codex"));
-    await waitFor(() =>
-      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default"),
-    );
-    fireEvent.click(screen.getByTestId("project-settings-save"));
-    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_codex" }));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", saved));
   });
 
   it("offers the Codex model's effort ladder and drops an effort the new model lacks", async () => {

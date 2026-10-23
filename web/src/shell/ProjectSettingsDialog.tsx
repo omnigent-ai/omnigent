@@ -1,18 +1,6 @@
-// Editor for a project's stored default session settings (`config`), reached
-// from the project-folder kebab menu. Writing a project's config is what lets
-// the new-chat composer pre-fill host / working directory / agent and the
-// isolated-worktree default when starting a session in the project.
-//
-// Scope mirrors what the composer prefills today: host, workspace, agent,
-// whether new sessions start in a fresh git worktree, the base branch a
-// worktree forks from (which overrides the user-global default in Settings ›
-// Git), and — when the default agent is a native harness with a model choice
-// (Claude Code / Codex / Pi) — a default model and reasoning effort for new
-// sessions. The host and agent pickers reuse the composer's components; the
-// working directory reuses its filesystem browser (inline, so it scrolls inside
-// the modal).
-// Fields are optional: an unset one stores no default (an absent key), and an
-// all-default dialog stores an empty config.
+// Project settings dialog: edits the stored defaults (`config`) the new-session
+// composer prefills (host, workspace, agent, worktree and base branch, and a model
+// and effort for native harnesses). An unset field stores no key.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -596,7 +584,7 @@ export function ProjectSettingsDialog({
               label="Effort"
               hint={
                 effortPickerEmpty
-                  ? "No effort levels available — pick a model (or connect a host) to choose from its levels"
+                  ? "Pick a model or connect a host to see effort levels."
                   : "Default reasoning effort for new sessions with this agent"
               }
             >
