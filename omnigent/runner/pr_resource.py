@@ -71,10 +71,13 @@ _ATTACHMENT_SIGNATURES: tuple[tuple[int, bytes, str, str], ...] = (
     (0, b"\xff\xd8\xff", "image/jpeg", "jpg"),
     (0, b"GIF87a", "image/gif", "gif"),
     (0, b"GIF89a", "image/gif", "gif"),
-    (8, b"WEBP", "image/webp", "webp"),
-    (8, b"qt  ", "video/quicktime", "mov"),
-    (4, b"ftyp", "video/mp4", "mp4"),
     (0, b"\x1a\x45\xdf\xa3", "video/webm", "webm"),
+)
+# ISO media files (``ftyp`` at byte 4) name their format in the next four bytes;
+# only video brands count, so HEIC and AVIF photos aren't sent as MP4.
+_QUICKTIME_BRAND = b"qt  "
+_MP4_BRANDS = frozenset(
+    (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ")
 )
 
 _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
@@ -851,6 +854,13 @@ def _attachment_media_type(content: bytes) -> tuple[str, str] | None:
     for offset, signature, content_type, extension in _ATTACHMENT_SIGNATURES:
         if content[offset : offset + len(signature)] == signature:
             return content_type, extension
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if content[4:8] == b"ftyp":
+        if content[8:12] == _QUICKTIME_BRAND:
+            return "video/quicktime", "mov"
+        if content[8:12] in _MP4_BRANDS:
+            return "video/mp4", "mp4"
     return None
 
 

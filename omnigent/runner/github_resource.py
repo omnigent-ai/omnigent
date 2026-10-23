@@ -1933,6 +1933,14 @@ def _attachments_endpoint(host: str) -> str:
     return f"https://{host}/api/uploads/user-attachments/assets"
 
 
+def _is_attachment_url(url: str, host: str) -> bool:
+    """Whether ``url`` is a user-attachments asset on ``host``, as an upload returns."""
+    return (
+        re.fullmatch(rf"https://{re.escape(host)}/user-attachments/assets/[0-9a-f-]+", url)
+        is not None
+    )
+
+
 def _upload_attachment(
     root: str, reference: PullRequestRef, *, name: str, content_type: str, content: bytes
 ) -> dict[str, Any]:
@@ -1943,6 +1951,9 @@ def _upload_attachment(
     with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
         host = _host_args(root, reference)
         token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the upload must not run as another.
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
         rc, out, _ = _gh(
             ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
             cwd=root,
@@ -1982,7 +1993,7 @@ def _upload_attachment(
     except ValueError:
         result = None
     url = result.get("url") if isinstance(result, dict) else None
-    if rc == 0 and isinstance(url, str) and url.startswith("https://"):
+    if rc == 0 and isinstance(url, str) and _is_attachment_url(url, reference.host):
         return {
             "object": PR_ATTACHMENT_OBJECT,
             "url": url,

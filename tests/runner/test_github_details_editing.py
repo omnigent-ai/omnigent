@@ -157,12 +157,15 @@ def test_enterprise_uploads_go_to_the_hosts_upload_api(monkeypatch: pytest.Monke
     monkeypatch.setattr(
         github, "_list_accounts", lambda _root: (True, [{"host": "ghe.example.com"}])
     )
+    enterprise_asset = ASSET_URL.replace("github.com", "ghe.example.com")
     calls: list[GhCall] = []
     monkeypatch.setattr(
-        github, "_gh", _fake_gh(calls, [(0, "7", ""), (0, json.dumps({"url": ASSET_URL}), "")])
+        github,
+        "_gh",
+        _fake_gh(calls, [(0, "7", ""), (0, json.dumps({"url": enterprise_asset}), "")]),
     )
 
-    github._upload_attachment(
+    result = github._upload_attachment(
         "/workspace",
         PullRequestRef.from_url(ENTERPRISE_PR_URL),
         name="clip.mp4",
@@ -177,6 +180,7 @@ def test_enterprise_uploads_go_to_the_hosts_upload_api(monkeypatch: pytest.Monke
             "https://ghe.example.com/api/uploads/user-attachments/assets?content_type=video%2Fmp4"
         )
     )
+    assert result["url"] == enterprise_asset
 
 
 @pytest.mark.parametrize(
@@ -201,6 +205,10 @@ def test_enterprise_uploads_go_to_the_hosts_upload_api(monkeypatch: pytest.Monke
             "GitHub rejected the file: content_type is not included",
         ),
         ([(0, "7", ""), (0, json.dumps({"url": "javascript:alert(1)"}), "")], "could not upload"),
+        (
+            [(0, "7", ""), (0, json.dumps({"url": "https://evil.example/assets/1"}), "")],
+            "could not upload",
+        ),
     ],
 )
 def test_upload_attachment_failures_are_user_facing(
@@ -214,6 +222,25 @@ def test_upload_attachment_failures_are_user_facing(
     with pytest.raises(ValueError, match=message):
         github._upload_attachment(
             "/workspace", reference, name="a.png", content_type="image/png", content=PNG
+        )
+
+
+def test_upload_attachment_stops_when_the_token_lookup_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def token_lookup_times_out(_root: str, _reference: PullRequestRef) -> None:
+        github._gh_timed_out.set(True)
+
+    monkeypatch.setattr(github, "_pr_token", token_lookup_times_out)
+    monkeypatch.setattr(github, "_gh", _fake_gh([], []))
+
+    with pytest.raises(ValueError, match="took too long"):
+        github._upload_attachment(
+            "/workspace",
+            PullRequestRef.from_url(PR_URL),
+            name="a.png",
+            content_type="image/png",
+            content=PNG,
         )
 
 
@@ -318,6 +345,9 @@ def test_attachments_take_their_type_and_extension_from_the_content(
         ({"content": b""}, "attachment is empty"),
         ({"content": b"<svg xmlns='http://www.w3.org/2000/svg'/>"}, "Attach a PNG, JPEG"),
         ({"content": b"%PDF-1.7"}, "Attach a PNG, JPEG"),
+        ({"content": b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8}, "Attach a PNG, JPEG"),
+        ({"content": b"\x00\x00\x00\x1cftypavif" + b"\x00" * 8}, "Attach a PNG, JPEG"),
+        ({"content": b"ABCD\x00\x00\x00\x00WEBPVP8 "}, "Attach a PNG, JPEG"),
         ({"content": PNG + b"\x00" * (10 * 1024 * 1024)}, "An image can be at most 10 MB"),
         ({"pr_url": GITLAB_MR_URL, "content": PNG}, "Attaching files to a GitLab merge request"),
         ({"pr_url": None, "content": PNG}, "Select a pull request to attach files"),
