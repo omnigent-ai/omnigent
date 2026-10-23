@@ -905,7 +905,7 @@ function assistantItemPostTimeoutMs(config) {
     : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
-// Final assistant messages and errors survive transient transport failures.
+// Persisted history survives transient failures with a stable deduplication key.
 async function postConversationItem(config, data, sourceId) {
   const body = {
     type: "external_conversation_item",
@@ -1909,10 +1909,9 @@ module.exports = function (pi) {
     const key = `${responseId}:${callId}`;
     toolCallsById.set(callId, { key, responseId, name });
     if (postedToolCalls.has(key)) return;
-    postedToolCalls.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postConversationItem(
+      config,
+      {
         response_id: responseId,
         item_type: "function_call",
         item_data: {
@@ -1924,7 +1923,9 @@ module.exports = function (pi) {
           call_id: callId,
         },
       },
-    });
+      `pi:tool-call:${key}`,
+    );
+    postedToolCalls.add(key);
   }
 
   async function postToolResult(event, responseId) {
@@ -1934,10 +1935,9 @@ module.exports = function (pi) {
     const known = toolCallsById.get(callId);
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    postedToolResults.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postConversationItem(
+      config,
+      {
         response_id: known && known.responseId ? known.responseId : responseId,
         item_type: "function_call_output",
         item_data: {
@@ -1945,7 +1945,9 @@ module.exports = function (pi) {
           output: textFromToolResult(event),
         },
       },
-    });
+      `pi:tool-result:${key}`,
+    );
+    postedToolResults.add(key);
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {
@@ -1953,17 +1955,16 @@ module.exports = function (pi) {
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
-    postedReasoning.add(key);
-    postedReasoning.add(textKey);
-    if (!streamed) {
+    if (!streamed && !postedReasoning.has(`delta:${key}`)) {
+      postedReasoning.add(`delta:${key}`);
       await postEvent(config, {
         type: "external_output_reasoning_delta",
         data: { delta: text, started: true },
       });
     }
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postConversationItem(
+      config,
+      {
         response_id: responseId,
         item_type: "reasoning",
         item_data: {
@@ -1972,7 +1973,10 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
-    });
+      `pi:reasoning:${key}`,
+    );
+    postedReasoning.add(key);
+    postedReasoning.add(textKey);
   }
 
   function reasoningBlockKey(responseId, contentIndex) {
@@ -2289,14 +2293,20 @@ module.exports = function (pi) {
     rememberContext(ctx);
     const blocked = replayPendingInterrupt(ctx);
     const responseId = currentResponseId();
-    await postToolCall(
-      {
-        id: event && event.toolCallId,
-        name: event && event.toolName,
-        arguments: event && event.input,
-      },
-      responseId,
-    );
+    let historyError;
+    try {
+      await postToolCall(
+        {
+          id: event && event.toolCallId,
+          name: event && event.toolName,
+          arguments: event && event.input,
+        },
+        responseId,
+      );
+    } catch (error) {
+      // Persistence failure must not skip the tool's policy check.
+      historyError = error;
+    }
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
     }
@@ -2306,6 +2316,7 @@ module.exports = function (pi) {
     // ASK policies, a double prompt. Pi's own built-in tools (read/shell/etc)
     // are NOT bridged and stay gated here.
     if (bridgedTools.has((event && event.toolName) || "")) {
+      if (historyError) throw historyError;
       return;
     }
     // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
@@ -2324,6 +2335,7 @@ module.exports = function (pi) {
         reason: verdict.reason || "blocked by Omnigent policy",
       };
     }
+    if (historyError) throw historyError;
   });
 
   pi.on("tool_result", async (event, ctx) => {
@@ -2360,17 +2372,19 @@ module.exports = function (pi) {
         await applyModelChange(pi, config, ctx, decision.model);
       }
     }
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
-        response_id: `pi-user-${Date.now()}-${++sequence}`,
+    const responseId = newResponseId("user");
+    await postConversationItem(
+      config,
+      {
+        response_id: responseId,
         item_type: "message",
         item_data: {
           role: "user",
           content: [{ type: "input_text", text }],
         },
       },
-    });
+      `pi:user:${responseId}`,
+    );
   });
 
   pi.on("message_end", async (event, ctx) => {

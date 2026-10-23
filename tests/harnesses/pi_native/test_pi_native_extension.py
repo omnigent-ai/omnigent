@@ -1129,6 +1129,85 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user"])
+def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const kind = process.argv[3];
+  const events = {
+    tool_call: ["message_update", { assistantMessageEvent: {
+      type: "toolcall_end", toolCall: { id: "call-1", name: "read", arguments: { path: "a" } },
+    } }],
+    tool_result: ["tool_result", {
+      toolCallId: "call-1", content: [{ type: "text", text: "result" }],
+    }],
+    reasoning: ["message_update", { assistantMessageEvent: {
+      type: "thinking_end", contentIndex: 0, content: "plan",
+    } }],
+    user: ["input", { text: "terminal prompt", source: "extension" }],
+  };
+  const [handler, event] = events[kind];
+  const invoke = () => handlers[handler](event, ctx);
+  let status = 503;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.type !== "external_conversation_item") return { ok: true, status: 204 };
+    return { ok: status === 204, status };
+  };
+  await assert.rejects(invoke, /HTTP 503/);
+  let items = posted.filter((body) => body.type === "external_conversation_item");
+  assert.equal(items.length, 3);
+  assert.ok(items[0].data.source_id);
+  assert.deepEqual(items[0], items[1]);
+  assert.deepEqual(items[1], items[2]);
+
+  status = 204;
+  await invoke();
+  items = posted.filter((body) => body.type === "external_conversation_item");
+  assert.equal(items.length, 4);
+  if (kind !== "user") {
+    // A rejected delivery remains eligible; accepted callbacks are suppressed.
+    assert.deepEqual(items[0], items[3]);
+    await invoke();
+    assert.equal(posted.filter((body) => body.type === "external_conversation_item").length, 4);
+  }
+  if (kind === "reasoning") {
+    const deltas = posted.filter((body) => body.type === "external_output_reasoning_delta");
+    assert.equal(deltas.length, 1);
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_failed_tool_history_delivery_still_checks_policy(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let policyCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/events")) return { ok: false, status: 503 };
+    policyCalls += 1;
+    return { ok: true, text: async () => JSON.stringify({ result: "POLICY_ACTION_DENY" }) };
+  };
+  const result = await handlers.tool_call({
+    toolCallId: "call-denied", toolName: "bash", input: { command: "echo safe" },
+  }, ctx);
+  assert.equal(policyCalls, 1);
+  assert.equal(result.block, true);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_registers_omnigent_tools_and_execute_round_trips(tmp_path: Path) -> None:
     """The extension registers config.tools and execute() round-trips via /mcp.
 
