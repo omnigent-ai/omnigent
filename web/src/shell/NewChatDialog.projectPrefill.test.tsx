@@ -1104,22 +1104,28 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.cost_control_mode_override).not.toBe("on");
   });
 
-  it("keeps an explicit Smart Routing pick when a project effort arrives afterwards", async () => {
-    setClaudeAgentAndModels();
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
-    const { rerender } = renderRoutingLanding();
-    await waitForClaudeAgent();
-    openAgentConfig(CLAUDE_AGENT_ID);
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
-    closeAgentConfig();
+  it.each([
+    { pick: "Smart Routing", sent: { cost_control_mode_override: "on" } },
+    { pick: "Sonnet", sent: { model_override: "sonnet" } },
+  ])(
+    "keeps an explicit $pick pick when a project effort arrives afterwards",
+    async ({ pick, sent }) => {
+      setClaudeAgentAndModels();
+      setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+      const { rerender } = renderRoutingLanding();
+      await waitForClaudeAgent();
+      openAgentConfig(CLAUDE_AGENT_ID);
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: pick }));
+      closeAgentConfig();
 
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
-    rerender(<NewChatLandingScreen />);
+      setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+      rerender(<NewChatLandingScreen />);
 
-    const body = await submitAndReadBody();
-    expect(body.cost_control_mode_override).toBe("on");
-    expect(body.reasoning_effort).toBeUndefined();
-  });
+      const body = await submitAndReadBody();
+      expect(body).toMatchObject(sent);
+      expect(body.reasoning_effort).toBeUndefined();
+    },
+  );
 
   it("leaves the project effort off when the user switches to another agent", async () => {
     setClaudeAgentAndModels();
@@ -1153,20 +1159,27 @@ describe("NewChatLandingScreen project prefill", () => {
     },
   );
 
-  it("keeps the remembered effort when the remembered Codex model can't run the project effort", async () => {
-    setCodexAgentAndModels(["low", "high", "xhigh"]);
-    localStorage.setItem(
-      HARNESS_OPTIONS_KEY,
-      JSON.stringify({ "codex-native": { model: "gpt-mini", effort: "low" } }),
-    );
-    // No project model, so the session runs the remembered model; its ladder lacks xhigh.
-    setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID, effort: "xhigh" });
-    renderLanding();
-    await waitForCodexAgent();
-    const body = await submitAndReadBody();
-    expect(body.model_override).toBe("gpt-mini");
-    expect(body.reasoning_effort).toBe("low");
-  });
+  it.each([
+    { routing: "off", sentModel: "gpt-mini", sentEffort: "low" },
+    // Remembered routing drops the remembered model, so the default model's ladder applies.
+    { routing: "on", sentModel: undefined, sentEffort: "xhigh" },
+  ])(
+    "checks a modelless Codex project effort against the seeded model (remembered routing $routing)",
+    async ({ routing, sentModel, sentEffort }) => {
+      setCodexAgentAndModels(["low", "high", "xhigh"]);
+      localStorage.setItem(
+        HARNESS_OPTIONS_KEY,
+        JSON.stringify({ "codex-native": { routing, model: "gpt-mini", effort: "low" } }),
+      );
+      setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID, effort: "xhigh" });
+      renderRoutingLanding();
+      await waitForCodexAgent();
+      const body = await submitAndReadBody();
+      expect(body.cost_control_mode_override).not.toBe("on");
+      expect(body.model_override).toBe(sentModel);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
 
   it("turns off a Smart Routing draft when the remembered Codex model runs instead", async () => {
     setCodexAgentAndModels(["low", "high", "xhigh"]);

@@ -4298,8 +4298,7 @@ export function NewChatLandingScreen() {
       options.some((m) => m.id === projectDefaultModel)
         ? projectDefaultModel
         : null;
-    // The project's default effort, when the seeded model's ladder offers it,
-    // outranks the remembered effort the same way (an explicit pick wins).
+    // Project effort outranks the remembered effort when the seeded model's ladder offers it.
     const projectEffortSeed = (
       modelOptions: readonly NativeModelOption[],
       model: string,
@@ -4378,9 +4377,7 @@ export function NewChatLandingScreen() {
       // it — anything else resolves to "" so a level another harness left in
       // the shared state never rides a Codex create.
       seedEffort(
-        selectedNativeHarness === "codex-native"
-          ? projectEffortSeed(codexModelOptions, seededCodexModel)
-          : null,
+        projectEffortSeed(codexModelOptions, seededCodexModel),
         !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
           stored.effort != null &&

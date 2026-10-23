@@ -184,7 +184,8 @@ export function ProjectSettingsDialog({
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
-    setEffort(c.effort ?? NONE);
+    // The server stores config untyped, so ignore a malformed effort.
+    setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
 
@@ -307,8 +308,8 @@ export function ProjectSettingsDialog({
       hostModelOptions ?? [],
       pinnedModel === NONE ? null : pinnedModel,
     );
-  // Fixed ladders are always known; a Codex ladder only once the catalog
-  // resolves the model (or its default row), so an unresolved one keeps the level.
+  // Codex ladders are known only once the catalog resolves the model; until then
+  // keep the stored level.
   const effortLadderKnown = (pinnedModel: string) => {
     if (selectedNativeSpec?.harness !== "codex-native") return true;
     const options = hostModelOptions ?? [];
