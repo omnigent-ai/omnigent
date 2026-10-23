@@ -412,10 +412,23 @@ def build_native_controls(
 
     async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
         """Recover a reaped pane and wait for startup to publish its owned bridge."""
+        from omnigent.entities.session_resources import terminal_resource_id
         from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         terminal_registry = resource_registry.terminal_registry
         if terminal_registry is not None:
+            # A picker change is client activity. Serialize with reaping before
+            # ensuring so an in-flight reap finishes before we recover its pane.
+            lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+            async with lock:
+                terminal = terminal_registry.get(conv_id, "codex", "main")
+                if terminal is not None and (
+                    resource_registry.terminal_resource_role(
+                        conv_id, terminal_resource_id("codex", "main")
+                    )
+                    == CODEX_NATIVE_TERMINAL_ROLE
+                ):
+                    terminal.note_client_interaction()
             await _ensure_native_terminal_for_turn(conv_id, "codex-native")
             if terminal_registry.get(conv_id, "codex", "main") is None:
                 return None

@@ -19,6 +19,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from omnigent.entities.session_resources import SessionResourceView, terminal_resource_id
 from omnigent.harnesses.codex_native import app_server, bridge
 from omnigent.native import native_cost_popup
+from omnigent.runner import app as runner_app
 from omnigent.runner import native_controls
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -192,6 +193,7 @@ class _NativeSession:
     terminals: TerminalRegistry
     resources: SessionResourceRegistry
     reaper: NativePaneReaper
+    ensure_lock: asyncio.Lock
     codex: _LoopbackCodex
     events: list[dict[str, Any]]
     runner_replies: list[httpx.Response]
@@ -353,6 +355,7 @@ async def native_session(
                 terminals,
                 runner_app.state.session_resource_registry,
                 reaper,
+                runner_app.state.native_terminal_ensure_locks["codex"][session_id],
                 codex,
                 events,
                 runner_replies,
@@ -374,6 +377,82 @@ async def test_connected_codex_model_change_before_idle_reap(
     )
     native_session.assert_applied(response)
     assert native_session.codex.launches == 1
+
+
+@pytest.mark.parametrize("selection", ["model", "effort", "model-and-effort"])
+async def test_codex_settings_pick_spares_the_pane_from_a_concurrent_idle_scan(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    selection: str,
+) -> None:
+    session = native_session
+    pane = session.terminals.get(session.session_id, "codex", "main")
+    assert pane is not None
+    session.reaper._last_busy_at[session.session_id] = time.monotonic() - 3601
+    lookup_started = asyncio.Event()
+    release_lookup = asyncio.Event()
+    labels_for_spawn = runner_app._session_labels_for_runner_spawn
+
+    async def pause_bridge_lookup(**kwargs: Any) -> dict[str, str]:
+        lookup_started.set()
+        await release_lookup.wait()
+        return await labels_for_spawn(**kwargs)
+
+    monkeypatch.setattr(runner_app, "_session_labels_for_runner_spawn", pause_bridge_lookup)
+    settings = {}
+    if "model" in selection:
+        settings["model_override"] = _REQUESTED_MODEL
+    if "effort" in selection:
+        settings["reasoning_effort"] = "low"
+    change = asyncio.create_task(client.patch(f"/v1/sessions/{session.session_id}", json=settings))
+    try:
+        await asyncio.wait_for(lookup_started.wait(), timeout=budget(5))
+        await session.reaper._scan_once()
+        release_lookup.set()
+        response = await asyncio.wait_for(change, timeout=budget(5))
+    finally:
+        release_lookup.set()
+        change.cancel()
+        await asyncio.gather(change, return_exceptions=True)
+
+    assert response.status_code == 200, response.text
+    session.assert_settings(
+        _REQUESTED_MODEL if "model" in selection else _PREVIOUS_MODEL,
+        "low" if "effort" in selection else "high",
+    )
+    assert session.terminals.get(session.session_id, "codex", "main") is pane
+    assert session.codex.launches == 1
+    assert session.codex.stops == 0
+    assert len(session.codex.applied_updates) == 1
+    assert not any(event.get("type") == "response.error" for event in session.events)
+
+    monkeypatch.setattr(pane, "_last_client_interaction_at", time.monotonic() - 121)
+    await session.reap(clear_bridge=False)
+
+
+async def test_codex_settings_wait_for_reaping_uses_the_readiness_budget(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = native_session
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.1)
+    async with session.ensure_lock:
+        response = await asyncio.wait_for(
+            client.patch(
+                f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+            ),
+            timeout=budget(2),
+        )
+    _assert_codex_unconfirmed(session, response)
+    assert session.codex.requests == []
+    assert session.codex.launches == 1
+
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _LATEST_MODEL}
+    )
+    session.assert_applied(response, model=_LATEST_MODEL)
 
 
 @pytest.mark.parametrize("backend", ["running", "exited", "forwarder-ended", "unowned"])
@@ -580,6 +659,8 @@ async def test_unowned_codex_pane_is_not_restarted_after_connection_refusal(
     client: httpx.AsyncClient, native_session: _NativeSession
 ) -> None:
     session = native_session
+    pane = session.terminals.get(session.session_id, "codex", "main")
+    assert pane is not None
     await session.codex.close()
     session.resources._terminal_roles.pop(
         (session.session_id, terminal_resource_id("codex", "main"))
@@ -589,6 +670,7 @@ async def test_unowned_codex_pane_is_not_restarted_after_connection_refusal(
     )
     _assert_codex_refusal(session, response)
     assert session.codex.launches == 1
+    assert not pane.client_interaction_within(120)
 
 
 async def test_codex_replacement_connection_refusal_is_not_retried_again(
