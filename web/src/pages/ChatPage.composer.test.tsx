@@ -5563,6 +5563,7 @@ describe("Composer config gear", () => {
     setComposerState({
       conversationId: "conv_test",
       skills: [],
+      isNativeTerminalSession: false,
       sessionModelOverride: null,
       llmModel: null,
       nativeVendorOwnsModel: false,
@@ -6236,14 +6237,18 @@ describe("Composer config gear", () => {
         { id: "opus", model: "opus", displayName: "Opus" },
         { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
       ] as never;
-      useChatStore.setState({ setModel, codexModelOptions: options });
+      // Native by harness alone: a custom agent on a native harness has no wrapper label.
+      useChatStore.setState({
+        setModel,
+        isNativeTerminalSession: true,
+        codexModelOptions: options,
+      });
       renderWithTooltips(
         <Composer
           {...composerProps({
             showModels: true,
             modelPickerKind: "claude",
             codexModelOptions: options,
-            isNativeWrapper: true,
             runnerOnline,
           })}
         />,
