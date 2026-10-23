@@ -1,0 +1,73 @@
+"""Tests for ``dev/lint/lint_young_dependency_floor.py``.
+
+Mirrors that embargo young releases resolve omnigent's declared requirements,
+not uv.lock, so a published floor that only a release inside the uv cooldown
+satisfies makes omnigent uninstallable from them.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import UTC, datetime
+
+import pytest
+
+import dev.lint.lint_young_dependency_floor as lint
+
+NOW = datetime(2026, 10, 22, 15, 12, tzinfo=UTC)
+YOUNG_UPLOAD = "2026-10-16T22:15:24Z"
+SUPPRESSION = "# custom-lint: disable-next=young-dependency-floor -- security fix, mirror checked"
+
+
+def _lock(upload_time: str = YOUNG_UPLOAD, span: str = "P7D") -> str:
+    return (
+        f'version = 1\n\n[options]\nexclude-newer-span = "{span}"\n\n'
+        '[[package]]\nname = "pillow"\nversion = "13.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'wheels = [{ url = "https://example.invalid/pillow.whl", '
+        f'upload-time = "{upload_time}" }}]\n'
+    )
+
+
+def _pyproject(dependencies: Sequence[str], extras: Sequence[str] = ()) -> str:
+    """One requirement per line; the dependency group always pins the young release."""
+    lines = ["[project]", 'name = "omnigent"', "dependencies = [", *dependencies, "]"]
+    lines += ["", "[project.optional-dependencies]", *extras]
+    lines += ["", "[dependency-groups]", 'test = ["pillow>=13"]', ""]
+    return "\n".join(lines)
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "line"),
+    [
+        (_pyproject(['    "pillow>=13,<14",']), 4),
+        (_pyproject([], ['images = ["pillow>=13,<14"]']), 7),
+    ],
+    ids=["dependency", "extra"],
+)
+def test_flags_floor_only_a_cooldown_release_satisfies(pyproject: str, line: int) -> None:
+    assert lint.find_violations(pyproject, _lock(), NOW) == [
+        f"pyproject.toml:{line}: `pillow>=13,<14` needs pillow 13.0.0+, uploaded 2026-10-16 "
+        "and inside the 7-day cooldown until 2026-10-23"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "lock"),
+    [
+        (_pyproject(['    "pillow>=12.2,<14",']), _lock()),
+        (_pyproject(['    "pillow>=13,<14",']), _lock(upload_time="2026-10-10T00:00:00Z")),
+        (_pyproject([f"    {SUPPRESSION}", '    "pillow>=13,<14",']), _lock()),
+        (_pyproject([]), _lock()),
+    ],
+    ids=["floor-below-young-release", "release-aged-out", "suppressed", "dependency-group-only"],
+)
+def test_passes_floors_mirrors_can_install(pyproject: str, lock: str) -> None:
+    assert lint.find_violations(pyproject, lock, NOW) == []
+
+
+def test_reports_cooldown_span_it_cannot_read() -> None:
+    """An unparseable span must not silently disable the rule."""
+    assert lint.find_violations(_pyproject([]), _lock(span="P1W"), NOW) == [
+        "uv.lock: exclude-newer-span 'P1W' is not a P<days>D duration"
+    ]

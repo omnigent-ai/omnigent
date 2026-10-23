@@ -12,6 +12,10 @@ required-version = ">=0.11.8"
 # `--refresh`, or a dependency change).
 exclude-newer = "P7D"
 
+# An exemption only relaxes uv.lock: mirrors that embargo young releases resolve
+# the pyproject.toml floors, so keep floors below an exempted release unless the
+# mirror serves it (`just check-internal-mirror`, see CONTRIBUTING.md).
+#
 # Per-package cooldown exemptions (each scoped to one package, a fixed date
 # just past its publish time, so the global P7D supply-chain cooldown still
 # guards every other dependency):
