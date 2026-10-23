@@ -375,3 +375,24 @@ def test_single_line_drag_selects_only_that_line(
     page.mouse.up()
 
     assert page.evaluate("() => window.getSelection().toString()").strip() == _CLOSING_LINE
+
+
+def test_virtualized_transcript_returns_after_losing_layout(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Restoring a zero-size transcript keeps its current virtual rows visible."""
+    chat = chat_session_contract
+    chat.seed_transcript(60)
+    open_live(page, chat)
+    newest_reply = page.get_by_text("Turn 60 response with", exact=False)
+    expect(newest_reply).to_be_visible(timeout=20_000)
+
+    transcript = page.locator('[role="log"]')
+    for _ in range(2):
+        transcript.evaluate("element => { element.style.display = 'none'; }")
+        expect(transcript).to_be_hidden()
+        page.wait_for_timeout(100)  # Let ResizeObserver record the zero-size viewport.
+        transcript.evaluate("element => { element.style.display = ''; }")
+        page.wait_for_timeout(150)  # Let restored layout observers settle.
+        expect(newest_reply).to_be_visible(timeout=5_000)
