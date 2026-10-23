@@ -1872,18 +1872,20 @@ async def test_runner_idle_shutdown_marks_relay_bound_sessions_before_the_grace(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
-@pytest.mark.parametrize("foreign_write", [True, False])
+@pytest.mark.parametrize("foreign_write", ["fresh", "blip", "none"])
 async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,
-    foreign_write: bool,
+    foreign_write: str,
 ) -> None:
     """A dropped runner that re-tunnelled to another replica is not failed.
 
-    This replica's registry only knows its own tunnels. When the runner's
-    row carries a fresh ``runner_last_seen`` newer than this replica's own
-    last stamp, another replica wrote it — the runner is live there, so the
-    grace timer must leave the mid-turn session alone.
+    This replica's registry only knows its own tunnels. When the runner's row
+    carries a stamp newer than this replica's own last write, another replica
+    wrote it — the runner is live there, so the grace timer must leave the
+    mid-turn session alone. The ``blip`` case clears the sibling's
+    ``runner_last_seen`` and keeps only the never-cleared connect stamp, so this
+    holds even across the sibling's own transient reconnect blip.
     """
 
     from omnigent.runtime import get_conversation_store
@@ -1928,13 +1930,17 @@ async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
         # Let this replica's own disconnect-time liveness write land first,
         # then stamp the row the way the replica now holding the tunnel does.
         await asyncio.sleep(0.1)
-        if foreign_write:
+        if foreign_write != "none":
             own = session_live_state.last_liveness_stamp(runner_id)
             assert own is not None, "the hello did not record this replica's own stamp"
             store.touch_runner_liveness([runner_id], own + 1)
+            if foreign_write == "blip":
+                # The sibling's tunnel then blips: its heartbeat clears but the
+                # never-cleared connect stamp still proves the runner is live there.
+                store.clear_runner_liveness(runner_id)
         await asyncio.sleep(grace * 3)
         cached = sessions_module._session_status_cache.get(session_id)
-        if foreign_write:
+        if foreign_write != "none":
             assert cached is None, (
                 f"a runner live on another replica left stale local state {cached!r}"
             )
@@ -2443,7 +2449,15 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize(
-    "scenario", ["reconnect", "expired", "host_back_without_runner", "unreadable", "host_online"]
+    "scenario",
+    [
+        "reconnect",
+        "expired",
+        "host_back_without_runner",
+        "unreadable",
+        "host_online",
+        "remote_blip",
+    ],
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
     tunnel_three_layer_stack: _TunnelStack,
@@ -2526,6 +2540,27 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             host_row[0] = None
             await asyncio.wait_for(_host_checked(10), timeout=budget(5.0))
             assert sessions_module._session_status_cache.get(session_id) == "running"
+        if scenario == "remote_blip":
+            from omnigent.server import session_live_state
+
+            stamp = session_live_state.last_liveness_stamp(runner_id)
+            assert stamp is not None
+            store.touch_runner_liveness([runner_id], now=stamp + 1)
+            store.clear_runner_liveness(runner_id)
+            host_row[0] = False
+
+            async def relinquished() -> None:
+                while session_id in sessions_module._session_status_cache:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(relinquished(), timeout=budget(5.0))
+            assert (
+                sessions_module._last_task_error_from_labels(
+                    store.get_conversation(session_id).labels
+                )
+                is None
+            )
+            return
         if scenario == "host_back_without_runner":
             host_row[0] = False
         if scenario in ("reconnect", "unreadable"):

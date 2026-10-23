@@ -790,15 +790,16 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
 class _RecordingLabelStore:
     """Minimal store for disconnect labels, live status, and runner liveness.
 
-    :param runner_liveness: Canned runner bindings and heartbeats used to
-        simulate a runner live on another replica.
+    :param runner_liveness: Canned ``(runner_id, runner_last_seen,
+        runner_last_connected)`` tuples used to simulate a runner live on
+        another replica.
     """
 
     def __init__(
         self,
         *,
         live_status: str = "idle",
-        runner_liveness: dict[str, tuple[str | None, int | None]] | None = None,
+        runner_liveness: dict[str, tuple[str | None, int | None, int | None]] | None = None,
     ) -> None:
         self.labels: dict[str, dict[str, str]] = {}
         self.live_status = live_status
@@ -807,7 +808,9 @@ class _RecordingLabelStore:
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
 
-    def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
+    def get_runner_liveness(
+        self, conversation_id: str
+    ) -> tuple[str | None, int | None, int | None] | None:
         return self._runner_liveness.get(conversation_id)
 
     def get_conversation(self, conversation_id: str) -> Conversation:
@@ -2905,6 +2908,121 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("row_status", "own_write", "other_offset_ms", "decision"),
+    [
+        ("idle", True, 1000, "handed_off"),
+        ("running", True, 1000, "failed_mid_turn"),
+        ("idle", False, 1000, "failed_mid_turn"),
+        ("idle", True, -1000, "failed_mid_turn"),
+        ("idle", True, None, "failed_mid_turn"),
+    ],
+    ids=["settled-elsewhere", "still-running", "no-own-write", "earlier-settle", "unstamped"],
+)
+async def test_offline_sweep_defers_to_a_status_settled_on_another_replica(
+    db_uri: str,
+    row_status: str,
+    own_write: bool,
+    other_offset_ms: int | None,
+    decision: str,
+) -> None:
+    """A stale mid-turn cache loses only to a settled status stamped after this replica's write.
+
+    After a session moves replicas, its new owner persists the turn's ``idle``
+    while the old replica's cache still reads ``running``. A delayed ``idle``
+    from an earlier turn carries an older stamp and must not hide this
+    replica's interrupted turn; nor can an unstamped write prove it is newer.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-moved-replicas")
+    session_live_state.configure(store)
+    sessions_module._session_status_cache[conv.id] = "running"
+    own_stamp = 1_800_000_000_000
+    if own_write:
+        session_live_state.persist_live_status(conv.id, "running")
+        await asyncio.wrap_future(session_live_state.submit("fence", lambda: None))
+        own_stamp = session_live_state.own_live_status_stamp(conv.id, store)
+        assert own_stamp is not None
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    # The other replica's write commits after this replica's own.
+    if other_offset_ms is None:
+        store.set_session_live_status(conv.id, row_status)
+    else:
+        store.set_session_live_status(conv.id, row_status, observed_at=own_stamp + other_offset_ms)
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(code="runner_disconnected", message="Synthetic runner drop"),
+                store,
+            )
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["decision"] == decision
+        assert logged["attributes"]["cached_session_status"] == "running"
+        failed = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        if decision == "handed_off":
+            assert logged["attributes"]["persisted_session_status"] == "idle"
+            assert failed == []
+            assert refreshed.live_status == "idle"
+            assert conv.id not in sessions_module._session_status_cache
+            assert session_live_state.own_live_status_stamp(conv.id, store) is None
+        else:
+            assert len(failed) == 1
+            assert sessions_module._session_status_cache[conv.id] == "failed"
+    finally:
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_offline_sweep_judges_a_pending_own_write_by_its_stamp(db_uri: str) -> None:
+    """An own write still queued at decision time cannot make an older settle look newer."""
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-pending-write")
+    snapshot = store.get_conversation(conv.id)
+    assert snapshot is not None
+    session_live_state.configure(store)
+    sessions_module._session_status_cache[conv.id] = "running"
+    release = threading.Event()
+    blocker = session_live_state.submit("block", release.wait, 10)
+    try:
+        session_live_state.persist_live_status(conv.id, "running")
+        own_stamp = session_live_state.own_live_status_stamp(conv.id, store)
+        assert own_stamp is not None
+        # An earlier turn's settle lands while this replica's running write is queued.
+        store.set_session_live_status(conv.id, "idle", observed_at=own_stamp - 1)
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [snapshot],
+                ErrorDetail(code="runner_disconnected", message="Synthetic runner drop"),
+                store,
+            )
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["decision"] == "failed_mid_turn"
+        assert [row for row in rows if row["event_name"] == "session_turn_failed"]
+    finally:
+        release.set()
+        await asyncio.wrap_future(blocker)
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
 @pytest.mark.parametrize("fail_idle_top_level", [False, True])
 async def test_offline_sweep_preserves_existing_failure(
@@ -3564,18 +3682,22 @@ async def test_relay_reads_handoff_evidence_with_conversation_database_unavailab
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("conversation_backend_unavailable", [False, True])
+@pytest.mark.parametrize("sibling_writer", ["blip", "old_writer"])
 async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     monkeypatch: pytest.MonkeyPatch,
     conversation_backend_unavailable: bool,
+    sibling_writer: str,
 ) -> None:
     """
     A runner already re-tunnelled to another replica is not failed here.
 
     The runner may reconnect elsewhere before this replica's grace expires
-    (ingress recycle, a 4003 close after a silent stretch). That replica's
-    fresh ``runner_last_seen`` stamp means it now owns the turn, so this
-    drop must publish no ``failed`` status and persist no
-    ``runner_disconnected`` labels — mirroring the idle-session case.
+    (ingress recycle, a 4003 close after a silent stretch). Two sibling kinds
+    prove it owns the turn now without a fresh ``runner_last_seen`` here: a
+    current replica whose own tunnel blipped (connect stamp fresh, seen cleared)
+    and an older replica that refreshes only ``runner_last_seen``. Either way
+    this drop must publish no ``failed`` status and persist no
+    ``runner_disconnected`` labels, mirroring the idle-session case.
     """
     import time
 
@@ -3592,13 +3714,16 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
     runner_id = "runner_live_elsewhere"
     session_id = "d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
     now = int(time.time())
-    # This replica's own last stamp is a minute old; the row's fresh stamp can
-    # only come from the replica the runner re-tunnelled to.
+    reference = now - 60
+    # This replica's own last stamp is a minute old; the sibling that re-tunnelled
+    # supplies the fresh evidence. The blip clears ``runner_last_seen`` (connect
+    # fresh); the older writer refreshes only ``runner_last_seen``.
     monkeypatch.setattr(
         "omnigent.server.session_live_state.last_liveness_stamp",
-        lambda _runner_id: now - 60,
+        lambda _runner_id: reference,
     )
-    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, now)})
+    seen, connected = {"blip": (None, now), "old_writer": (now, reference)}[sibling_writer]
+    store = _RecordingLabelStore(runner_liveness={session_id: (runner_id, seen, connected)})
     if conversation_backend_unavailable:
 
         def unavailable(conversation_id: str) -> Any:
@@ -3723,7 +3848,14 @@ async def test_relay_does_not_fail_a_session_that_moved_to_another_runner(
 
 
 def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
-    """The grace path can detect a newer replica from already-loaded rows."""
+    """The grace path detects a newer replica from already-loaded rows.
+
+    With ``for_disconnect_decision=True`` it uses the freshest of
+    ``runner_last_seen`` and the never-cleared ``runner_last_connected``, so a
+    reconnect blip (connect fresh, seen cleared) and an older replica that
+    refreshes only ``runner_last_seen`` both keep the runner live. The default
+    (message re-addressing) path reads ``runner_last_seen`` alone.
+    """
     import time
     from types import SimpleNamespace
 
@@ -3734,15 +3866,38 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
 
     now = int(time.time())
     expired_stamp = now - RUNNER_LIVENESS_TTL_S - 1
-    conversations = [SimpleNamespace(runner_id="runner_a", runner_last_seen=now)]
 
-    assert _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now - 1)
-    assert not _runner_live_on_another_replica_from_conversations(conversations, "runner_a", now)
-    assert not _runner_live_on_another_replica_from_conversations(
-        [SimpleNamespace(runner_id="runner_a", runner_last_seen=expired_stamp)],
-        "runner_a",
-        expired_stamp - 1,
+    def rows(seen: int | None, connected: int | None) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                runner_id="runner_a", runner_last_seen=seen, runner_last_connected=connected
+            )
+        ]
+
+    # Reconnect blip: seen cleared, but the fresh connect stamp proves liveness.
+    assert _runner_live_on_another_replica_from_conversations(
+        rows(None, now), "runner_a", now - 1, for_disconnect_decision=True
     )
+    # Older replica: connect stamp stuck at this replica's reference, but the
+    # fresh ``runner_last_seen`` it refreshed wins.
+    assert _runner_live_on_another_replica_from_conversations(
+        rows(now, now - 1), "runner_a", now - 1, for_disconnect_decision=True
+    )
+    # No stamp beats this replica's own reference -> not live elsewhere.
+    assert not _runner_live_on_another_replica_from_conversations(
+        rows(None, now), "runner_a", now, for_disconnect_decision=True
+    )
+    # Both stamps expired -> not live elsewhere.
+    assert not _runner_live_on_another_replica_from_conversations(
+        rows(None, expired_stamp), "runner_a", expired_stamp - 1, for_disconnect_decision=True
+    )
+    # Default path (message re-addressing) reads ``runner_last_seen`` only: a
+    # cleared seen is not a live sibling even with a fresh connect stamp, and a
+    # fresh seen is.
+    assert not _runner_live_on_another_replica_from_conversations(
+        rows(None, now), "runner_a", now - 1
+    )
+    assert _runner_live_on_another_replica_from_conversations(rows(now, None), "runner_a", now - 1)
 
 
 @pytest.mark.asyncio
@@ -3798,7 +3953,15 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
         "older-stamp": reference_stamp - 1,
     }.get(liveness_state, now)
     store = _RecordingLabelStore(
-        runner_liveness={} if liveness_state == "missing" else {session_id: (runner_id, stamp)}
+        runner_liveness={}
+        if liveness_state == "missing"
+        else {
+            session_id: (
+                "other-runner" if liveness_state == "different-runner" else runner_id,
+                stamp,
+                stamp,
+            )
+        }
     )
     if liveness_state == "unavailable":
 

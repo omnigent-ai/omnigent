@@ -629,6 +629,17 @@ class ConversationStore(ABC):
         """
         ...
 
+    def get_runner_disconnect_liveness(
+        self, conversation_id: str
+    ) -> tuple[str | None, int | None, int | None] | None:
+        """Return current and retained heartbeat evidence for disconnect decisions.
+
+        Stores without retained metadata keep their existing liveness behavior.
+        This does not change the two-field connectivity API.
+        """
+        current = self.get_runner_liveness(conversation_id)
+        return (*current, None) if current is not None else None
+
     @abstractmethod
     def get_session_connectivity(
         self, conversation_ids: list[str]
@@ -1535,7 +1546,8 @@ class ConversationStore(ABC):
         so concurrent binders race safely: exactly one transitions the
         row from NULL → ``runner_id`` and gets ``True``; others (or an
         already-bound / missing row) get ``False``. Closes the TOCTOU on
-        host-launch binding (see ``resolve_host_launch``).
+        host-launch binding (see ``resolve_host_launch``). The winning bind
+        also resets ``runner_last_seen``/``runner_last_connected`` for the row.
 
         :param conversation_id: Conversation to pin, e.g.
             ``"conv_abc123"``.
@@ -1549,12 +1561,14 @@ class ConversationStore(ABC):
     @abstractmethod
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
-        Stamp ``runner_last_seen`` for every session bound to these runners.
+        Stamp ``runner_last_seen`` and ``runner_last_connected`` for these runners.
 
         Called by the replica holding the runner tunnels (on connect and
         on a periodic sweep of the live registry) so any replica can
-        derive ``runner_online`` from freshness. One bulk ``UPDATE``;
-        must NOT bump ``updated_at`` (it drives sidebar ordering).
+        derive ``runner_online`` from freshness. Both stamps advance
+        together here; only a graceful disconnect clears
+        ``runner_last_seen`` alone. One bulk ``UPDATE``; must NOT bump
+        ``updated_at`` (it drives sidebar ordering).
 
         :param runner_ids: Runner ids with a live tunnel,
             e.g. ``["runner_token_abc123"]``. Empty is a no-op.
@@ -1569,7 +1583,9 @@ class ConversationStore(ABC):
 
         Called on a graceful tunnel disconnect so the sidebar flips
         offline immediately instead of waiting out
-        :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
+        :data:`RUNNER_LIVENESS_TTL_S`. Leaves ``runner_last_connected``
+        intact for the cross-replica liveness check. Must NOT bump
+        ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
         :param not_after: When given, only clear a row whose
@@ -1581,7 +1597,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def set_session_live_status(
+        self, conversation_id: str, status: str, *, observed_at: int | None = None
+    ) -> None:
         """
         Persist the relay-observed turn status for one session.
 
@@ -1591,6 +1609,11 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        :param observed_at: Epoch ms the writer observed *status*. When given,
+            stamp ``live_status_at`` and skip the write if the row already
+            holds a newer stamp, so a delayed write from a replica that lost
+            the session cannot overwrite its new owner's status. ``None``
+            writes unconditionally and clears the observation stamp.
         """
         ...
 
@@ -1645,7 +1668,9 @@ class ConversationStore(ABC):
         Atomic last-write-wins write. Public session binding routes
         validate session-scoped agent ownership before calling this
         method; internal sub-agent code also uses it to keep child
-        conversations on the parent's current runner.
+        conversations on the parent's current runner. A real runner change
+        clears ``runner_last_seen``/``runner_last_connected`` so the previous
+        runner's liveness is not attributed to the new binding.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -1671,7 +1696,9 @@ class ConversationStore(ABC):
 
         Counterpart to :meth:`replace_runner_id` for the 1:1
         session↔runner invariant — /clear and /switch unbind the old
-        session before binding the runner to the new one.
+        session before binding the runner to the new one. Also clears
+        ``runner_last_seen``/``runner_last_connected`` so an unbound session
+        reads as not live.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -1689,7 +1716,8 @@ class ConversationStore(ABC):
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
         Revert a session to fully unbound: NULL ``host_id``,
-        ``workspace``, ``git_branch``, and ``runner_id`` together.
+        ``workspace``, ``git_branch``, and ``runner_id`` together, and reset
+        ``runner_last_seen``/``runner_last_connected``.
 
         Used to undo a failed per-session bind (``POST
         /v1/hosts/{id}/runners``) after the runner was atomically

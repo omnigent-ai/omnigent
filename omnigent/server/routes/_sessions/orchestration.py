@@ -8307,16 +8307,38 @@ def _runner_stamp_is_live_elsewhere(
     )
 
 
+def _newest_liveness_stamp(seen: int | None, connected: int | None) -> int | None:
+    """Return the freshest of the two liveness stamps, ignoring missing ones."""
+    stamps = [stamp for stamp in (seen, connected) if stamp is not None]
+    return max(stamps) if stamps else None
+
+
 def _runner_live_on_another_replica_from_conversations(
     conversations: Sequence[Conversation],
     runner_id: str,
     reference_stamp: int | None,
+    *,
+    for_disconnect_decision: bool = False,
 ) -> bool:
-    """Check already-loaded runner-bound rows for a fresher replica's stamp."""
+    """Check already-loaded runner-bound rows for a fresher replica's stamp.
+
+    The "should this mid-turn runner be failed?" decision passes
+    ``for_disconnect_decision=True`` to use the freshest of ``runner_last_seen``
+    and the never-cleared ``runner_last_connected``. A sibling's reconnect blip
+    clears only ``runner_last_seen``; an older replica that predates the connect
+    stamp refreshes only ``runner_last_seen``. Taking the newest of both keeps
+    the runner's liveness visible in either case. The message re-addressing path
+    leaves it ``False``, so it requires a currently-live tunnel (a fresh
+    ``runner_last_seen``) before bouncing a message to a sibling.
+    """
     return any(
         conv.runner_id == runner_id
         and _runner_stamp_is_live_elsewhere(
-            stamp=conv.runner_last_seen,
+            stamp=(
+                _newest_liveness_stamp(conv.runner_last_seen, conv.runner_last_connected)
+                if for_disconnect_decision
+                else conv.runner_last_seen
+            ),
             reference_stamp=reference_stamp,
         )
         for conv in conversations
@@ -8390,6 +8412,10 @@ async def _runner_disconnect_requires_failure(
     needs a fresh row: an offline sweep's snapshot may predate a child's idle
     observation. Recheck the cache after the read, even when the read fails.
 
+    A mid-turn cache is stale once another replica owns the session. When the
+    row holds a settled status stamped after this replica's last write, the
+    turn was handed off, not lost.
+
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
     establish that a turn was interrupted.
@@ -8402,9 +8428,14 @@ async def _runner_disconnect_requires_failure(
     the saved status alone is no evidence of an interruption.
     """
     cached = _session_status_cache.get(session_id)
+    own_stamp = (
+        session_live_state.own_live_status_stamp(session_id, conversation_store)
+        if cached in _MID_TURN_STATUSES
+        else None
+    )
     persisted: Conversation | None = None
     lookup = "not_needed"
-    if cached is None:
+    if cached is None or own_stamp is not None:
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
@@ -8417,12 +8448,22 @@ async def _runner_disconnect_requires_failure(
                 extra={"session_id": session_id},
             )
         cached = _session_status_cache.get(session_id)
+    # A local edge during the read leaves the row behind this replica again.
+    handed_off = (
+        own_stamp is not None
+        and session_live_state.own_live_status_stamp(session_id, conversation_store) == own_stamp
+        and persisted is not None
+        and persisted.live_status is not None
+        and persisted.live_status not in _MID_TURN_STATUSES
+        and persisted.live_status_at is not None
+        and persisted.live_status_at > own_stamp
+    )
 
     handle = _runner_relay_tasks.get(session_id)
     relay_snapshot = handle.status_snapshot if handle is not None else None
     fallback = snapshot if snapshot is not None else relay_snapshot
 
-    if cached is not None:
+    if cached is not None and not handed_off:
         live, source = cached, "cache"
     elif persisted is not None:
         live, source = persisted.live_status, "persisted"
@@ -8441,10 +8482,10 @@ async def _runner_disconnect_requires_failure(
     ):
         # A Stop can arrive while the sweep refreshes its row.
         decision = "intentional_stop"
-    elif shutdown_state.runner_handoff_reason(runner_id) is not None:
-        # This replica moved the runner's tunnel to another replica, which now
-        # owns the turn. A failed or stale local read must not fail a turn that
-        # is still running there.
+    elif handed_off or shutdown_state.runner_handoff_reason(runner_id) is not None:
+        # Another replica owns the turn: it settled the session after this
+        # replica's last write, or this replica moved the runner's tunnel to it.
+        # A failed or stale local read must not fail a turn that is running there.
         decision = "handed_off"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
@@ -8514,6 +8555,8 @@ async def _runner_disconnect_requires_failure(
             # The cache retains positive counts only; absence is not an observed zero.
             cached_background_task_count=_session_background_task_count_cache.get(session_id),
             persisted_session_status=persisted.live_status if persisted is not None else None,
+            own_live_status_at=own_stamp,
+            persisted_live_status_at=persisted.live_status_at if persisted is not None else None,
             snapshot_session_status=fallback.live_status if fallback is not None else None,
             status_lookup=lookup,
             session_kind=conv.kind if conv is not None else None,
@@ -8525,6 +8568,8 @@ async def _runner_disconnect_requires_failure(
             **shutdown_state.disconnect_attributes(runner_id),
         ),
     )
+    if decision == "handed_off":
+        _relinquish_session_live_state(session_id)
     return decision in ("failed_mid_turn", "failed_before_start")
 
 
@@ -8536,9 +8581,13 @@ async def _relay_runner_live_elsewhere(
     Check this relay's bound runner using shared runner metadata.
 
     A full-conversation read can depend on unrelated backends; their outage
-    must not hide a fresh heartbeat from another replica. Prefer the active
+    must not hide a fresh stamp from another replica. Prefer the active
     relay's runner binding, falling back to the metadata binding when called
     without a registered relay.
+
+    Uses the freshest of ``runner_last_seen`` and the never-cleared
+    ``runner_last_connected`` so a sibling's reconnect blip or an older replica
+    that writes only ``runner_last_seen`` still counts as live.
 
     :param session_id: Session/conversation identifier.
     :param conversation_store: Store used to read runner metadata.
@@ -8546,7 +8595,12 @@ async def _relay_runner_live_elsewhere(
         another replica; ``False`` when unbound, unreadable, or not.
     """
     try:
-        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
+        lookup = getattr(
+            conversation_store,
+            "get_runner_disconnect_liveness",
+            conversation_store.get_runner_liveness,
+        )
+        liveness = await asyncio.to_thread(lookup, session_id)
     except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
         _logger.warning(
             "Relay: runner liveness lookup failed for session=%s",
@@ -8557,14 +8611,15 @@ async def _relay_runner_live_elsewhere(
         return False
     if liveness is None:
         return False
-    bound_runner_id, runner_last_seen = liveness
+    bound_runner_id, runner_last_seen, *retained = liveness
+    runner_last_connected = retained[0] if retained else None
     handle = _runner_relay_tasks.get(session_id)
     runner_id = handle.runner_id if handle is not None else bound_runner_id
     if runner_id is None:
         return False
     reference_stamp = session_live_state.last_liveness_stamp(runner_id)
     return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=runner_last_seen,
+        stamp=_newest_liveness_stamp(runner_last_seen, runner_last_connected),
         reference_stamp=reference_stamp,
     )
 
