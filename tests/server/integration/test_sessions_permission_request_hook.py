@@ -216,6 +216,9 @@ async def test_permission_request_hook_preserves_native_verdict(
     session_id = await _create_session(client, agent["id"])
     elicitation_id = f"elicit_{vendor}_" + "0" * 32
     payload = await _claude_permission_payload(tool_name)
+    payload["permission_suggestions"] = [
+        {"type": "addDirectories", "directories": ["/tmp/project"], "destination": "session"}
+    ]
     if supplies_id:
         payload["_omnigent_elicitation_id"] = elicitation_id
     if tool_name == "AskUserQuestion":
@@ -248,6 +251,7 @@ async def test_permission_request_hook_preserves_native_verdict(
         "allow_auto_mode",
         "allow_all_edits",
         "remember_scope",
+        "permission_directories",
         "ask_user_question",
         "exit_plan_mode",
     ):
@@ -257,7 +261,13 @@ async def test_permission_request_hook_preserves_native_verdict(
         session_id,
         elicitation_id,
         action,
-        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True, "feedback": "Wait"},
+        {
+            "allow_auto_mode": True,
+            "allow_all_edits": True,
+            "remember": True,
+            "allow_directories": True,
+            "feedback": "Wait",
+        },
     )
     assert verdict.status_code == 202, verdict.text
     resp = await hook_task
@@ -618,6 +628,143 @@ async def test_permission_request_hook_deny_round_trip(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "permission_mode", "standalone"),
+    [
+        ("Edit", "auto", False),
+        ("Edit", "acceptEdits", False),
+        ("Write", "default", True),
+        ("Bash", "default", False),
+    ],
+)
+async def test_permission_request_hook_directory_grant_round_trip(
+    client: httpx.AsyncClient, tool_name: str, permission_mode: str, standalone: bool
+) -> None:
+    """Offer both symlink spellings and grant only that scope without changing modes."""
+    agent = await create_test_agent(client, "test-permission-directories")
+    session_id = await _create_session(client, agent["id"])
+    directories = ["/home/test/worktrees/branch", "/mnt/worktrees/branch"]
+    update = {"type": "addDirectories", "directories": directories, "destination": "session"}
+    payload = await _claude_permission_payload(tool_name)
+    payload.update(
+        permission_mode=permission_mode,
+        agent_id="native-child",
+        tool_input=(
+            {"command": f"cd {directories[0]} && pwd"}
+            if tool_name == "Bash"
+            else {"file_path": directories[0] + "/fixture.txt"}
+        ),
+        permission_suggestions=[
+            {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+            update,
+        ],
+    )
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"]["permission_directories"] == directories
+    assert not {"allow_auto_mode", "allow_all_edits", "remember_scope"} & event["params"].keys()
+    elicitation_url = f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}"
+    pending = await client.get(elicitation_url)
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["permission_directories"] == directories
+    content = {
+        "allow_directories": True,
+        "permission_directories": ["/"],
+        "directories": ["/"],
+        "allow_auto_mode": True,
+        "allow_all_edits": True,
+        "remember": True,
+    }
+    if standalone:
+        verdict = await client.post(
+            elicitation_url + "/resolve", json={"action": "accept", "content": content}
+        )
+    else:
+        verdict = await _post_approval(
+            client, session_id, event["elicitation_id"], "accept", content
+        )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow",
+        "updatedPermissions": [update],
+    }
+
+
+@pytest.mark.parametrize(
+    ("action", "content"),
+    [
+        ("accept", None),
+        ("accept", {"allow_auto_mode": True, "allow_all_edits": True, "remember": True}),
+        ("accept", {"allow_directories": "true"}),
+        ("accept", {"allow_directories": 1}),
+        ("decline", {"allow_directories": True}),
+    ],
+)
+async def test_permission_request_hook_directory_grant_requires_explicit_accept(
+    client: httpx.AsyncClient, action: str, content: dict[str, Any] | None
+) -> None:
+    """Neither a one-shot verdict nor other approval controls install directory grants."""
+    agent = await create_test_agent(client, "test-permission-directories-explicit")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Edit")
+    payload["permission_suggestions"] = [
+        {"type": "addDirectories", "directories": ["/mnt/project"], "destination": "session"}
+    ]
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], action, content)
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow" if action == "accept" else "deny"
+    }
+
+
+@pytest.mark.parametrize("read_suggestion", [False, True])
+async def test_permission_request_hook_directory_grant_cannot_be_forged(
+    client: httpx.AsyncClient, read_suggestion: bool
+) -> None:
+    """A read rule or absent suggestions cannot become a directory grant from client input."""
+    agent = await create_test_agent(client, "test-permission-directories-forged")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Read" if read_suggestion else "Edit")
+    if read_suggestion:
+        payload["permission_suggestions"] = [
+            {
+                "type": "addRules",
+                "rules": [{"toolName": "Read", "ruleContent": "/mnt/project/**"}],
+                "behavior": "allow",
+                "destination": "session",
+            }
+        ]
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert "permission_directories" not in event["params"]
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        {"allow_directories": True, "permission_directories": ["/"]},
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
 
 
 @pytest.mark.parametrize(

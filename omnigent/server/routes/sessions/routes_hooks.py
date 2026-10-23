@@ -78,6 +78,7 @@ from omnigent.server.routes._sessions.helpers import (
     _allow_remember_eligible,
     _build_actor,
     _build_evaluation_context,
+    _claude_native_permission_directories,
     _claude_native_remember_host,
     _client_supplied_hook_elicitation_id,
     _emit_server_routing_decision,
@@ -300,17 +301,32 @@ def register_hooks_routes(
         # permission card with the gated tool name and distinguish
         # simultaneous prompts from different tools.
         extras: dict[str, Any] = {"tool_name": tool_name}
+        permission_directories = (
+            _claude_native_permission_directories(payload.get("permission_suggestions"))
+            if is_claude
+            else None
+        )
+        if permission_directories:
+            extras["permission_directories"] = permission_directories
         if cwd is not None:
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        if is_claude and _allow_auto_mode_eligible(tool_name, permission_mode):
+        if (
+            is_claude
+            and not permission_directories
+            and _allow_auto_mode_eligible(tool_name, permission_mode)
+        ):
             extras["allow_auto_mode"] = True
         # Edit tools → "Accept & allow all edits" (switches the session to
         # acceptEdits via setMode). Stamped only for edit-tool prompts
         # under a still-prompting mode — see _allow_all_edits_eligible.
         # The verdict site re-checks the same predicate before honoring it.
-        if is_claude and _allow_all_edits_eligible(tool_name, permission_mode):
+        if (
+            is_claude
+            and not permission_directories
+            and _allow_all_edits_eligible(tool_name, permission_mode)
+        ):
             extras["allow_all_edits"] = True
         # Non-edit eligible tools → "don't ask again" (installs a
         # session-scoped allow rule via addRules). Stamped only when the
@@ -319,7 +335,11 @@ def register_hooks_routes(
         # request host so the UI can label the button ("… for github.com"
         # vs "… for WebFetch"); the verdict site re-derives the same scope
         # before honoring the flag, never trusting a client-supplied rule.
-        if is_claude and _allow_remember_eligible(tool_name, permission_mode):
+        if (
+            is_claude
+            and not permission_directories
+            and _allow_remember_eligible(tool_name, permission_mode)
+        ):
             remember_scope: dict[str, Any] = {"tool": tool_name}
             remember_host = _claude_native_remember_host(tool_name, tool_input)
             if remember_host is not None:
@@ -441,7 +461,22 @@ def register_hooks_routes(
             and tool_input
         ):
             decision["updatedInput"] = tool_input
-        if (
+        if permission_directories:
+            # Only the explicit directory action grants the scope offered by Claude.
+            # Browser-supplied paths and generic permission-mode flags cannot widen it.
+            if (
+                behavior == "allow"
+                and isinstance(result.content, dict)
+                and result.content.get("allow_directories") is True
+            ):
+                decision["updatedPermissions"] = [
+                    {
+                        "type": "addDirectories",
+                        "directories": permission_directories,
+                        "destination": "session",
+                    }
+                ]
+        elif (
             behavior == "allow"
             and isinstance(result.content, dict)
             and result.content.get("allow_auto_mode") is True
