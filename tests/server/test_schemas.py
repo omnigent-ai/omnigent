@@ -1273,3 +1273,30 @@ def test_sandbox_workspace_validates_repository_choices(selection):
 
     with pytest.raises(ValueError):
         SessionCreateRequest(agent_id="a", host_id="host", sandbox_workspace=selection)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"workspace": "/tmp"}, {"git": {"branch_name": "feature/test"}}],
+)
+def test_controller_workspace_request_exclusivity(fields):
+    """Controller choices are optional and cannot mix with legacy directory policy."""
+    from pydantic import ValidationError
+
+    from omnigent.server.routes.hosts import LaunchRunnerRequest
+    from omnigent.server.schemas import SessionForkRequest
+
+    if fields:
+        with pytest.raises(ValidationError):
+            LaunchRunnerRequest(session_id="session", sandbox_workspace={}, **fields)
+    else:
+        assert LaunchRunnerRequest(session_id="session", sandbox_workspace={}).workspace is None
+        with pytest.raises(ValidationError):
+            LaunchRunnerRequest(session_id="session")
+    with pytest.raises(ValidationError):
+        SessionForkRequest(sandbox_workspace={})
+    with pytest.raises(ValidationError):
+        SessionForkRequest(host_type="managed", side_chat=True, sandbox_workspace={})
+    assert (
+        SessionForkRequest(host_type="managed", sandbox_workspace={}).sandbox_workspace is not None
+    )

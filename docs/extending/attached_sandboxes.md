@@ -230,7 +230,7 @@ sequenceDiagram
 
 ## Workspace policy
 
-Providers can opt into repository choices in **New session** by advertising
+Providers can opt into repository choices in **New session** and **Clone session** by advertising
 `SandboxCapabilities(reusable_hosts=True, session_workspaces=True)` (and
 `multi_repo=True` for several repositories). This works with saved boxes and
 newly created static sandboxes. Discovery-only providers can support it too.
@@ -325,9 +325,64 @@ controller-owned workspaces do not set the generic `git_branch` cleanup marker;
 Omnigent does not delete the controller's worktrees. Controllers should reclaim
 abandoned preparations if session persistence fails after a directory is made.
 
-This picker is currently in **New session**. **Clone session** retains its
-existing directory/worktree choices and does not call this new hook. Multipart
-agent-bundle uploads, automations, and child sessions do not gain this contract.
+### Clone into a controller workspace
+
+Clone uses the same repository and branch controls. On the source sandbox it
+defaults to **Use source working folder**, preserving the files and current
+branches in that directory. Uncheck it to ask the controller to prepare a
+workspace. Selecting another saved sandbox or **New static sandbox** also offers
+workspace preparation. Sleeping saved sandboxes wake when selected; creation
+can be disabled independently.
+
+The fields prefill from the source's recorded repository choices and worktree
+mode. For a single repo, the session's recorded Git branch takes precedence.
+This is not a live snapshot of every checkout: branches changed outside
+Omnigent and uncommitted files are not copied to a different workspace.
+
+Two existing requests gain the same optional object; no endpoint or schema
+migration is added:
+
+| Destination | Requests |
+| --- | --- |
+| New static sandbox | `POST /v1/sessions/{source_id}/fork` with `host_type: "managed"`, `sandbox_provider`, and `sandbox_workspace`. Provisions an empty box and calls the existing preparation hook before starting the runner. |
+| Saved static sandbox | Ordinary `POST /v1/sessions/{source_id}/fork`, then `POST /v1/hosts/{host_id}/runners` with `{session_id, sandbox_workspace}`. Authorizes both host and session, prepares and validates the directory, then binds the runner. |
+| Source working folder | Ordinary fork, then the existing runner request with `{session_id, workspace}`. No preparation call. |
+
+On the fork request, `sandbox_workspace` requires a managed destination and
+cannot accompany a non-null `workspace` or `side_chat`. On the runner request,
+it replaces `workspace` and cannot accompany `git`. Omitting it retains the
+existing request contract. Provider hooks receive no new arguments.
+
+```mermaid
+sequenceDiagram
+    participant U as Clone dialog
+    participant O as Omnigent
+    participant C as Controller
+    participant H as Saved host
+    opt Saved sandbox is asleep
+        U->>O: POST host wake
+        O->>C: Resume and reconnect host
+    end
+    U->>O: POST source session fork
+    O-->>U: New conversation ID
+    U->>O: POST host runners with ID and sandbox_workspace
+    O->>O: Authorize host and session owner
+    O->>C: prepare_session_workspace for new ID
+    C-->>O: Absolute directory
+    O->>H: Validate directory and launch runner
+    O-->>U: Launch accepted
+```
+
+If preparation or launch fails on a saved box, the dialog keeps the cloned
+conversation and offers **Retry start** for that same ID. It does not copy the
+conversation again. The controller must tolerate retries for the same session.
+Same-folder clones retain the source repository labels for subsequent clones.
+Moving to another saved sandbox rebuilds native history from the copied
+Omnigent messages rather than referencing a native transcript on the old host.
+
+Providers without `session_workspaces` retain their existing Clone controls.
+Multipart agent-bundle uploads, automations, child sessions, and the missing
+workspace recovery dialog do not gain this selection contract.
 
 ## Try it
 
@@ -375,8 +430,8 @@ and reuse it for two sessions without any controller creation call.
 ## Prototype limits
 
 Discovery and attachment are available in New session and Clone session.
-Detaching still uses the API. The new-session picker has the direct wake action;
-other pickers reuse an attachment once it is online, or connect through discovery.
+Detaching still uses the API. New session and Clone session can wake a saved
+sandbox directly; other pickers reuse an attachment once it is online.
 Automations retain their existing sandbox
 restrictions. Cross-replica wake coordination retains the existing resume
 implementation's limits; it is not a new distributed lease mechanism.

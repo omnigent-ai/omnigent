@@ -11806,9 +11806,9 @@ async def _create_session_from_existing_agent(
     initial_labels = dict(body.labels) if body.labels else {}
     initial_labels.update(registry_labels)
     if body.sandbox_workspace is not None:
-        from omnigent.server.managed_hosts import managed_repo_labels
+        from omnigent.server.sandbox_workspaces import sandbox_workspace_labels
 
-        initial_labels.update(managed_repo_labels(body.sandbox_workspace.repositories))
+        initial_labels.update(sandbox_workspace_labels(body.sandbox_workspace))
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
             WORKTREE_ROOT_LABEL_KEY,

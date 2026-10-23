@@ -12,11 +12,20 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     _apply_git_clone_options,
     build_owner_launcher,
+    managed_repo_labels,
     parse_repo_workspace,
 )
 from omnigent.server.routes._workspace_validation import _is_unc_path, _is_windows_absolute_path
 from omnigent.server.schemas import SandboxWorkspaceRequest
 from omnigent.stores.host_store import Host
+
+
+def sandbox_workspace_labels(selection: SandboxWorkspaceRequest) -> dict[str, str]:
+    """Remember requested repositories and worktree mode for subsequent forks."""
+    return {
+        **managed_repo_labels(selection.repositories),
+        "omnigent.sandbox.create_worktrees": str(selection.create_worktrees).lower(),
+    }
 
 
 def session_workspace_launcher(

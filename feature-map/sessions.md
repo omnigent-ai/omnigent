@@ -221,6 +221,13 @@ agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
+For a static sandbox whose controller supports session workspaces, Clone keeps
+the source working folder by default. Uncheck that option or choose another
+sandbox to select repositories, existing or typed branches, and worktree mode.
+Paused saved sandboxes wake when selected. If preparing a saved box fails,
+Retry start uses the same cloned conversation. Repo choices prefill from stored
+session metadata; selecting a different workspace does not copy uncommitted files.
+
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.
@@ -496,6 +503,11 @@ plain `uv run pytest`, which starts a private server for the test.
   component coverage in `web/src/components/blocks/StatusBlocks.test.tsx`.
   No browser test drives the card into the fork dialog.
 - **`fork`, whole session and resources:**
+  `tests/e2e_ui/start_session/test_start_session.py::test_static_sandbox_repository_and_worktree_choices`
+  (own environment, `clone` variant) drives the header Clone dialog through
+  source-folder reuse, waking another static sandbox, per-repo branch choices,
+  and a new static sandbox on mobile. The SPA and conversation-copy API are real;
+  controller, GitHub and runner-launch transport are mocked.
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
   The dialog's permission-mode picker for native targets has component

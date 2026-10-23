@@ -2806,3 +2806,50 @@ def test_fork_counts_files_recorded_for_filesystem_delivery(
         assert [f.source_metadata for f in copied if f.filename == "trace.gz"] == [recorded]
     else:
         assert not conv_store.fork_calls
+
+
+@pytest.mark.parametrize("supported", [False, True])
+async def test_managed_fork_controller_workspace(monkeypatch, supported):
+    """Opt-in preparation gets the fork identity; unsupported requests create nothing."""
+    from dataclasses import replace
+
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from tests.server.helpers import FakeSandboxLauncher
+
+    source = _make_conversation()
+    store = _ConversationStore(conversations={source.id: source})
+    app = _build_app(store)
+    launches = _arm_managed_app(app, monkeypatch)
+
+    class Controller(FakeSandboxLauncher):
+        @property
+        def capabilities(self):
+            return replace(super().capabilities, session_workspaces=supported, multi_repo=True)
+
+    app.state.sandbox_config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            provider="modal",
+            server_url="https://example.com",
+            token_ttl_s=3600,
+            launcher_factory=lambda: Controller(reusable_hosts=True),
+        )
+    )
+    selection = {
+        "repositories": ["https://github.com/org/api#release", "https://github.com/org/web"],
+        "create_worktrees": True,
+    }
+    response = TestClient(app).post(
+        f"/v1/sessions/{source.id}/fork",
+        json={"host_type": "managed", "sandbox_workspace": selection},
+    )
+    assert response.status_code == (201 if supported else 400), response.text
+    if not supported:
+        assert store.fork_calls == [] and launches == []
+        return
+    assert len(launches) == 1
+    assert launches[0]["session_id"] == response.json()["id"]
+    assert launches[0]["repos"] == []
+    assert launches[0]["sandbox_workspace"].model_dump() == selection
+    labels = dict(item for _, updates in store.label_writes for item in updates.items())
+    assert labels["omnigent.sandbox.repo.0"] == selection["repositories"][0]
+    assert labels["omnigent.sandbox.create_worktrees"] == "true"

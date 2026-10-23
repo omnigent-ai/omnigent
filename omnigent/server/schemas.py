@@ -2843,6 +2843,9 @@ class SessionForkRequest(BaseModel):
         explicit value overrides it and an explicit ``null`` gives the
         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
         an external fork's directory is chosen when it binds a host.
+    :param sandbox_workspace: Optional controller-owned repository and worktree
+        choices for a new managed sandbox. Replaces ``workspace``; requires the
+        provider's ``session_workspaces`` capability.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2856,6 +2859,7 @@ class SessionForkRequest(BaseModel):
     sandbox_provider: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    sandbox_workspace: SandboxWorkspaceRequest | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
@@ -2888,6 +2892,11 @@ class SessionForkRequest(BaseModel):
         # at module scope would risk import cycles.
         from omnigent.server.managed_hosts import parse_repo_workspace
 
+        if self.sandbox_workspace is not None:
+            if self.host_type != "managed" or self.workspace is not None or self.side_chat:
+                raise ValueError(
+                    "sandbox_workspace requires a managed fork without workspace or side_chat"
+                )
         if self.host_type == "managed":
             if self.host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(self.host_id):
                 raise ValueError(

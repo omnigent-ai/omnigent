@@ -3747,7 +3747,8 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
         _run_in_fresh_loop(drive(base_url, seeded["session_id"]))
 
 
-def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path):
+@pytest.mark.parametrize("journey", ["create", "clone"])
+def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path, journey):
     """Real SPA journeys; controller/create transport is stubbed and asserted."""
     import httpx
 
@@ -3790,6 +3791,13 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path):
                 "sandbox_id": "box-1",
                 "configured_harnesses": {"claude-native": True},
             }
+            paused_host = {
+                **host,
+                "host_id": "host_paused",
+                "name": "Second static sandbox",
+                "status": "offline",
+                "sandbox_id": "box-2",
+            }
             repos = [
                 {
                     "full_name": f"example/{name}",
@@ -3800,7 +3808,9 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path):
                 for name in ("api", "web")
             ]
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
-            await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": [host]}))
+            await page.route(
+                "**/v1/hosts", lambda route: route.fulfill(json={"hosts": [host, paused_host]})
+            )
             await page.route(
                 "**/v1/hosts/sandboxes?provider=static",
                 lambda route: route.fulfill(
@@ -3852,7 +3862,109 @@ def test_static_sandbox_repository_and_worktree_choices(built_spa, tmp_path):
                 await page.get_by_test_id("new-chat-landing-repo-select").click()
                 await page.get_by_role("option", name=f"example/{name}").click()
 
+            async def drive_clones():
+                forks, launches, wakes = [], [], []
+
+                async def source_snapshot(route):
+                    response = await route.fetch()
+                    snapshot = await response.json()
+                    snapshot.update(
+                        host_id=host["host_id"], workspace="/work/api", git_branch=None
+                    )
+                    snapshot["labels"] = {
+                        **snapshot.get("labels", {}),
+                        "omnigent.sandbox.repo.0": repos[0]["clone_url"] + "#release",
+                        "omnigent.sandbox.repo.1": repos[1]["clone_url"],
+                    }
+                    await route.fulfill(response=response, json=snapshot)
+
+                async def clone_session(route):
+                    forks.append(route.request.post_data_json)
+                    # Copy real history; compute is supplied by the mocked controller transport.
+                    response = await route.fetch(post_data="{}")
+                    assert response.status == 201
+                    await route.fulfill(response=response)
+
+                async def launch(route):
+                    launches.append(route.request.post_data_json)
+                    await route.fulfill(json={"runner_id": "demo-runner", "status": "launching"})
+
+                async def wake(route):
+                    wakes.append(route.request.url)
+                    paused_host["status"] = "online"
+                    await route.fulfill(json={"host_id": paused_host["host_id"]})
+
+                await page.route(re.compile(rf"/v1/sessions/{session_id}(\?|$)"), source_snapshot)
+                await page.route(f"**/v1/sessions/{session_id}/fork", clone_session)
+                await page.route("**/v1/hosts/*/runners", launch)
+                await page.route("**/v1/hosts/host_paused/wake", wake)
+                await page.route(
+                    "**/v1/hosts/*/filesystem**",
+                    lambda route: route.fulfill(json={"path": "/work/api", "entries": []}),
+                )
+                for target in ("same", "paused", "new"):
+                    await page.goto(f"{base_url}/c/{session_id}")
+                    await page.get_by_test_id("header-conversation-actions").click()
+                    await page.get_by_test_id("header-fork-conversation").click()
+                    dialog = page.get_by_test_id("fork-session-dialog")
+                    await expect(
+                        dialog.get_by_role("checkbox", name="Use source working folder")
+                    ).to_be_checked()
+                    if target != "same":
+                        await dialog.get_by_test_id("fork-session-host-select").click()
+                        await page.get_by_test_id(
+                            "fork-session-host-option-host_paused"
+                            if target == "paused"
+                            else "fork-session-sandbox-option"
+                        ).click()
+                        await expect(
+                            dialog.get_by_role("combobox", name="Branch for example/api")
+                        ).to_contain_text("release")
+                        await dialog.get_by_role("checkbox", name="Create worktrees").check()
+                        await dialog.get_by_role("combobox", name="Branch for example/web").click()
+                        await page.get_by_placeholder("Search or enter a branch…").fill(
+                            "feature/clone-ui"
+                        )
+                        await page.get_by_role("option", name="Use “feature/clone-ui”").click()
+                        if target == "paused":
+                            await poll_until_async(lambda: len(wakes) == 1)
+                        else:
+                            await page.set_viewport_size({"width": 390, "height": 844})
+                            assert await page.evaluate(
+                                "document.documentElement.scrollWidth <= window.innerWidth"
+                            )
+                    form_bottom = await dialog.locator("fieldset").evaluate(
+                        "element => element.parentElement.getBoundingClientRect().bottom"
+                    )
+                    submit_box = await dialog.get_by_test_id("fork-session-submit").bounding_box()
+                    assert submit_box is not None and form_bottom <= submit_box["y"] + 1
+                    await page.screenshot(path=str(tmp_path / f"clone-{target}.png"))
+                    await dialog.get_by_test_id("fork-session-submit").click()
+                    await expect(dialog).not_to_be_visible()
+                    await expect(page).not_to_have_url(re.compile(rf"/c/{session_id}$"))
+                assert (
+                    launches[0]["workspace"] == "/work/api"
+                    and "sandbox_workspace" not in launches[0]
+                )
+                selection = {
+                    "repositories": [
+                        repos[0]["clone_url"] + "#release",
+                        repos[1]["clone_url"] + "#feature/clone-ui",
+                    ],
+                    "create_worktrees": True,
+                }
+                assert (
+                    launches[1]["sandbox_workspace"] == selection
+                    and "workspace" not in launches[1]
+                )
+                assert len(launches) == 2
+                assert forks[-1]["sandbox_workspace"] == selection
+                assert forks[-1]["host_type"] == "managed"
+
             try:
+                if journey == "clone":
+                    await drive_clones()
+                    return
                 await page.goto(f"{base_url}/")
                 await page.get_by_test_id("new-chat-landing-host-chip").click()
                 await page.get_by_test_id("new-chat-landing-host-host_static").click()
