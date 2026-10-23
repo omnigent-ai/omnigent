@@ -46,6 +46,9 @@ catalog:
   '@shikijs/transformers': 4.5.0
   '@shikijs/stream': 4.5.0
   vite: 8.1.6
+  # Keep workspace test runners and their coverage provider on one release.
+  vitest: 4.1.12
+  '@vitest/coverage-v8': 4.1.12
 
 overrides:
   # Keep build-tool upgrades explicit and validate their bundles: incompatible
@@ -59,26 +62,28 @@ overrides:
   lightningcss: 1.32.0
   postcss: 8.5.29
   browserslist: 4.28.8
-  fast-uri: 3.1.6
+  fast-uri: 3.1.8
   '@xmldom/xmldom': 0.8.15
   qs: 6.16.0
   query-string: 9.5.0
   '@hono/node-server': 1.19.15
-  hono: 4.13.5
+  hono: 4.13.13
   linkify-it: 5.0.2
   shiki: "catalog:"
   react: "catalog:"
   react-dom: "catalog:"
-  dompurify: 3.4.14
+  dompurify: 3.4.17
   # Math renderers and their imported stylesheet must share the same classes.
   katex: "catalog:"
   mermaid: 11.16.1
   tar: 7.5.21
-  'node-gyp>undici': 6.28.0
-  'undici@>=7.0.0 <8.0.0': 7.29.0
-  'brace-expansion@>=1.0.0 <2.0.0': 1.1.18
-  'brace-expansion@>=2.0.0 <3.0.0': 2.1.4
-  'brace-expansion@>=5.0.0 <6.0.0': 5.0.9
+  'node-gyp>undici': 6.29.0
+  'brace-expansion@>=1.0.0 <2.0.0': 1.1.21
+  'brace-expansion@>=2.0.0 <3.0.0': 2.1.7
+  'brace-expansion@>=5.0.0 <6.0.0': 5.0.12
+  'markdown-it@>=14.0.0 <15.0.0': 14.3.2
+  'proxy-addr@>=2.0.0 <3.0.0': 2.0.8
+  'source-map-js@>=1.0.0 <2.0.0': 1.2.2
   '@shikijs/core': "catalog:"
   '@shikijs/primitive': "catalog:"
   '@shikijs/engine-javascript': "catalog:"
@@ -119,7 +124,7 @@ overrides:
   '@tiptap/pm': 3.31.4
   '@tiptap/react': 3.31.4
   '@tiptap/starter-kit': 3.31.4
-  express-rate-limit>ip-address: 10.3.1
+  express-rate-limit>ip-address: 10.7.4
 
 allowBuilds:
   '@anthropic-ai/claude-code': true

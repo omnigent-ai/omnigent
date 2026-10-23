@@ -27,7 +27,7 @@ from typing import IO, Literal
 
 from omnigent._platform import IS_POSIX
 from omnigent.debug_logging import close_debug_log_sink, debug_event
-from omnigent.process_logging import process_log_dir
+from omnigent.process_logging import drain_terminal_output, process_log_dir
 
 _logger = logging.getLogger(__name__)
 
@@ -54,6 +54,8 @@ _STOP_SIGNAL_NAMES = ("SIGTERM", "SIGHUP")
 _SIGNAL_FLUSH_TIMEOUT_S = 2.0
 # Hard deadline for the signal exit path, in case logging itself wedges.
 _SIGNAL_EXIT_DEADLINE_S = 3.0
+# Wait for terminal output on the signal exit path; a stalled terminal gets only this.
+_SIGNAL_TERMINAL_DRAIN_S = 0.5
 
 FAULTHANDLER_LOG_NAME = "faulthandler.log"
 
@@ -376,6 +378,8 @@ def _exit_on_signal(signum: int) -> None:
         for handler in logging.getLogger().handlers:
             with contextlib.suppress(Exception):
                 handler.flush()
+        # Terminal mirrors write from a thread; give the exit row a moment to show.
+        drain_terminal_output(_SIGNAL_TERMINAL_DRAIN_S)
     finally:
         _die_by_signal(signum)
 

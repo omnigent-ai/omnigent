@@ -23,10 +23,15 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
+import yaml
+
 from omnigent.errors import OmnigentError
 from omnigent.spec.parser import (
+    _FRONTMATTER_RE,
     _discover_skills,
+    _falsey_flag,
     _parse_skill,
+    _quote_description_with_colon,
     discover_host_skills,
     skill_matches_names,
 )
@@ -444,16 +449,197 @@ def _plugin_install_paths(
     return out
 
 
+# Claude Code's plugin command loader stops at these bounds; so does the menu.
+_MAX_PLUGIN_COMMAND_BYTES = 1024 * 1024
+_MAX_PLUGIN_COMMAND_DEPTH = 32
+_MAX_PLUGIN_COMMAND_DIRS = 4096
+_PLUGIN_COMMAND_SUMMARY_CHARS = 100
+
+
+def _plugin_command_summary(body: str) -> str:
+    """Claude Code's fallback label: the first non-empty body line, heading marker dropped."""
+    for line in body.splitlines():
+        text = re.sub(r"^#+\s+", "", line.strip())
+        if text:
+            if len(text) > _PLUGIN_COMMAND_SUMMARY_CHARS:
+                return text[: _PLUGIN_COMMAND_SUMMARY_CHARS - 3] + "..."
+            return text
+    return ""
+
+
+def _parse_plugin_command(command_md: Path, segments: tuple[str, ...]) -> SkillSpec | None:
+    """Parse one plugin command file the way Claude Code names and labels it.
+
+    *segments* is the command's path under its commands root, e.g.
+    ``("reports", "weekly")`` for ``commands/reports/weekly.md``; a frontmatter
+    ``name`` replaces the last segment. Frontmatter is optional and the
+    description falls back to the body's first line. Commands carry no
+    ``skill_dir`` because sibling command files are not skill resources.
+
+    :returns: The command, or ``None`` for an unreadable or oversized file.
+    """
+    try:
+        if command_md.stat().st_size > _MAX_PLUGIN_COMMAND_BYTES:
+            _log.warning("Skipping oversized plugin command %s", command_md)
+            return None
+        text = command_md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.warning("Skipping unreadable plugin command %s: %s", command_md, exc)
+        return None
+    *parents, name = segments
+    description = ""
+    user_invocable = True
+    body = text
+    match = _FRONTMATTER_RE.match(text)
+    if match:
+        frontmatter_str, body = match.groups()
+        try:
+            frontmatter = yaml.safe_load(frontmatter_str)
+        except yaml.YAMLError:
+            # Prose descriptions carry colons; recover them as SKILL.md parsing does.
+            try:
+                frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+            except yaml.YAMLError:
+                frontmatter = None
+        if isinstance(frontmatter, dict):
+            raw_name = frontmatter.get("name")
+            if isinstance(raw_name, str) and raw_name.strip():
+                name = raw_name.strip()
+            raw = frontmatter.get("description")
+            if isinstance(raw, str):
+                description = raw.strip()
+            user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
+    return SkillSpec(
+        name=":".join((*parents, name)),
+        description=description or _plugin_command_summary(body),
+        content=body.strip(),
+        skill_dir=None,
+        user_invocable=user_invocable,
+    )
+
+
+def _declared_command_paths(key: str, install_path: Path, declared: object) -> list[Path]:
+    """A manifest's usable ``commands`` paths, as declared, dropping any that leave the plugin.
+
+    The declared spelling is kept so a symlinked entry is named as declared.
+    """
+    entries = [declared] if isinstance(declared, str) else declared
+    if not isinstance(entries, list):
+        _log.warning("Plugin %r: manifest 'commands' must be a path or a list of paths", key)
+        return []
+    root = install_path.resolve()
+    paths: list[Path] = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry:
+            continue
+        path = install_path / entry
+        try:
+            inside = path.resolve().is_relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:  # 3.12: RuntimeError on a link loop
+            _log.warning("Plugin %r: command path %r is unusable: %s", key, entry, exc)
+            continue
+        if not inside:
+            _log.warning("Plugin %r: command path %r is outside the plugin; skipped", key, entry)
+            continue
+        paths.append(path)
+    return paths
+
+
+def _discover_plugin_commands(
+    key: str, install_path: Path, manifest: Mapping[str, object] | None
+) -> list[SkillSpec]:
+    """Read an enabled plugin's commands in stable order, mirroring Claude Code's loader.
+
+    The manifest's ``commands`` paths (one ``.md`` file or a directory each)
+    replace the default ``commands/`` directory when present. Under a directory,
+    ``<dir>/<name>.md`` is the command ``<dir>:<name>`` with every subdirectory
+    adding a segment, a directory holding a ``skill.md`` (``commands/`` itself
+    included) is the single command named by that file, any-case ``.md`` files
+    count, and symlinked entries are skipped.
+
+    :param key: The ``<plugin>@<marketplace>`` key, for diagnostics.
+    :param install_path: The plugin's trusted install directory.
+    :param manifest: The parsed ``.claude-plugin/plugin.json``, or ``None``.
+    :returns: Parsed commands, or an empty list when nothing is readable.
+    """
+    out: list[SkillSpec] = []
+    scanned = 0
+    bounded = False
+
+    def _is_markdown(entry: Path) -> bool:
+        return not entry.is_symlink() and entry.is_file() and entry.name.lower().endswith(".md")
+
+    def _stem(entry: Path) -> str:
+        # Any-case ``.md`` loads, but only the lowercase spelling is stripped.
+        return entry.name[:-3] if entry.name.endswith(".md") else entry.name
+
+    def _add(command_md: Path, segments: tuple[str, ...]) -> None:
+        spec = _parse_plugin_command(command_md, segments)
+        if spec is not None:
+            out.append(spec)
+
+    def _walk(directory: Path, prefix: tuple[str, ...], own: tuple[str, ...]) -> None:
+        # *prefix* names the children; *own* names the directory itself when it holds a skill.md.
+        nonlocal scanned, bounded
+        scanned += 1
+        if len(prefix) >= _MAX_PLUGIN_COMMAND_DEPTH or scanned > _MAX_PLUGIN_COMMAND_DIRS:
+            if not bounded:
+                _log.warning(
+                    "Plugin %r: commands beyond the walk's bounds skipped: %s", key, directory
+                )
+            bounded = True
+            return
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as exc:
+            _log.warning("Plugin %r: unreadable commands dir %s: %s", key, directory, exc)
+            return
+        skill_md = next(
+            (e for e in entries if e.name.lower() == "skill.md" and _is_markdown(e)), None
+        )
+        if skill_md is not None:
+            _add(skill_md, own)
+            return
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir():
+                _walk(entry, (*prefix, entry.name), (*prefix, entry.name))
+            elif _is_markdown(entry) and entry.name.lower() != "skill.md":
+                _add(entry, (*prefix, _stem(entry)))
+
+    declared = manifest.get("commands") if manifest else None
+    if declared is None:
+        commands_dir = install_path / "commands"
+        if not commands_dir.is_dir():
+            return out
+        if commands_dir.is_symlink() and not commands_dir.resolve().is_relative_to(
+            install_path.resolve()
+        ):
+            _log.warning("Plugin %r: commands/ links outside the plugin; skipped", key)
+            return out
+        _walk(commands_dir, (), (commands_dir.name,))
+        return out
+    for source in _declared_command_paths(key, install_path, declared):
+        # A declared entry may itself be a symlink; only entries found by walking are not followed.
+        if source.is_dir():
+            _walk(source, (), (source.name,))
+        elif source.is_file() and source.name.lower().endswith(".md"):
+            _add(source, (_stem(source),))
+        else:
+            _log.warning("Plugin %r: declared command path %s is missing or not .md", key, source)
+    return out
+
+
 def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Enabled Claude Code plugin skills, namespaced ``<plugin>:<skill>``.
+    Enabled Claude Code plugin skills and commands, namespaced ``<plugin>:<name>``.
 
-    Plugin skills are host skills, so they obey the spec's
-    ``skills_filter`` exactly as :func:`discover_host_skills` does:
-    ``"none"`` suppresses them entirely (hermetic), ``"all"`` surfaces
-    every skill from every enabled plugin, and a list selects by the
-    skill's own (bare) name — matching how the filter names skills,
-    independent of the display namespace.
+    Both are host skills, so they obey the spec's ``skills_filter`` exactly as
+    :func:`discover_host_skills` does: ``"none"`` suppresses them entirely,
+    ``"all"`` surfaces every entry of every enabled plugin, and a list selects
+    by the bare name. A skill precedes a same-named command, so the menu's
+    first-wins dedup keeps the skill.
     """
     if ctx.skills_filter == "none":
         return []
@@ -467,7 +653,10 @@ def _claude_plugin_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     for key, install_path in _plugin_install_paths(ctx, enabled).items():
         plugin = key.split("@", 1)[0]
         skipped: list[str] = []
-        for spec in _discover_skills(install_path / "skills", skipped=skipped):
+        specs = _discover_skills(install_path / "skills", skipped=skipped)
+        manifest = _read_json(install_path / ".claude-plugin" / "plugin.json")
+        specs += _discover_plugin_commands(key, install_path, manifest)
+        for spec in specs:
             if filter_names is not None and not skill_matches_names(spec, filter_names):
                 continue
             out.append(replace(spec, name=f"{plugin}:{spec.name}"))

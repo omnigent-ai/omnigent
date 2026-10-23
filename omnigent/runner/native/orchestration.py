@@ -1778,8 +1778,10 @@ async def _auto_create_opencode_terminal(
         # Bake fallback headers for the first calls before relay starts.
         from omnigent.runner._entry import _make_auth_token_factory
 
-        _policy_factory = _make_auth_token_factory()
-        _policy_token = _policy_factory() if _policy_factory is not None else None
+        _policy_factory = await asyncio.to_thread(_make_auth_token_factory)
+        _policy_token = (
+            await asyncio.to_thread(_policy_factory) if _policy_factory is not None else None
+        )
         if _policy_token:
             from omnigent.cli_auth import databricks_request_headers
 
@@ -1787,11 +1789,9 @@ async def _auto_create_opencode_terminal(
                 databricks_request_headers(runner_server_url, bearer_token=_policy_token)
             )
 
-    # Merge the user's global provider definitions (e.g. OpenAI-compatible
-    # endpoints with custom base URLs) into the synthesized config so the
-    # spawned server sees both. The per-session XDG_CONFIG_HOME override
-    # hides the user's ~/.config/opencode/opencode.jsonc, so without this
-    # merge, custom providers with non-default base URLs are invisible.
+    # Carry the user's global provider definitions (e.g. OpenAI-compatible
+    # endpoints with custom base URLs) into the synthesized config: the
+    # per-session XDG_CONFIG_HOME hides ~/.config/opencode from the server.
     config = maybe_merge_user_provider_config(config)
 
     if config:
@@ -2626,7 +2626,7 @@ async def _auto_create_pi_terminal(
     clear_inbox(bridge_dir)
     pi_extension = pi_extension_path(bridge_dir)
     session_dir = pi_session_dir(bridge_dir)
-    auth_factory = _make_auth_token_factory()
+    auth_factory = await asyncio.to_thread(_make_auth_token_factory)
     auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
     # Route the extension's out-of-process POSTs (/events, /mcp,
     # /policies/evaluate) through the shared header builder so they carry the
@@ -2881,6 +2881,18 @@ async def _auto_create_pi_terminal(
             server_client=server_client,
             code="pi_native_model_rerouted",
             notice=model_notice,
+        )
+    # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
+    # transcript forwarder, so its slot owns this task until relaunch/teardown.
+    if auth_token:
+        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_auth_refresh
+
+        _register_auto_forwarder_task(
+            session_id,
+            asyncio.create_task(
+                supervise_pi_auth_refresh(bridge_dir, launch_config.server_url),
+                name=f"pi-auth-refresh-{session_id}",
+            ),
         )
     return terminal_view
 
@@ -3259,7 +3271,7 @@ async def _auto_create_cursor_terminal(
     server_url = _required_runner_env("RUNNER_SERVER_URL")
     # Authorization rides solely on the refresh-capable auth (no static header
     # snapshot that would expire mid-session), matching the runner's server_client.
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+    _runner_auth = _RunnerDatabricksAuth(await asyncio.to_thread(_make_auth_token_factory))
 
     from omnigent.harnesses.cursor_native.forwarder import supervise_cursor_forwarder
     from omnigent.harnesses.cursor_native.permissions import (
@@ -3466,7 +3478,7 @@ async def _auto_create_goose_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+    _runner_auth = _RunnerDatabricksAuth(await asyncio.to_thread(_make_auth_token_factory))
 
     from omnigent.harnesses.goose_native.forwarder import supervise_goose_forwarder
     from omnigent.harnesses.goose_native.permissions import supervise_goose_approval_mirror
@@ -3517,6 +3529,19 @@ async def _auto_create_goose_terminal(
         _forwarder_task.get_name(),
     )
     return terminal_view
+
+
+async def _write_native_policy_hook[WriteResult](writer: Callable[[], WriteResult]) -> WriteResult:
+    """Drain policy-file writes before a cancelled launch releases ownership."""
+    from omnigent.inner._subprocess_lifecycle import await_cleanup_task
+
+    worker = asyncio.create_task(asyncio.to_thread(writer))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await await_cleanup_task(worker)
+        raise
 
 
 async def _auto_create_hermes_terminal(
@@ -3573,7 +3598,9 @@ async def _auto_create_hermes_terminal(
     # Write a per-session HERMES_HOME with the Omnigent policy hook so the
     # native TUI evaluates tool calls against Omnigent policies.
     _hermes_server_url = _required_runner_env("RUNNER_SERVER_URL")
-    write_policy_hook_config(bridge_dir, _hermes_server_url, session_id)
+    await _write_native_policy_hook(
+        lambda: write_policy_hook_config(bridge_dir, _hermes_server_url, session_id)
+    )
 
     # ``_pi_native_launch_config`` is a generic session-snapshot reader
     # (workspace + terminal_launch_args); reused here, not Pi-specific.
@@ -3714,7 +3741,7 @@ async def _auto_create_hermes_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+    _runner_auth = _RunnerDatabricksAuth(await asyncio.to_thread(_make_auth_token_factory))
 
     from omnigent.harnesses.hermes_native.bridge import read_hermes_home
     from omnigent.harnesses.hermes_native.forwarder import supervise_hermes_forwarder
@@ -3877,7 +3904,7 @@ async def _auto_create_kiro_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+    _runner_auth = _RunnerDatabricksAuth(await asyncio.to_thread(_make_auth_token_factory))
 
     # Start the Omnigent builtin-tool relay (writes tool_relay.json into the kiro
     # bridge dir) so the serve-mcp server declared in the workspace mcp.json can
@@ -4028,11 +4055,13 @@ async def _auto_create_devin_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+    _runner_auth = _RunnerDatabricksAuth(await asyncio.to_thread(_make_auth_token_factory))
 
     # The hook wrapper carries a one-shot Omnigent bearer, so it must be written
     # before the TUI starts — Devin reads its hook config once at launch.
-    hook_command = write_hook_wrapper(bridge_dir, server_url=server_url, session_id=session_id)
+    hook_command = await _write_native_policy_hook(
+        lambda: write_hook_wrapper(bridge_dir, server_url=server_url, session_id=session_id)
+    )
     from omnigent.harnesses.devin_native.bridge import write_devin_session_config
 
     # Devin has no --effort flag: a (model, effort) pick from the New Chat dialog
@@ -4471,7 +4500,7 @@ async def _auto_create_qwen_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
-    _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
+    _runner_auth = _RunnerDatabricksAuth(await asyncio.to_thread(_make_auth_token_factory))
 
     from omnigent.harnesses.qwen_native.bridge import qwen_session_recording_path
     from omnigent.harnesses.qwen_native.forwarder import (
@@ -4631,7 +4660,7 @@ async def _auto_create_kimi_terminal(
     # request/reply, like claude-native's permission hook); ``None`` factory is
     # a safe no-op for local unauthenticated runs.
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
-    _auth_factory = _make_auth_token_factory()
+    _auth_factory = await asyncio.to_thread(_make_auth_token_factory)
     _auth_token = await asyncio.to_thread(_auth_factory) if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
@@ -5518,7 +5547,7 @@ async def _auto_create_codex_terminal(
     # the claude-native PermissionRequest hook on this host-spawned path.
     from omnigent.runner._entry import _make_auth_token_factory
 
-    _policy_auth_factory = _make_auth_token_factory()
+    _policy_auth_factory = await asyncio.to_thread(_make_auth_token_factory)
     _policy_auth_token = (
         await asyncio.to_thread(_policy_auth_factory) if _policy_auth_factory is not None else None
     )
@@ -6368,8 +6397,8 @@ async def _codex_discover_thread_and_forward(
         )
 
         server_url = _required_runner_env("RUNNER_SERVER_URL")
-        auth_factory = _make_auth_token_factory()
-        auth_token = auth_factory() if auth_factory is not None else None
+        auth_factory = await asyncio.to_thread(_make_auth_token_factory)
+        auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
         headers: dict[str, str] = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
         # Mirror the discovered Codex thread id onto the Omnigent session as its
@@ -6502,8 +6531,8 @@ async def _codex_forward_known_thread(
     cancelled = False
     try:
         server_url = _required_runner_env("RUNNER_SERVER_URL")
-        auth_factory = _make_auth_token_factory()
-        auth_token = auth_factory() if auth_factory is not None else None
+        auth_factory = await asyncio.to_thread(_make_auth_token_factory)
+        auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         await supervise_forwarder(
             base_url=server_url,
@@ -6824,8 +6853,8 @@ async def _auto_create_antigravity_terminal(
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     server_url = _required_runner_env("RUNNER_SERVER_URL")
-    auth_factory = _make_auth_token_factory()
-    auth_token = auth_factory() if auth_factory is not None else None
+    auth_factory = await asyncio.to_thread(_make_auth_token_factory)
+    auth_token = await asyncio.to_thread(auth_factory) if auth_factory is not None else None
     runner_headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
 
     # Seed bridge state with the id known so far (the real id on resume; on a
@@ -8771,7 +8800,7 @@ async def _auto_create_claude_terminal(
     # HTTP calls are authenticated.
     _auth_factory = auth_token_factory
     if _auth_factory is None:
-        _auth_factory = _make_auth_token_factory()
+        _auth_factory = await asyncio.to_thread(_make_auth_token_factory)
     # The hook reads an owner-only header snapshot that the parent refreshes.
     # The forwarder uses refresh-capable auth directly; ``None`` is a no-op.
     _auth_token = await asyncio.to_thread(_auth_factory) if _auth_factory is not None else None
@@ -9919,7 +9948,11 @@ async def _resolve_native_spawn_env(
         )
 
         server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
-        write_policy_hook_config(bridge_dir_for_session_id(session_id), server_url, session_id)
+        await _write_native_policy_hook(
+            lambda: write_policy_hook_config(
+                bridge_dir_for_session_id(session_id), server_url, session_id
+            )
+        )
         return _typed_spawn_env(builder(session_id))
 
     if provider.bridge_id_label_key is not None:

@@ -12,7 +12,8 @@
 
 import type React from "react";
 import { useMemo } from "react";
-import { GitPullRequestIcon } from "lucide-react";
+import { CopyIcon, GitPullRequestIcon } from "lucide-react";
+import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -23,10 +24,18 @@ import {
   WORKSPACE_FILE_LINK_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
+import { copyText } from "@/lib/clipboard";
+import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import {
@@ -63,6 +72,8 @@ interface WorkspaceFileOpener {
   unopenable: boolean;
   /** The path resolution produced, for feedback messaging; "" when none. */
   resolvedPath: string;
+  /** Clipboard path: host-absolute when the root is known, else the cited path. */
+  copyPath: string;
 }
 
 /**
@@ -91,6 +102,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
   // home, …) → never a link.
   const resolution = cited ? resolveChatFilePath(cited, root, home) : null;
   const linkPath = resolution?.path ?? null;
+  const copyPath = linkPath === null ? cited : (absoluteWorkspacePath(linkPath, root) ?? linkPath);
 
   // Only relative paths can be in the changed-files list (it speaks
   // workspace-relative); an outside-workspace absolute is never a change.
@@ -115,6 +127,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
       // completed listing (skipped/pending/errored checks stay unverified).
       unopenable: !!openFile && !rootPending && (linkPath === null || (settled && !exists)),
       resolvedPath: linkPath ?? "",
+      copyPath,
     };
   }
   return {
@@ -128,6 +141,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
           }),
     unopenable: false,
     resolvedPath: linkPath,
+    copyPath,
   };
 }
 
@@ -257,6 +271,10 @@ function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
  *
  * A marked path that names no workspace file renders as plain text: its href is
  * the parked fragment, so a live link there would go nowhere.
+ *
+ * A marked path rendered as a link or text offers "Copy path" on right-click
+ * (long-press on touch): with no href, neither the browser nor the desktop shell
+ * offers to copy it.
  */
 function WorkspaceFileLink({
   href,
@@ -268,7 +286,12 @@ function WorkspaceFileLink({
 }: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
   const marked = (props as Record<string, unknown>)[WORKSPACE_FILE_LINK_ATTR];
   const path = typeof marked === "string" ? marked : "";
-  const { open: openWorkspaceFile, unopenable, resolvedPath } = useWorkspaceFileOpener(path, true);
+  const {
+    open: openWorkspaceFile,
+    unopenable,
+    resolvedPath,
+    copyPath,
+  } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
@@ -336,32 +359,36 @@ function WorkspaceFileLink({
             : `Can't open ${path}: it doesn't resolve to an openable file path.`,
         );
       return (
-        <span
-          role="button"
-          tabIndex={0}
-          className={cn(
-            "cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-2",
-            className,
-          )}
-          title={title ?? path}
-          onClick={explain}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              explain();
-            }
-          }}
-        >
-          {children}
-        </span>
+        <FileLinkContextMenu path={copyPath}>
+          <span
+            role="button"
+            tabIndex={0}
+            className={cn(
+              "cursor-pointer text-muted-foreground underline decoration-dotted underline-offset-2",
+              className,
+            )}
+            title={title ?? path}
+            onClick={explain}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                explain();
+              }
+            }}
+          >
+            {children}
+          </span>
+        </FileLinkContextMenu>
       );
     }
     // Not verified yet (existence check still in flight, or it can't run):
     // plain text, with the path on hover so it stays discoverable.
     return (
-      <span className={className} title={title ?? path}>
-        {children}
-      </span>
+      <FileLinkContextMenu path={copyPath}>
+        <span className={className} title={title ?? path}>
+          {children}
+        </span>
+      </FileLinkContextMenu>
     );
   }
 
@@ -390,27 +417,49 @@ function WorkspaceFileLink({
   // No href: the parked fragment would still navigate on cmd/middle-click, and
   // no URL opens the FileViewer. role/tabIndex/onKeyDown restore button semantics.
   return (
-    <a
-      {...props}
-      role="button"
-      tabIndex={0}
-      aria-label={shortLabel && linkText ? linkText : props["aria-label"]}
-      title={title ?? path}
-      data-streamdown="link"
-      // Dotted underline distinguishes "opens in the FileViewer" from a link
-      // that leaves the app; the rest matches Streamdown so a file link in a
-      // table cell wraps like any other.
-      className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
-      onClick={openWorkspaceFile}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openWorkspaceFile();
-        }
-      }}
-    >
-      {shortLabel ?? children}
-    </a>
+    <FileLinkContextMenu path={copyPath}>
+      <a
+        {...props}
+        role="button"
+        tabIndex={0}
+        aria-label={shortLabel && linkText ? linkText : props["aria-label"]}
+        title={title ?? path}
+        data-streamdown="link"
+        // Dotted underline distinguishes "opens in the FileViewer" from a link
+        // that leaves the app; the rest matches Streamdown so a file link in a
+        // table cell wraps like any other.
+        className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
+        onClick={openWorkspaceFile}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            openWorkspaceFile();
+          }
+        }}
+      >
+        {shortLabel ?? children}
+      </a>
+    </FileLinkContextMenu>
+  );
+}
+
+/** Right-click menu that copies the path a file link names. */
+function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
+  const copyPath = () =>
+    void copyText(path).then(
+      () => toast.success("Copied path"),
+      () => toast.error("Couldn't copy the path"),
+    );
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onSelect={copyPath}>
+          <CopyIcon />
+          Copy path
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 

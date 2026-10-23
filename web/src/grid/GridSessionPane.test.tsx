@@ -67,7 +67,10 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useDeleteTerminal: () => ({}),
 }));
 vi.mock("./GridSessionsContext", () => ({
-  useGridSessions: () => ({ closePane: vi.fn() }),
+  useGridSessions: () => {
+    const [selectedSessionId, selectSession] = useState("first");
+    return { closePane: vi.fn(), selectedSessionId, selectSession };
+  },
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
@@ -268,9 +271,6 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   expect(readSessionWorkspaceState("first").widthPx).toBe(320);
   expect(readSessionWorkspaceState("second").widthPx).toBe(900);
   expect(readSessionWorkspaceState("grid:saved")).toEqual({ open: false, widthPx: 504 });
-  // Removing the active session chooses a remaining cell.
-  view.rerender(tree(splitGrid("first", "first", "third", "bottom")!));
-  expect(first).toHaveAttribute("data-active", "true");
   view.unmount();
   render(tree());
   fireEvent.click(screen.getByRole("button", { name: "Expand grid workspace" }));

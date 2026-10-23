@@ -20,6 +20,8 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  failedSessionLastError,
+  isComposerReadOnly,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
@@ -52,7 +54,7 @@ import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 // or hide the share button from managers.
 
 function composerState(permissionLevel: number | null) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = isComposerReadOnly(permissionLevel, null, null);
   const canType = !isReadOnly;
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
@@ -89,6 +91,17 @@ describe("Composer permission gating", () => {
     const state = composerState(null);
     expect(state.isReadOnly).toBe(false);
     expect(state.canType).toBe(true);
+  });
+
+  it("a structural read-only reason locks the composer at any level", () => {
+    expect(isComposerReadOnly(4, "Mirrored transcript", null)).toBe(true);
+    expect(isComposerReadOnly(null, "Mirrored transcript", null)).toBe(true);
+  });
+
+  it("a temporary send block keeps the level-1 startup fallback editable", () => {
+    // A client-only conversation falls back to level 1 before its session
+    // exists; the send block, not read-only, is what holds submission.
+    expect(isComposerReadOnly(1, null, "Starting the session…")).toBe(false);
   });
 });
 
@@ -204,6 +217,23 @@ describe("Terminal-first surface selection", () => {
       }),
     ).toBe(false);
     expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("failedSessionLastError", () => {
+  const error = { code: "runner_failed_to_start", message: "host authentication failed" };
+
+  it("surfaces the error for a failed session", () => {
+    expect(failedSessionLastError({ status: "failed", lastTaskError: error })).toEqual(error);
+  });
+
+  it("hides a stale error on a session that is no longer failed", () => {
+    expect(failedSessionLastError({ status: "running", lastTaskError: error })).toBeNull();
+  });
+
+  it("returns null for a failed session with no error, or no session", () => {
+    expect(failedSessionLastError({ status: "failed" })).toBeNull();
+    expect(failedSessionLastError(null)).toBeNull();
   });
 });
 

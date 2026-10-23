@@ -27,7 +27,7 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from omnigent.process_logging import data_dir
 from omnigent.util.uuid import normalize_uuid
@@ -73,14 +73,24 @@ class HostDaemonRecord:
     workspace_id: str | None = None
 
 
-def normalize_daemon_target(server_url: str | None) -> str:
+def normalize_daemon_target(server_url: str | None, *, org_id: str | None = None) -> str:
     """Return the registry key for a daemon target.
 
     :param server_url: Requested server URL, or ``None`` / empty for local mode.
+    :param org_id: Workspace the daemon is bound to, e.g. ``"2850744067564480"``.
+        Added as an ``o`` query parameter (unless the URL already selects one)
+        so daemons for different workspaces behind one account host get
+        distinct records.
     :returns: ``"local"`` for local mode, else a canonical server URL.
     """
     if not server_url:
         return _LOCAL_DAEMON_MARKER
+    if org_id:
+        parsed = urlsplit(server_url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(key == "o" for key, _ in query):
+            query.append(("o", org_id))
+            server_url = urlunsplit(parsed._replace(query=urlencode(query)))
 
     fallback_target = server_url.rstrip("/")
     try:
@@ -325,6 +335,11 @@ def find_same_workspace_daemon(
             workspace_id = _lookup(server_url, None)
             if workspace_id is None:
                 return None
+        # The caller's own record, keyed by its workspace (see normalize_daemon_target).
+        if normalize_daemon_target(record.target) == normalize_daemon_target(
+            server_url, org_id=workspace_id
+        ):
+            continue
         if _lookup(record.server_url, record.workspace_id) == workspace_id:
             return record
     return None
@@ -457,6 +472,28 @@ def record_owner_is_live(record: HostDaemonRecord, *, base_dir: Path | None = No
     if record_flock_is_held(daemon_record_path(record.target, base_dir=base_dir)) is True:
         return True
     return pid_is_recorded_daemon(record)
+
+
+def daemon_target_server_url(target: str) -> str:
+    """Return the server URL for a daemon target, without its ``?o=`` workspace key.
+
+    Request paths are appended to this URL, so it must not carry the selector
+    that :func:`normalize_daemon_target` adds to the registry key.
+
+    :param target: Normalized daemon target, e.g.
+        ``"https://acct.example.com/api/2.0/omnigent?o=123"``.
+    :returns: The target minus its ``o`` query parameter, e.g.
+        ``"https://acct.example.com/api/2.0/omnigent"``.
+    """
+    parsed = urlsplit(target)
+    if not parsed.query:
+        return target
+    kept = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "o"
+    ]
+    return urlunsplit(parsed._replace(query=urlencode(kept)))
 
 
 def _target_digest(target: str) -> str:

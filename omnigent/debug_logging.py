@@ -494,8 +494,8 @@ def publish_origin_identity(server_url: str) -> str | None:
 
     Host and CLI processes call this at startup, before anything they log or
     spawn. The id comes from the URL's ``?o=`` or the stored login record, else
-    a one-time unauthenticated probe whose result is stored in that record, the
-    way an explicit ``?o=`` already is.
+    a one-time unauthenticated probe. Attribution never changes saved login
+    details; only an authenticated command may persist a workspace selector.
 
     :param server_url: The server API base, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
@@ -503,16 +503,12 @@ def publish_origin_identity(server_url: str) -> str | None:
         non-Databricks server or when it cannot be resolved.
     """
     try:
-        from omnigent.cli_auth import store_databricks_org_id
         from omnigent.util.server_url import ServerUrl
 
         resolved = ServerUrl.from_api_base(server_url)
         workspace_id = resolved.org_id
         if workspace_id is None and resolved.is_workspace_hosted:
             workspace_id = _probe_workspace_id(resolved.api_base)
-            if workspace_id:
-                with contextlib.suppress(OSError):
-                    store_databricks_org_id(resolved.api_base, workspace_id)
         if workspace_id:
             os.environ[ORIGIN_WORKSPACE_ID_ENV_VAR] = workspace_id
         return workspace_id

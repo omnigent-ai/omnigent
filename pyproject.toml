@@ -61,7 +61,9 @@ dependencies = [
     # a 0600 file when no keyring backend is available (e.g. headless).
     "keyring>=24,<26",
     # Decode and validate public branding assets before serving them.
-    "pillow>=12.2,<13",
+    # uv.lock pins 13.0.0 for its security fixes; the floor stays at 12.2 so
+    # installs behind a package-age cooldown mirror still resolve until 13 ages in.
+    "pillow>=12.2,<14",
     # Round-trip (comment/format-preserving) TOML editing of the user's
     # ~/.codex/config.toml when removing a Databricks provider
     # (omnigent/onboarding/ucode_cleanup.py). stdlib tomllib is read-only.

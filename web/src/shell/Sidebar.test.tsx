@@ -1578,11 +1578,14 @@ describe("Sidebar failed session indicator", () => {
         window.dispatchEvent(new StorageEvent("storage", { key, storageArea: localStorage }));
       });
       expect(screen.getByRole("link", { name: "conv_b" })).not.toHaveClass(
-        "bg-[var(--sidebar-active)]",
+        "bg-[var(--sidebar-active)]/50",
       );
       expect(screen.getByRole("link", { name: "conv_c" })).toHaveClass(
-        "bg-[var(--sidebar-active)]",
+        "bg-[var(--sidebar-active)]/50",
       );
+      expect(screen.getByRole("link", { name: "conv_c" })).not.toHaveClass("ring-1");
+      // The focused pane (first by default) also gets a ring.
+      expect(screen.getByRole("link", { name: "conv_a" })).toHaveClass("ring-1");
       expect(readState.mock.calls.some(([id]) => id === "conv_a")).toBe(false);
     } finally {
       viewer.mockRestore();

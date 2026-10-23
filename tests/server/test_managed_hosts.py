@@ -758,6 +758,8 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cluster": "my-gateway",
                 "workspace": "team-alpha",
+                "node_selector": {"kata-install": "true"},
+                "runtime_class": "kata-containers",
             },
         }
     )
@@ -774,6 +776,8 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.cluster == "my-gateway"
     assert fake.workspace == "team-alpha"
+    assert fake.node_selector == {"kata-install": "true"}
+    assert fake.runtime_class == "kata-containers"
 
 
 def test_parse_openshell_without_section_defaults(

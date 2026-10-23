@@ -774,6 +774,22 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     },
   );
 
+  it.each([
+    { directories: undefined },
+    { directories: null },
+    { directories: "/worktrees/branch" },
+    { directories: {} },
+    { directories: [""] },
+    { directories: ["/worktrees/branch", 123] },
+  ])("ignores malformed directory hints: $directories", ({ directories }) => {
+    const out = parse("response.elicitation_request", {
+      elicitation_id: "elicit_directory",
+      params: { message: "Approve Edit?", permission_directories: directories },
+    });
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).permissionDirectories).toBeUndefined();
+  });
+
   it("lifts the allow_all_edits hint for claude-native edit-tool prompts", () => {
     // The server stamps ``allow_all_edits`` on edit-tool
     // PermissionRequests so the card can offer "Accept & allow all

@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
@@ -485,7 +485,7 @@ export function activeTurnIdAtBubbleIndex(bubbles: Bubble[], midIndex: number): 
  * mount every bubble's markdown/tool subtree at once.
  *
  * The window is one flex child of the content div, sized to the full measured
- * height (`getTotalSize`) with each row absolutely positioned. Keeping the
+ * height (`getTotalSize`), with mounted rows padded to their offsets. Keeping the
  * wrapper at full height preserves `scrollHeight`, so StickToBottom's
  * at-bottom math, the TranscriptScrollbar, and the LatestTurnSpacer all keep
  * measuring the whole transcript even though most rows are unmounted. Rows are
@@ -557,6 +557,8 @@ function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): v
 }
 /** Physical "is this scroll element at (or within a hair of) its bottom". */
 const BOTTOM_EPSILON_PX = 8;
+/** Space between virtualized rows, shared by the virtualizer's offsets and the list's layout. */
+const ROW_GAP_PX = 16;
 const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
@@ -637,8 +639,8 @@ export function VirtualBubbleList({
       // offset is scroll-invariant and only in-flow content above it moves it,
       // while the hold measures purely inside the list. Neither sees the other's
       // change, so their writes add rather than double-count.
-      // Native scroll anchoring can't — the rows it would anchor to are out of
-      // flow — so it is off for this scroller (data-virtualized-transcript).
+      // Native scroll anchoring would also answer the virtualizer's own row
+      // corrections, so it is off for this scroller (data-virtualized-transcript).
       // Only the observer sees the net change per painted frame; a layout
       // effect can catch the indicator mid unmount-and-remount. At the very
       // top the indicator is meant to be seen, so nothing moves there.
@@ -649,8 +651,8 @@ export function VirtualBubbleList({
       if (observed) {
         const previous = listOffsetRef.current;
         listOffsetRef.current = { el: scrollEl, offset, scrollable };
-        // With virtualization off (native find) the rows are in flow and the
-        // browser's own anchoring handles this; writing too would double it.
+        // With virtualization off (native find) the browser's own anchoring is
+        // on and handles this; writing too would double it.
         if (
           !disableVirtualization &&
           previous?.el === scrollEl &&
@@ -729,11 +731,20 @@ export function VirtualBubbleList({
       const key = bubbleKey(bubbles[index]!);
       return rowKeyAliasRef.current.get(key) ?? key;
     },
-    // Replaces the content column's `gap-4` between bubbles, which absolute
-    // positioning would otherwise drop.
-    gap: 16,
+    gap: ROW_GAP_PX,
     overscan: 6,
     scrollMargin,
+    // Unrounded, unlike the library default: in-flow rows sit at their exact
+    // heights, so rounded sizes would drift each row off its virtual offset.
+    measureElement: (element, entry, instance) => {
+      const observed = entry?.borderBoxSize?.[0]?.blockSize;
+      if (observed !== undefined) return observed;
+      // On mount the library falls back to a cached size, else the rounded offsetHeight.
+      const key = instance.options.getItemKey(instance.indexFromElement(element));
+      return instance.itemSizeCache.has(key)
+        ? measureElement(element, entry, instance)
+        : element.getBoundingClientRect().height;
+    },
   });
 
   // An assistant bubble is keyed by its first item, so a history page that
@@ -931,9 +942,9 @@ export function VirtualBubbleList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bubbles, scrollEl, range, totalSize, virtualizer]);
 
-  // Older-history prepend compensation. Absolute rows are out of normal flow,
-  // so the browser's native scroll anchoring can't hold the read position
-  // across a prepend. Snapshot every mounted row's offset each render; when a
+  // Older-history prepend compensation. Native scroll anchoring is off for
+  // this scroller, so it can't hold the read position across a prepend.
+  // Snapshot every mounted row's offset each render; when a
   // prepend lands, restore scrollTop so the topmost snapshotted row that still
   // exists keeps its pre-prepend viewport position. A bubble the page renamed
   // is skipped when any other row survives, and otherwise held by its bottom
@@ -1035,9 +1046,22 @@ export function VirtualBubbleList({
     );
   }
 
+  // Rows stay in flow, padded to their virtual offsets: the browser resolves a
+  // drag ending beside or between out-of-flow rows to the start of the list.
+  const virtualItems = virtualizer.getVirtualItems();
+  const firstItem = virtualItems[0];
+  const lastItem = virtualItems.at(-1);
   return (
-    <div ref={wrapperRef} className="relative w-full" style={{ height: `${totalSize}px` }}>
-      {virtualizer.getVirtualItems().map((item) => {
+    <div
+      ref={wrapperRef}
+      className="flex w-full flex-col"
+      style={{
+        rowGap: ROW_GAP_PX,
+        paddingTop: firstItem ? firstItem.start - scrollMargin : 0,
+        paddingBottom: lastItem ? totalSize - (lastItem.end - scrollMargin) : totalSize,
+      }}
+    >
+      {virtualItems.map((item) => {
         const bubble = bubbles[item.index];
         if (!bubble) return null;
         return (
@@ -1046,8 +1070,7 @@ export function VirtualBubbleList({
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
             ref={virtualizer.measureElement}
-            className="absolute top-0 left-0 w-full"
-            style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
+            className="relative"
           >
             <BubbleView
               bubble={bubble}

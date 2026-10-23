@@ -550,15 +550,23 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 )
             tasks = list(session.execute(stmt).tuples())
         for workspace_id, task_id in tasks:
-            with workspace_scope(workspace_id):
-                run_cursor = (
-                    after[2]
-                    if after is not None and after[:2] == (workspace_id, task_id)
-                    else None
+            try:
+                with workspace_scope(workspace_id):
+                    run_cursor = (
+                        after[2]
+                        if after is not None and after[:2] == (workspace_id, task_id)
+                        else None
+                    )
+                    next_run_cursor = self._purge_deleted_task_page(task_id, after=run_cursor)
+                if next_run_cursor is not None:
+                    return (workspace_id, task_id, next_run_cursor)
+            except Exception:
+                _logger.exception(
+                    "Could not clean up deleted task %s in workspace %s; "
+                    "continuing with other tasks and retrying on the next scan",
+                    task_id,
+                    workspace_id,
                 )
-                next_run_cursor = self._purge_deleted_task_page(task_id, after=run_cursor)
-            if next_run_cursor is not None:
-                return (workspace_id, task_id, next_run_cursor)
         return (tasks[-1][0], tasks[-1][1], None) if len(tasks) == limit else None
 
     # ── Runs ─────────────────────────────────────────────────────
@@ -880,7 +888,12 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     def check_dispatch_support(self) -> None:
         """D1's REST driver auto-commits each statement and cannot roll back a claim."""
         if self._engine.dialect.name == "cloudflare_d1":
-            raise NotImplementedError("Database dispatch requires multi-statement transactions")
+            raise NotImplementedError(
+                "The persistent scheduler cannot use Cloudflare D1: its REST driver does not "
+                "support the multi-statement transactions needed to create a run and advance "
+                "its schedule together. Use a supported database backend, or disable "
+                "automations_v2 to use the existing scheduler."
+            )
 
     def initialize_next_run_at(self, task: ScheduledTask, next_run_at: int) -> bool:
         """Backfill an unchanged legacy task without overwriting edits or claims."""
@@ -917,7 +930,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> builtins.list[ScheduledTask]:
         """Indexed global discovery, keyset-paged past tasks owned by other replicas."""
         if limit < 1:
-            raise ValueError("limit must be positive")
+            raise ValueError("The page size (limit) for fetching due tasks must be at least 1.")
         with self._session("discover_due_tasks") as session:
             columns = (
                 SqlScheduledTask.next_run_at,
@@ -955,7 +968,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         self.check_dispatch_support()
         if lease_seconds <= 0 or (next_run_at is not None and next_run_at <= now):
             raise ValueError(
-                "lease_seconds must be positive and next_run_at must be in the future"
+                "Cannot claim a scheduled run: lease_seconds must be greater than zero, "
+                "and next_run_at must be later than now or None when no future run remains."
             )
         if (
             task.workspace_id != current_workspace_id()
@@ -1008,7 +1022,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         Completed/running rows are likewise never modified.
         """
         if lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive")
+            raise ValueError(
+                "Cannot renew a startup lease: its duration (lease_seconds) must be "
+                "greater than zero."
+            )
 
         def write(session: Session) -> ScheduledTaskRun | None:
             row = session.get(
@@ -1032,7 +1049,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> builtins.list[ScheduledTaskRun]:
         """Find expired startup leases across workspaces; running sessions are excluded."""
         if limit < 1:
-            raise ValueError("limit must be positive")
+            raise ValueError(
+                "The page size (limit) for fetching runs with expired startup leases "
+                "must be at least 1."
+            )
         with self._session("discover_expired_startups") as session:
             columns = (
                 SqlScheduledTaskRun.lease_expires_at,
@@ -1065,9 +1085,15 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> ScheduledTaskRun | None:
         """Transition only a matching startup lease."""
         if status not in {"starting", "running", "failed", "skipped"}:
-            raise ValueError("invalid startup transition")
+            raise ValueError(
+                f"Cannot update a starting run to status {status!r}. "
+                "Expected 'starting', 'running', 'failed', or 'skipped'."
+            )
         if status == "starting" and (expired or conversation_id is None):
-            raise ValueError("attaching a session requires a live startup lease")
+            raise ValueError(
+                "Keeping a run in 'starting' requires a conversation_id to attach its "
+                "session and an unexpired startup lease (expired=False)."
+            )
         if run.workspace_id != current_workspace_id():
             return None
 

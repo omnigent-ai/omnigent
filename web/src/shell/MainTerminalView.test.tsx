@@ -7,6 +7,7 @@ import { type TerminalInfo, useTerminals } from "@/hooks/useTerminals";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import type { Session } from "@/lib/types";
 import { updateTerminalSplit } from "./terminalSplitPanesStore";
 import { MainTerminalView } from "./MainTerminalView";
 import type { TerminalFirstContextValue } from "./TerminalFirstContext";
@@ -127,6 +128,7 @@ function viewTree({
   readOnly = false,
   conversationId = "conv_sdk",
   runnerOnline,
+  lastTaskError,
   onResume,
   setView,
   terminalStartingUp = false,
@@ -139,6 +141,7 @@ function viewTree({
   readOnly?: boolean;
   conversationId?: string;
   runnerOnline?: boolean;
+  lastTaskError?: Session["lastTaskError"];
   onResume?: () => void | Promise<void>;
   setView?: (view: "chat" | "terminal") => void;
   terminalStartingUp?: boolean;
@@ -153,6 +156,7 @@ function viewTree({
         visible={visible}
         readOnly={readOnly}
         runnerOnline={runnerOnline}
+        lastTaskError={lastTaskError}
         onResume={onResume}
         sandboxOffline={sandboxOffline}
       />
@@ -291,6 +295,33 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
 
     expect(await screen.findByText("Couldn't resume session: host offline")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+  });
+
+  it("surfaces the failure cause on the stopped state so the user sees why", () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    renderView({
+      terminals: [],
+      runnerOnline: false,
+      onResume,
+      lastTaskError: {
+        code: "runner_failed_to_start",
+        message: "runner process exited before connecting; host authentication failed",
+      },
+    });
+
+    expect(screen.getByText("The harness is not running.")).toBeInTheDocument();
+    expect(screen.getByTestId("terminal-failure-cause")).toHaveTextContent(
+      "runner process exited before connecting; host authentication failed",
+    );
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeInTheDocument();
+  });
+
+  it("keeps the plain stopped copy when the session carries no failure cause", () => {
+    const onResume = vi.fn().mockResolvedValue(undefined);
+    renderView({ terminals: [], runnerOnline: false, onResume });
+
+    expect(screen.getByText("The harness is not running.")).toBeInTheDocument();
+    expect(screen.queryByTestId("terminal-failure-cause")).toBeNull();
   });
 });
 
