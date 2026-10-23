@@ -117,7 +117,6 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
     """Exercise exec errors and input loss with a real child and PTY."""
     state_file = tmp_path / "status.json"
     ready = tmp_path / "ready"
-    pending_ready = tmp_path / "ready.pending"
     command = [str(tmp_path / "command")]
     wrapper = "from omnigent.terminals.program_status import main; main()"
     if failure == "not-executable":
@@ -129,8 +128,9 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
             "import os,signal,time; from pathlib import Path; "
             "signal.signal(signal.SIGHUP, lambda *_: "
             "(time.sleep(0.05), print('graceful-exit-tail', flush=True), exit(23))); "
-            f"Path({str(pending_ready)!r}).write_text(str(os.getpid())); "
-            f"os.replace({str(pending_ready)!r}, {str(ready)!r}); "
+            # Publish readiness only after the PID file is fully written and closed.
+            f"ready = Path({str(ready)!r}); pending = ready.with_suffix('.tmp'); "
+            "pending.write_text(str(os.getpid())); pending.replace(ready); "
             "time.sleep(30)",
         ]
         # Inject only the outer input failure; fork, inner PTY and child are real.

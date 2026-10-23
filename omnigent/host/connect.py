@@ -9,6 +9,8 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import errno
 import functools
@@ -3867,6 +3869,30 @@ class HostProcess:
                 pr_url=cast("str | None", params.get("pr_url")),
                 add=params.get("add", []),
                 remove=params.get("remove", []),
+            )
+        if op == "github_details_update":
+            return pr_resource.update_pr_details(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                title=params.get("title"),
+                body=params.get("body"),
+            )
+        if op == "github_attachment_upload":
+            # JSON frames carry no raw bytes, so the server sends the file base64-encoded.
+            encoded = params.get("content_base64")
+            try:
+                content = (
+                    base64.b64decode(encoded, validate=True) if isinstance(encoded, str) else b""
+                )
+            except binascii.Error as exc:
+                raise ValueError("Expected base64-encoded file content") from exc
+            return pr_resource.upload_pr_attachment(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                name=params.get("name"),
+                content=content,
             )
         raise ValueError(f"unknown fs write op: {op!r}")
 

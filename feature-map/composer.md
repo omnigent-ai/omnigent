@@ -39,6 +39,15 @@ and steers messages while the agent is busy.
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
   marked and the choice persists.
+- `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
+  Codex, and Devin native sessions steps through every mode in the chip's menu,
+  including Full Access and Dangerous, wrapping while the chip is clickable. States:
+  slash/mention menu acting on Tab, chip disabled, session in a mode the chip can't switch back to
+  (Codex read-only, Claude Don't ask; menu only), change in flight (Shift+Tab
+  holds focus without sending another request; Tab still moves focus forward), change
+  refused or failed (next press moves past it, or retries it when it is the only
+  other mode), no other mode (native focus move, no
+  `aria-keyshortcuts`).
 - `managed-mcp-picker`: choose administrator-configured services before launch
   on a host or sandbox. States: loading, empty, error/retry, selected, unavailable,
   remembered selection, explicitly none, restored connection needing sign-in.
@@ -52,10 +61,23 @@ and steers messages while the agent is busy.
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
-  suggestions with a read-only list of MCP servers enabled for that session and
-  links to harness Settings with the session’s host preselected. Host-native entries are limited to the
-  active harness, and a host lookup failure leaves known agent entries visible.
-  It is absent before a session starts and from side chat.
+  suggestions with the MCP servers enabled for that session and links to harness
+  Settings with the session’s host preselected. Host-native entries are limited
+  to the active harness, and a host lookup failure leaves known agent entries
+  visible. It is absent before a session starts and from side chat. When the
+  server has the MCP registry on, each registry service row also shows its
+  account state. States: connected; sign-in required, with an inline **Sign in**
+  that runs the popup sign-in and flips the row to connected, or a **Sign in
+  from Settings** link for a service that needs a typed token or workspace URL;
+  unavailable, for a service the account no longer sees; signing in; failed or
+  cancelled, reported on the row with Sign in available again. A host-native
+  server, including one pinned by an organization's managed Claude config,
+  shows connected or sign-in required when the host's sign-in manager
+  reports it (via `~/.omnigent/mcp-auth-status.json`, see
+  `docs/MCP_AUTH_STATUS.md`); its **Sign
+  in** opens the reported URL in a new tab and the panel re-reads the host
+  inventory every few seconds until the row is connected. Custom agent servers
+  carry no account state.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -120,6 +142,8 @@ and steers messages while the agent is busy.
   it is connected; click it to open the host menu.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
+- With focus in the prompt, press Shift+Tab to step the permission mode without
+  opening the menu; the draft and focus stay put.
 - For a custom `claude-sdk` or `codex` agent session, open configuration and
   pick an effort rung; the ladder is the harness's declared family (anthropic
   or openai) and the pick persists on the session. Changing effort after a
@@ -134,8 +158,11 @@ and steers messages while the agent is busy.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Select `/mcp` to replace the suggestions with the MCP servers enabled for the
-  session. An empty list points to Settings; the command is absent on the
-  new-session composer.
+  session. A registry service that needs sign-in shows **Sign in**; click it
+  and finish the popup, or follow **Sign in from Settings** for a token or
+  workspace service. A host server that needs sign-in shows **Sign in** too,
+  opening the page its host reported in a new tab. An empty list points to Settings; the command is absent
+  on the new-session composer.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
@@ -315,6 +342,18 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`permission-mode-hotkey`:** in session with a real Claude CLI,
+  `tests/e2e_ui/chat/test_claude_native_permission_switch_from_dont_ask.py::test_shift_tab_cycles_permission_mode_from_composer`.
+  The E2E is nightly; Codex and Devin have component tests but no dedicated
+  shortcut E2E in the suite.
+  Component tests cover the in-flight, refused, downgraded, next-lap, menu-reset,
+  Codex/Devin full cycles, slash-menu, viewer, read-only
+  and unreachable states in `web/src/pages/ChatPage.composer.test.tsx`, mention-menu
+  priority in `web/src/pages/ChatPage.mention.test.tsx`; mode ordering and
+  wraparound are in
+  `web/src/lib/permissionModeCycle.test.ts`.
+  `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
+  page leaves the launch mode unchanged and does not prevent focus traversal.
 - **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
   permission-mode picker has component coverage in
   `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort
@@ -371,6 +410,25 @@ Other connection providers alone do not enable the managed MCP picker.
   its loading status stays visible alongside agent entries; a session without a
   known host shows unavailable status rather than an empty inventory. Click
   **Go to Settings** and confirm the session’s harness and host are selected.
+  Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
+  row labels, the Sign in / Signing in… / error renderings and the Settings
+  link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
+  panel through to Connected, cancellation with retry, the Settings link for a
+  token service, an unavailable service, a catalog read failure, and no
+  registry read when the server has it off or no row needs it);
+  `web/src/hooks/useMcpRegistry.test.tsx` covers the sign-in hook's abort and
+  confirmation paths, and a reopened panel shows no state from the previous
+  open. Host account state: `tests/host/test_mcp_inventory.py` (the status
+  file), `tests/host/test_frames.py` (what survives the tunnel),
+  `tests/server/routes/test_mcp_servers.py` (the route) and
+  `ChatPage.composer.test.tsx` (row state, the new-tab Sign in, polling).
+  Manually, on a host whose sign-in manager writes the status file, expect a
+  host row to read **Sign-in required** with a Sign in that opens the reported
+  page, and to flip to **Connected** within 5s of the file changing. With the
+  registry on, attach an OAuth service
+  that is not connected, select `/mcp`, expect **Sign-in required** and
+  **Sign in**, complete the popup and expect **Connected**; cancel it instead
+  and expect the message on the row with Sign in still offered.
 - **`codex-plugin-skills`, both composers:**
   `tests/e2e_ui/chat/test_codex_plugin_skills.py::test_plugin_skill_in_both_composers_after_inventory_failure`
   installs an enabled local plugin using the real Codex CLI, moves away its

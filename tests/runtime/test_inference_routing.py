@@ -19,6 +19,7 @@ from omnigent.harnesses.codex_native.app_server import resolve_native_codex_laun
 from omnigent.harnesses.opencode_native.provider import resolve_bound_opencode_gateway
 from omnigent.harnesses.pi_native.credentials import (
     _live_family_model_entries,
+    pi_native_model_options,
     resolve_pi_native_provider,
 )
 from omnigent.host.connect import _build_runner_env, _write_runner_inference_config
@@ -264,27 +265,55 @@ def test_bound_codex_does_not_fallback_when_credential_disappears(
         resolve_native_codex_launch(model=None)
 
 
-def test_pi_single_model_policy_preserves_literal_ids_and_stays_curated() -> None:
+@pytest.mark.parametrize("model", ["databricks-literal/model-b", "omnigent/model-a"])
+@pytest.mark.parametrize("selection", ["default", "literal", "picker"])
+def test_pi_single_model_policy_preserves_literal_ids_and_stays_curated(
+    model: str, selection: str
+) -> None:
     profile = _profile()
     profile["inference"] = {
         "harnesses": {
             "pi-native": {
                 "provider": "bifrost",
-                "default_model": "databricks-literal/model-b",
-                "model_allowlist": ["databricks-literal/model-b"],
+                "default_model": model,
+                "model_allowlist": [model],
             }
         }
     }
     with inference_config_scope(profile):
-        provider = resolve_pi_native_provider()
+        option = pi_native_model_options()[0]
+        selected = None if selection == "default" else model
+        if selection == "picker":
+            selected = str(option["model"])
+        provider = resolve_pi_native_provider(model=selected)
         assert provider is not None
-        assert provider.model == "databricks-literal/model-b"
+        assert provider.model == model
         assert provider.curated_models
         assert [row["id"] for row in _live_family_model_entries(provider, transport=None)] == [
-            "databricks-literal/model-b"
+            model
         ]
-        with pytest.raises(OmnigentError, match="configured model list"):
-            resolve_pi_native_provider(model="unlisted")
+        prefix = str(option["model"]).split("/", 1)[0]
+        for unlisted in ("unlisted", f"{prefix}/unlisted"):
+            with pytest.raises(OmnigentError, match="configured model list"):
+                resolve_pi_native_provider(model=unlisted)
+
+
+def test_pi_picker_preserves_models_with_colliding_ids() -> None:
+    models = ["model-a", "omnigent-openai/model-a"]
+    profile = _profile()
+    profile["inference"] = {
+        "harnesses": {"pi-native": {"provider": "bifrost", "model_allowlist": models}}
+    }
+    with inference_config_scope(profile):
+        options = pi_native_model_options()
+        assert {row["model"] for row in options} == {
+            f"omnigent-openai/{model}" for model in models
+        }
+        for model in models:
+            option = next(row for row in options if row["model"] == f"omnigent-openai/{model}")
+            provider = resolve_pi_native_provider(model=str(option["model"]))
+            assert provider is not None
+            assert provider.model == model
 
 
 def test_acp_slug_binding_preserves_one_model_restriction() -> None:

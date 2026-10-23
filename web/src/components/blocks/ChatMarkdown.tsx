@@ -19,6 +19,7 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
 } from "@/components/ai-elements/streamdown-security";
@@ -89,8 +90,8 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
   // Agents cite a file with the position they mean, `docs/notes.md:12` or
   // `:12:7`. The position is not part of the filename, so no such path is ever
   // in the changed-files list or on disk; drop it before resolving, but keep
-  // the line so the viewer can land on the cited change. The span still
-  // displays the citation the agent wrote.
+  // the line so the viewer can land on the cited change. The link shows the file
+  // name and position; the full citation stays its accessible name.
   const citation = splitWorkspaceFileCitation(text);
   const cited = citation.path;
   const citedLine = citation.line;
@@ -136,6 +137,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
         : openFile(linkPath, {
             line: citedLine,
             ...(citation.column ? { column: citation.column } : {}),
+            ...(citation.endLine ? { endLine: citation.endLine } : {}),
           }),
     unopenable: false,
     resolvedPath: linkPath,
@@ -158,9 +160,9 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
  * path that may be an uncommitted/deleted file — or (b) a path-shaped string
  * that the filesystem API confirms points at a real file in the workspace.
  * Everything else (prose-y inline code, non-existent paths) falls back to a
- * styled `<code>` matching Streamdown's default inline appearance. The span
- * always *displays* the original text the agent wrote; only the link target
- * uses the resolved relative path.
+ * styled `<code>` matching Streamdown's default inline appearance. A link
+ * displays only the file name and cited position; the full text the agent
+ * wrote stays its accessible name and hover title.
  *
  * Rendered by Streamdown as a real component (via the `inlineCode` slot), so
  * it may call hooks: the existence query re-renders this span when it settles,
@@ -179,6 +181,7 @@ function WorkspacePathInlineCode({
   const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
 
   if (openWorkspaceFile) {
+    const shortLabel = shortFileCitationLabel(text);
     // Rendered as an inline <code> (not a <button>): a button is laid out as
     // an atomic inline-block, so a long path can't break across lines and
     // drops below the list marker as a whole unit. An inline <code> flows and
@@ -196,6 +199,8 @@ function WorkspacePathInlineCode({
           "font-mono text-ui text-link underline decoration-dotted underline-offset-2 transition-colors cursor-pointer",
           className,
         )}
+        aria-label={shortLabel ? text : undefined}
+        title={shortLabel ? text : undefined}
         onClick={openWorkspaceFile}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -205,7 +210,7 @@ function WorkspacePathInlineCode({
         }}
         {...codeProps}
       >
-        {codeChildren}
+        {shortLabel ?? codeChildren}
       </code>
     );
   }
@@ -289,6 +294,7 @@ function WorkspaceFileLink({
   } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
+  const { root, home } = useWorkspacePaths();
 
   if (!path) {
     if (typeof href === "string" && isRemoteVideoUrl(href)) {
@@ -400,6 +406,14 @@ function WorkspaceFileLink({
     );
   }
 
+  // Link text that spells out the linked file and position shows just its name;
+  // a descriptive label, or text citing a different place, is kept as written.
+  const linkText = typeof children === "string" ? children : null;
+  const shortLabel =
+    linkText && citesSamePlace(linkText, path, resolvedPath, root, home)
+      ? shortFileCitationLabel(linkText)
+      : null;
+
   // No href: the parked fragment would still navigate on cmd/middle-click, and
   // no URL opens the FileViewer. role/tabIndex/onKeyDown restore button semantics.
   return (
@@ -408,6 +422,7 @@ function WorkspaceFileLink({
         {...props}
         role="button"
         tabIndex={0}
+        aria-label={shortLabel && linkText ? linkText : props["aria-label"]}
         title={title ?? path}
         data-streamdown="link"
         // Dotted underline distinguishes "opens in the FileViewer" from a link
@@ -422,7 +437,7 @@ function WorkspaceFileLink({
           }
         }}
       >
-        {children}
+        {shortLabel ?? children}
       </a>
     </FileLinkContextMenu>
   );
@@ -445,6 +460,24 @@ function FileLinkContextMenu({ path, children }: { path: string; children: React
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>
+  );
+}
+
+function citesSamePlace(
+  text: string,
+  target: string,
+  resolvedTarget: string,
+  root: string | null,
+  home: string | null,
+): boolean {
+  const cited = splitWorkspaceFileCitation(text);
+  const linked = splitWorkspaceFileCitation(target);
+  return (
+    resolveChatFilePath(cited.path, root, home)?.path === resolvedTarget &&
+    (!cited.hasPosition ||
+      (cited.line === linked.line &&
+        cited.column === linked.column &&
+        cited.endLine === linked.endLine))
   );
 }
 

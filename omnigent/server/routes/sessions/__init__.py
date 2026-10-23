@@ -213,6 +213,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY as _CODEX_NATIVE_SUBAGENT_TOOL_CALL_ID_LABEL_KEY,
     _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE as _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _CLEAR_TYPE as _CLEAR_TYPE,
     _COMPACT_TYPE as _COMPACT_TYPE,
     _CURSOR_FORK_HISTORY_HARNESSES as _CURSOR_FORK_HISTORY_HARNESSES,
     _CURSOR_NATIVE_HARNESS as _CURSOR_NATIVE_HARNESS,
@@ -899,6 +900,7 @@ def create_sessions_router(
     from omnigent.server.routes.sessions.routes_items import register_items_routes
     from omnigent.server.routes.sessions.routes_permissions import register_permissions_routes
     from omnigent.server.routes.sessions.routes_resources import register_resources_routes
+    from omnigent.server.routes.sessions.routes_ui import register_ui_routes
 
     register_core_routes(
         router,
@@ -948,6 +950,13 @@ def create_sessions_router(
         permission_store=permission_store,
         host_registry=host_registry,
         register_initial_file_upload=register_initial_file_upload,
+    )
+
+    register_ui_routes(
+        router,
+        conversation_store=conversation_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
     )
 
     register_browser_routes(

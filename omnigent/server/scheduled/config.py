@@ -1,4 +1,4 @@
-"""Startup settings for persistent task scheduling."""
+"""Startup and runtime settings for scheduled tasks."""
 
 from typing import Self
 
@@ -10,6 +10,7 @@ class ScheduledTaskSchedulerConfig(BaseModel):
 
     model_config = ConfigDict(strict=True, frozen=True, extra="forbid", allow_inf_nan=False)
 
+    startup_retry_seconds: float = Field(default=30, gt=0)
     poll_seconds: float = Field(default=30, gt=0)
     renewal_seconds: float = Field(default=30, gt=0)
     lease_seconds: int = Field(default=120, gt=0)

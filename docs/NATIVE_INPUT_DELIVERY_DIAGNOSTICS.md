@@ -37,6 +37,7 @@ producer did not supply them; do not infer ownership from timestamps alone.
 
 | Event | What it records |
 | --- | --- |
+| `native_input_received` | An authorized native-message request reached the server, before runner recovery or initialization. Contains `input_received_at_ms` and a validated `input_stable_id` when supplied; emits even without that ID. It does not establish acceptance or delivery. |
 | `native_input_enqueued` | The server queued the input. |
 | `native_input_retry_deduplicated` | A client retry reused an existing pending entry. No second delivery was requested. |
 | `native_input_forward_started` | The server began forwarding the input to the runner. |

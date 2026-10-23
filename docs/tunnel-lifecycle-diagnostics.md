@@ -298,10 +298,45 @@ when the context exits.
   `parent_session_id`, `runner_id`, `host_id`, and `conversation_updated_at`.
   The latter measures content activity, not the time of a status transition.
   A relay cache hit does not load conversation metadata solely for logging.
-- `runner_session_init_started`: `resume_interrupted_turn`,
-  `suppress_recovery_turn`, `recovery_id`. Neither flag set is the tunnel
-  reconnect hook; resume set is a sub-agent restore; suppress set is a
-  message forward.
+- `runner_session_init_decision`: reconnect decisions are `initialize_now` or
+  `defer`, with `reason` (`idle`, `archived`, `no_agent`, or `recovery_required`),
+  `live_status`, pending elicitation count, last-task-error presence, and eager
+  recovery state. Initializer callers record `start`, `join_in_flight`, or
+  `reuse_completed`; a removed agent records `skip` with `reason=agent_removed`.
+  Every decision includes the session, runner, `runner_generation`, `init_trigger`,
+  `has_agent`, `archived`, `server_version`, and `server_commit_sha`. The commit is
+  `unknown` when the installed package lacks build metadata.
+- `runner_session_init_started`, `runner_session_initialized`, and
+  `runner_session_init_failed` share `init_attempt_id`, `runner_generation`,
+  `init_trigger`, and server build identity. Completion and failure include
+  `duration_ms` for the handshake. Joined/cached callers reference the same attempt
+  ID in their decisions, even when their HTTP requests or triggers differ.
+  `reuse_completed` describes task completion, not success: a failed task awaiting
+  eviction can still be observed. Check the attempt's completion/failure event.
+  `init_trigger` distinguishes `runner_connect`, `web_message`, `retry_session`,
+  `native_control`, and `child_recovery`; other ensure callers that pass the shared
+  initializer use `session_ensure`. The direct-POST fallback without an initializer
+  does not emit these initialization diagnostics (including scheduled dispatch and
+  Codex goal launch).
+  Direct callers that do not identify their trigger record `unspecified`.
+  Recovery flags and `recovery_id` remain on the start event; the flags alone do
+  not uniquely identify the caller.
+
+An interactive native terminal does not establish that the separate runtime
+handshake has run. To investigate delayed initialization, first find the
+connection's decision using the session, runner, and generation. A `defer` decision
+followed later by a web-message trigger is different from a handshake that started
+immediately and took a long time to complete.
+
+For native message events, start at `native_input_received`, before initialization can block
+delivery. Join using the session and HTTP `request_id`, or `input_stable_id` when
+available, then follow the initialization decision/attempt and
+`native_input_enqueued` / `native_input_forward_started`. The receipt timestamp is
+when the authorized request reached the route, not the time the user clicked Send.
+These events can also come from CLI/REPL or server startup-input dispatch through
+the same route. `web_message` names that initialization callsite, not the client UI.
+The receipt contains no message text, and a receipt without a completion does not
+establish a failed delivery by itself. These logs do not change KPI classification.
 
 ## Native event ingestion
 

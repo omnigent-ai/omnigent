@@ -283,6 +283,7 @@ class NativeControls:
 
     codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
     handle_claude_native_btw_dismiss: Callable[[str], Coroutine[Any, Any, Response]]
+    handle_claude_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_cost_popup: _HandleClaudeNativeCostPopupFn
     handle_claude_native_effort_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
@@ -292,6 +293,7 @@ class NativeControls:
     ]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
+    handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
     handle_codex_native_plan_mode_change: _HandleCodexNativePlanModeChangeFn
@@ -339,6 +341,7 @@ def build_native_controls(
     _model_dialog_watchers: set[asyncio.Task[None]],
     _native_cost_popup_config_file: Callable[[str, str], Coroutine[Any, Any, Path]],
     _native_pane_status: dict[str, str],
+    _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
     _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
@@ -507,12 +510,21 @@ def build_native_controls(
                 timeout=ready_deadline - asyncio.get_running_loop().time(),
             )
         except TimeoutError:
+            # A cold relaunch can outlast the budget. The next web turn applies the
+            # persisted selection, so report it unconfirmed instead of refusing it.
             _logger.warning(
-                "Codex-native runtime was not ready for settings update for session=%s",
+                "Codex-native runtime was not ready for settings update for session=%s; "
+                "the next turn applies it",
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            state = None
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": "codex_native_settings_update_timeout",
+                    "detail": "Codex was still starting; the next turn applies the settings.",
+                },
+            ), settings
         if state is None:
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
@@ -1755,7 +1767,7 @@ def build_native_controls(
             )
         return Response(status_code=200)
 
-    async def _handle_claude_native_compact(conv_id: str) -> Response:
+    async def _inject_claude_native_slash(conv_id: str, *, command: str, action: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
@@ -1773,7 +1785,7 @@ def build_native_controls(
                 deadline,
                 inject_slash_command,
                 bridge_dir,
-                command="/compact",
+                command=command,
                 timeout_s=1.0,
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
@@ -1781,20 +1793,26 @@ def build_native_controls(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "claude_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native compact"),
+                    "error": f"claude_native_{action}_failed",
+                    "detail": _client_safe_error_detail(exc, context=f"claude-native {action}"),
                 },
             )
         return Response(status_code=200)
 
-    async def _handle_codex_native_compact(conv_id: str) -> Response:
+    async def _handle_claude_native_compact(conv_id: str) -> Response:
+        return await _inject_claude_native_slash(conv_id, command="/compact", action="compact")
+
+    async def _handle_claude_native_clear(conv_id: str) -> Response:
+        return await _inject_claude_native_slash(conv_id, command="/clear", action="clear")
+
+    async def _inject_codex_native_slash(conv_id: str, *, command: str, action: str) -> Response:
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
+                    "error": f"codex_native_{action}_failed",
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
@@ -1803,16 +1821,22 @@ def build_native_controls(
         target = instance.tmux_target
 
         try:
-            await asyncio.to_thread(_inject_codex_compact, socket_path, target)
+            await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, command)
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                    "error": f"codex_native_{action}_failed",
+                    "detail": _client_safe_error_detail(exc, context=f"codex-native {action}"),
                 },
             )
         return Response(status_code=200)
+
+    async def _handle_codex_native_compact(conv_id: str) -> Response:
+        return await _inject_codex_native_slash(conv_id, command="/compact", action="compact")
+
+    async def _handle_codex_native_clear(conv_id: str) -> Response:
+        return await _inject_codex_native_slash(conv_id, command="/clear", action="clear")
 
     async def _handle_opencode_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
@@ -1936,14 +1960,16 @@ def build_native_controls(
         except OmnigentError:
             spec = None
         try:
-            await _auto_create_opencode_terminal(
-                conv_id,
-                resource_registry,
-                _publish_event,
-                agent_spec=spec,
-                server_client=server_client,
-                ensure_comment_relay=_ensure_comment_relay_started,
-            )
+            # The idle pane reaper holds this lock while it releases the relay this reuses.
+            async with _opencode_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock()):
+                await _auto_create_opencode_terminal(
+                    conv_id,
+                    resource_registry,
+                    _publish_event,
+                    agent_spec=spec,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(
                 status_code=503,
@@ -2004,14 +2030,14 @@ def build_native_controls(
             )
         return Response(status_code=200)
 
-    def _inject_codex_compact(socket_path: str, target: str) -> None:
-        # Typing "/compact" opens Codex's slash-command popup, which draws
+    def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        # Typing a slash command opens Codex's slash-command popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
@@ -2406,6 +2432,7 @@ def build_native_controls(
     return NativeControls(
         codex_native_model_options=_codex_native_model_options,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
+        handle_claude_native_clear=_handle_claude_native_clear,
         handle_claude_native_compact=_handle_claude_native_compact,
         handle_claude_native_cost_popup=_handle_claude_native_cost_popup,
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
@@ -2413,6 +2440,7 @@ def build_native_controls(
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
+        handle_codex_native_clear=_handle_codex_native_clear,
         handle_codex_native_compact=_handle_codex_native_compact,
         handle_codex_native_cost_popup=_handle_codex_native_cost_popup,
         handle_codex_native_plan_mode_change=_handle_codex_native_plan_mode_change,

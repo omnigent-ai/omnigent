@@ -269,14 +269,13 @@ export function CommandPalette({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        // Mobile: a top-anchored full-screen sheet sized to the keyboard-aware
-        // visible viewport (--omnigent-viewport-height), so the input and results
-        // sit above the soft keyboard instead of a centered card whose lower half
-        // hides behind it. Desktop keeps the centered command palette.
+        // Mobile: a top-anchored full-screen sheet sized to --omnigent-viewport-height,
+        // so the input and results sit above the soft keyboard. sm:max-w-full
+        // overrides DialogContent's sm:max-w-sm between 640px and md.
         className={cn(
           "overflow-hidden p-0",
           isMobile
-            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none"
+            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none sm:max-w-full"
             : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
         )}
         style={
@@ -285,10 +284,10 @@ export function CommandPalette({
                 top: 0,
                 height: "var(--omnigent-viewport-height, 100dvh)",
                 maxHeight: "var(--omnigent-viewport-height, 100dvh)",
-                // Pad both insets: safe-top clears the notch, safe-bottom keeps
-                // the last row above the home indicator when the keyboard is
-                // closed (the visible-viewport height then spans the home bar).
-                paddingTop: "var(--omnigent-safe-top, 0px)",
+                // Pad both insets: the macOS title bar or safe-top clears the window
+                // controls or notch; safe-bottom keeps the last row above the home
+                // indicator when the keyboard is closed (the viewport then spans it).
+                paddingTop: "var(--mac-titlebar-height, var(--omnigent-safe-top, 0px))",
                 paddingBottom: "var(--omnigent-safe-bottom, 0px)",
               }
             : undefined

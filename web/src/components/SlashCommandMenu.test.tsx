@@ -1,6 +1,8 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  type McpServerRow,
   matchSlashCommandInvocation,
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -191,5 +193,135 @@ describe("skill display name matching", () => {
     ]);
     // Without labels, the display name is not searchable.
     expect(rankedSlashCommandNames(commands, "simplified", new Set())).toEqual([]);
+  });
+});
+
+describe("/mcp panel connection state", () => {
+  const menuProps = { query: "", activeIndex: -1, onSelect: vi.fn(), commands: {} };
+
+  function renderPanel(overrides: Partial<Parameters<typeof SlashCommandMenu>[0]>) {
+    return render(
+      <MemoryRouter>
+        <SlashCommandMenu {...menuProps} showMcpServers {...overrides} />
+      </MemoryRouter>,
+    );
+  }
+
+  it("labels connected and sign-in-required rows and leaves stateless rows unlabeled", () => {
+    renderPanel({
+      mcpServers: [
+        { name: "github", description: "GitHub tools", connection: "connected" },
+        { name: "tracker", connection: "sign-in-required", signIn: { kind: "inline" } },
+        { name: "gone", connection: "unavailable" },
+        { name: "local-files" },
+      ],
+      onMcpSignIn: vi.fn(),
+    });
+    expect(screen.getByTestId("mcp-server-row-github")).toHaveTextContent("Connected");
+    expect(screen.getByTestId("mcp-server-row-tracker")).toHaveTextContent("Sign-in required");
+    expect(screen.getByTestId("mcp-server-row-gone")).toHaveTextContent(
+      "Not available to your account",
+    );
+    expect(screen.getByTestId("mcp-server-row-local-files")).toHaveTextContent(/^local-files$/);
+    // Only the row that needs it offers the action.
+    expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
+  });
+
+  it("runs the inline sign-in for the row and shows its progress and failure", () => {
+    const onMcpSignIn = vi.fn();
+    const row: McpServerRow = {
+      name: "tracker",
+      connection: "sign-in-required",
+      signIn: { kind: "inline" },
+    };
+    const panel = (extra: Partial<Parameters<typeof SlashCommandMenu>[0]> = {}) => (
+      <MemoryRouter>
+        <SlashCommandMenu
+          {...menuProps}
+          showMcpServers
+          mcpServers={[row]}
+          onMcpSignIn={onMcpSignIn}
+          {...extra}
+        />
+      </MemoryRouter>
+    );
+    const { rerender } = render(panel());
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(onMcpSignIn).toHaveBeenCalledWith("tracker");
+
+    rerender(panel({ mcpAuthorizingName: "tracker" }));
+    expect(screen.getByRole("button", { name: "Signing in…" })).toBeDisabled();
+
+    rerender(
+      panel({
+        mcpSignInError: { name: "tracker", message: "Sign-in cancelled. Try again when ready." },
+      }),
+    );
+    expect(
+      within(screen.getByTestId("mcp-server-row-tracker")).getByRole("alert"),
+    ).toHaveTextContent("Sign-in cancelled");
+    expect(screen.getByRole("button", { name: "Sign in" })).not.toBeDisabled();
+  });
+
+  it("opens a host-managed sign-in page in a new tab", () => {
+    renderPanel({
+      mcpServers: [
+        {
+          name: "linear",
+          connection: "sign-in-required",
+          signIn: { kind: "url", url: "https://auth.example.com/start" },
+        },
+      ],
+      onMcpSignIn: vi.fn(),
+    });
+    const link = screen.getByRole("link", { name: "Sign in" });
+    expect(link).toHaveAttribute("href", "https://auth.example.com/start");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+  });
+
+  it("disables every Sign in while one is running, labelling only the active row", () => {
+    renderPanel({
+      mcpServers: [
+        { name: "tracker", connection: "sign-in-required", signIn: { kind: "inline" } },
+        { name: "wiki", connection: "sign-in-required", signIn: { kind: "inline" } },
+      ],
+      onMcpSignIn: vi.fn(),
+      mcpAuthorizingName: "tracker",
+    });
+    // A second popup would silently abort the first, so no row invites one.
+    expect(screen.getByRole("button", { name: "Signing in…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Sign in" })).toBeDisabled();
+  });
+
+  it("offers nothing to click when a row needs sign-in but names no way to do it", () => {
+    // A host server whose manager reported no usable URL: the state is still worth
+    // showing, but the panel has no sign-in to run for it.
+    renderPanel({
+      mcpServers: [{ name: "linear", connection: "sign-in-required" }],
+      onMcpSignIn: vi.fn(),
+    });
+    expect(screen.getByTestId("mcp-server-row-linear")).toHaveTextContent("Sign-in required");
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.queryByRole("link", { name: /Sign in/ })).toBeNull();
+  });
+
+  it("sends a token- or workspace-based service to Settings instead of a popup", () => {
+    renderPanel({
+      mcpServers: [
+        {
+          name: "wiki",
+          connection: "sign-in-required",
+          signIn: { kind: "settings", href: "/settings/mcp" },
+        },
+      ],
+      onMcpSignIn: vi.fn(),
+    });
+    expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Sign in from Settings" })).toHaveAttribute(
+      "href",
+      "/settings/mcp",
+    );
   });
 });

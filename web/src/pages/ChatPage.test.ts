@@ -1387,7 +1387,7 @@ describe("buildSlashCommandMap", () => {
     // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
       Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp"].includes(name),
+        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
       ),
     );
     // Spot-check a built-in description survives the spread.
@@ -1402,6 +1402,13 @@ describe("buildSlashCommandMap", () => {
     expect(buildSlashCommandMap([], true, true, true, false, true)["/side"]).toBe(
       BUILTIN_SLASH_COMMANDS["/side"],
     );
+  });
+
+  it("includes /clear only when showClear is true (native terminals)", () => {
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -1471,7 +1478,7 @@ describe("buildSlashCommandMap", () => {
     // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
       ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
-        (name) => !["/btw", "/side", "/mcp"].includes(name),
+        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
       ),
       "/triage-issues",
       "/mlflow-bug",

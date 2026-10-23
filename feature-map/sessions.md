@@ -69,8 +69,9 @@ the header menu), and each place is a separate entry point.
   itself or explicitly reconnect a remembered Arca host. States: reconnecting
   (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
-  directory…**. Choose an existing host directory to fork the conversation into
-  a new session; the original remains available and missing files are not restored.
+  directory…**. Choose an existing host directory, optionally with a new git
+  worktree of it, to fork the conversation into a new session; the original
+  remains available and missing files are not restored.
 - `compaction-model-recovery`: a Codex turn that failed while compacting on the
   previous model shows the provider's error and why on a gray error card, with
   **Fork session…**. A spent-budget card is gray for every harness, since it
@@ -257,7 +258,9 @@ the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to
 the same board. Open sidebar appears on the board or, when the board is hidden,
 in the conversation header. On desktop, hovering previews the sidebar and clicking
-opens it. The macOS app uses its existing titlebar toggle, Search, and Settings.
+opens it. At md and wider, the macOS app uses its existing titlebar toggle, Search,
+and Settings; in a narrower window it uses the conversation header's Open sidebar
+button and the drawer's Search and Settings, all right of or below the window buttons.
 On macOS desktop, the board and its controls stay below the window title bar,
 including while focusing a conversation or using a narrow window.
 Open a Canvas session outside the loaded sidebar pages to see its current host
@@ -277,9 +280,11 @@ and send a follow-up after its parent runner is replaced.
 **Missing workspace, desktop and mobile:** open a conversation whose working
 directory is no longer available and choose **Continue in another directory…**
 on the error card. The dialog explains the new session and missing files, then
-lets you type or browse for an existing directory on a connected host. Choose
-**Continue** to open the new session with the copied conversation. A missing
-destination stays in the dialog with an error and creates no session.
+lets you type or browse for an existing directory on a connected host. Optionally
+name a branch under **Git worktree** to continue in a new worktree of that
+repository instead. Choose **Continue** to open the new session with the copied
+conversation. A missing destination stays in the dialog with an error and
+creates no session.
 The action also appears on an eligible error card inside a Canvas conversation
 or side chat; it continues that conversation, including when another parent
 conversation is open alongside it.
@@ -825,8 +830,10 @@ plain `uv run pytest`, which starts a private server for the test.
   Native variants of the agent-switch test skip without `LLM_API_KEY`; record
   those skips and use a configured test harness before claiming native coverage.
 - Continuing in another directory preserves conversation history, not files
-  from the missing workspace. Existing worktree recreation and sandbox creation
-  belong to the ordinary fork dialog, not this recovery action.
+  from the missing workspace. A new worktree starts from the `HEAD` of the
+  chosen repository's main checkout, never from the missing worktree's branch.
+  Existing worktree recreation and sandbox creation belong to the ordinary fork
+  dialog, not this recovery action.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.

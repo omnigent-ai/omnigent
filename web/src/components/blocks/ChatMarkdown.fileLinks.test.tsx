@@ -332,13 +332,6 @@ describe("cited positions", () => {
       3,
     ],
     [
-      "relative hash range",
-      "`docs/notes.md#L15-L20`",
-      "docs/notes.md#L15-L20",
-      "docs/notes.md",
-      15,
-    ],
-    [
       "absolute",
       `\`${WORKSPACE}/docs/notes.md:16\``,
       `${WORKSPACE}/docs/notes.md:16`,
@@ -365,7 +358,6 @@ describe("cited positions", () => {
 
   it.each([
     ["relative colon", "docs/notes.md:21", "docs/notes.md", 21],
-    ["relative hash range", "docs/notes.md#L22-L30", "docs/notes.md", 22],
     ["absolute hash line", `${WORKSPACE}/docs/notes.md#L23`, "docs/notes.md", 23],
     ["home-relative line+column", "~/ws/docs/notes.md:24:9", "docs/notes.md", 24, 9],
     ["file URI hash line", `file://${WORKSPACE}/docs/notes.md#L25`, "docs/notes.md", 25],
@@ -403,6 +395,103 @@ describe("cited positions", () => {
   ])("leaves an unsupported suffix inert: %s", (citation) => {
     renderMarkdown(`\`${citation}\``, ["docs/notes.md"]);
     expect(screen.queryByRole("button", { name: citation })).toBeNull();
+  });
+});
+
+// Agents cite a span of lines as `path:start-end` or `path#Lstart-Lend`; both
+// must link and open the file with the whole range, not just its first line.
+describe("cited line ranges", () => {
+  const SCALA = "sql/core/SQLFunctionExpression.scala";
+
+  it.each([
+    ["colon", `${SCALA}:68-72`],
+    ["hash", `${SCALA}#L68-L72`],
+    ["absolute colon", `${WORKSPACE}/${SCALA}:68-72`],
+  ])("opens an inline-code %s range with its first and last line", (_label, citation) => {
+    renderMarkdown(`see \`${citation}\``, [SCALA]);
+
+    fireEvent.click(screen.getByRole("button", { name: citation }));
+    expect(openFile).toHaveBeenCalledWith(SCALA, { line: 68, endLine: 72 });
+  });
+
+  it.each([
+    ["colon", "docs/notes.md:22-30"],
+    ["hash", "docs/notes.md#L22-L30"],
+    ["root basename colon", "notes.md:22-30"],
+  ])("opens a markdown %s range with its first and last line", (_label, href) => {
+    const path = href.startsWith("docs/") ? "docs/notes.md" : "notes.md";
+    renderMarkdown(`[target](${href})`, [path]);
+
+    expect(screen.queryByText(/\[blocked\]/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "target" }));
+    expect(openFile).toHaveBeenCalledWith(path, { line: 22, endLine: 30 });
+  });
+
+  it("keeps a backwards range openable at its first line", () => {
+    renderMarkdown("`docs/notes.md:30-22`", ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:30-22" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 30 });
+  });
+});
+
+// A full path says little to the reader and makes replies verbose, so a file
+// link shows just the file name (and cited position); the full path stays the
+// link's accessible name and hover title, and is still what opens.
+describe("file link labels", () => {
+  it("labels an inline-code file link by its file name and position", () => {
+    const citation = `${WORKSPACE}/sql/core/SQLFunctionExpression.scala:68-72`;
+    renderMarkdown(`see \`${citation}\``, ["sql/core/SQLFunctionExpression.scala"]);
+
+    const link = screen.getByRole("button", { name: citation });
+    expect(link).toHaveTextContent(/^SQLFunctionExpression\.scala:68-72$/);
+    expect(link).toHaveAttribute("title", citation);
+  });
+
+  it("leaves a bare file name and a non-openable path as written", () => {
+    renderMarkdown("`README.md` and `docs/ghost.md`", ["README.md"]);
+
+    const link = screen.getByRole("button", { name: "README.md" });
+    expect(link).toHaveTextContent(/^README\.md$/);
+    expect(link).not.toHaveAttribute("title");
+    expect(screen.getByText("docs/ghost.md").tagName).toBe("CODE");
+  });
+
+  it("shortens markdown link text that spells out the linked path", () => {
+    renderMarkdown("[docs/notes.md:12](docs/notes.md#L12)", ["docs/notes.md"]);
+
+    const link = screen.getByRole("button", { name: "docs/notes.md:12" });
+    expect(link).toHaveTextContent(/^notes\.md:12$/);
+    expect(link).toHaveAttribute("title", "docs/notes.md#L12");
+    fireEvent.click(link);
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
+  });
+
+  it("shortens a path label without a position on a link to a cited line", () => {
+    renderMarkdown("[docs/notes.md](docs/notes.md#L12)", ["docs/notes.md"]);
+
+    const link = screen.getByRole("button", { name: "docs/notes.md" });
+    expect(link).toHaveTextContent(/^notes\.md$/);
+    fireEvent.click(link);
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
+  });
+
+  it.each([
+    ["a descriptive label", "[the migration notes](docs/notes.md)", "the migration notes"],
+    ["a path to another file", "[docs/other.md](docs/notes.md)", "docs/other.md"],
+    ["a same-named file elsewhere", "[src/a/notes.md](docs/notes.md)", "src/a/notes.md"],
+    ["text citing another line", "[docs/notes.md:10](docs/notes.md#L50)", "docs/notes.md:10"],
+    [
+      "text citing another column",
+      "[docs/notes.md:12:5](docs/notes.md#L12C9)",
+      "docs/notes.md:12:5",
+    ],
+  ])("keeps %s as written", (_label, markdown, text) => {
+    renderMarkdown(markdown, ["docs/notes.md"]);
+
+    const link = screen.getByRole("button", { name: text });
+    expect(link).toHaveTextContent(text);
+    expect(link).not.toHaveAttribute("aria-label");
   });
 });
 
