@@ -236,7 +236,7 @@ export function useCollapsedWorkspaceLabels(barRef: RefObject<HTMLElement | null
  * sees it. The editing commands also keep it on the undo stack; the fallback
  * covers environments without them.
  */
-function insertComposerText(
+export function insertComposerText(
   textarea: HTMLTextAreaElement,
   text: string,
   start = textarea.selectionStart,

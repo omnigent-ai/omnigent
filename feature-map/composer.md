@@ -90,6 +90,11 @@ and steers messages while the agent is busy.
   terminal or code editor. While listening, Enter keeps the dictated text and
   Escape discards it. The button is absent when neither the browser nor the
   server can transcribe.
+- `mention-insert`: typing `@` opens the workspace file browser in both
+  composers. Tab, Enter or a click on a file attaches it as a chip and removes
+  the typed token. Enter or a click on a folder rewrites the token to browse into
+  it, and Tab or the folder's attach button attaches the whole folder.
+  ⌘/Ctrl+Z after either edit restores the previous text.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
@@ -476,6 +481,12 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`dictation`, new-session composer:** no browser-level coverage. Manually:
   on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
   and expect the text in the message box; Escape restores the previous draft.
+- **`mention-insert`, undo after attach or drill-down:**
+  `tests/browser_ui/chat/test_composer_mention_undo.py` covers each attach
+  gesture in both composers and folder drill-down in the in-session composer.
+  Attach and drill-down flows also have component coverage in
+  `web/src/pages/ChatPage.mention.test.tsx` and `web/src/shell/NewChatDialog.test.tsx`;
+  dedup is covered in `ChatPage.mention.test.tsx`.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`

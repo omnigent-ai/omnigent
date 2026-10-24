@@ -1,5 +1,6 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
+import { insertComposerText } from "@/components/composer/ChatComposer";
 import type { MentionItem, MentionState } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -76,9 +77,20 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
   }
 
+  // Edit the textarea as typed input so the browser keeps its undo history;
+  // assigning ``.value`` through state alone would clear it.
+  const replaceMentionToken = (token: MentionState, replacement: string) => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.focus();
+      insertComposerText(textarea, replacement, token.start, token.end);
+    }
+    setText(text.slice(0, token.start) + replacement + text.slice(token.end));
+  };
+
   const attachMention = (path: string, isDir: boolean) => {
     if (!mention) return;
-    setText(text.slice(0, mention.start) + text.slice(mention.end));
+    replaceMentionToken(mention, "");
     // Dedup on the shared attachment key (path + dir-ness + range) — the same
     // identity the store queue uses — so the "@" menu and the file viewer's
     // "Attach to agent" never disagree about what counts as a duplicate.
@@ -100,8 +112,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const openMentionDir = (path: string) => {
     if (!mention) return;
     const inserted = `@${path}/`;
-    const next = text.slice(0, mention.start) + inserted + text.slice(mention.end);
-    setText(next);
+    replaceMentionToken(mention, inserted);
     const caret = mention.start + inserted.length;
     setMention({ query: `${path}/`, start: mention.start, end: caret });
     setMentionIndex(0);
