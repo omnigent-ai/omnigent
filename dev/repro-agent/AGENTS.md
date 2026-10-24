@@ -618,6 +618,12 @@ For instruction-only changes, reuse applicable contract/bundle checks when
 sufficient; do not create a module that matches prose verbatim or invent a
 behavioral failure. If the journey remains unverified, report that honestly.
 
+**Assert the behavior the report requires.** Avoid prescribing a particular
+implementation when several fixes would satisfy the report. Use exact text,
+identifiers, or counts only when they are part of that requirement. Scope UI
+locators to the intended control; do not hide an ambiguous match with `.first`.
+Check environment-dependent expectations against the captured probe output.
+
 In `evidence`, briefly identify existing coverage, the smallest useful check,
 and any e2e needed only for investigation or recording. Resolve chooses which
 tests ship permanently. The e2e itself may be the minimal reliable test; do not
