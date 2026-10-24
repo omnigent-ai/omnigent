@@ -37,6 +37,12 @@ backend — no real provider creds.
   with a cookie-carrying redirect follower, so it runs on macOS and Linux. Covers
   connect, silent renewal, relaunch, and sign-out, and asserts the app window
   never loads the IdP.
+- `desktop_sso_security_key_prompt.e2e.js` — connect to a stand-in Databricks
+  App (`fixtures/fakeAppsFrontDoor.js`) whose in-window SSO asks for a security
+  key, with a CDP virtual authenticator as the key. Asserts the shell's
+  security-key prompt appears while the page waits, Dismiss leaves the request
+  waiting, and a touched key's sign-in shows the prompt and hides it once the
+  key answers, before the page navigates. Needs `openssl`.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.

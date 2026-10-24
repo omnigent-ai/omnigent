@@ -242,6 +242,7 @@ function loadNavigationHarness({
     },
   };
   const bannerCalls = { show: [], hide: 0 };
+  const securityKeyPromptCalls = { options: null, attached: [], registerIpc: 0 };
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
   const browserRegistryCalls = { setActive: [], closeAll: [] };
@@ -572,6 +573,15 @@ function loadNavigationHarness({
         registerIpc: () => {},
       }),
     },
+    "./security_key_prompt": {
+      createSecurityKeyPrompt: (options) => {
+        securityKeyPromptCalls.options = options;
+        return {
+          attach: (attached) => securityKeyPromptCalls.attached.push(attached),
+          registerIpc: () => securityKeyPromptCalls.registerIpc++,
+        };
+      },
+    },
     "./reconnect_overlay": {
       createReconnectOverlay: ({ onCancel }) => {
         overlay.cancel = () => onCancel(win);
@@ -702,6 +712,7 @@ function loadNavigationHarness({
     calls,
     overlay,
     bannerCalls,
+    securityKeyPromptCalls,
     browserRegistryCalls,
     browserRegistryDeps: () => browserRegistryDeps,
     browserIpcDeps: () => browserIpcDeps,
@@ -2823,6 +2834,18 @@ describe("return-to-server banner wiring (src/main.js)", () => {
 
   it("registers the banner's IPC handlers", () => {
     assert.match(liveCode, /returnBanner\.registerIpc\(\)/);
+  });
+
+  it("wires the security-key prompt to shell windows", (t) => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    t.after(harness.cleanup);
+    const prompt = harness.securityKeyPromptCalls;
+    const win = harness.api.createWindow("https://host.example/ml/omnigents");
+    assert.deepEqual(prompt.attached, [win]);
+    assert.equal(prompt.options.isShellWindow(win), true);
+    assert.equal(prompt.options.isShellWindow({ webContents: {} }), false);
+    harness.api.registerIpc();
+    assert.equal(prompt.registerIpc, 1);
   });
 
   it("shows the banner after a foreign commit outlasts the delay, hides on return", async () => {

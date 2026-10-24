@@ -70,6 +70,7 @@
       "server-selector-v2/**/*",
       "find/**/*",
       "return-banner/**/*",
+      "security-key-prompt/**/*",
       "connection-loading/**/*",
       "reconnect-overlay/**/*",
       "icons/**/*",

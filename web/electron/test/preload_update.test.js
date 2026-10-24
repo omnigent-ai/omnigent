@@ -6,10 +6,11 @@ const vm = require("node:vm");
 
 const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
-function loadPreload() {
+function loadPreload({ platform = "linux", executeInMainWorld } = {}) {
   const exposed = new Map();
   const listeners = new Map();
   const invokes = [];
+  const sent = [];
   let updateStatus = { state: "idle" };
   const ipcRenderer = {
     invoke: async (channel, args) => {
@@ -17,7 +18,7 @@ function loadPreload() {
       if (channel === "omnigent:get-update-status") return updateStatus;
       return null;
     },
-    send: () => {},
+    send: (channel, ...args) => sent.push({ channel, args }),
     on: (channel, listener) => listeners.set(channel, listener),
     removeListener: (channel, listener) => {
       if (listeners.get(channel) === listener) listeners.delete(channel);
@@ -25,11 +26,14 @@ function loadPreload() {
   };
   vm.runInNewContext(PRELOAD, {
     console,
-    process: { platform: "linux" },
+    process: { platform },
     require: (specifier) => {
       assert.equal(specifier, "electron");
       return {
-        contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
+        contextBridge: {
+          exposeInMainWorld: (name, value) => exposed.set(name, value),
+          ...(executeInMainWorld && { executeInMainWorld }),
+        },
         ipcRenderer,
       };
     },
@@ -42,6 +46,7 @@ function loadPreload() {
     emit: (channel, payload) => listeners.get(channel)?.({}, payload),
     hasListener: (channel) => listeners.has(channel),
     invokes,
+    sent,
   };
 }
 
@@ -112,5 +117,134 @@ describe("server-page update bridge", () => {
         .map(({ args }) => args.supported),
       [true, false],
     );
+  });
+});
+
+describe("WebAuthn request observer", () => {
+  // Serializes the observer into a realm with the page's CredentialsContainer, as
+  // executeInMainWorld does; only the desktop e2e crosses the real bridge.
+  function loadObserver({ report } = {}) {
+    let script;
+    const h = loadPreload({ executeInMainWorld: (s) => (script = s) });
+    assert.equal(typeof script?.func, "function");
+    const realm = vm.createContext({ report: report ?? script.args[0] });
+    vm.runInContext(
+      `function track(options) {
+        const call = { options };
+        call.promise = new Promise((resolve, reject) => Object.assign(call, { resolve, reject }));
+        calls.push(call);
+        return call.promise;
+      }
+      globalThis.CredentialsContainer = class CredentialsContainer {
+        get(options) {
+          if (options?.illegal) throw new TypeError("Illegal invocation");
+          return track(options);
+        }
+        create(options) {
+          return track(options);
+        }
+      };
+      globalThis.calls = [];
+      globalThis.credentials = new CredentialsContainer();
+      (${script.func})(report);`,
+      realm,
+    );
+    const pending = () => h.sent.filter(({ channel }) => channel === "omnigent:webauthn-pending");
+    return { realm, pending: () => pending().map(({ args }) => args[0]) };
+  }
+  const settle = () =>
+    new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+
+  it("reports every WebAuthn request and the last one settling", async () => {
+    const { realm, pending } = loadObserver();
+    const first = vm.runInContext("credentials.get({ publicKey: {} })", realm);
+    // A later request re-shows a prompt the user dismissed while the first one waits.
+    const second = vm.runInContext("credentials.create({ publicKey: {} })", realm);
+    assert.deepEqual(pending(), [true, true]);
+
+    vm.runInContext("calls[0].resolve('credential')", realm);
+    assert.equal(await first, "credential");
+    await settle();
+    assert.deepEqual(pending(), [true, true]);
+
+    vm.runInContext("calls[1].reject(new Error('NotAllowedError'))", realm);
+    await assert.rejects(second, /NotAllowedError/);
+    await settle();
+    assert.deepEqual(pending(), [true, true, false]);
+  });
+
+  it("does not count a request whose promise it cannot observe", () => {
+    const { realm, pending } = loadObserver();
+    vm.runInContext("Promise.prototype.constructor = 1", realm);
+    const request = vm.runInContext("credentials.get({ publicKey: {} })", realm);
+    assert.equal(request, vm.runInContext("calls[0].promise", realm));
+    assert.deepEqual(pending(), []);
+  });
+
+  it("keeps report errors out of the page", async () => {
+    const rejections = [];
+    const onRejection = (reason) => rejections.push(reason);
+    process.on("unhandledRejection", onRejection);
+    try {
+      const { realm } = loadObserver({
+        report: () => {
+          throw new Error("bridge gone");
+        },
+      });
+      const request = vm.runInContext("credentials.get({ publicKey: {} })", realm);
+      vm.runInContext("calls[0].resolve('credential')", realm);
+      assert.equal(await request, "credential");
+      await settle();
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+    assert.deepEqual(rejections, []);
+  });
+
+  it("ignores requests without a browser prompt and non-WebAuthn requests", async () => {
+    const { realm, pending } = loadObserver();
+    for (const mediation of ["conditional", "silent", "immediate"]) {
+      vm.runInContext(`credentials.get({ publicKey: {}, mediation: "${mediation}" })`, realm);
+    }
+    vm.runInContext("credentials.get({ password: true })", realm);
+    vm.runInContext("credentials.get()", realm);
+    await settle();
+    assert.deepEqual(pending(), []);
+
+    vm.runInContext("credentials.get({ publicKey: {}, mediation: 'required' })", realm);
+    assert.deepEqual(pending(), [true]);
+  });
+
+  it("leaves unreadable options and native errors to the page", () => {
+    const { realm, pending } = loadObserver();
+    const request = vm.runInContext(
+      "credentials.get({ get publicKey() { throw new Error('getter'); } })",
+      realm,
+    );
+    assert.equal(request instanceof vm.runInContext("Promise", realm), true);
+    assert.throws(
+      () => vm.runInContext("credentials.get({ publicKey: {}, illegal: true })", realm),
+      /Illegal invocation/,
+    );
+    assert.deepEqual(pending(), []);
+  });
+
+  it("keeps the page-visible methods looking native", () => {
+    const { realm } = loadObserver();
+    assert.equal(vm.runInContext("CredentialsContainer.prototype.get.name", realm), "get");
+    assert.equal(vm.runInContext("CredentialsContainer.prototype.create.length", realm), 1);
+    assert.match(
+      vm.runInContext("String(CredentialsContainer.prototype.get)", realm),
+      /native code/,
+    );
+  });
+
+  it("is not installed on Windows or without executeInMainWorld", () => {
+    let installed = false;
+    loadPreload({ platform: "win32", executeInMainWorld: () => (installed = true) });
+    assert.equal(installed, false);
+    assert.ok(loadPreload().desktop, "the preload still loads without the API");
   });
 });
