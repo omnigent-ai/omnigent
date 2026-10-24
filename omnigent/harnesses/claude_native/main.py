@@ -5805,6 +5805,8 @@ def _claude_transcript_record_from_session_item(
                 return None
             record_type = "user"
             message = {"role": "user", "content": user_content}
+            if item.get("is_meta") is True:
+                extra["isMeta"] = True
         elif role == "assistant":
             assistant_content = _claude_assistant_content_from_api_blocks(item.get("content"))
             if assistant_content is None and allow_native_message_content:

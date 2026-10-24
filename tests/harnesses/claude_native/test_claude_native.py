@@ -9065,6 +9065,59 @@ class _capture_warnings:
         return False
 
 
+@pytest.mark.parametrize("history_kind", ["ordinary", "compacted_api", "compacted_native"])
+@pytest.mark.parametrize("is_meta", [None, False, True])
+def test_claude_transcript_records_preserve_hidden_user_context(
+    tmp_path: Path, history_kind: str, is_meta: bool | None
+) -> None:
+    """Replayed context stays available to Claude without becoming a user bubble."""
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+
+    reminder = "<system-reminder>Codebase and user instructions</system-reminder>"
+    messages: list[dict[str, Any]] = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": (
+                reminder
+                if history_kind == "compacted_native"
+                else [{"type": "input_text", "text": reminder}]
+            ),
+            **({"is_meta": is_meta} if is_meta is not None else {}),
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue the task"}],
+        },
+    ]
+    items = (
+        messages
+        if history_kind == "ordinary"
+        else [{"type": "compaction", "compacted_messages": messages}]
+    )
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_test",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=tmp_path,
+        bridge_dir=tmp_path / "bridge",
+    )
+    user_records = [record for record in records if record["type"] == "user"]
+    assert len(user_records) == 2
+    assert user_records[0]["message"] == {"role": "user", "content": reminder}
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    _, _, replayed = read_transcript_items_since(transcript_path, 0, agent_name="claude-native-ui")
+    assert [item.data["content"][0]["text"] for item in replayed] == (
+        ["Continue the task"] if is_meta else [reminder, "Continue the task"]
+    )
+    assert user_records[0].get("isMeta", False) is bool(is_meta)
+    assert "isMeta" not in user_records[1]
+
+
 def test_claude_transcript_records_handles_compaction_item() -> None:
     """Compaction items replace prior records with compacted_messages."""
     items: list[dict[str, Any]] = [
