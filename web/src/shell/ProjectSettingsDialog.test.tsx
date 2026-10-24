@@ -59,14 +59,14 @@ const getProjectMock = vi.mocked(getProject);
 const updateMock = vi.mocked(updateProjectConfig);
 const createMock = vi.mocked(createProject);
 
-function renderDialog(projectId: string | null = "p_1") {
+function renderDialog(projectId: string | null = "p_1", onOpenChange = vi.fn()) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <ProjectSettingsDialog
           open
-          onOpenChange={vi.fn()}
+          onOpenChange={onOpenChange}
           projectId={projectId}
           projectName="Work"
         />
@@ -89,6 +89,26 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ProjectSettingsDialog", () => {
+  it("dismisses while the save request is still pending", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    let finish!: (project: Awaited<ReturnType<typeof updateProjectConfig>>) => void;
+    updateMock.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const onOpenChange = vi.fn();
+    const view = renderDialog("p_1", onOpenChange);
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    expect(onOpenChange).toHaveBeenCalledExactlyOnceWith(false);
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { use_worktree: true }));
+    view.unmount();
+    finish({ id: "p_1", name: "Work", config: { use_worktree: true } });
+    await waitFor(() => expect(onOpenChange).toHaveBeenCalledTimes(1));
+  });
+
   it("seeds fields from the project's stored config", async () => {
     // No stored host → the working directory can't be chosen yet, so it shows
     // the "pick a host first" placeholder rather than a path input / browser.

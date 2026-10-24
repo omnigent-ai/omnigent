@@ -9,7 +9,10 @@ import {
 } from "./projects";
 
 const { authenticatedFetchMock } = vi.hoisted(() => ({ authenticatedFetchMock: vi.fn() }));
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: authenticatedFetchMock,
+  getCurrentUserId: () => null,
+}));
 
 beforeEach(() => authenticatedFetchMock.mockReset());
 

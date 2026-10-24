@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
+import { toast } from "sonner";
 import * as identity from "@/lib/identity";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
@@ -24,6 +25,8 @@ import {
   undoArchiveConversations,
   useConversations,
   useDeleteProject,
+  useCreateProject,
+  useBulkMoveToProject,
   useProjects,
   useProjectConfig,
   useProjectSessions,
@@ -67,6 +70,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   clearSessionTombstones();
   // Same for the recently-created keep-alive.
@@ -2415,6 +2419,7 @@ describe("useUpdateProjectConfig cache seeding", () => {
     // and its (empty) config.
     queryClient.setQueryData(["projects"], [{ id: null, name: "Work" }]);
     queryClient.setQueryData(["project-config", "p_new"], {});
+    queryClient.setQueryData(["project-config", "Work"], { workspace: "/other" });
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
 
@@ -2432,6 +2437,8 @@ describe("useUpdateProjectConfig cache seeding", () => {
 
     // The config cache holds the fresh value keyed by the NEW id.
     expect(queryClient.getQueryData(["project-config", "p_new"])).toEqual({ agent_id: "ag_x" });
+    expect(queryClient.getQueryData(["project-config", "Work"])).toEqual({ workspace: "/other" });
+    expect(queryClient.getQueryState(["project-config", "legacy", "Work"])).toBeUndefined();
     // The projects list now resolves "Work" → the promoted first-class id.
     expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Work" }]);
   });
@@ -3069,7 +3076,7 @@ describe("useMoveToProject", () => {
     expect(row.project_id).toBe("p_before");
     expect(row.labels).toEqual({ keep: "me" });
     // The overlay dropped the row from its old folder's pages; the rollback
-    // must put it back (wholesale snapshot restore, not a field revert).
+    // must put it back without replacing other rows' concurrent changes.
     const folder = queryClient.getQueryData<ConversationsInfiniteData>([
       "project-sessions",
       "Before folder",
@@ -3701,4 +3708,675 @@ it("uses the configured API page size for archived initial loads and pagination"
   expect(calls[1].get("after")).toBe(first.last_id);
   unmount();
   client.clear();
+});
+
+describe("background project mutations", () => {
+  function setup() {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    client.setQueryData(["projects"], [{ id: "work", name: "Work", icon: "📁" }]);
+    return { client, wrapper };
+  }
+
+  function retryLastError() {
+    const action = vi.mocked(toast.error).mock.calls.at(-1)?.[1]?.action;
+    if (!action || typeof action !== "object" || !("onClick" in action))
+      throw new Error("Missing retry action");
+    act(() => action.onClick({} as never));
+  }
+
+  it("preserves pending neighbours when a refresh adds and removes projects", async () => {
+    const { client, wrapper } = setup();
+    const pending = [
+      { id: null, name: "New", pending: "Creating" },
+      { id: "renamed", name: "Renamed", previousName: "Old", pending: "Saving" },
+    ];
+    client.setQueryData(
+      ["projects"],
+      [{ id: "gone", name: "Gone" }, ...pending, { id: "work", name: "Work" }],
+    );
+    fetchMock.mockResolvedValue(
+      mockResponse([
+        { id: "work", name: "Work" },
+        { id: "renamed", name: "Old" },
+        { id: "added", name: "Added" },
+      ]),
+    );
+    const { result } = renderHook(() => useProjects(), { wrapper });
+    await act(() => result.current.refetch());
+    expect(client.getQueryData(["projects"])).toEqual([
+      ...pending,
+      { id: "work", name: "Work" },
+      { id: "added", name: "Added" },
+    ]);
+  });
+
+  it.each(["rename", "list", "member", "none"] as const)(
+    "preserves completed rename work when %s fails",
+    async (failure) => {
+      vi.spyOn(toast, "error");
+      const { client, wrapper } = setup();
+      const row = conversation({ id: "member", project_id: "work", labels: { keep: "value" } });
+      const key = ["conversations", "", false];
+      const legacy = conversation({
+        id: "legacy",
+        project_id: null,
+        labels: { omni_project: "Work" },
+      });
+      client.setQueryData(key, infinitePage(failure === "member" ? [row, legacy] : [row]));
+      const sourceFolder = ["project-sessions", "Work", "created_at"];
+      const targetFolder = ["project-sessions", "Renamed", "created_at"];
+      client.setQueryData(sourceFolder, infinitePage([row]));
+      client.setQueryData(targetFolder, infinitePage([]));
+      if (failure !== "rename")
+        fetchMock.mockResolvedValueOnce(mockResponse({ id: "work", name: "Renamed" }));
+      if (failure === "member")
+        fetchMock
+          .mockResolvedValueOnce(
+            mockResponse({ data: [{ id: "member" }, { id: "legacy" }], has_more: false }),
+          )
+          .mockResolvedValueOnce(mockResponse({}));
+      if (failure === "none")
+        fetchMock.mockResolvedValueOnce(mockResponse({ data: [], has_more: false }));
+      else fetchMock.mockRejectedValueOnce(new Error("offline"));
+      const { result } = renderHook(() => useRenameProject(), { wrapper });
+      act(() => result.current.mutate({ id: "work", oldName: "Work", newName: "Renamed" }));
+      await waitFor(() =>
+        expect(failure === "none" ? result.current.isSuccess : result.current.isError).toBe(true),
+      );
+      expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0].labels).toEqual({
+        keep: "value",
+      });
+      expect(client.getQueryData(["projects"])).toEqual([
+        { id: "work", name: failure === "rename" ? "Work" : "Renamed", icon: "📁" },
+      ]);
+      expect(client.getQueryData<ConversationsInfiniteData>(sourceFolder)!.pages[0].data).toEqual(
+        failure === "rename" ? [row] : failure === "member" ? [legacy] : [],
+      );
+      expect(client.getQueryData<ConversationsInfiniteData>(targetFolder)!.pages[0].data).toEqual(
+        failure === "rename" ? [] : [row],
+      );
+      if (failure === "member") {
+        expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[1]).toEqual(
+          legacy,
+        );
+        const completedCalls = fetchMock.mock.calls.length;
+        fetchMock
+          .mockResolvedValueOnce(mockResponse({ data: [{ id: "legacy" }], has_more: false }))
+          .mockResolvedValueOnce(mockResponse({}));
+        retryLastError();
+        await waitFor(() => expect(client.isMutating()).toBe(0));
+        expect(
+          fetchMock.mock.calls
+            .slice(completedCalls)
+            .map(([url, init]) => [url, init?.method ?? "GET"]),
+        ).toEqual([
+          [expect.stringContaining("project=Work"), "GET"],
+          ["/v1/sessions/legacy", "PATCH"],
+        ]);
+        expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[1]).toMatchObject(
+          { project_id: "work", labels: {} },
+        );
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "reports rejected moves once without changing sessions (bulk: %s)",
+    async (bulk) => {
+      const notification = vi.spyOn(toast, "error");
+      const { client, wrapper } = setup();
+      client.setQueryData(["projects"], [{ id: null, name: "New", pending: "Creating" }]);
+      const key = ["conversations", "", false];
+      const row = conversation({ id: "one", labels: { "omnigent.pinned": "1000" } });
+      const rows = [row, conversation({ id: "two" })];
+      client.setQueryData(key, infinitePage(rows));
+      const { result } = renderHook(
+        () => ({ single: useMoveToProject(), bulk: useBulkMoveToProject() }),
+        { wrapper },
+      );
+      act(() => {
+        if (bulk) result.current.bulk.mutate({ ids: ["one", "two"], project: "New" });
+        else result.current.single.mutate({ id: "one", project: "New" });
+      });
+      await waitFor(() =>
+        expect((bulk ? result.current.bulk : result.current.single).isError).toBe(true),
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data).toEqual(rows);
+      expect(notification).toHaveBeenCalledExactlyOnceWith(
+        bulk ? "Couldn't move 2 sessions" : "Couldn't move session",
+        expect.objectContaining({
+          description: "This project is still updating. Try again when it finishes.",
+        }),
+      );
+      expect(notification.mock.calls[0][1]?.action).toBeUndefined();
+      expect(notification.mock.calls[0][1]?.duration).not.toBe(Infinity);
+    },
+  );
+
+  it.each(
+    ["bulk", "rename", "delete"].flatMap((operation) =>
+      [
+        [403, 404],
+        [403, 500],
+        [408, 429],
+      ].map((statuses) => ({ operation, statuses })),
+    ),
+  )(
+    "classifies $operation member errors ($statuses) for retries",
+    async ({ operation, statuses }) => {
+      const notification = vi.spyOn(toast, "error");
+      const { client, wrapper } = setup();
+      const { result } = renderHook(
+        () => ({
+          bulk: useBulkMoveToProject(),
+          rename: useRenameProject(),
+          remove: useDeleteProject(),
+        }),
+        { wrapper },
+      );
+      fetchMock.mockImplementation((url: string) => {
+        if (url === "/v1/projects/work")
+          return Promise.resolve(mockResponse({ id: "work", name: "Renamed" }));
+        if (url.startsWith("/v1/sessions?"))
+          return Promise.resolve(
+            mockResponse({ data: [{ id: "one" }, { id: "two" }], has_more: false }),
+          );
+        return Promise.resolve(
+          mockResponse(
+            { error: { message: "Member write failed" } },
+            {
+              ok: false,
+              status: statuses[url.endsWith("/one") ? 0 : 1],
+            },
+          ),
+        );
+      });
+      act(() => {
+        if (operation === "bulk") result.current.bulk.mutate({ ids: ["one", "two"], project: "" });
+        else if (operation === "rename")
+          result.current.rename.mutate({ id: "work", oldName: "Work", newName: "Renamed" });
+        else result.current.remove.mutate({ id: "work", name: "Work" });
+      });
+      await waitFor(() => expect(notification).toHaveBeenCalledOnce());
+      await waitFor(() => expect(client.isMutating()).toBe(0));
+      const options = notification.mock.calls[0][1];
+      expect(!!options?.action).toBe(statuses[1] !== 404);
+      expect(options?.duration === Infinity).toBe(statuses[1] !== 404);
+      if (operation !== "rename") expect(options?.description).toContain("Member write failed");
+    },
+  );
+
+  it.each([false, true])(
+    "does not restore obsolete folder cursors after a failed move (paginated: %s)",
+    async (paginated) => {
+      const { client, wrapper } = setup();
+      const row = conversation({ id: "moving", project_id: "work" });
+      const neighbor = conversation({ id: "neighbor", project_id: "work" });
+      const key = ["project-sessions", "Work"];
+      client.setQueryData(["conversations", "", false], infinitePage([row]));
+      const original = infinitePage([neighbor, row]);
+      original.pages[0].has_more = true;
+      client.setQueryData(key, original);
+      let fail!: (response: Response) => void;
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          fail = resolve;
+        }),
+      );
+      const { result } = renderHook(() => useMoveToProject(), { wrapper });
+      act(() => result.current.mutate({ id: row.id, project: "" }));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      const newest = conversation({ id: "newest", project_id: "work" });
+      const refreshed = infinitePage([newest, neighbor]);
+      refreshed.pages[0].has_more = true;
+      const changed = paginated
+        ? {
+            pages: [
+              ...client.getQueryData<ConversationsInfiniteData>(key)!.pages,
+              infinitePage([newest]).pages[0],
+            ],
+            pageParams: [undefined, "neighbor"],
+          }
+        : refreshed;
+      client.setQueryData(key, changed);
+      act(() => fail(mockResponse({}, { ok: false, status: 500 })));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(client.getQueryData(key)).toEqual(changed);
+      expect(client.getQueryState(key)?.isInvalidated).toBe(true);
+      expect(
+        client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!.pages[0]
+          .data[0].project_id,
+      ).toBe("work");
+    },
+  );
+
+  it.each(["create", "rename", "delete", "config"] as const)(
+    "does not offer Retry for permanent %s errors",
+    async (operation) => {
+      const notification = vi.spyOn(toast, "error");
+      const { client, wrapper } = setup();
+      const { result } = renderHook(
+        () => {
+          const create = useCreateProject();
+          const rename = useRenameProject();
+          const remove = useDeleteProject();
+          const config = useUpdateProjectConfig();
+          return {
+            create: () => create.mutate({ name: "New" }),
+            rename: () => rename.mutate({ id: "work", oldName: "Work", newName: "New" }),
+            delete: () => remove.mutate({ id: "work", name: "Work" }),
+            config: () => config.mutate({ id: "work", name: "Work", config: {} }),
+          };
+        },
+        { wrapper },
+      );
+      fetchMock.mockResolvedValue(
+        mockResponse({ error: { message: "Conflict" } }, { ok: false, status: 409 }),
+      );
+      act(() => result.current[operation]());
+      await waitFor(() => expect(client.isMutating()).toBe(0));
+      expect(notification).toHaveBeenCalledOnce();
+      expect(notification.mock.calls[0][1]?.action).toBeUndefined();
+      expect(notification.mock.calls[0][1]?.duration).not.toBe(Infinity);
+      notification.mockClear();
+      fetchMock.mockClear();
+      client.setQueryData(
+        ["projects"],
+        [
+          { id: "work", name: "Work", pending: "Saving" },
+          { id: "new", name: "New" },
+        ],
+      );
+      act(() => result.current[operation]());
+      await waitFor(() => expect(client.isMutating()).toBe(0));
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(notification).toHaveBeenCalledOnce();
+      expect(notification.mock.calls[0][1]?.action).toBeUndefined();
+      expect(notification.mock.calls[0][1]?.duration).not.toBe(Infinity);
+    },
+  );
+
+  it("reserves a rename target before another project can claim it", async () => {
+    let finish!: (response: Response) => void;
+    fetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const { client, wrapper } = setup();
+    client.setQueryData(
+      ["projects"],
+      [
+        { id: "work", name: "Work" },
+        { id: "other", name: "Other" },
+      ],
+    );
+    const { result } = renderHook(() => useRenameProject(), { wrapper });
+    act(() => {
+      result.current.mutate({ id: "work", oldName: "Work", newName: "Same" });
+      result.current.mutate({ id: "other", oldName: "Other", newName: "Same" });
+    });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(client.getQueryData(["projects"])).toEqual([
+      expect.objectContaining({ id: "work", name: "Same", pending: "Saving" }),
+      { id: "other", name: "Other" },
+    ]);
+    fetchMock.mockResolvedValue(mockResponse({ data: [], has_more: false }));
+    act(() => finish(mockResponse({ id: "work", name: "Same" })));
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+  });
+
+  it("keeps one pending project across a stale refresh and recovers a failed create after unmount", async () => {
+    let reject!: (error: Error) => void;
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) =>
+      init?.method === "POST"
+        ? new Promise<Response>((_resolve, fail) => {
+            reject = fail;
+          })
+        : Promise.resolve(mockResponse([{ id: "work", name: "Work" }])),
+    );
+    const notification = vi.spyOn(toast, "error");
+    const { client, wrapper } = setup();
+    const list = renderHook(() => useProjects(), { wrapper });
+    const create = renderHook(() => useCreateProject(), { wrapper });
+    act(() => create.result.current.mutate({ name: "New", icon: "🔥" }));
+    await waitFor(() => expect(reject).toBeTypeOf("function"));
+    expect(list.result.current.data).toContainEqual({
+      id: null,
+      name: "New",
+      icon: "🔥",
+      pending: "Creating",
+    });
+    await act(async () => {
+      await list.result.current.refetch();
+    });
+    expect(list.result.current.data?.filter((project) => project.name === "New")).toHaveLength(1);
+    create.unmount();
+    act(() => reject(new Error("offline")));
+    await waitFor(() =>
+      expect(notification).toHaveBeenCalledWith(
+        expect.stringContaining("New"),
+        expect.objectContaining({ action: expect.objectContaining({ label: "Retry" }) }),
+      ),
+    );
+    expect(client.getQueryData(["projects"])).toEqual([{ id: "work", name: "Work" }]);
+    list.unmount();
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ id: "new", name: "New", config: { icon: "🔥" } }),
+    );
+    retryLastError();
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    expect(client.getQueryData(["projects"])).toContainEqual({
+      id: "new",
+      name: "New",
+      icon: "🔥",
+    });
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(2);
+    notification.mockRestore();
+  });
+
+  it("promotes a pending create immediately without waiting for a list refresh", async () => {
+    let resolve!: (response: Response) => void;
+    fetchMock.mockReturnValue(
+      new Promise<Response>((done) => {
+        resolve = done;
+      }),
+    );
+    const { client, wrapper } = setup();
+    const { result } = renderHook(() => useCreateProject(), { wrapper });
+    act(() => result.current.mutate({ name: "New", icon: "🔥" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    act(() => resolve(mockResponse({ id: "new-id", name: "New", config: { icon: "🔥" } })));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(client.getQueryData(["projects"])).toEqual([
+      { id: "work", name: "Work", icon: "📁" },
+      { id: "new-id", name: "New", icon: "🔥" },
+    ]);
+  });
+
+  it("recovers a settings submission after unmount without overwriting another dialog's keys", async () => {
+    let reject!: (error: Error) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((_resolve, fail) => {
+        reject = fail;
+      }),
+    );
+    const notification = vi.spyOn(toast, "error");
+    const { client, wrapper } = setup();
+    client.setQueryData(["project-config", "work"], { icon: "📁", workspace: "/old" });
+    const { result, unmount } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+    act(() =>
+      result.current.mutate({
+        id: "work",
+        name: "Work",
+        config: { icon: "📁", workspace: "/new" },
+        fields: ["workspace"],
+      }),
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(client.getQueryData(["project-config", "work"])).toEqual({
+      icon: "📁",
+      workspace: "/new",
+    });
+    unmount();
+    act(() => reject(new Error("offline")));
+    await waitFor(() => expect(notification).toHaveBeenCalled());
+    expect(client.getQueryData(["project-config", "work"])).toEqual({
+      icon: "📁",
+      workspace: "/old",
+    });
+    client.setQueryData(["project-config", "work"], { icon: "🔥", workspace: "/old" });
+    fetchMock.mockResolvedValue(
+      mockResponse({ id: "work", name: "Work", config: { icon: "🔥", workspace: "/new" } }),
+    );
+    const options = notification.mock.calls.at(-1)?.[1];
+    const action = options?.action;
+    if (!action || typeof action !== "object" || !("onClick" in action))
+      throw new Error("Missing retry action");
+    act(() => action.onClick({} as never));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      config: { icon: "🔥", workspace: "/new" },
+    });
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    notification.mockRestore();
+  });
+
+  it("keeps a successful legacy rename when the later icon save fails", async () => {
+    let rejectIcon!: (error: Error) => void;
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ id: "promoted", name: "Renamed" }))
+      .mockResolvedValueOnce(mockResponse({ data: [{ id: "member" }], has_more: false }))
+      .mockResolvedValueOnce(mockResponse({}))
+      .mockReturnValueOnce(
+        new Promise<Response>((_resolve, reject) => {
+          rejectIcon = reject;
+        }),
+      );
+    const notification = vi.spyOn(toast, "error");
+    const { client, wrapper } = setup();
+    client.setQueryData(["projects"], [{ id: null, name: "Legacy", icon: "📁" }]);
+    const key = ["conversations", "", false];
+    client.setQueryData(
+      key,
+      infinitePage([conversation({ id: "member", labels: { omni_project: "Legacy" } })]),
+    );
+    const { result, unmount } = renderHook(() => useRenameProject(), { wrapper });
+    act(() =>
+      result.current.mutate({
+        id: null,
+        oldName: "Legacy",
+        newName: "Renamed",
+        config: { icon: "🔥", host_id: "host" },
+      }),
+    );
+    await waitFor(() => expect(rejectIcon).toBeTypeOf("function"));
+    expect(client.getQueryData(["projects"])).toEqual([
+      expect.objectContaining({ name: "Renamed", icon: "🔥", pending: "Saving" }),
+    ]);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    unmount();
+    act(() => rejectIcon(new Error("icon failed")));
+    await waitFor(() => expect(notification).toHaveBeenCalled());
+    expect(client.getQueryData(["projects"])).toEqual([
+      { id: "promoted", name: "Renamed", icon: "📁" },
+    ]);
+    expect(notification).toHaveBeenCalledWith(
+      expect.stringContaining("was renamed"),
+      expect.anything(),
+    );
+    expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0]).toMatchObject({
+      project_id: "promoted",
+      labels: {},
+    });
+    const completedCalls = fetchMock.mock.calls.length;
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ data: [], has_more: false }))
+      .mockResolvedValueOnce(
+        mockResponse({ id: "promoted", name: "Renamed", config: { icon: "🔥", host_id: "host" } }),
+      );
+    retryLastError();
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    expect(
+      fetchMock.mock.calls.slice(completedCalls).map(([url, init]) => [url, init?.method ?? "GET"]),
+    ).toEqual([
+      [expect.stringContaining("project=Legacy"), "GET"],
+      ["/v1/projects/promoted", "PATCH"],
+    ]);
+    expect(JSON.parse(fetchMock.mock.calls.at(-1)![1].body)).toEqual({
+      config: { icon: "🔥", host_id: "host" },
+    });
+    expect(client.getQueryData(["projects"])).toEqual([
+      { id: "promoted", name: "Renamed", icon: "🔥" },
+    ]);
+    notification.mockRestore();
+  });
+
+  it.each([false, true])(
+    "cleans legacy config after failure (promotion fails: %s)",
+    async (promotionFails) => {
+      let reject!: (error: Error) => void;
+      if (!promotionFails)
+        fetchMock.mockResolvedValueOnce(mockResponse({ id: "work", name: "Work" }));
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((_resolve, fail) => {
+          reject = fail;
+        }),
+      );
+      const { client, wrapper } = setup();
+      client.setQueryData(["projects"], [{ id: null, name: "Work" }]);
+      client.setQueryData(["project-config", "Work"], { workspace: "/other", icon: "📁" });
+      const { result, unmount } = renderHook(() => useUpdateProjectConfig(), { wrapper });
+      act(() =>
+        result.current.mutate({
+          id: null,
+          name: "Work",
+          config: { workspace: "/new" },
+          fields: ["workspace"],
+        }),
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(promotionFails ? 1 : 2));
+      expect(client.getQueryData(["project-config", "legacy", "Work"])).toEqual({
+        workspace: "/new",
+      });
+      if (!promotionFails)
+        expect(client.getQueryData(["project-config", "work"])).toEqual({ workspace: "/new" });
+      unmount();
+      act(() => reject(new Error("offline")));
+      await waitFor(() => expect(client.isMutating()).toBe(0));
+      expect(client.getQueryData(["projects"])).toEqual([
+        { id: promotionFails ? null : "work", name: "Work" },
+      ]);
+      expect(client.getQueryData(["project-config", "work"])).toEqual(
+        promotionFails ? undefined : {},
+      );
+      expect(client.getQueryData(["project-config", "Work"])).toEqual({
+        workspace: "/other",
+        icon: "📁",
+      });
+      expect(client.getQueryState(["project-config", "legacy", "Work"])).toBeUndefined();
+    },
+  );
+
+  it("keeps successful project archives completed when another member fails", async () => {
+    vi.spyOn(toast, "error");
+    let failMember!: (response: Response) => void;
+    const succeeded = conversation({ id: "one", project_id: null, archived: true });
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith("/v1/sessions?"))
+        return Promise.resolve(
+          mockResponse({ data: [{ id: "one" }, { id: "two" }], has_more: false }),
+        );
+      if (url.endsWith("/one")) return Promise.resolve(mockResponse(succeeded));
+      return new Promise<Response>((resolve) => {
+        failMember = resolve;
+      });
+    });
+    const { client, wrapper } = setup();
+    client.setQueryData(PINNED_CONVERSATIONS_KEY, {
+      conversations: [succeeded],
+      filterHonored: true,
+    });
+    client.setQueryData(
+      ["conversations", "", true],
+      infinitePage([
+        conversation({ id: "one", project_id: "work" }),
+        conversation({ id: "two", project_id: "work" }),
+      ]),
+    );
+    const { result, unmount } = renderHook(() => useDeleteProject(), { wrapper });
+    act(() => result.current.mutate({ id: "work", name: "Work" }));
+    await waitFor(() => expect(failMember).toBeTypeOf("function"));
+    expect(client.getQueryData(["projects"])).toEqual([
+      expect.objectContaining({ pending: "Deleting" }),
+    ]);
+    unmount();
+    act(() => failMember(mockResponse({}, { ok: false, status: 500 })));
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    const rows = client.getQueryData<ConversationsInfiniteData>(["conversations", "", true])!
+      .pages[0].data;
+    expect(rows.find((row) => row.id === "one")).toMatchObject({
+      archived: true,
+      project_id: null,
+    });
+    expect(rows.find((row) => row.id === "two")).toMatchObject({ project_id: "work" });
+    expect(
+      client.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations,
+    ).toEqual([]);
+    expect(client.getQueryData(["projects"])).toEqual([{ id: "work", name: "Work", icon: "📁" }]);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+    const completedCalls = fetchMock.mock.calls.length;
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ data: [{ id: "two" }], has_more: false }))
+      .mockResolvedValueOnce(
+        mockResponse(conversation({ id: "two", archived: true, project_id: null })),
+      )
+      .mockResolvedValueOnce(mockResponse({}));
+    retryLastError();
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    expect(
+      fetchMock.mock.calls.slice(completedCalls).map(([url, init]) => [url, init?.method ?? "GET"]),
+    ).toEqual([
+      [expect.stringContaining("project=Work"), "GET"],
+      ["/v1/sessions/two", "PATCH"],
+      ["/v1/projects/work", "DELETE"],
+    ]);
+    expect(client.getQueryData(["projects"])).toEqual([]);
+  });
+
+  it("moves every selected row immediately and restores only failed rows after unmount", async () => {
+    vi.spyOn(toast, "error");
+    const finish = new Map<string, (response: Response) => void>();
+    fetchMock.mockImplementation((url: string) =>
+      url === "/v1/projects"
+        ? Promise.resolve(mockResponse({ data: [{ id: "work", name: "Work" }] }))
+        : new Promise<Response>((resolve) => {
+            finish.set(url, resolve);
+          }),
+    );
+    const { client, wrapper } = setup();
+    client.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({ id: "one", labels: { omni_project: "Before" } }),
+        conversation({ id: "two", labels: { omni_project: "Before" } }),
+      ]),
+    );
+    const { result, unmount } = renderHook(() => useBulkMoveToProject(), { wrapper });
+    act(() => result.current.mutate({ ids: ["one", "two"], project: "Work" }));
+    await waitFor(() => expect(finish.size).toBe(2));
+    const rows = () =>
+      client.getQueryData<ConversationsInfiniteData>(["conversations", "", false])!.pages[0].data;
+    expect(rows().map((row) => row.project_id)).toEqual(["work", "work"]);
+    unmount();
+    act(() =>
+      finish.get("/v1/sessions/one")!(
+        mockResponse(conversation({ id: "one", project_id: "work" })),
+      ),
+    );
+    await waitFor(() => expect(client.isMutating({ mutationKey: ["move-to-project"] })).toBe(1));
+    act(() => finish.get("/v1/sessions/two")!(mockResponse({}, { ok: false, status: 500 })));
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    expect(rows()[0]).toMatchObject({ project_id: "work", labels: {} });
+    expect(rows()[1].labels).toEqual({ omni_project: "Before" });
+    const completedCalls = fetchMock.mock.calls.length;
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ data: [{ id: "work", name: "Work" }] }))
+      .mockResolvedValueOnce(mockResponse(conversation({ id: "two", project_id: "work" })));
+    retryLastError();
+    await waitFor(() => expect(client.isMutating()).toBe(0));
+    expect(
+      fetchMock.mock.calls.slice(completedCalls).map(([url, init]) => [url, init?.method ?? "GET"]),
+    ).toEqual([
+      ["/v1/projects", "GET"],
+      ["/v1/sessions/two", "PATCH"],
+    ]);
+    expect(rows().map((row) => row.project_id)).toEqual(["work", "work"]);
+  });
 });

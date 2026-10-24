@@ -6,7 +6,7 @@
 //     hover-revealed edit/remove affordances (the OMNI-3742 design).
 
 import { type CSSProperties, lazy, Suspense, useState } from "react";
-import { FolderIcon, Loader2Icon, PencilIcon, Trash2Icon } from "lucide-react";
+import { FolderIcon, PencilIcon, Trash2Icon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -76,6 +76,7 @@ export function ProjectLandingIcon({
       id: projectId,
       name: projectName,
       config: { ...(config ?? {}), icon: native },
+      fields: ["icon"],
     });
     setOpen(false);
   };
@@ -83,7 +84,7 @@ export function ProjectLandingIcon({
     if (!configReady) return;
     const next = { ...(config ?? {}) };
     delete next.icon;
-    update.mutate({ id: projectId, name: projectName, config: next });
+    update.mutate({ id: projectId, name: projectName, config: next, fields: ["icon"] });
   };
 
   return (
@@ -128,9 +129,7 @@ export function ProjectLandingIcon({
               icon ? "bg-muted" : "bg-tag-pink",
             )}
           >
-            {update.isPending ? (
-              <Loader2Icon className="size-6 animate-spin text-muted-foreground" />
-            ) : icon ? (
+            {icon ? (
               <span className="text-[30px] leading-none">{icon}</span>
             ) : (
               <FolderIcon className="size-6 text-brand-accent" />

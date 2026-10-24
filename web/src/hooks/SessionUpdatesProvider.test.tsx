@@ -530,11 +530,11 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
       act(() => result.current.mutate(oldProjects));
       await waitFor(() => expect(fetchOrder).toHaveBeenCalledTimes(1));
       expect(fetchProjects).toHaveBeenCalledTimes(1);
-      expect(client.isMutating({ mutationKey: ["project-order"] })).toBe(1);
+      expect(client.isMutating({ mutationKey: ["project-order"] })).toBe(0);
       const frameListener = subscribe.mock.calls.at(-1)?.[0] as unknown as (frame: unknown) => void;
       act(() => frameListener({ type: "projects_changed" }));
-      expect(fetchProjects).toHaveBeenCalledTimes(1);
-      expect(fetchOrder).toHaveBeenCalledTimes(1);
+      expect(fetchProjects).toHaveBeenCalledTimes(2);
+      expect(fetchOrder).toHaveBeenCalledTimes(2);
 
       // The in-flight reads captured the snapshot before the other tab's change.
       await act(async () => {

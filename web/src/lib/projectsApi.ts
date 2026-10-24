@@ -10,8 +10,9 @@
 // camelCase-friendly, but the project shape is already flat snake_case-free
 // (`id`, `name`), so no boundary conversion is needed.
 
-import { authenticatedFetch } from "./identity";
-import { apiErrorFromResponse } from "./sessionsApi";
+import { authenticatedFetch, getCurrentUserId } from "./identity";
+import { getOmnigentHostGeneration } from "./host";
+import { ApiError, apiErrorFromResponse } from "./sessionsApi";
 
 /**
  * Default session settings a project stores, pre-filled into the new-chat
@@ -70,19 +71,10 @@ interface ProjectListResponse {
   data: Project[];
 }
 
-async function readError(res: Response): Promise<string> {
-  try {
-    const body = (await res.json()) as { error?: { message?: string }; message?: string };
-    return body.error?.message ?? body.message ?? `${res.status} ${res.statusText}`;
-  } catch {
-    return `${res.status} ${res.statusText}`;
-  }
-}
-
 /** List the caller's projects in their preferred display order. */
 export async function listProjects(): Promise<Project[]> {
   const res = await authenticatedFetch("/v1/projects");
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const body = (await res.json()) as ProjectListResponse;
   return body.data;
 }
@@ -94,18 +86,45 @@ export async function getProject(id: string): Promise<Project> {
   return (await res.json()) as Project;
 }
 
+const pendingProjectCreates = new Map<
+  string,
+  { config?: ProjectConfig; request: Promise<Project> }
+>();
+
 /**
- * Create a project, optionally with initial `config` defaults. Rejects with the
- * server's message on a duplicate name (409) so callers can surface it inline.
+ * Create a project, sharing same-name requests unless their configs conflict.
+ * Configless callers can join any creation; existing names are rejected by the server.
  */
-export async function createProject(name: string, config?: ProjectConfig): Promise<Project> {
-  const res = await authenticatedFetch("/v1/projects", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(config ? { name, config } : { name }),
-  });
-  if (!res.ok) throw new Error(await readError(res));
-  return (await res.json()) as Project;
+export function createProject(name: string, config?: ProjectConfig): Promise<Project> {
+  const key = JSON.stringify([getOmnigentHostGeneration(), getCurrentUserId(), name]);
+  const pending = pendingProjectCreates.get(key);
+  if (pending) {
+    if (
+      Object.entries(config ?? {}).some(
+        ([field, value]) =>
+          value !== undefined && value !== pending.config?.[field as keyof ProjectConfig],
+      )
+    )
+      return Promise.reject(
+        new ApiError(`“${name}” is already being created with different settings.`, 409, null),
+      );
+    return pending.request;
+  }
+  const request = (async () => {
+    const res = await authenticatedFetch("/v1/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(config ? { name, config } : { name }),
+    });
+    if (!res.ok) throw await apiErrorFromResponse(res);
+    return (await res.json()) as Project;
+  })();
+  pendingProjectCreates.set(key, { config, request });
+  const clear = () => {
+    pendingProjectCreates.delete(key);
+  };
+  void request.then(clear, clear);
+  return request;
 }
 
 /** Rename a project (O(1) — members reference the id, not the name string). */
@@ -115,7 +134,7 @@ export async function renameProject(id: string, name: string): Promise<Project> 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 
@@ -130,7 +149,7 @@ export async function updateProjectConfig(id: string, config: ProjectConfig): Pr
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ config }),
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }
 
@@ -144,7 +163,7 @@ export async function deleteProject(id: string): Promise<void> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
 }
 
 export interface ProjectOrder {
@@ -154,7 +173,7 @@ export interface ProjectOrder {
 
 export async function getProjectOrder(): Promise<ProjectOrder> {
   const res = await authenticatedFetch("/v1/projects/order");
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as ProjectOrder;
 }
 
@@ -164,6 +183,6 @@ export async function saveProjectOrder(ids: string[] | null): Promise<ProjectOrd
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ordered_project_ids: ids }),
   });
-  if (!res.ok) throw new Error(await readError(res));
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as ProjectOrder;
 }

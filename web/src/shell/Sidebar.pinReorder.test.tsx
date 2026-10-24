@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   pinned: [] as ReturnType<typeof conv>[],
   filterHonored: true,
   pinFn: vi.fn(),
+  moveFn: vi.fn(),
   reorderPins: vi.fn(),
 }));
 
@@ -34,11 +35,12 @@ vi.mock("@/hooks/useConversations", async () => {
         mutationFn: (vars: unknown) => mocks.pinFn(vars),
       }),
     useReorderPinnedConversations: () => ({ mutate: mocks.reorderPins }),
+    useMoveToProject: () => useMutation({ mutationFn: mocks.moveFn }),
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
-import { useConversations } from "@/hooks/useConversations";
+import { useConversations, useProjects } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 
@@ -80,6 +82,7 @@ async function dropOnto(sourceId: string, targetId: string, { expectTarget = tru
 
 beforeEach(() => {
   mocks.filterHonored = true;
+  vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
   mocks.pinned = [
     conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
     conv("conv_b", { labels: { "omnigent.pinned": "1000" } }),
@@ -191,6 +194,66 @@ describe("dropping an unpinned session onto a pinned row", () => {
     });
     await waitFor(() => expect(pinButton("conv_d")).toHaveAttribute("aria-disabled", "false"));
   });
+});
+
+describe("dropping a pinned session onto a project", () => {
+  it.each([false, true])(
+    "unpins and expands only after a successful move (rejected: %s)",
+    async (rejected) => {
+      let finish!: () => void;
+      let fail!: (error: Error) => void;
+      mocks.moveFn.mockReturnValue(
+        new Promise<void>((resolve, reject) => {
+          finish = resolve;
+          fail = reject;
+        }),
+      );
+      mocks.pinFn.mockResolvedValue({});
+      vi.mocked(useProjects).mockReturnValue({ data: [{ id: "work", name: "Work" }] } as ReturnType<
+        typeof useProjects
+      >);
+      localStorage.removeItem("omnigent:expanded-project-sections");
+      renderSidebar();
+      const header = screen.getByRole("button", { name: "Work" });
+      const folder = header.closest("section")!.parentElement;
+      const rect = vi.mocked(Element.prototype.getBoundingClientRect);
+      const rowRects = rect.getMockImplementation()!;
+      rect.mockImplementation(function (this: Element) {
+        return this === folder ? new DOMRect(0, 300, 200, ROW_HEIGHT) : rowRects.call(this);
+      });
+      const source = screen.getByRole("link", { name: "conv_a" }).closest("li")!;
+      const start = rowCenter("conv_a");
+      fireEvent.mouseDown(source, { button: 0, ...start });
+      fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+      await act(async () => {
+        fireEvent.mouseMove(document, { clientX: 50, clientY: 315 });
+      });
+      await act(async () => {
+        fireEvent.mouseUp(document, { clientX: 50, clientY: 315 });
+      });
+      await waitFor(() =>
+        expect(mocks.moveFn).toHaveBeenCalledWith(
+          { id: "conv_a", project: "Work" },
+          expect.anything(),
+        ),
+      );
+      expect(mocks.pinFn).not.toHaveBeenCalled();
+      expect(header).toHaveAttribute("aria-expanded", "false");
+      await act(async () => {
+        if (rejected) fail(new Error("Project is updating"));
+        else finish();
+      });
+      if (rejected) {
+        expect(mocks.pinFn).not.toHaveBeenCalled();
+        expect(header).toHaveAttribute("aria-expanded", "false");
+      } else {
+        await waitFor(() =>
+          expect(mocks.pinFn).toHaveBeenCalledWith({ id: "conv_a", pinned: false }),
+        );
+        expect(header).toHaveAttribute("aria-expanded", "true");
+      }
+    },
+  );
 });
 
 describe("unpinning from a sidebar row", () => {

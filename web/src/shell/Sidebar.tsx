@@ -155,6 +155,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   type Conversation,
+  type ProjectSummary,
   type PinnedConversationsResult,
   useArchiveConversation,
   useBulkArchiveConversations,
@@ -1431,6 +1432,7 @@ function ProjectFolder({
   name,
   projectId,
   icon,
+  pending,
   windowConversations,
   activeConversationId,
   expanded,
@@ -1457,6 +1459,7 @@ function ProjectFolder({
     last: boolean;
   };
   name: string;
+  pending?: ProjectSummary["pending"];
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
   /** Chosen emoji icon (unicode grapheme), or null/absent for the default
@@ -1549,6 +1552,7 @@ function ProjectFolder({
     name,
     projectId,
     icon,
+    pending,
   );
 
   const headerDrag = useSortable({
@@ -1577,6 +1581,13 @@ function ProjectFolder({
       <ConversationSection
         headerDrag={headerDrag}
         title={name}
+        headerStatus={
+          pending ? (
+            <span role="status" className="text-xs text-muted-foreground">
+              {pending}…
+            </span>
+          ) : undefined
+        }
         icon={
           icon ? (
             <span className="text-[14px] leading-none">{icon}</span>
@@ -1808,7 +1819,6 @@ function ConversationList({
   const pinWriting = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
   const { mutate: reorderPins } = useReorderPinnedConversations();
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
-    if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
     const to =
       destination === "top"
@@ -1948,8 +1958,9 @@ function ConversationList({
       id: string | null;
       name: string;
       icon?: string | null;
+      pending?: ProjectSummary["pending"];
       conversations: Conversation[];
-    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
+    }[] = (grouped ? [] : projects).map(({ id, name, icon, pending }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -1961,6 +1972,7 @@ function ConversationList({
         id,
         name,
         icon,
+        pending,
         conversations: sortConversations(inProject, activeOverride, frozenKeys, sortBy),
       };
     });
@@ -2226,7 +2238,7 @@ function ConversationList({
       if (event.active.data.current?.type === "project-order") {
         setDraggedProject(null);
         setOverProject(null);
-        if (event.over?.data.current?.type !== "project-order" || saveOrder.isPending) return;
+        if (event.over?.data.current?.type !== "project-order") return;
         const from = projects.findIndex((p) => p.name === event.active.data.current?.name);
         const to = projects.findIndex((p) => p.name === event.over?.data.current?.name);
         if (from >= 0 && to >= 0 && from !== to) saveOrder.mutate(arrayMove(projects, from, to));
@@ -2248,13 +2260,13 @@ function ConversationList({
         target,
       );
       if (action.kind === "move") {
-        moveToProject.mutate({ id: dragged.id, project: action.project });
-        // Unpin a pinned session so it actually drops into the folder instead of
-        // staying floated up in Pinned (pin outranks project membership). No
-        // Undo pill: re-pinning would leave the session filed in the new folder.
-        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
-        // Open the (possibly brand-new) folder so the session is visible in it.
-        expandProject(action.project);
+        moveToProject
+          .mutateAsync({ id: dragged.id, project: action.project })
+          .then(async () => {
+            expandProject(action.project);
+            if (action.unpin) await pinAt({ id: dragged.id, pinned: false });
+          })
+          .catch(() => {});
         return;
       }
       if (action.kind === "reorder-pin") {
@@ -2290,8 +2302,12 @@ function ConversationList({
       if (action.kind === "ungroup") {
         // Unfile silently — a first-class project persists when emptied, so
         // dragging out its last session deletes nothing. Mirrors the kebab flow.
-        moveToProject.mutate({ id: dragged.id, project: "" });
-        if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
+        moveToProject
+          .mutateAsync({ id: dragged.id, project: "" })
+          .then(async () => {
+            if (action.unpin) await pinAt({ id: dragged.id, pinned: false });
+          })
+          .catch(() => {});
       }
     },
     [
@@ -2792,7 +2808,7 @@ function ConversationList({
                                 saveOrder.mutate(manual ? restored : null);
                               }}
                               manualOrder={projectOrder.data?.sort_mode === "manual"}
-                              orderDisabled={saveOrder.isPending || !projectOrder.data}
+                              orderDisabled={!projectOrder.data}
                               projectNames={sections.projectGroups.map((group) => group.name)}
                               collapsed={effectiveCollapsedSections.includes("Projects")}
                               expandedProjects={expandedProjects}
@@ -2821,11 +2837,7 @@ function ConversationList({
                           <ProjectFolder
                             key={group.name}
                             ordering={{
-                              disabled:
-                                !projectOrder.data ||
-                                saveOrder.isPending ||
-                                selectionMode ||
-                                editingIds.size > 0,
+                              disabled: !projectOrder.data || selectionMode || editingIds.size > 0,
                               first: index === 0,
                               last: index === projects.length - 1,
                               move: (destination) => moveProject(group.name, destination),
@@ -2841,6 +2853,7 @@ function ConversationList({
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}
+                            pending={group.pending}
                             windowConversations={group.conversations}
                             activeConversationId={displayedActiveId}
                             expanded={expandedProjects.includes(group.name)}
@@ -5839,11 +5852,19 @@ function ProjectFolderMenuItems({
           New session
         </Link>
       </C.Item>
-      <C.Item data-testid="rename-project" onSelect={actions.openRename}>
+      <C.Item
+        data-testid="rename-project"
+        disabled={!!actions.pending}
+        onSelect={actions.openRename}
+      >
         <PencilIcon className="size-3.5" />
         Rename project
       </C.Item>
-      <C.Item data-testid="project-settings" onSelect={actions.openSettings}>
+      <C.Item
+        data-testid="project-settings"
+        disabled={!!actions.pending}
+        onSelect={actions.openSettings}
+      >
         <Settings2Icon className="size-3.5" />
         Project settings
       </C.Item>
@@ -5874,7 +5895,12 @@ function ProjectFolderMenuItems({
         </C.Sub>
       )}
       <C.Separator />
-      <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
+      <C.Item
+        data-testid="delete-project"
+        disabled={!!actions.pending}
+        variant="destructive"
+        onSelect={actions.openDelete}
+      >
         <Trash2Icon className="size-3.5" />
         Delete project
       </C.Item>
@@ -5883,6 +5909,7 @@ function ProjectFolderMenuItems({
 }
 
 interface ProjectFolderMenuActions {
+  pending?: ProjectSummary["pending"];
   ordering?: {
     disabled: boolean;
     first: boolean;
@@ -5902,6 +5929,7 @@ function useProjectFolderMenu(
   projectName: string,
   projectId: string | null,
   icon?: string | null,
+  pending?: ProjectSummary["pending"],
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -5939,6 +5967,7 @@ function useProjectFolderMenu(
 
   const actions = useMemo<ProjectFolderMenuActions>(
     () => ({
+      pending,
       openRename: () => {
         menuOpenedDialogRef.current = true;
         setRenameValue(projectName);
@@ -5963,7 +5992,7 @@ function useProjectFolderMenu(
         if (menuOpenedDialogRef.current) event.preventDefault();
       },
     }),
-    [projectName],
+    [projectName, pending],
   );
 
   const dialogs = (
@@ -5998,43 +6027,25 @@ function useProjectFolderMenu(
               doesn't wrap children in one) instead of relying on a manual
               key handler + button lookup. */}
           <form
-            onSubmit={async (e) => {
+            onSubmit={(e) => {
               e.preventDefault();
               const newName = renameValue.trim();
-              const nameChanged = newName !== "" && newName !== projectName;
+              if (!newName || pending || renameProject.isPending || updateConfig.isPending) return;
+              const nameChanged = newName !== projectName;
               const iconChanged = pendingIcon !== undefined && pendingIcon !== (savedIcon ?? null);
-              // Only the icon write needs a loaded config to merge onto; a
-              // name-only rename must proceed even if the config fetch failed.
               if (iconChanged && !configReady) return;
-              try {
-                // Name first: it promotes a label-only folder (creating the
-                // first-class row) and reconciles members. Capture the resolved
-                // id so the icon write below targets that row — passing the
-                // stale render-time `null` would make the config write try to
-                // create the project a second time and 409 on the duplicate.
-                let targetId = projectId;
-                if (nameChanged) {
-                  targetId = await renameProject.mutateAsync({
-                    id: projectId,
-                    oldName: projectName,
-                    newName,
-                  });
-                }
-                if (iconChanged) {
-                  const next = { ...(iconConfig ?? {}) };
-                  if (pendingIcon === null) delete next.icon;
-                  else next.icon = pendingIcon;
-                  await updateConfig.mutateAsync({
-                    id: targetId,
-                    name: nameChanged ? newName : projectName,
-                    config: next,
-                  });
-                }
-              } catch {
-                // Errors surface via the mutation state below. A rename that
-                // lands before a failed icon write is already persisted; only
-                // the icon needs retrying.
-                return;
+              const config = { ...(iconConfig ?? {}) };
+              if (pendingIcon === null) delete config.icon;
+              else if (pendingIcon !== undefined) config.icon = pendingIcon;
+              if (nameChanged) {
+                renameProject.mutate({
+                  id: projectId,
+                  oldName: projectName,
+                  newName,
+                  ...(iconChanged ? { config } : {}),
+                });
+              } else if (iconChanged) {
+                updateConfig.mutate({ id: projectId, name: projectName, config, fields: ["icon"] });
               }
               setRenameOpen(false);
               setMenuOpen(false);
@@ -6127,24 +6138,13 @@ function useProjectFolderMenu(
                 changing the icon is unavailable until this loads.
               </p>
             )}
-            {(renameProject.isError || updateConfig.isError) && (
-              <p className="text-ui text-destructive" role="alert">
-                {((renameProject.error ?? updateConfig.error) as Error).message}
-              </p>
-            )}
             <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setRenameOpen(false)}
-                disabled={renameProject.isPending || updateConfig.isPending}
-              >
+              <Button type="button" variant="ghost" onClick={() => setRenameOpen(false)}>
                 Cancel
               </Button>
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                loading={renameProject.isPending || updateConfig.isPending}
                 disabled={renameValue.trim() === ""}
                 componentId="sidebar.project.rename"
               >
@@ -6186,28 +6186,16 @@ function useProjectFolderMenu(
             </p>
           )}
           <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleteProject.isPending}
-            >
+            <Button type="button" variant="ghost" onClick={() => setDeleteOpen(false)}>
               Cancel
             </Button>
             <Button
               type="button"
               variant="destructive"
-              loading={deleteProject.isPending}
               onClick={() => {
-                deleteProject.mutate(
-                  { id: projectId, name: projectName },
-                  {
-                    onSuccess: () => {
-                      setDeleteOpen(false);
-                      setMenuOpen(false);
-                    },
-                  },
-                );
+                deleteProject.mutate({ id: projectId, name: projectName });
+                setDeleteOpen(false);
+                setMenuOpen(false);
               }}
             >
               Delete project
@@ -6473,15 +6461,9 @@ function BulkActionBar({
   function handleMoveToProject(project: string) {
     const ids = ownedSelected.map((c) => c.id);
     if (ids.length === 0) return;
-    bulkMove.mutate(
-      { ids, project },
-      {
-        onSuccess: () => {
-          if (project) onProjectAssigned?.(project);
-          onExit();
-        },
-      },
-    );
+    bulkMove.mutate({ ids, project });
+    if (project) onProjectAssigned?.(project);
+    onExit();
   }
 
   // Read state is per-viewer (not ownership-gated, matching the row menu),
@@ -6743,7 +6725,7 @@ function BulkActionBar({
           </div>
         </div>
 
-        {(bulkArchive.isError || bulkDelete.isError || bulkMove.isError) && (
+        {(bulkArchive.isError || bulkDelete.isError) && (
           <p className="text-sm text-destructive" role="alert">
             Some actions failed. Retry or dismiss.
           </p>

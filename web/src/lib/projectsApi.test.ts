@@ -44,6 +44,66 @@ describe("listProjects", () => {
 });
 
 describe("createProject", () => {
+  it("shares an in-flight creation with dependent filing and releases it after failure", async () => {
+    let reject!: (error: Error) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((_resolve, fail) => {
+        reject = fail;
+      }),
+    );
+    const first = createProject("Pending", { icon: "🔥" });
+    const dependent = createProject("Pending");
+    expect(dependent).toBe(first);
+    const settled = Promise.allSettled([first, dependent]);
+    reject(new Error("offline"));
+    expect((await settled).map((item) => item.status)).toEqual(["rejected", "rejected"]);
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "real", name: "Pending" }));
+    expect(await createProject("Pending")).toMatchObject({ id: "real" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([undefined, { icon: "📁" }])(
+    "rejects conflicting config instead of silently sharing %j",
+    async (config) => {
+      let finish!: (response: Response) => void;
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const first = createProject("Pending", config);
+      await expect(createProject("Pending", { icon: "🔥" })).rejects.toThrow("different settings");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      finish(mockResponse({ id: "real", name: "Pending", config }));
+      expect(await first).toMatchObject({ id: "real", config });
+    },
+  );
+
+  it.each([
+    [
+      { host_id: "host", agent_id: "agent" },
+      { agent_id: "agent", host_id: "host" },
+    ],
+    [undefined, {}],
+    [{}, undefined],
+    [{ icon: "🔥" }, { icon: undefined }],
+  ])(
+    "shares compatible configs regardless of key order: %j / %j",
+    async (firstConfig, nextConfig) => {
+      let finish!: (response: Response) => void;
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const first = createProject("Pending", firstConfig);
+      expect(createProject("Pending", nextConfig)).toBe(first);
+      finish(mockResponse({ id: "real", name: "Pending", config: firstConfig }));
+      await first;
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
+
   it("POSTs the name and returns the project", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ id: "p_1", name: "New" }));
     const result = await createProject("New");

@@ -178,11 +178,17 @@ export function ProjectSettingsDialog({
     }
   };
 
+  const seeded = useRef(false);
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      seeded.current = false;
+      return;
+    }
+    if (seeded.current || isLoading) return;
     // Don't seed a blank draft from a failed load — Save is blocked anyway, and
     // clobbering the fields would risk sending `{}` if the guard ever regressed.
     if (loadFailed) return;
+    seeded.current = true;
     const c: ProjectConfig = stored ?? {};
     setHostId(c.host_id ?? NONE);
     setWorkspace(c.workspace ?? "");
@@ -191,13 +197,13 @@ export function ProjectSettingsDialog({
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
     setWorkspaceOpen(false);
-  }, [open, stored, loadFailed]);
+  }, [open, stored, loadFailed, isLoading]);
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
-    if (loadFailed) return;
+    if (loadFailed || isLoading || updateConfig.isPending) return;
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
@@ -233,10 +239,13 @@ export function ProjectSettingsDialog({
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
 
-    updateConfig.mutate(
-      { id: projectId, name: projectName, config },
-      { onSuccess: () => onOpenChange(false) },
-    );
+    updateConfig.mutate({
+      id: projectId,
+      name: projectName,
+      config,
+      fields: ["host_id", "workspace", "agent_id", "use_worktree", "base_branch", "model"],
+    });
+    onOpenChange(false);
   };
 
   // Offer only online hosts (an offline host can only fail on create), plus the
@@ -554,19 +563,9 @@ export function ProjectSettingsDialog({
               disabled so your existing defaults aren't overwritten.
             </p>
           )}
-          {updateConfig.isError && (
-            <p className="text-destructive text-ui" role="alert">
-              {(updateConfig.error as Error).message}
-            </p>
-          )}
 
           <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={updateConfig.isPending}
-            >
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button

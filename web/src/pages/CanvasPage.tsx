@@ -411,6 +411,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
 
   const selectCanvas = useCallback(
     (canvasId: string) => {
+      pendingProjectNameRef.current = null;
       if (activeCanvasRef.current === canvasId) return;
       trackClick("canvas.tab");
       userSelectedCanvasRef.current = true;
@@ -428,6 +429,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
     if (value === previousCanvasParam.current) return;
     previousCanvasParam.current = value;
     const canvasId = value ?? MAIN_CANVAS_ID;
+    pendingProjectNameRef.current = null;
     if (canvasId === activeCanvasRef.current) return;
     prepareCanvasViewport(canvasId);
     activeCanvasRef.current = canvasId;
@@ -442,6 +444,13 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
       if (!available.has(canvasId)) viewportsRef.current.delete(canvasId);
     }
     if (available.has(activeCanvas)) return;
+    const promoted = projects.find((project) => `name:${project.name}` === activeCanvas);
+    if (promoted?.id) {
+      activeCanvasRef.current = promoted.id;
+      setActiveCanvas(promoted.id);
+      writeCanvasParam(promoted.id);
+      return;
+    }
     activeCanvasRef.current = MAIN_CANVAS_ID;
     setActiveCanvas(MAIN_CANVAS_ID);
     writeCanvasParam(MAIN_CANVAS_ID);
@@ -621,13 +630,22 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
               >
                 <ProjectRowIcon icon={project.icon} />
                 <span className="truncate">{project.name}</span>
+                {project.pending && (
+                  <span role="status" className="text-xs text-muted-foreground">
+                    {project.pending}…
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
         <NewProjectButton
           onCreated={(name) => {
-            pendingProjectNameRef.current = name;
+            if (!projects.some((project) => project.name === name))
+              pendingProjectNameRef.current = name;
+          }}
+          onCreateFailed={(name) => {
+            if (pendingProjectNameRef.current === name) pendingProjectNameRef.current = null;
           }}
         />
       </nav>

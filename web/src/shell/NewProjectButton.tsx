@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from "react";
+import { type CSSProperties, useRef, useState } from "react";
 import { PlusIcon, SmilePlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,30 +18,32 @@ import { cn } from "@/lib/utils";
 /**
  * "New project" control in the Projects group header. Opens a dialog that
  * creates an EMPTY first-class project (`POST /v1/projects`) — the capability
- * the legacy label model can't express. On success the new folder is expanded
- * (via `onCreated`) so the user can immediately file sessions into it.
+ * the legacy label model can't express. On submission the pending folder is expanded
+ * (via `onCreated`) so progress is visible outside the dismissed dialog.
  */
-export function NewProjectButton({ onCreated }: { onCreated: (name: string) => void }) {
+export function NewProjectButton({
+  onCreated,
+  onCreateFailed,
+}: {
+  onCreated: (name: string) => void;
+  onCreateFailed?: (name: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const createProject = useCreateProject();
+  const submitted = useRef(false);
 
   const submit = () => {
     const trimmed = name.trim();
-    if (trimmed === "") return;
-    createProject.mutate(
-      { name: trimmed, icon },
-      {
-        onSuccess: (project) => {
-          setOpen(false);
-          setName("");
-          setIcon(undefined);
-          onCreated(project.name);
-        },
-      },
-    );
+    if (trimmed === "" || submitted.current) return;
+    submitted.current = true;
+    createProject.mutate({ name: trimmed, icon }, { onError: () => onCreateFailed?.(trimmed) });
+    setOpen(false);
+    setName("");
+    setIcon(undefined);
+    onCreated(trimmed);
   };
 
   return (
@@ -57,6 +59,8 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             className="text-muted-foreground"
             onClick={(e) => {
               e.stopPropagation();
+              submitted.current = false;
+              createProject.reset();
               setName("");
               setIcon(undefined);
               setOpen(true);
@@ -156,24 +160,13 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
               }}
             />
           </div>
-          {createProject.isError && (
-            <p className="text-ui text-destructive" role="alert">
-              {(createProject.error as Error).message}
-            </p>
-          )}
           <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setOpen(false)}
-              disabled={createProject.isPending}
-            >
+            <Button type="button" variant="ghost" onClick={() => setOpen(false)}>
               Cancel
             </Button>
             <Button
               type="button"
               data-testid="new-project-confirm"
-              loading={createProject.isPending}
               disabled={name.trim() === ""}
               onClick={submit}
             >

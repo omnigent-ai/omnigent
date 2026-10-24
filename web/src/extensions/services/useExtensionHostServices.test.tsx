@@ -16,9 +16,13 @@ const { navigate, identityRef, serverRef, authenticatedFetchMock } = vi.hoisted(
 vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: authenticatedFetchMock,
+  getCurrentUserId: () => identityRef.current,
   resolveIdentity: async () => identityRef.current,
 }));
-vi.mock("@/lib/host", () => ({ getOmnigentServerIdentity: () => serverRef.current }));
+vi.mock("@/lib/host", () => ({
+  getOmnigentServerIdentity: () => serverRef.current,
+  getOmnigentHostGeneration: () => 0,
+}));
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "dark" }) }));
 
 import { useExtensionHostServices } from "./useExtensionHostServices";
