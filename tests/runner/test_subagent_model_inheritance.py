@@ -584,3 +584,58 @@ async def test_binding_lets_foreign_multi_model_child_inherit(
         },
     )
     assert bodies[0]["model_override"] == "databricks-claude-opus-5"
+
+
+@pytest.mark.asyncio
+async def test_antigravity_native_child_of_claude_parent_skips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude parent's selection is not inherited by an agy child: agy accepts
+    Claude ids, so only the different-vendor rule leaves the child on agy's default."""
+    _stub_worker_launchable(monkeypatch)
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("antigravity-native"),
+        conv_id="conv_parent_agy_foreign",
+        parent_snapshot={
+            "id": "conv_parent_agy_foreign",
+            "agent_id": "ag_parent",
+            "harness": "claude-native",
+            "model_override": "claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("parent_harness", "child_harness"),
+    [
+        pytest.param("antigravity", "antigravity-native", id="sdk-parent-native-child"),
+        pytest.param("antigravity-native", "antigravity", id="native-parent-sdk-child"),
+    ],
+)
+async def test_antigravity_sdk_and_native_do_not_inherit_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_harness: str,
+    child_harness: str,
+) -> None:
+    """The SDK and native antigravity harnesses are foreign to each other for
+    inheritance: a Gemini id selected on one (API-key catalog vs signed-in agy
+    account) is not carried onto the other, which stays on its own default."""
+    _stub_worker_launchable(monkeypatch)
+    conv_id = f"conv_parent_agy_split_{child_harness}"
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker(child_harness),
+        conv_id=conv_id,
+        parent_snapshot={
+            "id": conv_id,
+            "agent_id": "ag_parent",
+            "harness": parent_harness,
+            "model_override": "gemini-2.5-pro",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
