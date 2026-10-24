@@ -9,6 +9,7 @@ import pytest
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
     detect_sign_in_prompt,
+    launcher_failure_evidence,
     launcher_password_prompt,
     sanitize_diagnostic_text,
     sign_in_next_step,
@@ -405,3 +406,95 @@ def test_launcher_password_prompt_reads_only_the_last_line(
 ) -> None:
     """Only a password prompt the launcher is still waiting on counts."""
     assert launcher_password_prompt(screen) is expected
+
+
+_LAUNCHER_FAILURE_PANEL = (
+    "╭──────── Error ────────╮\n│ Claude Code exited with code 1 │\n╰──────────────────────╯"
+)
+
+
+@pytest.mark.parametrize(
+    ("preamble", "kind"),
+    [
+        (
+            "Error: Invalid MCP configuration:\n"
+            "MCP config file not found: /private/synthetic-config.json",
+            "missing_mcp_configuration",
+        ),
+        (
+            "ERROR model services (network error: [SSL: CERTIFICATE_VERIFY_FAILED])",
+            "tls_verification_failed",
+        ),
+        (
+            "ERROR ug requires Claude Code 2.1.290 or newer. Your current version is 2.1.185.",
+            "agent_update_required",
+        ),
+        (
+            "ERROR Claude Code managed settings changed while ucode was preparing the update.",
+            "managed_settings_changed",
+        ),
+        ("A private startup failure with token=synthetic-private-value", "unclassified"),
+    ],
+)
+@pytest.mark.parametrize("footer", ["", "\nPane is dead (status 0, synthetic timestamp)"])
+def test_launcher_failure_evidence_exports_only_bounded_fields(
+    preamble: str, kind: str, footer: str
+) -> None:
+    assert launcher_failure_evidence(f"{preamble}\n{_LAUNCHER_FAILURE_PANEL}{footer}") == {
+        "launcher_failure_kind": kind,
+        "launcher_reported_exit_status": "1",
+        "launcher_exit_evidence_source": "terminal_final_error_panel",
+    }
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        None,
+        "",
+        "Command exit 1 failed",
+        "Claude Code exited with code 1",
+        _LAUNCHER_FAILURE_PANEL + "\nWelcome to Claude Code",
+        "│ " + _LAUNCHER_FAILURE_PANEL.replace("\n", "\n│ "),
+        "```\n" + _LAUNCHER_FAILURE_PANEL + "\n```",
+        _LAUNCHER_FAILURE_PANEL.replace("code 1", "code 0"),
+        _LAUNCHER_FAILURE_PANEL.replace("code 1", "code 256"),
+        _LAUNCHER_FAILURE_PANEL.replace("code 1", "code -1"),
+        "Goodbye!\nPane is dead (status 0, synthetic timestamp)",
+    ],
+)
+def test_launcher_failure_evidence_ignores_other_terminal_output(screen: str | None) -> None:
+    assert launcher_failure_evidence(screen) == {}
+
+
+def test_launcher_failure_evidence_does_not_infer_an_exit_code_from_an_exception() -> None:
+    screen = (
+        "╭──────── Error ────────╮\n"
+        "│ An error occurred while running Claude Code: │\n"
+        "│ private launcher exception detail │\n"
+        "╰──────────────────────╯"
+    )
+    assert launcher_failure_evidence(screen) == {
+        "launcher_failure_kind": "launcher_exception",
+        "launcher_exit_evidence_source": "terminal_final_error_panel",
+    }
+
+
+def test_launcher_failure_evidence_bounds_the_classification_window() -> None:
+    screen = (
+        "Error: Invalid MCP configuration:\nMCP config file not found: private.json\n"
+        + "x" * 8192
+        + "\n"
+        + _LAUNCHER_FAILURE_PANEL
+    )
+    assert launcher_failure_evidence(screen)["launcher_failure_kind"] == "unclassified"
+
+
+def test_launcher_failure_evidence_does_not_reuse_an_earlier_error_panel() -> None:
+    screen = (
+        "Invalid MCP configuration:\nMCP config file not found: private.json\n"
+        + _LAUNCHER_FAILURE_PANEL
+        + "\nA later startup failed for an unknown reason\n"
+        + _LAUNCHER_FAILURE_PANEL
+    )
+    assert launcher_failure_evidence(screen)["launcher_failure_kind"] == "unclassified"

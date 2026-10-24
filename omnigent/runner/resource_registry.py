@@ -203,7 +203,10 @@ class TerminalExitEvent:
 
 
 def _terminal_lifecycle_context(
-    instance: TerminalInstance | None, resource_role: str | None
+    instance: TerminalInstance | None,
+    resource_role: str | None,
+    *,
+    last_output: str | None = None,
 ) -> dict[str, str]:
     """Freeze launch evidence before cleanup without changing exit handling.
 
@@ -238,6 +241,15 @@ def _terminal_lifecycle_context(
                 claude_session_end_identity=evidence.get("session_end_identity"),
                 claude_hook_turn_in_progress=evidence.get("hook_turn_in_progress"),
             )
+            if (
+                last_output is not None
+                and evidence.get("read_status") in {"not_found", "ok"}
+                and evidence.get("session_start") is None
+                and not evidence.get("recent_hooks")
+            ):
+                from omnigent.harnesses.diagnostics import launcher_failure_evidence
+
+                context.update(launcher_failure_evidence(last_output))
             session_end = evidence.get("session_end")
             if isinstance(session_end, dict):
                 context.update(
@@ -1783,7 +1795,10 @@ class SessionResourceRegistry:
         if instance is not None:
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_exit()
-        lifecycle_context = _terminal_lifecycle_context(instance, resource_role)
+        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        lifecycle_context = _terminal_lifecycle_context(
+            instance, resource_role, last_output=last_output
+        )
         lifecycle_context.update(
             terminal_exit_status_source="tmux_pane_dead_status",
             terminal_exit_status_process="launched_command",
@@ -1792,7 +1807,6 @@ class SessionResourceRegistry:
             self.session_turn_is_active(session_id)
         ).lower()
         lifecycle_context["session_activity_epoch"] = str(self.session_activity_epoch(session_id))
-        command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:

@@ -250,3 +250,73 @@ def sign_in_next_step(agent: str) -> str:
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
         "sign-in completes; then send your message again."
     )
+
+
+_LAUNCHER_ERROR_PANEL_START = re.compile(r"╭─+ Error ─+╮")
+_LAUNCHER_ERROR_PANEL_END = re.compile(r"╰─+╯")
+_LAUNCHER_AGENT_EXIT = re.compile(r"Claude Code exited with code ([1-9][0-9]{0,2})")
+_DEAD_PANE_FOOTER = re.compile(r"Pane is dead(?: \(status [0-9]+, [^\n]+\))?")
+_LAUNCHER_FAILURE_MARKERS = (
+    ("missing_mcp_configuration", ("invalid mcp configuration:", "mcp config file not found:")),
+    ("tls_verification_failed", ("certificate_verify_failed",)),
+    ("agent_update_required", ("ug requires claude code", "your current version is")),
+    (
+        "managed_settings_changed",
+        ("managed settings changed while ucode was preparing the update",),
+    ),
+)
+
+
+def launcher_failure_evidence(screen: str | None) -> dict[str, str]:
+    """Summarize a final launcher error panel without exporting its text.
+
+    Call only before any hook for this launch proves the agent started. This
+    is reported terminal evidence; the process exit code remains authoritative.
+    """
+    if not screen:
+        return {}
+    lines = [line.strip() for line in screen[-8192:].splitlines() if line.strip()]
+    if lines and _DEAD_PANE_FOOTER.fullmatch(lines[-1]):
+        lines.pop()
+    if not lines or not _LAUNCHER_ERROR_PANEL_END.fullmatch(lines[-1]):
+        return {}
+    start = next(
+        (
+            index
+            for index in range(len(lines) - 2, -1, -1)
+            if _LAUNCHER_ERROR_PANEL_START.fullmatch(lines[index])
+        ),
+        None,
+    )
+    if start is None:
+        return {}
+    panel = lines[start + 1 : -1]
+    if not panel or any(not (line.startswith("│") and line.endswith("│")) for line in panel):
+        return {}
+    message = " ".join(line[1:-1].strip() for line in panel)
+    match = _LAUNCHER_AGENT_EXIT.fullmatch(message)
+    attributes = {"launcher_exit_evidence_source": "terminal_final_error_panel"}
+    if match is not None and int(match.group(1)) <= 255:
+        attributes["launcher_reported_exit_status"] = match.group(1)
+        previous_end = next(
+            (
+                index
+                for index in range(start - 1, -1, -1)
+                if _LAUNCHER_ERROR_PANEL_END.fullmatch(lines[index])
+            ),
+            -1,
+        )
+        preceding = "\n".join(lines[previous_end + 1 : start]).lower()
+        attributes["launcher_failure_kind"] = next(
+            (
+                kind
+                for kind, markers in _LAUNCHER_FAILURE_MARKERS
+                if all(marker in preceding for marker in markers)
+            ),
+            "unclassified",
+        )
+    elif message.startswith("An error occurred while running Claude Code:"):
+        attributes["launcher_failure_kind"] = "launcher_exception"
+    else:
+        return {}
+    return attributes
