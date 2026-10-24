@@ -159,6 +159,80 @@ def test_reset_button_has_rendered_top_margin(page: Page, appearance_url: str) -
     assert gap >= 24, f"Reset button margin is only {gap:.0f}px; expected at least 24px"
 
 
+_FONT_FAMILY_ROW_GEOMETRY = """group => {
+    const labelColumn = group.parentElement.firstElementChild;
+    const label = labelColumn.querySelector('span');
+    const help = labelColumn.querySelector('button[aria-label^="About "]');
+    const labelBox = label.getBoundingClientRect();
+    const groupBox = group.getBoundingClientRect();
+    const helpBox = help.getBoundingClientRect();
+    return {
+        labelLines: Math.round(labelBox.height / parseFloat(getComputedStyle(label).lineHeight)),
+        labelOverflow: labelBox.right - labelColumn.getBoundingClientRect().right,
+        helpOverlapsControls: helpBox.right > groupBox.left && helpBox.left < groupBox.right
+            && helpBox.bottom > groupBox.top && helpBox.top < groupBox.bottom,
+    };
+}"""
+
+
+@pytest.mark.parametrize(
+    "width",
+    [
+        pytest.param(
+            width,
+            marks=pytest.mark.browser_context_args(
+                viewport={"width": width, "height": 844}, is_mobile=True, has_touch=True
+            ),
+        )
+        for width in (390, 430)
+    ],
+)
+@pytest.mark.parametrize("group_name", ["Font family", "Code font family"])
+def test_font_family_row_keeps_label_readable_on_phone(
+    page: Page, appearance_url: str, width: int, group_name: str
+) -> None:
+    assert page.viewport_size == {"width": width, "height": 844}
+    _open_appearance(page, appearance_url)
+    group = page.get_by_role("group", name=group_name, exact=True)
+    group.scroll_into_view_if_needed()
+    page.evaluate("() => document.fonts.ready.then(() => true)")
+
+    geometry = group.evaluate(_FONT_FAMILY_ROW_GEOMETRY)
+
+    assert geometry["labelLines"] == 1, f"{group_name!r} label wraps: {geometry}"
+    assert geometry["labelOverflow"] <= 0.5, f"{group_name!r} label overflows: {geometry}"
+    assert not geometry["helpOverlapsControls"], f"{group_name!r} help overlaps: {geometry}"
+
+
+@pytest.mark.browser_context_args(viewport={"width": 1280, "height": 800})
+@pytest.mark.parametrize(
+    ("group_name", "stepper_name"),
+    [("Font family", "Interface font size"), ("Code font family", "Code font size")],
+)
+def test_font_family_input_stays_inline_on_desktop(
+    page: Page, appearance_url: str, group_name: str, stepper_name: str
+) -> None:
+    assert page.viewport_size == {"width": 1280, "height": 800}
+    _open_appearance(page, appearance_url)
+    group = page.get_by_role("group", name=group_name, exact=True)
+    group.scroll_into_view_if_needed()
+    label_box = group.evaluate(
+        "group => group.parentElement.firstElementChild.getBoundingClientRect().toJSON()"
+    )
+    group_box = group.bounding_box()
+    stepper_box = page.get_by_role("group", name=stepper_name, exact=True).bounding_box()
+    assert group_box is not None and stepper_box is not None
+
+    group_bottom = group_box["y"] + group_box["height"]
+    assert group_box["y"] < label_box["bottom"] and group_bottom > label_box["top"], (
+        f"{group_name!r} controls wrapped below the label: {group_box} vs {label_box}"
+    )
+    right_edge_offset = (group_box["x"] + group_box["width"]) - (
+        stepper_box["x"] + stepper_box["width"]
+    )
+    assert abs(right_edge_offset) <= 1, f"{group_name!r} is {right_edge_offset:.1f}px off"
+
+
 def _wait_session_ready(page: Page) -> None:
     """Wait until the session chrome has settled enough to assert rail state.
 

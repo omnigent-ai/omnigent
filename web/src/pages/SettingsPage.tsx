@@ -2022,12 +2022,11 @@ function UiFontFamilyControl() {
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      {/* Take the remaining width (and let the longer description wrap within
-          this column) so the input stays inline instead of dropping to its own
-          row — matches the font-size row's alignment. */}
+      {/* A real basis keeps the input inline on wide screens and wraps it
+          below the label on phones instead of squeezing the label column. */}
       <SettingsLabel
         label="Font family"
-        className="flex-1"
+        className="grow basis-48"
         description="Use any font installed on this device. Leave blank for the system default."
       />
       {/* Reset sits left of the input so the input is the rightmost element and
@@ -2185,7 +2184,7 @@ function UiCodeFontFamilyControl() {
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <SettingsLabel
         label="Code font family"
-        className="flex-1"
+        className="grow basis-48"
         description="Font for the code editor and terminal. Leave blank for the default."
       />
       {/* Reset sits left of the input so the input's right edge lines up flush
