@@ -185,6 +185,37 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+    # The gateway launcher checks the installed Claude Code before it starts it.
+    _TerminalMatcher(
+        "gateway_claude_too_old",
+        lambda s: s.output_contains_any(("ug requires claude code",)),
+        FailureDiagnosis(
+            title="Claude Code is too old for the Databricks gateway",
+            cause=(
+                "The gateway launcher needs a newer Claude Code than the one installed, "
+                "and it does not update a copy that a package manager manages."
+            ),
+            remediation=(
+                "Update Claude Code on the host (for Homebrew: `brew upgrade claude-code`), "
+                "then send your message again."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
+        "certificate_expired",
+        lambda s: s.output_contains_any(("certificate_expire", "certificate has expired")),
+        FailureDiagnosis(
+            title="Databricks certificate expired",
+            cause=(
+                "The certificate this machine uses to reach Databricks has expired, "
+                "so the agent could not reach its gateway to start."
+            ),
+            remediation=(
+                "Renew the certificate on a Databricks laptop (run `dbcert`), then "
+                "send your message again."
+            ),
+        ),
+    ),
 )
 
 
