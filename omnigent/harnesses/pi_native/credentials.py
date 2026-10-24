@@ -59,6 +59,7 @@ from omnigent.models.pi_model_compatibility import (
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_json_entry,
+    pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import (
@@ -162,9 +163,6 @@ class _PiProviderCompat(TypedDict, total=False):
     supportsStrictMode: bool
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
-    # Pi 0.84.2+: send thinking.type.adaptive + output_config.effort instead
-    # of thinking.type.enabled + budget_tokens. Required for claude-4+ / claude-5
-    # models which no longer accept thinking.type.enabled.
     forceAdaptiveThinking: bool
 
 
@@ -386,12 +384,10 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
-        # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
-        # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
-        # is set in the compat block; reasoning:true on the model entry enables Pi's
-        # thinking level controls.
         if self.api == "anthropic-messages":
+            # Preserve the native default for unlisted models; model-level flags win.
             provider["compat"] = {"forceAdaptiveThinking": True}
+            provider["models"] = [pi_model_with_thinking_defaults(entry) for entry in models]
         providers = {self.provider_id: provider}
         providers.update(additional)
         for provider_id, payload in providers.items():

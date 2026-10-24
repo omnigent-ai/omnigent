@@ -5104,14 +5104,15 @@ async def test_create_session_codex_envelope_avoids_reads_and_overlaps_recovery(
         recovery_wait = asyncio.create_task(server_client.recovery_started.wait())
         done, _ = await asyncio.wait(
             {request_task, recovery_wait},
-            timeout=1.0,
+            timeout=budget(1.0),
             return_when=asyncio.FIRST_COMPLETED,
         )
+        assert done, "session init did not start recovery within the test budget"
         assert recovery_wait in done, (
             f"session init finished before recovery started: "
             f"{request_task.result().status_code} {request_task.result().text}"
         )
-        await asyncio.wait_for(terminal_started.wait(), timeout=1.0)
+        await asyncio.wait_for(terminal_started.wait(), timeout=budget(1.0))
         assert not request_task.done()
         server_client.release_recovery.set()
         resp = await request_task
