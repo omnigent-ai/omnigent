@@ -14845,6 +14845,75 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   });
 
   it.each([
+    { path: "ordinary backfill", gapLength: 5 },
+    { path: "the fresh-window fallback", gapLength: 100 },
+  ])(
+    "settles a queued !cmd bubble whose shell input the reconnect recovers through $path",
+    async ({ gapLength }) => {
+      const id = `conv_shell_gap_${gapLength}`;
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      const queued = (tempId: string, text: string) => ({
+        tempId,
+        content: [{ type: "input_text" as const, text }],
+        posted: true,
+      });
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        blocks: itemsToBlocks(windowItems),
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+        pendingUserMessages: [
+          queued("pend_push", "!git push"),
+          queued("pend_push_again", "!git push"),
+          queued("pend_text", "still waiting"),
+        ],
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+
+      // The shell input commits while the socket is dead, so its live item
+      // event, the only acknowledgement a `!cmd` gets, is never delivered.
+      const shellInput: ConversationItem = {
+        id: "term_gap_input",
+        response_id: "resp_gap_shell",
+        type: "terminal_command",
+        status: "completed",
+        kind: "input",
+        input: "git push",
+      };
+      const filler = Array.from({ length: gapLength - 1 }, (_, i) =>
+        assistantMessage(`gap_${i.toString().padStart(4, "0")}`, `gap ${i}`),
+      );
+      seedSessionItems(id, [...preGap, ...filler, shellInput]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+
+      const pendingIds = () => useChatStore.getState().pendingUserMessages.map((p) => p.tempId);
+      expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(shellInput.id);
+      expect(pendingIds()).toEqual(["pend_push_again", "pend_text"]);
+
+      // A replay of the same item on the new stream must not settle the
+      // identical second command too.
+      sinks[1]!.push(sse("response.output_item.done", { item: shellInput }));
+      await drainAsync();
+      expect(pendingIds()).toEqual(["pend_push_again", "pend_text"]);
+
+      const last = sinks[1]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
+
+  it.each([
     { path: "ordinary backfill", gapLength: 5, refreshesWindow: false },
     { path: "the fresh-window fallback", gapLength: 100, refreshesWindow: true },
   ])(

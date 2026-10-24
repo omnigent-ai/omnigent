@@ -54,7 +54,12 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
-import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import {
+  isTerminalCommandInput,
+  LIVE_ITEM_PREFIX,
+  PENDING_FILE_PREFIX,
+  structuredErrorFields,
+} from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
@@ -5550,6 +5555,10 @@ async function rehydrateWindowOnReconnect(
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
     const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const shellSettled = settleRecoveredShellInputs(
+      s,
+      freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
+    );
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -5563,6 +5572,7 @@ async function rehydrateWindowOnReconnect(
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+      ...(shellSettled === s ? {} : shellSettled),
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
@@ -5709,12 +5719,15 @@ async function reconcileOnReconnect(
       ...reconcileSendDraftWithSnapshot(s, snapshotItemIds, session),
     };
     // `session.input.consumed` is not replayed, so recovered user blocks are
-    // the durable equivalent of its FIFO acknowledgement.
+    // the durable equivalent of its FIFO acknowledgement. Shell inputs never
+    // get one: settle their `!cmd` bubbles by command first.
+    const shellSettled = settleRecoveredShellInputs(s, unseen);
+    if (shellSettled !== s) patch.settledShellInputs = shellSettled.settledShellInputs;
     const recoveredUserInputs = unseen.filter(
       (b) => b.type === "user_message" && !isSystemUserContent(b.content),
     ).length;
-    if (recoveredUserInputs > 0) {
-      patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
+    if (recoveredUserInputs > 0 || shellSettled.pendingUserMessages !== s.pendingUserMessages) {
+      patch.pendingUserMessages = shellSettled.pendingUserMessages.slice(recoveredUserInputs);
     }
     let nextBlocks = reconciledBlocks;
     if (unseen.length > 0) {
@@ -7523,6 +7536,58 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
 /** Bound replay protection to the server's maximum pending queue size. */
 const MAX_SETTLED_SHELL_INPUTS = 64;
 
+type ShellInputSettlement = Pick<ConversationState, "pendingUserMessages" | "settledShellInputs">;
+
+/**
+ * Settle the queued `!cmd` bubble a mirrored shell input acknowledges.
+ * Shell inputs get no consumed receipt, so each item id settles here once,
+ * whether it arrives live or in a reconnect backfill.
+ *
+ * @returns `state` itself when this item id was already settled.
+ */
+function settleShellInput(
+  state: ShellInputSettlement,
+  itemId: string,
+  command: string,
+): ShellInputSettlement {
+  if (state.settledShellInputs.some((entry) => entry.itemId === itemId)) return state;
+  const at = state.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+  const popped = state.pendingUserMessages[at];
+  return {
+    pendingUserMessages: popped
+      ? [...state.pendingUserMessages.slice(0, at), ...state.pendingUserMessages.slice(at + 1)]
+      : state.pendingUserMessages,
+    settledShellInputs: [
+      ...state.settledShellInputs,
+      {
+        itemId,
+        tempId: popped?.tempId,
+        pendingId: popped?.pendingId,
+        contentKey: popped ? contentKeyOf(popped.content) : undefined,
+      },
+    ].slice(-MAX_SETTLED_SHELL_INPUTS),
+  };
+}
+
+/**
+ * Settle the bubbles of shell inputs a reconnect recovered: their live item
+ * events fired into the dead socket.
+ *
+ * @returns `state` itself when `recovered` holds no shell input.
+ */
+function settleRecoveredShellInputs(
+  state: ShellInputSettlement,
+  recovered: AnyBlock[],
+): ShellInputSettlement {
+  return recovered.reduce(
+    (next, block) =>
+      isTerminalCommandInput(block) && block.ctx.itemId
+        ? settleShellInput(next, block.ctx.itemId, block.input)
+        : next,
+    state,
+  );
+}
+
 /**
  * Normalized texts of the committed user-message blocks in `blocks`,
  * dropping empties (image-only messages). The dedup baseline for the
@@ -8384,23 +8449,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       const command = event.kind === "input" ? event.input : null;
       if (command === null) return;
       applyToConversation((s) => {
-        if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
-        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
-        const popped = s.pendingUserMessages[at];
-        return {
-          pendingUserMessages: popped
-            ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
-            : s.pendingUserMessages,
-          settledShellInputs: [
-            ...s.settledShellInputs,
-            {
-              itemId: event.itemId,
-              tempId: popped?.tempId,
-              pendingId: popped?.pendingId,
-              contentKey: popped ? contentKeyOf(popped.content) : undefined,
-            },
-          ].slice(-MAX_SETTLED_SHELL_INPUTS),
-        };
+        const settled = settleShellInput(s, event.itemId, command);
+        return settled === s ? {} : settled;
       });
       return;
     }
