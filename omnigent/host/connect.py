@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -25,9 +26,9 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypedDict, TypeVar, cast
 
 import click
 import httpx
@@ -1128,6 +1129,48 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    launch_request_id: str | None = None
+    tracking_started_monotonic: float = field(default_factory=time.monotonic)
+
+
+class _RunnerExitAttributes(TypedDict):
+    runner_pid: int
+    runner_exit_code: int | None
+    runner_exit_signal_number: int | None
+    runner_exit_signal_name: str | None
+    runner_had_connected: bool | None
+    runner_connection_phase: str
+    runner_tracking_age_s: float
+    launch_request_id: str | None
+
+
+def _runner_exit_attributes(
+    handle: _RunnerHandle, *, had_connected: bool | None, exit_code: int | None
+) -> _RunnerExitAttributes:
+    """Describe observed process facts without inferring who terminated it."""
+    signal_number = -exit_code if IS_POSIX and exit_code is not None and exit_code < 0 else None
+    signal_name = None
+    if signal_number is not None:
+        with contextlib.suppress(ValueError):
+            signal_name = signal.Signals(signal_number).name
+    return {
+        "runner_pid": handle.proc.pid,
+        "runner_exit_code": exit_code,
+        "runner_exit_signal_number": signal_number,
+        "runner_exit_signal_name": signal_name,
+        "runner_had_connected": had_connected,
+        "runner_connection_phase": (
+            "post_connect"
+            if had_connected is True
+            else "pre_connect"
+            if had_connected is False
+            else "unknown"
+        ),
+        "runner_tracking_age_s": round(
+            max(0.0, time.monotonic() - handle.tracking_started_monotonic), 3
+        ),
+        "launch_request_id": handle.launch_request_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -2096,6 +2139,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            launch_request_id=frame.request_id,
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
@@ -2521,6 +2565,12 @@ class HostProcess:
             _logger.info(
                 "Runner %s exited cleanly (code 0) before connecting; reporting exit",
                 runner_id,
+                extra=debug_event(
+                    "runner_exit_before_connect",
+                    session_id=handle.session_id,
+                    runner_id=runner_id,
+                    **_runner_exit_attributes(handle, had_connected=had_connected, exit_code=0),
+                ),
             )
             await self._report_runner_exit(runner_id, error, had_connected=had_connected)
             return
@@ -2552,6 +2602,9 @@ class HostProcess:
                 error_phase=(
                     ErrorPhase.RUNNER_LAUNCH if auth_rejected else ErrorPhase.UNKNOWN
                 ).value,
+                **_runner_exit_attributes(
+                    handle, had_connected=had_connected, exit_code=handle.proc.returncode
+                ),
             ),
         )
         await self._report_runner_exit(runner_id, error, had_connected=had_connected)
@@ -2591,6 +2644,9 @@ class HostProcess:
                 error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
                 error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                **_runner_exit_attributes(
+                    handle, had_connected=False, exit_code=handle.proc.returncode
+                ),
             ),
         )
 

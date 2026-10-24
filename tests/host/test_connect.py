@@ -1749,6 +1749,7 @@ async def test_watch_runner_reports_unexpected_exit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     marker_state: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A runner that dies after launch is reported via host.runner_exited.
 
@@ -1823,6 +1824,20 @@ async def test_watch_runner_reports_unexpected_exit(
     expected = {"connected": True, "not_connected": False}.get(marker_state)
     assert report.had_connected is expected
     assert maintenance_reasons == ["runner_exited"]
+
+    records = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_died"]
+    assert len(records) == 1
+    attrs = records[0].attributes
+    assert attrs["runner_exit_code"] == 3
+    assert attrs["runner_pid"] == handle.proc.pid
+    assert attrs["runner_had_connected"] is expected
+    assert attrs["launch_request_id"] == "req_watch"
+    assert attrs["runner_connection_phase"] == (
+        "post_connect" if expected is True else "pre_connect" if expected is False else "unknown"
+    )
+    assert isinstance(attrs["runner_tracking_age_s"], float)
+    assert 0 <= attrs["runner_tracking_age_s"] < 60
+    assert "tok_watch" not in str(attrs)
 
 
 @pytest.mark.parametrize("connected", [False, True])
