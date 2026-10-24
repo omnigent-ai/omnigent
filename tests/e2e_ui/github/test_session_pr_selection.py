@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui.conftest import stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO
 
 
@@ -141,6 +142,7 @@ def test_session_pr_selection_and_unlink(
                 route.fulfill(json=info(url))
 
     page.route(re.compile(r"/resources/github(?:/|\?|$)"), respond)
+    stub_session_pull_requests(page, lambda: info(None)["prs"], urls.remove)
     page.goto(f"{base_url}/c/{session_id}")
     indicator = page.get_by_test_id("composer-pr-link")
     expect(indicator).to_have_accessible_name("2 PRs", timeout=30_000)

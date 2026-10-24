@@ -4407,7 +4407,10 @@ function SessionTooltipDetail({
 }
 
 // GitHub's glyph and label for a PR state; gh reports a draft as OPEN + is_draft.
-function pullRequestStatus(pr: PullRequest): { icon: LucideIcon; label: string } {
+function pullRequestStatus(pr: Pick<PullRequest, "state" | "is_draft">): {
+  icon: LucideIcon;
+  label: string;
+} {
   const state = pr.state.toUpperCase();
   if (state === "MERGED") return { icon: GitMergeIcon, label: "Merged" };
   if (state === "CLOSED") return { icon: GitPullRequestClosedIcon, label: "Closed" };
@@ -4425,15 +4428,22 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   // `owner` is null when permissions are off; there's no creator to name then.
   const owner = conversation.owner ?? null;
   const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
-  const repo = github?.repo?.name_with_owner?.split("/").pop() ?? null;
+  // The server's stored first PR stands in while the host is offline.
+  const stored = conversation.pull_request ?? null;
+  const repo =
+    github?.repo?.name_with_owner?.split("/").pop() ?? stored?.repository.split("/").pop() ?? null;
   // Prefer the resolved PR (carries state); fall back to the tracked association
   // (number only) so the row still shows when gh can't resolve state — e.g. gh
   // isn't authenticated on the host.
   const pr = github?.pr ?? null;
   const association =
     github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
-  const prNumber = pr?.number ?? association?.number ?? null;
-  const prStatus = pr ? pullRequestStatus(pr) : null;
+  const prNumber = pr?.number ?? association?.number ?? stored?.number ?? null;
+  const prStatus = pr
+    ? pullRequestStatus(pr)
+    : !association && stored?.state
+      ? pullRequestStatus({ state: stored.state, is_draft: stored.is_draft === true })
+      : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
   if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
   return (

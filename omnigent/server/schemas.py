@@ -2912,6 +2912,35 @@ class ReadStatePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionPullRequestSummary(BaseModel):
+    """
+    The first pull request linked to a session, for list surfaces.
+
+    Stored on the server from what the session's host last reported, so it
+    is available while the host is offline.
+
+    :param url: The PR's URL.
+    :param provider: Git provider id, e.g. ``"github"``.
+    :param provider_display: The provider's labels (``display_name``,
+        ``request_name``, ``number_prefix``), or ``None`` for an unknown provider.
+    :param repository: Base repository, e.g. ``"owner/repo"``.
+    :param number: The PR number.
+    :param title: The last title the host looked up, or ``None``.
+    :param state: ``"OPEN"``, ``"MERGED"`` or ``"CLOSED"`` as last fetched, or
+        ``None`` before the host fetched the PR.
+    :param is_draft: Whether the PR was a draft when last fetched.
+    """
+
+    url: str
+    provider: str
+    provider_display: dict[str, str] | None = None
+    repository: str
+    number: int
+    title: str | None = None
+    state: str | None = None
+    is_draft: bool = False
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -3012,6 +3041,8 @@ class SessionListItem(BaseModel):
         matched in its body. Present whenever the query hit an item body
         (even if the title also matched); ``None`` on non-search reads and
         when only the title matched.
+    :param pull_request: The session's first linked pull request, or
+        ``None`` when it has none.
     """
 
     id: str
@@ -3044,6 +3075,7 @@ class SessionListItem(BaseModel):
     # unfiled. Lets the sidebar group sessions by project without a follow-up
     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
     project_id: str | None = None
+    pull_request: SessionPullRequestSummary | None = None
 
 
 class SessionList(BaseModel):

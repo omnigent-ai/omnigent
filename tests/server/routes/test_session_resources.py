@@ -507,8 +507,11 @@ def runner_globals_reset() -> Iterator[None]:
 @pytest.fixture
 def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
+    return _sessions_app(_ConversationStore())
+
+
+def _sessions_app(conversation_store: _ConversationStore) -> FastAPI:
     app = FastAPI()
-    conversation_store = _ConversationStore()
     host_registry = HostRegistry()
     app.state.test_conversation_store = conversation_store
     app.state.test_host_registry = host_registry
@@ -3252,6 +3255,97 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github",
     ) in fake_runner.calls
+
+
+@pytest.fixture
+async def pr_client(runner_globals_reset: None, db_uri: str) -> AsyncIterator[httpx.AsyncClient]:
+    """Client whose sessions keep their pull requests in a real SQLite store."""
+    del runner_globals_reset
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    transport = httpx.ASGITransport(app=_sessions_app(conversation_store))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+def _reported_pr(url: str, number: int, relationship: str) -> dict[str, object]:
+    return {
+        "url": url,
+        "provider": "github",
+        "host": "github.com",
+        "repository": url.removeprefix("https://github.com/").split("/pull/")[0],
+        "number": number,
+        "relationship": relationship,
+        "source": "native_hook",
+        "first_seen_at": 100.0,
+        "last_seen_at": 100.0,
+        "title": None,
+        "title_checked_at": 0,
+        "title_lookup_timed_out": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_pull_requests_stay_listed_and_unlinkable_offline(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    """The server keeps what the runner reports, so the tab still works while it sleeps."""
+    session = "79b22ebd2309e48fdeb450c65611d51b"
+    first = "https://github.com/example/one/pull/42"
+    second = "https://github.com/example/two/pull/7"
+    info = {
+        "object": "session.github.info",
+        "available": True,
+        "tracking_available": True,
+        "prs": [_reported_pr(first, 42, "created"), _reported_pr(second, 7, "inferred")],
+        "selected_pr_url": first,
+        "pr": {"number": 42, "title": "Ship it", "state": "OPEN", "url": first},
+    }
+    runner = _FakeRunnerClient(payload=info)
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    live = await pr_client.get(f"/v1/sessions/{session}/resources/github")
+    assert live.status_code == 200, live.text
+    assert [pr["url"] for pr in live.json()["prs"]] == [first, second]
+    assert live.json()["prs"][0]["state"] == "OPEN"
+
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+    offline = await pr_client.get(f"/v1/sessions/{session}/resources/github")
+    assert offline.status_code == 503
+    listed = await pr_client.get(f"/v1/sessions/{session}/pull-requests")
+    assert [pr["url"] for pr in listed.json()["data"]] == [first, second]
+    assert (listed.json()["data"][0]["title"], listed.json()["data"][0]["state"]) == (
+        "Ship it",
+        "OPEN",
+    )
+    unlinked = await pr_client.delete(
+        f"/v1/sessions/{session}/pull-requests", params={"url": first}
+    )
+    assert unlinked.status_code == 200, unlinked.text
+    assert [pr["url"] for pr in unlinked.json()["data"]] == [second]
+
+    # The runner learns of the unlink with its next request, and still listing
+    # the PR cannot bring it back.
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    refreshed = await pr_client.get(f"/v1/sessions/{session}/resources/github")
+    assert runner.get_params[-1] == {"removed_prs": json.dumps([first])}
+    assert [pr["url"] for pr in refreshed.json()["prs"]] == [second]
+    assert "selected_pr_url" not in refreshed.json()
+
+    linked = await pr_client.post(
+        f"/v1/sessions/{session}/resources/github/prs", json={"url": first, "action": "attach"}
+    )
+    assert linked.status_code == 200, linked.text
+    assert runner.post_json_calls[-1][1]["removed_prs"] == json.dumps([first])
+    assert [pr["url"] for pr in linked.json()["prs"]] == [first, second]
+
+    # Online, the unlink also reaches the runner; older runners ignore removed_prs.
+    unlinked = await pr_client.delete(
+        f"/v1/sessions/{session}/pull-requests", params={"url": first}
+    )
+    path, body = runner.post_json_calls[-1]
+    assert path.endswith("/resources/github/prs")
+    assert (body["url"], body["action"]) == (first, "remove")
+    assert [pr["url"] for pr in unlinked.json()["data"]] == [second]
 
 
 @pytest.mark.asyncio

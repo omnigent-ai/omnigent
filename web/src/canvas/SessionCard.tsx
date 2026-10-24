@@ -124,7 +124,11 @@ function SessionCardComponent({ data, selected }: NodeProps<SessionCardNode>) {
           rel="noopener noreferrer"
           // `nodrag` keeps React Flow from turning a click on the link into a card drag.
           className="nodrag flex min-w-0 items-center gap-1.5 text-xs font-medium text-brand-accent hover:underline"
-          title={`${pullRequest.title} (${pullRequest.state.toLowerCase()})`}
+          title={
+            pullRequest.state
+              ? `${pullRequest.title} (${pullRequest.state.toLowerCase()})`
+              : pullRequest.title
+          }
           aria-label={`Open ${prCopy.requestName} ${prNumberPrefix}${pullRequest.number}`}
           onClick={stopCardEvents}
           onDoubleClick={stopCardEvents}

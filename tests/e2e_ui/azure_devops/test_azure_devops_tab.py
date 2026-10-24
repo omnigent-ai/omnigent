@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO, _stub_github
 
 _PR_URL = "https://dev.azure.com/contoso/web/_git/app/pullrequest/7"
@@ -308,6 +308,11 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
 
     page.route(re.compile(r"/resources/github(?:/prs)?(?:\?|$)"), respond)
 
+    def unlink(url: str) -> None:
+        references[:] = [ref for ref in references if ref["url"] != url]
+
+    stub_session_pull_requests(page, lambda: references, unlink)
+
     def diff(route: Route) -> None:
         if parse_qs(urlsplit(route.request.url).query).get("pr_url") == [_SECOND_URL]:
             route.fulfill(
@@ -360,7 +365,17 @@ def test_azure_canvas_link_uses_provider_identity(
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     page.route(
         "**/v1/sessions?*",
-        _serve_list([_session(session_id, "Azure session", 1, git_branch="feature/widget")]),
+        _serve_list(
+            [
+                _session(
+                    session_id,
+                    "Azure session",
+                    1,
+                    git_branch="feature/widget",
+                    pull_request={**_REFERENCE, "state": "OPEN", "is_draft": False},
+                )
+            ]
+        ),
     )
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
     page.goto(f"{base_url}/canvas")

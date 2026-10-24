@@ -3,7 +3,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
 import { resolveIdentity } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
-import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+import { fetchPullRequestInfo, type PullRequest } from "@/hooks/usePullRequests";
+import { fetchSessionPullRequests, sessionPullRequestsKey } from "@/hooks/useSessionPullRequests";
+import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { useNavigate } from "@/lib/routing";
 import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
 import { ExtensionHostServiceError } from "./errors";
@@ -178,13 +180,32 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) {
             throw new ExtensionHostServiceError("InvalidParams", "sessionId is invalid");
           }
-          // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
-          const info = await queryClient.fetchQuery({
-            queryKey: ["github-info", sessionId],
-            queryFn: () => fetchPullRequestInfo(sessionId),
-            staleTime: 30_000,
-          });
-          const pr = info.available ? info.pr : null;
+          let pr: Pick<PullRequest, "number" | "title" | "state" | "url"> | null | undefined;
+          try {
+            // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
+            const info = await queryClient.fetchQuery({
+              queryKey: ["github-info", sessionId],
+              queryFn: () => fetchPullRequestInfo(sessionId),
+              staleTime: 30_000,
+            });
+            pr = info.available ? info.pr : null;
+          } catch (error) {
+            if (!(error instanceof RunnerOfflineError)) throw error;
+            // The host is offline; answer with the state the server last stored.
+            const [stored] = await queryClient.fetchQuery({
+              queryKey: sessionPullRequestsKey(sessionId),
+              queryFn: () => fetchSessionPullRequests(sessionId),
+              staleTime: 30_000,
+            });
+            pr = stored?.state
+              ? {
+                  number: stored.number,
+                  title: stored.title ?? "",
+                  state: stored.state,
+                  url: stored.url,
+                }
+              : null;
+          }
           if (!pr || !/^https:\/\//.test(pr.url)) return null;
           externalUrlsRef.current.add(pr.url);
           return { number: pr.number, title: pr.title.slice(0, 256), state: pr.state, url: pr.url };

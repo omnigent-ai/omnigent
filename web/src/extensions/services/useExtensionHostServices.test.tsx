@@ -324,6 +324,49 @@ describe("useExtensionHostServices", () => {
     open.mockRestore();
   });
 
+  it("answers with the server's stored pull request while the host is offline", async () => {
+    authenticatedFetchMock.mockImplementation((url: string) =>
+      Promise.resolve(
+        url.includes("/resources/github")
+          ? new Response(
+              JSON.stringify({ error: { code: "runner_unavailable", message: "offline" } }),
+              { status: 503 },
+            )
+          : new Response(
+              JSON.stringify({
+                object: "list",
+                data: [
+                  {
+                    url: "https://github.com/acme/repo/pull/42",
+                    host: "github.com",
+                    repository: "acme/repo",
+                    number: 42,
+                    title: "Add canvas",
+                    relationship: "created",
+                    state: "MERGED",
+                  },
+                ],
+              }),
+              { status: 200 },
+            ),
+      ),
+    );
+    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+
+    await expect(
+      result.current.methods["sessions.pullRequest"]?.({ sessionId: "conv_1" }, signal()),
+    ).resolves.toEqual({
+      number: 42,
+      title: "Add canvas",
+      state: "MERGED",
+      url: "https://github.com/acme/repo/pull/42",
+    });
+    expect(authenticatedFetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/sessions/conv_1/resources/github",
+      "/v1/sessions/conv_1/pull-requests",
+    ]);
+  });
+
   it("does not make session pages wait behind pull-request enrichment", async () => {
     let resolvePullRequest!: (response: Response) => void;
     const pullRequestResponse = new Promise<Response>((resolve) => {

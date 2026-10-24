@@ -3712,7 +3712,12 @@ class HostProcess:
         """
         from typing import cast
 
+        from omnigent.runner import pr_resource
+        from omnigent.runner.session_prs import REMOVED_PRS_PARAM
+
         r = cast("WorkspaceReader", reader)
+        if op.startswith("github_"):
+            pr_resource.apply_server_unlinks(session_id, params.get(REMOVED_PRS_PARAM))
         if op == "list_or_read":
             return r.list_or_read(
                 str(params.get("path", "")),
@@ -3824,7 +3829,11 @@ class HostProcess:
         from typing import cast
 
         from omnigent.runner import pr_resource
+        from omnigent.runner.session_prs import REMOVED_PRS_PARAM
 
+        pr_resource.apply_server_unlinks(
+            cast("str | None", params.get("session_id")), params.get(REMOVED_PRS_PARAM)
+        )
         if op == "github_set_preference":
             return pr_resource.set_pr_preference(
                 workspace,

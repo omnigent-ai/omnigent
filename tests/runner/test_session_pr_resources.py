@@ -614,6 +614,26 @@ async def test_pr_reads_report_lock_contention_and_allow_retry(
     assert reader.github_info(session_id="session", pr_url=pr_url)["pr"]["number"] == 42
 
 
+async def test_runner_applies_server_unlinks_before_reading(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/github", params={"removed_prs": json.dumps([A])}
+        )
+    assert response.status_code == 200, response.text
+    assert [pr["url"] for pr in response.json()["prs"]] == [B]
+    assert response.json()["selected_pr_url"] == B
+    assert [entry.url for entry in SessionPrRegistry("session").list()] == [B]
+
+
 @pytest.mark.parametrize("operation", ["github_changes", "github_pr_diff", "github_file_diff"])
 def test_selected_pr_reads_report_lock_contention(tracked: str, operation: str) -> None:
     registry = SessionPrRegistry("session")

@@ -67,6 +67,7 @@ from omnigent.runner.resource_registry import (
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.session_prs import REMOVED_PRS_PARAM
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -1351,28 +1352,43 @@ def register_resource_routes(
             )
         return root
 
-    async def _github_call(session_id: str, operation: str, **kwargs: Any) -> JSONResponse:
+    async def _github_call(
+        session_id: str, operation: str, *, removed_prs: object = None, **kwargs: Any
+    ) -> JSONResponse:
         from omnigent.runner import pr_resource
 
         root = await _github_workspace_root(session_id)
         function = getattr(pr_resource, operation)
+
+        def call() -> dict[str, Any]:
+            pr_resource.apply_server_unlinks(session_id, removed_prs)
+            return function(root, session_id=session_id, **kwargs)
+
         try:
-            result = await asyncio.to_thread(function, root, session_id=session_id, **kwargs)
+            result = await asyncio.to_thread(call)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(status_code=200, content=result)
 
     @app.get("/v1/sessions/{session_id}/resources/github")
-    async def read_github_info(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_info", pr_url=pr_url)
+    async def read_github_info(
+        session_id: str, pr_url: str | None = None, removed_prs: str | None = None
+    ) -> JSONResponse:
+        return await _github_call(session_id, "pr_info", pr_url=pr_url, removed_prs=removed_prs)
 
     @app.get("/v1/sessions/{session_id}/resources/github/changes")
-    async def read_github_changes(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_changed_files", pr_url=pr_url)
+    async def read_github_changes(
+        session_id: str, pr_url: str | None = None, removed_prs: str | None = None
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id, "pr_changed_files", pr_url=pr_url, removed_prs=removed_prs
+        )
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
-    async def read_github_pr_diff(session_id: str, pr_url: str | None = None) -> JSONResponse:
-        return await _github_call(session_id, "pr_diff", pr_url=pr_url)
+    async def read_github_pr_diff(
+        session_id: str, pr_url: str | None = None, removed_prs: str | None = None
+    ) -> JSONResponse:
+        return await _github_call(session_id, "pr_diff", pr_url=pr_url, removed_prs=removed_prs)
 
     @app.get("/v1/sessions/{session_id}/resources/github/diff/{relative_path:path}")
     async def read_github_file_diff(
@@ -1383,6 +1399,7 @@ def register_resource_routes(
         previous_path: str | None = None,
         head_sha: str | None = None,
         base_sha: str | None = None,
+        removed_prs: str | None = None,
     ) -> JSONResponse:
         if relative_path.startswith("/") or any(
             seg in ("", "..") for seg in relative_path.split("/")
@@ -1397,6 +1414,7 @@ def register_resource_routes(
             previous_path=previous_path,
             head_sha=head_sha,
             base_sha=base_sha,
+            removed_prs=removed_prs,
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/prs")
@@ -1405,7 +1423,11 @@ def register_resource_routes(
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
         return await _github_call(
-            session_id, "update_session_pr", url=body["url"], action=body.get("action", "attach")
+            session_id,
+            "update_session_pr",
+            url=body["url"],
+            action=body.get("action", "attach"),
+            removed_prs=body.get(REMOVED_PRS_PARAM),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/preferences")
@@ -1417,6 +1439,7 @@ def register_resource_routes(
             account=body.get("account"),
             remote=body.get("remote"),
             pr_url=body.get("pr_url"),
+            removed_prs=body.get(REMOVED_PRS_PARAM),
         )
 
     @app.get("/v1/sessions/{session_id}/resources/github/labels")

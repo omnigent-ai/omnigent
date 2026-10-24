@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
 
 HOST = "git.example.test:8443"
 URL = f"https://{HOST}/team/sub/project/-/merge_requests/7"
@@ -195,7 +195,12 @@ def stub(
         else:
             route.fulfill(json=info(selected))
 
+    def unlink(url: str) -> None:
+        urls.remove(url)
+        requested.append(("pull-requests", url))
+
     page.route(re.compile(r"/resources/github(?:/|\?|$)"), respond)
+    stub_session_pull_requests(page, lambda: info(None)["prs"], unlink)
     return requested
 
 
@@ -302,7 +307,7 @@ def test_gitlab_unlink_last_mr_clears_selection(
     expect(panel.get_by_text(re.compile("Couldn.t load pull request"))).to_have_count(0)
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     page.screenshot(path=str(tmp_path / f"gitlab-unlinked-{entry}.png"), animations="disabled")
-    removal = next(i for i, (resource, _) in enumerate(requested) if resource == "prs")
+    removal = next(i for i, (resource, _) in enumerate(requested) if resource == "pull-requests")
     page.reload()
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     page.wait_for_timeout(1200)
@@ -349,7 +354,24 @@ def test_gitlab_canvas_link_uses_merge_request_identity(
     page.route(
         "**/v1/sessions?*",
         _serve_list(
-            [_session(session_id, "GitLab canvas session", 1, git_branch="feature/widget")]
+            [
+                _session(
+                    session_id,
+                    "GitLab canvas session",
+                    1,
+                    git_branch="feature/widget",
+                    pull_request={
+                        "url": URL,
+                        "provider": "gitlab",
+                        "provider_display": DISPLAY,
+                        "repository": "team/sub/project",
+                        "number": 7,
+                        "title": "Add the widget",
+                        "state": "OPEN",
+                        "is_draft": False,
+                    },
+                )
+            ]
         ),
     )
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))

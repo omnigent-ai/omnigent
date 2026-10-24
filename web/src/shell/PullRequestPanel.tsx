@@ -15,6 +15,9 @@
 //
 // Data comes from the runner's read-only PR resource API (see
 // hooks/usePullRequests.ts), which shells out to the provider CLI + `git`.
+// While the runner and host are offline, the server's stored PRs
+// (hooks/useSessionPullRequests.ts) keep the picker and the selected PR's last
+// summary.
 // `derivePullRequestPanelState` is the single switch that turns the info query
 // into what the panel shows: an outdated host, a non-git workspace, an
 // unsupported remote, a missing provider CLI, an unresolved upstream repo, or no
@@ -78,7 +81,16 @@ import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
-import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  RunnerOfflineError,
+  useWorkspaceAsleep,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
+import {
+  sessionPullRequestsKey,
+  useSessionPullRequests,
+  useUnlinkSessionPr,
+} from "@/hooks/useSessionPullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
@@ -1033,8 +1045,8 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     setRefreshing(true);
     try {
       await Promise.all(
-        ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
-          queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
+        ["github-info", "github-changed-files", "github-pr-diff", "session-pull-requests"].map(
+          (key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
         ),
       );
     } finally {
@@ -1050,26 +1062,33 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       Refresh
     </Button>
   );
-  const [knownAssociations, setKnownAssociations] = useState<{
-    sessionId: string;
-    data: Pick<
-      PullRequestInfo,
-      "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
-    >;
-  }>();
+  // The server keeps the session's PRs, so the controls survive a selection
+  // switch and the runner and host being offline.
+  const stored = useSessionPullRequests(conversationId);
   useEffect(() => {
-    if (info.data) {
-      const { prs, tracking_available, selected_pr_url, provider, provider_display } = info.data;
-      setKnownAssociations({
-        sessionId: conversationId,
-        data: { prs, tracking_available, selected_pr_url, provider, provider_display },
-      });
+    // Info payloads carry the server's list; keep the stored copy current.
+    if (info.data?.tracking_available && info.data.prs) {
+      queryClient.setQueryData(sessionPullRequestsKey(conversationId), info.data.prs);
     }
-  }, [conversationId, info.data]);
-  // Switching the metadata query must not unmount the session's PR controls.
-  const associations =
-    info.data ??
-    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  }, [conversationId, info.data, queryClient]);
+  const hostOffline = useHostOffline(conversationId, info);
+  const storedAssociations:
+    | Pick<
+        PullRequestInfo,
+        "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
+      >
+    | undefined = stored.data?.length
+    ? {
+        prs: stored.data,
+        tracking_available: true,
+        selected_pr_url: stored.data[0].url,
+        provider: stored.data[0].provider,
+        provider_display: stored.data[0].provider_display,
+      }
+    : undefined;
+  const associations = hostOffline
+    ? (storedAssociations ?? info.data)
+    : (info.data ?? storedAssociations);
   const panelState = derivePullRequestPanelState(info);
   // No provider is known without a payload, or in a non-git workspace (older hosts omit it).
   const copy = gitProviderCopy(
@@ -1078,6 +1097,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     associations?.provider_display,
   );
   const update = useUpdateSessionPr(conversationId);
+  const unlink = useUnlinkSessionPr(conversationId);
   useEffect(() => {
     if (!selected && info.data?.selected_pr_url) {
       setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
@@ -1235,20 +1255,22 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                 <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
                   {refreshIcon}
                 </IconButton>
-                <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
+                <IconButton
+                  // Linking verifies the PR with the host's provider account.
+                  label={hostOffline ? "Link a PR (needs the host online)" : "Link a PR"}
+                  disabled={hostOffline}
+                  onClick={() => setLinking(!linking)}
+                >
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>
-                {selected && (
+                {selectedPr && (
                   <IconButton
                     label="Unlink PR"
-                    disabled={update.isPending}
+                    disabled={unlink.isPending}
                     onClick={() =>
-                      update.mutate(
-                        { url: selected, action: "remove" },
-                        {
-                          onSuccess: (data) => changeSelection(data.selected_pr_url),
-                        },
-                      )
+                      unlink.mutate(selectedPr.url, {
+                        onSuccess: (remaining) => changeSelection(remaining[0]?.url),
+                      })
                     }
                   >
                     <Trash2Icon className="size-3.5" aria-hidden="true" />
@@ -1269,6 +1291,11 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           {linkControls}
         </div>
       )}
+      {unlink.isError && (
+        <p role="alert" className="shrink-0 border-b border-border p-2 text-ui text-destructive">
+          Couldn’t unlink: {unlink.error.message}
+        </p>
+      )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
           role="status"
@@ -1282,6 +1309,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           key={`${conversationId}:${selected ?? ""}`}
           conversationId={conversationId}
           info={info}
+          storedPr={hostOffline ? selectedPr : undefined}
           showProviderIcon={!showTrackingControls}
           refreshButton={!showTrackingControls ? refreshButton : undefined}
           emptyStateAction={
@@ -1300,15 +1328,91 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   );
 }
 
+/**
+ * Whether neither the runner nor the host can answer, so the panel falls back
+ * to the server's stored PRs. Live info cached before they went away counts as
+ * offline too, since its failed refetch would otherwise replace the PR.
+ */
+function useHostOffline(
+  conversationId: string,
+  info: Pick<ReturnType<typeof usePullRequestInfo>, "error">,
+): boolean {
+  const serveable = useWorkspaceServeable(conversationId);
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  return serveable === false || sandboxAsleep || info.error instanceof RunnerOfflineError;
+}
+
+/**
+ * The selected PR as the server last stored it, while the runner and host are
+ * offline: its title, link and state. Everything else stays on the host, so the
+ * panel says when it comes back.
+ */
+function StoredPullRequestDetails({
+  pr,
+  copy,
+  sandboxAsleep,
+  showProviderIcon,
+  refreshButton,
+}: {
+  pr: PullRequestAssociation;
+  copy: GitProviderCopy;
+  sandboxAsleep: boolean;
+  showProviderIcon: boolean;
+  refreshButton?: React.ReactNode;
+}) {
+  const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
+  const lastSync = pr.state_checked_at ? absoluteTime(pr.state_checked_at * 1000) : "";
+  return (
+    <TooltipProvider delayDuration={0}>
+      <div className="flex h-full min-h-0 flex-col" data-testid="github-stored-pr">
+        <div className="shrink-0 border-b border-border px-3 pt-2 pb-2">
+          <div className="flex items-center gap-2">
+            {showProviderIcon && <PanelTitle copy={copy} />}
+            <span className="block min-w-0 truncate text-xs text-muted-foreground">
+              {pr.repository}
+            </span>
+            <div className="ml-auto shrink-0">{refreshButton}</div>
+          </div>
+          <div className="mt-1 flex flex-nowrap items-center gap-2">
+            <a
+              href={pr.url}
+              target="_blank"
+              rel="noreferrer"
+              className="group flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+            >
+              <span className="truncate">{title}</span>
+              <span className="shrink-0 text-muted-foreground">
+                {copy.prNumberPrefix}
+                {pr.number}
+              </span>
+              <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+            </a>
+            {pr.state && <PullRequestStatus state={pr.state} />}
+          </div>
+        </div>
+        <p role="status" className="p-3 text-ui text-muted-foreground">
+          {lastSync && `Last sync time: ${lastSync}. `}
+          {sandboxAsleep
+            ? "To load the PR details, send a message to start the session’s sandbox."
+            : "To load the PR details, please reconnect the session’s host."}
+        </p>
+      </div>
+    </TooltipProvider>
+  );
+}
+
 function PullRequestPanelDetails({
   conversationId,
   info,
+  storedPr,
   showProviderIcon,
   refreshButton,
   emptyStateAction,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
+  /** The selected PR as the server stored it, passed while the host is offline. */
+  storedPr?: PullRequestAssociation;
   showProviderIcon: boolean;
   refreshButton?: React.ReactNode;
   emptyStateAction?: React.ReactNode;
@@ -1490,6 +1594,18 @@ function PullRequestPanelDetails({
     normalized?.auth.hint,
     normalized?.provider_display,
   );
+
+  if (storedPr) {
+    return (
+      <StoredPullRequestDetails
+        pr={storedPr}
+        copy={gitProviderCopy(storedPr.provider, undefined, storedPr.provider_display)}
+        sandboxAsleep={sandboxAsleep}
+        showProviderIcon={showProviderIcon}
+        refreshButton={refreshButton}
+      />
+    );
+  }
 
   // ── Whole-panel states (before the header + stacked diff) ───────────────
   // One central switch: every non-`ready` kind returns its own whole-panel

@@ -87,6 +87,25 @@ Provider-specific JSON fields belong in `pr_from_object`; common `html_url` and
 `url` fields are handled centrally. A failing provider is isolated so it cannot
 change a tool's result or prevent another provider from recording requests.
 
+## Server storage
+
+The runner or host remains the only forge client. The server stores each
+session's linked requests (`session_pull_requests`) from the `prs` and
+selected `pr` of every pull request response it proxies, and after each turn it
+reads the PR resource itself. Its own list then replaces `prs` in the response.
+Each row keeps the request's title, state, and draft flag, with when the host
+last fetched its details; the description, checks, comments, changed files, and
+diff stay on the host.
+
+`GET /v1/sessions/{id}/pull-requests` answers without the runner or host, so
+the panel, sidebar, canvas, composer, and extension API keep showing requests
+while both are offline. Each session list item carries its first request as
+`pull_request`. Linking needs the host to verify the request. Unlinking
+(`DELETE /v1/sessions/{id}/pull-requests?url=`) is recorded on the server and
+forwarded to the runner or host when one is reachable. The server also sends
+the unlinked URLs with later requests as the `removed_prs` JSON list; the runner
+and host add them to the session registry's exclusions.
+
 ## Verification
 
 Run the existing GitHub resource and tracking suites together with provider

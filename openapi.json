@@ -7201,6 +7201,17 @@
             ],
             "title": "Project Id"
           },
+          "pull_request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPullRequestSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's first linked pull request, or `None` when it has none."
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -7562,6 +7573,85 @@
           "name"
         ],
         "title": "SessionProjectSummary",
+        "type": "object"
+      },
+      "SessionPullRequestSummary": {
+        "description": "The first pull request linked to a session, for list surfaces.\n\nStored on the server from what the session's host last reported, so it\nis available while the host is offline.",
+        "properties": {
+          "is_draft": {
+            "default": false,
+            "description": "Whether the PR was a draft when last fetched.",
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "number": {
+            "description": "The PR number.",
+            "format": "int64",
+            "title": "Number",
+            "type": "integer"
+          },
+          "provider": {
+            "description": "Git provider id, e.g. `\"github\"`.",
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_display": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The provider's labels (`display_name`, `request_name`, `number_prefix`), or `None` for an unknown provider.",
+            "title": "Provider Display"
+          },
+          "repository": {
+            "description": "Base repository, e.g. `\"owner/repo\"`.",
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"OPEN\"`, `\"MERGED\"` or `\"CLOSED\"` as last fetched, or `None` before the host fetched the PR.",
+            "title": "State"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last title the host looked up, or `None`.",
+            "title": "Title"
+          },
+          "url": {
+            "description": "The PR's URL.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "provider",
+          "repository",
+          "number"
+        ],
+        "title": "SessionPullRequestSummary",
         "type": "object"
       },
       "SessionReasoningEffortEvent": {
@@ -15382,6 +15472,98 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/pull-requests": {
+      "delete": {
+        "description": "Unlink a pull request from the session, whether or not its host is online.\n\nThe server records the unlink, then passes it to the runner or host when\none is reachable; otherwise they apply it with their next PR request.\n\n**Returns:** The session's remaining linked PRs.",
+        "operationId": "unlink_session_pull_request_v1_sessions__session_id__pull_requests_delete",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The linked PR's URL.",
+            "in": "query",
+            "name": "url",
+            "required": true,
+            "schema": {
+              "title": "Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Session Pull Request",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "get": {
+        "description": "List the session's linked pull requests from the server.\n\nNever contacts the runner or host, so it answers while both are\noffline. Each entry carries the state the host last fetched.\n\n**Returns:** A `list` object of linked PRs in display order.",
+        "operationId": "list_session_pull_requests_v1_sessions__session_id__pull_requests_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Pull Requests",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/read-state": {
       "put": {
         "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",
@@ -17304,9 +17486,11 @@
     },
     "/v1/sessions/{session_id}/resources/github/prs": {
       "post": {
+        "description": "Link a pull request the session's host can read, or unlink one.\n\nBoth need the runner or host online: linking verifies the PR with its\nprovider account. `DELETE /pull-requests` unlinks while they are offline.\n\n**Returns:** The refreshed `session.github.info` object.",
         "operationId": "update_session_github_pr_v1_sessions__session_id__resources_github_prs_post",
         "parameters": [
           {
+            "description": "Session/conversation identifier.",
             "in": "path",
             "name": "session_id",
             "required": true,

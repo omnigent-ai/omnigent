@@ -45,6 +45,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
+    SqlSessionPullRequest,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
@@ -5424,7 +5425,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         Collects the full subtree of conversation IDs (the target plus
         all direct/indirect children), then deletes their items, labels,
-        comments, policies, and session-permission rows before deleting
+        comments, pull requests, policies, and session-permission rows before deleting
         the conversation rows themselves (children before parent).
 
         :param conversation_id: Unique conversation identifier,
@@ -5497,6 +5498,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlComment).where(
                     SqlComment.workspace_id == current_workspace_id(),
                     SqlComment.conversation_id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlSessionPullRequest).where(
+                    SqlSessionPullRequest.workspace_id == current_workspace_id(),
+                    SqlSessionPullRequest.conversation_id.in_(subtree_ids),
                 )
             )
             session.execute(

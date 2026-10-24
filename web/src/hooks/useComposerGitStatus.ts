@@ -1,6 +1,7 @@
 import { useCallback } from "react";
 
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import { useSessionPullRequests } from "@/hooks/useSessionPullRequests";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { gitProviderCopy } from "@/lib/gitProviders";
@@ -69,6 +70,7 @@ export function useComposerGitStatus({
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
   const github = usePullRequestInfo(sessionId ?? undefined);
+  const stored = useSessionPullRequests(sessionId ?? undefined);
   const info = github.data;
   const result = worktrees.data;
 
@@ -104,7 +106,8 @@ export function useComposerGitStatus({
     }
   }
 
-  const prs = info?.prs;
+  // The server's stored list names the PRs while there's no live payload.
+  const prs = info ? info.prs : stored.data;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
   // The primary PR's own provider first, then the session's.
@@ -128,7 +131,11 @@ export function useComposerGitStatus({
     worktreePath,
     creationBranch: creationBranch?.trim() || null,
     repoNameWithOwner: info?.repo?.name_with_owner ?? null,
-    githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
+    githubState: github.isLoading
+      ? "loading"
+      : (github.isError || !info) && !stored.data?.length
+        ? "unknown"
+        : "ready",
     prCount,
     prNumber,
     prNumberPrefix,

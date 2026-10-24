@@ -9293,6 +9293,30 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
     assert seen == {"root": "/ws/omnigent", "account": "octocat", "remote": "origin"}
 
 
+@pytest.mark.parametrize("write", [False, True])
+async def test_host_applies_server_unlinks_before_github_ops(
+    monkeypatch: pytest.MonkeyPatch, write: bool
+) -> None:
+    """Both host dispatchers record the server's unlinks before serving a PR op."""
+    from omnigent.runner import pr_resource
+
+    applied: list[tuple[object, object]] = []
+    monkeypatch.setattr(pr_resource, "apply_server_unlinks", lambda *args: applied.append(args))
+    monkeypatch.setattr(pr_resource, "set_pr_preference", lambda *_a, **_kw: {"ok": True})
+    reader = SimpleNamespace(
+        github_info=lambda *_a: {"ok": True}, changes=lambda *_a: {"ok": True}
+    )
+    removed = '["https://github.com/example/one/pull/42"]'
+    if write:
+        HostProcess._dispatch_fs_write_op(
+            "/ws", "github_set_preference", {"session_id": "s1", "removed_prs": removed}
+        )
+    else:
+        HostProcess._dispatch_fs_op(reader, "github_info", "s1", {"removed_prs": removed})
+        HostProcess._dispatch_fs_op(reader, "changes", "s1", {})
+    assert applied == [("s1", removed)]
+
+
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):

@@ -69,6 +69,7 @@ import {
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
+import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
 
@@ -229,6 +230,11 @@ export interface Conversation {
    * detection only — never displayed. See `comments_count`.
    */
   comments_updated_at?: number | null;
+  /**
+   * The session's first linked pull request as the server last stored it, so
+   * list surfaces show it while the host is offline. Absent on older servers.
+   */
+  pull_request?: SessionPullRequestSummary | null;
   /**
    * The requesting user's "last seen" wall-clock baseline (seconds) for
    * this session, or null/undefined when they've never seen it. Per-viewer,

@@ -687,6 +687,66 @@ def test_comment_add_pushes_changed_frame(
         assert changed_items[s1]["comments_updated_at"] == 1_000 * _US
 
 
+def test_reported_pull_request_pushes_changed_frame(
+    app: FastAPI, stores, db_uri: str, fast_rescan: None
+) -> None:
+    """A PR the host reports reaches the sidebar through the stream's diff.
+
+    The sidebar tooltip and canvas cards read the session's first PR from
+    its list item instead of asking the runner, so they keep showing it
+    while the host is offline.
+    """
+    from omnigent.stores.session_pull_request_store import (
+        PullRequestReport,
+        SessionPullRequestStore,
+    )
+
+    url = "https://github.com/example/one/pull/42"
+    s1 = _seed_session(stores, owner=ALICE, title="opened a PR")
+    pull_requests = SessionPullRequestStore(db_uri)
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["pull_request"] is None
+
+        pull_requests.record(
+            s1,
+            [
+                PullRequestReport(
+                    url=url,
+                    provider="github",
+                    host="github.com",
+                    repository="example/one",
+                    number=42,
+                    relationship="created",
+                    first_seen_at=1.0,
+                    last_seen_at=1.0,
+                )
+            ],
+        )
+        pull_requests.update_state(
+            s1, url, state="MERGED", is_draft=False, title="Ship it", checked_at=2.0
+        )
+        changed = _recv_until(ws, {"changed"})
+        assert changed["items"][0]["pull_request"] == {
+            "url": url,
+            "provider": "github",
+            "provider_display": {
+                "id": "github",
+                "display_name": "GitHub",
+                "request_name": "pull request",
+                "number_prefix": "#",
+            },
+            "repository": "example/one",
+            "number": 42,
+            "title": "Ship it",
+            "state": "MERGED",
+            "is_draft": False,
+        }
+
+
 def test_comment_status_change_pushes_changed_frame(
     app: FastAPI,
     stores,

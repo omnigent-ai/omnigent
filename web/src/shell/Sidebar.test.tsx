@@ -3682,6 +3682,33 @@ describe("Sidebar view options", () => {
     });
   });
 
+  it("shows the server's stored PR while the host is offline", async () => {
+    usePullRequestInfoMock.mockReturnValue({ data: undefined });
+    mockConversations([
+      conv("conv_offline", "Codex", {
+        workspace: "/Users/me/omnigent",
+        pull_request: {
+          url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+          provider: "github",
+          repository: "omnigent-ai/omnigent",
+          number: 7918,
+          title: "Ship it",
+          state: "MERGED",
+          is_draft: false,
+        },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_offline" }), {
+      pointerType: "mouse",
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("session-tooltip-repo")).toHaveTextContent("Repoomnigent");
+      expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent("PR#7918 · Merged");
+    });
+  });
+
   it("skips the GitHub lookup for a session without a workspace", async () => {
     mockConversations([conv("conv_bare", "Codex", { owner: null })]);
     renderGroupingSidebar();

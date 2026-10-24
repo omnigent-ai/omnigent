@@ -39,7 +39,12 @@ from omnigent.runner.git_providers import (
     local_git,
     unsupported_remote_info,
 )
-from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
+from omnigent.runner.session_prs import (
+    PullRequestRef,
+    SessionPrRegistry,
+    SessionPullRequest,
+    removed_prs_from_param,
+)
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -171,6 +176,21 @@ def _resolve(root: str, reference: PullRequestRef | None) -> ProviderResolution:
     if reference is not None:
         return ProviderResolution(reference.provider, reference.host)
     return _workspace_provider(root)
+
+
+def apply_server_unlinks(session_id: str | None, removed_prs: object) -> None:
+    """Exclude the PRs the user unlinked on the server before serving a request.
+
+    :param session_id: The session the request serves, if any.
+    :param removed_prs: The server's ``removed_prs`` parameter, a JSON list of URLs.
+    """
+    urls = removed_prs_from_param(removed_prs)
+    if not session_id or not urls:
+        return
+    try:
+        SessionPrRegistry(session_id).exclude(urls)
+    except (OSError, ValueError, FileLockTimeout):
+        _logger.warning("Could not apply server pull request unlinks", exc_info=True)
 
 
 def resolve_provider(

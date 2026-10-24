@@ -17,6 +17,10 @@ from pydantic import BaseModel, Field
 
 from omnigent.process_logging import data_dir
 
+# Request parameter carrying the PRs the user unlinked on the server, as a JSON list of URLs.
+REMOVED_PRS_PARAM = "removed_prs"
+_MAX_REMOVED_PRS = 200
+
 
 class PullRequestRef(BaseModel):
     """A PR belongs to its base repository, including for fork PRs."""
@@ -220,6 +224,31 @@ class SessionPrRegistry:
             if changed:
                 self._write(state)
 
+    def exclude(self, urls: Collection[str]) -> None:
+        """Apply unlinks made on the server, writing only when one is new here.
+
+        URLs no registered provider recognizes are skipped. A later
+        ``attached`` record links the PR again, as after :meth:`remove`.
+        """
+        references: list[str] = []
+        for url in urls:
+            try:
+                references.append(PullRequestRef.from_url(url).url)
+            except ValueError:
+                continue
+        if not references:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            state = self._read()
+            new = [url for url in dict.fromkeys(references) if url not in state.excluded]
+            if not new:
+                return
+            state.excluded.extend(new)
+            state.prs = [pr for pr in state.prs if pr.url not in new]
+            # Commit the exclusions before deleting any companion association.
+            self._write(state, legacy_first=True)
+
     def remove(self, url: str) -> None:
         """Remember removal so subsequent hook replay cannot attach the PR again."""
         reference = PullRequestRef.from_url(url)
@@ -231,6 +260,19 @@ class SessionPrRegistry:
                 state.excluded.append(reference.url)
             # Commit the exclusion before deleting its companion association.
             self._write(state, legacy_first=reference.provider != "github")
+
+
+def removed_prs_from_param(value: object) -> list[str]:
+    """Decode :data:`REMOVED_PRS_PARAM`; a malformed value decodes to no URLs."""
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [url for url in decoded[:_MAX_REMOVED_PRS] if isinstance(url, str)]
 
 
 def observation_key(source: str, call_id: str, payload: object) -> str:

@@ -53,6 +53,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -202,6 +203,7 @@ from omnigent.server.schemas import (
     SessionList,
     SessionListItem,
     SessionProjectSummary,
+    SessionPullRequestSummary,
     SessionResponse,
     UpdateSessionRequest,
 )
@@ -1802,6 +1804,7 @@ def register_core_routes(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        pull_requests = await _pull_requests_for(conv_ids)
         # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
         # A session whose persisted live_status is still running/waiting but
         # whose runner is confirmed gone — a replica that restarted and
@@ -1872,6 +1875,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                pull_request=pull_requests.get(conv.id),
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -1912,6 +1916,34 @@ def register_core_routes(
         if comment_store is None or not conv_ids:
             return {}
         return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
+
+    pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _pull_requests_for(
+        conv_ids: list[str],
+    ) -> dict[str, SessionPullRequestSummary]:
+        """
+        Batch-fetch each session's first linked pull request.
+
+        Shared by the ``GET /v1/sessions`` page builder and
+        ``WS /v1/sessions/updates``, so a PR the host reports reaches the
+        sidebar and canvas through the stream's diff.
+
+        :param conv_ids: Session ids to summarize, e.g. ``["conv_abc123"]``.
+        :returns: Map from session id to its first PR; sessions without
+            PRs are absent, and the map is empty without PR storage.
+        """
+        if pull_request_store is None or not conv_ids:
+            return {}
+        try:
+            primary = await asyncio.to_thread(pull_request_store.primary_for_sessions, conv_ids)
+        except Exception:  # The list must load even if PR storage fails.
+            _logger.warning("Could not load session pull requests", exc_info=True)
+            return {}
+        return {
+            conv_id: SessionPullRequestSummary(**server_prs.primary_summary(entry))
+            for conv_id, entry in primary.items()
+        }
 
     # ── WS /sessions/updates ────────────────────────────────────
 
@@ -1983,13 +2015,19 @@ def register_core_routes(
             return []
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+        (
+            agent_names_by_id,
+            child_ids_by_parent,
+            comments_fingerprints,
+            pull_requests,
+        ) = await asyncio.gather(
             asyncio.to_thread(agent_store.get_names, unique_agent_ids),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
+            _pull_requests_for(conv_ids),
         )
         pending_counts = pending_elicitations.counts_for(conv_ids)
         items = [
@@ -2003,6 +2041,7 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                pull_request=pull_requests.get(conv.id),
             )
             for conv in convs
         ]

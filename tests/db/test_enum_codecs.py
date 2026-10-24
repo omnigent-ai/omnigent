@@ -21,6 +21,12 @@ _CODECS = [
     (ec.ITEM_TYPE, ec.encode_item_type, ec.decode_item_type),
     (ec.ITEM_STATUS, ec.encode_item_status, ec.decode_item_status),
     (ec.COMMENT_STATUS, ec.encode_comment_status, ec.decode_comment_status),
+    (
+        ec.SESSION_PR_RELATIONSHIP,
+        ec.encode_session_pr_relationship,
+        ec.decode_session_pr_relationship,
+    ),
+    (ec.SESSION_PR_STATE, ec.encode_session_pr_state, ec.decode_session_pr_state),
     (ec.ACCOUNT_TOKEN_KIND, ec.encode_account_token_kind, ec.decode_account_token_kind),
     (ec.POLICY_TYPE, ec.encode_policy_type, ec.decode_policy_type),
     (ec.POLICY_SCOPE, ec.encode_policy_scope, ec.decode_policy_scope),
@@ -107,6 +113,13 @@ def test_shipped_codes_are_stable() -> None:
     }
     assert ec.ITEM_STATUS == {"completed": 1, "in_progress": 2, "incomplete": 3, "failed": 4}
     assert ec.COMMENT_STATUS == {"draft": 1, "addressed": 2}
+    assert ec.SESSION_PR_RELATIONSHIP == {
+        "inferred": 1,
+        "worked_on": 2,
+        "attached": 3,
+        "created": 4,
+    }
+    assert ec.SESSION_PR_STATE == {"OPEN": 1, "CLOSED": 2, "MERGED": 3}
     assert ec.ACCOUNT_TOKEN_KIND == {"invite": 1, "magic": 2}
     assert ec.POLICY_TYPE == {"python": 1, "url": 2}
     assert ec.POLICY_SCOPE == {"default": 1, "session": 2}

@@ -7,6 +7,7 @@ import { useComposerGitStatus } from "./useComposerGitStatus";
 
 const useSessionWorktreesMock = vi.fn();
 const usePullRequestInfoMock = vi.fn();
+const useSessionPullRequestsMock = vi.fn(() => ({ data: undefined as unknown }));
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -17,6 +18,9 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
 }));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
+}));
+vi.mock("@/hooks/useSessionPullRequests", () => ({
+  useSessionPullRequests: () => useSessionPullRequestsMock(),
 }));
 
 function wt(overrides: Partial<HostWorktree>): HostWorktree {
@@ -61,6 +65,8 @@ function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
 afterEach(() => {
   useSessionWorktreesMock.mockReset();
   usePullRequestInfoMock.mockReset();
+  useSessionPullRequestsMock.mockReset();
+  useSessionPullRequestsMock.mockReturnValue({ data: undefined });
 });
 
 const FORGE_DISPLAY = {
@@ -210,6 +216,32 @@ describe("useComposerGitStatus", () => {
     const { result } = run();
     expect(result.current.prCount).toBe(2);
     expect(result.current.prNumber).toBe(7);
+  });
+
+  it("names the server's stored PRs while the host is offline", () => {
+    setWorktrees(undefined);
+    usePullRequestInfoMock.mockReturnValue({
+      data: undefined,
+      isError: true,
+      isFetching: false,
+      refetch: vi.fn(),
+    });
+    useSessionPullRequestsMock.mockReturnValue({
+      data: [{ url: "https://github.com/o/r/pull/42", number: 42, provider: "github" }],
+    });
+    const { result } = run();
+    expect(result.current.githubState).toBe("ready");
+    expect(result.current.prCount).toBe(1);
+    expect(result.current.prNumber).toBe(42);
+  });
+
+  it("keeps a live PR from a host without tracking over the empty stored list", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ branch: "main" })] });
+    setGithub({ pr: { number: 6000 } });
+    useSessionPullRequestsMock.mockReturnValue({ data: [] });
+    const { result } = run();
+    expect(result.current.prCount).toBe(1);
+    expect(result.current.prNumber).toBe(6000);
   });
 
   it("styles the PR number by the primary PR's provider, then the session's", () => {

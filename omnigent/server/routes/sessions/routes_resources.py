@@ -40,6 +40,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -214,6 +215,7 @@ def register_resources_routes(
     register_initial_file_upload: Callable[..., None] | None = None,
 ) -> None:
     """Register the resources routes on router."""
+    pull_request_store = server_prs.open_store(conversation_store)
 
     async def _require_filesystem_attachment_support(
         request: Request, conv: Conversation, filename: str, capability: str
@@ -2841,12 +2843,13 @@ def register_resources_routes(
         :returns: JSON with the ``patch`` text.
         """
         conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_pr_diff",
-            host_params={"pr_url": pr_url} if pr_url else {},
-            runner_params={"pr_url": pr_url} if pr_url else None,
+            host_params=params,
+            runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
         )
 
@@ -2899,6 +2902,7 @@ def register_resources_routes(
             if value is not None
         }
         encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
+        params = await _github_params(session_id, params)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -3160,6 +3164,154 @@ def register_resources_routes(
             publish_invalidation=False,
         )
 
+    # ── Pull requests (stored on the server) ──────────────────────
+    # The runner or host fetches every PR from its forge; the server keeps the
+    # list and last summaries so the tab shows them while both are offline.
+
+    async def _github_params(session_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Add the URLs the user unlinked, so the runner or host stops selecting them."""
+        if pull_request_store is None:
+            return params
+        removed = server_prs.removed_param(
+            await asyncio.to_thread(pull_request_store.removed_urls, session_id)
+        )
+        return {**params, server_prs.REMOVED_PRS_PARAM: removed} if removed else params
+
+    async def _with_server_pull_requests(session_id: str, info: dict[str, Any]) -> dict[str, Any]:
+        """Store a runner or host payload's PRs, then answer with the server's list."""
+        if pull_request_store is None:
+            return info
+        try:
+            await asyncio.to_thread(server_prs.ingest_info, pull_request_store, session_id, info)
+            return await asyncio.to_thread(
+                server_prs.apply_server_state, pull_request_store, session_id, info
+            )
+        except Exception:  # Storage trouble must not break the live panel.
+            _logger.warning(
+                "Could not store session pull requests",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return info
+
+    async def _record_attached(session_id: str, info: dict[str, Any]) -> None:
+        """Record the PR a successful link selected, clearing an earlier unlink."""
+        selected = info.get("selected_pr_url")
+        if pull_request_store is None or not isinstance(selected, str):
+            return
+        report = next(
+            (item for item in server_prs.reports_from_info(info) if item.url == selected), None
+        )
+        if report is not None:
+            await asyncio.to_thread(pull_request_store.attach, session_id, report)
+
+    async def _github_info(
+        session_id: str, conv: Conversation, pr_url: str | None = None
+    ) -> dict[str, Any]:
+        """Read PR context through the runner or host and store what it reports."""
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        info = await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_info",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github",
+        )
+        return await _with_server_pull_requests(session_id, info)
+
+    async def _update_host_pull_requests(
+        session_id: str, conv: Conversation, url: str, action: str
+    ) -> dict[str, Any]:
+        """Link or unlink a PR in the runner's or host's session registry.
+
+        :raises OmnigentError: ``RUNNER_UNAVAILABLE`` when neither can answer.
+        """
+        params = await _github_params(
+            session_id, {"url": url, "action": action, "session_id": session_id}
+        )
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/prs",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_prs_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update pull requests")
+            )
+        return result
+
+    async def _refresh_pull_requests_after_turn(session_id: str) -> None:
+        conv = await _validate_session(session_id)
+        if conv.runner_id is None and conv.host_id is None:
+            return
+        await _github_info(session_id, conv)
+
+    if pull_request_store is not None:
+        server_prs.set_turn_end_sync(server_prs.TurnEndSync(_refresh_pull_requests_after_turn))
+
+    @router.get("/sessions/{session_id}/pull-requests", response_model=None)
+    async def list_session_pull_requests(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        List the session's linked pull requests from the server.
+
+        Never contacts the runner or host, so it answers while both are
+        offline. Each entry carries the state the host last fetched.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :returns: A ``list`` object of linked PRs in display order.
+        """
+        await _validate_session(session_id, request, LEVEL_READ)
+        if pull_request_store is None:
+            return server_prs.list_payload([])
+        entries = await asyncio.to_thread(pull_request_store.list_for_session, session_id)
+        return server_prs.list_payload(entries)
+
+    @router.delete("/sessions/{session_id}/pull-requests", response_model=None)
+    async def unlink_session_pull_request(
+        request: Request, session_id: str, url: str
+    ) -> dict[str, Any]:
+        """
+        Unlink a pull request from the session, whether or not its host is online.
+
+        The server records the unlink, then passes it to the runner or host when
+        one is reachable; otherwise they apply it with their next PR request.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param url: The linked PR's URL.
+        :returns: The session's remaining linked PRs.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        if pull_request_store is None:
+            raise OmnigentError(
+                "Pull request storage is unavailable", code=ErrorCode.INTERNAL_ERROR
+            )
+        await asyncio.to_thread(pull_request_store.remove, session_id, url)
+        try:
+            info = await _update_host_pull_requests(session_id, conv, url, "remove")
+            await _with_server_pull_requests(session_id, info)
+        except (OmnigentError, HTTPException):  # The stored unlink stands either way.
+            _logger.debug(
+                "Unlink not forwarded to the session host",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        entries = await asyncio.to_thread(pull_request_store.list_for_session, session_id)
+        return server_prs.list_payload(entries)
+
     # ── GitHub integration (read-only) ───────────────────────────
     # Registered BEFORE the generic ``/{resource_id}`` lookup so
     # ``/resources/github`` is not captured as a resource id. The diff route
@@ -3186,14 +3338,7 @@ def register_resources_routes(
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _fs_get_with_host_fallback(
-            session_id,
-            conv,
-            op="github_info",
-            host_params={"pr_url": pr_url} if pr_url else {},
-            runner_params={"pr_url": pr_url} if pr_url else None,
-            runner_path=f"/v1/sessions/{session_id}/resources/github",
-        )
+        return await _github_info(session_id, conv, pr_url)
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",
@@ -3212,47 +3357,39 @@ def register_resources_routes(
         :returns: Flat list of changed files with ``status`` and line counts.
         """
         conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_changes",
-            host_params={"pr_url": pr_url} if pr_url else {},
-            runner_params={"pr_url": pr_url} if pr_url else None,
+            host_params=params,
+            runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
         )
 
     @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
     async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Link a pull request the session's host can read, or unlink one.
+
+        Both need the runner or host online: linking verifies the PR with its
+        provider account. ``DELETE /pull-requests`` unlinks while they are offline.
+
+        :param request: JSON body with ``url`` and ``action`` (``attach`` or ``remove``).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
-        params = {
-            "url": body["url"],
-            "action": body.get("action", "attach"),
-            "session_id": session_id,
-        }
-        try:
-            status, result = await _proxy_post_to_runner(
-                session_id,
-                f"/v1/sessions/{session_id}/resources/github/prs",
-                params,
-                conv,
-            )
-        except OmnigentError as exc:
-            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                raise
-            payload = await _write_workspace_via_host(
-                session_id, conv, op="github_prs_update", host_params=params
-            )
-            if payload is None:
-                raise
-            return payload
-        if status >= 400:
-            raise HTTPException(
-                status_code=status, detail=result.get("detail", "Cannot update pull requests")
-            )
-        return result
+        action = body.get("action", "attach")
+        if action == "remove" and pull_request_store is not None:
+            await asyncio.to_thread(pull_request_store.remove, session_id, body["url"])
+        result = await _update_host_pull_requests(session_id, conv, body["url"], action)
+        if action == "attach":
+            await _record_attached(session_id, result)
+        return await _with_server_pull_requests(session_id, result)
 
     @router.post(
         "/sessions/{session_id}/resources/github/preferences",
@@ -3281,6 +3418,7 @@ def register_resources_routes(
         params = {"account": body.get("account"), "remote": body.get("remote")}
         if body.get("pr_url"):
             params.update(pr_url=body["pr_url"], session_id=session_id)
+        params = await _github_params(session_id, params)
         try:
             status, result = await _proxy_post_to_runner(
                 session_id,
@@ -3297,14 +3435,14 @@ def register_resources_routes(
             )
             if payload is None:
                 raise
-            return payload
+            return await _with_server_pull_requests(session_id, payload)
         if status >= 400:
             error = result.get("error", {})
             raise OmnigentError(
                 error.get("message", f"GitHub preference update failed (HTTP {status})"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
             )
-        return result
+        return await _with_server_pull_requests(session_id, result)
 
     @router.get(
         "/sessions/{session_id}/resources/github/labels",

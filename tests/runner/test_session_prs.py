@@ -10,7 +10,11 @@ import pytest
 from filelock import FileLock
 
 from omnigent.runner.pr_observer import extract_prs, observe_hook
-from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.runner.session_prs import (
+    PullRequestRef,
+    SessionPrRegistry,
+    removed_prs_from_param,
+)
 from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
@@ -510,6 +514,38 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert store.list() == []
     store.record([reference], relationship="attached", source="user")
     assert [entry.url for entry in store.list()] == [A]
+
+
+def test_server_unlinks_behave_like_local_removals(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record(
+        [PullRequestRef.from_url(A), PullRequestRef.from_url(B)],
+        relationship="created",
+        source="test",
+    )
+    store.exclude([A, "https://example.com/not/a/pr", A])
+    assert [entry.url for entry in store.list()] == [B]
+    unchanged = store.path.stat().st_mtime_ns
+    store.exclude([A])
+    assert store.path.stat().st_mtime_ns == unchanged
+    store.record([PullRequestRef.from_url(A)], relationship="inferred", source="branch")
+    assert [entry.url for entry in store.list()] == [B]
+    store.record([PullRequestRef.from_url(A)], relationship="attached", source="user")
+    assert {entry.url for entry in store.list()} == {A, B}
+
+
+@pytest.mark.parametrize(
+    ("value", "urls"),
+    [
+        (json.dumps([A, 7, B]), [A, B]),
+        (json.dumps({"url": A}), []),
+        ("not json", []),
+        ("", []),
+        (None, []),
+    ],
+)
+def test_removed_prs_param_decodes_only_url_lists(value: object, urls: list[str]) -> None:
+    assert removed_prs_from_param(value) == urls
 
 
 @pytest.mark.parametrize(

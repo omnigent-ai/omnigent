@@ -2,9 +2,9 @@
 
 Several low-cardinality closed-set columns (``conversations.kind``,
 ``conversation_items.type``/``status``, ``comments.status``,
-``account_tokens.kind``, ``policies.type``, ``policies.scope``,
-``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
-``scheduled_tasks.execution_target``,
+``session_pull_requests.relationship``, ``account_tokens.kind``,
+``policies.type``, ``policies.scope``, ``hosts.status``, ``agents.kind``,
+``scheduled_tasks.state``, ``scheduled_tasks.execution_target``,
 ``scheduled_task_runs.status``) are stored as
 integer codes rather
 than their string names — smaller rows and a tighter ``CHECK`` than a
@@ -62,6 +62,22 @@ ITEM_STATUS: dict[str, int] = {
 COMMENT_STATUS: dict[str, int] = {
     "draft": 1,
     "addressed": 2,
+}
+
+# How a pull request joined a session (``session_pull_requests.relationship``).
+SESSION_PR_RELATIONSHIP: dict[str, int] = {
+    "inferred": 1,
+    "worked_on": 2,
+    "attached": 3,
+    "created": 4,
+}
+
+# A pull request's last fetched state (``session_pull_requests.state``), as the
+# runner's git providers normalize it.
+SESSION_PR_STATE: dict[str, int] = {
+    "OPEN": 1,
+    "CLOSED": 2,
+    "MERGED": 3,
 }
 
 # Last relay-observed turn status persisted on the conversation's metadata
@@ -239,6 +255,26 @@ def encode_comment_status(name: str) -> int:
 def decode_comment_status(code: int) -> str:
     """Decode a ``comments.status`` int code to its name."""
     return _decode(COMMENT_STATUS, code, field="comments.status")
+
+
+def encode_session_pr_relationship(name: str) -> int:
+    """Encode a ``session_pull_requests.relationship`` name to its int code."""
+    return _encode(SESSION_PR_RELATIONSHIP, name, field="session_pull_requests.relationship")
+
+
+def decode_session_pr_relationship(code: int) -> str:
+    """Decode a ``session_pull_requests.relationship`` int code to its name."""
+    return _decode(SESSION_PR_RELATIONSHIP, code, field="session_pull_requests.relationship")
+
+
+def encode_session_pr_state(name: str) -> int:
+    """Encode a ``session_pull_requests.state`` name to its int code."""
+    return _encode(SESSION_PR_STATE, name, field="session_pull_requests.state")
+
+
+def decode_session_pr_state(code: int) -> str:
+    """Decode a ``session_pull_requests.state`` int code to its name."""
+    return _decode(SESSION_PR_STATE, code, field="session_pull_requests.state")
 
 
 def encode_session_live_status(name: str) -> int:
