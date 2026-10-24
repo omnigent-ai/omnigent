@@ -8965,7 +8965,7 @@ describe("NewChatLandingScreen attachments", () => {
     const composer = screen.getByTestId("new-chat-landing-composer");
     // Dragging over the composer lifts the drop-target overlay.
     fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
-    expect(screen.getByText("Drop files here")).toBeTruthy();
+    expect(screen.getByText("Attach to message")).toBeTruthy();
     expect(composer).toHaveClass("ring-2", "ring-ring", "ring-inset");
     expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]");
     // Dropping a file attaches it (chip proves it reached state) and clears
@@ -8973,7 +8973,7 @@ describe("NewChatLandingScreen attachments", () => {
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
     fireEvent.drop(composer, { dataTransfer: fileDrag([file]) });
     expect(screen.getByText("dropped.txt")).toBeTruthy();
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText("Attach to message")).toBeNull();
   });
 
   // The whole landing surface is the drop target, not just the composer box.
@@ -8981,18 +8981,18 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const surface = screen.getByTestId("new-chat-landing");
     fireEvent.dragEnter(surface, { dataTransfer: fileDrag() });
-    expect(screen.getByText("Drop files here")).toBeTruthy();
+    expect(screen.getByText("Attach to message")).toBeTruthy();
     const file = new File(["hello"], "shot.png", { type: "image/png" });
     fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
     expect(screen.getByAltText("shot.png")).toBeTruthy();
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText("Attach to message")).toBeNull();
   });
 
   // Outside it — the sidebar and the rest of the shell — nothing is claimed.
   it("ignores files dropped outside the landing surface", () => {
     renderLanding();
     fireEvent.dragEnter(document.body, { dataTransfer: fileDrag() });
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText("Attach to message")).toBeNull();
     const file = new File(["hello"], "elsewhere.txt", { type: "text/plain" });
     fireEvent.drop(document.body, { dataTransfer: fileDrag([file]) });
     expect(screen.queryByText("elsewhere.txt")).toBeNull();
@@ -9002,9 +9002,9 @@ describe("NewChatLandingScreen attachments", () => {
     renderLanding();
     const composer = screen.getByTestId("new-chat-landing-composer");
     fireEvent.dragEnter(composer, { dataTransfer: fileDrag() });
-    expect(screen.getByText("Drop files here")).toBeTruthy();
+    expect(screen.getByText("Attach to message")).toBeTruthy();
     fireEvent.dragLeave(composer, { dataTransfer: fileDrag() });
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText("Attach to message")).toBeNull();
   });
 
   // Dragging selected text (no "Files" type) must stay native so it can be
@@ -9014,7 +9014,7 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragOver(screen.getByTestId("new-chat-landing-composer"), {
       dataTransfer: { types: ["text/plain"], files: [] },
     });
-    expect(screen.queryByText("Drop files here")).toBeNull();
+    expect(screen.queryByText("Attach to message")).toBeNull();
   });
 
   // An unsupported attachment has to be caught HERE, before the session

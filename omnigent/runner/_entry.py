@@ -1718,10 +1718,14 @@ def create_app(
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await _start_pm()
         try:
+            await _app.state.workspace_uploads.start()
             with monitor_event_loop(process_role="runner"):
                 yield
         finally:
-            await _stop_pm()
+            try:
+                await _app.state.workspace_uploads.stop()
+            finally:
+                await _stop_pm()
 
     app.router.lifespan_context = _lifespan
     return app

@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useFileDropTarget } from "./useFileDropTarget";
+import { ignoreWorkspaceUploadDrag, useFileDropTarget } from "./useFileDropTarget";
 
 /** A dataTransfer for an OS file drag. */
 function fileDrag(files: File[] = []) {
@@ -37,7 +37,7 @@ describe("useFileDropTarget", () => {
 
     fireEvent.drop(screen.getByTestId("inside"), { dataTransfer: fileDrag([file]) });
 
-    expect(onFiles).toHaveBeenCalledWith([file]);
+    expect(onFiles).toHaveBeenCalledWith([file], expect.objectContaining({ type: "drop" }));
   });
 
   // The shell around the chat is not an attachment surface.
@@ -124,4 +124,39 @@ describe("useFileDropTarget", () => {
 
     expect(onFiles).not.toHaveBeenCalled();
   });
+});
+
+it("excludes a nested upload root from chat attachments and owns only one overlay during a rail-to-chat swap", () => {
+  const attach = vi.fn();
+  const upload = vi.fn();
+  function Surfaces() {
+    const [chat, setChat] = useState<HTMLElement | null>(null);
+    const [rail, setRail] = useState<HTMLElement | null>(null);
+    const chatActive = useFileDropTarget(chat, attach, { ignore: ignoreWorkspaceUploadDrag });
+    const railActive = useFileDropTarget(rail, upload);
+    return (
+      <div ref={setChat} data-testid="chat">
+        <span data-testid="chat-space" />
+        {chatActive && <span data-testid="attach-overlay" />}
+        <div ref={setRail} data-upload-drop-root data-testid="rail">
+          {railActive && <span data-testid="upload-overlay" />}
+        </div>
+      </div>
+    );
+  }
+  render(<Surfaces />);
+  const files = [new File(["bytes"], "a.txt")];
+  fireEvent.dragOver(screen.getByTestId("rail"), { dataTransfer: fileDrag(files) });
+  expect(screen.queryByTestId("attach-overlay")).toBeNull();
+  expect(screen.getByTestId("upload-overlay")).toBeTruthy();
+  fireEvent.drop(screen.getByTestId("rail"), { dataTransfer: fileDrag(files) });
+  expect(upload).toHaveBeenCalledTimes(1);
+  expect(attach).not.toHaveBeenCalled();
+  fireEvent.dragOver(screen.getByTestId("rail"), { dataTransfer: fileDrag(files) });
+  fireEvent.dragOver(screen.getByTestId("chat-space"), { dataTransfer: fileDrag(files) });
+  expect(screen.queryByTestId("upload-overlay")).toBeNull();
+  expect(screen.getByTestId("attach-overlay")).toBeTruthy();
+  fireEvent.drop(screen.getByTestId("chat-space"), { dataTransfer: fileDrag(files) });
+  expect(attach).toHaveBeenCalledTimes(1);
+  expect(upload).toHaveBeenCalledTimes(1);
 });

@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { RefObject } from "react";
+import type { ReactNode, RefObject } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -19,6 +19,14 @@ import {
   writePinnedWorkspaceTabs,
 } from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
+
+vi.mock("./WorkspaceUploads", () => ({
+  WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
+  WorkspaceUploadDropRoot: ({ children }: { children: ReactNode }) => (
+    <div data-testid="upload-root-stub">{children}</div>
+  ),
+  UploadsTray: () => <div data-testid="uploads-tray-stub" />,
+}));
 
 // The rail's content children are exercised by their own suites; stub them so
 // these tests focus on WorkspacePanel's own logic (the open-file/shell tab
@@ -234,6 +242,18 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel surface presentation", () => {
+  it("keeps the upload tray outside the Files and viewer content slot", () => {
+    const { view } = renderWorkspace();
+    const tray = screen.getByTestId("uploads-tray-stub");
+    expect(tray.closest("[data-workspace-panel-content]")).toBeNull();
+    expect(
+      screen.getByTestId("files-panel-stub").closest('[data-testid="upload-root-stub"]'),
+    ).toBeTruthy();
+    view.unmount();
+    renderWorkspace({ selectedFilePath: "a.txt", openFiles: ["a.txt"] });
+    expect(screen.getByTestId("uploads-tray-stub")).toBeTruthy();
+    expect(screen.queryByTestId("upload-root-stub")).toBeNull();
+  });
   it("offers unpinned pages in + without requiring shell or browser support", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });

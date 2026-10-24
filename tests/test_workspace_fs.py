@@ -627,3 +627,40 @@ def test_search_from_filesystem_root_keeps_paths_intact(monkeypatch: pytest.Monk
     paths = [e["path"] for e in result["data"]]
     assert "etc" in paths, paths
     assert all((Path("/") / p).exists() for p in paths), paths
+
+
+@pytest.mark.parametrize("view", ["filesystem", "search", "changes"])
+def test_upload_staging_hidden(tmp_path: Path, view: str) -> None:
+    """Offline reads hide staging from each file discovery path."""
+    _git_repo(tmp_path)
+    hidden = "model.3mf.omnigent-upload-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part"
+    (tmp_path / hidden).write_bytes(b"partial")
+    (tmp_path / "model.3mf").write_bytes(b"visible")
+    directory = "folder.omnigent-upload-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.part"
+    (tmp_path / directory).mkdir()
+    (tmp_path / directory / "visible.txt").write_bytes(b"visible")
+    (tmp_path / directory / hidden).write_bytes(b"partial")
+    visible = ["notes.part", "x.omnigent-upload-notanid.part", ".x.omnigent-upload-notanid.part"]
+    for name in visible:
+        (tmp_path / name).write_bytes(b"visible")
+    reader = WorkspaceReader(tmp_path)
+    if view == "filesystem":
+        result = reader.list_or_read("", limit=1000)
+    elif view == "search":
+        result = reader.search(".")
+    else:
+        result = reader.changes("session")
+    names = {e["name"] for e in result["data"]}
+    assert "model.3mf" in names
+    assert hidden not in names
+    assert set(visible) <= names
+    paths = {e["path"] for e in result["data"]}
+    assert directory + "/" + hidden not in paths
+    if view == "filesystem":
+        assert directory in paths
+        nested = reader.list_or_read(directory, limit=1000)
+        assert {e["name"] for e in nested["data"]} == {"visible.txt"}
+    else:
+        assert directory + "/visible.txt" in paths
+    if view == "search":
+        assert directory in paths

@@ -762,7 +762,12 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
             return
         session.diagnostics.dequeued(frame)
         try:
-            await session.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
+            if isinstance(frame.data, bytes):
+                await session.diagnostics.send(ws.send_bytes, frame.data)
+            else:
+                await session.diagnostics.send(
+                    ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts
+                )
         except RuntimeError:
             if WebSocketState.DISCONNECTED in (ws.application_state, ws.client_state):
                 # A local close (ping timeout, retire) or the peer's close won the
@@ -770,6 +775,9 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
                 _logger.debug("Runner %s send raced a concurrent close", session.runner_id)
                 return
             raise
+        finally:
+            if frame.on_sent is not None:
+                frame.on_sent()
 
 
 async def _receive_tunnel_text(ws: WebSocket, runner_id: str) -> str | None:
