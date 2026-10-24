@@ -261,13 +261,13 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@9dde2bee3b3b55b944c7e2ebb10bb9208d3ffb7b
         with:
           harness: claude
 
       - name: Install Codex CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@9dde2bee3b3b55b944c7e2ebb10bb9208d3ffb7b
         with:
           harness: codex
 
