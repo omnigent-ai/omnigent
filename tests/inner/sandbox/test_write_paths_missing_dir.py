@@ -27,7 +27,6 @@ failure is specifically the missing-directory case.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -35,7 +34,11 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
-from tests.inner.sandbox.conftest import _repo_root_for_pythonpath, run_async
+from tests.inner.sandbox.conftest import (
+    _bwrap_functional,
+    _repo_root_for_pythonpath,
+    run_async,
+)
 
 _BWRAP = shutil.which("bwrap")
 
@@ -43,26 +46,6 @@ linux_bwrap_only = pytest.mark.skipif(
     not sys.platform.startswith("linux") or _BWRAP is None,
     reason="linux_bwrap requires Linux + bwrap on PATH",
 )
-
-
-def _bwrap_functional() -> bool:
-    """Whether bwrap can actually create a namespace on this host.
-
-    A seccomp-confined CI runner can have ``bwrap`` on PATH while the
-    kernel denies unprivileged user namespaces; the runtime tests skip
-    there instead of failing for a reason unrelated to the bug.
-    """
-    if _BWRAP is None or not sys.platform.startswith("linux"):
-        return False
-    try:
-        proc = subprocess.run(
-            [_BWRAP, "--ro-bind", "/", "/", "/bin/true"],
-            capture_output=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return proc.returncode == 0
 
 
 def _missing_dir_spec(workspace: Path) -> OSEnvSpec:
