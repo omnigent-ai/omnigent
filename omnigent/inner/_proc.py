@@ -222,6 +222,17 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def process_create_time(pid: int) -> float | None:
+    """Return the OS start time identifying the process at *pid*, or ``None``.
+
+    Pairs with the PID to detect reuse: a recycled PID reports a different
+    start time, letting a caller reject a stale PID before acting on it.
+    """
+    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        return _process_start_stamp(psutil.Process(pid))
+    return None
+
+
 def _process_start_stamp(proc: psutil.Process) -> float:
     """Return ``proc``'s creation time on a clock that wall-clock steps can't move.
 

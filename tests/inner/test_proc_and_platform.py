@@ -292,6 +292,29 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
+def test_process_create_time_is_stable_for_a_live_process() -> None:
+    proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    try:
+        identity = _proc.process_create_time(proc.pid)
+        assert identity is not None and identity > 0
+        assert _proc.process_create_time(proc.pid) == identity
+    finally:
+        _proc.kill_tree(proc)
+        proc.wait(timeout=5)
+
+
+def test_process_create_time_is_none_for_a_bogus_pid() -> None:
+    assert _proc.process_create_time(2_000_000_000) is None
+
+
+def test_process_create_time_swallows_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _deny(pid: int) -> psutil.Process:
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(_proc.psutil, "Process", _deny)
+    assert _proc.process_create_time(1234) is None
+
+
 def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
     """A target pgid of 1 must never be signalled.
 
@@ -431,6 +454,7 @@ def test_kill_tree_survives_a_wall_clock_step(
     _proc.remember_process_group(proc)
     child: psutil.Process | None = None
     try:
+        identity = _proc.process_create_time(proc.pid)
         deadline = time.monotonic() + 10
         while not child_pid_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -438,6 +462,7 @@ def test_kill_tree_survives_a_wall_clock_step(
         _proc.refresh_process_tree(proc)
         real_boot_time = pslinux.boot_time
         monkeypatch.setattr(pslinux, "boot_time", lambda: real_boot_time() + step)
+        assert _proc.process_create_time(proc.pid) == identity
 
         _proc.kill_tree(proc)
 
