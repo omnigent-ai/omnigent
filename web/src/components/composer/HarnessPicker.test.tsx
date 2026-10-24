@@ -390,6 +390,15 @@ describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
     expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
   });
 
+  it("caps the Edit configuration flyout while keeping it vertically scrollable", () => {
+    openConfig();
+    const flyout = screen.getByTestId("config-menu");
+    expect(flyout).toHaveClass("composer-agent-config-menu", "overflow-y-auto");
+    expect(flyout.className).toContain(
+      "max-h-[min(24rem,var(--radix-dropdown-menu-content-available-height,24rem))]",
+    );
+  });
+
   it("closes the config flyout on a second click of Edit (pointer toggle)", () => {
     openConfig();
     fireEvent.click(screen.getByTestId("edit"));
