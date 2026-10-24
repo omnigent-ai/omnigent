@@ -126,6 +126,25 @@ class RoutedCall:
     client: RoutingClient
 
 
+def _without_excluded(available_models: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Drop the models the deployment's ``routing.exclude_models`` names.
+
+    A harness the exclusion would leave with nothing keeps its own list, so
+    the setting can narrow a menu but never empty it.
+    """
+    from omnigent.runtime._globals import _caps
+
+    excluded = getattr(getattr(_caps, "routing_settings", None), "exclude_models", ())
+    if not excluded:
+        return available_models
+    from omnigent.server.smart_routing import is_excluded_model
+
+    return {
+        harness: [m for m in models if not is_excluded_model(m, excluded)] or models
+        for harness, models in available_models.items()
+    }
+
+
 async def route_with_fallback(
     backends: RoutingBackends,
     message: str,
@@ -154,6 +173,7 @@ async def route_with_fallback(
     choice = select_router(backends, gateway_backed=gateway_backed)
     if choice is None:
         return None
+    available_models = _without_excluded(available_models)
     if choice.source != "databricks-aigw" or backends.local is None:
         return RoutedCall(
             result=await choice.client.route(message, available_models),
