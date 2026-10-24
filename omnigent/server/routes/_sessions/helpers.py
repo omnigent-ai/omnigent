@@ -4937,6 +4937,8 @@ def _publish_status(
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
     failure_context: object = None,
+    *,
+    completes_scheduled_run: bool = True,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4971,6 +4973,9 @@ def _publish_status(
         undifferentiated signature. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
         the failure-log boundary. Malformed values cannot reject the status edge.
+    :param completes_scheduled_run: Whether an ``idle`` edge can complete a
+        scheduled run. ``False`` marks PTY activity that is not authoritative
+        for a harness with a hook forwarder; ``failed`` edges ignore it.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5016,7 +5021,7 @@ def _publish_status(
             error_code="incomplete",
             error="runner disappeared before the turn reached a terminal state",
         )
-    elif status == "idle":
+    elif status == "idle" and completes_scheduled_run:
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated

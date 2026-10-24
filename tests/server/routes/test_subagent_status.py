@@ -752,3 +752,50 @@ async def test_native_child_completes_once_per_confirmed_turn(
         assert all(item.data.event_type == "session.subagent.returned" for item in notices)
         assert all(item.data.resource_id == route.child_id for item in notices)
         assert all(item.data.resource["status"] == "completed" for item in notices)
+
+
+@pytest.mark.parametrize(
+    ("harness", "source", "run_status_after_relay"),
+    [
+        ("claude-native", "pty_activity", "running"),
+        ("pi-native", "pty_activity", "succeeded"),
+        ("claude-native", None, "succeeded"),
+    ],
+)
+async def test_relayed_pane_idle_scheduled_run_completion(
+    status_route: _StatusRoute,
+    harness: str,
+    source: str | None,
+    run_status_after_relay: str,
+) -> None:
+    """PTY idle is authoritative only for harnesses without a hook forwarder."""
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+
+    route = status_route
+    route.store.update_conversation(route.child_id, harness_override=harness)
+    event: dict[str, Any] = {"type": "session.status", "status": "idle"}
+    if source is not None:
+        event["source"] = source
+    release = asyncio.Event()
+    release.set()
+    await _relay_runner_stream_once(
+        route.child_id,
+        _ScriptedRunnerClient(release, [event]),
+        route.store,
+    )
+    await _flush_live_state()
+
+    runs, _ = route.scheduled.list_runs(route.task_id)
+    run = next(item for item in runs if item.conversation_id == route.child_id)
+    assert run.status == run_status_after_relay
+
+    if run_status_after_relay == "running":
+        response = await route.client.post(
+            f"/v1/sessions/{route.child_id}/events",
+            json={"type": "external_session_status", "data": {"status": "idle"}},
+        )
+        assert response.status_code == 202, response.text
+        await _flush_live_state()
+        runs, _ = route.scheduled.list_runs(route.task_id)
+        run = next(item for item in runs if item.conversation_id == route.child_id)
+        assert run.status == "succeeded"
