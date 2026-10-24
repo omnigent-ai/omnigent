@@ -471,6 +471,19 @@ def _token_secret_name(job_name: str) -> str:
     return f"{job_name}-token"
 
 
+def _clone_helper_source(server_url: str, host_id: str) -> str:
+    """Python source of the init container's git credential helper.
+
+    The token joins its flag as one ``--host-token=<tok>`` argument, so a token
+    that starts with ``-`` cannot parse as an option.
+    """
+    return (
+        "import os,sys; from omnigent.git_credential_github import main; "
+        f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
+        f"'--host-token='+os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
+    )
+
+
 def _render_workspace_prep_command(
     workspace: str,
     repos: Sequence[RepoWorkspace],
@@ -501,12 +514,7 @@ def _render_workspace_prep_command(
     if repos:
         # Keep the launch token in the init container's environment: the helper
         # reads it in-process instead of persisting it or putting it in argv.
-        helper_source = (
-            "import os,sys; from omnigent.git_credential_github import main; "
-            f"sys.exit(main(['--server',{server_url!r},'--host-id',{host_id!r},"
-            f"'--host-token',os.environ[{HOST_TOKEN_ENV_VAR!r}],*sys.argv[1:]]))"
-        )
-        helper = f"!python3 -Ic {shlex.quote(helper_source)}"
+        helper = f"!python3 -Ic {shlex.quote(_clone_helper_source(server_url, host_id))}"
         helper_key = "credential.https://github.com.helper"
         expected_helpers = ["", helper]
         wire = (

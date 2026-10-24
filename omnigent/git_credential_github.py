@@ -34,7 +34,8 @@ already-fetched token. The trust boundary is the sandbox, not this helper.
 
 Run as: ``git credential.helper`` →
 ``python -m omnigent.git_credential_github --server <url> --host-id <id>
---host-token <tok>``.
+--host-token=<tok>``. The token is attached to its flag because a launch token
+can start with ``-``.
 """
 
 from __future__ import annotations
@@ -157,7 +158,7 @@ def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
     helper = (
         "!python3 -m omnigent.git_credential_github "
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
-        f"--host-token {shlex.quote(token)}"
+        f"--host-token={shlex.quote(token)}"
     )
     _git_config("--replace-all", "credential.https://github.com.helper", "")
     _git_config("--add", "credential.https://github.com.helper", helper)
