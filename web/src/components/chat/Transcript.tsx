@@ -15,12 +15,14 @@ import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent } from "@/lib/systemMessage";
 import { isTerminalCommandInput } from "@/lib/blocks";
+import { readsFollowUpsOnNextTurn, useLiveSteeringHarnessIds } from "@/lib/agentLabels";
 import {
   type Bubble,
   type BubbleCache,
   buildBubbles,
   createBubbleCache,
   liveCandidateAssistantIndex,
+  workingIndicatorInsertIndex,
 } from "@/lib/renderItems";
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
@@ -62,6 +64,7 @@ import {
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  useWorkingIndicatorPaints,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -135,6 +138,14 @@ function TranscriptImpl({
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
   const conversationId = useChatStore((s) => s.conversationId);
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const isNativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
+  const liveSteeringHarnesses = useLiveSteeringHarnessIds();
+  const placeNextTurnFollowUps = readsFollowUpsOnNextTurn(
+    sessionHarness,
+    liveSteeringHarnesses,
+    isNativeTerminalSession,
+  );
 
   // Build bubbles once per blocks/activeResponse change. Per-surface reuse
   // cache so a streaming append rebuilds only the active bubble, reusing the
@@ -150,6 +161,7 @@ function TranscriptImpl({
           bubbleCacheRef.current,
           interruptedResponseIds,
           computeIsWorking(sessionStatus),
+          placeNextTurnFollowUps,
         ),
       ),
       subagentRoutingOverride,
@@ -166,6 +178,7 @@ function TranscriptImpl({
     pendingUserMessages,
     subagentRoutingOverride,
     sessionStatus,
+    placeNextTurnFollowUps,
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
@@ -298,9 +311,25 @@ function TranscriptImpl({
     return out;
   }, [display.bubbles]);
 
+  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  // Repositioning the marker is worth it only when the indicator actually
+  // paints. In the background-tasks-only state it renders nothing, so splicing
+  // a marker row would reserve blank space in the virtualized list.
+  const workingIndicatorRenders = useWorkingIndicatorPaints() && showWorkingIndicator;
+  // Keep Working… with the running turn, above a follow-up sent mid-turn.
+  const workingInsert = useMemo(
+    () => workingIndicatorInsertIndex(display.streamBubbles, workingIndicatorRenders),
+    [display.streamBubbles, workingIndicatorRenders],
+  );
+  const streamBubblesWithWorking = useMemo<Bubble[]>(() => {
+    if (workingInsert === -1) return display.streamBubbles;
+    const next = display.streamBubbles.slice();
+    next.splice(workingInsert, 0, { kind: "working", itemId: "working" });
+    return next;
+  }, [display.streamBubbles, workingInsert]);
   const lastAssistantIndex = useMemo(
-    () => liveCandidateAssistantIndex(display.streamBubbles),
-    [display.streamBubbles],
+    () => liveCandidateAssistantIndex(streamBubblesWithWorking),
+    [streamBubblesWithWorking],
   );
 
   // Cmd+Alt+↑/↓ (Ctrl+Alt on win/linux) user-turn navigation.
@@ -317,7 +346,6 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
@@ -379,7 +407,7 @@ function TranscriptImpl({
                 {/* Older pages prepend here while their request is in flight. */}
                 {display.loadingMoreHistory && <HistoryLoadingIndicator />}
                 <VirtualBubbleList
-                  bubbles={display.streamBubbles}
+                  bubbles={streamBubblesWithWorking}
                   scrollEl={scroller?.el ?? null}
                   lastAssistantIndex={lastAssistantIndex}
                   showsWorking={display.showsWorking}
@@ -405,8 +433,15 @@ function TranscriptImpl({
                     </MessageContent>
                   </Message>
                 ))}
-                {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                {/* Working… shimmer, lit for the whole busy turn. When it moves to
+                a marker row above a waiting follow-up, only the aria-live
+                announcement stays at the tail. */}
+                {showWorkingIndicator &&
+                  (workingInsert === -1 ? (
+                    <WorkingIndicator />
+                  ) : (
+                    <WorkingIndicator mode="announce" />
+                  ))}
                 {/* Managed-sandbox stage cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the

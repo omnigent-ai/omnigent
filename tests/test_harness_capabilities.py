@@ -9,7 +9,12 @@ drift.
 
 from __future__ import annotations
 
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
 from omnigent import harness_plugins as hp
+from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
     AuthModel,
@@ -27,6 +32,7 @@ from omnigent.harness_plugins import (
     harness_capabilities,
     harness_catalog,
     harness_setup_steps_by_spelling,
+    live_steering_harnesses,
     native_agents,
     valid_harnesses,
 )
@@ -34,6 +40,7 @@ from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
 )
+from omnigent.server.routes.harnesses import create_harnesses_router
 
 _NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
 
@@ -406,3 +413,57 @@ def test_sdk_harnesses_only_advertise_effort_their_executor_applies() -> None:
     ):
         assert caps[harness].effort is not EffortFamily.NONE, harness
         assert "reasoning_effort" in inspect.getsource(module), harness
+
+
+_ACP_EXECUTOR = "omnigent.inner.acp_executor:AcpExecutor"
+_SDK_EXECUTORS = {
+    "acp": _ACP_EXECUTOR,
+    **dict.fromkeys(ACP_CLI_HARNESSES, _ACP_EXECUTOR),
+    "antigravity": "omnigent.inner.antigravity_executor:AntigravityExecutor",
+    "claude-sdk": "omnigent.inner.claude_sdk_executor:ClaudeSDKExecutor",
+    "codex": "omnigent.inner.codex_executor:CodexExecutor",
+    "copilot": "omnigent.inner.copilot_executor:CopilotExecutor",
+    "cursor": "omnigent.inner.cursor_executor:CursorExecutor",
+    "goose": "omnigent.inner.goose_executor:GooseExecutor",
+    "hermes": "omnigent.inner.hermes_executor:HermesExecutor",
+    "kimi": "omnigent.inner.kimi_executor:KimiExecutor",
+    "open-responses": "omnigent.inner.open_responses_sdk:OpenResponsesExecutor",
+    "openai-agents": "omnigent.inner.openai_agents_sdk_executor:OpenAIAgentsSDKExecutor",
+    "pi": "omnigent.inner.pi_executor:PiExecutor",
+    "qwen": "omnigent.inner.qwen_executor:QwenExecutor",
+}
+
+
+@pytest.mark.parametrize(("harness", "executor_path"), sorted(_SDK_EXECUTORS.items()))
+def test_sdk_steering_matches_the_executors_live_message_queue(
+    harness: str, executor_path: str
+) -> None:
+    """``steering`` tells the web UI whether a running SDK turn reads a message sent mid-turn.
+
+    The adapter injects that message only into an executor with a live message
+    queue; any other executor reads it on its next turn, which the transcript
+    renders after the running turn.
+    """
+    executor_cls = hp.load_object(executor_path)
+    assert isinstance(executor_cls, type)
+    live_queue = executor_cls.supports_live_message_queue(object.__new__(executor_cls))
+    assert (harness_capabilities()[harness].steering is True) is live_queue
+
+
+def test_sdk_executor_table_covers_every_non_native_harness() -> None:
+    caps = harness_capabilities()
+    non_native = {h for h in valid_harnesses() if caps[h].integration_mode not in _NATIVE_MODES}
+    assert set(_SDK_EXECUTORS) == non_native
+
+
+def test_live_steering_lists_steering_harnesses_and_their_aliases() -> None:
+    steering = set(live_steering_harnesses())
+    assert {"codex", "pi", "devin-native", "devin"} <= steering
+    assert steering.isdisjoint({"claude-sdk", "openai-agents", "openai-agents-sdk", "cursor"})
+
+
+def test_harnesses_route_serves_live_steering() -> None:
+    app = FastAPI()
+    app.include_router(create_harnesses_router(), prefix="/v1")
+    body = TestClient(app).get("/v1/harnesses").json()
+    assert body["live_steering"] == live_steering_harnesses()

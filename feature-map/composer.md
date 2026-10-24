@@ -495,7 +495,10 @@ Other connection providers alone do not enable the managed MCP picker.
   Ctrl+Shift+M does nothing.
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
-  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`
+  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`,
+  `tests/e2e_ui/chat/test_steered_followup_waits_behind_active_turn.py::test_follow_up_sent_mid_turn_waits_behind_the_running_turn`
+  (a non-steering harness keeps the running turn, Working…, and its reply
+  above a follow-up sent mid-turn)
 - **`browser-pointer-queue`, desktop:** manually hold an agent turn open, then
   send a normal composer follow-up and two pointer instructions (Send and Enter).
   With Always steer off, all three stay queued and the popup says "Queued for
