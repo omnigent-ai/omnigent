@@ -400,6 +400,18 @@ _AGY_SKILL_DIRS = (
 )
 
 
+# agy reads global rules (root/config GEMINI.md / AGENTS.md plus config/rules/) only
+# from the --gemini_dir it runs under, so without these links a session starts with
+# none of the rules the user's interactive agy applies.
+_AGY_GLOBAL_RULE_PATHS = (
+    Path("GEMINI.md"),
+    Path("AGENTS.md"),
+    Path(_MCP_CONFIG_DIR) / "GEMINI.md",
+    Path(_MCP_CONFIG_DIR) / "AGENTS.md",
+    Path(_MCP_CONFIG_DIR) / "rules",
+)
+
+
 def agy_home_dir(bridge_dir: Path) -> Path:
     """Return the parent directory for this session's isolated agy state.
 
@@ -586,6 +598,7 @@ def seed_isolated_agy_home(
 
     _seed_isolated_agy_plugins(real_home, iso_gemini)
     _seed_isolated_agy_skills(real_home, iso_gemini)
+    _seed_isolated_agy_rules(real_home, iso_gemini)
     _seed_isolated_agy_hooks(real_home, iso_gemini)
 
     if trusted_workspace is not None:
@@ -696,6 +709,21 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
         _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
 
 
+def _seed_isolated_agy_rules(real_home: Path, iso_gemini: Path) -> None:
+    """Expose the user's global agy rules under the isolated Gemini dir.
+
+    Links each path in :data:`_AGY_GLOBAL_RULE_PATHS` back to the real home, so
+    an edit to a global rule reaches the next turn exactly as it does for the
+    user's interactive agy. Best-effort, like the skill seed: a missing rule
+    file seeds nothing.
+
+    :param real_home: The user's real home directory.
+    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
+    """
+    for rel in _AGY_GLOBAL_RULE_PATHS:
+        _link_into_isolated_gemini_dir(real_home / ".gemini" / rel, iso_gemini / rel)
+
+
 def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
     """Refresh session hooks while preserving each command's original working directory."""
     real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
@@ -734,14 +762,14 @@ def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
     """Symlink *link* at the isolated Gemini dir to the real tree *real*.
 
     Linking rather than copying keeps a tree the user edits mid-session (a
-    ``/plugin install``, a newly authored skill) visible instead of pinning a
-    stale snapshot. A missing source seeds nothing.
+    ``/plugin install``, a newly authored skill or rule) visible instead of
+    pinning a stale snapshot. A missing source seeds nothing.
 
-    :param real: Source directory in the user's real ``~/.gemini``.
+    :param real: Source directory or file in the user's real ``~/.gemini``.
     :param link: Path to create under the bridge-owned ``--gemini_dir``.
     :returns: None.
     """
-    if not real.is_dir():
+    if not real.exists():
         return
     with contextlib.suppress(OSError):
         # Re-seeding an existing bridge dir must not fail on the prior link;
@@ -750,7 +778,7 @@ def _link_into_isolated_gemini_dir(real: Path, link: Path) -> None:
             link.unlink()
         if not link.exists():
             link.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            link.symlink_to(real.resolve(), target_is_directory=True)
+            link.symlink_to(real.resolve(), target_is_directory=real.is_dir())
 
 
 # agy's periodic engagement survey ("How's the CLI experience so far?") is gated by

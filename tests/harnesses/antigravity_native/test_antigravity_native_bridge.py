@@ -2134,6 +2134,42 @@ def test_seed_isolated_agy_home_skill_links_never_mutate_real_home(
     assert sorted(p.name for p in real_shared.iterdir()) == []
 
 
+def test_seed_isolated_agy_home_exposes_user_global_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agy's global rule files and ``config/rules/`` resolve under ``--gemini_dir``.
+
+    agy reads global rules only from the Gemini dir it runs under, so an
+    unlinked isolated dir silently drops every rule the user's interactive agy
+    applies. Links (not copies) keep a mid-session edit visible; a rule path the
+    user lacks seeds nothing; re-seeding an existing bridge dir is a no-op.
+    """
+    fake_home = tmp_path / "real-home"
+    real_gemini = fake_home / ".gemini"
+    (real_gemini / "config" / "rules").mkdir(parents=True)
+    (real_gemini / "GEMINI.md").write_text("root gemini", encoding="utf-8")
+    (real_gemini / "config" / "AGENTS.md").write_text("config agents", encoding="utf-8")
+    (real_gemini / "config" / "rules" / "style.md").write_text("always on", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_gemini = agy_gemini_dir(bridge_dir)
+    for rel in ("GEMINI.md", "config/AGENTS.md", "config/rules"):
+        assert (iso_gemini / rel).is_symlink(), rel
+    assert (iso_gemini / "GEMINI.md").read_text(encoding="utf-8") == "root gemini"
+    assert (iso_gemini / "config" / "rules" / "style.md").read_text(
+        encoding="utf-8"
+    ) == "always on"
+    (real_gemini / "GEMINI.md").write_text("edited", encoding="utf-8")
+    assert (iso_gemini / "GEMINI.md").read_text(encoding="utf-8") == "edited"
+    assert not (iso_gemini / "AGENTS.md").exists()
+    assert not (iso_gemini / "config" / "GEMINI.md").exists()
+
+
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
     """The isolated state parent is a child of the per-session bridge dir."""
     bridge_dir = tmp_path / "bridge"
