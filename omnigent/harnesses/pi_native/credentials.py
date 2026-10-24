@@ -719,17 +719,26 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     gpt_models: list[_PiModelEntry] = []
     completions_models: list[_PiModelEntry] = []
     gemini_models: list[_PiModelEntry] = []
+    list_host: str | None = None
+    list_token: str | None = None
     try:
         creds = resolve_databricks_workspace(entry.profile)
+        list_host, list_token = creds.host, creds.token
     except Exception:  # noqa: BLE001 — credential failure must not break launch
-        _LOGGER.info(
-            "pi-native: falling back to single-model display (could not resolve credentials)"
-        )
-        credential_warning = _databricks_credential_warning(entry.profile)
-    else:
+        # The SDK probe can fail where Pi's apiKey command works (it skips any
+        # `databricks` under 1 MB, e.g. a wrapper shim); trust the command Pi runs.
+        list_token = _run_auth_command(auth_command)
+        if list_token:
+            list_host = host
+        else:
+            _LOGGER.info(
+                "pi-native: falling back to single-model display (could not resolve credentials)"
+            )
+            credential_warning = _databricks_credential_warning(entry.profile)
+    if list_host and list_token:
         try:
             claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                creds.host, creds.token
+                list_host, list_token
             )
         except Exception:  # noqa: BLE001 — network failure must not break launch
             _LOGGER.info(

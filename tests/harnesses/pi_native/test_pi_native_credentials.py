@@ -105,6 +105,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
         raise OSError("refresh token is invalid")
 
     monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -112,6 +113,49 @@ def test_databricks_unresolvable_credentials_sets_warning(
     assert provider.credential_warning is not None
     assert "demo-staging" in provider.credential_warning
     assert "databricks auth login" in provider.credential_warning
+
+
+def test_databricks_sdk_probe_failure_with_working_auth_command_has_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK probe fails but Pi's apiKey command mints a token -> no false warning.
+
+    The SDK rejects a ``databricks`` wrapper shim on PATH that the apiKey
+    command runs fine, so the command decides whether the session works.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("databricks-sdk could not mint a token")
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    commands: list[str] = []
+
+    def _auth(command: str) -> str:
+        commands.append(command)
+        return "cmd-tok"
+
+    monkeypatch.setattr(creds, "_run_auth_command", _auth)
+    fetched: list[tuple[str, str]] = []
+
+    def _fetch(host: str, token: str):
+        fetched.append((host, token))
+        return [], [], [], []
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    assert commands == [provider.api_key.removeprefix("!")]
+    assert fetched == [("https://wkspc.example.com", "cmd-tok")]
 
 
 def test_databricks_model_list_failure_has_no_warning(
