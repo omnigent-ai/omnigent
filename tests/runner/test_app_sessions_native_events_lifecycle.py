@@ -4674,6 +4674,126 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "during_grace,replacement_kind",
+    [
+        (False, "terminal"),
+        (True, "terminal"),
+        (True, "completed-turn"),
+        (True, "initializing"),
+        (True, "cache-reset"),
+    ],
+    ids=[
+        "before-cleanup",
+        "during-grace",
+        "completed-turn",
+        "init-during-grace",
+        "cache-reset",
+    ],
+)
+async def test_required_terminal_cleanup_preserves_a_resumed_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    during_grace: bool,
+    replacement_kind: str,
+) -> None:
+    """An old pane's deferred harness cleanup cannot close its replacement."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = uuid.uuid4().hex
+    terminals = TerminalRegistry()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminals,
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    if during_grace:
+        app.state.live_response_id[conv_id] = "resp_old"
+    publish_exit(
+        TerminalExitEvent(
+            session_id=conv_id,
+            terminal_id="terminal_claude_main",
+            terminal_name="claude",
+            session_key="main",
+            lifecycle=TerminalLifecycle.REQUIRED,
+            session_was_idle=True,
+        )
+    )
+    release_task = next(
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == f"required-terminal-release:{conv_id}"
+    )
+    acquired = asyncio.Event()
+    finish_init = asyncio.Event()
+    init_task = None
+    try:
+        if during_grace:
+            await asyncio.sleep(0)
+            assert not release_task.done()
+        app.state.live_response_id.pop(conv_id, None)
+        replacement = None
+        if replacement_kind == "terminal":
+            replacement = make_test_terminal_instance("claude", "main", tmp_path)
+            terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = replacement
+        elif replacement_kind == "initializing":
+            original_get_client = pm.get_client
+
+            async def pause_after_acquisition(*args: Any, **kwargs: Any) -> Any:
+                client = await original_get_client(*args, **kwargs)
+                acquired.set()
+                await finish_init.wait()
+                return client
+
+            monkeypatch.setattr(pm, "get_client", pause_after_acquisition)
+            async with _runner_client(app) as client:
+                init_task = asyncio.create_task(
+                    client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "agent"})
+                )
+                await asyncio.wait_for(acquired.wait(), timeout=2.0)
+                assert terminals.get(conv_id, "claude", "main") is None
+                await asyncio.wait_for(release_task, timeout=1.0)
+                assert pm.has_session(conv_id), "cleanup released a harness during session init"
+                assert pm.release_guards == [(conv_id, True, False)]
+                finish_init.set()
+                response = await asyncio.wait_for(init_task, timeout=2.0)
+                assert response.status_code == 201, response.text
+        elif replacement_kind == "cache-reset":
+            async with _runner_client(app) as client:
+                response = await client.post(
+                    f"/v1/sessions/{conv_id}/agent-cache/reset", json={"agent_id": "replacement"}
+                )
+            assert response.status_code == 200, response.text
+        else:
+            async with _runner_client(app) as client:
+                response = await client.post(
+                    f"/v1/sessions/{conv_id}/events?stream=true",
+                    json={"type": "message", "role": "user", "model": "fake/model", "content": []},
+                )
+            assert response.status_code == 200, response.text
+            assert conv_id not in app.state.active_turns
+        await asyncio.wait_for(release_task, timeout=1.0)
+
+        assert pm.has_session(conv_id), "old terminal cleanup released the replacement harness"
+        assert pm.released == []
+        if not during_grace and replacement_kind == "terminal":
+            assert pm.release_guards == [(conv_id, False, True)]
+        assert terminals.get(conv_id, "claude", "main") is replacement
+    finally:
+        finish_init.set()
+        if init_task is not None and not init_task.done():
+            await asyncio.wait_for(init_task, timeout=2.0)
+        app.state.live_response_id.pop(conv_id, None)
+        _session_event_queues_ref.pop(conv_id, None)
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_codex_tui_exit_preserves_app_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

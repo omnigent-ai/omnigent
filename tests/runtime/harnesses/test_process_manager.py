@@ -801,6 +801,61 @@ async def test_release_clears_marker_before_same_session_replacement(
         await manager.shutdown()
 
 
+@pytest.mark.parametrize("replacement", ["owner", "reacquired", "activity"])
+async def test_release_rechecks_ownership_after_waiting_for_spawn(
+    manager: HarnessProcessManager,
+    replacement: str,
+) -> None:
+    """Cleanup waiting on a spawn cannot retire a newly owned harness."""
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        manager.mark_in_flight("conv_release", "resp_replacement")
+        spawn_lock = await manager._get_spawn_lock("conv_release")
+        owns_release = True
+        cutoff = time.monotonic()
+        reacquired = None
+        async with spawn_lock:
+            if replacement == "reacquired":
+                reacquired = asyncio.create_task(
+                    manager.get_client("conv_release", _TEST_HARNESS_NAME)
+                )
+            release = asyncio.create_task(
+                manager.release(
+                    "conv_release",
+                    only_if_current=lambda: owns_release,
+                    only_if_unused_since=cutoff,
+                )
+            )
+            await asyncio.sleep(0)
+            assert not release.done()
+            if replacement == "owner":
+                owns_release = False
+            elif replacement == "activity":
+                manager.note_activity("conv_release")
+        if reacquired is not None:
+            assert await reacquired is client
+        await release
+
+        assert manager.has_active_turn("conv_release")
+        assert await manager.get_client("conv_release", _TEST_HARNESS_NAME) is client
+        assert (await client.get("/pid")).json()["pid"] == pid
+        assert _pid_alive(pid)
+
+        owns_release = True
+        await manager.release(
+            "conv_release",
+            only_if_current=lambda: owns_release,
+            only_if_unused_since=time.monotonic(),
+        )
+        assert not manager.has_session("conv_release")
+        assert not manager.has_active_turn("conv_release")
+        assert not _pid_alive(pid)
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_respawns_on_harness_change(
     manager: HarnessProcessManager,
 ) -> None:

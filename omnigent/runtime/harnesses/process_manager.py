@@ -1125,7 +1125,12 @@ class HarnessProcessManager:
         self._in_flight_response_ids.pop(conversation_id, None)
 
     async def release(
-        self, conversation_id: str, *, only_if_idle_cutoff: float | None = None
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+        only_if_current: Callable[[], bool] | None = None,
+        only_if_unused_since: float | None = None,
     ) -> None:
         """
         Terminate and unregister the subprocess for a conversation.
@@ -1167,12 +1172,25 @@ class HarnessProcessManager:
         spawn lock is acquired).
 
         :param conversation_id: AP-allocated conversation id.
+        :param only_if_current: Synchronous ownership check evaluated under the
+            spawn and registry locks, immediately before unregistering.
+        :param only_if_unused_since: Preserve an entry acquired or touched after
+            this monotonic timestamp, even before a new terminal is registered.
+            Unlike idle reaping, a draining old turn does not veto release.
         """
         spawn_lock = await self._get_spawn_lock(conversation_id)
         async with spawn_lock:
             async with self._registry_lock:
+                if only_if_current is not None and not only_if_current():
+                    return
+                current = self._entries.get(conversation_id)
+                if (
+                    only_if_unused_since is not None
+                    and current is not None
+                    and current.last_used_at > only_if_unused_since
+                ):
+                    return
                 if only_if_idle_cutoff is not None:
-                    current = self._entries.get(conversation_id)
                     if (
                         current is None
                         or current.last_used_at > only_if_idle_cutoff
