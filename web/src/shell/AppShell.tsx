@@ -114,6 +114,7 @@ import {
 } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
@@ -126,7 +127,8 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
-import { isMobileViewport, Sidebar } from "./Sidebar";
+import { isMobileViewport } from "@/lib/breakpoints";
+import { Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -360,6 +362,7 @@ function AppShellImpl() {
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
+  const mobileViewport = useIsMobileViewport();
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -903,18 +906,6 @@ function AppShellImpl() {
   useEffect(() => {
     if (rootSessionResolved) stickyRootRef.current = rootSessionId;
   }, [rootSessionId, rootSessionResolved]);
-  const {
-    panelWidth: inlinePanelWidth,
-    preferredContentWidth: preferredConversationWidth,
-    handleProps: inlinePanelHandleProps,
-    isDragging: inlinePanelResizing,
-  } = useResizableInlinePanel(
-    rootSessionId,
-    inlinePanelMinWidth,
-    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
-    rootSessionResolved,
-    canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
-  );
   // How many children are actively working — surfaced in the tab badge so
   // "something's happening" is visible without opening the panel.
   const subagentsWorking = childSessions.filter((c) => c.busy).length;
@@ -2364,6 +2355,19 @@ function AppShellImpl() {
     focusWorkspaceTabsOnOpenRef.current = false;
     focusWorkspaceTabs();
   }, [workspacePanelVisible, focusWorkspaceTabs]);
+  const {
+    panelWidth: inlinePanelWidth,
+    preferredContentWidth: preferredConversationWidth,
+    handleProps: inlinePanelHandleProps,
+    isDragging: inlinePanelResizing,
+  } = useResizableInlinePanel(
+    rootSessionId,
+    inlinePanelMinWidth,
+    (sidebarOpen ? sidebarWidth : 0) + (canvasMode ? canvasReservedWidth : 0),
+    workspacePanelVisible && !mobileViewport,
+    rootSessionResolved,
+    canvasMode ? CANVAS_CONVERSATION_MIN_WIDTH : undefined,
+  );
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
@@ -2855,12 +2859,11 @@ function AppShellImpl() {
 }
 
 /**
- * Initial sidebar open state — open on desktop, closed on mobile. SSR-
- * safe (returns false when window is undefined). The threshold (`md`)
- * matches Tailwind's default 768px, used in the Sidebar's responsive
- * classes.
+ * Initial sidebar open state — open on desktop, closed on mobile, per the
+ * one canonical layout predicate ("mobile unless provably md+"). SSR-safe
+ * (returns false when window is undefined).
  */
 function initialSidebarOpen(): boolean {
   if (typeof window === "undefined") return false;
-  return window.matchMedia("(min-width: 768px)").matches;
+  return !isMobileViewport();
 }

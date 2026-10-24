@@ -17,6 +17,21 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* Input-capability gate shared by the sidebar's hover-revealed controls: a
+   control fades until hover only when the PRIMARY pointer is fine and can
+   hover; everywhere else (touch tablets, coarse-primary convertibles) it stays
+   painted and reserves its column. Complement via `no-fine-hover`. */
+@custom-variant fine-hover (@media (hover: hover) and (pointer: fine));
+@custom-variant no-fine-hover (@media not ((hover: hover) and (pointer: fine)));
+
+/* Only the sidebar itself reads its width; not inheriting keeps a resize drag
+   from restyling every row beneath it. */
+@property --sidebar-width {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
 @theme inline {
   --font-heading: var(--font-sans);
   /* Native system UI font stack — defers to whatever the OS ships
