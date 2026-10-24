@@ -122,6 +122,9 @@ _REFRESHABLE_HTTP_STATUSES = {401, 403}
 # it reaches the server) and exiting would kill every conversation on the
 # runner. Mirrors the host tunnel's status classification.
 _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
+# A never-connected runner with no credential to send keeps re-minting for this long
+# before it exits as signed out; a transient mint failure clears within the window.
+_NO_CREDENTIAL_FATAL_WINDOW_S = 120.0
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
 # ingress cycles long-lived WebSockets out from under a healthy app. The
@@ -431,6 +434,8 @@ async def serve_tunnel(
     login_redirect_streak = 0
     # Consecutive HTTP 401/403 rejections; reset by a successful upgrade.
     http_auth_rejection_streak = 0
+    # When the current rejection streak began (``time.monotonic()``).
+    http_auth_rejection_started: float | None = None
     connected_this_attempt = False
     connect_monotonic: float | None = None
     # Debug-log correlation: the attempt ordinal within the current reconnect
@@ -449,6 +454,7 @@ async def serve_tunnel(
         nonlocal ever_connected
         nonlocal login_redirect_streak
         nonlocal http_auth_rejection_streak
+        nonlocal http_auth_rejection_started
         nonlocal connect_monotonic
         record_websocket_connected("runner", reconnect=ever_connected)
         # Tell the launching host's connect watchdog this runner made it.
@@ -457,6 +463,7 @@ async def serve_tunnel(
         ever_connected = True
         login_redirect_streak = 0
         http_auth_rejection_streak = 0
+        http_auth_rejection_started = None
         connect_monotonic = time.monotonic()
 
     # Set by the per-connection suspend watcher (in _serve_tunnel_once) when it
@@ -620,25 +627,32 @@ async def serve_tunnel(
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
-                    if (
-                        not ever_connected
-                        and auth_token is None
+                    if http_auth_rejection_streak == 1:
+                        http_auth_rejection_started = time.monotonic()
+                    no_credential_to_send = (
+                        auth_token is None
                         and auth_token_factory is not None
                         and not getattr(auth_token_factory, "declined", False)
+                    )
+                    if (
+                        not ever_connected
+                        and no_credential_to_send
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
-                        # Same streak as the rejection below: a transient mint
-                        # failure (factory returned None) still gets the loop-top
-                        # re-mint; only the message names the local cause.
-                        raise RunnerTunnelAuthRejectedError(
-                            f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
-                            f"(HTTP {http_status} persisted across "
-                            f"{http_auth_rejection_streak} unauthenticated attempts; the "
-                            "credential source returned no token, e.g. the host "
-                            "credential service's grant expired or was rejected); "
-                            f"{_reauth_hint(server_url)}"
-                        ) from exc
-                    if (
+                        # A transient mint failure (factory returned None) clears on a later
+                        # re-mint, so only a missing credential that outlasts the window ends
+                        # the launch; the message then names the local cause.
+                        waited_s = time.monotonic() - (http_auth_rejection_started or 0.0)
+                        if waited_s >= _NO_CREDENTIAL_FATAL_WINDOW_S:
+                            raise RunnerTunnelAuthRejectedError(
+                                f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
+                                f"(HTTP {http_status} persisted across "
+                                f"{http_auth_rejection_streak} unauthenticated attempts over "
+                                f"{int(waited_s)} s; the credential source returned no token, "
+                                "e.g. the host credential service's grant expired or was "
+                                f"rejected); {_reauth_hint(server_url)}"
+                            ) from exc
+                    elif (
                         not ever_connected
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):

@@ -478,6 +478,84 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
 
 
+@pytest.mark.asyncio
+async def test_serve_tunnel_rides_out_a_transient_missing_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A credential that is missing for a few attempts connects once it is minted again.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    mints = 0
+    upgrades: list[str | None] = []
+
+    def _mint() -> str | None:
+        nonlocal mints
+        mints += 1
+        return None if mints <= 4 else "tok-recovered"
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        if auth_token is None:
+            raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_transient_credential",
+            runner_version="0.1.0",
+            auth_token_factory=_mint,
+        )
+
+    assert upgrades[-1] == "tok-recovered"
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_no_credential_exits_only_after_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A credential that stays missing past the retry window still ends the launch.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    attempts = 0
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        assert auth_token is None
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_persistent_no_credential",
+            runner_version="0.1.0",
+            auth_token_factory=lambda: None,
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert sum(sleeps) >= serve_module._NO_CREDENTIAL_FATAL_WINDOW_S
+    assert attempts > serve_module._HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
 class _SignInFactory:
     """Token factory whose credential source reports a pending interactive sign-in."""
 
@@ -495,6 +573,16 @@ class _SignInFactory:
         self.calls += 1
         self.sign_in_pending = self.calls <= self._pending_calls
         return None if self.sign_in_pending else self._token
+
+
+@pytest.fixture(autouse=True)
+def _no_credential_window_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the immediate no-credential exit for tests that predate the retry window.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 0.0)
 
 
 def _clock_advanced_by_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:

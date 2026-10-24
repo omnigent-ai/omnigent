@@ -1825,12 +1825,20 @@ async def test_watch_runner_reports_unexpected_exit(
     assert maintenance_reasons == ["runner_exited"]
 
 
-@pytest.mark.parametrize("connected", [False, True])
+@pytest.mark.parametrize(
+    ("connected", "log_line"),
+    [
+        (False, "tunnel rejected (HTTP 401)"),
+        (True, "tunnel rejected (HTTP 401)"),
+        (False, "runner tunnel has no credential available (HTTP 401 persisted)"),
+    ],
+)
 async def test_watch_runner_reports_refused_credentials_as_sign_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     connected: bool,
+    log_line: str,
 ) -> None:
     """A runner refused on credentials before connecting asks for a new sign-in.
 
@@ -1847,9 +1855,7 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
     workspace = tmp_path / "project"
     workspace.mkdir()
     original_popen = subprocess.Popen
-    script = (
-        f"echo 'tunnel rejected (HTTP 401)' >&2; sleep 0.2; exit {RUNNER_AUTH_REJECTED_EXIT_CODE}"
-    )
+    script = f"echo '{log_line}' >&2; sleep 0.2; exit {RUNNER_AUTH_REJECTED_EXIT_CODE}"
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         """Spawn a runner that exits with the credential-rejection code."""
@@ -1879,11 +1885,17 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
     died = next(
         record for record in caplog.records if getattr(record, "event_name", None) == "runner_died"
     )
-    assert "tunnel rejected (HTTP 401)" in report.error
+    assert log_line in report.error
     if connected:
         assert not report.error.startswith("The server rejected")
         assert died.attributes["error_category"] == "runner"
         assert died.attributes["error_phase"] == "unknown"
+    elif "no credential available" in log_line:
+        # No credential was sent, so the server did not reject this host.
+        assert report.error.startswith("The runner had no credential to send")
+        assert " login " in report.error
+        assert died.attributes["error_category"] == "config"
+        assert died.attributes["error_phase"] == "runner_launch"
     else:
         assert report.error.startswith("The server rejected this host's credentials")
         assert " login " in report.error
