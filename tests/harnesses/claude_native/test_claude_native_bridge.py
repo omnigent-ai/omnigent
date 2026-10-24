@@ -5024,7 +5024,52 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
         inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
 
 
-@pytest.mark.parametrize("submit_capture", ["ready", "empty", "whitespace", "failed"])
+@pytest.mark.parametrize("after_paste", ["empty-composer", "repainting", "empty-capture"])
+def test_unobserved_user_draft_has_uncertain_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after_paste: str,
+) -> None:
+    """A blind Enter cannot establish that Claude accepted the web message."""
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    commands: list[list[str]] = []
+    pasted = False
+
+    def run_tmux(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal pasted
+        commands.append(cmd)
+        if "paste-buffer" in cmd:
+            pasted = True
+        pane = _composer_pane()
+        if pasted:
+            pane = {
+                "empty-composer": _composer_pane(),
+                "repainting": "Rendering terminal output",
+                "empty-capture": "",
+            }[after_paste]
+        return SimpleNamespace(
+            returncode=0, stdout=pane if "capture-pane" in cmd else "", stderr=""
+        )
+
+    monkeypatch.setattr("subprocess.run", run_tmux)
+
+    with pytest.raises(RuntimeError, match="delivery could not be confirmed"):
+        inject_user_message(bridge_dir, content="a message whose draft never renders")
+
+    assert sum(cmd[-1] == "Enter" for cmd in commands) == 1
+    assert all("kill-session" not in cmd for cmd in commands)
+
+
+@pytest.mark.parametrize(
+    "submit_capture", ["ready", "empty", "whitespace", "failed", "glyphless", "scrollback-glyph"]
+)
 @pytest.mark.parametrize("accept_first", [False, True], ids=["swallowed", "accepted"])
 def test_inject_user_message_verifies_submit_after_transient_capture_loss(
     tmp_path: Path,
@@ -5075,7 +5120,15 @@ def test_inject_user_message_verifies_submit_after_transient_capture_loss(
                     assert len(enters) == 1, "an unreadable pane must not draw another Enter"
                     return SimpleNamespace(
                         returncode=1 if submit_capture == "failed" else 0,
-                        stdout="  \n" if submit_capture == "whitespace" else "",
+                        stdout=(
+                            "  \n"
+                            if submit_capture == "whitespace"
+                            else "Working...\n"
+                            if submit_capture == "glyphless"
+                            else "Earlier ❯ submitted message\nWorking...\n"
+                            if submit_capture == "scrollback-glyph"
+                            else ""
+                        ),
                         stderr="capture unavailable" if submit_capture == "failed" else "",
                     )
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")

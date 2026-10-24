@@ -23,7 +23,12 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    InjectionDeliveryAmbiguous,
+    TurnComplete,
+)
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
@@ -315,6 +320,26 @@ async def test_enqueue_session_message_refuses_auth_commands(
     accepted = await executor.enqueue_session_message("session-key", command)
 
     assert accepted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "uncertainty",
+    [claude_bridge.ClaudeSubmitUnconfirmed, claude_bridge.ClaudeSubmitBlockedUnconfirmed],
+)
+async def test_enqueue_uncertain_submit_does_not_request_automatic_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    uncertainty: type[RuntimeError],
+) -> None:
+    def submit(_bridge_dir: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        raise uncertainty("the submit may already have been delivered")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", submit)
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    with pytest.raises(InjectionDeliveryAmbiguous, match="may already have been delivered"):
+        await executor.enqueue_session_message("session-key", "keep working")
 
 
 @pytest.mark.asyncio
@@ -1732,9 +1757,17 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
         (True, "pending_prompt"),
         (True, "draft_persisted"),
         (True, "capture_lost"),
+        (True, "draft_unobserved"),
         (False, "missing_target"),
     ],
-    ids=["before_submit", "after_submit", "draft_not_accepted", "capture_lost", "missing_target"],
+    ids=[
+        "before_submit",
+        "after_submit",
+        "draft_not_accepted",
+        "capture_lost",
+        "draft_unobserved",
+        "missing_target",
+    ],
 )
 async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
@@ -1747,7 +1780,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    pane = "──────\n❯ \n──────\n"
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
@@ -1755,12 +1788,14 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     def run_tmux(socket_path: str, *args: str) -> None:
         nonlocal pane, enters, prompt_pending
         del socket_path
-        if args[-1] == "Space":
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
         elif args[0] == "paste-buffer":
-            pane = "❯ review this function"
+            pane = (
+                "──────\n❯ \n──────\n"
+                if refusal == "draft_unobserved"
+                else "──────\n❯ review this function\n──────\n"
+            )
             prompt_pending = not submitted
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
@@ -1788,6 +1823,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
     monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(claude_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.01)
     monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
@@ -1809,7 +1845,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
     if refusal == "draft_persisted":
         assert enters >= 1
-        assert pane == "❯ review this function"
+        assert pane == "──────\n❯ review this function\n──────\n"
     else:
         assert enters == int(submitted)
     assert killed == []
@@ -1820,6 +1856,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
         "pending_prompt": "waiting for an explicit answer",
         "draft_persisted": "draft is still in the input box",
         "capture_lost": "delivery could not be confirmed",
+        "draft_unobserved": "delivery could not be confirmed",
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message

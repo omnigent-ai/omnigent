@@ -679,7 +679,11 @@ class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
     """A draft left in Claude's input box could not be cleared, so nothing was sent."""
 
 
-class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
+class ClaudeSubmitUnconfirmed(RuntimeError):
+    """A submit Enter was sent, but delivery could not be established."""
+
+
+class ClaudeSubmitBlockedUnconfirmed(ClaudeSubmitUnconfirmed):
     """A fresh matching native refusal stops retries without proving web ownership."""
 
 
@@ -4356,6 +4360,8 @@ def _paste_and_submit(
         pending before the submit Enter; the message was not sent.
     :raises ClaudeComposerNotCleared: If a draft left in the input box could
         not be cleared first; the message was not sent.
+    :raises ClaudeSubmitUnconfirmed: A submit was sent without an observable draft,
+        or later terminal capture could not confirm delivery.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
@@ -4404,10 +4410,8 @@ def _paste_and_submit(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
+    # load / large payloads); polling waits for the rendered draft. If it
+    # never becomes identifiable, a single Enter below leaves delivery uncertain.
     delivery_diagnostics.set_stage("waiting_for_draft")
     draft_seen = False
     pane = ""
@@ -4450,9 +4454,12 @@ def _paste_and_submit(
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
         delivery_diagnostics.record_details(verification="unverified")
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
+        # An Enter was sent; neither retrying nor reporting non-delivery is safe.
+        raise ClaudeSubmitUnconfirmed(
+            "Claude Code message delivery could not be confirmed because its draft was "
+            "never observed. Inspect the terminal before retrying; the message may "
+            "already have been delivered."
+        )
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -4472,7 +4479,7 @@ def _paste_and_submit(
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
-        raise RuntimeError(
+        raise ClaudeSubmitUnconfirmed(
             "Claude is waiting for an explicit answer after the message was submitted; "
             "it may already have been delivered."
         ) from exc
@@ -4552,9 +4559,9 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
-        # An empty capture can be a repaint or failed tmux read. It proves
-        # neither that the draft cleared nor that another Enter is safe.
-        if not pane.strip():
+        # Repaints and overlays can hide a draft without accepting it.
+        # Only the live chat composer can confirm absence or permit a retry.
+        if not pane.strip() or (submitted_text is not None and not _claude_prompt_rendered(pane)):
             continue
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
@@ -4599,10 +4606,10 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
-    if not pane.strip():
-        raise RuntimeError(
+    if not pane.strip() or (submitted_text is not None and not _claude_prompt_rendered(pane)):
+        raise ClaudeSubmitUnconfirmed(
             f"Claude Code {what} delivery could not be confirmed within "
-            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because terminal capture is unavailable. "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because the chat input cannot be observed. "
             "Inspect the terminal before retrying; the message may already have been delivered."
         )
     return False
