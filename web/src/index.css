@@ -1235,6 +1235,11 @@ html[data-electron-mac] .breadcrumb-folder {
      * controls, spacing, or radii. Typography is mapped separately below. */
     font-size: 16px;
   }
+  /* Headings (e.g. sidebar section headers) inherit the UI font. Embedded, this
+   * scopes under `.omnigent-app` and outranks the host page's heading font. */
+  :is(h1, h2, h3, h4, h5, h6) {
+    font-family: inherit;
+  }
   /* Code surfaces stay on the mono stack, immune to the UI --ui-font-family
    * override above. The Appearance font-family setting is UI chrome only; the
    * Monaco editor and xterm terminals are code fonts, owned by a separate

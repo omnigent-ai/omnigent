@@ -3,7 +3,7 @@ import { cleanup, render } from "@testing-library/react";
 import { createPortal } from "react-dom";
 import { MemoryRouter } from "react-router-dom";
 import { transform } from "lightningcss";
-import { parse } from "postcss";
+import { parse, type Rule } from "postcss";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { scopeCss } from "../vite.embed.config";
 import { OmnigentApp } from "./embed";
@@ -105,6 +105,34 @@ describe("macOS Electron embed", () => {
     const outside = document.createElement("button");
     document.body.appendChild(outside);
     expect(outside.matches(controlsSelector)).toBe(false);
+    outside.remove();
+  });
+});
+
+describe("embed heading font", () => {
+  // The host page styles headings by element (e.g. `body h2`), so a sidebar
+  // section header would drop the user's UI font without a scoped reset.
+  it("scopes a heading font-family reset that outranks host element rules", () => {
+    const selectors: string[] = [];
+    css.walkDecls("font-family", (decl) => {
+      if (decl.value === "inherit" && decl.parent?.type === "rule") {
+        selectors.push((decl.parent as Rule).selector);
+      }
+    });
+    const scope = document.createElement("div");
+    scope.className = "omnigent-app";
+    scope.innerHTML = "<nav><h2>Sessions</h2></nav>";
+    document.body.append(scope);
+    const outside = document.createElement("h2");
+    document.body.append(outside);
+
+    const selector = selectors.find((s) => scope.querySelector("h2")!.matches(s));
+    expect(selector).toBeDefined();
+    // A leading class selector beats element-only host rules like `body h2`.
+    expect(selector!.startsWith(".omnigent-app ")).toBe(true);
+    expect(outside.matches(selector!)).toBe(false);
+
+    scope.remove();
     outside.remove();
   });
 });
