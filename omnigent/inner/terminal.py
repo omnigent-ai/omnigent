@@ -68,6 +68,7 @@ from .terminal_lifecycle import (
     TERMINAL_LAUNCH_SESSION_ID_ENV,
     TerminalLifecycleTrace,
 )
+from .tmux_hooks import START_ON_ATTACH_CHANNEL, client_hook_commands
 
 # Heterogeneous JSON-shaped result returned by :meth:`TerminalInstance.send`
 # and :meth:`TerminalInstance.read`. In practice the dicts carry a mix of
@@ -83,7 +84,6 @@ logger = logging.getLogger(__name__)
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
 
-_TMUX_START_ON_ATTACH_CHANNEL = "omnigent-start-on-attach"
 # Each terminal instance lives in a private tmpdir with this prefix
 # (see ``create_terminal_instance``). The owner-pid marker inside it
 # records the process that launched the instance so a later startup
@@ -1082,7 +1082,9 @@ class TerminalInstance:
     :param tmux_allow_passthrough: Whether pane applications may use
         tmux passthrough escapes to query/control the attached terminal.
     :param tmux_start_on_attach: Whether to delay command startup until
-        the first tmux client attaches to the session.
+        the first tmux client attaches to the session. The server then
+        also signals later viewer attach / last-detach transitions (see
+        :mod:`omnigent.inner.tmux_hooks`).
     :param running: Whether the tmux server is currently expected to
         be alive.
     """
@@ -1709,7 +1711,7 @@ class TerminalInstance:
             ]
         inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
-            inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
+            inner_str = f"tmux wait-for {START_ON_ATTACH_CHANNEL}; exec {inner_str}"
 
         option_commands = [
             *_tmux_managed_option_commands(
@@ -1725,14 +1727,7 @@ class TerminalInstance:
             ],
         ]
         if self.tmux_start_on_attach:
-            option_commands.append(
-                [
-                    "set-hook",
-                    "-g",
-                    "client-attached",
-                    f"wait-for -S {_TMUX_START_ON_ATTACH_CHANNEL}",
-                ]
-            )
+            option_commands.extend(client_hook_commands())
         # ``pane-died`` is a window-scope hook that fires when remain-on-exit
         # keeps the pane alive after the inner process exits. We need to set
         # it AFTER new-session (not before) because window scope requires an
