@@ -59,6 +59,12 @@ When you open a pull request, fill in the repo's PR template at
 filename). Keep every section and checkbox row so reviewers can skim them,
 except the optional Changelog section as described below.
 
+- **Related issue** — before opening a PR that fixes a bug, adds a feature, or
+  changes the UI, find an existing issue or create one (`gh issue create`), then
+  reference it with `Closes #123` (or `Part of #123` for a partial step). A bare
+  `#123` or a link to another PR doesn't count. Pure Refactor / chore, Docs, or
+  Test / CI PRs are exempt; see
+  [CONTRIBUTING.md](CONTRIBUTING.md#every-pr-needs-an-issue).
 - **Summary** — what changed and why.
 - **Test Plan** — how you verified it.
 - **Demo** — a **video or images** showing the change. Expected on contributor
