@@ -1,3 +1,4 @@
+import { SidebarChildSessions } from "./SidebarChildSessions";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { useGridSessions } from "@/grid/GridSessionsContext";
 import { GridSidebar } from "@/grid/GridWorkspace";
@@ -5140,10 +5141,11 @@ function ConversationRowImpl({
     );
   }
 
-  return (
+  return [
     // Drag props on the <li> so the whole row is grabbable; `isDragging` dims
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
+      key="session"
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
       onMouseDown={(event) => {
@@ -5653,8 +5655,11 @@ function ConversationRowImpl({
           </DialogContent>
         )}
       </Dialog>
-    </li>
-  );
+    </li>,
+    isActive && !selectionMode && !isArchived ? (
+      <SidebarChildSessions key="children" conversationId={conversation.id} onNavigate={onClick} />
+    ) : null,
+  ];
 }
 
 // The `conversation` fields the row renders. The comparator below compares
