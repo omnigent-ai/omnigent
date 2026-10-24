@@ -464,3 +464,49 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
     # = 3; sub-agents: blast_radius x7 (claude_code, codex, opencode, cursor,
     # hermes, agy, pi) = 7 -> 10 total. Fewer = a policy dropped.
     assert checked == 10, f"expected 10 function policies in the bundle, inspected {checked}"
+
+
+def test_builtin_polly_scopes_self_authored_skills_outside_the_omnigent_repo() -> None:
+    """Self-authored skills must target the active Omnigent checkout or a
+    user-owned location, never an unconditional in-repo path. Built-in Polly
+    often runs outside a checkout with the user's clone elsewhere, so an
+    unconditional ``examples/polly/skills/<dir>/SKILL.md`` directive would write
+    private skills into that clone for Polly to commit and push.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+
+    # Pins the prompt's exact wording; update these checks when the prompt changes.
+    lowered = compact.lower()
+    describes_checkout_condition = "omnigent checkout" in lowered or "git checkout root" in lowered
+    describes_user_owned_alternative = "user-owned" in lowered
+    unconditional_repo_rule = "examples/polly/skills/<dir>/SKILL.md` in this repo" in compact
+
+    assert describes_checkout_condition and describes_user_owned_alternative, (
+        "self-authored skills must be scoped to an Omnigent checkout and offer a "
+        "user-owned location when the workspace is not a checkout"
+    )
+    assert not unconditional_repo_rule, (
+        "the unconditional examples/polly/skills/<dir>/SKILL.md 'in this repo' "
+        "directive must be gone; otherwise a package user's Omnigent clone "
+        "receives them"
+    )
+
+
+def test_builtin_polly_does_not_open_unsolicited_prs_on_the_upstream_repo() -> None:
+    """Require explicit user approval before opening PRs or issues on
+    omnigent-ai/omnigent. The configured guardrails never gate ``gh pr create``
+    (blast_radius runs with ``gate_pushes: false``), so a prompt rule is the
+    only restraint.
+    """
+    config = (_POLLY_BUNDLE / "config.yaml").read_text(encoding="utf-8")
+    compact = " ".join(config.split())
+    assert "omnigent-ai/omnigent" in compact, (
+        "no restraint on opening PRs/issues against omnigent-ai/omnigent without "
+        "an explicit user request"
+    )
+    lowered = compact.lower()
+    assert "never open a pull request or an issue" in lowered and "explicitly asks" in lowered, (
+        "omnigent-ai/omnigent is named, but the prohibition on opening both PRs "
+        "and issues there without an explicit user request is missing"
+    )
