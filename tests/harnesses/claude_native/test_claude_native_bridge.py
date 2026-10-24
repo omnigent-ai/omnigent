@@ -11157,6 +11157,7 @@ class _EditableComposer:
         *,
         cursor: int,
         visible_rows: int | None = None,
+        pane_rows: int | None = None,
         unavailable_clear_captures: int = 0,
     ) -> None:
         """
@@ -11167,12 +11168,16 @@ class _EditableComposer:
             the closing rule shows framed; a taller one is cut off at the
             bottom of the pane without it (the ``_SLIVER_MULTILINE_DRAFT_PANE``
             geometry). ``None`` shows the whole box.
+        :param pane_rows: When set, the pane has this many lines and keeps the
+            bottom of the screen in view, as Claude Code 2.1.309 does: a draft
+            too tall for it scrolls the opening rule and glyph row off the top.
         :param unavailable_clear_captures: Captures that fail after clearing
             starts; readiness captures remain readable.
         """
         self.text = draft
         self.cursor = cursor
         self._visible_rows = visible_rows
+        self._pane_rows = pane_rows
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
         self.submitted: list[str] = []
@@ -11222,7 +11227,10 @@ class _EditableComposer:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
             return f"⏺ done\n{self._RULE}\n{clipped}\n"
-        return f"{self._RULE}\n" + "\n".join(rows) + f"\n{self._RULE}\n  ? for shortcuts\n"
+        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
+        if self._pane_rows is not None:
+            screen = screen[-self._pane_rows :]
+        return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
 
     def _insert(self, text: str) -> None:
         self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
@@ -11412,6 +11420,105 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         assert [text.strip() for text in composer.submitted] == [expected]
 
 
+_TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
+
+
+@pytest.mark.parametrize("cursor", [0, len(_TALL_DRAFT)], ids=["cursor-at-start", "cursor-at-end"])
+@pytest.mark.parametrize(
+    ("inject", "expected"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor: int,
+    inject: Callable[[Path], None],
+    expected: str,
+) -> None:
+    """
+    A draft too tall for the pane is cleared, not waited on as an overlay.
+
+    Claude Code keeps the bottom of its screen in view, so the draft scrolls
+    the box's opening rule and ``❯`` row off the top. Read as "no input box",
+    the readiness gate waited out its budget and the turn failed as a
+    terminal that never became ready.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
+    composer.install(monkeypatch)
+
+    inject(bridge_dir)
+
+    assert [text.strip() for text in composer.submitted] == [expected]
+
+
+def test_blank_rows_after_an_empty_glyph_row_count_as_a_cleared_box(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whole box holding only blank rows below ``❯`` is empty: nothing can join the paste."""
+    sends = _fake_tmux(monkeypatch, ["──────\n❯\n\n──────\n  ? for shortcuts\n"])
+
+    claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+
+    assert sum(1 for send in sends if "-l" in send) == 1
+
+
+def test_a_refused_clear_records_what_the_box_looked_like(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The delivery record says how much of the box was visible, without its text."""
+    recorded: dict[str, object] = {}
+    monkeypatch.setattr(
+        claude_native_bridge.delivery_diagnostics,
+        "record_details",
+        lambda **attributes: recorded.update(attributes),
+    )
+    composer = _EditableComposer("ONE\nTWO\nTHREE\nFOUR", cursor=0, visible_rows=1)
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared):
+        inject_user_message(_picker_bridge_dir(tmp_path), content="hello from the web")
+
+    assert recorded == {"composer_seen": True, "composer_framed": False, "composer_rows": 1}
+
+
+def test_composer_box_reads_a_draft_scrolled_past_the_top_of_the_pane() -> None:
+    """Only the closing rule shows: the rows above it are the draft's, the glyph row is gone."""
+    pane = "  step 9\n  step 10\n\n  step 12\n──────\n  paste again to expand\n"
+
+    assert claude_native_bridge._composer_row(pane) is None
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        ["  step 9", "  step 10", "", "  step 12"], framed=False
+    )
+    assert claude_native_bridge._occupying_surface(pane) == "a draft taller than the terminal"
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "● done\n  ⎿ output\n──────\n  ? for shortcuts\n",
+        "  tool output\n  more output\n──────\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n",
+    ],
+    ids=["transcript-row-above", "dialog-below-the-rule"],
+)
+def test_composer_box_does_not_read_other_screens_as_a_scrolled_draft(pane: str) -> None:
+    """A screen with transcript rows or a dialog under its rule is not a draft."""
+    assert claude_native_bridge._composer_box(pane) is None
+
+
 @pytest.mark.parametrize(
     ("pane", "box"),
     [
@@ -11437,6 +11544,10 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
+        (
+            "──────\n\n❯ one\n──────\n  ? for shortcuts\n",
+            claude_native_bridge._ComposerBox(["❯ one"], framed=True),
+        ),
     ],
     ids=[
         "framed-with-blank-row",
@@ -11446,6 +11557,7 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         "indented-frame-with-earlier-rule",
         "dialog-selector",
         "no-box",
+        "blank-row-under-the-opening-rule",
     ],
 )
 def test_composer_box_reads_every_row_of_the_input_box(

@@ -321,6 +321,8 @@ _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
 # Retry rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
+# Footer rows Claude Code draws under the input box (mode hints, status line).
+_SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -419,6 +421,9 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 _OVERLAY_SURFACE = "an overlay"
 # What :func:`_occupying_surface` reports when the box is in ``!`` shell mode.
 _SHELL_MODE_SURFACE = "shell mode"
+# What :func:`_occupying_surface` reports when a draft taller than the pane
+# has scrolled the box's glyph row out of view.
+_SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
 # Ctrl+U, CSI-u encoded like the other clearing keys. Claude Code leaves shell
 # mode on it only with the cursor at the start of the line, so a typed command
 # takes two: the first clears the line, the second switches the box back to
@@ -5947,7 +5952,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane. The exception is a shell-mode box
     holding a typed command, which Escape leaves in shell mode: that command
     is cleared from the box instead (see :func:`_shell_mode_draft`), the way
-    an unsent chat draft is cleared before a paste.
+    an unsent chat draft is cleared before a paste. So is a draft taller than
+    the pane, which scrolls the box's glyph row out of view
+    (:func:`_scrolled_draft_rows`).
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -6029,6 +6036,11 @@ def _restore_occupied_input(
             # transient back to a caller that will refuse to type into it.
             if unclearable_seen:
                 return surface
+        elif surface == _SCROLLED_DRAFT_SURFACE:
+            # Deleting lines shrinks the box until its glyph row is back on
+            # screen; the keys only edit the draft, so they need no spacing.
+            _logger.info("claude-native: clearing a draft taller than the terminal")
+            _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
                 # Escape keeps a typed shell command in shell mode, so the
@@ -6088,7 +6100,8 @@ def _occupying_surface(pane: str) -> str | None:
         return "the prompt-history search"
     row = _composer_row(pane)
     if row is None:
-        return _OVERLAY_SURFACE
+        box = _composer_box(pane)
+        return _SCROLLED_DRAFT_SURFACE if box is not None else _OVERLAY_SURFACE
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return _SHELL_MODE_SURFACE
@@ -6179,8 +6192,8 @@ class _ComposerBox(NamedTuple):
     #: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``. Blank rows
     #: are kept, since a draft's empty lines are lines too.
     rows: list[str]
-    #: Whether the closing rule was on screen, so ``rows`` is the whole box
-    #: rather than the part of it above the bottom of the pane.
+    #: Whether both rules were on screen, so ``rows`` is the whole box rather
+    #: than the part of it the pane had room for.
     framed: bool
 
 
@@ -6201,13 +6214,14 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     """
     Return every visible row of Claude Code's live input box, or ``None``.
 
-    The box is located as in :func:`_composer_row`: its first row sits
-    directly under the opening rule, led by a composer glyph. The rows run to
-    the closing rule, or to the bottom of the pane when there is none on
-    screen.
+    The box is located as in :func:`_composer_row`: its first row is the
+    first non-blank one under the opening rule, led by a composer glyph. The
+    rows run to the closing rule, or to the bottom of the pane when there is
+    none on screen. A draft taller than the pane is read as well
+    (:func:`_scrolled_draft_rows`), without its first rows.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: The box's visible rows and whether its closing rule was on
+    :returns: The box's visible rows and whether both of its rules were on
         screen, or ``None`` when no input box is on screen.
     """
     lines = pane.splitlines()
@@ -6215,13 +6229,45 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     if not rules:
         return None
     if len(rules) >= 2:
-        first = rules[-2] + 1
+        first = _first_non_blank(lines, rules[-2] + 1, rules[-1])
         if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return _ComposerBox(lines[first : rules[-1]], framed=True)
-    first = rules[-1] + 1
+    first = _first_non_blank(lines, rules[-1] + 1, len(lines))
     if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
         return _ComposerBox(lines[first:], framed=False)
-    return None
+    scrolled = _scrolled_draft_rows(lines, rules)
+    return None if scrolled is None else _ComposerBox(scrolled, framed=False)
+
+
+def _first_non_blank(lines: list[str], start: int, end: int) -> int:
+    """Return the index of the first non-blank line in ``lines[start:end]``, else *end*."""
+    return next((idx for idx in range(start, end) if lines[idx].strip()), end)
+
+
+def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None:
+    """
+    Return the visible rows of a draft taller than the pane, or ``None``.
+
+    Claude Code keeps the bottom of its screen in view, so such a draft pushes
+    the box's opening rule and glyph row off the top: the pane shows draft rows
+    (indented under the glyph) down to the closing rule, then the footer.
+
+    :param lines: Captured pane lines.
+    :param rules: Frame rule indices from :func:`_composer_frame_rule_indices`.
+    :returns: The draft rows above the closing rule, e.g. ``["  step 9", "  step 10"]``.
+    """
+    if len(rules) != 1:
+        return None
+    rows = lines[: rules[0]]
+    footer = [line for line in lines[rules[0] + 1 :] if line.strip()]
+    if len(footer) > _SCROLLED_DRAFT_MAX_FOOTER_ROWS:
+        return None
+    text = [row for row in rows if row.strip()]
+    if len(text) < 2 or any(not row.startswith("  ") for row in text):
+        return None
+    if any(_CLAUDE_PROMPT_GLYPH in line for line in footer):
+        return None
+    return rows
 
 
 def _clear_composer(socket_path: str, tmux_target: str) -> None:
@@ -6236,9 +6282,9 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     next message.
 
     One burst is known to have emptied the box only when the capture showed
-    the box whole (closing rule on screen) with a single row. A box with
-    more rows, or one cut off by the bottom of the pane (a draft taller than
-    the pane, or a sliver-height pane with no room for the closing rule),
+    the box whole (both rules on screen) with nothing after its glyph row but
+    blank rows. A box with more text, or one the pane cut off (a draft taller
+    than the pane, or a sliver-height pane with no room for the closing rule),
     may still hold lines the capture did not show, so it is cleared again,
     up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
     state afterwards is refused rather than pasted into: an exhausted budget
@@ -6258,19 +6304,36 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
         box = _composer_box(_capture_pane(socket_path, tmux_target))
-        settled = box is not None and box.framed and len(box.rows) <= 1
+        # Blank rows after the glyph row hold nothing a paste could join.
+        settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            delivery_diagnostics.record_details(
+                composer_seen=box is not None,
+                composer_framed=box is not None and box.framed,
+                composer_rows=0 if box is None else len(box.rows),
+            )
             raise ClaudeComposerNotCleared(
                 "A draft left in Claude Code's input box could not be cleared, so nothing "
                 "was sent. Open the terminal, clear the input box, then retry."
             )
         if box is not None:
-            presses = 2 * len(box.rows)
-            keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
-            _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
+            _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _send_composer_clear_keys(socket_path: str, tmux_target: str, *, rows: int) -> None:
+    """
+    Send the Ctrl+K and Ctrl+U presses that empty *rows* rows of a draft.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param rows: Draft rows to delete, e.g. ``3``.
+    """
+    presses = 2 * rows
+    keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
