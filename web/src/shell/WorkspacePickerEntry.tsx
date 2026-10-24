@@ -1,4 +1,5 @@
 import { ChevronRightIcon, FolderIcon } from "lucide-react";
+import { useEffect, useRef } from "react";
 
 import type { HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { cn } from "@/lib/utils";
@@ -9,6 +10,9 @@ export interface WorkspacePickerEntryProps {
   entry: HostFilesystemEntry;
   onOpen: (path: string) => void;
   variant?: "default" | "compact";
+  /** Keyboard highlight from the picker's search field; kept scrolled into view. */
+  active?: boolean;
+  id?: string;
 }
 
 /** A single folder or file row in a workspace directory listing. */
@@ -16,14 +20,30 @@ export function WorkspacePickerEntry({
   entry,
   onOpen,
   variant = "default",
+  active = false,
+  id,
 }: WorkspacePickerEntryProps) {
   const isDirectory = entry.type === "directory";
   const compact = variant === "compact";
+  const ref = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (active) ref.current?.scrollIntoView({ block: "nearest" });
+  }, [active]);
 
   return (
-    <MenuItem asChild density={compact ? "compact" : "none"} interactive={isDirectory}>
+    <MenuItem
+      asChild
+      density={compact ? "compact" : "none"}
+      interactive={isDirectory}
+      active={active}
+    >
       <button
+        ref={ref}
+        id={id}
         type="button"
+        role="option"
+        aria-selected={active}
         disabled={!isDirectory}
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => isDirectory && onOpen(entry.path)}

@@ -25,7 +25,7 @@ describe("WorkspacePickerEntry", () => {
     const onOpen = vi.fn();
     render(<WorkspacePickerEntry entry={folder} onOpen={onOpen} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "projects" }));
+    fireEvent.click(screen.getByRole("option", { name: "projects" }));
 
     expect(onOpen).toHaveBeenCalledWith(folder.path);
   });
@@ -34,7 +34,7 @@ describe("WorkspacePickerEntry", () => {
     const onOpen = vi.fn();
     render(<WorkspacePickerEntry entry={file} onOpen={onOpen} />);
 
-    const row = screen.getByRole("button", { name: "README.md" });
+    const row = screen.getByRole("option", { name: "README.md" });
     expect(row).toBeDisabled();
     fireEvent.click(row);
     expect(onOpen).not.toHaveBeenCalled();
@@ -42,7 +42,7 @@ describe("WorkspacePickerEntry", () => {
 
   it("supports default and compact dimensions", () => {
     const { rerender } = render(<WorkspacePickerEntry entry={folder} onOpen={() => undefined} />);
-    const row = screen.getByRole("button", { name: "projects" });
+    const row = screen.getByRole("option", { name: "projects" });
     expect(row).toHaveClass("min-h-11", "px-5", "py-2");
 
     rerender(<WorkspacePickerEntry entry={folder} onOpen={() => undefined} variant="compact" />);
@@ -52,7 +52,7 @@ describe("WorkspacePickerEntry", () => {
   it("matches the compact modal file-row treatment", () => {
     render(<WorkspacePickerEntry entry={file} onOpen={() => undefined} variant="compact" />);
 
-    const row = screen.getByRole("button", { name: "README.md" });
+    const row = screen.getByRole("option", { name: "README.md" });
     expect(row).toHaveClass("cursor-default", "text-muted-foreground");
     expect(row).not.toHaveClass("cursor-not-allowed", "opacity-55", "hover:bg-muted");
     const icon = row.querySelector('[data-file-type="document"]');

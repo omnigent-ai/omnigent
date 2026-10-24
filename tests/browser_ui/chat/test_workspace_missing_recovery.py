@@ -302,7 +302,7 @@ def test_continue_missing_workspace_in_another_directory(
     activate(dialog.get_by_role("button", name="Browse directories", exact=True))
     picker = page.get_by_test_id("workspace-picker")
     expect(picker).to_be_visible()
-    activate(picker.get_by_role("button", name="project", exact=True))
+    activate(picker.get_by_role("option", name="project", exact=True))
     expect(picker.get_by_role("textbox", name="Current folder path")).to_have_value(_DESTINATION)
     activate(picker.get_by_test_id("workspace-picker-select"))
     expect(picker).not_to_be_visible()
