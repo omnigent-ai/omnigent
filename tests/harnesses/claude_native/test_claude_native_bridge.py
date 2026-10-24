@@ -1757,6 +1757,9 @@ def test_read_transcript_leaves_unflagged_login_text_untouched(
         "OAuth token revoked · Please run /login",
         "Your organization has disabled API key authentication · Run /login "
         "to sign in with your claude.ai account",
+        # 2.1.283 labels every first-party 401/403 this way.
+        'Please run /login · API Error: 401 {"error_code":"UNAUTHENTICATED",'
+        '"message":"Invalid Token"}',
     ],
 )
 def test_read_transcript_rewrites_flagged_api_error_anywhere(
@@ -1859,6 +1862,43 @@ def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> N
 
     expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
     assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+_GATEWAY_BUDGET_REFUSAL = (
+    'Please run /login · API Error: 403 Budget "team budget" '
+    "(00000000-0000-0000-0000-000000000001) has reached its limit of $0"
+)
+_GATEWAY_IP_ACL_REFUSAL = (
+    'Please run /login · API Error: 403 {"error_code":403,"message":"Source IP address: '
+    '203.0.113.7 is blocked by Databricks IP ACL for workspace: 1234567890123456"}'
+)
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "cause"),
+    [
+        (_GATEWAY_BUDGET_REFUSAL, "budget"),
+        (_GATEWAY_IP_ACL_REFUSAL, "IP access list"),
+    ],
+)
+def test_read_transcript_gateway_refusal_names_cause_instead_of_sign_in(
+    tmp_path: Path,
+    raw_text: str,
+    cause: str,
+) -> None:
+    """
+    A gateway 403 that signing in cannot clear gets its own remedy, not ``omni setup``.
+
+    Claude Code labels these refusals "Please run /login" too, so the sign-in
+    guidance would keep a user who already re-authenticated stuck.
+    """
+    rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert rendered.startswith(f"{raw_text}\n\n")
+    guidance = rendered.removeprefix(raw_text)
+    assert "omni setup" not in guidance
+    assert "signing in again won't fix this" in guidance.lower()
+    assert cause in guidance
 
 
 def test_read_transcript_items_from_offset_skips_existing_prefix(
@@ -8590,6 +8630,20 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+    budget = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "error_details": _GATEWAY_BUDGET_REFUSAL,
+            }
+        )
+    )
+    assert budget.failure_message is not None
+    assert budget.failure_message.startswith(f"{_GATEWAY_BUDGET_REFUSAL}\n\n")
+    budget_guidance = budget.failure_message.removeprefix(_GATEWAY_BUDGET_REFUSAL)
+    assert "omni setup" not in budget_guidance
+    assert "budget" in budget_guidance
 
 
 def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:

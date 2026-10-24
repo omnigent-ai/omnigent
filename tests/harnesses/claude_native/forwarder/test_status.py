@@ -431,6 +431,27 @@ def test_stop_failure_detail_uses_transcript_api_error_without_warning(
     assert not [record for record in caplog.records if record.levelno == logging.WARNING]
 
 
+def test_stop_failure_detail_names_gateway_refusal_cause_from_transcript() -> None:
+    """A transcript budget refusal labeled ``/login`` gets its cause, not ``omni setup``."""
+    record = ClaudeHookRecord(
+        event_cursor=5,
+        byte_offset=100,
+        event_name="StopFailure",
+        failure_category="authentication_failed",
+    )
+    message = 'Please run /login · API Error: 403 Budget "team budget" has reached its limit of $0'
+    detail = forwarder._stop_failure_detail(
+        record,
+        session_id="conv_test",
+        transcript_context={"native_api_error_message": True, "native_error_message": message},
+    )
+    assert detail is not None
+    assert detail.startswith(f"{message}\n\n")
+    guidance = detail.removeprefix(message)
+    assert "omni setup" not in guidance
+    assert "budget" in guidance
+
+
 @pytest.mark.asyncio
 async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     tmp_path: Path,

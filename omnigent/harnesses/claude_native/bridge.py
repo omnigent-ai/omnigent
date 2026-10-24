@@ -88,6 +88,7 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.runner.launch_failure import describe_gateway_policy_refusal
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -9812,6 +9813,8 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 # delete the only instruction that fixes them, stranding the user with
 # advice for a different problem.
 #
+# Gateway budget and IP access list 403s also say "Please run /login"; they get their real cause.
+#
 # Matching the bare token anywhere in the message is only safe because
 # it is paired with :func:`_is_api_error_entry`: a flagged record is not
 # model output, so there is no prose to mislabel. An UNFLAGGED record is
@@ -9919,7 +9922,8 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
+        guidance = describe_gateway_policy_refusal(stripped) or _LOGIN_GUIDANCE
+        return f"{text.rstrip()}\n\n{guidance}"
     return text
 
 
