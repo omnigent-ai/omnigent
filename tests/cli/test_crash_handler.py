@@ -116,6 +116,21 @@ def test_save_report_writes_and_rotates(data_dir: Path) -> None:
     assert all((p.stat().st_mode & 0o077) == 0 for p in remaining)
 
 
+def test_rotate_keeps_current_report_when_mtimes_tie(data_dir: Path) -> None:
+    crashes = data_dir / "crashes"
+    crashes.mkdir(parents=True)
+    paths = [crashes / f"crash-tied-{index}.md" for index in range(3)]
+    for path in paths:
+        path.write_text(path.name, encoding="utf-8")
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+    current = paths[-1]
+
+    ch._rotate(crashes, 2, current=current)
+
+    assert current.exists()
+    assert len(list(crashes.glob("crash-*.md"))) == 2
+
+
 def test_save_report_keeps_every_same_second_report(data_dir: Path) -> None:
     """Repeated crashes inside one second/process must not overwrite each other.
 
