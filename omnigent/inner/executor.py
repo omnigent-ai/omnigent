@@ -348,8 +348,10 @@ class ExecutorError(ExecutorEvent):
         call started has already reported its prompt size, and
         discarding it freezes the context-occupancy meter at the
         previous turn's value exactly when the session is in trouble.
-    :param preserve_session: The executor is idle and safe to reuse after this
-        failure. Set only when no prompt or tool work remains in progress.
+    :param preserve_session: The executor object is idle and safe to reuse for
+        the next turn after this failure. It describes THIS executor's own state,
+        not any external agent: a native harness may set it when it stops waiting
+        on a turn an out-of-process agent is still running in its own loop.
         Defaults to ``False`` so failed turns receive normal teardown.
     :param code: Semantic failure code the turn error should carry, e.g.
         ``"databricks_sign_in_pending"``. ``None`` lets the harness adapter
