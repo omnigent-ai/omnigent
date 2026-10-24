@@ -316,8 +316,8 @@ composer's host menu shows a disabled **Switch host…** item for both when you
 have write access. Read-only viewers retain the
 existing host menu without switching controls. Hover or focus a disabled action
 to read why it is unsupported.
-The reconnect dialog also disables Clone and Switch host; directory selection
-cannot enable either action.
+The reconnect dialog also disables Switch host, and Clone wherever Fork is
+disabled; directory selection cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,
 the explanation asks you to reload. A missing source-host record keeps switching
 disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
@@ -845,6 +845,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
 - An Arclet source is recognized from its host's provider, so a shared managed
   Arclet session whose host is not in your host list keeps Fork disabled.
+  Without the managed label, such a session forks like an ordinary one.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after
