@@ -164,6 +164,8 @@ class OidcLoginManager {
         conn.setRequestProperty("Content-Type", "application/json")
         conn.connectTimeout = HTTP_TIMEOUT_MS
         conn.readTimeout = HTTP_TIMEOUT_MS
+        // A redirect must fail, not follow: the ticket flow stays on the pinned origin.
+        conn.instanceFollowRedirects = false
         return try {
             val body =
                 JSONObject()
@@ -220,6 +222,8 @@ class OidcLoginManager {
             conn.setRequestProperty("X-Omnigent-Code-Verifier", codeVerifier)
             conn.connectTimeout = HTTP_TIMEOUT_MS
             conn.readTimeout = HTTP_TIMEOUT_MS
+            // Following a redirect would hand the one-time ticket to another server.
+            conn.instanceFollowRedirects = false
             try {
                 when (conn.responseCode) {
                     202 -> {
