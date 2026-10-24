@@ -11,6 +11,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { CONNECTED_HOSTS_FORK_TARGET, FORK_TARGETS_LABEL_KEY } from "@/lib/sessionCapabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
@@ -1441,6 +1442,62 @@ describe("ForkSessionDialog", () => {
 
       openHostSelect();
       expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
+    });
+
+    it("clones a restricted sandbox session onto a connected host when labeled", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_arclet",
+          labels: {
+            "omnigent.host_type": "managed",
+            [FORK_TARGETS_LABEL_KEY]: CONNECTED_HOSTS_FORK_TARGET,
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      const sourceSandbox = host({ host_id: "host_arclet", sandbox_provider: "arclet" });
+      // Like the real hook, only the restriction lookup includes sandbox hosts.
+      useHostsMock.mockImplementation(
+        (options) =>
+          ({
+            data: options?.includeSandbox ? [sourceSandbox, host()] : [host()],
+          }) as ReturnType<typeof useHosts>,
+      );
+      renderDialog({
+        sourceTitle: "My session",
+        sourceWorkspace: "/home/a/repo",
+        sourceHostId: "host_arclet",
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "arclet" },
+      });
+
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+      openHostSelect();
+      expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_1"));
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/repo" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        config: {},
+        sandbox: undefined,
+      });
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/Users/a/repo",
+        undefined,
+      );
     });
 
     it("offers a sandbox even when no host is online, labelled per provider", () => {

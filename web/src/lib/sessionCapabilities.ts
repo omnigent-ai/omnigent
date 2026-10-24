@@ -1,6 +1,8 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
 export const SANDBOX_FORK_UNSUPPORTED = "Forking this sandbox session is not supported yet.";
+export const SANDBOX_TARGET_FORK_UNSUPPORTED =
+  "This session can only be cloned onto a connected host.";
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
@@ -13,6 +15,13 @@ export const SESSION_ACTIONS_UNAVAILABLE =
  */
 const UNSUPPORTED_FORK_PROVIDERS = new Set(["arclet", "lakebox"]);
 
+/**
+ * Snapshot label a deployment derives to allow forking a session onto the
+ * caller's connected hosts, even when it can't fork the session into a new sandbox.
+ */
+export const FORK_TARGETS_LABEL_KEY = "omnigent.fork_targets";
+export const CONNECTED_HOSTS_FORK_TARGET = "connected_hosts";
+
 export interface SessionActionSource {
   labels?: Record<string, string | null> | null;
   /** Session snapshot shape. */
@@ -21,17 +30,28 @@ export interface SessionActionSource {
   host_id?: string | null;
 }
 
+export interface SessionActionRestrictions {
+  forkDisabledReason?: string;
+  /** Set when a fork may target only connected hosts, not a new sandbox. */
+  sandboxForkDisabledReason?: string;
+  switchHostDisabledReason?: string;
+}
+
 export function sessionActionRestrictions(
   session: SessionActionSource | null | undefined,
   host?: { sandbox_provider?: string | null },
-): { forkDisabledReason?: string; switchHostDisabledReason?: string } {
+): SessionActionRestrictions {
   // The embedded deployment derives this marker alongside its managed-fork ban,
   // regardless of provider. It is distinct from core `host_type: managed` launches.
   const unsupportedSource =
     session?.labels?.["omnigent.host_type"] === "managed" ||
     (host?.sandbox_provider != null && UNSUPPORTED_FORK_PROVIDERS.has(host.sandbox_provider));
+  const connectedHostsOnly =
+    session?.labels?.[FORK_TARGETS_LABEL_KEY] === CONNECTED_HOSTS_FORK_TARGET;
   return {
-    forkDisabledReason: unsupportedSource ? SANDBOX_FORK_UNSUPPORTED : undefined,
+    forkDisabledReason:
+      unsupportedSource && !connectedHostsOnly ? SANDBOX_FORK_UNSUPPORTED : undefined,
+    sandboxForkDisabledReason: connectedHostsOnly ? SANDBOX_TARGET_FORK_UNSUPPORTED : undefined,
     switchHostDisabledReason:
       unsupportedSource || host?.sandbox_provider ? SANDBOX_SWITCH_HOST_UNSUPPORTED : undefined,
   };
