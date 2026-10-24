@@ -676,6 +676,47 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_conversation_fingerprints(self, conversation_ids: list[str]) -> dict[str, object]:
+        """
+        Return a cheap change fingerprint per conversation.
+
+        Lets a caller that re-reads the same conversations on a timer, such
+        as the ``WS /v1/sessions/updates`` ticker, skip :meth:`get_conversations`
+        for rows that haven't changed. Covers every conversation, metadata
+        and label column except the large compressed blobs (session state,
+        usage, inference snapshot, terminal launch args) and the
+        ``runner_last_seen`` heartbeat stamp.
+
+        :param conversation_ids: Conversation ids to fingerprint,
+            e.g. ``["conv_abc123"]``. Duplicates are tolerated.
+        :returns: Mapping ``{conversation_id: fingerprint}`` for ids that
+            resolve to a row. Fingerprints are opaque; compare them with
+            ``==``. Equal fingerprints mean :meth:`get_conversations` would
+            return the same entity apart from the excluded fields.
+        """
+        ...
+
+    @abstractmethod
+    def get_conversations_with_fingerprints(
+        self, conversation_ids: list[str]
+    ) -> dict[str, tuple[object, Conversation]]:
+        """
+        Load conversations together with their fingerprints.
+
+        Each fingerprint is computed from the same row reads as its
+        conversation, so it always describes that entity and equals what
+        :meth:`get_conversation_fingerprints` returns while the row is
+        unchanged. Pairing a separately read fingerprint with a later load
+        could match a row that changed and then changed back.
+
+        :param conversation_ids: Conversation ids to fetch,
+            e.g. ``["conv_abc123"]``. Duplicates are tolerated.
+        :returns: Mapping ``{conversation_id: (fingerprint, Conversation)}``
+            for ids that resolve to a row.
+        """
+        ...
+
+    @abstractmethod
     def list_child_conversation_ids_by_parent(
         self,
         parent_conversation_ids: list[str],

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
@@ -176,6 +176,44 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
 # pathological directory can impose on a delete. Hitting it answers "in use".
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
+
+
+# Metadata columns read by ``get_conversation_fingerprints``: all but the
+# compressed blobs and the heartbeat stamp, which no list row reads.
+_FINGERPRINT_METADATA_COLUMNS = [
+    column
+    for column in SqlConversationMetadata.__table__.c
+    if column.name
+    not in {
+        "session_state",
+        "session_usage",
+        "inference_snapshot",
+        "terminal_launch_args",
+        "runner_last_seen",
+    }
+]
+
+
+def _conversation_fingerprint(
+    conversation_values: Iterable[object],
+    metadata_values: Iterable[object] | None,
+    labels: Iterable[tuple[str, str]],
+) -> object:
+    """
+    Combine one conversation's fingerprinted values into a comparable value.
+
+    :param conversation_values: Every ``conversations`` column value, in
+        table order.
+    :param metadata_values: The ``_FINGERPRINT_METADATA_COLUMNS`` values, in
+        that order, or ``None`` when the metadata row is missing.
+    :param labels: ``(key, value)`` label pairs in any order.
+    :returns: An opaque value compared with ``==``.
+    """
+    return (
+        tuple(conversation_values),
+        None if metadata_values is None else tuple(metadata_values),
+        tuple(sorted(labels)),
+    )
 
 
 class _RowCountResult(Protocol):
@@ -1368,8 +1406,54 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: Mapping ``{conversation_id: Conversation}`` for the
             ids that resolved to a row.
         """
+        rows, meta_by_id, labels_by_conv = self._load_conversation_rows(conversation_ids)
+        return {
+            row.id: _to_conversation(row, meta_by_id.get(row.id), labels_by_conv.get(row.id, {}))
+            for row in rows
+        }
+
+    def get_conversations_with_fingerprints(
+        self, conversation_ids: list[str]
+    ) -> dict[str, tuple[object, Conversation]]:
+        """
+        Load conversations with fingerprints taken from the same row reads.
+
+        See the abstract method for the contract.
+
+        :param conversation_ids: Conversation ids to fetch,
+            e.g. ``["conv_abc123"]``.
+        :returns: Mapping ``{conversation_id: (fingerprint, Conversation)}``;
+            ids without a row are omitted.
+        """
+        rows, meta_by_id, labels_by_conv = self._load_conversation_rows(conversation_ids)
+        result: dict[str, tuple[object, Conversation]] = {}
+        for row in rows:
+            meta = meta_by_id.get(row.id)
+            labels = labels_by_conv.get(row.id, {})
+            fingerprint = _conversation_fingerprint(
+                (getattr(row, column.key) for column in SqlConversation.__table__.c),
+                None
+                if meta is None
+                else (getattr(meta, column.key) for column in _FINGERPRINT_METADATA_COLUMNS),
+                labels.items(),
+            )
+            result[row.id] = (fingerprint, _to_conversation(row, meta, labels))
+        return result
+
+    def _load_conversation_rows(
+        self, conversation_ids: list[str]
+    ) -> tuple[
+        list[SqlConversation], dict[str, SqlConversationMetadata], dict[str, dict[str, str]]
+    ]:
+        """
+        Read conversation, metadata and label rows for a batch of ids.
+
+        :param conversation_ids: Conversation ids to read; duplicates are
+            tolerated and empty input skips the database.
+        :returns: The conversation rows, metadata rows by id, and labels by id.
+        """
         if not conversation_ids:
-            return {}
+            return [], {}, {}
         unique_ids = list(set(conversation_ids))
         with self._conv_session("get_conversations") as session:
             rows = list(
@@ -1402,13 +1486,57 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .scalars()
                     .all()
                 )
-        meta_by_id = {m.id: m for m in meta_rows}
+        return rows, {m.id: m for m in meta_rows}, labels_by_conv
+
+    def get_conversation_fingerprints(self, conversation_ids: list[str]) -> dict[str, object]:
+        """
+        Fingerprint conversations from raw column tuples.
+
+        Same three queries as :meth:`get_conversations`, but selecting plain
+        columns skips the blob decompression, JSON decoding and ORM entity
+        construction that dominate that call. See the abstract method for the
+        contract.
+
+        :param conversation_ids: Conversation ids to fingerprint,
+            e.g. ``["conv_abc123"]``.
+        :returns: Mapping ``{conversation_id: fingerprint}``; ids without a
+            row are omitted.
+        """
+        if not conversation_ids:
+            return {}
+        unique_ids = list(set(conversation_ids))
+        with self._conv_session("get_conversation_fingerprints") as session:
+            rows = session.execute(
+                select(*SqlConversation.__table__.c).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
+                )
+            ).all()
+            label_rows = session.execute(
+                select(
+                    SqlConversationLabel.conversation_id,
+                    SqlConversationLabel.key,
+                    SqlConversationLabel.value,
+                ).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id.in_(unique_ids),
+                )
+            ).all()
+        if not rows:
+            return {}
+        with self._session("get_conversation_fingerprints") as meta_sess:
+            meta_rows = meta_sess.execute(
+                select(*_FINGERPRINT_METADATA_COLUMNS).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_([row.id for row in rows]),
+                )
+            ).all()
+        labels: dict[str, list[tuple[str, str]]] = {}
+        for conv_id, key, value in label_rows:
+            labels.setdefault(conv_id, []).append((key, value))
+        meta_by_id = {row.id: row for row in meta_rows}
         return {
-            row.id: _to_conversation(
-                row,
-                meta_by_id.get(row.id),
-                labels_by_conv.get(row.id, {}),
-            )
+            row.id: _conversation_fingerprint(row, meta_by_id.get(row.id), labels.get(row.id, ()))
             for row in rows
         }
 
