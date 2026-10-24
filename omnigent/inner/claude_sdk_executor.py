@@ -893,6 +893,8 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    # Set for a bwrap-sandboxed CLI: the credentials file it was started with.
+    sandboxed_credentials: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -1403,13 +1405,32 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
     return roots
 
 
+def _claude_credentials_file() -> pathlib.Path:
+    """The file holding the Claude CLI's OAuth sign-in on Linux."""
+    return pathlib.Path.home() / ".claude" / ".credentials.json"
+
+
+def _claude_credentials_identity() -> tuple[int, int]:
+    """Identify the credentials file, ``(0, 0)`` when it is absent.
+
+    A Claude CLI saves the file by renaming a new copy over it, which gives it
+    a new inode, so a changed identity means some process replaced it.
+
+    :returns: ``(st_dev, st_ino)`` of the file, or ``(0, 0)``.
+    """
+    try:
+        info = _claude_credentials_file().stat()
+    except OSError:
+        return (0, 0)
+    return (info.st_dev, info.st_ino)
+
+
 def _claude_internal_write_files() -> list[pathlib.Path]:
     """Exact files the Claude CLI updates outside its writable roots."""
 
-    # .credentials.json holds the Claude CLI's OAuth token on Linux.
     candidates = [
         pathlib.Path.home() / ".claude.json",
-        pathlib.Path.home() / ".claude" / ".credentials.json",
+        _claude_credentials_file(),
     ]
     return [path for path in candidates if path.exists()]
 
@@ -1973,6 +1994,10 @@ class ClaudeSDKExecutor(Executor):
 
             options.stderr = _tee_stderr
             client = sdk.ClaudeSDKClient(options)
+            # bwrap binds the credentials file as it is now; see _credentials_replaced.
+            sandboxed_credentials = (
+                _claude_credentials_identity() if self._cli_bind_mounts_credentials() else None
+            )
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2052,6 +2077,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                sandboxed_credentials=sandboxed_credentials,
             )
             self._clients[session_key] = state
             return client
@@ -2112,6 +2138,23 @@ class ClaudeSDKExecutor(Executor):
         task = asyncio.create_task(self._force_close_client(state.client))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    def _cli_bind_mounts_credentials(self) -> bool:
+        """Whether the CLI runs under bwrap, which binds its credentials file by path."""
+        return self._cli_wrapper_path is not None and sys.platform == "linux"
+
+    def _credentials_replaced(self, state: _ClaudeClientState) -> bool:
+        """Whether a sandboxed CLI's credentials file was replaced after it started.
+
+        bwrap binds the file it saw at launch. Once another Claude process saves
+        a refreshed sign-in (a new file renamed over the old one), that bind is
+        gone and the path is read-only inside the sandbox, so this CLI can't save
+        its own refresh and a rotated refresh token is lost. A new CLI binds the
+        current file.
+        """
+        if state.sandboxed_credentials is None:
+            return False
+        return _claude_credentials_identity() != state.sandboxed_credentials
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2637,9 +2680,21 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
+        credentials_replaced = state is not None and self._credentials_replaced(state)
+        if (
+            state is not None
+            and (state.effort != reasoning_effort or credentials_replaced)
+            and prompt != "/compact"
+        ):
+            # Effort is a launch option, and a CLI whose credentials bind went
+            # stale needs a new launch. Rebuild with history for conversational
             # turns, but let /compact operate on the existing client's context.
+            if credentials_replaced:
+                logger.info(
+                    "Claude credentials file was replaced since the sandboxed CLI for "
+                    "session %s started; restarting the CLI so it can save refreshed sign-ins.",
+                    session_key,
+                )
             await self._close_live_client(session_key)
             resume_session = False
             prompt = self._build_prompt(messages, resume_session=False)
