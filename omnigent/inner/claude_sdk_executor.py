@@ -1276,19 +1276,17 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
-    if host is None and base_url_override is not None and auth_command_override is not None:
+    generic_provider = (
+        host is None and base_url_override is not None and auth_command_override is not None
+    )
+    if generic_provider:
         # Generic-provider gateway: explicit base_url + auth command,
         # no Databricks host or profile required (e.g. ApiKeyAuth with
         # a mock LLM server URL).
-        return {
-            "ANTHROPIC_BASE_URL": base_url_override,
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
-                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
-            ),
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
-        }
-    if host is None:
+        assert base_url_override is not None and auth_command_override is not None
+        base_url = base_url_override
+        auth_command = auth_command_override
+    elif host is None:
         # Only the workspace host is needed here: the auth command mints the
         # bearer at request time. Resolving the host (rather than a static
         # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
@@ -1332,9 +1330,10 @@ def _resolve_gateway_env(
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
+    if not generic_provider:
+        gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = _DATABRICKS_CODING_AGENT_HEADER
     # DATABRICKS-PATCH(claude-sdk-gateway-betas)
     # Blanket-disabling betas makes Claude Code strip `interleaved-thinking`,
     # after which the Databricks gateway rejects the malformed thinking blocks
@@ -1347,7 +1346,14 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
+            "\n".join(
+                value
+                for value in (
+                    os.environ.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
+                    gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
+                )
+                if value
+            ),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(base_url),
         )
@@ -2711,6 +2717,7 @@ class ClaudeSDKExecutor(Executor):
         # ``_get_or_create_client`` via ``_unset_env_var`` — setting it to
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
+        env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites

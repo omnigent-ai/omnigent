@@ -41,6 +41,7 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.databricks_ai_gateway import (
+    CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
@@ -1292,11 +1293,15 @@ def _populate_codex_home_config(
                     set_codex_model_catalog_path(dest_path, catalog_path)
 
 
+_CODEX_MANAGED_CONFIG_PATH = Path("/etc/codex/managed_config.toml")
+
+
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    include_managed_config: bool = True,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1314,11 +1319,29 @@ def materialize_codex_provider_config(
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param include_managed_config: Attribute providers inherited from Codex's
+        system config. Signer workers use only their trusted generated provider.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
+    from omnigent.onboarding.codex_auth_readiness import (
+        CODEX_BUILTIN_PROVIDERS,
+        load_codex_config,
+    )
+
+    managed_config = (
+        load_codex_config(_CODEX_MANAGED_CONFIG_PATH) if include_managed_config else None
+    )
+    managed = managed_config.get("model_providers") if managed_config else None
+    managed_providers = {
+        name: provider
+        for name, provider in (managed.items() if isinstance(managed, Mapping) else ())
+        if isinstance(provider, Mapping)
+        and isinstance(base_url := provider.get("base_url"), str)
+        and is_databricks_ai_gateway_url(base_url)
+    }
 
     provider_overrides: list[str] = []
     argv_overrides: list[str] = []
@@ -1327,7 +1350,7 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file():
+    if not provider_overrides and not config_path.is_file() and not managed_providers:
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1337,7 +1360,7 @@ def materialize_codex_provider_config(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
     providers = document.get("model_providers")
-    if providers is None and not provider_overrides:
+    if providers is None and not provider_overrides and not managed_providers:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
@@ -1355,7 +1378,11 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
-    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+    for provider_name in managed_providers:
+        if provider_name in providers or provider_name in CODEX_BUILTIN_PROVIDERS:
+            continue
+        # A partial table adds metadata; Codex still owns routing and auth.
+        providers[provider_name] = tomlkit.inline_table()
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1373,11 +1400,23 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
-        base_url = provider_config.get("base_url")
+        inherited = managed_providers.get(provider_name, {})
+        base_url = provider_config.get("base_url", inherited.get("base_url"))
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
             headers = provider_config.get("http_headers")
+            inherited_headers = inherited.get("http_headers")
+            # Never copy credentials or auth helpers out of machine policy.
+            metadata = {
+                name: value
+                for name, value in (
+                    inherited_headers.items() if isinstance(inherited_headers, Mapping) else ()
+                )
+                if name.lower() in ("user-agent", CLIENT_SURFACES_HEADER.lower())
+            }
             provider_config["http_headers"] = with_gateway_attribution(
-                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+                {**metadata, **(headers if isinstance(headers, Mapping) else {})},
+                CODEX_AGENT,
+                base_url,
             )
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
@@ -2994,6 +3033,7 @@ class _CodexAppServerSession:
             self._codex_home_dir,
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
+            include_managed_config=self._signer is None,
         )
         if self._signer is not None:
             self._codex_config_overrides.extend(

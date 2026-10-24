@@ -39,6 +39,12 @@ from typing import Any, TypeAlias
 import httpx
 import uvicorn
 
+from omnigent.databricks_ai_gateway import (
+    CLAUDE_CODE_AGENT,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -295,6 +301,12 @@ class ClaudeGatewayShim:
             name = raw_name.decode("latin-1")
             if name.lower() not in _REQUEST_HEADER_EXCLUDES:
                 headers.append((name, raw_value.decode("latin-1")))
+        if is_databricks_ai_gateway_url(self._upstream_base_url):
+            headers = list(
+                with_gateway_attribution(
+                    dict(headers), CLAUDE_CODE_AGENT, self._upstream_base_url
+                ).items()
+            )
         query = scope.get("query_string", b"").decode("latin-1")
         url = f"{self._upstream_base_url}{path}" + (f"?{query}" if query else "")
 

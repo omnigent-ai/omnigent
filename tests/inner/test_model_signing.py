@@ -63,6 +63,46 @@ def test_reconstructs_authority_and_bearer_from_frozen_inputs() -> None:
 
 
 @pytest.mark.parametrize(
+    ("host", "path", "via_ug", "surfaces"),
+    [
+        ("workspace.cloud.databricks.com", "/ai-gateway/codex/v1/responses", False, "omnigent"),
+        (
+            "workspace.cloud.databricks.com",
+            "/ai-gateway/codex/v1/responses",
+            True,
+            "omnigent, ug",
+        ),
+        ("workspace.ai-gateway.cloud.databricks.com", "/v1/responses", False, "omnigent"),
+        (_HOST, _PATH, True, None),
+    ],
+    ids=["workspace", "ug", "dedicated", "serving-endpoint"],
+)
+def test_signer_synthesizes_gateway_attribution(
+    host: str, path: str, via_ug: bool, surfaces: str | None
+) -> None:
+    request = reconstruct_signed_request(
+        route=FrozenModelRoute(method="POST", host=host, path=path),
+        placeholder=_PLACEHOLDER,
+        bearer_token=_TOKEN,
+        method="POST",
+        connect_host=host,
+        sni_host=host,
+        request_host=host,
+        target=path,
+        headers=[
+            ("Authorization", f"Bearer {_PLACEHOLDER}"),
+            ("Content-Type", "application/json"),
+            ("databricks-custom-coding-agent", "other-agent"),
+            ("Databricks-Custom-Client-Surfaces", "other-app"),
+        ],
+        body=b'{"model":"test"}',
+        via_ug=via_ug,
+    )
+    assert request.header("Databricks-Custom-Coding-Agent") == ("codex" if surfaces else None)
+    assert request.header("Databricks-Custom-Client-Surfaces") == surfaces
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("connect_host", "attacker.example"),

@@ -1054,6 +1054,7 @@ class TestConstructor(unittest.TestCase):
                         pass
 
             env = captured["env"]
+            self.assertEqual(env["CLAUDE_AGENT_SDK_CLIENT_APP"], "omnigent")
             # Newest served generation per family; the non-Claude id is ignored.
             self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-claude-opus-5")
             self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "gw-claude-fable-5")
@@ -1859,6 +1860,25 @@ class TestResolveGatewayEnv(unittest.TestCase):
             auth_command_override="printf sk-test",
         )
         self.assertNotIn("ANTHROPIC_CUSTOM_HEADERS", env)
+
+    def test_generic_provider_on_unity_gateway_gets_attribution(self):
+        from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
+
+        with patch.dict("os.environ", {"ANTHROPIC_CUSTOM_HEADERS": "X-Trace: keep"}, clear=True):
+            env = _resolve_gateway_env(
+                base_url_override="https://wkspc.cloud.databricks.com/ai-gateway/anthropic",
+                auth_command_override="printf sk-test",
+            )
+        self.assertEqual(env["CLAUDE_CODE_USE_GATEWAY"], "1")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
+            [
+                "X-Trace: keep",
+                "Databricks-Custom-Coding-Agent: claude-code",
+                "Databricks-Custom-Client-Surfaces: omnigent",
+            ],
+        )
 
     def test_host_override_requires_base_url(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
