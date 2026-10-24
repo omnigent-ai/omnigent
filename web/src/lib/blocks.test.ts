@@ -35,6 +35,7 @@ describe("structuredErrorFields", () => {
     "workspace_missing",
     "connection_error",
     "context_length_exceeded",
+    "output_limit_exceeded",
     "rate_limit_exceeded",
     "codex_thread_reset",
     "internal_error",
