@@ -1,6 +1,6 @@
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { CancelledError, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -13,7 +13,7 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
 import { getSessionHost } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
-import { prefetchSessionHostChain, useSession } from "./useSession";
+import { fetchSessionSnapshot, prefetchSessionHostChain, useSession } from "./useSession";
 
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
@@ -99,6 +99,70 @@ describe("useSession — refresh_state", () => {
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
     await flush(5 * 60_000);
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("fetchSessionSnapshot", () => {
+  it("rejects a silent cancellation without a replacement", async () => {
+    const { client } = harness();
+    const id = "cancelled_without_replacement";
+    const queryKey = ["session", id];
+    let finish!: (value: Session) => void;
+    getSessionSlimMock.mockImplementationOnce(
+      () =>
+        new Promise<Session>((done) => {
+          finish = done;
+        }),
+    );
+    const snapshot = fetchSessionSnapshot(client, {
+      queryKey,
+      queryFn: () => getSessionSlim(id),
+    });
+    const rejected = expect(snapshot).rejects.toBeInstanceOf(CancelledError);
+
+    await client.cancelQueries({ queryKey }, { silent: true });
+    finish(session(id));
+    await rejected;
+
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+    expect(client.getQueryState(queryKey)?.fetchStatus).toBe("idle");
+  });
+
+  it("rejects a replacement evicted before the cancelled caller resumes", async () => {
+    const { client } = harness();
+    const id = "evicted_replacement";
+    const queryKey = ["session", id];
+    client.setQueryData(queryKey, session(id));
+    let finishOld!: (value: Session) => void;
+    getSessionSlimMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Session>((done) => {
+            finishOld = done;
+          }),
+      )
+      // Settle the replacement before the cancelled caller resumes.
+      .mockResolvedValue(session(id));
+    const options = { queryKey, queryFn: () => getSessionSlim(id), staleTime: 0 };
+    const owner = client.fetchQuery(options).catch(() => undefined);
+    const joined = fetchSessionSnapshot(client, options);
+    const rejected = expect(joined).rejects.toBeInstanceOf(CancelledError);
+    const unsubscribe = client.getQueryCache().subscribe((event) => {
+      if (
+        event.type === "updated" &&
+        event.action.type === "success" &&
+        event.query.queryKey[1] === id
+      ) {
+        client.removeQueries({ queryKey, exact: true });
+      }
+    });
+
+    await client.invalidateQueries({ queryKey, refetchType: "all" });
+    finishOld(session(id));
+    await Promise.all([owner, rejected]);
+    unsubscribe();
+
+    expect(client.getQueryCache().find({ queryKey, exact: true })).toBeUndefined();
   });
 });
 
@@ -207,6 +271,77 @@ describe("prefetchSessionHostChain", () => {
 
     expect(getSessionHost("inflight_managed")).toBe("host_after_provision");
     expect(getSessionSlimMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits for a replaced pre-provisioning snapshot before fetching the assigned host", async () => {
+    const { client } = harness();
+    const id = "replaced_managed";
+    const queryKey = ["session", id];
+    const hostless = routed(id, null, null);
+    client.setQueryData(queryKey, hostless);
+    let finishOld!: (value: Session) => void;
+    let finishReplacement!: (value: Session) => void;
+    getSessionSlimMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Session>((done) => {
+            finishOld = done;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<Session>((done) => {
+            finishReplacement = done;
+          }),
+      )
+      .mockResolvedValue(routed(id, "host_assigned", null));
+
+    const oldSnapshot = client
+      .fetchQuery({ queryKey, queryFn: () => getSessionSlim(id), staleTime: 0 })
+      .catch(() => undefined);
+    const refresh = prefetchSessionHostChain(client, id, { force: true });
+    const invalidated = client.invalidateQueries({ queryKey, refetchType: "all" });
+    await flush();
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(2);
+
+    finishOld(hostless);
+    finishReplacement(hostless);
+    await Promise.all([oldSnapshot, invalidated, refresh]);
+
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(3);
+    expect(getSessionHost(id)).toBe("host_assigned");
+    expect(client.getQueryData(queryKey)).toMatchObject({ hostId: "host_assigned" });
+  });
+
+  it("follows a replaced in-flight refetch without forcing a fresh read", async () => {
+    const { client } = harness();
+    const id = "replaced_host_lookup";
+    const queryKey = ["session", id];
+    const hostless = routed(id, null, null);
+    client.setQueryData(queryKey, hostless);
+    // Mark the cache stale so the walk joins the in-flight refetch.
+    await client.invalidateQueries({ queryKey, refetchType: "none" });
+    let finishOld!: (value: Session) => void;
+    getSessionSlimMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<Session>((done) => {
+            finishOld = done;
+          }),
+      )
+      .mockResolvedValue(routed(id, "host_replacement", null));
+    const owner = client
+      .fetchQuery({ queryKey, queryFn: () => getSessionSlim(id), staleTime: 0 })
+      .catch(() => undefined);
+    const lookup = prefetchSessionHostChain(client, id);
+    const resolved = expect(lookup).resolves.toBeUndefined();
+
+    await client.invalidateQueries({ queryKey, refetchType: "all" });
+    finishOld(hostless);
+    await Promise.all([owner, resolved]);
+
+    expect(getSessionSlimMock).toHaveBeenCalledTimes(2);
+    expect(getSessionHost(id)).toBe("host_replacement");
   });
 
   it.each([false, true])("resolves nested side chats after reload (cached: %s)", async (cached) => {
