@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
+import anyio
 import httpx
 from fastapi import (
     APIRouter,
@@ -116,6 +117,24 @@ if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 
+class _ShieldedCloseByteStream(httpx.AsyncByteStream):
+    """Keep an upstream stream's cleanup running through request cancellation.
+
+    :param stream: The upstream httpx byte stream to delegate to.
+    """
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        with anyio.CancelScope(shield=True):
+            await self._stream.aclose()
+
+
 class _RunnerStreamResponse(StreamingResponse):
     """Stream a runner response body and close it however the send ends.
 
@@ -123,13 +142,22 @@ class _RunnerStreamResponse(StreamingResponse):
     send that fails before that, or a client that disconnects (where
     Starlette skips background tasks), would leak the tunnel request.
     Closing in ``__call__`` covers every exit.
+    The route wraps ``upstream.stream`` in ``_ShieldedCloseByteStream`` before
+    constructing this response, so the ``finally`` close completes on cancellation.
 
     :param upstream: The runner's streamed response.
     :param headers: Response headers to forward.
+    :param content: Async iterator of body chunks, including the prefetched first chunk.
     """
 
-    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+    def __init__(
+        self,
+        upstream: httpx.Response,
+        *,
+        headers: Mapping[str, str],
+        content: AsyncIterator[bytes],
+    ) -> None:
+        super().__init__(content, headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -422,9 +450,10 @@ def register_resources_routes(
         :returns: The attachment, streamed as the runner sends it, or the
             runner's own error body and status for a missing file, a
             directory, or an out-of-grant path.
-        :raises OmnigentError: ``runner_unavailable`` when the runner
-            predates downloads.
-        :raises HTTPException: 502 when no runner can be reached.
+        :raises OmnigentError: ``runner_unavailable`` when no runner is
+            available, a send-time connection failure shows it is unreachable,
+            or the runner predates downloads.
+        :raises HTTPException: 502 when a download or error-body read fails.
         """
         try:
             runner_client = await _get_runner_client_for_resource_access(
@@ -450,9 +479,9 @@ def register_resources_routes(
                 conversation=conversation,
             )
         if runner_client is None:
-            raise HTTPException(
-                status_code=502,
-                detail="no runner available for resource access",
+            raise OmnigentError(
+                "No runner is available to download this file.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         try:
             resp = await runner_client.send(
@@ -460,10 +489,16 @@ def register_resources_routes(
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            if isinstance(exc, (httpx.ConnectError, ConnectionError)):
+                raise OmnigentError(
+                    "The session runner is offline. Reconnect the host and retry.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
             raise HTTPException(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
+        resp.stream = _ShieldedCloseByteStream(cast(httpx.AsyncByteStream, resp.stream))
         if resp.status_code == 200 and "content-disposition" in resp.headers:
             skip_gzip(request)
             forwarded = {
@@ -478,9 +513,38 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
-            return _RunnerStreamResponse(resp, headers=forwarded)
+            chunks = resp.aiter_raw()
+            try:
+                first_chunk = await anext(chunks)
+            except StopAsyncIteration:
+                first_chunk = None
+            except BaseException as exc:
+                with contextlib.suppress(BaseException):
+                    await resp.aclose()
+                if isinstance(exc, (httpx.HTTPError, ConnectionError)):
+                    _logger.warning("Runner download failed before streaming began: %s", exc)
+                    raise HTTPException(
+                        status_code=502,
+                        detail="runner download failed",
+                    ) from exc
+                raise
+
+            async def stream_chunks() -> AsyncIterator[bytes]:
+                if first_chunk is not None:
+                    yield first_chunk
+                async for chunk in chunks:
+                    yield chunk
+
+            return _RunnerStreamResponse(
+                resp,
+                headers=forwarded,
+                content=stream_chunks(),
+            )
         try:
             await resp.aread()
+        except (httpx.HTTPError, ConnectionError) as exc:
+            _logger.warning("Runner download error response could not be read: %s", exc)
+            raise HTTPException(status_code=502, detail="runner download failed") from exc
         finally:
             await resp.aclose()
         if resp.status_code == 200:
