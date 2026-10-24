@@ -1631,9 +1631,14 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     launch_kwargs: dict[str, Any] = {}
 
     async def _fake_create_session(
-        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+        _client: object,
+        _bundle: bytes,
+        *,
+        bridge_id: str,
+        claude_args: object = (),
+        terminal_launch_args: object = None,
     ) -> str:
-        del _client, _bundle, bridge_id, terminal_launch_args
+        del _client, _bundle, bridge_id, claude_args, terminal_launch_args
         return "conv_local_fresh_raw"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -1999,6 +2004,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         bundle: bytes,
         *,
         bridge_id: str | None,
+        claude_args: tuple[str, ...] = (),
         terminal_launch_args: list[str] | None = None,
     ) -> str:
         """
@@ -2007,11 +2013,12 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         :param client: HTTP client created by the prepare helper.
         :param bundle: Bundled agent bytes.
         :param bridge_id: Bridge label requested by the caller.
+        :param claude_args: Pass-through Claude args for the effort stamp.
         :param terminal_launch_args: Claude launch args persisted on
             the session for the runner to apply.
         :returns: Fixed conversation id.
         """
-        del client
+        del client, claude_args
         assert bundle == b"bundle"
         assert bridge_id is None
         assert terminal_launch_args == ["--print", "hi"]
@@ -6293,9 +6300,10 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         _bundle: bytes,
         *,
         bridge_id: str,
+        claude_args: tuple[str, ...] = (),
     ) -> str:
         """Return a freshly-minted conv id without HTTP."""
-        del _client, _bundle, bridge_id
+        del _client, _bundle, bridge_id, claude_args
         return "conv_new"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:

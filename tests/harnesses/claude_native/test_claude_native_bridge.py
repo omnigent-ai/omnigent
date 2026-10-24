@@ -8114,6 +8114,29 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     assert claude_native_bridge.read_user_effort_level() is None
 
 
+@pytest.mark.parametrize(
+    ("claude_args", "expected"),
+    [
+        (("--effort", "xhigh"), "xhigh"),
+        (("--effort=max",), "max"),
+        (("--effort", "low", "--model", "opus", "--effort", "xhigh"), "xhigh"),
+        (("--model", "opus"), "high"),
+        (("--effort", "ultra"), "high"),
+    ],
+)
+def test_resolve_launch_effort_level_prefers_passed_effort(
+    claude_args: tuple[str, ...],
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid pass-through ``--effort`` wins over settings.json's ``effortLevel``."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.resolve_launch_effort_level(claude_args) == expected
+
+
 # ---------------------------------------------------------------------------
 # launch_model storage and retrieval
 # ---------------------------------------------------------------------------
