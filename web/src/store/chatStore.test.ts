@@ -2229,6 +2229,114 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("lands a prefetched page from memory and never fetches the same cursor twice", async () => {
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS + 5;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pf_${idx.toString().padStart(4, "0")}`, `pf ${idx}`),
+    );
+    seedSession("conv_pf", items);
+    await useChatStore.getState().switchTo("conv_pf");
+    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+    const olderPageRequests = () =>
+      fetchMock.mock.calls.filter(([u]) =>
+        /\/v1\/sessions\/conv_pf\/items\?.*after=/.test(String(u)),
+      );
+
+    // The loader asks on every re-evaluation; one page per cursor goes on the wire.
+    useChatStore.getState().prefetchMoreHistory();
+    useChatStore.getState().prefetchMoreHistory();
+    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(1));
+    // A prefetch is not a prepend: nothing lands and no loading row shows.
+    expect(useChatStore.getState().blocks).toHaveLength(INITIAL_WINDOW_ITEMS);
+    expect(useChatStore.getState().loadingMoreHistory).toBe(false);
+
+    await useChatStore.getState().loadMoreHistory();
+    expect(olderPageRequests()).toHaveLength(1);
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+      ...items.slice(5, 5 + OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
+      ...windowIds,
+    ]);
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
+
+    // The cursor moved on, so the next prefetch is a new page.
+    useChatStore.getState().prefetchMoreHistory();
+    await vi.waitFor(() => expect(olderPageRequests()).toHaveLength(2));
+  });
+
+  it("refetches an older page whose prefetch failed when the reader asks for it", async () => {
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pff_${idx.toString().padStart(4, "0")}`, `pff ${idx}`),
+    );
+    seedSession("conv_pff", items);
+    await useChatStore.getState().switchTo("conv_pff");
+    const windowIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+
+    let failed = false;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_pff\/items\?.*after=/.test(url) && !failed) {
+        failed = true;
+        return Promise.reject(new TypeError("network down"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore.getState().prefetchMoreHistory();
+    await vi.waitFor(() => expect(failed).toBe(true));
+    // The rejection settles within the task it arrives in; let that task end.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    // A failed prefetch is silent: scroll-up stays armed rather than disabled.
+    expect(useChatStore.getState().hasMoreHistory).toBe(true);
+
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([
+      ...items.slice(0, OLDER_HISTORY_PAGE_ITEMS).map((item) => item.id),
+      ...windowIds,
+    ]);
+    expect(useChatStore.getState().hasMoreHistory).toBe(false);
+  });
+
+  it("does not prefetch while a page is in flight or once history is exhausted", async () => {
+    const total = INITIAL_WINDOW_ITEMS + OLDER_HISTORY_PAGE_ITEMS;
+    const items = Array.from({ length: total }, (_, idx) =>
+      userMessage(`pfx_${idx.toString().padStart(4, "0")}`, `pfx ${idx}`),
+    );
+    seedSession("conv_pfx", items);
+    await useChatStore.getState().switchTo("conv_pfx");
+    const olderPageRequests = () =>
+      fetchMock.mock.calls.filter(([u]) =>
+        /\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(String(u)),
+      );
+
+    let releasePage: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/conv_pfx\/items\?.*after=/.test(url) && releasePage === null) {
+        return new Promise<Response>((resolve) => {
+          releasePage = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const page = useChatStore.getState().loadMoreHistory();
+    await vi.waitFor(() => expect(releasePage).not.toBeNull());
+    // The page in flight is the one a prefetch would fetch.
+    useChatStore.getState().prefetchMoreHistory();
+    await Promise.resolve();
+    expect(olderPageRequests()).toHaveLength(1);
+
+    releasePage!();
+    await page;
+    expect(useChatStore.getState().hasMoreHistory).toBe(false);
+    useChatStore.getState().prefetchMoreHistory();
+    await Promise.resolve();
+    expect(olderPageRequests()).toHaveLength(1);
+  });
+
   it("keeps each conversation's own effort across a warm A→B→A switch", async () => {
     // `sessionReasoningEffort` is a single app-global sticky pick, so it cannot answer
     // "what is THIS conversation at" once a warm switch skips hydration: cold

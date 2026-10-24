@@ -74,7 +74,12 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
-import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
+import {
+  ApiError,
+  continueFailedTurn,
+  OLDER_HISTORY_PAGE_ITEMS,
+  retrySession,
+} from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -1643,12 +1648,13 @@ const TOUCH_DRAG_SLOP_PX = 8;
 const WHEEL_GESTURE_QUIET_MS = 300;
 
 /**
- * Pages one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
- * may chain beyond its first while every page folds into a turn already on
- * screen. One enormous turn would otherwise let a single gesture page in the
- * whole transcript with the reader's hands off.
+ * Items one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
+ * may chain beyond its first page while every page folds into a turn already
+ * on screen. One enormous turn would otherwise let a single gesture page in
+ * the whole transcript with the reader's hands off.
  */
-const SEEK_PAGES_PER_GESTURE = 30;
+export const SEEK_ITEMS_PER_GESTURE = 600;
+const SEEK_PAGES_PER_GESTURE = Math.ceil(SEEK_ITEMS_PER_GESTURE / OLDER_HISTORY_PAGE_ITEMS);
 
 /**
  * Quiet time after the last scroll event before a touch-armed page may land.
@@ -1730,6 +1736,11 @@ export function HistoryAutoLoader({
   // later one — chained or from a further tick of the same gesture — spends
   // the budget, even after a page that added a row ended the seek.
   const gestureFetchedRef = useRef(false);
+  // Whether the gesture in hand is still asking for older history. While it
+  // is, the next page is fetched as soon as the pane comes within the load
+  // threshold, so the landing — which may wait for the pane to settle, or for
+  // the reader's next tick — comes from memory rather than the network.
+  const prefetchArmedRef = useRef(false);
 
   // Position across a prepend is held by the transcript (VirtualBubbleList), not
   // by this component. Writing scrollTop here instead used to interrupt the
@@ -1740,6 +1751,7 @@ export function HistoryAutoLoader({
     const noteUpwardGesture = (seekPages: number, viaTouch = false) => {
       touchArmedRef.current = viaTouch;
       scrolledUpRef.current = true;
+      prefetchArmedRef.current = true;
       // A fresh gesture seeks from what is on screen now, with a fresh budget.
       seekBaseRowsRef.current = null;
       seekPagesLeftRef.current = seekPages;
@@ -1750,6 +1762,7 @@ export function HistoryAutoLoader({
     // lands, but nothing chains after it.
     const noteDownwardGesture = () => {
       scrolledUpRef.current = false;
+      prefetchArmedRef.current = false;
       seekBaseRowsRef.current = null;
     };
     // Scroll movement alone is never intent: the virtualizer, the bottom lock,
@@ -1772,6 +1785,7 @@ export function HistoryAutoLoader({
         return;
       }
       scrolledUpRef.current = true;
+      prefetchArmedRef.current = true;
       setScrollRevision((revision) => revision + 1);
     };
     // The transcript draws its own scrollbar; a thumb drag reports its direction
@@ -1881,6 +1895,7 @@ export function HistoryAutoLoader({
       generationRef.current = historyGeneration;
       // A new window is a new open: require a fresh gesture, with a fresh budget.
       scrolledUpRef.current = false;
+      prefetchArmedRef.current = false;
       seekBaseRowsRef.current = null;
       seekPagesLeftRef.current = SEEK_PAGES_PER_GESTURE;
       gestureFetchedRef.current = false;
@@ -1888,15 +1903,14 @@ export function HistoryAutoLoader({
     }
 
     const state = useChatStore.getState();
-    if (
-      !state.oldestItemId ||
-      !state.hasMoreHistory ||
-      state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged)
-    ) {
+    if (!state.oldestItemId || !state.hasMoreHistory || !(itemsChanged || scrollPositionChanged)) {
       return;
     }
     if (el.scrollTop >= historyLoadThreshold(el)) return;
+    // The gesture is still seeking and the pane is within the threshold: get
+    // the next page on the wire now, ahead of the landing decided below.
+    if (prefetchArmedRef.current) state.prefetchMoreHistory();
+    if (state.loadingMoreHistory) return;
     // A finger-armed request waits while the pane is still moving, so the page
     // cannot land mid-fling. A pane that has been still for the settle window
     // fetches at once — a slow drag that stopped at the top has no momentum to

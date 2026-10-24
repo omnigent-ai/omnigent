@@ -30,7 +30,7 @@ from tests.e2e_ui.conftest import seed_committed_items
 # viewport, matching the report's surface.
 _VIEWPORT = {"width": 390, "height": 844}
 
-# Older real text turns above the window — many 20-item history pages remain.
+# Older real text turns above the window — more history pages remain.
 _OLD_TURNS = 30
 # Tool calls per giant settled turn. Two such turns (~1000 items) mirror the
 # reported lengthy Otto session whose recent history is one huge tool chain.
@@ -38,10 +38,11 @@ _CALLS_PER_BIG_TURN = 250
 
 # One drag keeps paging while every page folds into the giant turn already on
 # screen and stops at the first page that shows something new — bounded by the
-# loader's per-gesture budget (a first page plus 30 chained) so it can never
-# run through the whole transcript. The buggy build chained ~47 pages from one
-# drag and kept going after a new row had appeared.
-_MAX_PAGES_PER_GESTURE = 31
+# loader's per-gesture budget (a first page plus 600 items chained: three
+# 200-item pages) so it can never run through the whole transcript. The buggy
+# build chained ~47 pages from one drag and kept going after a new row had
+# appeared.
+_MAX_PAGES_PER_GESTURE = 4
 
 # Paging is considered settled once no new /items request lands for this long.
 _SETTLE_SECONDS = 3.0
@@ -241,7 +242,7 @@ def test_one_touch_drag_loads_bounded_history(
             f"first page that shows something new or at its budget"
         )
         # And it paged far enough to show the reader something new: the newest
-        # giant turn alone is ~20 pages of folded tool calls above the opening
+        # giant turn alone is hundreds of folded tool-call items above the opening
         # window, and the drag must carry through them to the turn before it.
         expect(page.get_by_text("FINAL SUMMARY 0", exact=False)).to_be_attached()
         # And the loading row must not still be churning after the settle.
