@@ -11,12 +11,18 @@ readline parity:
 - Option/Alt+Enter and Ctrl+Enter insert a newline (regression for the
   ``[13;3u`` / ``[13;5u`` leaks).
 - Shift+Tab decodes to back-tab (regression for the ``[9;2u`` leak).
+- Every Ctrl+letter decodes to its control key; the host binds Ctrl+J to
+  "insert newline" (regression for the ``[106;5u`` leak).
+- Alt+<key> decodes to Escape + the key, exactly like the legacy ``ESC <key>``
+  encoding, so the emacs word motions fire (regression for the ``[98;3u`` /
+  ``[102;3u`` leaks).
 - Plain Backspace/Enter/Tab are unchanged (we didn't over-broaden).
 """
 
 from __future__ import annotations
 
 import asyncio
+import string
 
 import pytest
 from omnigent_ui_sdk.terminal._host import _install_csi_u_sequences
@@ -45,11 +51,14 @@ def _parse_raw(raw: str) -> list:
     return presses
 
 
-async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
+async def _drive_raw(
+    start_text: str, raw: str, *, cursor: int | None = None, times: int = 1
+) -> Buffer:
     """Feed ``raw`` (repeated ``times``) into a buffer holding ``start_text``
-    with the cursor at the end, through the default emacs key bindings, and
-    return the resulting buffer text. Drives the full real input pipeline."""
-    buf = Buffer(document=Document(start_text, len(start_text)))
+    (cursor at the end unless ``cursor`` is given), through the default emacs
+    key bindings, and return the buffer. Drives the full real input pipeline."""
+    position = len(start_text) if cursor is None else cursor
+    buf = Buffer(document=Document(start_text, position))
     app = Application(
         layout=Layout(Window(BufferControl(buffer=buf))),
         key_bindings=load_key_bindings(),
@@ -62,7 +71,12 @@ async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
                 processor.feed(press)
         processor.process_keys()
         await asyncio.sleep(0)  # let the processor settle on the running loop
-    return buf.text
+    return buf
+
+
+async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
+    """The buffer text left behind by :func:`_drive_raw`."""
+    return (await _drive_raw(start_text, raw, times=times)).text
 
 
 # ── decode: every fixed CSI-u sequence resolves to one real key (no leak) ──
@@ -77,6 +91,8 @@ async def _apply_raw(start_text: str, raw: str, *, times: int = 1) -> str:
         ("Option/Alt+Enter", "\x1b[13;3u", Keys.F20),
         ("Ctrl+Enter", "\x1b[13;5u", Keys.F20),
         ("Shift+Tab", "\x1b[9;2u", Keys.BackTab),
+        ("Ctrl+J", "\x1b[106;5u", Keys.ControlJ),
+        ("Ctrl+V", "\x1b[118;5u", Keys.ControlV),
         # Guards — unchanged plain keys:
         ("plain Backspace", "\x1b[127u", Keys.Backspace),
         ("plain Enter", "\x1b[13u", Keys.ControlM),
@@ -90,6 +106,53 @@ def test_csi_u_sequence_decodes_to_single_key(label: str, raw: str, expected: Ke
     presses = _parse_raw(raw)
     assert len(presses) == 1, f"{label}: expected 1 key, got {[str(p.key) for p in presses]}"
     assert presses[0].key == expected, label
+
+
+def test_every_ctrl_letter_decodes_to_its_control_key() -> None:
+    """The terminal encodes any Ctrl+letter as ``<cp>;5u`` once the host has
+    pushed the protocol, so every letter must resolve (a gap leaks text)."""
+    for ch in string.ascii_lowercase:
+        presses = _parse_raw(f"\x1b[{ord(ch)};5u")
+        expected = getattr(Keys, f"Control{ch.upper()}")
+        assert [p.key for p in presses] == [expected], f"Ctrl+{ch.upper()}"
+
+
+# ── decode: Alt+<key> resolves to Escape + key, like the legacy ESC prefix ──
+
+
+@pytest.mark.parametrize(
+    ("label", "raw", "char"),
+    [
+        ("Alt+B", "\x1b[98;3u", "b"),
+        ("Alt+F", "\x1b[102;3u", "f"),
+        ("Alt+D", "\x1b[100;3u", "d"),
+        ("Alt+.", "\x1b[46;3u", "."),
+    ],
+)
+def test_csi_u_alt_key_decodes_like_legacy_escape_prefix(label: str, raw: str, char: str) -> None:
+    """Alt+<key> yields the same two presses as the legacy ``ESC <key>`` bytes,
+    so every ``escape <key>`` binding keeps working on CSI-u terminals."""
+    csi_u_keys = [p.key for p in _parse_raw(raw)]
+    legacy_keys = [p.key for p in _parse_raw("\x1b" + char)]
+    assert csi_u_keys == legacy_keys == [Keys.Escape, char], label
+
+
+# ── functional: Alt+B / Alt+F / Alt+D act on words instead of leaking text ──
+
+
+async def test_alt_b_moves_back_a_word() -> None:
+    buf = await _drive_raw("hello world", "\x1b[98;3u")
+    assert (buf.text, buf.cursor_position) == ("hello world", len("hello "))
+
+
+async def test_alt_f_moves_forward_a_word() -> None:
+    buf = await _drive_raw("hello world", "\x1b[102;3u", cursor=0)
+    assert (buf.text, buf.cursor_position) == ("hello world", len("hello"))
+
+
+async def test_alt_d_kills_the_next_word() -> None:
+    buf = await _drive_raw("hello world", "\x1b[100;3u", cursor=0)
+    assert buf.text == " world"
 
 
 # ── functional: backward word-delete on Option+/Ctrl+Backspace ──
