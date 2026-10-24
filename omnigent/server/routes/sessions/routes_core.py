@@ -1643,7 +1643,9 @@ def register_core_routes(
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
             matches if its title contains the query or any of
-            its conversation items' text does. Powers the
+            its conversation items' text does. Title matches are
+            listed before content-only matches; each group keeps
+            the ``sort_by``/``order`` ordering. Powers the
             sidebar's session search.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions

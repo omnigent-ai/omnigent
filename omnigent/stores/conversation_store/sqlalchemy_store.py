@@ -11,6 +11,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    Integer,
     LargeBinary,
     Select,
     and_,
@@ -25,6 +26,7 @@ from sqlalchemy import (
     select,
     text,
     tuple_,
+    union_all,
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
@@ -2960,7 +2962,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``conversation_items.search_text`` contains the
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
-            Postgres without extra extensions.
+            Postgres without extra extensions. Title matches are
+            listed before content-only matches; each group keeps
+            the ``sort_by``/``order`` ordering, and cursors page
+            through both groups in that sequence.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -3178,6 +3183,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            # Ranked match groups for a search, read in order: title matches,
+            # then content-only matches. ``[None]`` is the single unfiltered
+            # group of a plain listing.
+            match_tiers: list[ColumnElement[bool] | None] = [None]
+            title_match: ColumnElement[bool] | None = None
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
@@ -3204,7 +3214,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                # Each tier is a separately limited branch, which keeps it on the
+                # sort index instead of sorting every match. Sparse title matches
+                # still scan all titles.
+                match_tiers = [title_match, and_(~title_match, content_match)]
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3297,31 +3310,68 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 )
-            if after:
-                stmt = self._apply_cursor(
-                    session,
-                    stmt,
-                    after,
-                    sort_col,
-                    is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
-                    forward=True,
+            # A cursor resumes inside its own tier: groups before an ``after``
+            # cursor's tier (or past a ``before`` cursor's tier) are skipped.
+            last_tier = len(match_tiers) - 1
+            after_tier = (
+                self._cursor_search_tier(session, stmt, after, title_match) if after else 0
+            )
+            before_tier = (
+                self._cursor_search_tier(session, stmt, before, title_match)
+                if before
+                else last_tier
+            )
+            tier_stmts: list[tuple[int, Select[tuple[SqlConversation]]]] = []
+            for tier_index, tier_filter in enumerate(match_tiers):
+                if tier_index < after_tier or tier_index > before_tier:
+                    continue
+                tier_stmt = stmt if tier_filter is None else stmt.where(tier_filter)
+                if tier_filter is not None:
+                    # A cursor renamed after its tier was read could otherwise
+                    # land in an unbounded tier and be listed again.
+                    for cursor_id in (after, before):
+                        if cursor_id:
+                            tier_stmt = tier_stmt.where(SqlConversation.id != cursor_id)
+                if after and tier_index == after_tier:
+                    tier_stmt = self._apply_cursor(
+                        session,
+                        tier_stmt,
+                        after,
+                        sort_col,
+                        is_desc,
+                        tiebreaker_col=self._tiebreaker_col,
+                        forward=True,
+                    )
+                if before and tier_index == before_tier:
+                    tier_stmt = self._apply_cursor(
+                        session,
+                        tier_stmt,
+                        before,
+                        sort_col,
+                        is_desc,
+                        tiebreaker_col=self._tiebreaker_col,
+                        forward=False,
+                    )
+                tier_stmts.append((tier_index, tier_stmt))
+            rows: list[SqlConversation]
+            if not tier_stmts:
+                # An ``after`` cursor ranked past its ``before`` cursor: no rows.
+                rows = []
+            elif len(tier_stmts) == 1:
+                rows = list(
+                    session.execute(
+                        tier_stmts[0][1]
+                        .order_by(
+                            sort_fn(sort_col),
+                            sort_fn(self._tiebreaker_col),  # insertion order breaks ties
+                        )
+                        .limit(limit + 1)
+                    )
+                    .scalars()
+                    .all()
                 )
-            if before:
-                stmt = self._apply_cursor(
-                    session,
-                    stmt,
-                    before,
-                    sort_col,
-                    is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
-                    forward=False,
-                )
-            stmt = stmt.order_by(
-                sort_fn(sort_col),
-                sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
-            ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            else:
+                rows = self._fetch_ranked_tiers(session, tier_stmts, sort_col, is_desc, limit + 1)
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
@@ -3390,6 +3440,103 @@ class SqlAlchemyConversationStore(ConversationStore):
         if col is None:
             raise ValueError(f"invalid sort_by: {sort_by!r}")
         return col
+
+    @staticmethod
+    def _cursor_search_tier(
+        session: Session,
+        listing_stmt: Select[tuple[SqlConversation]],
+        cursor_id: str,
+        title_match: ColumnElement[bool] | None,
+    ) -> int:
+        """
+        Return the search tier a page cursor belongs to.
+
+        Search results list title matches (tier 0) before content-only
+        matches (tier 1), so a cursor resumes in the tier of its own row.
+        The cursor is classified through the listing's own filters, so a
+        session the caller cannot list reads exactly like a deleted one and
+        its title is never compared on the caller's behalf.
+
+        :param session: Open conversation-DB session.
+        :param listing_stmt: The listing query with every visibility,
+            permission and scope filter applied, before search tiers.
+        :param cursor_id: The conversation ID acting as the page cursor,
+            e.g. ``"conv_abc123"``.
+        :param title_match: The search's title predicate, or ``None`` for a
+            plain listing, which has a single tier.
+        :returns: ``0`` when the cursor row's title matches (or there is no
+            search), otherwise ``1``.
+        :raises StaleCursorError: If the cursor row no longer exists or is
+            outside the caller's listing.
+        """
+        if title_match is None:
+            return 0
+        cursor_row = session.execute(
+            listing_stmt.with_only_columns(title_match).where(SqlConversation.id == cursor_id)
+        ).first()
+        if cursor_row is None:
+            raise StaleCursorError(cursor_id)
+        return 0 if cursor_row[0] else 1
+
+    def _fetch_ranked_tiers(
+        self,
+        session: Session,
+        tier_stmts: list[tuple[int, Select[tuple[SqlConversation]]]],
+        sort_col: QueryableAttribute[int],
+        is_desc: bool,
+        row_limit: int,
+    ) -> list[SqlConversation]:
+        """
+        Read several search tiers in rank order with one statement.
+
+        Each tier is limited on its own, then the tiers are combined with
+        ``UNION ALL``. One statement reads one snapshot, so a session renamed
+        mid-request cannot appear in two tiers or drop out of both.
+
+        :param session: Open conversation-DB session.
+        :param tier_stmts: ``(tier_rank, statement)`` pairs, each already
+            filtered to its tier and any cursor bound.
+        :param sort_col: Primary sort column (``created_at`` or ``updated_at``).
+        :param is_desc: ``True`` for descending, ``False`` for ascending.
+        :param row_limit: Maximum rows to return, e.g. ``21`` for a page of
+            20 plus the ``has_more`` probe.
+        :returns: Up to ``row_limit`` conversations, lower tiers first.
+        """
+        sort_fn = desc if is_desc else asc
+        branches = []
+        for tier_rank, tier_stmt in tier_stmts:
+            limited_tier = (
+                tier_stmt.with_only_columns(
+                    SqlConversation.id.label("conversation_id"),
+                    literal(tier_rank, Integer).label("tier_rank"),
+                    sort_col.label("sort_value"),
+                    self._tiebreaker_col.label("tiebreak_value"),
+                )
+                .order_by(sort_fn(sort_col), sort_fn(self._tiebreaker_col))
+                .limit(row_limit)
+                .subquery()
+            )
+            # SQLite rejects ORDER BY/LIMIT directly on a compound member, so
+            # each limited tier is wrapped as a derived table.
+            branches.append(select(*limited_tier.c))
+        ranked = union_all(*branches).subquery("ranked_matches")
+        ranked_stmt = (
+            select(SqlConversation)
+            .join(
+                ranked,
+                and_(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == ranked.c.conversation_id,
+                ),
+            )
+            .order_by(
+                ranked.c.tier_rank,
+                sort_fn(ranked.c.sort_value),
+                sort_fn(ranked.c.tiebreak_value),
+            )
+            .limit(row_limit)
+        )
+        return list(session.execute(ranked_stmt).scalars().all())
 
     @staticmethod
     def _apply_cursor(
