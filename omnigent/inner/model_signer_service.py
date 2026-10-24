@@ -42,6 +42,11 @@ _UCODE_CONFIG_KEYS = _CONFIG_KEYS | {"auth_profile"}
 _ROUTE_KEYS = frozenset({"method", "host", "path"})
 _TEST_BINDING = "test-fake-provider-v1"
 _UCODE_BINDING = "databricks-ucode-v1"
+# The ucode binding is ug's Codex route; name it for Unity Gateway usage attribution.
+_UCODE_ATTRIBUTION_HEADERS = (
+    ("Databricks-Custom-Coding-Agent", "codex"),
+    ("Databricks-Custom-Client-Surfaces", "omnigent, ug"),
+)
 _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_HEADER_BYTES = 64 * 1024
 _MAX_HEADER_LINE_BYTES = 8 * 1024
@@ -242,6 +247,7 @@ class _SignerRelay(EgressProxy):
         ca_key_path: Path,
         ca_bundle_path: Path,
         provider_port: int | None,
+        extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(
             parse_rules([f"{route.method} {route.host}{route.path}"]),
@@ -252,6 +258,7 @@ class _SignerRelay(EgressProxy):
         )
         self._route = route
         self._placeholder = placeholder
+        self._extra_headers = extra_headers
         if (bearer_token is None) == (credential_source is None):
             raise ValueError("signer relay requires exactly one credential source")
         self._credential_source = credential_source or _StaticCredential(bearer_token or "")
@@ -352,6 +359,7 @@ class _SignerRelay(EgressProxy):
             target=path,
             headers=headers,
             body=body,
+            extra_headers=self._extra_headers,
         )
         if port != 443:
             await self._send_forbidden(client_writer, "")
@@ -982,6 +990,7 @@ async def _run(config_fd: int) -> int:
             ca_key_path=ca_key,
             ca_bundle_path=ca_bundle,
             provider_port=provider_port,
+            extra_headers=_UCODE_ATTRIBUTION_HEADERS if binding_id == _UCODE_BINDING else (),
         )
         socket_path = public_dir / "relay.sock"
         await relay.start_unix(socket_path)
