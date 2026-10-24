@@ -3387,7 +3387,30 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         # ucode's env/model when its base URL is HTTPS on the connected workspace
         # host (mirrors the opencode guard); otherwise keep the profile-derived
         # route rather than forwarding the bearer to an unverified origin.
-        if ucode_base_url and https_url_on_workspace_host(ucode_base_url, workspace_host):
+        #
+        # When the current state entry is an alias to another workspace (alias_of),
+        # also accept the base URL if it matches the canonical workspace's host and
+        # the state entry's workspace field points to that canonical workspace.
+        # Security: state.json is writable; only trust alias_of if it points to the
+        # workspace entry's host and that host is a trusted Databricks gateway.
+        base_url_trusted = False
+        if ucode_base_url:
+            if https_url_on_workspace_host(ucode_base_url, workspace_host):
+                base_url_trusted = True
+            elif workspace_state is not None and workspace_state.alias_of:
+                # Alias is trusted iff:
+                # 1. alias_of is the workspace entry's own host
+                # 2. alias_of is a trusted Databricks host
+                # 3. base URL is HTTPS on the alias_of host
+                if (
+                    workspace_state.workspace_url == workspace_state.alias_of
+                    and is_databricks_ai_gateway_url(
+                        f"{workspace_state.alias_of}/ai-gateway/anthropic"
+                    )
+                    and https_url_on_workspace_host(ucode_base_url, workspace_state.alias_of)
+                ):
+                    base_url_trusted = True
+        if base_url_trusted:
             # Adopt only the explicit routing/model keys from the writable
             # state.json — never credential keys or arbitrary process env — then
             # re-pin the base URL to the guarded value.
@@ -3415,7 +3438,9 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
         via_ug=adopted_ug_route,
     )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
-    return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
+    return ClaudeNativeUcodeConfig(
+        env=cast(dict[str, str], env), api_key_helper=api_key_helper, model=model
+    )
 
 
 def resolve_native_claude_config(
