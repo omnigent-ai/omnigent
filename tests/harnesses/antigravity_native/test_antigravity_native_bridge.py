@@ -1114,6 +1114,120 @@ def test_inject_user_message_via_tui_submits_a_collapsed_paste(
 
 
 # ---------------------------------------------------------------------------
+# Draft scrolled behind agy's overflow row
+# ---------------------------------------------------------------------------
+
+
+_SCROLLED_DRAFT_CONTENT = (
+    "Please review the repository notes for release agy-0d42e902 and write a short "
+    "report: summarise the purpose of last week's change to how messages are typed "
+    "into the terminal in two or three plain-language sentences, list the files you "
+    "believe are most relevant with one line each on why they matter, call out any "
+    "assumptions the change makes about terminal size, line wrapping or paste "
+    "handling and whether those assumptions are documented anywhere, note which "
+    "tests cover the behaviour and whether they exercise a long multi-paragraph "
+    "prompt or only short single-line messages, and suggest two follow-up checks a "
+    "reviewer could run by hand. This is a read-only task, so do not edit files or "
+    "run commands that change state; keep the report under four hundred words and "
+    "quote file paths exactly as they appear. End your reply with the single line "
+    "DONE agy-0d42e902 so the result is easy to find."
+)
+_AGY_RULE = "\u2500" * 80
+_AGY_IDLE_PANE = (
+    f"{_AGY_RULE}\n>\n{_AGY_RULE}\n"
+    "? for shortcuts                                             Gemini 3.1 Pro \u00b7 low"
+)
+# agy 1.2.4, 80x24: a single paragraph wrapping past the composer's viewport keeps
+# only its tail visible and hides the first wrapped line behind the overflow row.
+_AGY_SCROLLED_DRAFT_PANE = (
+    f"{_AGY_RULE}\n"
+    "> \u2191 1 more lines\n"
+    "  short report: summarise the purpose of last week's change to how messages\n"
+    "  are typed into the terminal in two or three plain-language sentences, list\n"
+    "  the files you believe are most relevant with one line each on why they\n"
+    "  matter, call out any assumptions the change makes about terminal size, line\n"
+    "  wrapping or paste handling and whether those assumptions are documented\n"
+    "  anywhere, note which tests cover the behaviour and whether they exercise a\n"
+    "  long multi-paragraph prompt or only short single-line messages, and suggest\n"
+    "  two follow-up checks a reviewer could run by hand. This is a read-only task,\n"
+    "  so do not edit files or run commands that change state; keep the report\n"
+    "  under four hundred words and quote file paths exactly as they appear. End\n"
+    "  your reply with the single line DONE agy-0d42e902 so the result is easy to\n"
+    "  find.\n"
+    f"{_AGY_RULE}\n"
+    "                                                            Gemini 3.1 Pro \u00b7 low"
+)
+_AGY_RUNNING_PANE = f"{_AGY_RULE}\n>\n{_AGY_RULE}\nesc to cancel"
+
+
+def test_draft_in_input_region_detects_draft_scrolled_behind_overflow_row() -> None:
+    """A draft whose first line hides behind ``\u2191 N more lines`` still counts as rendered."""
+    baseline = _mod._agy_input_region(_AGY_IDLE_PANE)
+    needle = _mod._submit_needle(_SCROLLED_DRAFT_CONTENT)
+    assert needle not in _AGY_SCROLLED_DRAFT_PANE
+    assert _mod._draft_in_input_region(_AGY_SCROLLED_DRAFT_PANE, needle, baseline)
+    assert not _mod._draft_in_input_region(_AGY_RUNNING_PANE, needle, baseline)
+
+
+def test_inject_user_message_via_tui_submits_a_draft_scrolled_behind_overflow_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _fast_tmux_timeouts: None,
+) -> None:
+    """A long single-paragraph prompt agy scrolls is submitted, not reported as unrendered."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(bridge_dir, socket_path=Path("/tmp/ex/tmux.sock"), tmux_target="main")
+    tui = {"pane": _AGY_IDLE_PANE}
+    enters = {"n": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """agy shows only the tail of the paste, then starts a turn on Enter."""
+        del kwargs
+        if "has-session" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _AGY_SCROLLED_DRAFT_PANE
+        if cmd[-1] == "Enter":
+            enters["n"] += 1
+            tui["pane"] = _AGY_RUNNING_PANE
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message_via_tui(bridge_dir, content=_SCROLLED_DRAFT_CONTENT, timeout_s=0.5)
+
+    assert enters["n"] == 1, "the scrolled draft should submit on the first Enter"
+
+
+def test_format_pane_debug_tail_keeps_composer_overflow_row() -> None:
+    """The failure diagnostic keeps the whole composer, so a tall draft's overflow row shows."""
+    tail = _mod._format_pane_debug_tail(_AGY_SCROLLED_DRAFT_PANE)
+    assert "↑ 1 more lines" in tail
+    assert tail.endswith("Gemini 3.1 Pro · low")
+
+
+def test_format_pane_debug_tail_caps_fallback_and_skips_blank_padding() -> None:
+    """A separator-less pane drops blank padding and keeps only the last 20 nonblank lines."""
+    content = [f"status line {index}" for index in range(1, 26)]
+    padded = "\n".join(f"{line}\n" for line in content)
+    tail = _mod._format_pane_debug_tail(padded)
+    assert tail.splitlines() == content[-_mod._PANE_TAIL_MAX_LINES :]
+
+
+def test_format_pane_debug_tail_caps_composer_region_from_the_head() -> None:
+    """A tall composer region is capped from its head so the overflow row survives."""
+    body = [f"draft line {index}" for index in range(1, 31)]
+    pane = "\n".join([_AGY_RULE, "> ↑ 3 more lines", *body, _AGY_RULE, "? for shortcuts"])
+    tail = _mod._format_pane_debug_tail(pane)
+    lines = tail.splitlines()
+    assert len(lines) == _mod._PANE_TAIL_MAX_LINES
+    assert lines[0] == _AGY_RULE
+    assert "↑ 3 more lines" in lines[1]
+    assert "? for shortcuts" not in tail
+
+
+# ---------------------------------------------------------------------------
 # Account-verification re-delivery
 # ---------------------------------------------------------------------------
 
