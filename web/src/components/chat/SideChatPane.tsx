@@ -54,6 +54,8 @@ import { Button } from "@/components/ui/button";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  isCompactControl,
+  rejectBusyCompact,
   restoredSendDraftUnchanged,
   takeFailedSendDraft,
   type SideChatComposerDraft,
@@ -741,6 +743,8 @@ function SideChatComposer({
     clearText: () => setText(""),
   });
   const showInterrupt = !pending && busy;
+  // Side chats accept follow-ups while busy; a grid session waits for its turn to end.
+  const sendBlocked = busy && fullSession;
 
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
@@ -758,7 +762,7 @@ function SideChatComposer({
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if (busy || !canSend || agentId === null) return;
+    if (sendBlocked || !canSend || agentId === null) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote or
     // attachment is always an ordinary message.
@@ -795,15 +799,13 @@ function SideChatComposer({
       return;
     }
     const outgoing = files;
+    const message = serializeReplyDraft({ quotes, text: trimmed });
+    // A running Codex chat refuses /compact; keep the draft as the main composer does.
+    if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
-    void send(
-      serializeReplyDraft({ quotes, text: trimmed }),
-      agentId,
-      outgoing.length > 0 ? outgoing : undefined,
-      {
-        pinnedConversationId: childId,
-      },
-    ).finally(refreshLabels);
+    void send(message, agentId, outgoing.length > 0 ? outgoing : undefined, {
+      pinnedConversationId: childId,
+    }).finally(refreshLabels);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
@@ -937,25 +939,26 @@ function SideChatComposer({
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />
-              <ComposerSendButton
-                type="button"
-                label={
-                  fullSession
-                    ? showInterrupt
-                      ? "Interrupt session"
-                      : "Send message"
-                    : showInterrupt
-                      ? "Interrupt side chat"
-                      : "Send side question"
-                }
-                interrupt={showInterrupt}
-                busy={interrupting}
-                disabled={
-                  showInterrupt ? interrupting || !interruptReady : !canSend || !ready || busy
-                }
-                onClick={showInterrupt ? interruptSideChat : submit}
-                data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
-              />
+              {showInterrupt && (
+                <ComposerSendButton
+                  type="button"
+                  label={fullSession ? "Interrupt session" : "Interrupt side chat"}
+                  interrupt
+                  busy={interrupting}
+                  disabled={interrupting || !interruptReady}
+                  onClick={interruptSideChat}
+                  data-testid="side-chat-interrupt"
+                />
+              )}
+              {!sendBlocked && (
+                <ComposerSendButton
+                  type="button"
+                  label={fullSession ? "Send message" : "Send side question"}
+                  disabled={!canSend || !ready}
+                  onClick={submit}
+                  data-testid="side-chat-send"
+                />
+              )}
             </>
           ),
         }}

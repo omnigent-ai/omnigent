@@ -3732,7 +3732,7 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 
 // ── Internal helpers ─────────────────────────────────────
 
-function isCompactControl(
+export function isCompactControl(
   harness: string | null | undefined,
   text: string,
   files?: File[],
@@ -3744,7 +3744,7 @@ function isCompactControl(
   );
 }
 
-function rejectBusyCompact(conversationId: string | null): boolean {
+export function rejectBusyCompact(conversationId: string | null): boolean {
   const state = conversationId === null ? undefined : setterForState(conversationId);
   if (state?.sessionHarness === "claude-sdk" || state?.sessionHarness === "pi-native") return false;
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
