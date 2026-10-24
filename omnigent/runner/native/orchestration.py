@@ -4681,6 +4681,7 @@ async def _auto_create_kimi_terminal(
     kimi_env = build_kimi_session_home(
         bridge_dir / "kimi-code-home",
         bridge_dir=bridge_dir,
+        workspace=Path(workspace),
     )
     # Inherit the agent's os_env so its declared sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
