@@ -7,6 +7,8 @@ selection and its refresh behaviour are asserted in one place.
 
 from __future__ import annotations
 
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,8 @@ def _run_generated_helper(
     force_refresh_works: bool,
     cached_token_works: bool,
     bearer: str | None = None,
+    cwd: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """
     Run *command* against a fake ``databricks`` CLI and return its stdout.
@@ -30,6 +34,9 @@ def _run_generated_helper(
         is the stale-refresh-token case.
     :param cached_token_works: Whether plain ``auth token`` succeeds.
     :param bearer: Value for ``DATABRICKS_BEARER``, or ``None`` to unset it.
+    :param cwd: Directory the helper runs in (a harness runs it in the agent's
+        workspace), or ``None`` to inherit the test's.
+    :param extra_env: Variables set on top of the helper's environment.
     :returns: The helper's stdout, stripped.
     """
     import os
@@ -65,10 +72,45 @@ def _run_generated_helper(
     env["DATABRICKS_CONFIG_FILE"] = str(tmp_path / "nonexistent-databrickscfg")
     if bearer is not None:
         env["DATABRICKS_BEARER"] = bearer
+    env.update(extra_env or {})
     result = subprocess.run(
-        ["sh", "-c", command], env=env, capture_output=True, text=True, check=False
+        ["sh", "-c", command], env=env, cwd=cwd, capture_output=True, text=True, check=False
     )
     return result.stdout.strip()
+
+
+def _write_script(path: Path, body: str) -> None:
+    """Write an executable ``/bin/sh`` script at *path* (creating its parent)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\n{body}")
+    path.chmod(0o755)
+
+
+def _offline_databricks_sdk(root: Path) -> dict[str, str]:
+    """
+    Stand in for the databricks-sdk in the helper's child interpreter.
+
+    The real ``Config()`` probes the workspace's metadata endpoint over the
+    network; this stub resolves the example workspace to a fixed bearer, so the
+    real entrypoint runs end to end offline. It rides on ``PYTHONPATH``, which
+    ``-P`` keeps (``-I`` would drop it, and with it installs that rely on it).
+
+    :param root: Directory the stub ``databricks`` package is written into.
+    :returns: Env overrides putting the stub ahead of the installed SDK.
+    """
+    sdk = root / "databricks" / "sdk"
+    sdk.mkdir(parents=True)
+    (root / "databricks" / "__init__.py").write_text("")
+    (sdk / "__init__.py").write_text("")
+    (sdk / "config.py").write_text(
+        "class Config:\n"
+        "    host = 'https://example.databricks.com'\n"
+        "    def __init__(self, **kwargs): pass\n"
+        "    @classmethod\n"
+        "    def attributes(cls): return []\n"
+        "    def authenticate(self): return {'Authorization': 'Bearer sdk-minted'}\n"
+    )
+    return {"PYTHONPATH": str(root)}
 
 
 def _recorded_fallback(tmp_path: Path) -> str:
@@ -343,12 +385,21 @@ def test_no_sidecar_falls_back_to_the_sdk_mint_not_the_broker(
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     cmd = databricks_bearer_token_command("https://example.databricks.com", "myprofile")
     assert "omnigent.host.databricks_credential" not in cmd
-    assert (
-        "python3 -m omnigent.inner.databricks_token "
-        "--host https://example.databricks.com --profile myprofile" in cmd
+    sdk_mint = shlex.join(
+        [
+            sys.executable,
+            "-P",
+            "-m",
+            "omnigent.inner.databricks_token",
+            "--host",
+            "https://example.databricks.com",
+            "--profile",
+            "myprofile",
+        ]
     )
+    sdk_mint = f"cd / && exec {sdk_mint}"
     # The eval-fallback clause now carries the sdk mint.
-    assert "eval" in cmd
+    assert f"eval {shlex.quote(sdk_mint)}" in cmd
 
 
 def test_the_sdk_fallback_selects_by_host_when_no_profile(
@@ -361,9 +412,110 @@ def test_the_sdk_fallback_selects_by_host_when_no_profile(
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     cmd = databricks_bearer_token_command("https://example.databricks.com/", None)
-    assert (
-        "python3 -m omnigent.inner.databricks_token --host https://example.databricks.com" in cmd
+    sdk_mint = shlex.join(
+        [
+            sys.executable,
+            "-P",
+            "-m",
+            "omnigent.inner.databricks_token",
+            "--host",
+            "https://example.databricks.com",
+        ]
     )
+    sdk_mint = f"cd / && exec {sdk_mint}"
+    assert f"eval {shlex.quote(sdk_mint)}" in cmd
+
+
+@pytest.mark.posix_only
+def test_the_sdk_fallback_runs_under_omnigents_interpreter_not_path_python3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The sdk mint runs under the interpreter omnigent runs in.
+
+    A bare ``python3`` resolved through the helper's ``PATH`` — live, to a
+    Homebrew Python with neither omnigent nor the SDK — so a PAT profile the CLI
+    couldn't mint got an empty bearer and every gateway request 401'd. The
+    interpreter sits at a path with a space to carry the quoting through the
+    helper's ``eval``.
+    """
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    bin_dir = tmp_path / "bin"
+    _write_script(
+        bin_dir / "python3",
+        f": > {shlex.quote(str(tmp_path / 'path-python3-ran'))}\necho wrong-python\n",
+    )
+    interpreter = tmp_path / "omnigent python" / "python3"
+    _write_script(interpreter, f'exec {shlex.quote(sys.executable)} "$@"\n')
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    command = databricks_bearer_token_command("https://example.databricks.com", "agent")
+
+    token = _run_generated_helper(
+        command,
+        bin_dir,
+        force_refresh_works=False,
+        cached_token_works=False,
+        extra_env=_offline_databricks_sdk(tmp_path / "sdk"),
+    )
+    assert token == "sdk-minted"
+    assert not (tmp_path / "path-python3-ran").exists()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("pythonpath_prefix", ["", ":"])
+def test_an_omnigent_package_in_the_workspace_cannot_stand_in_for_the_sdk_mint(
+    tmp_path: Path, pythonpath_prefix: str
+) -> None:
+    """The helper runs in the agent's workspace, and ``-m`` would put that cwd
+    first on ``sys.path``: an ``omnigent`` package there (a checkout, or one an
+    agent wrote) would mint in place of the installed one. ``-P`` keeps it off,
+    and running from ``/`` covers an empty ``PYTHONPATH`` component (``:``),
+    which ``-P`` does not."""
+    from omnigent.inner.databricks_executor import databricks_bearer_token_command
+
+    shadow = tmp_path / "workspace" / "omnigent" / "inner"
+    shadow.mkdir(parents=True)
+    (shadow.parent / "__init__.py").write_text("")
+    (shadow / "__init__.py").write_text("")
+    (shadow / "databricks_token.py").write_text("print('shadowed')\n")
+    # PATH's python3 is omnigent's own here, so only the cwd could mislead it.
+    bin_dir = tmp_path / "bin"
+    _write_script(bin_dir / "python3", f'exec {shlex.quote(sys.executable)} "$@"\n')
+    command = databricks_bearer_token_command("https://example.databricks.com", "agent")
+
+    token = _run_generated_helper(
+        command,
+        bin_dir,
+        force_refresh_works=False,
+        cached_token_works=False,
+        cwd=tmp_path / "workspace",
+        extra_env={
+            "PYTHONPATH": pythonpath_prefix
+            + _offline_databricks_sdk(tmp_path / "sdk")["PYTHONPATH"]
+        },
+    )
+    assert token == "sdk-minted"
+
+
+def test_the_sdk_fallback_names_python3_when_the_interpreter_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An embedded interpreter can leave ``sys.executable`` empty; fall back to
+    ``PATH``'s ``python3`` rather than emit an unrunnable command."""
+    from omnigent.inner.databricks_executor import _databricks_sdk_token_command
+
+    monkeypatch.setattr(sys, "executable", "")
+    command = _databricks_sdk_token_command("https://example.databricks.com", None)
+    assert shlex.split(command)[:8] == [
+        "cd",
+        "/",
+        "&&",
+        "exec",
+        "python3",
+        "-P",
+        "-m",
+        "omnigent.inner.databricks_token",
+    ]
 
 
 def test_the_connect_profile_tries_the_broker_then_the_sdk_fallback(
