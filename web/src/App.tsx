@@ -1,5 +1,6 @@
-import { lazy, Suspense, type ComponentType, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, type ComponentType, type ReactNode } from "react";
 import { Navigate, Route, Routes } from "react-router-dom";
+import { useNavigate, useParams } from "@/lib/routing";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
@@ -9,16 +10,12 @@ import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
+import { useSettingsRoute } from "@/shell/settingsNav";
 import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 
-// Bind a page component to its analytics page-view id. Declaring the id here,
-// beside the component, keeps the route table clean and means no route ships
-// without one. Re-fires on pathname change (see useOmnigentPageView), so a page
-// kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
-// one view per destination under the same id.
-//
-// SettingsPage opts out (stays unwrapped): its id is param-derived
-// (`settings.<section>`), so it calls useOmnigentPageView itself.
+// Binds a page to its analytics page-view id; re-fires per pathname, so a page
+// kept mounted across `/` ↔ `/c/:id` still emits one view per destination.
+// SettingsPage stays unwrapped: SettingsRoute reports its section-derived id.
 function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
   return function WithPageView(props: P) {
     useOmnigentPageView(id);
@@ -80,6 +77,21 @@ function FeatureGatedPage({ feature, children }: { feature: FeatureKey; children
     );
   }
   return isFeatureEnabled(info, feature) ? children : <NotFoundPage />;
+}
+
+// Bare /settings renders General at once and canonicalizes the URL afterwards.
+// A <Navigate> hop would commit an empty outlet beside the swapped settings nav
+// and hold that blank frame while the lazy page loads; the view counts once.
+function SettingsRoute() {
+  const { section: sectionSegment } = useParams();
+  const { section } = useSettingsRoute();
+  const navigate = useNavigate();
+  const canonical = sectionSegment !== undefined;
+  useOmnigentPageView(canonical ? `settings.${section}` : null);
+  useEffect(() => {
+    if (!canonical) navigate("/settings/general", { replace: true });
+  }, [canonical, navigate]);
+  return <SettingsPage />;
 }
 
 interface AppProps {
@@ -203,16 +215,9 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
-          {/* Settings renders into the chat outlet so the conversations
-              sidebar stays put — entering settings only swaps the card's
-              content (the section nav) and the main area. The active section
-              is carried in the URL (/settings/<section>); bare /settings
-              redirects to the canonical General section. */}
-          <Route
-            path={`${prefix}/settings`}
-            element={<Navigate to={`${prefix}/settings/general`} replace />}
-          />
-          <Route path={`${prefix}/settings/:section/:subSection?`} element={<SettingsPage />} />
+          {/* Settings renders in the chat outlet so the conversations sidebar stays put;
+              bare /settings shows General and is replaced with /settings/general. */}
+          <Route path={`${prefix}/settings/:section?/:subSection?`} element={<SettingsRoute />} />
           <Route path={`${prefix}/extensions/:extensionId/*`} element={<ExtensionPageRoute />} />
           {/* Members / Policies are now settings sub-categories
               (/settings/members, /settings/policies) so entering them
