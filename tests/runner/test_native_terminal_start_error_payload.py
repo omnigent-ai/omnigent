@@ -13,12 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
+import types
 from pathlib import Path
 from unittest.mock import Mock
 
 import httpx
 import pytest
 
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
@@ -29,6 +32,15 @@ from omnigent.runner.native.orchestration import (
     _native_terminal_start_error_payload,
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
+)
+from omnigent.server.routes._sessions.helpers import (
+    _LAST_TASK_ERROR_CAUSE_LABEL_KEY,
+    _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+    _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY,
+    _LAST_TASK_ERROR_TITLE_LABEL_KEY,
+    _last_task_error_from_labels,
+    _truncate_label,
 )
 from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
@@ -88,6 +100,266 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
     assert "agent no longer exists" not in payload["message"]
+
+
+@pytest.mark.parametrize(
+    ("wrapper_command", "cli"),
+    [
+        (None, "omnigent"),
+        ("isaac omni", "isaac omni"),
+    ],
+)
+def test_mixed_version_import_failure_guides_host_restart(
+    monkeypatch: pytest.MonkeyPatch, wrapper_command: str | None, cli: str
+) -> None:
+    """A stale in-tree import failure is classified as a host-restart card.
+
+    After an in-place upgrade the running host imports an upgraded module whose
+    new symbol its in-memory copy lacks. The card must read as a recognized
+    failure (title + cause + remediation), name both the foreground host and
+    the host user-service restart in the configured CLI spelling, each with
+    its original options, and never echo the on-disk install path. Each field
+    must fit the per-field conversation-label budget, or a reloaded card
+    silently truncates the guidance away.
+    """
+    if wrapper_command is None:
+        monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", wrapper_command)
+
+    exc = _stale_host_import_error()
+    frames_path = exc.path
+    assert frames_path is not None
+
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    # Classified: a real headline instead of "Something went wrong", with the
+    # diagnosis and the fix split into their own fields.
+    assert payload["title"] == "Claude can't start until you restart the host"
+    cause = payload["cause"]
+    remediation = payload["remediation"]
+    assert "in-place upgrade" in cause
+    assert "mixed-version" in cause
+    assert "Restart the host" in remediation
+    # Both recipes must carry the original options: a bare `host` re-run falls
+    # back to the configured or a local server, and the bare disable+enable
+    # deletes the stored service definition, dropping a remote `--server`.
+    assert f"re-run `{cli} host` with the options you started it with" in remediation
+    assert "re-enable it with the options you installed it with" in remediation
+    assert "keeping `--server`" in remediation
+    assert "disable &&" not in remediation
+    # The web card hides `message` once a cause is set, so the log-correlation
+    # ID must ride in a displayed field to stay quotable for support.
+    assert payload["error_id"] in cause
+    # The reload card is rebuilt from per-field labels, so each field must fit
+    # the label column or the guidance truncates away on refresh.
+    assert len(cause) <= LABEL_VALUE_MAX_LEN
+    assert len(remediation) <= LABEL_VALUE_MAX_LEN
+    # Never leak the on-disk install path, nor fall back to the log pointer.
+    for text in (payload["title"], cause, remediation, payload["message"]):
+        assert frames_path not in text
+        assert "see the runner log" not in text
+    # The ID is well-formed and sits at the end of the displayed cause field.
+    assert _ERROR_ID_RE.search(cause) is not None
+    # The labelless `message` fallback ends with the ID like every other branch
+    # of the payload builder, so HTTP consumers keep one correlation convention.
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+
+
+def _stale_host_import_error() -> ImportError:
+    """Build the mixed-version in-tree lazy-import failure from the bug report."""
+    frames_path = (
+        "/opt/pipx/venvs/omnigent/lib/python3.12/site-packages/"
+        "omnigent/runner/transports/ws_tunnel/frames.py"
+    )
+    exc = ImportError(
+        "cannot import name 'EventAckFrame' from "
+        "'omnigent.runner.transports.ws_tunnel.frames' "
+        f"({frames_path})",
+        name="omnigent.runner.transports.ws_tunnel.frames",
+        path=frames_path,
+    )
+    exc.name_from = "EventAckFrame"
+    return exc
+
+
+def test_long_wrapper_command_keeps_restart_guidance_across_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long wrapper command must not truncate the reload-visible guidance.
+
+    ``cli_invocation()`` echoes ``OMNIGENT_WRAPPER_COMMAND`` verbatim, so an
+    unusually long wrapper would push the remediation past the per-field label
+    budget and silently clip ``--server`` on reload. The guidance falls back
+    to a wrapper-independent phrasing, and the complete remedy survives the
+    actual label persistence/read-back boundary intact.
+    """
+    monkeypatch.setenv(
+        "OMNIGENT_WRAPPER_COMMAND",
+        "/home/alice/.local/share/acme-enterprise/omnigent-wrapper/current/bin/isaac-omnigent",
+    )
+
+    payload = _native_terminal_start_error_payload(
+        _stale_host_import_error(), "Claude", session_id="conv_1"
+    )
+
+    # Persist exactly as the status relay does, then project back for a reload.
+    labels = {
+        _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(payload["code"]),
+        _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_label(payload["message"]),
+        _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(payload["title"]),
+        _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(payload["cause"]),
+        _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(payload["remediation"]),
+    }
+    reloaded = _last_task_error_from_labels(labels)
+
+    assert reloaded is not None
+    # The complete remedy survives the reload with no truncation marker, keeps
+    # the endpoint-preserving instruction, and never embeds the long wrapper.
+    assert reloaded["remediation"] == payload["remediation"]
+    assert "\u2026" not in reloaded["remediation"]
+    assert "keeping `--server`" in reloaded["remediation"]
+    assert "isaac-omnigent" not in reloaded["remediation"]
+    assert (
+        "re-run your host command with the options you started it with" in reloaded["remediation"]
+    )
+    assert reloaded["title"] == payload["title"]
+    assert reloaded["cause"] == payload["cause"]
+    # The ID is carried in the cause, so it must survive the reload too.
+    assert payload["error_id"] in reloaded["cause"]
+
+
+def test_stale_host_classified_before_fragile_lazy_imports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed-version host is classified before the fragile lazy imports.
+
+    The harness/registry imports in the payload builder can themselves raise
+    the same stale-host ``ImportError``; classifying first keeps the restart
+    guidance from being lost to a second import failure.
+    """
+    # A broken replacement makes ``from ... import PiNativeCliOutdatedError``
+    # raise, so a stale-host failure must return before reaching that import.
+    broken = types.ModuleType("omnigent.harnesses.pi_native.main")
+    monkeypatch.setitem(sys.modules, "omnigent.harnesses.pi_native.main", broken)
+
+    payload = _native_terminal_start_error_payload(
+        _stale_host_import_error(), "Claude", session_id="conv_1"
+    )
+
+    assert payload["title"] == "Claude can't start until you restart the host"
+    assert "Restart the host" in payload["remediation"]
+
+
+def test_stale_host_guidance_survives_label_limit_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The restart guidance still goes out if the label-limit import fails too.
+
+    The branch loads ``LABEL_VALUE_MAX_LEN`` lazily from the ORM module, which
+    is not in the runner's startup import graph. On a genuinely stale host that
+    import can raise the same mixed-version ``ImportError``; the branch must
+    fall back to the known schema limit so this exact failure mode still gets
+    its classified restart card instead of crashing the payload builder.
+    """
+    # A ``db_models`` stand-in without the constant makes the lazy
+    # ``from ... import LABEL_VALUE_MAX_LEN`` raise ImportError, as it would on
+    # a stale host that cannot import the upgraded ORM module.
+    stub = types.ModuleType("omnigent.db.db_models")
+    monkeypatch.setitem(sys.modules, "omnigent.db.db_models", stub)
+
+    payload = _native_terminal_start_error_payload(
+        _stale_host_import_error(), "Claude", session_id="conv_1"
+    )
+
+    assert payload["title"] == "Claude can't start until you restart the host"
+    assert "Restart the host" in payload["remediation"]
+    assert "keeping `--server`" in payload["remediation"]
+    cause = payload["cause"]
+    assert "mixed-version" in cause
+    assert payload["error_id"] in cause
+    # Pin the fallback literal to the schema constant so a limit change
+    # surfaces here instead of silently diverging.
+    assert LABEL_VALUE_MAX_LEN == 256
+    assert len(cause) <= LABEL_VALUE_MAX_LEN
+
+
+def test_long_runtime_name_keeps_error_id_within_label_budget() -> None:
+    """A long runtime name must not clip the error ID carried in the cause.
+
+    ``cause`` ends with the log-correlation ID. An unusually long runtime name
+    would push the diagnosis past the per-field label budget and, without
+    reserving room, truncate exactly the ID this design preserves. The
+    diagnosis is trimmed instead, so the complete ID survives the label
+    persistence/read-back boundary intact.
+    """
+    long_runtime_name = "Experimental " + "native runtime " * 4
+
+    payload = _native_terminal_start_error_payload(
+        _stale_host_import_error(), long_runtime_name, session_id="conv_1"
+    )
+    cause = payload["cause"]
+    # The diagnosis is trimmed with the shared marker so the ID keeps its room.
+    assert "\u2026" in cause
+    assert len(cause) <= LABEL_VALUE_MAX_LEN
+    assert _ERROR_ID_RE.search(cause) is not None
+
+    reloaded = _last_task_error_from_labels(
+        {
+            _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(payload["code"]),
+            _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_label(payload["message"]),
+            _LAST_TASK_ERROR_TITLE_LABEL_KEY: _truncate_label(payload["title"]),
+            _LAST_TASK_ERROR_CAUSE_LABEL_KEY: _truncate_label(payload["cause"]),
+            _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: _truncate_label(payload["remediation"]),
+        }
+    )
+    assert reloaded is not None
+    assert reloaded["cause"] == cause
+    assert payload["error_id"] in reloaded["cause"]
+
+
+def _third_party_cannot_import_name() -> ImportError:
+    """A dependency "cannot import name" failure with ``name_from`` set.
+
+    A ``parametrize`` entry is an expression, so set ``name_from`` through a
+    helper: the constructor kwarg exists at runtime but not in typeshed.
+    """
+    exc = ImportError(
+        "cannot import name 'Timeout' from 'httpx'",
+        name="httpx",
+    )
+    exc.name_from = "Timeout"
+    return exc
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        # A "cannot import name" failure outside the omnigent tree is a plain
+        # dependency problem, not a stale host: it must keep the generic log
+        # pointer and must not claim a host restart will help.
+        _third_party_cannot_import_name(),
+        # A missing in-tree module (no ``name_from``) is not the symbol-skew
+        # signature the stale-host guard is scoped to.
+        ModuleNotFoundError(
+            "No module named 'omnigent.runner.transports.ws_tunnel.frames'",
+            name="omnigent.runner.transports.ws_tunnel.frames",
+        ),
+    ],
+)
+def test_unrelated_import_failure_keeps_generic_startup_code(exc: ImportError) -> None:
+    """Only the in-tree symbol-skew signature gets the host-restart guidance."""
+    payload = _native_terminal_start_error_payload(exc, "Claude", session_id="conv_1")
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    # The generic path stays a bare log pointer: no classified card fields.
+    assert "title" not in payload
+    assert "cause" not in payload
+    assert "remediation" not in payload
+    message = payload["message"].lower()
+    assert "see the runner log" in message
+    assert "restart the host" not in message
 
 
 @pytest.mark.parametrize(
