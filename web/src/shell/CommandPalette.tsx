@@ -11,6 +11,9 @@
 //     lifts the cap.
 //   • Actions — static app commands (new chat, navigate, toggle panels).
 //     Filtered client-side against the live query.
+//   • New chat in project — one row per project, opening the composer with that
+//     project's stored defaults (`/?project=`). Hidden until the user types, so
+//     a long project list doesn't push Actions out of view.
 //
 // cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
 // sessions, and we filter the (tiny, static) action list ourselves so both
@@ -30,7 +33,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
+import { useConversations, useProjects } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -43,6 +46,7 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
+import { ProjectRowIcon } from "./ProjectPicker";
 import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
 
 export interface CommandPaletteProps {
@@ -189,6 +193,18 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly]);
 
+  const { data: projects = [] } = useProjects();
+  // Every typed word must appear in the row label or the group heading, so
+  // "new omni", "omni" and "project" all reach "New chat in omnigent".
+  const filteredProjects = useMemo(() => {
+    const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    if (sessionsOnly || words.length === 0) return [];
+    return projects.filter((project) => {
+      const label = `new chat in project ${project.name}`.toLowerCase();
+      return words.every((word) => label.includes(word));
+    });
+  }, [projects, query, sessionsOnly]);
+
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations(sessionsOnly ? "" : debouncedQuery, false, { enabled: open });
   const loadedPages = data?.pages.length ?? 0;
@@ -258,6 +274,11 @@ export function CommandPalette({
   const runAction = (action: ActionCommand): void => {
     close();
     action.run();
+  };
+
+  const newChatInProject = (name: string): void => {
+    close();
+    navigate(`/?project=${encodeURIComponent(name)}`);
   };
 
   const goToSession = (id: string): void => {
@@ -415,6 +436,20 @@ export function CommandPalette({
                     </CommandItem>
                   );
                 })}
+              </CommandGroup>
+            )}
+            {filteredProjects.length > 0 && (
+              <CommandGroup heading="New chat in project">
+                {filteredProjects.map((project) => (
+                  <CommandItem
+                    key={project.name}
+                    value={`project:${project.name}`}
+                    onSelect={() => newChatInProject(project.name)}
+                  >
+                    <ProjectRowIcon icon={project.icon} className="size-4 text-[16px]" />
+                    <span className="flex-1 truncate text-left">New chat in {project.name}</span>
+                  </CommandItem>
+                ))}
               </CommandGroup>
             )}
           </CommandList>

@@ -10,8 +10,10 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 const useConversations = vi.fn();
+const useProjects = vi.fn();
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
+  useProjects: () => useProjects(),
 }));
 
 function conv(
@@ -49,6 +51,7 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   setSessions([]);
+  useProjects.mockReturnValue({ data: [] });
 });
 afterEach(cleanup);
 
@@ -339,6 +342,69 @@ describe("CommandPalette — match preview", () => {
     expect(screen.getByText(/deploy/)).toBeTruthy();
     // No second line: only the single title row is present.
     expect(screen.queryByText(/runbook.*\n/)).toBeNull();
+  });
+});
+
+describe("CommandPalette — new chat in project", () => {
+  beforeEach(() => {
+    useProjects.mockReturnValue({
+      data: [
+        { id: "p1", name: "omnigent", icon: "🔥" },
+        { id: null, name: "home lab", icon: null },
+      ],
+    });
+  });
+
+  it("hides project rows until the user types", () => {
+    renderPalette();
+    expect(screen.queryByText("New chat in project")).toBeNull();
+    expect(screen.queryByText("New chat in omnigent")).toBeNull();
+  });
+
+  it("matches every typed word against the row label", () => {
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "new omni" },
+    });
+    expect(screen.getByText("New chat in omnigent")).toBeTruthy();
+    expect(screen.queryByText("New chat in home lab")).toBeNull();
+    expect(screen.getByTestId("project-icon").textContent).toBe("🔥");
+  });
+
+  it("lists every project when the query is the group heading's word", () => {
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "project" },
+    });
+    expect(screen.getByText("New chat in omnigent")).toBeTruthy();
+    expect(screen.getByText("New chat in home lab")).toBeTruthy();
+  });
+
+  it("opens the highlighted project row with Enter", () => {
+    const { onOpenChange } = renderPalette();
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "omni" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/?project=omnigent");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("opens the composer with the project's defaults and closes", () => {
+    const { onOpenChange } = renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "home" },
+    });
+    fireEvent.click(screen.getByText("New chat in home lab"));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(navigate).toHaveBeenCalledWith("/?project=home%20lab");
+  });
+
+  it("omits project rows in the sessions-only switcher", () => {
+    renderPalette({ sessionsOnly: true });
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "omni" },
+    });
+    expect(screen.queryByText("New chat in omnigent")).toBeNull();
   });
 });
 
