@@ -21,6 +21,7 @@ from omnigent.inner.agent_env import (
     clean_agent_env,
     declared_passthrough,
 )
+from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 
 # Families that must never reach a vendor CLI unless the spec asks for them.
 # One planted value per family, all distinct so a failure names the leak.
@@ -193,6 +194,47 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+@pytest.mark.parametrize("marker", [None, "0", "true", "1", " 1 "])
+def test_real_builders_scope_default_git_credentials(marker, hostile_env, monkeypatch):
+    git = {"GIT_TOKEN": "canary-git", "GIT_USERNAME": "git-user"}
+    unlisted = {
+        "GH_TOKEN": "canary-gh",
+        "GIT_TOKEN_OTHER_HOST": "canary-other-host",
+        **dict.fromkeys(RUNNER_AUTH_SECRET_ENV_VARS, "canary-runner-auth"),
+    }
+    monkeypatch.setattr("os.environ", {**hostile_env, **git, **unlisted})
+    if marker is not None:
+        monkeypatch.setenv("IS_SANDBOX", marker)
+    expected = git if marker in {"1", " 1 "} else {}
+
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert {name: env[name] for name in git if name in env} == expected, harness
+        assert (CANARY_SECRETS.keys() | unlisted.keys()).isdisjoint(env), harness
+
+
+def test_managed_git_credentials_reach_codex(monkeypatch):
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    git = {"GIT_TOKEN": "canary-git", "GIT_USERNAME": "git-user"}
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    runner_env = _build_runner_env(
+        {"IS_SANDBOX": "1", **git},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert {name: runner_env.get(name) for name in git} == git
+    monkeypatch.setattr("os.environ", runner_env)
+
+    agent_env = _clean_codex_env()
+
+    assert {name: agent_env.get(name) for name in git} == git
+
+
 def test_real_builders_pass_ssh_auth_sock(monkeypatch):
     """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
     sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
@@ -302,6 +344,62 @@ def test_env_passthrough_is_the_documented_escape_hatch(hostile_env):
     assert with_pt["GEMINI_API_KEY"] == "canary-gemini"
 
 
+@pytest.mark.parametrize("harness", sorted(SPAWN_ENV_BUILDERS))
+def test_real_builder_honors_operator_passthrough(harness, hostile_env, monkeypatch):
+    named = {
+        "XAI_API_KEY": "canary-xai",
+        "GITHUB_TOKEN": "canary-github",
+        "GIT_TOKEN": "declared-git",
+        "GIT_USERNAME": "git-user",
+    }
+    protected = {
+        "DBUS_SESSION_BUS_ADDRESS": "canary-desktop",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+        **dict.fromkeys(RUNNER_AUTH_SECRET_ENV_VARS, "canary-runner-auth"),
+    }
+    monkeypatch.setattr(
+        "os.environ",
+        {
+            **hostile_env,
+            **named,
+            **protected,
+            "OPENAI_API_KEY": "canary-openai",
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": ",".join([*named, *protected, "OPENAI_API_KEY"]),
+        },
+    )
+
+    env = SPAWN_ENV_BUILDERS[harness]()
+
+    assert {name: env.get(name) for name in named} == named
+    assert (CANARY_SECRETS.keys() - named.keys()).isdisjoint(env)
+    assert protected.keys().isdisjoint(env)
+    if harness == "codex":
+        assert "OPENAI_API_KEY" not in env
+
+
+def test_operator_passthrough_uses_exact_names_from_source(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "AMBIENT_SECRET")
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    source = {
+        "OMNIGENT_RUNNER_ENV_PASSTHROUGH": " KEY, , KEY, MISSING, KEY_*, EMPTY ",
+        "KEY": "named",
+        "KEY_OTHER": "unlisted",
+        "key": "different-case",
+        "EMPTY": "",
+        "FROM_SPEC": "declared",
+        "AMBIENT_SECRET": "unlisted",
+        "GIT_TOKEN": "unlisted",
+        "GIT_USERNAME": "unlisted",
+        **dict.fromkeys(RUNNER_AUTH_SECRET_ENV_VARS, "canary-runner-auth"),
+    }
+    before = dict(source)
+
+    env = clean_agent_env(extra_allowed=("FROM_SPEC", *RUNNER_AUTH_SECRET_ENV_VARS), source=source)
+
+    assert env == {"KEY": "named", "EMPTY": "", "FROM_SPEC": "declared"}
+    assert source == before
+
+
 def test_deny_exact_beats_a_matching_prefix(hostile_env):
     """codex strips OPENAI_API_KEY despite allowing the OPENAI_ prefix."""
     src = {**hostile_env, "OPENAI_API_KEY": "sk-dev", "OPENAI_BASE_URL": "https://x"}
@@ -361,12 +459,17 @@ def test_acp_agent_declaration_passes_only_what_it_names(hostile_env, monkeypatc
     """
     from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 
-    monkeypatch.setattr("os.environ", {**hostile_env, "XAI_API_KEY": "declared-and-wanted"})
+    named = {
+        "XAI_API_KEY": "declared-and-wanted",
+        "GIT_TOKEN": "declared-git",
+        "GIT_USERNAME": "git-user",
+    }
+    monkeypatch.setattr("os.environ", {**hostile_env, **named})
     ex = AcpExecutor(
-        AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("XAI_API_KEY",))
+        AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=tuple(named))
     )
     env = ex._build_spawn_env()
 
-    assert env.get("XAI_API_KEY") == "declared-and-wanted"
+    assert {name: env.get(name) for name in named} == named
     for name in CANARY_SECRETS:
         assert name not in env, name
