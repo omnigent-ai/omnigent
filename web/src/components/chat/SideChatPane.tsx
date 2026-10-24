@@ -743,7 +743,7 @@ function SideChatComposer({
     clearText: () => setText(""),
   });
   const showInterrupt = !pending && busy;
-  // A side chat takes follow-ups into its running turn; a grid session waits for its turn to end.
+  // Side chats accept follow-ups while busy; a grid session waits for its turn to end.
   const sendBlocked = busy && fullSession;
 
   const interruptSideChat = () => {
