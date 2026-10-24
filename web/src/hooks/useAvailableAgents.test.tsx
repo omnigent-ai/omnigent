@@ -1239,6 +1239,37 @@ describe("useAvailableAgents slow discovery scan", () => {
     const catalogCalls = fetchMock.mock.calls.filter((c) => c[0] === BUILTINS_URL);
     expect(catalogCalls).toHaveLength(1);
   });
+
+  it("drops a suppressed built-in that session history would otherwise resurface", async () => {
+    // A deployment trimmed polly via OMNIGENT_SEEDED_AGENTS after the row was
+    // seeded, so a user's older sessions still bind it. The catalog omits the
+    // row and names it as suppressed; the discovery pass must not promote it
+    // back into the picker as a "custom" agent.
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [{ id: "ag_native", name: "claude-native-ui", harness: "claude-native" }],
+        has_more: false,
+        suppressed_agent_names: ["polly"],
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        data: [
+          { id: "ag_polly", name: "polly" },
+          { id: "ag_polly_fork", name: "polly (fork conv_3)" },
+          { id: "ag_doc", name: "doc-writer" },
+        ],
+        has_more: false,
+      }),
+    });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+    const names = (result.current.data ?? []).map((a) => a.name);
+    expect(names).toEqual(["claude-native-ui", "doc-writer"]);
+  });
 });
 
 describe("useAvailableAgents user agents (scope=user)", () => {
