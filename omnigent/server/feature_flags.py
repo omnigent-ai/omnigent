@@ -20,6 +20,7 @@ _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 class Feature(StrEnum):
     """Canonical release-feature keys accepted by ``OMNIGENT_FEATURES``."""
 
+    WORKSPACE_UPLOAD = "workspace_upload"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
@@ -66,6 +67,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Split the main terminal view into several shell panes",
         owner="web",
         review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_UPLOAD,
+        description="Resumable uploads into session workspaces",
+        owner="server",
+        review_by_release="0.20.0",
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
