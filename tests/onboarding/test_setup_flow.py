@@ -42,6 +42,15 @@ _JIRA = ProfileSpec("jira", "https://jira.example.com", "Jira MCP", False)
 _CLI = "/usr/bin/databricks"
 
 
+@pytest.fixture(autouse=True)
+def _port_preflight_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the scripted logins independent of the test host's own port 8020."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_login_port_conflict",
+        lambda _bin, **_kwargs: None,
+    )
+
+
 @pytest.fixture()
 def catalog(monkeypatch: pytest.MonkeyPatch) -> tuple[ProfileSpec, ...]:
     """Stub the internal-beta catalog with two known profiles."""
@@ -252,6 +261,45 @@ def test_login_profile_handles_ctrl_c(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert _login_profile(_CLI, _OSS, console) is False
     assert "cancelled oss" in out.getvalue()
+
+
+def test_login_profile_port_conflict_skips_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reported port conflict prints the message, returns False, and never logs in."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _run_returning(0, calls))
+    monkeypatch.setattr(
+        db_cfg_mod,
+        "databricks_login_port_conflict",
+        lambda _bin, **_kwargs: "Port 8020 is busy [x]; upgrade.",
+    )
+    console, out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is False
+
+    assert calls == []
+    assert "Port 8020 is busy [x]; upgrade." in out.getvalue()
+
+
+def test_login_profile_failure_names_busy_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A login that fails while the callback port is busy prints the port message too."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _run_returning(1, calls))
+    monkeypatch.setattr(
+        db_cfg_mod,
+        "databricks_login_port_conflict",
+        lambda _bin, *, login_failed=False: "Port 8020 is busy [x]." if login_failed else None,
+    )
+    console, out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is False
+
+    assert len(calls) == 1
+    assert "failed (exit 1)" in out.getvalue()
+    assert "Port 8020 is busy [x]." in out.getvalue()
 
 
 # ── silent aliasing ──────────────────────────────────────────

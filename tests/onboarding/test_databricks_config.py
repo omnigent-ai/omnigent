@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import configparser
+import errno
+import socket
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
+from omnigent.onboarding import databricks_config as db_cfg_mod
 from omnigent.onboarding.databricks_config import (
+    _databricks_cli_version,
+    _oauth_callback_port_busy,
+    _oauth_callback_port_holder,
+    _OAuthPortHolder,
+    databricks_login_port_conflict,
     databricks_sdk_installed,
     get_workspace_url_for_profile,
     normalize_workspace_url,
@@ -168,3 +178,191 @@ def test_normalize_workspace_url_scheme_less_input_only_strips_trailing_slash() 
     prior ``rstrip("/")`` behavior — the wizard pre-adds ``https://`` before
     calling, so a scheme is present in practice."""
     assert normalize_workspace_url("my-ws.cloud.databricks.com/") == "my-ws.cloud.databricks.com"
+
+
+# ── OAuth callback port preflight ────────────────────────────────────────────
+
+
+@pytest.fixture
+def busy_port(monkeypatch: pytest.MonkeyPatch):
+    """Point the callback port at a loopback port that is currently listening."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", port)
+        yield port
+
+
+def _set_cli_version(
+    monkeypatch: pytest.MonkeyPatch, version: tuple[int, int, int] | None
+) -> None:
+    monkeypatch.setattr(db_cfg_mod, "_databricks_cli_version", lambda _bin: version)
+
+
+def test_port_conflict_none_when_port_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A free callback port is never a conflict, whatever the CLI version."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+    monkeypatch.setattr(db_cfg_mod, "_DATABRICKS_OAUTH_CALLBACK_PORT", free_port)
+    _set_cli_version(monkeypatch, (0, 244, 0))
+    assert databricks_login_port_conflict("databricks") is None
+    assert databricks_login_port_conflict("databricks", login_failed=True) is None
+
+
+@pytest.mark.parametrize(
+    ("platform", "find_holder"),
+    [
+        ("linux", "`lsof -nP -iTCP:{port} -sTCP:LISTEN`"),
+        ("win32", "`netstat -ano | findstr :{port}`"),
+    ],
+)
+def test_port_conflict_message_for_old_cli(
+    monkeypatch: pytest.MonkeyPatch, busy_port: int, platform: str, find_holder: str
+) -> None:
+    """A busy port with a non-falling-back CLI yields an upgrade message for this platform."""
+    monkeypatch.setattr(db_cfg_mod, "sys", SimpleNamespace(platform=platform))
+    _set_cli_version(monkeypatch, (0, 244, 0))
+    monkeypatch.setattr(
+        db_cfg_mod, "_oauth_callback_port_holder", lambda: _OAuthPortHolder(None, None)
+    )
+    msg = databricks_login_port_conflict("databricks")
+    assert msg is not None
+    assert str(busy_port) in msg
+    assert "v0.244.0" in msg
+    assert "v0.265.0" in msg
+    assert find_holder.format(port=busy_port) in msg
+    assert " by " not in msg
+
+
+def test_port_conflict_names_holder(monkeypatch: pytest.MonkeyPatch, busy_port: int) -> None:
+    """The holder's pid and process name appear in the message when known."""
+    _set_cli_version(monkeypatch, (0, 244, 0))
+    monkeypatch.setattr(
+        db_cfg_mod, "_oauth_callback_port_holder", lambda: _OAuthPortHolder(9999, "arcaterm")
+    )
+    msg = databricks_login_port_conflict("databricks")
+    assert msg is not None
+    assert "by pid 9999 (arcaterm)" in msg
+
+
+@pytest.mark.parametrize("version", [(0, 265, 0), (1, 17, 0)])
+@pytest.mark.parametrize("login_failed", [False, True])
+def test_port_conflict_none_for_fallback_capable_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    busy_port: int,
+    version: tuple[int, int, int],
+    login_failed: bool,
+) -> None:
+    """CLI v0.265.0+ picks another port itself, so a busy 8020 is never blamed."""
+    _set_cli_version(monkeypatch, version)
+    assert databricks_login_port_conflict("databricks", login_failed=login_failed) is None
+
+
+def test_port_conflict_none_for_unknown_version(
+    monkeypatch: pytest.MonkeyPatch, busy_port: int
+) -> None:
+    """An unreadable CLI version never blocks login."""
+    _set_cli_version(monkeypatch, None)
+    assert databricks_login_port_conflict("databricks") is None
+
+
+def test_port_conflict_after_failed_login_with_unknown_version(
+    monkeypatch: pytest.MonkeyPatch, busy_port: int
+) -> None:
+    """Once the login has failed, a busy port is named even if the CLI version is unreadable."""
+    _set_cli_version(monkeypatch, None)
+    monkeypatch.setattr(
+        db_cfg_mod, "_oauth_callback_port_holder", lambda: _OAuthPortHolder(None, None)
+    )
+    msg = databricks_login_port_conflict("databricks", login_failed=True)
+    assert msg is not None
+    assert str(busy_port) in msg
+    assert "releases before v0.265.0" in msg
+    assert "v0.265.0 or newer" in msg
+
+
+def _fake_cli(tmp_path: Path, body: str) -> str:
+    script = tmp_path / "databricks"
+    script.write_text(f"#!/bin/sh\n{body}\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_oauth_callback_port_busy_fails_open_on_socket_setup_error(
+    monkeypatch: pytest.MonkeyPatch, busy_port: int
+) -> None:
+    """A probe that cannot create its socket never blocks the login."""
+
+    def _no_socket(*_args: object, **_kwargs: object) -> socket.socket:
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    assert _oauth_callback_port_busy()
+    monkeypatch.setattr(socket, "socket", _no_socket)
+    assert not _oauth_callback_port_busy()
+
+
+_posix_shell_cli = pytest.mark.skipif(
+    sys.platform == "win32", reason="fake CLI is a /bin/sh script"
+)
+
+
+@_posix_shell_cli
+def test_databricks_cli_version_parses_output(tmp_path: Path) -> None:
+    cli = _fake_cli(tmp_path, "echo 'Databricks CLI v0.244.0'")
+    assert _databricks_cli_version(cli) == (0, 244, 0)
+
+
+@_posix_shell_cli
+@pytest.mark.parametrize(
+    "body",
+    [
+        "echo garbage",
+        "echo 'Databricks CLI v0.244.0'; exit 1",
+        "echo 'Databricks CLI v0.0.0-dev'",
+        "printf '\\377Databricks CLI v0.244.0\\n'",
+    ],
+)
+def test_databricks_cli_version_none_for_unusable_output(tmp_path: Path, body: str) -> None:
+    assert _databricks_cli_version(_fake_cli(tmp_path, body)) is None
+
+
+def test_databricks_cli_version_none_for_missing_binary(tmp_path: Path) -> None:
+    assert _databricks_cli_version(str(tmp_path / "nope")) is None
+
+
+def test_oauth_callback_port_holder_names_listener(
+    monkeypatch: pytest.MonkeyPatch, busy_port: int
+) -> None:
+    """Only a LISTEN socket on the callback port is attributed, with a printable name."""
+    import psutil
+
+    def _connection(port: int, status: str, pid: int) -> SimpleNamespace:
+        return SimpleNamespace(laddr=SimpleNamespace(port=port), status=status, pid=pid)
+
+    connections = [
+        _connection(busy_port, "ESTABLISHED", 1111),
+        _connection(busy_port + 1, "LISTEN", 2222),
+        _connection(busy_port, "LISTEN", 3333),
+    ]
+    monkeypatch.setattr(psutil, "net_connections", lambda **_kwargs: connections)
+    monkeypatch.setattr(
+        psutil, "Process", lambda pid: SimpleNamespace(name=lambda: f"\x1b[2Jproc-{pid}\x07")
+    )
+
+    assert _oauth_callback_port_holder() == _OAuthPortHolder(pid=3333, name="[2Jproc-3333")
+
+
+def test_oauth_callback_port_holder_tolerates_psutil_access_denied(
+    monkeypatch: pytest.MonkeyPatch, busy_port: int
+) -> None:
+    """psutil AccessDenied still yields a bare holder instead of raising."""
+    import psutil
+
+    def _denied(**kwargs: object) -> list[object]:
+        raise psutil.AccessDenied()
+
+    monkeypatch.setattr(psutil, "net_connections", _denied)
+    assert _oauth_callback_port_holder() == _OAuthPortHolder(pid=None, name=None)

@@ -13466,17 +13466,37 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     split = urlsplit(workspace_host.rstrip("/"))
     host = split.hostname or split.netloc or split.path
     profile = host.split(".")[0]
+    from omnigent.onboarding.databricks_config import databricks_login_port_conflict
+
+    conflict = databricks_login_port_conflict(databricks_bin)
+    if conflict is not None:
+        raise _databricks_login_port_error(conflict)
     click.echo(f"Opening browser to log in to {login_host} (profile {profile}) ...")
     result = subprocess.run(
         [databricks_bin, "auth", "login", "--host", login_host, "--profile", profile],
         check=False,
     )
     if result.returncode != 0:
-        raise click.ClickException(
+        failure = (
             f"`databricks auth login --host {login_host} --profile {profile}` failed "
-            f"(exit {result.returncode}). If the workspace is unreachable from "
+            f"(exit {result.returncode})."
+        )
+        conflict = databricks_login_port_conflict(databricks_bin, login_failed=True)
+        if conflict is not None:
+            raise _databricks_login_port_error(f"{failure} {conflict}")
+        raise click.ClickException(
+            f"{failure} If the workspace is unreachable from "
             "this machine (VPN / IP access lists), resolve that and retry."
         )
+
+
+def _databricks_login_port_error(message: str) -> click.ClickException:
+    """Build a callback-port login error without the stale-host hint, which cannot fix it."""
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
 
 
 def _verify_databricks_server_token(
