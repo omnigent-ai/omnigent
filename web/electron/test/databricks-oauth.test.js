@@ -34,6 +34,7 @@ Module["_load"] = function (request, ...rest) {
 };
 
 const oauth = require("../src/databricks-oauth");
+const { isTransientRenewalError, IP_ACL_BLOCKED } = require("../src/databricks-auth");
 
 // Point the token store at a throwaway HOME per test.
 let tmpHome;
@@ -596,6 +597,29 @@ describe("getValidStoredToken", () => {
     mockTokenFetch(() => httpErr(400, { error: "invalid_grant" }));
     await assert.rejects(oauth.getValidStoredToken(WS));
     assert.equal(oauth.loadTokens(WS), null);
+  });
+
+  it("treats an IP access list refusal of the refresh as a transient renewal failure", async () => {
+    oauth.saveWorkspaceToken(
+      WS,
+      { access_token: "old", refresh_token: "r0", expires_at: past() },
+      null,
+    );
+    mockTokenFetch(() =>
+      httpErr(403, {
+        error_code: "403",
+        message: "Source IP address: 203.0.113.7 is blocked by Databricks IP ACL for workspace: 1",
+      }),
+    );
+    const error = await oauth.getValidStoredToken(WS).then(
+      () => assert.fail("refresh should be refused"),
+      (refused) => refused,
+    );
+    assert.equal(error.status, 403);
+    assert.equal(error.errorCode, IP_ACL_BLOCKED);
+    assert.equal(isTransientRenewalError(error), true);
+    assert.doesNotMatch(error.message, /203\.0\.113\.7/);
+    assert.equal(oauth.loadTokens(WS).refresh_token, "r0");
   });
 
   it("logs token request metadata without credentials or raw error responses", async () => {
