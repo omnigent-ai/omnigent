@@ -156,6 +156,15 @@ class _FakeWebSocket:
             await asyncio.sleep(self._send_delay_s)
         self.sent_text.append(data)
 
+    @property
+    def clipboard_messages(self) -> list[str]:
+        """Clipboard frames, skipping the list of tmux-answered queries sent first."""
+        return [
+            message
+            for message in self.sent_text
+            if json.loads(message).get("type") == "clipboard-write"
+        ]
+
     async def receive(self) -> dict[str, object]:
         if self._inbound:
             return self._inbound.pop(0)
@@ -545,6 +554,43 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
+async def test_control_bridge_lists_tmux_answers_before_any_pane_output() -> None:
+    """The browser learns which queries tmux answers before a query can reach it."""
+    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    await asyncio.sleep(0.3)
+
+    frames: list[str | bytes] = []
+
+    class _OrderedWebSocket(_FakeWebSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            frames.append(data)
+            await super().send_bytes(data)
+
+        async def send_text(self, data: str) -> None:
+            frames.append(data)
+            await super().send_text(data)
+
+    ws = _OrderedWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    await asyncio.sleep(1.0)
+
+    assert frames, "the bridge sent nothing"
+    first = frames[0]
+    assert isinstance(first, str), f"pane output reached the browser first: {first!r}"
+    message = json.loads(first)
+    assert message["type"] == "tmux-replies"
+    assert {"da1", "dsr:6"} <= set(message["queries"])
+    assert b"SEEDED-LINE" in b"".join(frame for frame in frames if isinstance(frame, bytes))
+
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
 async def test_seed_restores_cursor_position() -> None:
     """The seed ends with a CUP escape putting the cursor where the app left it.
 
@@ -866,13 +912,13 @@ async def test_control_bridge_forwards_recent_copy_buffer_as_text_frame() -> Non
 
     async def _clipboard_arrived() -> bool:
         for _ in range(50):
-            if ws.sent_text:
+            if ws.clipboard_messages:
                 return True
             await asyncio.sleep(0.05)
         return False
 
     assert await _clipboard_arrived(), "clipboard control frame was not sent"
-    message = json.loads(ws.sent_text[-1])
+    message = json.loads(ws.clipboard_messages[-1])
     assert message["type"] == "clipboard-write"
     assert message["encoding"] == "base64"
     assert base64.b64decode(message["data"]) == copied
@@ -902,7 +948,7 @@ async def test_control_bridge_ignores_copy_without_recent_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.3)
-    assert ws.sent_text == []
+    assert ws.clipboard_messages == []
 
     await _kill_and_join(sock, task)
 
@@ -993,16 +1039,16 @@ async def test_native_pbcopy_uses_consent_transport_not_host_clipboard(
         assert not bypass_marker.exists(), "native pbcopy bypassed browser consent"
         if recent_input and not read_only:
             for _ in range(100):
-                if ws.sent_text:
+                if ws.clipboard_messages:
                     break
                 await asyncio.sleep(0.02)
-            assert ws.sent_text, "native copy never reached the browser consent transport"
-            message = json.loads(ws.sent_text[-1])
+            assert ws.clipboard_messages, "native copy never reached the browser consent transport"
+            message = json.loads(ws.clipboard_messages[-1])
             assert message["type"] == "clipboard-write"
             assert base64.b64decode(message["data"]).decode() == copied
         else:
             await asyncio.sleep(0.2)
-            assert not ws.sent_text
+            assert not ws.clipboard_messages
         if sandbox != "none":
             probe = instance.private_dir / "control-socket-probe"
             await instance.send(
@@ -1046,7 +1092,7 @@ async def test_control_bridge_read_only_drops_input() -> None:
     )
     await proc.communicate()
     await asyncio.sleep(0.2)
-    assert ws.sent_text == []
+    assert ws.clipboard_messages == []
 
     await _kill_and_join(sock, task)
 
