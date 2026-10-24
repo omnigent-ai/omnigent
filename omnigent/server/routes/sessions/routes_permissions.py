@@ -417,6 +417,7 @@ def _to_agent_object(
     # Harness/kind for the UI; None until the spec loads (mirrors the
     # GET /v1/agents catalog so both endpoints report it consistently).
     harness: str | None = None
+    short_description: str | None = None
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -430,6 +431,7 @@ def _to_agent_object(
             harness = loaded.spec.executor.harness_kind
             if description is None:
                 description = loaded.spec.description
+            short_description = loaded.spec.short_description
             # Declared terminal names, in spec order — the Web UI
             # gates its "new terminal" affordance on this list.
             terminals = (
@@ -484,6 +486,7 @@ def _to_agent_object(
         name=agent.name,
         version=agent.version,
         description=description,
+        short_description=short_description,
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,

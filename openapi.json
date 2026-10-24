@@ -274,6 +274,17 @@
             "title": "Policies",
             "type": "array"
           },
+          "short_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Short Description"
+          },
           "skills": {
             "items": {
               "$ref": "#/components/schemas/SkillSummary"
@@ -475,6 +486,18 @@
             },
             "title": "Policies",
             "type": "array"
+          },
+          "short_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional one-line blurb from the spec's `short_description:`, for compact UI surfaces (e.g. a picker row) where `description` would truncate badly. `None` when the spec declares none or the bundle cannot be loaded.",
+            "title": "Short Description"
           },
           "skills": {
             "description": "Skills bundled in the agent spec (`skills/<dir>/SKILL.md`). Lets the Web UI's new-session composer offer a slash-command menu before a session exists. `GET /skills` discovers host skills and, when given `session_id`, merges the session's bundled skills. Empty list when the spec bundles no skills or when the bundle cannot be loaded.",

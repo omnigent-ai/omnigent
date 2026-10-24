@@ -355,6 +355,9 @@ import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDra
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
 // truncate badly in the dropdown; other dialogs keep the server values.
+// Fallback only: an agent's own spec `short_description:` (surfaced as
+// `AvailableAgent.short_description`) takes precedence over this map, so
+// only agents without one need an entry here.
 const AGENT_PICKER_DESCRIPTIONS: Record<string, string> = {
   polly: "Multi-agent coding",
   debby: "Multi-agent debate",
@@ -1662,7 +1665,7 @@ export function AgentHarnessPicker({
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
-    const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
+    const blurb = agent.short_description ?? AGENT_PICKER_DESCRIPTIONS[agent.name];
     const details = active
       ? triggerDetails
           .map((detail) => compactModelTriggerLabel(detail.value))
