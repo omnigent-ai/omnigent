@@ -352,6 +352,13 @@ class ExecutorAdapter(HarnessApp):
                         agent_name=request.model or "unknown",
                         user_message=user_message,
                         model=request.model_override or request.model,
+                        # ``request.model`` is the agent name, never a requested model.
+                        request_model=request.model_override,
+                    )
+                    tctx.set_requested_turn_settings(
+                        agent_span,
+                        requested_model=request.model_override,
+                        requested_effort=extra.get("reasoning_effort"),
                     )
 
                 response_text: str | None = None
@@ -427,6 +434,11 @@ class ExecutorAdapter(HarnessApp):
                                 from omnigent.runtime.telemetry import record_llm_usage
 
                                 record_llm_usage(agent_span, event.usage)
+                            tctx.set_observed_turn_settings(
+                                agent_span,
+                                usage=event.usage,
+                                reasoning_effort=event.reasoning_effort,
+                            )
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):

@@ -3756,6 +3756,8 @@ class _CodexAppServerSession:
         )
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
+        # With no effort asked for, the thread runs at the default Codex reported for it.
+        turn_effort = effort or self._default_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
         if not isinstance(raw_active_turn_id, str) or not raw_active_turn_id:
             yield ExecutorError(message="Codex App Server did not return a turn id")
@@ -4073,7 +4075,11 @@ class _CodexAppServerSession:
                             )
                             turn_usage = self._consume_turn_usage()
                             _notify_usage_from_dict(model=model, usage=turn_usage)
-                            yield TurnComplete(response=final_response, usage=turn_usage)
+                            yield TurnComplete(
+                                response=final_response,
+                                usage=turn_usage,
+                                reasoning_effort=turn_effort,
+                            )
                             return
                         continue
                     if item_type == "dynamicToolCall":
@@ -4134,7 +4140,9 @@ class _CodexAppServerSession:
                         )
                     turn_usage = self._consume_turn_usage()
                     _notify_usage_from_dict(model=model, usage=turn_usage)
-                    yield TurnComplete(response=final_response, usage=turn_usage)
+                    yield TurnComplete(
+                        response=final_response, usage=turn_usage, reasoning_effort=turn_effort
+                    )
                     return
 
                 if method == "turn/failed":
