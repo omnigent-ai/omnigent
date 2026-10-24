@@ -3613,6 +3613,8 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
+    # The --remote TUI's launch args do not configure this app-server's MCP tools.
+    config_overrides.extend(codex_mcp_tool_approval_overrides(terminal_launch_args))
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -4525,6 +4527,52 @@ def _codex_config_string(raw_value: str) -> str:
     except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
         value = raw_value.strip().strip('"').strip("'")
     return value if isinstance(value, str) else ""
+
+
+def codex_mcp_tool_approval_overrides(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Carry explicit Omnigent MCP tool approvals into the app-server config.
+
+    A session's persisted ``terminal_launch_args`` can pre-approve specific
+    Omnigent tools (for example ``sys_session_send``) through Codex's
+    ``mcp_servers.omnigent.tools.<tool>.approval_mode`` config keys. The TUI
+    honors those keys, but the app-server that runs web-chat turns only sees
+    ``extra_config_overrides``, so without this bridge an orchestrated session
+    stops on a redundant approval prompt. Only explicit Omnigent ``sys_*``
+    tool assignments with a recognized mode are propagated; arbitrary MCP
+    servers and the global approval policy are untouched.
+
+    :param terminal_launch_args: Persisted Codex launch arguments.
+    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
+    """
+    args = canonical_codex_launch_args(terminal_launch_args or ())
+    modes: dict[str, str | None] = {}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        if arg == "--":
+            break
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            assignment = args[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            key = key.strip()
+            # Codex applies overrides in order: a later key or parent-table assignment wins.
+            for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
+                del modes[tracked_key]
+            if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
+                modes[key] = _codex_config_string(raw_value)
+        index += 1
+    return [
+        f"{key}={json.dumps(mode)}"
+        for key, mode in modes.items()
+        if mode in {"approve", "prompt", "deny"}
+    ]
 
 
 def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
