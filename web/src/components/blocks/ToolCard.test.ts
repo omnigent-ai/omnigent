@@ -407,7 +407,7 @@ describe("ToolCard shell terminal panel", () => {
 
   it("prompts each command of a multi-line script", () => {
     // WHY: newlines collapsed into spaces made separate commands read as one,
-    // and a prompt on the first line only made continuations look like commands.
+    // and wrapped or continued lines looked like commands of their own.
     const { container } = renderCard({
       name: "Bash",
       arguments: { command: "git diff --check\ngit add a \\\n  b\ngit status" },
@@ -415,7 +415,7 @@ describe("ToolCard shell terminal panel", () => {
       state: "output-available",
     });
     const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
-    expect(trigger.textContent).toBe("git diff --check; git add a b; git status");
+    expect(trigger.textContent).toBe("git diff --check +3 lines");
 
     expand(container);
     const lines = screen.getByTestId("shell-tool-terminal").querySelectorAll("pre code > span");

@@ -36,7 +36,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
-import { oneLineShellCommand, shellCommandStarts } from "@/lib/shellCommandLines";
+import { shellCommandPreview, shellCommandStarts } from "@/lib/shellCommandLines";
 import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOutput";
 import { terminalSurfaceStyle } from "@/lib/terminalPalette";
 import { iconForTool } from "@/lib/toolIcon";
@@ -383,13 +383,25 @@ function ToolTitleBody({ title, onBodyClick }: { title: ToolTitle; onBodyClick?:
   );
 }
 
-/** Collapsed-row command: a multi-line script folded onto one line. */
+/** Collapsed-row command: a script's first line, and a count of the rest. */
 function ShellCommandLine({ command }: { command: string }) {
-  const { env, rest } = splitEnvPrefix(oneLineShellCommand(command));
+  const { firstLine, moreLines } = shellCommandPreview(command);
+  const { env, rest } = splitEnvPrefix(firstLine);
   return (
-    <span className="font-mono text-[0.92em]">
-      {env.length > 0 && <span className="opacity-60">{env}</span>}
-      <span>{rest}</span>
+    // Only the command truncates, so the line count stays visible.
+    <span className="inline-flex max-w-full items-baseline font-mono text-[0.92em]">
+      <span className="min-w-0 truncate">
+        {env.length > 0 && <span className="opacity-60">{env}</span>}
+        <span>{rest}</span>
+      </span>
+      {moreLines > 0 && (
+        <>
+          {" "}
+          <span className="ml-1.5 shrink-0 font-sans opacity-60">
+            +{moreLines} {moreLines === 1 ? "line" : "lines"}
+          </span>
+        </>
+      )}
     </span>
   );
 }

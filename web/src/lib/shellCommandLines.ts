@@ -1,6 +1,7 @@
-// Finds where each command of a multi-line shell script starts, so the chat can
-// prompt every command and fold the script onto one line. A display aid that
-// tracks quotes, heredocs, blocks and line continuations, not a full parser.
+// Display helpers for multi-line shell scripts: where each command starts, so
+// the panel can prompt every command, and a first-line preview for the row.
+// The scanner tracks quotes, heredocs, blocks and continuations; it is a
+// display aid, not a full parser.
 
 type Quote = "'" | '"' | "`" | "$'";
 type Construct = "paren" | "arith" | "case" | "block";
@@ -15,17 +16,6 @@ interface ScanState {
   continues: boolean;
   /** The next word is a command name, so it may be a keyword. */
   commandPosition: boolean;
-  /** A `case` still waits for its `in`. */
-  caseHead: boolean;
-}
-
-interface ScannedLine {
-  /** A new command starts on this line. */
-  startsCommand: boolean;
-  /** The line without a trailing comment or `\`. */
-  code: string;
-  /** What joins the next line to this one on a single line. */
-  joinNext: "; " | " ";
 }
 
 const BLOCK_OPENERS = new Set(["if", "for", "while", "until", "select"]);
@@ -35,7 +25,6 @@ const TAKES_NAME = new Set(["for", "select"]);
 // Keywords followed by another command.
 const KEEPS_COMMAND_POSITION = new Set(["then", "do", "else", "elif", "!", "time"]);
 const CONTINUING_OPERATORS = new Set(["&&", "||", "|", "|&"]);
-const TERMINATORS = new Set([";", ";;", ";&", ";;&", "&"]);
 const OPERATOR_RE = /;;&|;;|;&|&&|\|\||\|&|<<<|<<-|<<|&>>|&>|>>|>&|<&|>\||<>|[;&|()<>]/y;
 const HEREDOC_DELIMITER_RE = /^[ \t]*((?:[^\s;&|()<>'"\\]|\\.|'[^']*'|"[^"]*")+)/;
 
@@ -45,72 +34,54 @@ const HEREDOC_DELIMITER_RE = /^[ \t]*((?:[^\s;&|()<>'"\\]|\\.|'[^']*'|"[^"]*")+)
  * block, or after `\`) report `false`.
  */
 export function shellCommandStarts(script: string): boolean[] {
-  return scanShellScript(script).map((line) => line.startsCommand);
-}
-
-/**
- * The script on one line for a collapsed row: a newline that ends a command
- * becomes `; `, other line breaks a space, and comments are left out.
- */
-export function oneLineShellCommand(script: string): string {
-  let folded = "";
-  let separator = "";
-  for (const { code, joinNext } of scanShellScript(script)) {
-    const text = code.trim();
-    if (text === "") continue;
-    folded += separator + text;
-    separator = joinNext;
-  }
-  return folded === "" ? script.trim() : folded;
-}
-
-function scanShellScript(script: string): ScannedLine[] {
   const state: ScanState = {
     quote: null,
     stack: [],
     heredocs: [],
     continues: false,
     commandPosition: true,
-    caseHead: false,
   };
   return script.split("\n").map((text) => {
     const line = text.endsWith("\r") ? text.slice(0, -1) : text;
     const heredoc = state.heredocs[0];
     if (heredoc !== undefined) {
       const body = heredoc.stripTabs ? line.replace(/^\t+/, "") : line;
-      const ends = body === heredoc.delimiter;
-      if (ends) state.heredocs.shift();
-      // The body is data; only the newline after the last terminator ends the command.
-      const joinNext = ends && state.heredocs.length === 0 && !state.continues ? "; " : " ";
-      return { startsCommand: false, code: line, joinNext };
+      if (body === heredoc.delimiter) state.heredocs.shift();
+      return false;
     }
     const startsCommand =
       state.quote === null && state.stack.length === 0 && !state.continues && line.trim() !== "";
-    return { startsCommand, ...scanLine(line, state) };
+    scanLine(line, state);
+    return startsCommand;
   });
 }
 
-function scanLine(line: string, state: ScanState): Omit<ScannedLine, "startsCommand"> {
+/**
+ * A script's first line for a collapsed row, and how many more non-blank lines
+ * follow it. Leading comment lines are skipped: the first line is always top
+ * level, so a `#` there starts a comment.
+ */
+export function shellCommandPreview(script: string): { firstLine: string; moreLines: number } {
+  const lines = script
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const shown = lines.find((line) => !line.startsWith("#")) ?? lines[0] ?? "";
+  return { firstLine: shown.replace(/\s*\\$/, ""), moreLines: Math.max(0, lines.length - 1) };
+}
+
+function scanLine(line: string, state: ScanState): void {
   let index = 0;
   // Unquoted text of the word being read, or null between words.
   let word: string | null = null;
   let plain = true;
   let lastToken: string | null = null;
   let escapedNewline = false;
-  let commentStart: number | null = null;
-  const heredocsBefore = state.heredocs.length;
-  // The last token already separates commands or needs more of the command
-  // after it (`;`, `&&`, `(`, `then`), so a newline there is not a `;`.
-  let joinsWithSpace = false;
 
   const finishWord = () => {
     if (word !== null) {
-      if (plain) {
-        joinsWithSpace = applyWord(word, state);
-      } else {
-        state.commandPosition = false;
-        joinsWithSpace = false;
-      }
+      if (plain) applyWord(word, state);
+      else state.commandPosition = false;
       lastToken = "word";
     }
     word = null;
@@ -127,7 +98,6 @@ function scanLine(line: string, state: ScanState): Omit<ScannedLine, "startsComm
       finishWord();
       index += 1;
     } else if (char === "#" && word === null) {
-      commentStart = index;
       break;
     } else if (char === "\\") {
       if (index === line.length - 1) {
@@ -154,7 +124,6 @@ function scanLine(line: string, state: ScanState): Omit<ScannedLine, "startsComm
       state.stack.push(arithmetic ? "arith" : "paren");
       state.commandPosition = true;
       lastToken = "(";
-      joinsWithSpace = true;
       index += arithmetic ? 3 : 2;
     } else if (!";&|()<>".includes(char)) {
       word = (word ?? "") + char;
@@ -164,8 +133,6 @@ function scanLine(line: string, state: ScanState): Omit<ScannedLine, "startsComm
       const operator = OPERATOR_RE.exec(line)![0];
       finishWord();
       lastToken = operator;
-      joinsWithSpace =
-        CONTINUING_OPERATORS.has(operator) || TERMINATORS.has(operator) || operator === "(";
       index += operator.length;
       // In arithmetic (`$((...))`, `((...))`) `<<` is a shift, not a heredoc.
       if ((operator === "<<" || operator === "<<-") && !state.stack.includes("arith")) {
@@ -187,37 +154,27 @@ function scanLine(line: string, state: ScanState): Omit<ScannedLine, "startsComm
     }
   }
   finishWord();
-  if (state.quote !== null) return { code: line, joinNext: " " };
+  if (state.quote !== null) return;
   state.continues = escapedNewline || (lastToken !== null && CONTINUING_OPERATORS.has(lastToken));
   if (!escapedNewline) state.commandPosition = true;
-  const code = line.slice(0, commentStart ?? (escapedNewline ? -1 : line.length));
-  const continued = escapedNewline || joinsWithSpace || state.heredocs.length > heredocsBefore;
-  return { code, joinNext: continued ? " " : "; " };
 }
 
-/** Apply a word's effect on the open constructs; returns whether a command must follow it. */
-function applyWord(word: string, state: ScanState): boolean {
+function applyWord(word: string, state: ScanState): void {
   // A bare `{` or `}` is taken as a group even off command position, which
   // also covers `function name {`.
   if (word === "{") {
     state.stack.push("block");
     state.commandPosition = true;
-    return true;
+    return;
   }
   if (word === "}") {
     if (state.stack.at(-1) === "block") state.stack.pop();
     state.commandPosition = false;
-    return false;
+    return;
   }
-  if (word === "in" && state.caseHead) {
-    // `case word in`: the patterns follow.
-    state.caseHead = false;
-    return true;
-  }
-  if (!state.commandPosition) return false;
+  if (!state.commandPosition) return;
   if (word === "case") {
     state.stack.push("case");
-    state.caseHead = true;
     state.commandPosition = false;
   } else if (word === "esac") {
     const caseIndex = state.stack.lastIndexOf("case");
@@ -226,16 +183,12 @@ function applyWord(word: string, state: ScanState): boolean {
   } else if (BLOCK_OPENERS.has(word)) {
     state.stack.push("block");
     state.commandPosition = !TAKES_NAME.has(word);
-    return state.commandPosition;
   } else if (BLOCK_CLOSERS.has(word)) {
     if (state.stack.at(-1) === "block") state.stack.pop();
     state.commandPosition = false;
-  } else if (KEEPS_COMMAND_POSITION.has(word)) {
-    return true;
-  } else {
+  } else if (!KEEPS_COMMAND_POSITION.has(word)) {
     state.commandPosition = false;
   }
-  return false;
 }
 
 /** Advance past quoted text, closing the quote if it ends on this line. */

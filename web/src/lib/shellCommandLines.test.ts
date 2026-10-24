@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { oneLineShellCommand, shellCommandStarts } from "./shellCommandLines";
+import { shellCommandPreview, shellCommandStarts } from "./shellCommandLines";
 
 describe("shellCommandStarts", () => {
   it.each([
@@ -66,46 +66,36 @@ describe("shellCommandStarts", () => {
   });
 });
 
-describe("oneLineShellCommand", () => {
-  it("leaves a one-line command as it is", () => {
-    expect(oneLineShellCommand("ls -la")).toBe("ls -la");
+describe("shellCommandPreview", () => {
+  it("shows a one-line command as it is", () => {
+    expect(shellCommandPreview("ls -la")).toEqual({ firstLine: "ls -la", moreLines: 0 });
   });
 
-  it("joins separate commands with a semicolon", () => {
-    expect(oneLineShellCommand("git diff --check\ngit status --short\n")).toBe(
-      "git diff --check; git status --short",
-    );
+  it("counts the non-blank lines after the first", () => {
+    expect(shellCommandPreview("git diff --check\n\ngit status --short\nls\n")).toEqual({
+      firstLine: "git diff --check",
+      moreLines: 2,
+    });
   });
 
-  it("joins continuation lines with a space and drops the backslash", () => {
-    expect(oneLineShellCommand("git add a \\\n  b\ngit commit")).toBe("git add a b; git commit");
+  it("drops a trailing backslash from the first line", () => {
+    expect(shellCommandPreview("pnpm test \\\n  --filter web")).toEqual({
+      firstLine: "pnpm test",
+      moreLines: 1,
+    });
   });
 
-  it("does not double an existing separator", () => {
-    expect(oneLineShellCommand("make &\nwait;\nls")).toBe("make & wait; ls");
-  });
-
-  it("leaves out comment-only lines", () => {
-    expect(oneLineShellCommand("# Inspect the tree\ngit status")).toBe("git status");
+  it("skips leading comment lines", () => {
+    expect(shellCommandPreview("# Inspect the tree\ngit status")).toEqual({
+      firstLine: "git status",
+      moreLines: 1,
+    });
   });
 
   it("keeps a comment-only script", () => {
-    expect(oneLineShellCommand("# nothing to run\n")).toBe("# nothing to run");
-  });
-
-  it("drops trailing comments so they cannot swallow the next command", () => {
-    expect(oneLineShellCommand("git status # see what changed\nls")).toBe("git status; ls");
-  });
-
-  it.each([
-    ["an if block", "if [ -f x ]; then\n  rm x\nfi\nls", "if [ -f x ]; then rm x; fi; ls"],
-    ["a for loop", "for f in *.py\ndo\n  echo $f\ndone", "for f in *.py; do echo $f; done"],
-    ["a case statement", "case $x in\n  a) echo a ;;\nesac", "case $x in a) echo a ;; esac"],
-    ["a brace group", "{\n  echo a\n} > out", "{ echo a; } > out"],
-    ["a comment inside a block", "if x; then\n  # why\n  rm x\nfi", "if x; then rm x; fi"],
-    ["a heredoc", "cat > f <<'EOF'\nhello\nEOF\nls", "cat > f <<'EOF' hello EOF; ls"],
-    ["a heredoc before &&", "cat <<EOF &&\nhi\nEOF\n  ls", "cat <<EOF && hi EOF ls"],
-  ])("ends each command inside %s", (_label, script, expected) => {
-    expect(oneLineShellCommand(script)).toBe(expected);
+    expect(shellCommandPreview("# nothing to run\n")).toEqual({
+      firstLine: "# nothing to run",
+      moreLines: 0,
+    });
   });
 });
