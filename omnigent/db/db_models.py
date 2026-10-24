@@ -7,12 +7,14 @@ import hashlib
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
+from types import MappingProxyType
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Column,
     Float,
     Index,
     Integer,
@@ -671,7 +673,27 @@ class SqlConversationMetadata(OmnigentBase):
     # label via the store's dual-read until labels are consolidated.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
+    # Bootstrap reserves the schema before runtime consumers are deployed.
+    # Keep ordinary ORM reads and writes compatible with the preceding schema.
+    __mapper_args__ = MappingProxyType(
+        {"exclude_properties": ("live_status_version", "live_error_state")}
+    )
+
     __table_args__ = (
+        Column("live_status_version", Uuid16(), nullable=True),
+        Column("live_error_state", LargeBinary(16383), nullable=True),
+        CheckConstraint(
+            "live_status_version IS NULL OR length(live_status_version) = 16",
+            name="ck_conv_meta_live_version_size",
+        ),
+        CheckConstraint(
+            "live_error_state IS NULL OR length(live_error_state) <= 16383",
+            name="ck_conv_meta_live_error_size",
+        ),
+        CheckConstraint(
+            "live_error_state IS NULL OR live_status_version IS NOT NULL",
+            name="ck_conv_meta_live_error_version",
+        ),
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
         CheckConstraint(
             "host_id IS NULL OR workspace IS NOT NULL",
