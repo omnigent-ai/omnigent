@@ -32,6 +32,7 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    HOST_STATS = "host_stats"
 
 
 @dataclass(frozen=True)
@@ -108,6 +109,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.SIDEBAR_GROUPING_UI,
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
+        review_by_release="0.19.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.HOST_STATS,
+        description="Host CPU, memory, disk and network stats in the sidebar session tooltip",
+        owner="hosts",
         review_by_release="0.19.0",
     ),
     FeatureDefinition(

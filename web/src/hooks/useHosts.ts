@@ -36,6 +36,31 @@ export interface Host {
    * or server — and must not gate anything away; only an explicit `false` does.
    */
   gateway_inference?: Record<string, boolean> | null;
+  /**
+   * Latest resource snapshot the host piggybacked on its tunnel keepalive.
+   * `null`/absent means no stats — an older host or server, or no report on
+   * this server replica yet — and the UI shows nothing rather than zeros.
+   */
+  stats?: HostStats | null;
+}
+
+/**
+ * A host's resource snapshot. Each reading is optional (the first keepalive
+ * after a host starts may lack some); `reported_at` is the server's receive
+ * time in epoch seconds, so the snapshot's age never depends on the host clock.
+ * The server sends readings only while fresh by its own clock; a host that
+ * disconnected after reporting keeps just `reported_at`, its last-seen.
+ */
+export interface HostStats {
+  reported_at: number;
+  cpu_percent?: number;
+  memory_total_bytes?: number;
+  memory_used_bytes?: number;
+  disk_total_bytes?: number;
+  disk_free_bytes?: number;
+  /** Throughput since the previous sample, not link capacity. */
+  net_rx_bytes_per_s?: number;
+  net_tx_bytes_per_s?: number;
 }
 
 interface HostsResponse {
