@@ -34,6 +34,11 @@ Five behaviors are covered:
    followed by a hard reload inside the cold-boot window — renders the
    stopped copy with an enabled Resume action and no startup status.
 
+5. **A program's terminal queries are answered once.** tmux answers a query
+   such as the cursor position itself; the browser terminal must not answer
+   the copy control mode forwards, or the extra reply reaches the program as
+   typed input.
+
 All use the function-scoped ``terminal_session`` fixture (registers the
 ``zsh``-declaring agent and a runner-bound session), so each test gets an
 independent session.
@@ -52,6 +57,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import _server_state, open_right_rail
 
 
@@ -578,6 +584,47 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
         f"(log: {log.read_bytes()[:200]!r})"
         if log.exists()
         else "wheel log never created"
+    )
+
+
+def _cursor_position_reports(log: Path) -> int:
+    """Count the cursor position reports a shell program has read so far."""
+    return len(re.findall(rb"\x1b\[\d+;\d+R", log.read_bytes())) if log.exists() else 0
+
+
+def test_shell_program_gets_one_reply_to_a_cursor_position_query(
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A program's cursor position query is answered by tmux alone.
+
+    PowerShell asks for the cursor position on every prompt. tmux answers, but
+    control mode also forwards the raw query to the browser's xterm, and a
+    second answer from there reaches the program as typed input: ``28;1R`` at
+    the prompt, corrupting the next command. Like the wheel test, a program in
+    the shell writes the query from a raw tty and records its stdin to an
+    absolute ``tmp_path`` file; exactly one report must arrive.
+    """
+    base_url, session_id = terminal_session
+    log = tmp_path / "replies.log"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    page.keyboard.type(f"stty raw -echo; printf '\\e[6n'; cat > '{log}'")
+    page.keyboard.press("Enter")
+
+    poll_until(lambda: _cursor_position_reports(log) >= 1, timeout_s=15)
+    # A duplicate from the browser trails tmux's reply by a WebSocket round trip.
+    page.wait_for_timeout(1_500)
+    reports = _cursor_position_reports(log)
+    assert reports == 1, (
+        f"expected one cursor position report, got {reports} (log: {log.read_bytes()[:200]!r})"
     )
 
 

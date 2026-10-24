@@ -21,6 +21,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { suppressTerminalQueryReplies } from "./TerminalQueryReplies";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -642,6 +643,7 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  private readonly queryRepliesDispose: { dispose: () => void };
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
@@ -735,6 +737,8 @@ export class TerminalSession {
     // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
     // writes can only arrive through validated tmux `clipboard-write` frames.
     this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
+    // tmux answers the pane's queries; a second answer from here would arrive as typed input.
+    this.queryRepliesDispose = suppressTerminalQueryReplies(this.term);
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links; xterm alone
@@ -1014,6 +1018,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
+    this.queryRepliesDispose.dispose();
     try {
       this.ws.close();
     } catch {
