@@ -71,7 +71,7 @@ class ClaudeProgramStatusPoller:
             self._fallback.tick()
 
     def resync(self) -> None:
-        """Re-arm the next poll after a reconnect or a forwarded idle edge."""
+        """Re-arm the next poll after a reconnect or a forwarded status edge."""
         with self._resync_lock:
             self._resync_requested = True
         self._fallback.resync()

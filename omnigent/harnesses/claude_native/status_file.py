@@ -411,9 +411,9 @@ class SessionStatusPoller:
         """Request that the watcher re-assert the file on its next tick.
 
         The file changes only when Claude's status changes. A server recycle
-        or forwarded idle edge must re-arm the watcher so it reports the current
-        value again. A request during an in-flight read stays pending for the
-        following tick instead of being overwritten by that read.
+        or forwarded status edge must re-arm the watcher so it reports the
+        current value again. A request during an in-flight read stays pending
+        for the following tick instead of being overwritten by that read.
 
         Keeps the resolved path and attempt count; resolution is not restarted.
         """

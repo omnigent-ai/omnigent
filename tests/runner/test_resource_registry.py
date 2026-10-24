@@ -18,6 +18,8 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.harnesses.claude_native import status_file as status_file_module
+from omnigent.harnesses.claude_native.status_file import SessionStatus
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -36,6 +38,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.program_status import ProgramStatusReader
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -810,8 +813,10 @@ async def _observe_native_with_real_poller(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     session_id: str,
+    *,
+    program_status: ProgramStatusReader | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
-    """Observe a Claude terminal with a real poller and caller-written status file."""
+    """Observe Claude with a real poller; *program_status* makes the file the OSC fallback."""
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
     status_file.parent.mkdir(parents=True)
@@ -822,6 +827,7 @@ async def _observe_native_with_real_poller(
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.program_status = program_status
     terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
     watcher = Mock()
     monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
@@ -1024,28 +1030,131 @@ async def test_queued_turn_republishes_running_after_stop(
     assert not registry.session_turn_is_active(session_id)
 
 
-@pytest.mark.asyncio
-async def test_failed_hook_does_not_republish_stale_running_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A failed turn stays failed while its busy status file catches up."""
-    session_id = "conv_failed_status"
+async def _observe_claude_status_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_id: str, source: str
+) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Callable[[str], None]]:
+    """Observe Claude reporting through *source* (``"osc"`` or ``"status_file"``)."""
+    osc_snapshot = tmp_path / "program-status.json"
     on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id
+        tmp_path,
+        monkeypatch,
+        session_id,
+        program_status=ProgramStatusReader(osc_snapshot) if source == "osc" else None,
     )
-    status_file.write_text(
-        json.dumps({"kind": "interactive", "sessionId": "claude-failed-status", "status": "busy"}),
-        encoding="utf-8",
+    mtimes = iter(range(1, 100))
+
+    def report(state: str) -> None:
+        if source == "osc":
+            status = {"state": "working" if state == "busy" else state}
+            osc_snapshot.write_text(json.dumps({"relay_pid": os.getpid(), "status": status}))
+            return
+        status_file.write_text(json.dumps({"kind": "interactive", "status": state}))
+        mtime_ns = next(mtimes) * 1_000_000_000
+        os.utime(status_file, ns=(mtime_ns, mtime_ns))
+
+    return on_tick, statuses, registry, report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["osc", "status_file"])
+@pytest.mark.parametrize("forwarded_before_failure", [None, "running", "waiting"])
+async def test_failed_hook_does_not_republish_stale_running_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forwarded_before_failure: str | None,
+    source: str,
+) -> None:
+    """A failed turn stays failed while Claude's busy status catches up."""
+    session_id = "conv_failed_status"
+    on_tick, statuses, registry, report = await _observe_claude_status_source(
+        tmp_path, monkeypatch, session_id, source
     )
+    report("busy")
     on_tick()
     await asyncio.sleep(0)
     assert statuses == ["running"]
 
+    if forwarded_before_failure is not None:
+        registry.note_external_session_status(session_id, forwarded_before_failure)
     registry.note_external_session_status(session_id, "failed")
     on_tick()
     await asyncio.sleep(0)
     assert statuses == ["running"]
     assert not registry.session_turn_is_active(session_id)
+
+    # Claude's genuine next transitions still publish.
+    report("idle")
+    on_tick()
+    await asyncio.sleep(0)
+    report("busy")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle", "running"]
+    assert registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_failure_forwarded_during_a_resync_read_stays_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure that lands while the poller re-reads Claude's busy status wins."""
+    session_id = "conv_failed_mid_read"
+    on_tick, statuses, registry, report = await _observe_claude_status_source(
+        tmp_path, monkeypatch, session_id, "status_file"
+    )
+    report("busy")
+    on_tick()
+    await asyncio.sleep(0)
+    registry.note_external_session_status(session_id, "running")
+    read_status = status_file_module.read_session_status
+
+    def read_while_failing(path: Path) -> SessionStatus | None:
+        registry.note_external_session_status(session_id, "failed")
+        return read_status(path)
+
+    monkeypatch.setattr(status_file_module, "read_session_status", read_while_failing)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["osc", "status_file"])
+@pytest.mark.parametrize("forwarded_status", ["running", "waiting"])
+async def test_claude_idle_settles_a_forwarded_edge_without_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forwarded_status: str, source: str
+) -> None:
+    """A forwarded working edge cannot outlive Claude's own idle status."""
+    session_id = "conv_forwarded_running"
+    on_tick, statuses, registry, report = await _observe_claude_status_source(
+        tmp_path, monkeypatch, session_id, source
+    )
+    report("idle")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["idle"]
+
+    registry.note_external_session_status(session_id, forwarded_status)
+    assert registry.session_turn_is_active(session_id)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["idle", "idle"]
+    assert not registry.session_turn_is_active(session_id)
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["idle", "idle"]
+
+    # A busy Claude agrees with a forwarded running edge, so it adds no duplicate.
+    report("busy")
+    on_tick()
+    await asyncio.sleep(0)
+    registry.note_external_session_status(session_id, "running")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["idle", "idle", "running"]
+    assert registry.session_turn_is_active(session_id)
 
 
 @pytest.mark.asyncio
