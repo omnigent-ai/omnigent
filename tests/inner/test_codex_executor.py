@@ -4350,6 +4350,51 @@ def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
     _run(_t())
 
 
+async def test_app_server_starts_when_windows_chmod_leaves_codex_home_writable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native Windows ``os.chmod`` only toggles read-only, so directories report 0o777."""
+    real_chmod = os.chmod
+
+    def _windows_chmod(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+        if os.path.isdir(path):
+            mode = 0o777 if mode & stat.S_IWRITE else 0o555
+        real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", _windows_chmod)
+    monkeypatch.delattr(os, "getuid", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake_proc = _FakeProcess()
+    recorded_env: dict[str, str] = {}
+
+    async def _fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _FakeProcess:
+        recorded_env.update(kwargs["env"])
+        return fake_proc
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(workspace),
+        env={},
+        tool_executor=None,
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    with patch(
+        "omnigent.inner.codex_executor._create_subprocess_exec",
+        new=_fake_create_subprocess_exec,
+    ):
+        await session.start()
+        codex_home = Path(recorded_env["CODEX_HOME"])
+        assert codex_home.is_dir()
+        await session.close()
+
+    assert not codex_home.exists()
+
+
 def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

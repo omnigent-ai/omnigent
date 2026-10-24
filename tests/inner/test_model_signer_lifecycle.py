@@ -325,6 +325,33 @@ async def test_signer_backed_home_rejects_symlink_temp_root(
     assert not list(real_root.iterdir())
 
 
+async def test_signer_backed_home_rejects_mode_windows_chmod_cannot_set(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without POSIX modes a signer home cannot be proven private, so start fails closed."""
+    real_chmod = os.chmod
+
+    def _windows_chmod(path: Path | str, mode: int, *args: object, **kwargs: object) -> None:
+        if os.path.isdir(path):
+            mode = 0o777 if mode & stat.S_IWRITE else 0o555
+        real_chmod(path, mode, *args, **kwargs)
+
+    temp_root = tmp_path / "temp"
+    temp_root.mkdir(mode=0o700)
+    monkeypatch.setattr(os, "chmod", _windows_chmod)
+    monkeypatch.delattr(os, "getuid", raising=False)
+    monkeypatch.setattr("tempfile.tempdir", os.fspath(temp_root))
+    signer = _Signer([])
+    session = _session(tmp_path, signer)
+
+    with pytest.raises(OSError, match="unsafe signer CODEX_HOME"):
+        await session.start()
+
+    assert signer.closed
+    assert not list(temp_root.rglob("omnigent-codex-home-*"))
+
+
 def test_credential_exclusion_keeps_config_but_not_host_auth(tmp_path: Path) -> None:
     source = tmp_path / "source"
     target = tmp_path / "target"
