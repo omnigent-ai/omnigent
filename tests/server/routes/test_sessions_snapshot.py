@@ -3135,7 +3135,9 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path)
         def set_labels(self, session_id: str, updates: dict[str, str]) -> None:
             captured[session_id] = updates
 
-    error = ErrorDetail(code="runner_failed_to_start", message=_runner_exit_error(1, log_path))
+    error = ErrorDetail(
+        code="runner_failed_to_start", message=_runner_exit_error(1, log_path, disk_full=False)
+    )
     assert len(error.message) > _LABEL_VALUE_MAX_LEN
 
     await _persist_session_status_error_labels(
