@@ -12,7 +12,12 @@ function ReplyTextInput({ input, keyboard, onGrowth }: TextInputProps & { onGrow
   return (
     <ComposerTextInput
       keyboard={keyboard}
-      input={{ ...input, ref, className: "min-h-[20.8px] max-h-none overflow-y-hidden" }}
+      input={{
+        ...input,
+        ref,
+        className: "min-h-[20.8px] max-h-none overflow-y-hidden",
+        onCompactChange: onGrowth,
+      }}
     />
   );
 }
