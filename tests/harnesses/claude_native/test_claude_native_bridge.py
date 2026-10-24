@@ -12157,8 +12157,44 @@ _TRUST_DIALOG_PANE = """\
  Enter to confirm · Esc to cancel
 """
 
+# A keypress notice with no ❯ row (constructed around the "Press Enter to
+# continue" footer the gate accepts): the footer alone tells it from output.
+_PRESS_ENTER_NOTICE_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+  Welcome to Claude Code 2.1
+  What's new: faster boot, new /model picker.
+  Press Enter to continue · Esc to cancel
+"""
+
 # The same dialog text scrolled into the transcript above a live input box.
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
+
+# A bare transcript tail with no box rule where Claude's own output happens to
+# quote a footer phrase that wraps across rows ("press enter to" / "continue").
+_WRAPPED_FOOTER_IN_TRANSCRIPT_PANE = """\
+⏺ Here is how the installer finishes: it waits
+for you to press enter to
+continue past the summary screen.
+"""
+
+# A selector-less notice below a rule whose footer is "Esc to cancel", with an
+# unrelated "press enter" later in the same region. The dialog qualifies only
+# when its own footer phrase is a keypress hint, not when one trails elsewhere.
+_SELECTORLESS_CANCEL_THEN_PRESS_ENTER_PANE = """\
+────────────────────────────────────────────────────────────
+Something finished. Press Esc to cancel the
+remaining steps, or press enter when ready.
+"""
+
+
+def _wrap_phrase(pane: str, phrase: str, wrapped: str) -> str:
+    """Return *pane* with *phrase* split as *wrapped*, failing if it is absent.
+
+    A silent ``str.replace`` no-op would turn a wrapped-footer case into a
+    duplicate of the unwrapped one if the pane's wording ever changed.
+    """
+    assert phrase in pane, f"{phrase!r} not found; wrapped-footer case is stale"
+    return pane.replace(phrase, wrapped)
 
 
 @pytest.mark.parametrize(
@@ -12166,19 +12202,38 @@ _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
     [
         (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
         (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
+        # A narrow pane wraps the footer across rows.
+        (
+            _wrap_phrase(_MCP_APPROVAL_CHECKLIST_PANE, "Esc to reject all", "Esc to\n reject all"),
+            "2 new MCP servers found in this project",
+        ),
         (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
         (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+        (_PRESS_ENTER_NOTICE_PANE, "Welcome to Claude Code 2.1"),
+        (
+            _wrap_phrase(_PRESS_ENTER_NOTICE_PANE, "Esc to cancel", "Esc to\n  cancel"),
+            "Welcome to Claude Code 2.1",
+        ),
     ],
-    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+    ids=[
+        "mcp-single",
+        "mcp-checklist",
+        "mcp-checklist-wrapped-footer",
+        "api-key",
+        "folder-trust",
+        "press-enter",
+        "press-enter-wrapped-footer",
+    ],
 )
 def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
     """
-    Each real startup dialog is recognised by shape and named by its headline.
+    Each startup dialog is recognised by shape and named by its headline.
 
-    All four captures come from Claude Code 2.1.269. None of them is a mounted
-    input box, and each replaces the box with an option list under a
-    "Enter to … · Esc to …" footer, so the headline is what the web error
-    can show the person who has to answer it.
+    The four dialog captures come from Claude Code 2.1.269; the wrapped-footer
+    and keypress-notice variants are built from the same shapes. None of them is
+    a mounted input box, and each replaces the box with a "Enter to … · Esc to
+    …" footer, so the headline is what the web error can show the person who
+    has to answer it.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) == headline
     assert _claude_prompt_rendered(pane) is False
@@ -12195,6 +12250,8 @@ def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str
         _SETTINGS_PANEL_PANE,
         _PERMISSION_PROMPT_PANE,
         _DIALOG_ECHO_ABOVE_COMPOSER_PANE,
+        _WRAPPED_FOOTER_IN_TRANSCRIPT_PANE,
+        _SELECTORLESS_CANCEL_THEN_PRESS_ENTER_PANE,
     ],
     ids=[
         "ready",
@@ -12205,6 +12262,8 @@ def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str
         "settings-panel",
         "permission-prompt",
         "dialog-echo-above-composer",
+        "wrapped-footer-in-transcript",
+        "selectorless-cancel-then-press-enter",
     ],
 )
 def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
@@ -12214,7 +12273,10 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
     A live composer wins even with dialog text scrolled above it; a booting
     pane has no footer; the settings panel's "Esc to clear" is not a confirm
     footer; and a boxed tool permission prompt has no footer at all, so it
-    stays on its own PermissionRequest path.
+    stays on its own PermissionRequest path. Without a framing rule, a footer
+    phrase that only wraps across transcript rows is not a dialog either. A
+    selector-less "Esc to cancel" notice does not qualify just because an
+    unrelated "press enter" trails later in the region.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) is None
 
