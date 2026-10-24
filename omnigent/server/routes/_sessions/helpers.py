@@ -42,6 +42,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
+from omnigent.db.db_models import LABEL_KEY_MAX_LEN
 from omnigent.db.utils import generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
@@ -135,6 +136,7 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
+    create_labels,
     validate_existing_host_workspace,
 )
 
@@ -10474,7 +10476,7 @@ def _repl_terminal_ui_labels(
     return {_CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
 
 
-def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
+def _reject_reserved_cost_control_label_seed(labels: Mapping[str, str | None]) -> None:
     """
     Reject a session-create body that seeds policy-owned labels.
 
@@ -10497,7 +10499,7 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+def _reject_server_reserved_label_seed(labels: Mapping[str, str | None] | None) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
 
@@ -10588,6 +10590,24 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             f"and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+def _reject_malformed_label_keys(labels: Mapping[str, str | None] | None) -> None:
+    """
+    Reject an empty label key or one wider than the ``conversation_labels.key``
+    column, which PostgreSQL would otherwise refuse mid-write.
+
+    :param labels: The client-supplied label mapping, or ``None``.
+    :raises OmnigentError: 400 on a malformed key.
+    """
+    for key in labels or ():
+        if not key:
+            raise OmnigentError("label keys must not be empty", code=ErrorCode.INVALID_INPUT)
+        if len(key) > LABEL_KEY_MAX_LEN:
+            raise OmnigentError(
+                f"label key {key[:LABEL_KEY_MAX_LEN]!r}… exceeds {LABEL_KEY_MAX_LEN} characters",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
 
 def _require_cost_control_label_authority(
@@ -10689,7 +10709,7 @@ def _persist_stored_session_bundle(
             agent_bundle_location=agent_bundle_location,
             agent_description=agent_description,
             title=metadata.title,
-            labels=metadata.labels,
+            labels=create_labels(metadata),
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
             terminal_launch_args=metadata.terminal_launch_args,
@@ -10775,7 +10795,7 @@ def _persist_session_for_uploaded_agent(
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
-            labels=metadata.labels,
+            labels=create_labels(metadata),
             reasoning_effort=metadata.reasoning_effort,
             model_override=inference_model,
         )

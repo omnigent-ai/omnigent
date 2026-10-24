@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -124,6 +125,115 @@ async def test_explicit_values_are_not_overridden(
     assert response.status_code == 201, response.text
     assert response.json()["agent_id"] == OTHER_AGENT_ID
     assert response.json()["workspace"] == "/work/project/subdir"
+
+
+async def test_project_labels_fill_under_request_labels(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    """Project default labels land on the new session, the request's own
+    labels win on conflict, and internal or malformed entries are skipped."""
+    project_id = await _project(
+        project_create_client,
+        {
+            "agent_id": CUSTOM_AGENT_ID,
+            "labels": {
+                "team": "ml",
+                "env": "dev",
+                "omnigent.archived_at": "1",
+                "omni_project": "legacy",
+                "cost_control.plan": "{}",
+                "count": 3,
+                "k" * 129: "too long",
+            },
+        },
+    )
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "labels": {"env": "prod"}},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    labels = response.json()["labels"]
+    assert labels["team"] == "ml"
+    assert labels["env"] == "prod"
+    for skipped in ("omnigent.archived_at", "omni_project", "cost_control.plan", "count"):
+        assert skipped not in labels
+    assert "k" * 129 not in labels
+
+
+async def test_null_request_label_leaves_project_default_off(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    """A ``null`` request label leaves that project default off the new session
+    (mirroring the ``null`` delete on PATCH), the other defaults still apply,
+    and a ``null`` for a key the project doesn't default is ignored."""
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "labels": {"team": "ml", "env": "dev"}},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={
+            "project_id": project_id,
+            "labels": {"team": None, "owner": "me", "never-set": None},
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["agent_id"] == CUSTOM_AGENT_ID
+    assert body["project_id"] == project_id
+    assert body["labels"]["env"] == "dev"
+    assert body["labels"]["owner"] == "me"
+    assert "team" not in body["labels"]
+    assert "never-set" not in body["labels"]
+
+
+async def test_null_label_without_project_is_ignored(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"agent_id": CUSTOM_AGENT_ID, "labels": {"team": None, "owner": "me"}},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["labels"]["owner"] == "me"
+    assert "team" not in response.json()["labels"]
+
+
+@pytest.mark.parametrize("reserved_key", ["omnigent.archived_at", "cost_control.plan"])
+async def test_null_reserved_label_on_create_is_rejected(
+    project_create_client: httpx.AsyncClient,
+    reserved_key: str,
+) -> None:
+    """A ``null`` for a reserved key is rejected like setting it, even though
+    there is nothing to delete yet."""
+    project_id = await _project(project_create_client, {"agent_id": CUSTOM_AGENT_ID})
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "labels": {reserved_key: None}},
+        headers=_headers(),
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("malformed_labels", ["team=ml", ["team"], None])
+async def test_malformed_project_labels_are_ignored(
+    project_create_client: httpx.AsyncClient,
+    malformed_labels: object,
+) -> None:
+    project_id = await _project(
+        project_create_client,
+        {"agent_id": CUSTOM_AGENT_ID, "labels": malformed_labels},
+    )
+    response = await project_create_client.post(
+        "/v1/sessions",
+        json={"project_id": project_id, "labels": {"env": "prod"}},
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["labels"]["env"] == "prod"
 
 
 async def test_explicit_null_is_not_defaulted(
@@ -442,7 +552,9 @@ async def test_git_default_fill_with_differing_workspace(db_uri: str) -> None:
 async def test_multipart_create_defaults_workspace_and_files_atomically(
     project_create_client: httpx.AsyncClient,
 ) -> None:
-    project_id = await _project(project_create_client, {"workspace": "/work/upload"})
+    project_id = await _project(
+        project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
+    )
     response = await project_create_client.post(
         "/v1/sessions",
         data={"metadata": f'{{"project_id":"{project_id}"}}'},
@@ -462,6 +574,34 @@ async def test_multipart_create_defaults_workspace_and_files_atomically(
     assert session.status_code == 200, session.text
     assert session.json()["workspace"] == "/work/upload"
     assert session.json()["project_id"] == project_id
+    assert session.json()["labels"]["team"] == "ml"
+
+
+async def test_multipart_null_label_leaves_project_default_off(
+    project_create_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _project(
+        project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
+    )
+    metadata = {"project_id": project_id, "labels": {"env": "dev", "team": None}}
+    response = await project_create_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="project-upload-final-labels"),
+                "application/gzip",
+            )
+        },
+        headers=_headers(),
+    )
+    assert response.status_code == 201, response.text
+    session = await project_create_client.get(
+        f"/v1/sessions/{response.json()['session_id']}", headers=_headers()
+    )
+    assert session.json()["labels"]["env"] == "dev"
+    assert "team" not in session.json()["labels"]
 
 
 async def test_multipart_malformed_project_config_is_structured_400(
@@ -536,7 +676,9 @@ async def test_import_with_project_defaults_workspace_and_files_session(
 ) -> None:
     """An import naming a project consumes the resolver's decisions for real."""
     _seed_claude_import_agent(db_uri)
-    project_id = await _project(project_create_client, {"workspace": "/work/import"})
+    project_id = await _project(
+        project_create_client, {"workspace": "/work/import", "labels": {"team": "ml"}}
+    )
     response = await project_create_client.post(
         "/v1/imports",
         json=_import_payload("project-import-1", project_id=project_id),
@@ -549,6 +691,7 @@ async def test_import_with_project_defaults_workspace_and_files_session(
     assert session.status_code == 200, session.text
     assert session.json()["workspace"] == "/work/import"
     assert session.json()["project_id"] == project_id
+    assert session.json()["labels"]["team"] == "ml"
 
 
 async def test_import_with_unowned_or_unknown_project_is_404(

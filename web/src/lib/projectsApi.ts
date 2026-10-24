@@ -17,7 +17,8 @@ import { apiErrorFromResponse } from "./sessionsApi";
  * Default session settings a project stores, pre-filled into the new-chat
  * composer. All fields optional — an unset key means "no default for this
  * slot". The vocabulary is client-owned; the server persists the object whole
- * and never acts on it, so adding a key here needs no backend change.
+ * and reads only the session-create defaults (`agent_id`, `workspace`, `git`,
+ * `labels`) from it, so adding another key here needs no backend change.
  */
 export interface ProjectConfig {
   /** Default host id, or the sandbox sentinel. */
@@ -51,6 +52,12 @@ export interface ProjectConfig {
    * the harness's own configured default.
    */
   model?: string;
+  /**
+   * Labels stamped on every session created in the project, under any labels
+   * the create request sets itself. Applied server-side at creation only, so
+   * moving an existing session into the project doesn't add them.
+   */
+  labels?: Record<string, string>;
 }
 
 /** A first-class project. Mirrors the `ProjectObject` response shape. */

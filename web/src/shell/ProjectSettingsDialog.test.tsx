@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -59,14 +59,14 @@ const getProjectMock = vi.mocked(getProject);
 const updateMock = vi.mocked(updateProjectConfig);
 const createMock = vi.mocked(createProject);
 
-function renderDialog(projectId: string | null = "p_1") {
+function renderDialog(projectId: string | null = "p_1", onOpenChange = vi.fn()) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <ProjectSettingsDialog
           open
-          onOpenChange={vi.fn()}
+          onOpenChange={onOpenChange}
           projectId={projectId}
           projectName="Work"
         />
@@ -207,6 +207,192 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
   });
 
+  it("edits default labels and saves them with the config", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      // A malformed stored entry is dropped rather than shown or re-saved.
+      config: {
+        labels: { team: "ml", stale: "yes", count: 3 } as unknown as Record<string, string>,
+      },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+    expect(screen.getByTestId("project-settings-labels")).toHaveTextContent(
+      "Moving an existing session here doesn't add them.",
+    );
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Remove label stale" }));
+    await waitFor(() => expect(within(editor).queryByText("yes")).toBeNull());
+    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(editor).getByLabelText("New label key"), {
+      target: { value: "env" },
+    });
+    const valueInput = within(editor).getByLabelText("New label value");
+    fireEvent.change(valueInput, { target: { value: "prod" } });
+    // Enter adds the label without submitting the dialog's form.
+    fireEvent.keyDown(valueInput, { key: "Enter" });
+    await waitFor(() => expect(within(editor).getByText("prod")).toBeInTheDocument());
+    expect(updateMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "ml", env: "prod" } }),
+    );
+  });
+
+  it("clears the labels key when every default label is removed", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Remove label team" }));
+    await waitFor(() => expect(within(editor).getByText("No default labels")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", {}));
+  });
+
+  it("warns once before a close discards unsaved label changes", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    const onOpenChange = vi.fn();
+    renderDialog("p_1", onOpenChange);
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(screen.getByTestId("project-settings-save")).toBeEnabled());
+    expect(screen.queryByTestId("project-settings-labels-unsaved")).toBeNull();
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(editor).getByLabelText("New label key"), {
+      target: { value: "team" },
+    });
+    fireEvent.click(within(editor).getByRole("button", { name: "Add" }));
+    expect(await screen.findByTestId("project-settings-labels-unsaved")).toHaveTextContent(
+      "Unsaved",
+    );
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(screen.getByTestId("project-settings-labels-unsaved")).toHaveAttribute("role", "alert");
+
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("saves a valid label left in the add row when Save is clicked", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(editor).getByLabelText("New label key"), {
+      target: { value: "env" },
+    });
+    fireEvent.change(within(editor).getByLabelText("New label value"), {
+      target: { value: "prod" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "ml", env: "prod" } }),
+    );
+  });
+
+  it("saves an edit still in progress when Save is clicked", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Edit label team" }));
+    fireEvent.change(within(editor).getByLabelText("Value for label team"), {
+      target: { value: "infra" },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { labels: { team: "infra" } }),
+    );
+  });
+
+  it("blocks Save while an edit in progress is invalid", async () => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Edit label team" }));
+    fireEvent.change(within(editor).getByLabelText("Value for label team"), {
+      target: { value: "v".repeat(257) },
+    });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    expect(await within(editor).findByRole("alert")).toHaveTextContent(
+      "Value must be 256 characters or fewer.",
+    );
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a duplicate key", "team", '"team" already exists. Edit it instead.'],
+    ["a key over the column width", "k".repeat(129), "Key must be 128 characters or fewer."],
+  ])("blocks Save when the add row holds %s", async (_case, key, message) => {
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { labels: { team: "ml" } },
+    });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() => expect(within(editor).getByText("ml")).toBeInTheDocument());
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(editor).getByLabelText("New label key"), { target: { value: key } });
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+
+    expect(await within(editor).findByRole("alert")).toHaveTextContent(message);
+    expect(within(editor).getByLabelText("New label key")).toHaveValue(key);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a reserved default label key inline", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    const editor = screen.getByTestId("project-settings-labels-editor");
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+
+    fireEvent.click(within(editor).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(editor).getByLabelText("New label key"), {
+      target: { value: "omnigent.pinned" },
+    });
+    fireEvent.click(within(editor).getByRole("button", { name: "Add" }));
+    expect(within(editor).getByRole("alert")).toHaveTextContent(
+      '"omnigent.pinned" is reserved for Omnigent.',
+    );
+  });
+
   it("hides the sandbox option when managed sandboxes are disabled", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
     renderDialog();
@@ -290,7 +476,7 @@ describe("ProjectSettingsDialog", () => {
     expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(true);
 
     // Even if a submit is forced, onSubmit bails — no clearing PATCH is sent.
-    fireEvent.submit(screen.getByTestId("project-settings-save").closest("form")!);
+    fireEvent.submit((screen.getByTestId("project-settings-save") as HTMLButtonElement).form!);
     expect(updateMock).not.toHaveBeenCalled();
   });
 

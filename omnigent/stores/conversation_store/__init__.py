@@ -4,7 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypedDict
 
@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.util.cost_plan import COST_CONTROL_LABEL_NAMESPACE
 
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
@@ -86,6 +87,20 @@ CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 # is the store layer; the SQLAlchemy store and the server route both import it,
 # and the web client mirrors the literal as ``PROJECT_LABEL_KEY``.
 PROJECT_LABEL_KEY = "omni_project"
+
+# Label namespaces Omnigent writes for itself (pins, wrappers, cost telemetry).
+INTERNAL_LABEL_PREFIXES = ("omnigent.", COST_CONTROL_LABEL_NAMESPACE)
+
+
+def is_internal_label_key(key: str) -> bool:
+    """
+    Whether a label key is Omnigent's own bookkeeping rather than a user label.
+
+    :param key: A ``conversation_labels`` key, e.g. ``"omnigent.pinned"``.
+    :returns: ``True`` for ``omni_project`` and keys under ``omnigent.`` or
+        ``cost_control.``; ``False`` for a user label such as ``"team"``.
+    """
+    return key == PROJECT_LABEL_KEY or key.startswith(INTERNAL_LABEL_PREFIXES)
 
 
 class DailyCostState(TypedDict):
@@ -1174,12 +1189,17 @@ class ConversationStore(ABC):
         conversation_id: str,
         updates: dict[str, str],
         updated_at: int | None = None,
+        *,
+        delete_keys: Iterable[str] = (),
     ) -> None:
         """
         Upsert guardrails labels on a conversation.
 
         Atomic batched UPSERT: either every key in *updates*
         lands, or none of them do (matches POLICIES.md §6.3).
+        Keys in *delete_keys* are removed in the same
+        transaction, before the upsert, so a mixed edit (a
+        ``null`` and a value in one PATCH) is all-or-nothing.
         Overwrites existing rows for the same keys;
         non-mentioned keys are left untouched. The caller is
         responsible for schema validation (``values`` /
@@ -1210,6 +1230,9 @@ class ConversationStore(ABC):
             audit trails aligned with the enforcement site
             rather than wall-clock drift between evaluate()
             and the actual DB write.
+        :param delete_keys: Label keys to delete first, e.g.
+            ``["team"]``; missing keys are ignored. Empty by
+            default.
         """
         ...
 

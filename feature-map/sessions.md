@@ -49,6 +49,12 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+- `labels`: the session info popover lists the session's labels (tags) and,
+  with edit access, adds, edits and removes them; internal labels stay hidden.
+  A project's settings hold default labels that sessions created in it receive;
+  a label set at creation wins, and moving a session in later adds none. The
+  new-session composer's "+" menu → Labels sets a new session's labels, with
+  the project's defaults filled in and removable for that session only.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
@@ -196,6 +202,15 @@ session), archive or unarchive, and delete.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
+
+**Labels:** open a session and hover or click the header's info icon (on
+mobile, the header menu's Agent info). The Labels section offers Add label and,
+per label, edit and remove. A view-only collaborator sees the labels without
+controls, and no section at all when there are none. For defaults, open a project folder's three-dot menu → Project
+settings → Default labels, save, then start a session in that project. Closing
+the dialog with unsaved label changes warns once before discarding them. Before
+a session exists, the new-session composer's "+" menu → Labels opens the same
+editor; its labels show as chips in the composer and go with the create.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -466,6 +481,18 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
   Repeat from the header menu's Add to project by hand and expect the row to
   regroup under that project.
+- **`labels`, info popover and project settings:** component coverage in
+  `web/src/components/AgentInfo.test.tsx` and
+  `web/src/shell/ProjectSettingsDialog.test.tsx`; server coverage of deletion
+  and project defaults in `tests/server/routes/test_sessions_crud.py` and
+  `tests/server/routes/test_session_create_project_consistency.py`, without a
+  browser test. By hand: add `team: ml` in the popover, reload, and expect it
+  kept; remove it and expect it gone. Then set a project default label, start
+  a session in the project, and expect the label in its popover. The composer's
+  "+" menu → Labels has component coverage in
+  `web/src/shell/NewChatDialog.projectCreate.test.tsx`; by hand, remove the
+  project default there, add another label, start the session, and expect only
+  the added label in its popover.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`project-rename`, project header right-click and three-dot menus:**

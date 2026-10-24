@@ -58,6 +58,23 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   getCurrentUserId: () => viewerData.current,
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
+// The session snapshot feeding the Labels section, and its PATCH mutation.
+const sessionLabelsData = vi.hoisted(() => ({
+  current: undefined as Record<string, string> | undefined,
+}));
+const { updateLabelsMutateAsync } = vi.hoisted(() => ({
+  updateLabelsMutateAsync: vi.fn((_changes: Record<string, string | null>) => Promise.resolve()),
+}));
+vi.mock("@/hooks/useSession", () => ({
+  useSession: () => ({
+    session: sessionLabelsData.current ? { labels: sessionLabelsData.current } : null,
+    isLoading: false,
+    error: null,
+  }),
+}));
+vi.mock("@/hooks/useSessionLabels", () => ({
+  useUpdateSessionLabels: () => ({ mutateAsync: updateLabelsMutateAsync, isPending: false }),
+}));
 // The codex-only "Restart with model…" dialog mounts (closed) inside
 // AgentInfoContent for codex sessions; stub its routing + fork deps so it
 // renders without a Router/network in jsdom.
@@ -104,6 +121,8 @@ afterEach(() => {
   ownerData.current = null;
   viewerData.current = null;
   grantsData.current = undefined;
+  sessionLabelsData.current = undefined;
+  updateLabelsMutateAsync.mockClear();
 });
 
 function renderButton(agent: Agent | undefined) {
@@ -946,6 +965,114 @@ describe("SessionPoliciesSection", () => {
     fireEvent.click(screen.getByTitle("Add policy"));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText("Alpha Guard")).toBeInTheDocument();
+  });
+});
+
+describe("SessionLabelsSection", () => {
+  it("lists user labels and hides internal ones", () => {
+    sessionLabelsData.current = {
+      team: "ml",
+      env: "prod",
+      "omnigent.wrapper": "claude-code-native-ui",
+      "omnigent.pinned": "1",
+      omni_project: "Sprint",
+      "cost_control.plan": "{}",
+    };
+    renderContent("conv_labels");
+    const section = screen.getByTestId("agent-info-labels");
+    const rows = within(section).getAllByTestId("agent-info-labels-editor-row");
+    expect(rows.map((row) => row.textContent)).toEqual(["env:prod", "team:ml"]);
+    expect(within(section).queryByText(/omnigent\./)).toBeNull();
+    expect(within(section).queryByText(/Sprint/)).toBeNull();
+  });
+
+  it("adds, edits and removes labels through the session PATCH", async () => {
+    sessionLabelsData.current = { team: "ml" };
+    renderContent("conv_labels");
+    const section = screen.getByTestId("agent-info-labels");
+
+    fireEvent.click(within(section).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(section).getByLabelText("New label key"), {
+      target: { value: " env " },
+    });
+    fireEvent.change(within(section).getByLabelText("New label value"), {
+      target: { value: "prod" },
+    });
+    await act(async () => {
+      fireEvent.click(within(section).getByRole("button", { name: "Add" }));
+    });
+    expect(updateLabelsMutateAsync).toHaveBeenLastCalledWith({ env: "prod" });
+    expect(within(section).queryByLabelText("New label key")).toBeNull();
+
+    fireEvent.click(within(section).getByRole("button", { name: "Edit label team" }));
+    const valueInput = within(section).getByLabelText("Value for label team");
+    fireEvent.change(valueInput, { target: { value: "infra" } });
+    await act(async () => {
+      fireEvent.keyDown(valueInput, { key: "Enter" });
+    });
+    expect(updateLabelsMutateAsync).toHaveBeenLastCalledWith({ team: "infra" });
+
+    await act(async () => {
+      fireEvent.click(within(section).getByRole("button", { name: "Remove label team" }));
+    });
+    expect(updateLabelsMutateAsync).toHaveBeenLastCalledWith({ team: null });
+  });
+
+  it("validates key and value length inline without saving", () => {
+    sessionLabelsData.current = {};
+    renderContent("conv_labels");
+    const section = screen.getByTestId("agent-info-labels");
+
+    fireEvent.click(within(section).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(section).getByLabelText("New label key"), {
+      target: { value: "k".repeat(129) },
+    });
+    fireEvent.click(within(section).getByRole("button", { name: "Add" }));
+    expect(within(section).getByRole("alert")).toHaveTextContent(
+      "Key must be 128 characters or fewer.",
+    );
+
+    fireEvent.change(within(section).getByLabelText("New label key"), {
+      target: { value: "team" },
+    });
+    fireEvent.change(within(section).getByLabelText("New label value"), {
+      target: { value: "v".repeat(257) },
+    });
+    fireEvent.click(within(section).getByRole("button", { name: "Add" }));
+    expect(within(section).getByRole("alert")).toHaveTextContent(
+      "Value must be 256 characters or fewer.",
+    );
+    expect(updateLabelsMutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("keeps the input and shows the server error when the PATCH fails", async () => {
+    sessionLabelsData.current = {};
+    updateLabelsMutateAsync.mockRejectedValueOnce(new Error("label rejected"));
+    renderContent("conv_labels");
+    const section = screen.getByTestId("agent-info-labels");
+
+    fireEvent.click(within(section).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(section).getByLabelText("New label key"), {
+      target: { value: "team" },
+    });
+    await act(async () => {
+      fireEvent.click(within(section).getByRole("button", { name: "Add" }));
+    });
+    expect(within(section).getByRole("alert")).toHaveTextContent("label rejected");
+    expect(within(section).getByLabelText("New label key")).toHaveValue("team");
+  });
+
+  it("is read-only for a viewer without edit access, and hidden when empty", () => {
+    sessionLabelsData.current = { team: "ml" };
+    const { unmount } = renderContent("conv_labels", 1);
+    const section = screen.getByTestId("agent-info-labels");
+    expect(within(section).getByText("ml")).toBeInTheDocument();
+    expect(within(section).queryByRole("button")).toBeNull();
+    unmount();
+
+    sessionLabelsData.current = { "omnigent.wrapper": "claude-code-native-ui" };
+    renderContent("conv_labels", 1);
+    expect(screen.queryByTestId("agent-info-labels")).toBeNull();
   });
 });
 

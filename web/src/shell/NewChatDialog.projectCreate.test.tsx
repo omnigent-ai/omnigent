@@ -36,7 +36,7 @@ import type * as ToastModule from "@/components/ui/toast";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -518,6 +518,93 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("host_id" in body).toBe(false);
     // The untouched config agent is still omitted for default-fill.
     expect("agent_id" in body).toBe(false);
+  });
+
+  it("pre-fills the project's default labels into the create", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-session-label-chips")).toHaveTextContent("team: ml"),
+    );
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect((body.labels as Record<string, string>).team).toBe("ml");
+  });
+
+  it("sends a removed project default as null", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml", env: "dev" } });
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Edit labels (env: dev)" }));
+    const dialog = await screen.findByTestId("new-session-labels-dialog");
+    expect(dialog).toHaveTextContent("from project");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove label team" }));
+    await waitFor(() => expect(dialog).not.toHaveTextContent("team:"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(dialog).getByLabelText("New label key"), {
+      target: { value: "owner" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("New label value"), {
+      target: { value: "me" },
+    });
+    // Done keeps a valid label still in the add row.
+    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
+    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
+
+    const body = await submitAndReadBody();
+    const labels = body.labels as Record<string, string | null>;
+    expect(labels.env).toBe("dev");
+    expect(labels.owner).toBe("me");
+    expect(labels.team).toBeNull();
+  });
+
+  it("keeps an edit still in progress when Done is clicked", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
+    renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Edit labels (team: ml)" }));
+    const dialog = await screen.findByTestId("new-session-labels-dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Edit label team" }));
+    fireEvent.change(within(dialog).getByLabelText("Value for label team"), {
+      target: { value: "infra" },
+    });
+    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
+    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
+    expect(screen.getByTestId("new-session-label-chips")).toHaveTextContent("team: infra");
+
+    const body = await submitAndReadBody();
+    expect((body.labels as Record<string, string>).team).toBe("infra");
+  });
+
+  it("restores label edits with the composer draft", async () => {
+    setProjectConfig({ host_id: "host_1", workspace: REPO, labels: { team: "ml" } });
+    const first = renderLanding();
+    await waitFor(() => expect(screen.getByTestId("new-session-label-chips")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Edit labels (team: ml)" }));
+    const dialog = await screen.findByTestId("new-session-labels-dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Remove label team" }));
+    await waitFor(() => expect(dialog).not.toHaveTextContent("team:"));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add label" }));
+    fireEvent.change(within(dialog).getByLabelText("New label key"), {
+      target: { value: "env" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("New label value"), {
+      target: { value: "dev" },
+    });
+    fireEvent.click(within(dialog).getByTestId("new-session-labels-done"));
+    await waitFor(() => expect(screen.queryByTestId("new-session-labels-dialog")).toBeNull());
+    first.unmount();
+
+    renderLanding();
+    const chips = await screen.findByTestId("new-session-label-chips");
+    expect(chips).toHaveTextContent("env: dev");
+    expect(chips).not.toHaveTextContent("team:");
+
+    const body = await submitAndReadBody();
+    const labels = body.labels as Record<string, string | null>;
+    expect(labels.env).toBe("dev");
+    expect(labels.team).toBeNull();
   });
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {

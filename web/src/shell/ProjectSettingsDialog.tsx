@@ -11,12 +11,14 @@
 // harness stay per-agent run config, out of scope here. The host and agent
 // pickers reuse the composer's components; the working directory reuses its
 // filesystem browser (inline, so it scrolls inside the modal).
+// Default labels are stamped on new sessions server-side at creation.
 // Fields are optional: an unset one stores no default (an absent key), and an
 // all-default dialog stores an empty config.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { LabelEditor, type LabelEditorHandle } from "@/components/LabelEditor";
 import {
   Dialog,
   DialogContent,
@@ -49,6 +51,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
+import { labelRecordFromUnknown, labelsEqual } from "@/lib/sessionLabels";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 
@@ -140,6 +143,20 @@ export function ProjectSettingsDialog({
   // Default model for new sessions, only meaningful when the default agent is
   // a native harness with a model choice; NONE stores no default (unset key).
   const [model, setModel] = useState<string>(NONE);
+  // Labels stamped on sessions created in the project; empty stores no key.
+  const [labels, setLabels] = useState<Record<string, string>>({});
+  const labelEditorRef = useRef<LabelEditorHandle>(null);
+  // "Add" in the editor only changes the draft, so closing with unsaved label
+  // changes is caught once and warned about; Cancel or a second close discards.
+  const labelsDirty = !labelsEqual(labels, labelRecordFromUnknown(stored?.labels));
+  const [discardWarned, setDiscardWarned] = useState(false);
+  const onDialogOpenChange = (next: boolean) => {
+    if (!next && labelsDirty && !discardWarned) {
+      setDiscardWarned(true);
+      return;
+    }
+    onOpenChange(next);
+  };
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
@@ -190,6 +207,8 @@ export function ProjectSettingsDialog({
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
+    setLabels(labelRecordFromUnknown(c.labels));
+    setDiscardWarned(false);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
 
@@ -198,6 +217,15 @@ export function ProjectSettingsDialog({
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
     if (loadFailed) return;
+    // A label typed into the add row but not yet added is saved too; an
+    // invalid one blocks Save and shows its inline message.
+    const pendingLabel = labelEditorRef.current?.takePendingLabel() ?? { status: "none" };
+    if (pendingLabel.status === "invalid") return;
+    const labelsToSave =
+      pendingLabel.status === "valid"
+        ? { ...labels, [pendingLabel.key]: pendingLabel.value }
+        : labels;
+    if (labelsToSave !== labels) setLabels(labelsToSave);
     // Preserve config keys owned by other dialogs, then replace only the fields
     // this form edits.
     const config: ProjectConfig = { ...(stored ?? {}) };
@@ -232,6 +260,8 @@ export function ProjectSettingsDialog({
     const agentUnresolved = agentId != null && selectedAgent === null;
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
+    if (Object.keys(labelsToSave).length > 0) config.labels = labelsToSave;
+    else delete config.labels;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -308,10 +338,10 @@ export function ProjectSettingsDialog({
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={onDialogOpenChange}>
       <DialogContent
         onClick={(e) => e.stopPropagation()}
-        className="sm:max-w-lg"
+        className="flex max-h-[85vh] flex-col sm:max-w-lg"
         // Keep a nested dropdown's dismiss (pick an option, or click the modal
         // body while it's open) from closing the whole Dialog. See
         // `guardDialogDismiss`; real backdrop clicks and Escape still close.
@@ -325,7 +355,11 @@ export function ProjectSettingsDialog({
             a starting point you can change per session; leave a field blank for no default.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={onSubmit} className="flex flex-col gap-4">
+        <form
+          id="project-settings-form"
+          onSubmit={onSubmit}
+          className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1"
+        >
           <Field label="Host" hint="Where new sessions run by default">
             <Select
               value={hostId}
@@ -544,6 +578,42 @@ export function ProjectSettingsDialog({
             </Field>
           )}
 
+          <div className="flex flex-col gap-1.5" data-testid="project-settings-labels">
+            <div className="flex flex-col">
+              <span className="font-medium text-ui">Default labels</span>
+              <span className="text-muted-foreground text-sm">
+                Added to sessions created in this project; a label set at creation wins. Moving an
+                existing session here doesn't add them.
+              </span>
+            </div>
+            <LabelEditor
+              labels={labels}
+              disabled={isLoading || loadFailed}
+              onSet={(key, value) => setLabels((prev) => ({ ...prev, [key]: value }))}
+              onRemove={(key) =>
+                setLabels((prev) =>
+                  Object.fromEntries(Object.entries(prev).filter(([k]) => k !== key)),
+                )
+              }
+              emptyText="No default labels"
+              testIdPrefix="project-settings-labels-editor"
+              handleRef={labelEditorRef}
+            />
+            {labelsDirty && (
+              <p
+                className={
+                  discardWarned ? "text-destructive text-sm" : "text-muted-foreground text-sm"
+                }
+                role={discardWarned ? "alert" : undefined}
+                data-testid="project-settings-labels-unsaved"
+              >
+                {discardWarned
+                  ? "Your label changes aren't saved. Save to keep them, or close again to discard them."
+                  : "Unsaved. Save to apply these labels to new sessions."}
+              </p>
+            )}
+          </div>
+
           {loadFailed && (
             <p
               className="text-destructive text-ui"
@@ -559,26 +629,27 @@ export function ProjectSettingsDialog({
               {(updateConfig.error as Error).message}
             </p>
           )}
-
-          <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={updateConfig.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              data-testid="project-settings-save"
-              loading={updateConfig.isPending}
-              disabled={isLoading || loadFailed}
-            >
-              Save
-            </Button>
-          </DialogFooter>
         </form>
+        {/* Outside the scrolling form so Save stays in view on a short window. */}
+        <DialogFooter className="border-t-0 bg-transparent">
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => onOpenChange(false)}
+            disabled={updateConfig.isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="submit"
+            form="project-settings-form"
+            data-testid="project-settings-save"
+            loading={updateConfig.isPending}
+            disabled={isLoading || loadFailed}
+          >
+            Save
+          </Button>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   );

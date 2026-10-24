@@ -158,6 +158,25 @@ describe("ComposerAddMenu", () => {
     expect(onProjectSelect).toHaveBeenCalledWith("docs");
   });
 
+  it("opens the labels editor once the menu has closed and shows the label count", async () => {
+    const onLabels = vi.fn();
+    render(
+      <ComposerAddMenu
+        disabled={false}
+        onAttach={vi.fn()}
+        planActive={false}
+        onLabels={onLabels}
+        labelCount={2}
+      />,
+    );
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+    const item = screen.getByRole("menuitem", { name: /Labels/ });
+    expect(item).toHaveTextContent("2 labels");
+    fireEvent.click(item);
+    await waitFor(() => expect(onLabels).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("menu", { name: "Add" })).not.toBeInTheDocument();
+  });
+
   it("enables plan mode through the existing harness handler", () => {
     const onPlan = vi.fn();
     render(

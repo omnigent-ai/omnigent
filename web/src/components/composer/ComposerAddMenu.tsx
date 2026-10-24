@@ -5,6 +5,7 @@ import {
   MessagesSquareIcon,
   PaperclipIcon,
   PlusIcon,
+  TagIcon,
   TargetIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -35,6 +36,8 @@ export function ComposerAddMenu({
   onSideChat,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
+  onLabels,
+  labelCount = 0,
 }: {
   disabled: boolean;
   onAttach: () => void;
@@ -55,10 +58,15 @@ export function ComposerAddMenu({
   onSideChat?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
+  /** Edit the labels a new session starts with. */
+  onLabels?: () => void;
+  labelCount?: number;
 }) {
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const pendingGoalRef = useRef(false);
+  // Opened once the menu has closed, so the menu's focus return can't close it.
+  const pendingLabelsRef = useRef(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });
   const measure = useCallback(() => {
@@ -121,6 +129,10 @@ export function ComposerAddMenu({
             pendingGoalRef.current = false;
             requestAnimationFrame(() => onGoal?.());
           }
+          if (pendingLabelsRef.current) {
+            pendingLabelsRef.current = false;
+            requestAnimationFrame(() => onLabels?.());
+          }
         }}
         side="top"
         align="start"
@@ -158,7 +170,7 @@ export function ComposerAddMenu({
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat || onLabels) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
@@ -207,6 +219,24 @@ export function ComposerAddMenu({
                       <span>Plan</span>
                       <span className="truncate text-xs leading-4 text-muted-foreground">
                         {planActive ? "Plan mode is on" : "Turn plan mode on"}
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                  {onLabels && (
+                    <DropdownMenuItem
+                      data-testid={`${testIdPrefix}-labels-action`}
+                      onSelect={() => {
+                        pendingLabelsRef.current = true;
+                      }}
+                    >
+                      <span className="flex size-4 shrink-0 items-center justify-center">
+                        <TagIcon className="size-3.5" />
+                      </span>
+                      <span className="shrink-0">Labels</span>
+                      <span className="truncate text-xs leading-4 text-muted-foreground">
+                        {labelCount === 0
+                          ? "Tag this session"
+                          : `${labelCount} label${labelCount === 1 ? "" : "s"}`}
                       </span>
                     </DropdownMenuItem>
                   )}
