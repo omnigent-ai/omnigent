@@ -2,7 +2,7 @@
 // everything else keeps the shell's external default.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import type * as NativeBridge from "@/lib/nativeBridge";
@@ -29,6 +29,7 @@ afterEach(() => {
   cleanup();
   delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
   window.localStorage.clear();
+  vi.restoreAllMocks();
 });
 
 const FILE_VIEWER = {
@@ -71,5 +72,23 @@ it.each([
 it("keeps the external default when the preference is off", () => {
   writeOpenLinksInApp(false);
   expect(clickLink().defaultPrevented).toBe(false);
+  expect(openOrNavigate).not.toHaveBeenCalled();
+});
+
+it("allows an explicit integrated-browser choice even when plain-click routing is off", () => {
+  writeOpenLinksInApp(false);
+  clickLink();
+  fireEvent.contextMenu(screen.getByText("docs"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Open in Omnigent" }));
+  expect(openOrNavigate).toHaveBeenCalledWith("conv-1", LINK, undefined, { agent: true });
+});
+
+it("opens the default browser without applying the integrated-browser preference", () => {
+  clickLink();
+  openOrNavigate.mockClear();
+  const open = vi.spyOn(window, "open").mockReturnValue(null);
+  fireEvent.contextMenu(screen.getByText("docs"));
+  fireEvent.click(screen.getByRole("menuitem", { name: "Open in default browser" }));
+  expect(open).toHaveBeenCalledWith(LINK, "_blank", "noopener,noreferrer");
   expect(openOrNavigate).not.toHaveBeenCalled();
 });

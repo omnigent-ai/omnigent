@@ -8,7 +8,7 @@ import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
-from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
+from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload, message_item
 
 _CODE_BODY = '[data-streamdown="code-block-body"]'
 _LONG_WORD = "horizontalScrolling" * 14
@@ -220,7 +220,7 @@ def test_mermaid_recovery_uses_the_real_browser_renderer(
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
 
 
-@pytest.mark.parametrize("activation", ["click", "keyboard"])
+@pytest.mark.parametrize("activation", ["click", "keyboard", "context-menu"])
 def test_external_link_click_opens_the_rendered_target(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -246,8 +246,11 @@ def test_external_link_click_opens_the_rendered_target(
     with page.expect_popup() as popup_info:
         if activation == "click":
             link.click()
-        else:
+        elif activation == "keyboard":
             link.press("Enter")
+        else:
+            link.click(button="right")
+            page.get_by_role("menuitem", name="Open in browser tab").click()
     popup = popup_info.value
     popup.wait_for_url(_TARGET)
     expect(page).to_have_url(chat.url)
@@ -258,7 +261,86 @@ def test_external_link_click_opens_the_rendered_target(
     assert len(page.context.pages) == 2
 
 
-@pytest.mark.parametrize("activation", ["click", "keyboard"])
+@pytest.mark.parametrize("surface", ["full-chat", "side-chat"])
+def test_file_link_context_menu_opens_and_copies_the_viewer_url(
+    page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path, surface: str
+) -> None:
+    chat = chat_session_contract
+    page_errors: list[str] = []
+    page.on("pageerror", lambda error: page_errors.append(str(error)))
+    page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    page.emulate_media(color_scheme="dark")
+    page.set_viewport_size({"width": 1440, "height": 900})
+    text = "Open [my report](report.md:12)."
+    _seed_assistant_message(chat, text if surface == "full-chat" else "Parent conversation.")
+    environment = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(environment, {"metadata": {"root": "/browser-workspace"}})
+    chat.contract.json(f"{environment}/changes", list_payload([]))
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/comments", [])
+    chat.contract.json(
+        f"{environment}/filesystem",
+        list_payload([{"path": "report.md", "name": "report.md", "type": "file"}]),
+    )
+    chat.contract.json(
+        f"{environment}/filesystem/report.md",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": "report.md",
+            "content": "# My report\n\nA report from this workspace.",
+            "encoding": "utf-8",
+            "content_type": "text/markdown",
+            "bytes": 40,
+        },
+    )
+    if surface == "side-chat":
+        child_id = "link-menu-side-chat"
+        child = f"/v1/sessions/{child_id}"
+        chat.contract.json(child, {**chat._session(), "id": child_id})
+        chat.contract.json(child + "/agent", chat._agent())
+        chat.contract.json(
+            child + "/items",
+            list_payload(
+                [message_item("child-link", "assistant", text, response_id="child-reply")]
+            ),
+        )
+        chat.contract.json(child + "/child_sessions", list_payload([]))
+        chat.contract.json(child + "/resources/terminals", list_payload([]))
+        chat.contract.response(child + "/read-state", method="PUT")
+        chat.contract.sse(child + "/stream")
+        chat.contract.json(f"/v1/sessions/{chat.session_id}/policies", list_payload([]))
+        chat.contract.json("/v1/policy-registry", list_payload([]))
+        chat.contract.json(f"/v1/sessions/{chat.session_id}/owner", {"owner": None})
+        page.add_init_script(
+            "localStorage.setItem('omnigent:session-workspace-state', JSON.stringify(["
+            f"{{id: '{chat.session_id}', state: {{open: true, rightRailTab: 'sidechat', "
+            f"openSideChats: ['{child_id}'], selectedSideChatId: '{child_id}'}}}}]));"
+            f"localStorage.setItem('omnigent.sideChatInherited:{child_id}', '[]');"
+        )
+    page.goto(chat.url)
+    link = page.get_by_role("button", name="my report", exact=True)
+    link.click(button="right")
+    expect(page.get_by_role("menuitem", name="Open in Omnigent")).to_be_enabled()
+    expect(page.get_by_role("menuitem", name="Open in browser tab")).to_be_enabled()
+    page.screenshot(path=str(tmp_path / f"file-link-menu-{surface}.png"))
+    page.get_by_role("menuitem", name="Copy link", exact=True).click()
+    expected = f"{chat.url}?file=report.md&line=12"
+    assert page.evaluate("navigator.clipboard.readText()") == expected
+    link.click(button="right")
+    with page.expect_popup() as opened:
+        page.get_by_role("menuitem", name="Open in browser tab").click()
+    opened.value.wait_for_url(expected)
+    assert opened.value.evaluate("window.opener === null")
+    opened.value.close()
+    link.click(button="right")
+    page.get_by_role("menuitem", name="Open in Omnigent", exact=True).click()
+    viewer = page.locator('[data-testid="file-viewer"]:visible').first
+    expect(viewer.get_by_text("A report from this workspace.", exact=True)).to_be_visible()
+    assert not page_errors
+    assert page.url == expected
+    assert not chat.event_posts
+
+
+@pytest.mark.parametrize("activation", ["click", "keyboard", "context-menu"])
 def test_external_link_falls_back_inside_a_popup_blocked_host(
     page: Page,
     chat_session_contract: ChatSessionContract,
@@ -294,9 +376,12 @@ def test_external_link_falls_back_inside_a_popup_blocked_host(
     expect(link).to_be_visible(timeout=20_000)
     if activation == "click":
         link.click()
-    else:
+    elif activation == "keyboard":
         link.focus()
         link.press("Enter")
+    else:
+        link.click(button="right")
+        frame.get_by_role("menuitem", name="Open in browser tab").click()
 
     body = frame.locator("body")
     expect(body).to_contain_text("target-ok", timeout=10_000)
