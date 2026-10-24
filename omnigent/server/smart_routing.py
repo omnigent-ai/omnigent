@@ -1177,6 +1177,35 @@ def _model_tier(model: str, prefixes: Sequence[str] | None = None) -> str | None
     return None if tier in ("gpt", "claude") else tier
 
 
+#: Relative cost of each model line a native picker names, cheapest first. A
+#: picker lists its rows in its own order (Claude Code puts its default
+#: first; codex's ``model/list`` mixes generations), not by cost, but the
+#: judge rubric reads position as cost. Unknown lines rank mid-table.
+_MODEL_LINE_COST_RANK: dict[str, int] = {
+    "haiku": 0,
+    "nano": 0,
+    "luna": 1,
+    "mini": 1,
+    "sonnet": 2,
+    "terra": 2,
+    "opus": 3,
+    "sol": 3,
+    "fable": 4,
+    "astra": 4,
+}
+
+
+def order_by_model_line_cost(models: Sequence[str]) -> list[str]:
+    """Sort picker ids cheapest model line first, keeping picker order within a line.
+
+    :param models: Model ids in picker order, e.g. ``["claude-sonnet-5-5",
+        "claude-opus-5-5", "claude-haiku-4-5"]``.
+    :returns: The same ids, e.g. ``["claude-haiku-4-5", "claude-sonnet-5-5",
+        "claude-opus-5-5"]``.
+    """
+    return sorted(models, key=lambda m: _MODEL_LINE_COST_RANK.get(_model_tier(m) or "", 2))
+
+
 def _version_key(model: str, prefixes: Sequence[str] | None = None) -> tuple[int, ...]:
     """Numeric version of *model*, higher = newer, to rank within a tier.
 
