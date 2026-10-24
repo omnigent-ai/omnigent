@@ -62,6 +62,26 @@ describe("browser action bridge", () => {
 });
 
 describe("server-page update bridge", () => {
+  it("forwards notification preferences and removes its change listener", async () => {
+    const h = loadPreload();
+    const patch = { mode: "always", soundEnabled: true, soundName: "Ping" };
+    await h.desktop.getNotificationSettings();
+    await h.desktop.setNotificationSettings(patch);
+    await h.desktop.previewNotificationSound("Ping");
+    await h.desktop.openNotificationSettings();
+    assert.deepEqual(h.invokes, [
+      { channel: "omnigent:get-notification-settings", args: undefined },
+      { channel: "omnigent:set-notification-settings", args: patch },
+      { channel: "omnigent:preview-notification-sound", args: "Ping" },
+      { channel: "omnigent:open-notification-settings", args: undefined },
+    ]);
+    const received = [];
+    const unsubscribe = h.desktop.onNotificationModeChanged((mode) => received.push(mode));
+    h.emit("omnigent:notification-mode-changed", "always");
+    assert.deepEqual(received, ["always"]);
+    unsubscribe();
+    assert.equal(h.hasListener("omnigent:notification-mode-changed"), false);
+  });
   it("hides every shell-owned update prompt state, including download progress", async () => {
     const h = loadPreload();
     async function expectHidden(state, lastError) {

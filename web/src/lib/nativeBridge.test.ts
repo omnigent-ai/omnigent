@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyMacElectronShellAttribute,
+  getNativeNotificationMode,
+  getNativeNotificationSettings,
+  setNativeNotificationSettings,
+  previewNativeNotificationSound,
+  openNativeNotificationSettings,
   checkDbcert,
   getServerPicker,
   hasDbcertPreflightBridge,
@@ -10,6 +15,7 @@ import {
   isIOSShell,
   isNativeShell,
   nativeNotify,
+  onNativeNotificationModeChanged,
   refreshDbcert,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
@@ -30,6 +36,11 @@ const electronNotify = vi.fn().mockResolvedValue(true);
 const electronUnsubscribe = vi.fn();
 const electronOnNotificationActivated = vi.fn().mockReturnValue(electronUnsubscribe);
 const electronSetColorScheme = vi.fn();
+const electronGetNotificationMode = vi.fn().mockResolvedValue("always");
+const electronNotificationModeUnsubscribe = vi.fn();
+const electronOnNotificationModeChanged = vi
+  .fn()
+  .mockReturnValue(electronNotificationModeUnsubscribe);
 
 // The iOS WKWebView bridge mock, installed on window.omnigentNative.
 const iosSetBadge = vi.fn();
@@ -67,6 +78,8 @@ function setElectron(on: boolean, withClickRouting = true, withBrowser = false):
       setBadgeCount: (...args: unknown[]) => electronSetBadge(...args),
       setColorScheme: (...args: unknown[]) => electronSetColorScheme(...args),
       notify: (...args: unknown[]) => electronNotify(...args),
+      getNotificationMode: () => electronGetNotificationMode(),
+      onNotificationModeChanged: (...args: unknown[]) => electronOnNotificationModeChanged(...args),
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) =>
@@ -282,6 +295,57 @@ describe("applyMacElectronShellAttribute", () => {
     setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0");
     applyMacElectronShellAttribute();
     expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
+  });
+});
+
+describe("native notification mode", () => {
+  it("forwards settings and actions on a current desktop app", async () => {
+    setElectron(true);
+    const saved = {
+      mode: "always" as const,
+      soundEnabled: true,
+      soundName: "Ping",
+      sounds: ["Ping"],
+    };
+    const desktop = (window as unknown as { omnigentDesktop: Record<string, unknown> })
+      .omnigentDesktop;
+    desktop.getNotificationSettings = vi.fn().mockResolvedValue(saved);
+    desktop.setNotificationSettings = vi.fn().mockResolvedValue(saved);
+    desktop.previewNotificationSound = vi.fn().mockResolvedValue(undefined);
+    desktop.openNotificationSettings = vi.fn().mockResolvedValue(undefined);
+    await expect(getNativeNotificationSettings()).resolves.toEqual(saved);
+    await expect(setNativeNotificationSettings({ mode: "always" })).resolves.toEqual(saved);
+    expect(desktop.setNotificationSettings).toHaveBeenCalledWith({ mode: "always" });
+    await previewNativeNotificationSound("Ping");
+    expect(desktop.previewNotificationSound).toHaveBeenCalledWith("Ping");
+    await openNativeNotificationSettings();
+    expect(desktop.openNotificationSettings).toHaveBeenCalledOnce();
+  });
+
+  it("reports unavailable settings on old shells and preserves save failures", async () => {
+    setElectron(true);
+    await expect(getNativeNotificationSettings()).resolves.toBeNull();
+    await expect(setNativeNotificationSettings({ mode: "always" })).rejects.toThrow(
+      /Update the desktop app/,
+    );
+  });
+  it("reads and subscribes to the Electron preference", async () => {
+    setElectron(true);
+    const callback = vi.fn();
+
+    await expect(getNativeNotificationMode()).resolves.toBe("always");
+    const unsubscribe = onNativeNotificationModeChanged(callback);
+
+    const forwarded = electronOnNotificationModeChanged.mock.calls[0][0];
+    forwarded("always");
+    expect(callback).toHaveBeenCalledWith("always");
+    expect(unsubscribe).toBe(electronNotificationModeUnsubscribe);
+  });
+
+  it("falls back to when-away outside a current Electron shell", async () => {
+    setElectron(false);
+    await expect(getNativeNotificationMode()).resolves.toBe("when-away");
+    expect(onNativeNotificationModeChanged(vi.fn())).toEqual(expect.any(Function));
   });
 });
 
