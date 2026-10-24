@@ -686,8 +686,9 @@ Follow these rules for each clip:
   in view and unobstructed, and quote only visibly rendered text. DOM attributes,
   hidden accessibility labels and backend logs are not screen evidence. Disclose
   unavailable frame inspection and limit claims to verified states. An absence
-  check covers only the element it targets: write "the chat pane shows no
-  working indicator" unless every place showing that state was checked. Follow
+  check covers only the element it targets: name the checked element, as in
+  "the chat pane shows no working indicator" after checking only the chat pane,
+  unless every place showing that state was checked. Follow
   `dev/recording-lanes.md` and correct captions that conflict with the frames.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an

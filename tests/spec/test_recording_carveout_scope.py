@@ -110,6 +110,9 @@ def test_caption_absence_claims_stay_scoped_to_the_checked_element() -> None:
     instructions = _loaded_repro_instructions()
     assert "A driver check covers only the element it targets" in lanes
     assert "a spinner on its sidebar row, and a sub-agent count badge" in lanes
+    assert "An absence check on the chat pane's indicator supports" in lanes
     assert "Check every such place before claiming that none shows the state" in lanes
     assert "An absence check covers only the element it targets" in instructions
+    assert "name the checked element" in instructions
+    assert "after checking only the chat pane" in instructions
     assert "unless every place showing that state was checked" in instructions
