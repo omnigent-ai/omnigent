@@ -2902,13 +2902,9 @@ export function NewChatLandingScreen() {
     seededConfigSigRef.current = prefillConfigSig;
   }, [prefill, projectParam, prefillConfigSig]);
 
-  // Auto-select an option so a session can be started without an explicit
-  // pick. Prefer the user's last explicit choice (persisted across visits);
-  // otherwise fall back to the FIRST AVAILABLE option in menu order — the
-  // sandbox when the server supports it (it's pinned first in the picker),
-  // else the first online host. Only fills an empty slot; an explicit choice
-  // already in state (or restored from the in-memory draft) is never
-  // overridden. Holds off while a project prefill is deciding.
+  // Fill an empty target slot so a session can start without a pick: the last
+  // explicit choice, else the first online host, else the sandbox. A choice
+  // already in state is never overridden; waits while a project prefill decides.
   useEffect(() => {
     if (!prefillSettled) return;
     if (!onboardingHostSettled.current) {
@@ -2953,13 +2949,17 @@ export function NewChatLandingScreen() {
       return;
     }
 
+    // Wait for the list so a connected host cannot lose to the sandbox.
+    if (hostsLoading) return;
+    const firstOnline = (hosts ?? []).find((h) => h.status === "online");
+    if (firstOnline) {
+      setSelectedHostId(firstOnline.host_id);
+      return;
+    }
     if (managedSandboxesEnabled) {
       setSandboxSelected(true);
       setSandboxProvider(defaultSandboxProvider());
-      return;
     }
-    const firstOnline = (hosts ?? []).find((h) => h.status === "online");
-    if (firstOnline) setSelectedHostId(firstOnline.host_id);
   }, [
     hosts,
     hostsLoading,

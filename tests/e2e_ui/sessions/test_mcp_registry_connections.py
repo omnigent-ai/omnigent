@@ -115,6 +115,9 @@ async def _drive_launch(
                         json={"models": [{"id": "demo-model", "displayName": "Demo model"}]}
                     ),
                 )
+            else:
+                # No connected hosts, so the sandbox is the default.
+                await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": []}))
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
             await page.route(
                 "**/v1/sandbox-providers/*/harnesses/*/model-options*",

@@ -1455,10 +1455,10 @@ def _managed_info_body() -> str:
     """Stub body for ``GET /v1/info``: a managed deployment offering a sandbox.
 
     ``managed_sandboxes_enabled: true`` + ``sandbox_provider: "lakebox"`` makes
-    the picker offer (and default to) the "Databricks Sandbox" option, exactly
-    the deployment shape behind the original complaint. Every field the SPA
-    reads is supplied so the boot probe resolves to a fully-managed capability
-    set rather than the fail-closed sentinel.
+    the picker offer the "Databricks Sandbox" option (the default when no host
+    is connected), the deployment shape behind the original complaint. Every
+    field the SPA reads is supplied so the boot probe resolves to a
+    fully-managed capability set rather than the fail-closed sentinel.
     """
     return json.dumps(
         {
@@ -1479,11 +1479,11 @@ def test_start_session_managed_remembers_host_over_sandbox_default(
 ) -> None:
     """In a managed deployment, a picked host survives reload — not the sandbox.
 
-    This is the original complaint end-to-end: the managed picker defaults to
-    "Databricks Sandbox", so a user who picks a connected host used to lose it
-    on the next visit (the picker reverted to the sandbox default). With the
-    last-host preference persisted, picking the host and reloading must restore
-    the host, NOT snap back to the sandbox default.
+    This is the original complaint end-to-end: a user who picked a connected
+    host over "Databricks Sandbox" used to lose it on the next visit (the
+    picker reverted to the sandbox). Starting from a remembered sandbox pick,
+    picking the host and reloading must restore the host, NOT snap back to the
+    sandbox.
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
@@ -1523,6 +1523,8 @@ async def _drive_managed_repository_workspace_bar(
                     status=200, content_type="application/json", body=_managed_info_body()
                 ),
             )
+            # No connected hosts, so the sandbox is the default.
+            await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": []}))
 
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -1625,6 +1627,13 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
                     JSON.stringify({{ "{host_id}": ["/work/repo"] }})
                 );"""
             )
+            # Start from a remembered sandbox pick, since the connected host is
+            # otherwise the default. Seeded once, so the reload reads the new pick.
+            await page.add_init_script(
+                """if (window.localStorage.getItem("omnigent:last-host-choice") === null) {
+                    window.localStorage.setItem("omnigent:last-host-choice", "__sandbox__");
+                }"""
+            )
 
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -1632,8 +1641,7 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
             )
 
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            # Managed default with no stored pick: the sandbox, labeled by its
-            # provider ("Databricks Sandbox").
+            # The remembered sandbox, labeled by its provider ("Databricks Sandbox").
             await expect(chip).to_have_attribute("aria-label", re.compile("Databricks Sandbox"))
 
             # Explicitly pick the connected host instead.
@@ -1641,8 +1649,7 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
             await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
             await expect(chip).to_have_attribute("aria-label", re.compile(host_display_name))
 
-            # Reload: the host must be restored, NOT reverted to the sandbox
-            # default — the exact regression this change fixes.
+            # Reload: the picked host must be restored, not reverted to the sandbox.
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000

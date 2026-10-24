@@ -5,7 +5,7 @@
 // the source of truth; these helpers only seed that state on mount and
 // snapshot it when the user explicitly picks a host (or the managed sandbox),
 // so the next visit starts from the last choice instead of the auto-picked
-// default — the sandbox in managed deployments, the first online host in OSS.
+// default — the first online host, else the sandbox in managed deployments.
 // The consumer still validates a stored host id against the live host list. An
 // unavailable stored host is never silently replaced with the automatic
 // default: the picker waits for it to reappear, or for the user to explicitly

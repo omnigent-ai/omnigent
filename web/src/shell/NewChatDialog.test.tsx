@@ -3948,7 +3948,7 @@ describe("NewChatLandingScreen", () => {
     {
       state: "a sandbox",
       remembered: null,
-      hosts: [host("online", 1)],
+      hosts: [],
       info: { managed_sandboxes_enabled: true },
       rows: ["Host: New Sandbox", "Status: Starts when you send"],
     },
@@ -5477,6 +5477,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("keeps the responsive sandbox repository trigger accessibly named", async () => {
+    mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true });
 
     const contextBar = screen.getByTestId("new-chat-landing-workspace-controls");
@@ -7703,22 +7704,41 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("defaults to New Sandbox when the server supports managed sandboxes", async () => {
-    // No clicks: the auto-select effect picks the FIRST menu option — the
-    // sandbox — even though an online host (machine-1) exists. If this
-    // regressed to host-first, the chip would read "machine-1".
+  it("defaults to a connected host even when the server supports managed sandboxes", async () => {
+    // No clicks: the auto-select effect prefers the first online host
+    // (machine-1) over the sandbox pinned first in the menu. If this
+    // regressed to sandbox-first, the chip would read "New Sandbox".
+    mockHosts([host("online", 1), host("online", 2)]);
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
-        "New Sandbox",
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: machine-1, Online",
       ),
     );
-    // Sandbox mode chrome comes with the default: repository chip in,
-    // workspace/worktree chips out.
+    // Host mode chrome comes with the default: workspace chip in, repository
+    // chip out.
     const contextBar = screen.getByTestId("new-chat-landing-workspace-controls");
-    expect(contextBar).toContainElement(screen.getByTestId("new-chat-landing-repo-chip"));
-    expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-worktree-chip")).toBeNull();
+    expect(contextBar).toContainElement(screen.getByTestId("new-chat-landing-workspace-chip"));
+    expect(screen.queryByTestId("new-chat-landing-repo-chip")).toBeNull();
+  });
+
+  it("waits for the host list before falling back to the sandbox", async () => {
+    // The sandbox must not claim the empty slot while hosts load, or a
+    // connected host arriving a moment later could never win it.
+    mockHosts(undefined);
+    renderLanding({ managed_sandboxes_enabled: true });
+    expect(
+      screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
+    ).not.toContain("Sandbox");
+    mockHosts([host("online", 1), host("online", 2)]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rerender" },
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: machine-1, Online",
+      ),
+    );
   });
 
   it("labels the sandbox option with the server's provider name", async () => {
@@ -7726,6 +7746,7 @@ describe("NewChatLandingScreen", () => {
     // "Modal Sandbox" on both the chip and the dropdown option — if the
     // label regressed to the generic "New Sandbox", the provider name
     // never reached the UI.
+    mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "modal" });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
@@ -7753,9 +7774,31 @@ describe("NewChatLandingScreen", () => {
     ).not.toContain("No hosts");
   });
 
-  it("switching between a host and the sandbox swaps the workspace chrome", async () => {
+  it.each<{
+    state: string;
+    hosts: Host[] | undefined;
+    queryState: Partial<ReturnType<typeof useHosts>>;
+  }>([
+    { state: "every host is offline", hosts: [host("offline")], queryState: {} },
+    {
+      state: "the host list fails to load",
+      hosts: undefined,
+      queryState: { status: "error", isPending: false, isLoading: false, isError: true },
+    },
+  ])("falls back to the sandbox when $state", async ({ hosts, queryState }) => {
+    mockHosts(hosts, queryState);
     renderLanding({ managed_sandboxes_enabled: true });
-    // Sandbox is the default; switch to the host first so the test
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "New Sandbox",
+      ),
+    );
+  });
+
+  it("switching between a host and the sandbox swaps the workspace chrome", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "__sandbox__");
+    renderLanding({ managed_sandboxes_enabled: true });
+    // The remembered sandbox wins; switch to the host first so the test
     // exercises both directions of the toggle.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
@@ -7826,6 +7869,7 @@ describe("NewChatLandingScreen", () => {
       return Promise.resolve({ ok: true, json: async () => ({}) } as unknown as Response);
     }) as unknown as typeof authenticatedFetch);
 
+    mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true, enabled_connections: ["github"] });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
@@ -7855,6 +7899,7 @@ describe("NewChatLandingScreen", () => {
   });
 
   it("hides the GitHub repo picker when the GitHub App is disabled", async () => {
+    mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true, enabled_connections: [] });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
@@ -7912,6 +7957,7 @@ describe("NewChatLandingScreen", () => {
   it.each([undefined, true])(
     "includes managed first input only when the server accepts it durably (%s)",
     async (durableInitialInput) => {
+      mockHosts([]);
       renderLanding({
         managed_sandboxes_enabled: true,
         durable_initial_input: durableInitialInput,
@@ -7934,6 +7980,7 @@ describe("NewChatLandingScreen", () => {
   );
 
   it("uploads managed first-message files in the create request", async () => {
+    mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true, durable_initial_input: true });
     const file = new File(["saved context"], "context.txt", { type: "text/plain" });
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
@@ -8131,6 +8178,7 @@ describe("NewChatLandingScreen", () => {
         ok: true,
         json: async () => ({ id: "conv_new" }),
       } as unknown as Response);
+      mockHosts([]);
       renderLanding({
         managed_sandboxes_enabled: true,
         sandbox_provider: "modal",
@@ -8351,6 +8399,7 @@ describe("NewChatLandingScreen", () => {
     setOmnigentHostConfig({
       docsLinks: { databricksGitCredentials: "Use Databricks Git credentials before cloning." },
     });
+    mockHosts([]);
     renderLanding({ managed_sandboxes_enabled: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
@@ -9641,19 +9690,11 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
     renderLanding({ managed_sandboxes_enabled: true });
-    // The managed default is the sandbox even with a host present, so switch
-    // to the connected host (machine-1) first.
+    // The connected host is the default even with sandboxes on.
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
-        "Sandbox",
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: This machine, Online",
       ),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
-    await waitFor(() =>
-      expect(
-        screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
-      ).not.toContain("Sandbox"),
     );
     // Open the create dialog through the custom-agents submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
@@ -9771,16 +9812,9 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
   // custom agent from the dialog so it becomes the selected agent.
   async function createAndSelectPendingAgentOnHost(): Promise<void> {
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
-        "Sandbox",
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        "Host: This machine, Online",
       ),
-    );
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
-    await waitFor(() =>
-      expect(
-        screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
-      ).not.toContain("Sandbox"),
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
@@ -11581,7 +11615,11 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
 });
 
 describe("managed sandbox inference models", () => {
-  beforeEach(setupLandingMocks);
+  // No connected host, so the composer defaults to the sandbox.
+  beforeEach(() => {
+    setupLandingMocks();
+    mockHosts([]);
+  });
 
   const models = [
     { id: "private/default", displayName: "Gateway default", isDefault: true },
@@ -11790,7 +11828,11 @@ describe("managed sandbox inference models", () => {
 });
 
 describe("managed sandbox gateway preview", () => {
-  beforeEach(setupLandingMocks);
+  // No connected host, so the composer defaults to the sandbox.
+  beforeEach(() => {
+    setupLandingMocks();
+    mockHosts([]);
+  });
 
   const astra = {
     id: "system.ai.gpt-6-astra",
@@ -12216,6 +12258,7 @@ describe("managed sandbox gateway preview", () => {
   });
 
   it("keeps a connected host's authoritative discovery when Arclet preview is offered", () => {
+    mockHosts([host("online")]);
     localStorage.setItem("omnigent:last-host-choice", "host_1");
     preview();
     renderGatewaySandbox();
