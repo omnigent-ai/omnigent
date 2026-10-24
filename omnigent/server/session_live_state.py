@@ -71,6 +71,10 @@ _executor: ThreadPoolExecutor | None = None
 # already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# Epoch-ms stamp of this process's last queued status write per session.
+_last_status_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Newest stamp issued; keeps this process's stamps increasing across clock steps.
+_last_stamp = 0
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
@@ -96,6 +100,7 @@ def configure(
     _store = store
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
+    _last_status_at.clear()
     _last_pending.clear()
     _last_liveness_stamp.clear()
 
@@ -179,7 +184,11 @@ def persist_live_status(session_id: str, status: str) -> None:
         return
     if _last_status.get(session_id) == status:
         return
+    global _last_stamp
+    observed_at = max(time.time_ns() // 1_000_000, _last_stamp + 1)
+    _last_stamp = observed_at
     _last_status[session_id] = status
+    _last_status_at[session_id] = observed_at
 
     def _evict() -> None:
         # A dropped write must not leave the dedupe cache asserting this
@@ -187,15 +196,39 @@ def persist_live_status(session_id: str, status: str) -> None:
         # swallowed and the row stays stale until a *different* status
         # arrives. Evict only if we still own the entry (a newer publish
         # may have overwritten it, and its write is the live one).
-        if _last_status.get(session_id) == status:
+        if _last_status_at.get(session_id) == observed_at:
             _last_status.pop(session_id, None)
+            _last_status_at.pop(session_id, None)
 
-    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    store = _store
+
+    def _write() -> None:
+        store.set_session_live_status(session_id, status, observed_at=observed_at)
+
+    submit("live_status", _write, on_failure=_evict)
 
 
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state for a session handed to another replica."""
     _last_status.pop(session_id, None)
+    _last_status_at.pop(session_id, None)
+
+
+def own_live_status_stamp(session_id: str, store: ConversationStore) -> int | None:
+    """
+    Return the stamp of THIS process's last queued status write for *session_id*.
+
+    A row stamped later was written by another replica after that write.
+
+    :param session_id: Session/conversation identifier.
+    :param store: Store the caller reads the row from; writes go elsewhere
+        unless it is the configured one.
+    :returns: Epoch ms, or ``None`` when *store* is not the configured one,
+        the write failed, or the session was handed off.
+    """
+    if _store is None or store is not _store:
+        return None
+    return _last_status_at.get(session_id)
 
 
 def persist_scheduled_run_completion(

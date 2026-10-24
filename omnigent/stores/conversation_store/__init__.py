@@ -1581,7 +1581,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def set_session_live_status(
+        self, conversation_id: str, status: str, *, observed_at: int | None = None
+    ) -> None:
         """
         Persist the relay-observed turn status for one session.
 
@@ -1591,6 +1593,11 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        :param observed_at: Epoch ms the writer observed *status*. When given,
+            stamp ``live_status_at`` and skip the write if the row already
+            holds a newer stamp, so a delayed write from a replica that lost
+            the session cannot overwrite its new owner's status. ``None``
+            writes unconditionally and leaves the stamp unchanged.
         """
         ...
 

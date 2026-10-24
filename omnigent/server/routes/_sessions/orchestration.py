@@ -8390,6 +8390,10 @@ async def _runner_disconnect_requires_failure(
     needs a fresh row: an offline sweep's snapshot may predate a child's idle
     observation. Recheck the cache after the read, even when the read fails.
 
+    A mid-turn cache is stale once another replica owns the session. When the
+    row holds a settled status stamped after this replica's last write, the
+    turn was handed off, not lost.
+
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
     establish that a turn was interrupted.
@@ -8402,9 +8406,14 @@ async def _runner_disconnect_requires_failure(
     the saved status alone is no evidence of an interruption.
     """
     cached = _session_status_cache.get(session_id)
+    own_stamp = (
+        session_live_state.own_live_status_stamp(session_id, conversation_store)
+        if cached in _MID_TURN_STATUSES
+        else None
+    )
     persisted: Conversation | None = None
     lookup = "not_needed"
-    if cached is None:
+    if cached is None or own_stamp is not None:
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
@@ -8417,12 +8426,22 @@ async def _runner_disconnect_requires_failure(
                 extra={"session_id": session_id},
             )
         cached = _session_status_cache.get(session_id)
+    # A local edge during the read leaves the row behind this replica again.
+    handed_off = (
+        own_stamp is not None
+        and session_live_state.own_live_status_stamp(session_id, conversation_store) == own_stamp
+        and persisted is not None
+        and persisted.live_status is not None
+        and persisted.live_status not in _MID_TURN_STATUSES
+        and persisted.live_status_at is not None
+        and persisted.live_status_at > own_stamp
+    )
 
     handle = _runner_relay_tasks.get(session_id)
     relay_snapshot = handle.status_snapshot if handle is not None else None
     fallback = snapshot if snapshot is not None else relay_snapshot
 
-    if cached is not None:
+    if cached is not None and not handed_off:
         live, source = cached, "cache"
     elif persisted is not None:
         live, source = persisted.live_status, "persisted"
@@ -8441,10 +8460,10 @@ async def _runner_disconnect_requires_failure(
     ):
         # A Stop can arrive while the sweep refreshes its row.
         decision = "intentional_stop"
-    elif shutdown_state.runner_handoff_reason(runner_id) is not None:
-        # This replica moved the runner's tunnel to another replica, which now
-        # owns the turn. A failed or stale local read must not fail a turn that
-        # is still running there.
+    elif handed_off or shutdown_state.runner_handoff_reason(runner_id) is not None:
+        # Another replica owns the turn: it settled the session after this
+        # replica's last write, or this replica moved the runner's tunnel to it.
+        # A failed or stale local read must not fail a turn that is running there.
         decision = "handed_off"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
@@ -8514,6 +8533,8 @@ async def _runner_disconnect_requires_failure(
             # The cache retains positive counts only; absence is not an observed zero.
             cached_background_task_count=_session_background_task_count_cache.get(session_id),
             persisted_session_status=persisted.live_status if persisted is not None else None,
+            own_live_status_at=own_stamp,
+            persisted_live_status_at=persisted.live_status_at if persisted is not None else None,
             snapshot_session_status=fallback.live_status if fallback is not None else None,
             status_lookup=lookup,
             session_kind=conv.kind if conv is not None else None,
@@ -8525,6 +8546,8 @@ async def _runner_disconnect_requires_failure(
             **shutdown_state.disconnect_attributes(runner_id),
         ),
     )
+    if decision == "handed_off":
+        _relinquish_session_live_state(session_id)
     return decision in ("failed_mid_turn", "failed_before_start")
 
 

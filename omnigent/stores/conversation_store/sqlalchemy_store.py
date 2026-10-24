@@ -265,6 +265,7 @@ def _to_conversation(
             if meta and meta.live_status is not None
             else None
         ),
+        live_status_at=meta.live_status_at if meta else None,
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
         project_id=meta.project_id if meta else None,
@@ -3956,7 +3957,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "clear_runner_liveness", write)
 
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def set_session_live_status(
+        self, conversation_id: str, status: str, *, observed_at: int | None = None
+    ) -> None:
         """
         Persist the relay-observed turn status for one session.
 
@@ -3965,19 +3968,28 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        :param observed_at: Epoch ms the writer observed *status*; when given,
+            the write is skipped if the row holds a newer stamp.
         """
         from sqlalchemy import update
 
         encoded_status = encode_session_live_status(status)
 
         def write(session: Session) -> None:
+            stmt = update(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if observed_at is None:
+                session.execute(stmt.values(live_status=encoded_status))
+                return
             session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                )
-                .values(live_status=encoded_status)
+                stmt.where(
+                    or_(
+                        SqlConversationMetadata.live_status_at.is_(None),
+                        SqlConversationMetadata.live_status_at <= observed_at,
+                    )
+                ).values(live_status=encoded_status, live_status_at=observed_at)
             )
 
         run_write_transaction(self._session_immediate, "set_session_live_status", write)
