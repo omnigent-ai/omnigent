@@ -40,6 +40,7 @@ vi.mock("./tiptapBoundedTokenizers", () => ({
   BoundedTaskList: {},
   BoundedTable: { configure: vi.fn().mockReturnValue({}) },
 }));
+vi.mock("./tiptapOrderedList", () => ({ AlignedOrderedList: {} }));
 vi.mock("./TipTapGitHubAlert", () => ({ GitHubAlertBlockquote: {} }));
 vi.mock("./TipTapHtmlPassthrough", () => ({ HtmlPassthrough: {} }));
 vi.mock("./tiptapMarkdownPatches", () => ({

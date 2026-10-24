@@ -53,6 +53,7 @@ import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { SoftBreak } from "./TipTapSoftBreak";
 import { BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
+import { AlignedOrderedList } from "./tiptapOrderedList";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -375,13 +376,17 @@ function MarkdownRichTextViewerInner({
       // schema-invalid doc that crashes the panel. See SafeListItem above.
       // codeBlock: false — replaced by CodeBlockWithLanguage, which adds a
       // language picker and a live mermaid preview via a React node view.
+      // orderedList: false — replaced by AlignedOrderedList, which keeps
+      // indented blocks inside an item aligned to its content column.
       StarterKit.configure({
         link: false,
         blockquote: false,
         listItem: false,
         codeBlock: false,
+        orderedList: false,
       }),
       SafeListItem,
+      AlignedOrderedList,
       CodeBlockWithLanguage,
       // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
       // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
