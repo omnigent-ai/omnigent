@@ -82,11 +82,17 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    ErrorData,
     NewConversationItem,
     PagedList,
     parse_item_data,
 )
-from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
+from omnigent.errors import (
+    ErrorCode,
+    OmnigentError,
+    StaleCursorError,
+    is_payload_rejected_rpc_error,
+)
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -734,6 +740,35 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         response_id=row.response_id,
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
+        created_by=row.created_by,
+    )
+
+
+def _to_unreadable_item(row: SqlConversationItem) -> ConversationItem:
+    """Represent a row whose data cannot be decoded as an error item.
+
+    Keeps the row's id, ordering metadata and timestamps so cursors still
+    resolve; the agent loop excludes error items from LLM context.
+
+    :param row: Stored row whose data could not be decoded.
+    :returns: Error placeholder carrying the row's metadata.
+    """
+    return ConversationItem(
+        id=row.id,
+        type="error",
+        status=decode_item_status(row.status),
+        response_id=row.response_id,
+        created_at=row.created_at,
+        data=ErrorData(
+            source="execution",
+            code="item_data_unreadable",
+            title="Part of this conversation couldn't be loaded",
+            message=(
+                "Its stored content could not be read from conversation storage "
+                "(for example, an attachment too large to decode). The rest of "
+                "the conversation is unaffected."
+            ),
+        ),
         created_by=row.created_by,
     )
 
@@ -2140,8 +2175,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Preserve FTS rank order
             order = {iid: i for i, iid in enumerate(item_ids)}
             ordered = sorted(rows, key=lambda r: order[r.id])
-            decoded = self._decode_item_data_batch([r.data for r in ordered])
-            return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
+            decoded = self._decode_item_data_batch_for_read([r.data for r in ordered])
+            return [
+                _to_item(r, d) if d is not None else _to_unreadable_item(r)
+                for r, d in zip(ordered, decoded, strict=True)
+            ]
 
     def list_host_conversation_ids(
         self,
@@ -2251,8 +2289,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             ).scalar_one_or_none()
             if row is None:
                 return None
-            [data] = self._decode_item_data_batch([row.data])
-            return _to_item(row, data)
+            [data] = self._decode_item_data_batch_for_read([row.data])
+            return _to_item(row, data) if data is not None else _to_unreadable_item(row)
 
     def list_items(
         self,
@@ -2280,7 +2318,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             with this type are returned, e.g. ``"compaction"``. ``None``
             means return all types.
         :returns: A :class:`PagedList` of
-            :class:`ConversationItem` objects.
+            :class:`ConversationItem` objects. A row whose data the store
+            cannot decode is returned as an ``error`` placeholder, even under
+            a ``type`` filter (see :meth:`_decode_item_data_batch_for_read`).
         """
         with self._conv_session("list_items") as session:
             is_asc = order == "asc"
@@ -2357,8 +2397,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            decoded = self._decode_item_data_batch([r.data for r in rows])
-            items = [_to_item(r, d) for r, d in zip(rows, decoded, strict=True)]
+            decoded = self._decode_item_data_batch_for_read([r.data for r in rows])
+            items = [
+                _to_item(r, d) if d is not None else _to_unreadable_item(r)
+                for r, d in zip(rows, decoded, strict=True)
+            ]
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -2435,9 +2478,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(ranked.c.row_num <= per_conversation_limit)
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
-            decoded = self._decode_item_data_batch([row.data for row in rows])
+            decoded = self._decode_item_data_batch_for_read([row.data for row in rows])
             for row, data_json in zip(rows, decoded, strict=True):
-                result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
+                item = (
+                    _to_item(row, data_json)  # type: ignore[arg-type]
+                    if data_json is not None
+                    else _to_unreadable_item(row)  # type: ignore[arg-type]
+                )
+                result[row.conversation_id].append(item)
         return result
 
     def _encode_item_data(self, data_json: str) -> str:
@@ -2479,6 +2527,62 @@ class SqlAlchemyConversationStore(ConversationStore):
         single pass (e.g. one bulk decrypt call) instead of once per row.
         """
         return stored
+
+    def _decode_item_data_batch_for_read(self, stored: list[str]) -> list[str | None]:
+        """Decode a read page, isolating rows the backend refuses as unreadable.
+
+        A batch failure the backend attributes to the payload
+        (:func:`is_payload_rejected_rpc_error`) is halved until each refused
+        row stands alone and becomes ``None``; other exceptions propagate, as
+        does a refusal of every row on a multi-row page, which points at a
+        backend-wide fault rather than bad payloads. Placeholders are never
+        persisted, so such a page pays the halving on every read. Parsing of
+        decoded JSON and the mutation paths that decode content remain strict.
+
+        :param stored: Raw ``data`` column values of the page, in order.
+        :returns: Decoded JSON per row, ``None`` where the row is unreadable.
+        """
+        try:
+            return list(self._decode_item_data_batch(stored))
+        except Exception as exc:
+            if not is_payload_rejected_rpc_error(exc):
+                raise
+            refused = exc
+            _logger.debug("decoding a page of %d items was refused", len(stored), exc_info=True)
+        decoded = self._isolate_unreadable_rows(stored)
+        unreadable = sum(1 for d in decoded if d is None)
+        if unreadable == len(stored) > 1:
+            raise refused
+        if unreadable:
+            _logger.warning(
+                "%d of %d items could not be decoded (%s: %s); serving placeholders",
+                unreadable,
+                len(stored),
+                type(refused).__name__,
+                refused,
+            )
+        return decoded
+
+    def _isolate_unreadable_rows(self, failed: list[str]) -> list[str | None]:
+        """Halve a slice whose batch decode failed until each unreadable row stands alone.
+
+        :param failed: Stored values whose batch decode was refused.
+        :returns: Decoded JSON per row, ``None`` for a row refused on its own.
+        """
+        if not failed:
+            return []
+        if len(failed) == 1:
+            return [None]
+        mid = len(failed) // 2
+        decoded: list[str | None] = []
+        for half in (failed[:mid], failed[mid:]):
+            try:
+                decoded.extend(self._decode_item_data_batch(half))
+            except Exception as exc:
+                if not is_payload_rejected_rpc_error(exc):
+                    raise
+                decoded.extend(self._isolate_unreadable_rows(half))
+        return decoded
 
     def _item_search_text(self, item: NewConversationItem) -> str | None:
         """

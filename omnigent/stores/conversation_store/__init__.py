@@ -756,8 +756,10 @@ class ConversationStore(ABC):
         :param before: Cursor item ID; only return items before
             this item in sort order.
         :param order: Sort direction, ``"asc"`` or ``"desc"``.
-        :param type: Optional item type filter. When provided, only items
-            with this type are returned, e.g. ``"compaction"``. ``None``
+        :param type: Optional item type filter. When provided, only rows
+            stored with this type are returned, e.g. ``"compaction"``; a
+            selected row whose data cannot be decoded comes back as an
+            ``error`` placeholder that keeps its id and position. ``None``
             means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.

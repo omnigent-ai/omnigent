@@ -2940,6 +2940,24 @@ class _LoadedHistory:
     last_compaction_created_at: int | None = None
 
 
+def _load_full_history(conv_store: ConversationStore, conversation_id: str) -> _LoadedHistory:
+    """
+    Load every content item of a conversation, with no compaction cursor.
+
+    :param conv_store: The ConversationStore to read.
+    :param conversation_id: The conversation to load,
+        e.g. ``"conv_abc123"``.
+    :returns: A :class:`_LoadedHistory` without a compaction timestamp.
+    """
+    return _LoadedHistory(
+        items=[
+            item
+            for item in fetch_all_items(conv_store, conversation_id)
+            if item.type not in NON_CONTENT_ITEM_TYPES
+        ]
+    )
+
+
 def _load_initial_history(
     conv_store: ConversationStore,
     conversation_id: str,
@@ -2964,14 +2982,15 @@ def _load_initial_history(
     """
     compaction_item = _find_latest_compaction_item(conv_store, conversation_id)
     if compaction_item is None:
-        return _LoadedHistory(
-            items=[
-                item
-                for item in fetch_all_items(conv_store, conversation_id)
-                if item.type not in NON_CONTENT_ITEM_TYPES
-            ]
+        return _load_full_history(conv_store, conversation_id)
+    if not isinstance(compaction_item.data, CompactionData):
+        # The store serves a row it cannot decode as an error placeholder.
+        _logger.warning(
+            "Ignoring unreadable compaction item %s for %s; loading full history",
+            compaction_item.id,
+            conversation_id,
         )
-    assert isinstance(compaction_item.data, CompactionData)
+        return _load_full_history(conv_store, conversation_id)
     # Validate the compaction item before trusting it as a cursor.
     # A broken item (empty summary, missing/bogus last_item_id) would
     # make the after= query return nothing, leaving history as just
@@ -2986,13 +3005,7 @@ def _load_initial_history(
             conversation_id,
             last_id,
         )
-        return _LoadedHistory(
-            items=[
-                item
-                for item in fetch_all_items(conv_store, conversation_id)
-                if item.type not in NON_CONTENT_ITEM_TYPES
-            ]
-        )
+        return _load_full_history(conv_store, conversation_id)
     # Load after last_item_id, NOT after the compaction item itself.
     # The compaction item may be appended after additional output
     # items that the summary does not cover — using last_item_id
@@ -3012,13 +3025,7 @@ def _load_initial_history(
             last_id,
             conversation_id,
         )
-        return _LoadedHistory(
-            items=[
-                item
-                for item in fetch_all_items(conv_store, conversation_id)
-                if item.type not in NON_CONTENT_ITEM_TYPES
-            ]
-        )
+        return _load_full_history(conv_store, conversation_id)
     # Filter metadata items — they are not conversation content the
     # LLM should receive verbatim.
     content_items = [i for i in recent_items if i.type not in NON_CONTENT_ITEM_TYPES]
