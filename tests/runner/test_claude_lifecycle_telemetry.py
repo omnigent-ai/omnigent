@@ -446,3 +446,38 @@ async def test_explicit_close_and_cleanup_are_distinct_and_sink_json_remains_par
         json.loads(request["attributes"]["terminal_control_requests"])[0]["action"]
         == "close_terminal"
     )
+
+
+async def test_idle_required_terminal_exit_records_the_launcher_output(
+    launch: _Launch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A launcher that dies before any turn must leave its exit cause in the runner log."""
+    caplog.set_level(logging.INFO)
+    launcher_output = "Failed to start session: Expecting value: line 1 column 1 (char 0)"
+    launch.callbacks["on_activity"]()
+    launch.callbacks["on_idle"]()
+    await asyncio.sleep(0)
+    instance = launch.instance
+    instance._remember_pane_snapshot(
+        f"{launcher_output}\n" + "\n" * 20 + "Pane is dead (status 1, Thu Oct 15 03:27:06 2026)"
+    )
+    instance._remember_exit_status("1 1")
+    instance.running = False
+    launch.callbacks["on_exit"]()
+    await asyncio.wait_for(launch.resources.wait_for_terminal_exit_cleanup(), timeout=2)
+    await asyncio.sleep(0)
+
+    [exit_row] = _rows(caplog, "terminal_exit_observed")
+    assert exit_row["attributes"]["session_status_before_exit"] == "idle"
+    assert exit_row["attributes"]["terminal_exit_status"] == "1"
+    statuses = _drain_session_event_queue(_session_event_queues_ref.get(_SESSION))
+    assert not any(event.get("status") == "failed" for event in statuses), statuses
+
+    # The idle exit fails no turn, so this WARNING is the only record of the
+    # cause; selecting it by name keeps an unrelated diagnostic from satisfying
+    # the assertion.
+    [idle_row] = _rows(caplog, "required_terminal_exited_idle")
+    assert launcher_output in json.dumps(idle_row), (
+        "the idle-exit diagnostic does not carry the dead terminal's output: "
+        + json.dumps(idle_row)
+    )
