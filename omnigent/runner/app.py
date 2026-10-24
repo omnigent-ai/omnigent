@@ -2097,7 +2097,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # best-effort, but surface it
+        except Exception:  # noqa: BLE001 -- best-effort, but surface it
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -4051,7 +4051,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # best-effort: harness may have exited
+        except Exception:  # noqa: BLE001 -- best-effort: harness may have exited
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -4794,7 +4794,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # best-effort observer; never fail the hook
+            except Exception:  # noqa: BLE001 -- best-effort observer; never fail the hook
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -6839,6 +6839,7 @@ def create_runner_app(
                     {"effort": effort},
                     # An older server keeps a refused selection for the next turn.
                     legacy_server=not server_rolls_back,
+                    allow_cold_start=body.get("cold_start_settings") is True,
                 )
                 if server_rolls_back and not (
                     200 <= response.status_code < 300 or response.status_code == 504
@@ -6902,6 +6903,7 @@ def create_runner_app(
                         conversation_id,
                         settings,
                         legacy_server=body.get("rollback_on_refusal") is not True,
+                        allow_cold_start=body.get("cold_start_settings") is True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
@@ -7681,7 +7683,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # best-effort; never block catch-up.
+            except Exception:  # noqa: BLE001 -- best-effort; never block catch-up.
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,
