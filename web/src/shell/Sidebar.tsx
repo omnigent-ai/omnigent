@@ -5620,8 +5620,8 @@ function ConversationRowImpl({
               <DialogDescription>
                 This terminates the running session for <span className="font-medium">{label}</span>
                 {conversation.host_id
-                  ? " and stops its runner, including side chats running on it."
-                  : "."}{" "}
+                  ? " and stops its runner, including side chats running on it, and closes any open side shells."
+                  : " and closes any open side shells."}{" "}
                 Conversation histories are kept.
               </DialogDescription>
             </DialogHeader>
