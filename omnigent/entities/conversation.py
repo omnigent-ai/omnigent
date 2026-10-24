@@ -643,6 +643,94 @@ class TerminalCommandData(BaseModel):
     stderr: str | None = None
 
 
+# Cap on the total characters across a saved code run's output segments.
+CODE_RUN_OUTPUT_MAX_CHARS = 100_000
+
+
+class CodeRunOutputSegment(BaseModel):
+    """
+    One contiguous chunk of a code run's output from a single stream.
+
+    :param stream: ``"stdout"`` or ``"stderr"``.
+    :param text: The chunk's text, e.g. ``"hello\\n"``.
+    """
+
+    stream: Literal["stdout", "stderr"]
+    text: str
+
+
+class CodeRunData(BaseModel):
+    """
+    Data payload for a chat code block the session owner ran.
+
+    Each run appends two ``code_run`` items sharing ``run_id``: a
+    ``started`` item and, once the process ends, a ``finished`` item.
+    Fields of the other phase stay unset. Listed in
+    :data:`NON_CONTENT_ITEM_TYPES` so the agent loop never replays a run
+    as model history; the agent gets a summary through a framework notice.
+
+    :param run_id: Id shared by the run's two items, e.g. ``"run_abc"``.
+    :param phase: ``"started"`` or ``"finished"``.
+    :param message_id: Started: id of the assistant message holding the
+        block.
+    :param block_hash: Started: hash identifying the block within that
+        message.
+    :param language: Started: block language, e.g. ``"bash"``.
+    :param command: Started: the exact code that ran.
+    :param timeout: Started: timeout in seconds, e.g. ``60``.
+    :param approved_by: Started: who approved a policy ASK for this run,
+        or ``None`` when no approval was needed.
+    :param started_at: Started: Unix epoch seconds when the run began.
+    :param status: Finished: ``"exited"``, ``"stopped"``,
+        ``"timed_out"``, or ``"failed"``.
+    :param exit_code: Finished: process exit code, or ``None`` when the
+        process did not exit on its own.
+    :param duration_ms: Finished: run duration in milliseconds.
+    :param output: Finished: output segments in arrival order, at most
+        :data:`CODE_RUN_OUTPUT_MAX_CHARS` characters in total.
+    :param truncated: Finished: ``True`` when output was cut to the cap.
+    """
+
+    run_id: str
+    phase: Literal["started", "finished"]
+    message_id: str | None = None
+    block_hash: str | None = None
+    language: str | None = None
+    command: str | None = None
+    timeout: int | None = None
+    approved_by: str | None = None
+    started_at: int | None = None
+    status: Literal["exited", "stopped", "timed_out", "failed"] | None = None
+    exit_code: int | None = None
+    duration_ms: int | None = None
+    output: list[CodeRunOutputSegment] | None = None
+    truncated: bool | None = None
+
+    @model_validator(mode="after")
+    def check_phase_fields_and_output_cap(self) -> CodeRunData:
+        """
+        Require the declared phase's fields and enforce the output cap.
+
+        :returns: The validated model.
+        :raises ValueError: If a field the phase needs is unset, or the
+            output exceeds :data:`CODE_RUN_OUTPUT_MAX_CHARS` characters.
+        """
+        missing = [
+            name for name in _CODE_RUN_PHASE_FIELDS[self.phase] if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(f"code_run {self.phase} item requires {', '.join(missing)}")
+        if sum(len(segment.text) for segment in self.output or ()) > CODE_RUN_OUTPUT_MAX_CHARS:
+            raise ValueError(f"code_run output exceeds {CODE_RUN_OUTPUT_MAX_CHARS} characters")
+        return self
+
+
+_CODE_RUN_PHASE_FIELDS: dict[str, tuple[str, ...]] = {
+    "started": ("message_id", "block_hash", "language", "command", "timeout", "started_at"),
+    "finished": ("status", "duration_ms", "output", "truncated"),
+}
+
+
 class RoutingDecisionData(BaseModel):
     """
     Data payload for an intelligent model-router decision item.
@@ -781,6 +869,7 @@ ItemData = (
     | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
+    | CodeRunData
 )
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
@@ -795,6 +884,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
+    "code_run": CodeRunData,
 }
 
 # Item types that are metadata / lifecycle events — not content
@@ -808,6 +898,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "routing_decision",
         "slash_command",
         "terminal_command",
+        "code_run",
     }
 )
 

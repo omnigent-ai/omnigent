@@ -1185,6 +1185,213 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CodeRunData": {
+        "description": "Data payload for a chat code block the session owner ran.\n\nEach run appends two `code_run` items sharing `run_id`: a\n`started` item and, once the process ends, a `finished` item.\nFields of the other phase stay unset. Listed in\n`NON_CONTENT_ITEM_TYPES` so the agent loop never replays a run\nas model history; the agent gets a summary through a framework notice.",
+        "properties": {
+          "approved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: who approved a policy ASK for this run, or `None` when no approval was needed.",
+            "title": "Approved By"
+          },
+          "block_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: hash identifying the block within that message.",
+            "title": "Block Hash"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: the exact code that ran.",
+            "title": "Command"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: run duration in milliseconds.",
+            "title": "Duration Ms"
+          },
+          "exit_code": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: process exit code, or `None` when the process did not exit on its own.",
+            "title": "Exit Code"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: block language, e.g. `\"bash\"`.",
+            "title": "Language"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: id of the assistant message holding the block.",
+            "title": "Message Id"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeRunOutputSegment"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: output segments in arrival order, at most `CODE_RUN_OUTPUT_MAX_CHARS` characters in total.",
+            "title": "Output"
+          },
+          "phase": {
+            "description": "`\"started\"` or `\"finished\"`.",
+            "enum": [
+              "started",
+              "finished"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "run_id": {
+            "description": "Id shared by the run's two items, e.g. `\"run_abc\"`.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: Unix epoch seconds when the run began.",
+            "title": "Started At"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "exited",
+                  "stopped",
+                  "timed_out",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: `\"exited\"`, `\"stopped\"`, `\"timed_out\"`, or `\"failed\"`.",
+            "title": "Status"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: timeout in seconds, e.g. `60`.",
+            "title": "Timeout"
+          },
+          "truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: `True` when output was cut to the cap.",
+            "title": "Truncated"
+          }
+        },
+        "required": [
+          "run_id",
+          "phase"
+        ],
+        "title": "CodeRunData",
+        "type": "object"
+      },
+      "CodeRunOutputSegment": {
+        "description": "One contiguous chunk of a code run's output from a single stream.",
+        "properties": {
+          "stream": {
+            "description": "`\"stdout\"` or `\"stderr\"`.",
+            "enum": [
+              "stdout",
+              "stderr"
+            ],
+            "title": "Stream",
+            "type": "string"
+          },
+          "text": {
+            "description": "The chunk's text, e.g. `\"hello\\n\"`.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream",
+          "text"
+        ],
+        "title": "CodeRunOutputSegment",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -1633,6 +1840,9 @@
               },
               {
                 "$ref": "#/components/schemas/TerminalCommandData"
+              },
+              {
+                "$ref": "#/components/schemas/CodeRunData"
               }
             ],
             "description": "The typed data payload (MessageData, etc.).",
